@@ -16,3 +16,7 @@ tests:
     query_overrides: databricks-catalog
     runner_type: spiceai-dev-large-runners
     duration: 28800
+  schema:
+    spicepod_path: federated/databricks[catalog].yaml
+    runner_type: spiceai-dev-runners
+    min_tables: 1

@@ -2,7 +2,7 @@
 description = "Manage multiple Tokio runtimes for use in the Spice.ai OSS runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime-async"
 repository.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,9 @@ version.workspace = true
 tracing.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
+tokio-util.workspace = true
 snafu.workspace = true
+num_cpus.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

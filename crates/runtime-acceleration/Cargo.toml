@@ -2,7 +2,7 @@
 description = "Acceleration support for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime-acceleration"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,31 +11,57 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
+arrow_tools = { path = "../arrow_tools" }
 async-trait.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "extensions-full",
+], optional = true }
 fundu.workspace = true
 futures.workspace = true
-itertools.workspace = true
 object_store.workspace = true
+opentelemetry.workspace = true
+telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
-spicepod = { path = "../spicepod" }
-tracing.workspace = true
-snafu.workspace = true
-tokio = { workspace = true, features = ["fs"] }
-util = { path = "../util" }
-url.workspace = true
+rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
-opentelemetry.workspace = true
+sha2.workspace = true
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tar = "0.4"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tracing.workspace = true
+turso = { workspace = true, optional = true }
+url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+uuid = { version = "1", features = ["v7"] }
 
 [features]
 default = []
+duckdb = ["dep:duckdb"]
 snapshots = []
+sqlite = ["dep:rusqlite"]
+turso = ["dep:turso"]
 
 [dev-dependencies]
+anyhow = { workspace = true }
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+futures.workspace = true
+hex = "0.4"
+serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+harness = false
+name = "snapshot_operations"

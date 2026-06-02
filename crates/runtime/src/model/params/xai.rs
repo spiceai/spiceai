@@ -14,18 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
-    &concat_arrays::<
-        ParameterSpec,
-        XAI_PARAM_LEN,
-        PARAM_WITH_DEPRE_LEN,
-        { XAI_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
-    >(XAI_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
+pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
+    ParameterSpec,
+    XAI_PARAM_LEN,
+    PARAM_WITH_DEPRE_LEN,
+    { XAI_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
+>(XAI_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const XAI_PARAM_LEN: usize = 1;
+const XAI_PARAM_LEN: usize = 2;
 
-pub(crate) const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] =
-    [ParameterSpec::component("api_key").description("The xAI API key.")];
+pub(crate) const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] = [
+    ParameterSpec::component("api_key").description("The xAI API key."),
+    ParameterSpec::component("usage_tier")
+        .description("xAI usage tier (0-4). Used for rate limit defaults."),
+];

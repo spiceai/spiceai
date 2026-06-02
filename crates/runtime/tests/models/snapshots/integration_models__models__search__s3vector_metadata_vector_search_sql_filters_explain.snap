@@ -7,7 +7,7 @@ snapshot_kind: text
 | plan_type     | plan                                                                                                                                                                     |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: score DESC NULLS FIRST, fetch=4                                                                                                                                    |
-|               |   Projection: vector_search(qs, Utf8("secondary")).id, vector_search(qs, Utf8("secondary")).answer, trunc(vector_search(qs, Utf8("secondary")).score, Int64(3)) AS score |
+|               |   Projection: vector_search(qs, Utf8("secondary")).id, vector_search(qs, Utf8("secondary")).answer, trunc(vector_search(qs, Utf8("secondary")).score, Int64(2)) AS score |
 |               |     BytesProcessedNode                                                                                                                                                   |
 |               |       Filter: vector_search(qs, Utf8("secondary")).source = Utf8("textbook_reasoning")                                                                                   |
 |               |         TableScan: vector_search(qs, Utf8("secondary")) projection=[id, answer, source, score]                                                                           |
@@ -27,8 +27,8 @@ snapshot_kind: text
 |               |                           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                           |
 |               |                             CooperativeExec                                                                                                                              |
 |               |                               S3VectorsQueryExec: limit=30                                                                                                               |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                       |
-|               |                 BytesProcessedExec                                                                                                                                       |
+|               |               BytesProcessedExec                                                                                                                                         |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                     |
 |               |                   SchemaCastScanExec                                                                                                                                     |
 |               |                     DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                    |
 |               |                                                                                                                                                                          |

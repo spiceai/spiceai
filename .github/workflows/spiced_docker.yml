@@ -3,6 +3,13 @@ name: spiced_docker
 on:
   release:
     types:
+      # 'published' fires when a release (including a pre-release / RC) is
+      # first published, so RC tags still get pushed to DockerHub / GHCR even
+      # though they aren't marked as "latest" on GitHub.
+      - published
+      # 'edited' fires when an existing release is edited — we use this to
+      # re-run the workflow when a release is flipped to 'latest' so the
+      # :latest tag can be updated without re-publishing all images.
       - edited
   workflow_dispatch:
     inputs:
@@ -15,6 +22,15 @@ on:
         required: false
         type: boolean
         default: false
+      tag_latest:
+        description: "Tag as 'latest' (auto = only if the GitHub release is marked 'latest')"
+        required: false
+        type: choice
+        options:
+          - auto
+          - 'true'
+          - 'false'
+        default: auto
       target:
         description: Build docker images for specific target(s)
         required: false
@@ -28,12 +44,39 @@ on:
 
 jobs:
   setup:
-    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == true) }}
-    runs-on: ubuntu-latest
+    # Run on:
+    #   - workflow_dispatch (manual runs)
+    #   - release 'published' ONLY for stable releases (vX.Y.Z) or RC tags
+    #     (vX.Y.Z-rc.N / vX.Y.Z-rc-N). Other pre-releases (nightly, beta,
+    #     alpha, dev, etc.) are intentionally excluded so they never get
+    #     published to DockerHub / GHCR via this workflow.
+    #   - release 'edited' only when the release is flipped to 'latest', so the
+    #     ':latest' tag can be moved without re-publishing on every edit.
+    #
+    # Draft releases are NEVER published from release events — the
+    # 'github.event.release.draft' guard ensures unpublished drafts can't
+    # reach DockerHub / GHCR even if 'edited' fires while in draft state.
+    if: >-
+      ${{
+        github.event_name != 'release'
+        || (
+          github.event.action == 'published'
+          && !github.event.release.draft
+          && contains(github.event.release.tag_name, '-rc.')
+        )
+        || (
+          github.event.action == 'edited'
+          && !github.event.release.draft
+          && github.event.changes.make_latest
+          && github.event.changes.make_latest.to == 'true'
+        )
+      }}
+    runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       publish: ${{ steps.resolve.outputs.publish }}
+      should_tag_latest: ${{ steps.resolve.outputs.should_tag_latest }}
       target: ${{ steps.resolve.outputs.target }}
       run_amd64: ${{ steps.resolve.outputs.run_amd64 }}
       run_arm64: ${{ steps.resolve.outputs.run_arm64 }}
@@ -52,10 +95,13 @@ jobs:
             target_input="${{ github.event.inputs.target }}"
             publish_flag="${{ github.event.inputs.publish || 'false' }}"
             release_tag_input="${{ github.event.inputs.release_tag }}"
+            allow_cuda=true
           else
+            # For release events, CUDA is not built (nightly-only)
             target_input="all"
             publish_flag="true"
             release_tag_input="${{ github.event.release.tag_name }}"
+            allow_cuda=false
           fi
 
           target_input="${target_input:-all}"
@@ -77,6 +123,17 @@ jobs:
 
           rel_version="${release_tag#v}"
 
+          # Refuse to publish draft releases. Drafts have no tag in the git
+          # repo and should never be pushed to DockerHub / GHCR. We check
+          # GitHub's release metadata directly so this guards both
+          # release-event runs (defense in depth) and workflow_dispatch
+          # runs that supply a draft release's tag.
+          is_draft=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft -q .isDraft 2>/dev/null || echo "false")
+          if [ "$is_draft" = "true" ]; then
+            echo "Release ${release_tag} is a draft; refusing to publish." >&2
+            exit 1
+          fi
+
           run_amd64=false
           run_arm64=false
           run_cuda=false
@@ -84,7 +141,9 @@ jobs:
             all|"")
               run_amd64=true
               run_arm64=true
-              run_cuda=true
+              if [ "$allow_cuda" = "true" ]; then
+                run_cuda=true
+              fi
               ;;
             amd64)
               run_amd64=true
@@ -93,7 +152,12 @@ jobs:
               run_arm64=true
               ;;
             cuda)
-              run_cuda=true
+              if [ "$allow_cuda" = "true" ]; then
+                run_cuda=true
+              else
+                echo "CUDA builds are only available via workflow_dispatch (nightly builds)" >&2
+                exit 1
+              fi
               ;;
             *)
               echo "Unknown target selection: $target_input" >&2
@@ -101,9 +165,41 @@ jobs:
               ;;
           esac
 
+          # Determine if this release should be tagged as 'latest'.
+          #
+          # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
+          # itself is marked as the repository's "latest" release. We no
+          # longer infer this from the version string — RCs, stable releases
+          # published out-of-order, etc. all respect GitHub's latest flag.
+          if [ "$event_name" = "workflow_dispatch" ]; then
+            tag_latest_input="${{ github.event.inputs.tag_latest }}"
+          else
+            # For release events, use 'auto' detection
+            tag_latest_input="auto"
+          fi
+
+          if [ "$tag_latest_input" = "auto" ]; then
+            # Query GitHub for whether this tag is currently the 'latest' release.
+            is_latest=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isLatest -q .isLatest 2>/dev/null || echo "false")
+            if [ "$is_latest" = "true" ]; then
+              should_tag_latest="true"
+              echo "Release ${release_tag} is marked as 'latest' on GitHub, will tag as 'latest'"
+            else
+              should_tag_latest="false"
+              echo "Release ${release_tag} is not marked as 'latest' on GitHub, skipping 'latest' tag"
+            fi
+          elif [ "$tag_latest_input" = "true" ]; then
+            should_tag_latest="true"
+            echo "Explicitly requested 'latest' tag"
+          else
+            should_tag_latest="false"
+            echo "Explicitly skipping 'latest' tag"
+          fi
+
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
           echo "rel_version=${rel_version}" >> "$GITHUB_OUTPUT"
           echo "publish=${publish_flag}" >> "$GITHUB_OUTPUT"
+          echo "should_tag_latest=${should_tag_latest}" >> "$GITHUB_OUTPUT"
           echo "target=${target_input}" >> "$GITHUB_OUTPUT"
           echo "run_amd64=${run_amd64}" >> "$GITHUB_OUTPUT"
           echo "run_arm64=${run_arm64}" >> "$GITHUB_OUTPUT"
@@ -117,25 +213,31 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
         run: echo "Skipping AMD64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_amd64 == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: Dockerfile-release
@@ -150,16 +252,14 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
-      - name: models
+      - name: Validate AMD64 image
         run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          docker load -i /tmp/image-amd64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
-      - *build-amd64-image
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -172,7 +272,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
         run: echo "Skipping ARM64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Install docker
@@ -198,21 +298,27 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (debian, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_arm64 == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: default
         run: |
           echo "IMAGE_TAG=default" >> $GITHUB_ENV
           echo "BINARY_VARIANT=default" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: Dockerfile-release
@@ -227,16 +333,14 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
-      - name: models
+      - name: Validate ARM64 image
         run: |
-          echo "IMAGE_TAG=models" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models" >> $GITHUB_ENV
-          echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+          docker load -i /tmp/image-arm64-${{ env.IMAGE_TAG }}.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-arm64 --version
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
-      - *build-arm64-image
 
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -252,25 +356,31 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
         run: echo "Skipping CUDA image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Configure CUDA models build
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before building so base image pulls (nvidia/cuda, etc.)
+        # use authenticated rate limits instead of anonymous (per-IP) limits.
+        if: ${{ needs.setup.outputs.run_cuda == 'true' && github.repository == 'spiceai/spiceai' }}
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure CUDA build
         run: |
-          echo "IMAGE_TAG=models-cuda" >> $GITHUB_ENV
-          echo "BINARY_VARIANT=models-cuda" >> $GITHUB_ENV
+          echo "IMAGE_TAG=cuda" >> $GITHUB_ENV
+          echo "BINARY_VARIANT=cuda" >> $GITHUB_ENV
           echo "CARGO_FEATURES=release,models,cuda" >> $GITHUB_ENV
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
-      - name: Package CUDA models image
-        uses: docker/build-push-action@v6
+      - name: Package CUDA image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: Dockerfile-cuda-release
@@ -285,8 +395,14 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
+      - name: Validate CUDA image
+        run: |
+          docker load -i /tmp/images-amd64-cuda.tar
+          docker run --rm localhost:5000/spiceai:${{ env.IMAGE_TAG }}-amd64 --version
+        if: ${{ needs.setup.outputs.run_cuda == 'true' }}
+
       - name: Upload CUDA artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
@@ -295,23 +411,24 @@ jobs:
   publish:
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
+      SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
       RUN_AMD64: ${{ needs.setup.outputs.run_amd64 }}
       RUN_ARM64: ${{ needs.setup.outputs.run_arm64 }}
     steps:
       - name: Download AMD64 artifacts
         if: needs.setup.outputs.run_amd64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-amd64
           path: /tmp
 
       - name: Download ARM64 artifacts
         if: needs.setup.outputs.run_arm64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-arm64
           path: /tmp
@@ -321,7 +438,17 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start local registry
         run: |
@@ -329,7 +456,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -337,7 +464,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -346,74 +473,78 @@ jobs:
         run: |
           echo "REL_VERSION=${REL_VERSION}"
           echo "PUBLISH=${PUBLISH}"
+          echo "SHOULD_TAG_LATEST=${SHOULD_TAG_LATEST}"
           echo "RUN_AMD64=${RUN_AMD64}"
           echo "RUN_ARM64=${RUN_ARM64}"
 
-          variants=("default" "models")
-          for variant in "${variants[@]}"; do
-            suffix=""
-            if [ "$variant" != "default" ]; then
-              suffix="-${variant}"
-            fi
+          # Single default variant
+          variant="default"
 
-            sources=()
+          sources=()
 
-            if [ "${RUN_AMD64}" = "true" ] && [ -f "/tmp/image-amd64-${variant}.tar" ]; then
-              echo "Loading AMD64 image for ${variant}"
-              docker load -i /tmp/image-amd64-${variant}.tar
-              docker push localhost:5000/spiceai:${variant}-amd64
-              sources+=("localhost:5000/spiceai:${variant}-amd64")
-            fi
+          if [ "${RUN_AMD64}" = "true" ] && [ -f "/tmp/image-amd64-${variant}.tar" ]; then
+            echo "Loading AMD64 image for ${variant}"
+            docker load -i /tmp/image-amd64-${variant}.tar
+            docker push localhost:5000/spiceai:${variant}-amd64
+            sources+=("localhost:5000/spiceai:${variant}-amd64")
+          fi
 
-            if [ "${RUN_ARM64}" = "true" ] && [ -f "/tmp/image-arm64-${variant}.tar" ]; then
-              echo "Loading ARM64 image for ${variant}"
-              docker load -i /tmp/image-arm64-${variant}.tar
-              docker push localhost:5000/spiceai:${variant}-arm64
-              sources+=("localhost:5000/spiceai:${variant}-arm64")
-            fi
+          if [ "${RUN_ARM64}" = "true" ] && [ -f "/tmp/image-arm64-${variant}.tar" ]; then
+            echo "Loading ARM64 image for ${variant}"
+            docker load -i /tmp/image-arm64-${variant}.tar
+            docker push localhost:5000/spiceai:${variant}-arm64
+            sources+=("localhost:5000/spiceai:${variant}-arm64")
+          fi
 
-            if [ ${#sources[@]} -eq 0 ]; then
-              echo "No images built for variant ${variant}; skipping manifest creation."
-              continue
-            fi
+          if [ ${#sources[@]} -eq 0 ]; then
+            echo "No images built; skipping manifest creation."
+            exit 0
+          fi
 
-            if [[ "${PUBLISH}" == "true" ]]; then
-              echo "Publishing ${variant} to GHCR and DockerHub"
-              docker buildx imagetools create \
-                -t ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t ghcr.io/spiceai/spiceai:latest${suffix} \
-                "${sources[@]}"
+          if [[ "${PUBLISH}" == "true" ]]; then
+            echo "Publishing to GHCR and DockerHub"
 
-              docker buildx imagetools create \
-                -t spiceai/spiceai:${REL_VERSION}${suffix} \
-                -t spiceai/spiceai:latest${suffix} \
-                "${sources[@]}"
+            # Build tag arguments - always include version tag
+            ghcr_tags="-t ghcr.io/spiceai/spiceai:${REL_VERSION}"
+            dockerhub_tags="-t spiceai/spiceai:${REL_VERSION}"
 
-              echo "Verifying GHCR image:"
-              docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}${suffix}
-
-              echo "Verifying DockerHub image:"
-              docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}${suffix}
+            # Add optionally 'latest' tags
+            if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
+              echo "Adding 'latest' tag"
+              ghcr_tags="${ghcr_tags} -t ghcr.io/spiceai/spiceai:latest"
+              dockerhub_tags="${dockerhub_tags} -t spiceai/spiceai:latest"
             else
-              echo "Skipping registry publish for ${variant}"
-              docker buildx imagetools create \
-                -t localhost:5000/spiceai:latest${suffix} \
-                "${sources[@]}"
-
-              docker buildx imagetools inspect localhost:5000/spiceai:latest${suffix}
+              echo "Skipping 'latest' tag (pre-release or explicitly disabled)"
             fi
-          done
+
+            docker buildx imagetools create ${ghcr_tags} "${sources[@]}"
+            docker buildx imagetools create ${dockerhub_tags} "${sources[@]}"
+
+            echo "Verifying GHCR image:"
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}
+
+            echo "Verifying DockerHub image:"
+            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}
+          else
+            echo "Skipping registry publish"
+            docker buildx imagetools create \
+              -t localhost:5000/spiceai:latest \
+              "${sources[@]}"
+
+            docker buildx imagetools inspect localhost:5000/spiceai:latest
+          fi
 
   publish-cuda:
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-    runs-on: 'ubuntu-gpu-t4-4-core'
+    runs-on: ubuntu-24.04
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
+      SHOULD_TAG_LATEST: ${{ needs.setup.outputs.should_tag_latest }}
     steps:
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: images-amd64-cuda
           path: /tmp
@@ -423,7 +554,17 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to Docker Hub
+        # Authenticate to Docker Hub before pulling so we use the authenticated
+        # rate limits instead of anonymous (per-IP) limits when pulling
+        # registry:2 below.
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start local registry
         run: |
@@ -431,7 +572,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -439,7 +580,7 @@ jobs:
 
       - name: Login to DockerHub
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -451,29 +592,38 @@ jobs:
             exit 0
           fi
 
-          echo "Handling CUDA models..."
+          echo "Handling CUDA..."
           docker load -i /tmp/images-amd64-cuda.tar
-          docker push localhost:5000/spiceai:models-cuda-amd64
+          docker push localhost:5000/spiceai:cuda-amd64
 
           if [[ "${PUBLISH}" == "true" ]]; then
-            echo "Pushing CUDA models to GHCR and DockerHub"
-            docker buildx imagetools create \
-              -t spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t spiceai/spiceai:latest-models-cuda \
-              -t ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda \
-              -t ghcr.io/spiceai/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+            echo "Pushing CUDA to GHCR and DockerHub"
+
+            # Build tag arguments - always include version tag
+            ghcr_tags="-t ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda"
+            dockerhub_tags="-t spiceai/spiceai:${REL_VERSION}-cuda"
+
+            # Add optionally 'latest-cuda' tags
+            if [[ "${SHOULD_TAG_LATEST}" == "true" ]]; then
+              echo "Adding 'latest-cuda' tag"
+              ghcr_tags="${ghcr_tags} -t ghcr.io/spiceai/spiceai:latest-cuda"
+              dockerhub_tags="${dockerhub_tags} -t spiceai/spiceai:latest-cuda"
+            else
+              echo "Skipping 'latest-cuda' tag (pre-release or explicitly disabled)"
+            fi
+
+            docker buildx imagetools create ${ghcr_tags} ${dockerhub_tags} localhost:5000/spiceai:cuda-amd64
 
             echo "Verifying CUDA GHCR image:"
-            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-models-cuda
+            docker buildx imagetools inspect ghcr.io/spiceai/spiceai:${REL_VERSION}-cuda
 
             echo "Verifying CUDA DockerHub image:"
-            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-models-cuda
+            docker buildx imagetools inspect spiceai/spiceai:${REL_VERSION}-cuda
           else
             echo "Skipping push for non-publish CUDA build"
             docker buildx imagetools create \
-              -t localhost:5000/spiceai:latest-models-cuda \
-              localhost:5000/spiceai:models-cuda-amd64
+              -t localhost:5000/spiceai:latest-cuda \
+              localhost:5000/spiceai:cuda-amd64
 
-            docker buildx imagetools inspect localhost:5000/spiceai:latest-models-cuda
+            docker buildx imagetools inspect localhost:5000/spiceai:latest-cuda
           fi

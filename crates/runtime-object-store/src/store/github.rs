@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::TimeZone;
@@ -28,11 +28,13 @@ use http::{
 use object_store::{
     ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    client::SpawnedReqwestConnector,
     http::{HttpBuilder, HttpStore},
     path::Path,
 };
 use serde::Deserialize;
 use snafu::prelude::*;
+use tokio::runtime::Handle;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,6 +81,7 @@ impl GitHubRawObjectStore {
         repo: impl Display,
         rev: impl Display,
         token: Option<&str>,
+        io_runtime: Handle,
     ) -> Result<Self, Error> {
         let mut headers = HeaderMap::with_capacity(1);
         if let Some(token) = token {
@@ -93,6 +96,7 @@ impl GitHubRawObjectStore {
                 "https://raw.githubusercontent.com/{org}/{repo}/{rev}"
             ))
             .with_client_options(ClientOptions::default().with_default_headers(headers))
+            .with_http_connector(SpawnedReqwestConnector::new(io_runtime))
             .build()
             .context(HttpBuilderFailedSnafu)?;
         Ok(Self {
@@ -158,7 +162,18 @@ impl ObjectStore for GitHubRawObjectStore {
         let config = Arc::clone(&self.config);
 
         Box::pin(async_stream::stream! {
-            let gh_rest_api = GithubRestClient::new(config.token.as_deref());
+            let gh_rest_api = match GithubRestClient::new(config.token.as_deref()) {
+                Ok(client) => client,
+                Err(err) => {
+                    yield Err(object_store::Error::Generic {
+                        store: "GitHubRawObjectStore",
+                        source: Box::new(std::io::Error::other(format!(
+                            "Failed to create GitHub client: {err}"
+                        ))),
+                    });
+                    return;
+                }
+            };
             let git_tree = match gh_rest_api.fetch_git_tree(&config.org, &config.repo, &config.rev).await {
                 Ok(tree) => tree,
                 Err(e) => {
@@ -174,7 +189,7 @@ impl ObjectStore for GitHubRawObjectStore {
             let files: Vec<GitTreeNode> = git_tree
                 .tree
                 .into_iter()
-                .filter(|node| node.node_type == "blob" && prefix.as_ref().is_none_or(|p| node.path.starts_with(&p.to_string())))
+                .filter(|node| node.node_type == "blob" && prefix.as_ref().is_none_or(|p| node.path.starts_with(&p.clone())))
                 .collect();
 
             for file in files {
@@ -232,12 +247,17 @@ pub struct GithubRestClient {
 }
 
 impl GithubRestClient {
-    #[must_use]
-    pub fn new(token: Option<&str>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    pub fn new(token: Option<&str>) -> reqwest::Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(util::spiceai_user_agent())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()?;
+
+        Ok(Self {
+            client,
             token: token.map(ToString::to_string),
-        }
+        })
     }
 
     async fn fetch_git_tree(
@@ -286,8 +306,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_opts() {
-        let store = GitHubRawObjectStore::try_new("spiceai", "spiceai", "refs/heads/trunk", None)
-            .expect("failed to create store");
+        let store = GitHubRawObjectStore::try_new(
+            "spiceai",
+            "spiceai",
+            "refs/heads/trunk",
+            None,
+            Handle::current(),
+        )
+        .expect("failed to create store");
         let result = store
             .get_opts(&Path::from("README.md"), GetOptions::default())
             .await

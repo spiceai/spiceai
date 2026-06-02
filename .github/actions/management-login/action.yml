@@ -1,0 +1,50 @@
+name: "Management Login"
+description: "Fetches a Spice OAuth access token and exports it as an env var for remaining steps."
+
+inputs:
+  client-id:
+    description: "OAuth client id"
+    required: true
+  client-secret:
+    description: "OAuth client secret"
+    required: true
+  token-url:
+    description: "OAuth token endpoint"
+    required: false
+    default: "https://dev.spice.ai/api/oauth/token"
+  env-name:
+    description: "Environment variable name to set"
+    required: false
+    default: "SPICEAI_API_KEY"
+
+outputs:
+  token:
+    description: "Extracted access token from response"
+    value: ${{ steps.token.outputs.value }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Request OAuth token
+      id: token
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "jq is required but not found on PATH" >&2
+          exit 1
+        fi
+
+        response=$(curl -sS -X POST "${{ inputs.token-url }}" -H "Content-Type: application/json" \
+          -d "$(jq -cn --arg client_id '${{ inputs.client-id }}' --arg client_secret '${{ inputs.client-secret }}' '{client_id: $client_id, client_secret: $client_secret, grant_type: "client_credentials"}')")
+
+        value=$(echo "$response" | jq -er '.access_token')
+
+        {
+          echo "${{ inputs.env-name }}=$value"
+        } >> "$GITHUB_ENV"
+
+        {
+          echo "value=$value"
+        } >> "$GITHUB_OUTPUT"

@@ -1,0 +1,26 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+---
+[
+  {
+    "id": 612,
+    "_match": "\n2",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.796
+  },
+  {
+    "id": 349,
+    "_match": " is 2.",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.785
+  },
+  {
+    "id": 948,
+    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.557
+  },
+  {
+    "id": 1277,
+    "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
+  }
+]

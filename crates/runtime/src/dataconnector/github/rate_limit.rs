@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,6 +20,12 @@ use data_components::rate_limit::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+
+const GITHUB_RATE_LIMIT_BUFFER: i32 = 100;
+
+fn primary_rate_limit_buffer(limit: i32) -> i32 {
+    (limit / 20).clamp(1, GITHUB_RATE_LIMIT_BUFFER)
+}
 
 #[derive(Debug)]
 pub struct GitHubRateLimiter {
@@ -140,7 +146,7 @@ impl RateLimiter for GitHubRateLimiter {
                         .unwrap_or(Duration::from_secs(1));
                     let wait_duration_secs = wait_duration.as_secs();
                     tracing::warn!(
-                        "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {}.",
+                        "GitHub API secondary rate limit exceeded. Waiting for {} second{} until {} before sending another request.",
                         wait_duration_secs,
                         if wait_duration_secs == 1 { "" } else { "s" },
                         secondary.retry_after
@@ -148,8 +154,9 @@ impl RateLimiter for GitHubRateLimiter {
                     tokio::time::sleep(wait_duration).await;
                 }
                 RateLimitInfo::Primary(primary) => {
-                    // GitHub GraphQL requests consume more than 1 rate-limit unit, so add some buffer to ensure the proper handling
-                    if primary.remaining <= 5 {
+                    // GitHub GraphQL requests can consume more than 1 rate-limit unit, so keep a
+                    // small percentage-based buffer without stalling low-limit unauthenticated REST traffic.
+                    if primary.remaining <= primary_rate_limit_buffer(primary.limit) {
                         let now = Utc::now();
                         if now < primary.reset_time {
                             let wait_duration = (primary.reset_time - now)
@@ -157,24 +164,38 @@ impl RateLimiter for GitHubRateLimiter {
                                 .unwrap_or(Duration::from_secs(1));
                             let wait_duration_secs = wait_duration.as_secs();
                             tracing::warn!(
-                                "GitHub API rate limit exceeded. Waiting for {} second{} until {}. Limit: {}, Used: {}, Resource: {}",
+                                "GitHub API primary rate limit is nearly exhausted for {}. Waiting for {} second{} until {}. Remaining: {}, Limit: {}, Used: {}",
+                                primary.resource,
                                 wait_duration_secs,
                                 if wait_duration_secs == 1 { "" } else { "s" },
                                 primary.reset_time,
+                                primary.remaining,
                                 primary.limit,
                                 primary.used,
-                                primary.resource
                             );
                             tokio::time::sleep(wait_duration).await;
                         }
                     } else {
-                        tracing::debug!(
-                            "GitHub API rate limit status: {}/{} remaining. Reset at {}. Resource: {}",
-                            primary.remaining,
-                            primary.limit,
-                            primary.reset_time,
-                            primary.resource
-                        );
+                        let usage_percent =
+                            (f64::from(primary.used) / f64::from(primary.limit)) * 100.0;
+                        if usage_percent >= 80.0 {
+                            tracing::warn!(
+                                "GitHub API rate limit is getting low for {}: {}/{} remaining ({:.1}% used). Reset at {}",
+                                primary.resource,
+                                primary.remaining,
+                                primary.limit,
+                                usage_percent,
+                                primary.reset_time
+                            );
+                        } else {
+                            tracing::trace!(
+                                "GitHub API rate limit status for {}: {}/{} remaining. Reset at {}",
+                                primary.resource,
+                                primary.remaining,
+                                primary.limit,
+                                primary.reset_time
+                            );
+                        }
                     }
                 }
             }
@@ -265,6 +286,37 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(elapsed.as_millis() < 100);
+    }
+
+    #[tokio::test]
+    async fn test_small_primary_limit_does_not_wait_too_early() {
+        let rate_limiter = GitHubRateLimiter::new();
+
+        let headers = create_test_headers(HashMap::from([
+            ("x-ratelimit-limit", s("60")),
+            ("x-ratelimit-remaining", s("52")),
+            ("x-ratelimit-used", s("8")),
+            (
+                "x-ratelimit-reset",
+                (Utc::now() + Duration::seconds(2)).timestamp().to_string(),
+            ),
+            ("x-ratelimit-resource", s("core")),
+        ]));
+
+        rate_limiter.update_from_headers(&headers).await;
+
+        let start = std::time::Instant::now();
+        rate_limiter
+            .check_rate_limit()
+            .await
+            .expect("rate limit check failed");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 100,
+            "Expected no wait for a healthy small public quota, but waited {}ms",
+            elapsed.as_millis()
+        );
     }
 
     #[tokio::test]

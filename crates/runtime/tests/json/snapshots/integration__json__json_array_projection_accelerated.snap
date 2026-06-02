@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/json/mod.rs
+expression: result
+---
++-----+
+| age |
++-----+
+| 25  |
+| 30  |
+| 35  |
++-----+

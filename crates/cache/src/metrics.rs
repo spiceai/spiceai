@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,12 +63,59 @@ macro_rules! generate_cache_metrics {
                     .build()
             });
 
+            pub static MISSES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_misses"))
+                    .with_description("Cache miss count.")
+                    .build()
+            });
+
+            pub static HIT_RATIO: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+                METER
+                    .f64_gauge(concat!($prefix, "_cache_hit_ratio"))
+                    .with_description("Cache hit ratio (hits / total requests).")
+                    .build()
+            });
+
             pub static ITEMS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
                 METER
                     .u64_gauge(concat!($prefix, "_cache_items_count"))
                     .with_description("Number of items currently in the cache.")
                     .build()
             });
+
+            pub static EVICTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                METER
+                    .u64_counter(concat!($prefix, "_cache_evictions"))
+                    .with_description("Number of cache evictions.")
+                    .build()
+            });
+
+            pub static STALE_WHILE_REVALIDATE_SKIPPED: LazyLock<Counter<u64>> =
+                LazyLock::new(|| {
+                    METER
+                        .u64_counter(concat!(
+                            $prefix,
+                            "_cache_stale_swr_count"
+                        ))
+                        .with_description(
+                            "Number of stale-while-revalidate background refreshes skipped due to existing in-flight revalidation.",
+                        )
+                        .build()
+                });
+
+            pub static STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES: LazyLock<Counter<u64>> =
+                LazyLock::new(|| {
+                    METER
+                        .u64_counter(concat!(
+                            $prefix,
+                            "_cache_swr_background_query_count"
+                        ))
+                        .with_description(
+                            "Number of background queries triggered for stale-while-revalidate cache refreshes.",
+                        )
+                        .build()
+                });
         }
     };
 }
@@ -90,6 +137,9 @@ pub trait CacheMetrics: Send + Sync {
     fn record_hit()
     where
         Self: Sized;
+    fn record_miss()
+    where
+        Self: Sized;
     fn record_request()
     where
         Self: Sized;
@@ -102,11 +152,30 @@ pub trait CacheMetrics: Send + Sync {
     fn record_max_size(size: u64)
     where
         Self: Sized;
+    fn record_eviction()
+    where
+        Self: Sized;
+    fn update_hit_ratio(hits: u64, total: u64)
+    where
+        Self: Sized;
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn calculate_hit_ratio(hits: u64, total: u64) -> f64 {
+    if total > 0 {
+        hits as f64 / total as f64
+    } else {
+        0.0
+    }
 }
 
 impl CacheMetrics for CachedSearchResult {
     fn record_hit() {
         search_results::HITS.add(1, &[]);
+    }
+
+    fn record_miss() {
+        search_results::MISSES.add(1, &[]);
     }
 
     fn record_request() {
@@ -124,11 +193,24 @@ impl CacheMetrics for CachedSearchResult {
     fn record_max_size(size: u64) {
         search_results::MAX_SIZE_BYTES.record(size, &[]);
     }
+
+    fn record_eviction() {
+        search_results::EVICTIONS.add(1, &[]);
+    }
+
+    fn update_hit_ratio(hits: u64, total: u64) {
+        let ratio = calculate_hit_ratio(hits, total);
+        search_results::HIT_RATIO.record(ratio, &[]);
+    }
 }
 
 impl CacheMetrics for CachedQueryResult {
     fn record_hit() {
         sql_results::HITS.add(1, &[]);
+    }
+
+    fn record_miss() {
+        sql_results::MISSES.add(1, &[]);
     }
 
     fn record_request() {
@@ -146,11 +228,24 @@ impl CacheMetrics for CachedQueryResult {
     fn record_max_size(size: u64) {
         sql_results::MAX_SIZE_BYTES.record(size, &[]);
     }
+
+    fn record_eviction() {
+        sql_results::EVICTIONS.add(1, &[]);
+    }
+
+    fn update_hit_ratio(hits: u64, total: u64) {
+        let ratio = calculate_hit_ratio(hits, total);
+        sql_results::HIT_RATIO.record(ratio, &[]);
+    }
 }
 
 impl CacheMetrics for CachedEmbeddingResult {
     fn record_hit() {
         embeddings::HITS.add(1, &[]);
+    }
+
+    fn record_miss() {
+        embeddings::MISSES.add(1, &[]);
     }
 
     fn record_request() {
@@ -167,5 +262,14 @@ impl CacheMetrics for CachedEmbeddingResult {
 
     fn record_max_size(size: u64) {
         embeddings::MAX_SIZE_BYTES.record(size, &[]);
+    }
+
+    fn record_eviction() {
+        embeddings::EVICTIONS.add(1, &[]);
+    }
+
+    fn update_hit_ratio(hits: u64, total: u64) {
+        let ratio = calculate_hit_ratio(hits, total);
+        embeddings::HIT_RATIO.record(ratio, &[]);
     }
 }

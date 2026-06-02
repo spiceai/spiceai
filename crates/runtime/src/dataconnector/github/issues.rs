@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -72,6 +72,14 @@ impl GraphQLContext for IssuesTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
     }
+
+    fn query_cost(&self) -> Option<u32> {
+        // issues(first: 100) could retrieve up to 100 issues
+        // each query returns labels, comments and assignees which are each additional requests
+        // 1 + 100 (labels) + 25 (comments) + 100 (assignees) = 226 points
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(226)
+    }
 }
 
 impl GitHubTableArgs for IssuesTableArgs {
@@ -104,8 +112,9 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             milestone_title: milestone {{ milestone_title: title }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 25) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            type: issueType {{ type: name, type_color: color }}
                         }}
                     }}
                 }}
@@ -136,8 +145,9 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             milestone_title: milestone {{ milestone_title: title }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 25) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            type: issueType {{ type: name, type_color: color }}
                         }}
                     }}
                 }}

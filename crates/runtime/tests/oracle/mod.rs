@@ -23,7 +23,9 @@ use crate::init_tracing;
 use crate::oracle::common::{
     make_oracle_cloud_dataset, make_oracle_dataset, start_oracle_docker_container,
 };
-use crate::utils::{runtime_ready_check, test_request_context, verify_env_secret_exists};
+use crate::utils::{
+    register_test_connectors, runtime_ready_check, test_request_context, verify_env_secret_exists,
+};
 
 pub mod common;
 
@@ -166,6 +168,7 @@ async fn init_oracle_db(port: u16) -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -228,7 +231,7 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
             run_and_snapshot_query(
                 &rt,
                 r#"select 
-                    round("ID") as ID, 
+                    "ID"::BIGINT as ID,
                     "VAL_NUMBER", 
                     "VAL_DECIMAL", 
                     "VAL_FLOAT", 
@@ -268,6 +271,21 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
             )
             .await?;
 
+            // Sort pushdown: verify ORDER BY is pushed into the federated SQL and SortExec is removed
+            run_and_snapshot_query(
+                &rt,
+                r#"explain select "ID", "VAL_NUMBER", "VAL_VARCHAR2" from test_tbl order by "VAL_NUMBER" desc limit 2"#,
+                "sort_pushdown_plan",
+            )
+            .await?;
+
+            run_and_snapshot_query(
+                &rt,
+                r#"select "ID", "VAL_NUMBER", "VAL_VARCHAR2" from test_tbl order by "VAL_NUMBER" desc limit 2"#,
+                "sort_pushdown_result",
+            )
+            .await?;
+
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
                  e
@@ -281,6 +299,7 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn oracle_test_cloud_mtls() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     for env_var in [
         "ORACLE_CLOUD_CONNECTION_STRING",

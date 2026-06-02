@@ -1,0 +1,51 @@
+name: Setup ADBC BigQuery Driver
+description: 'Build and install the ADBC BigQuery driver from source'
+
+inputs:
+  adbc_bigquery_commit:
+    description: 'Git commit hash to build the driver from'
+    required: false
+    default: 'fe83ac26d43bffeaf28844bcf5fef303b1bdf345'
+  go_version:
+    description: 'Go version to use for building'
+    required: false
+    default: '1.24.1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+      with:
+        go-version: ${{ inputs.go_version }}
+        cache: false
+
+    - name: Ensure C compiler for cgo
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if ! command -v gcc &>/dev/null; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq gcc libc6-dev
+        fi
+
+    - name: Build ADBC BigQuery driver
+      shell: bash
+      run: |
+        set -eu
+        DRIVER_DIR="/etc/adbc/drivers"
+
+        git clone --depth=1 https://github.com/adbc-drivers/bigquery.git /tmp/adbc-bigquery
+        cd /tmp/adbc-bigquery
+        git fetch --depth=1 origin "${{ inputs.adbc_bigquery_commit }}"
+        git checkout "${{ inputs.adbc_bigquery_commit }}"
+        cd go
+        CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
+          -o /tmp/libadbc_driver_bigquery.so ./pkg/
+        rm -f /tmp/libadbc_driver_bigquery.h
+
+        sudo mkdir -p "${DRIVER_DIR}"
+        sudo cp /tmp/libadbc_driver_bigquery.so "${DRIVER_DIR}/"
+        printf '[Driver]\nshared = "%s/libadbc_driver_bigquery.so"\n' "${DRIVER_DIR}" | sudo tee "${DRIVER_DIR}/bigquery.toml"
+
+        echo "ADBC BigQuery driver installed to ${DRIVER_DIR}/libadbc_driver_bigquery.so"
+        rm -rf /tmp/adbc-bigquery /tmp/libadbc_driver_bigquery.so

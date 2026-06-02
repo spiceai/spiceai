@@ -76,19 +76,22 @@ pub enum Error {
         schema: Schema,
     },
 
-    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    #[snafu(display("Failed to process Debezium data: internal type conversion error"))]
     DowncastBuilder,
 
-    #[snafu(display("Unable to decode base64 string: {source}"))]
+    #[snafu(display("Invalid Debezium change event schema: {reason}"))]
+    InvalidChangeEventSchema { reason: &'static str },
+
+    #[snafu(display("Failed to decode base64-encoded column value: {source}"))]
     UnableToDecodeBase64 { source: base64::DecodeError },
 
     #[snafu(display("Decimal value is not 16 bytes. Got: {} bytes", value.len()))]
     Decimal128BytesNot16Bytes { value: Vec<u8> },
 
-    #[snafu(display("Unable to convert value to i64"))]
+    #[snafu(display("Failed to convert Debezium value to i64 integer"))]
     UnableToConvertToI64,
 
-    #[snafu(display("Unable to convert value to f64"))]
+    #[snafu(display("Failed to convert Debezium value to f64 floating point"))]
     UnableToConvertToF64,
 
     #[snafu(display("Timestamp type ({unit:?},{time_zone:?}) not supported yet",))]
@@ -112,6 +115,11 @@ pub enum Error {
     #[snafu(display("A deletion change was received without a 'before' field."))]
     DeleteOpWithoutBeforeField,
 
+    #[snafu(display(
+        "An update change without primary keys was received without a 'before' field. Configure Debezium to include the full before image for keyless updates."
+    ))]
+    UpdateOpWithoutBeforeField,
+
     #[snafu(display("Invalid decimal JSON: {reason}"))]
     InvalidDecimalJson { reason: String },
 
@@ -124,8 +132,8 @@ pub enum Error {
     #[snafu(display("Missing the `value` parameter for VariableScaleDecimal"))]
     MissingValueForVariableScaleDecimal,
 
-    #[snafu(display("VariableScaleDecimal expects either string or object"))]
-    UnsupportedTypeForVariableScaleDecimal,
+    #[snafu(display("VariableScaleDecimal expects either string or object, got: {actual_type}"))]
+    UnsupportedTypeForVariableScaleDecimal { actual_type: String },
 
     #[snafu(display("scale must be integer"))]
     NonIntegerScaleForVariableScaleDecimal,
@@ -161,14 +169,21 @@ pub fn append_value_to_struct_builder(
     builder: &mut StructBuilder,
 ) -> Result<()> {
     builder.append(true);
+    let null_value = serde_json::Value::Null;
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        let Some(field_value) = value.get(field.name()) else {
-            return MissingFieldInValueSnafu {
-                field_name: field.name().to_string(),
-                value,
+        // If the field is missing from the message (e.g. due to schema evolution),
+        // append null for nullable fields instead of failing.
+        let field_value = match value.get(field.name()) {
+            Some(v) => v,
+            None if field.is_nullable() => &null_value,
+            None => {
+                return MissingFieldInValueSnafu {
+                    field_name: field.name().clone(),
+                    value,
+                }
+                .fail();
             }
-            .fail();
         };
 
         let field_builder = builder.field_builder_array(idx);
@@ -179,8 +194,7 @@ pub fn append_value_to_struct_builder(
     Ok(())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::cast_possible_truncation)]
 fn append_field_value_to_builder(
     field_value: &serde_json::Value,
     field: &Arc<Field>,
@@ -214,7 +228,10 @@ fn append_field_value_to_builder(
         }
         DataType::Decimal128(_, scale) => {
             let decimal_builder = downcast_builder::<Decimal128Builder>(builder)?;
-            decimal_builder.append_value(convert_json_to_decimal(field_value, *scale)?);
+            match convert_json_to_decimal(field_value, *scale)? {
+                Some(val) => decimal_builder.append_value(val),
+                None => decimal_builder.append_null(),
+            }
         }
         DataType::Timestamp(unit, time_zone) => match (unit, time_zone) {
             (TimeUnit::Microsecond, None) => {
@@ -473,7 +490,7 @@ fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128> {
 /// Supported inputs:
 /// - JSON string: base64-encoded
 /// - JSON object: {"scale": <int>, "value": <base64>}
-pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
+pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128>> {
     if !(0..=38).contains(&target_scale) {
         return InvalidDecimalJsonSnafu {
             reason: "target_scale must be in 0..=38".to_string(),
@@ -482,10 +499,10 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
     }
 
     match v {
-        Json::String(s) => convert_string_to_decimal(s),
-
+        Json::Null => Ok(None),
+        Json::String(s) => Ok(Some(convert_string_to_decimal(s)?)),
         Json::Object(m) => {
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation)]
             let src_scale =
                 m.get("scale")
                     .context(MissingScaleForVariableScaleDecimalSnafu)?
@@ -499,10 +516,18 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<i128> {
 
             let unscaled = convert_string_to_decimal(value)?;
             let normalized = rescale_i128(unscaled, src_scale, target_scale)?;
-            Ok(normalized)
+            Ok(Some(normalized))
         }
-
-        _ => UnsupportedTypeForVariableScaleDecimalSnafu.fail(),
+        _ => {
+            let actual_type = match v {
+                Json::Null => "null",
+                Json::Bool(_) => "boolean",
+                Json::Number(_) => "number",
+                Json::Array(_) => "array",
+                _ => "unknown",
+            };
+            UnsupportedTypeForVariableScaleDecimalSnafu { actual_type }.fail()
+        }
     }
 }
 
@@ -607,7 +632,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), n);
+        assert_eq!(result.ok().flatten(), Some(n));
     }
 
     #[test]
@@ -615,7 +640,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
@@ -623,7 +648,7 @@ mod tests {
         let n: i128 = 12345;
         let input = json!({"scale": 2, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 4);
-        assert_eq!(result.expect("Parse decimal"), 1_234_500);
+        assert_eq!(result.ok().flatten(), Some(1_234_500));
     }
 
     #[test]
@@ -631,7 +656,7 @@ mod tests {
         let n: i128 = 1_234_500;
         let input = json!({"scale": 4, "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert_eq!(result.expect("Parse decimal"), 12_345);
+        assert_eq!(result.ok().flatten(), Some(12_345));
     }
 
     #[test]
@@ -639,7 +664,7 @@ mod tests {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, -1);
-        assert!(result.is_err());
+        result.expect_err("Should fail for too low target scale");
     }
 
     #[test]
@@ -647,7 +672,7 @@ mod tests {
         let n: i128 = 1;
         let input = json!(i128_to_base64(n));
         let result = convert_json_to_decimal(&input, 39);
-        assert!(result.is_err());
+        result.expect_err("Should fail for too high target scale");
     }
 
     #[test]
@@ -655,7 +680,7 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing scale");
     }
 
     #[test]
@@ -663,14 +688,14 @@ mod tests {
         let n: i128 = 12_345;
         let input = json!({"scale": "abc", "value": i128_to_base64(n)});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for non-integer scale");
     }
 
     #[test]
     fn test_object_missing_value() {
         let input = json!({"scale": 2});
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing value");
     }
 
     #[test]
@@ -678,6 +703,137 @@ mod tests {
         let n: i128 = 12345;
         let input = json!(n); // Not a string or object
         let result = convert_json_to_decimal(&input, 2);
-        assert!(result.is_err());
+        result.expect_err("Should fail for wrong JSON type");
+    }
+
+    #[test]
+    fn test_append_value_missing_nullable_field_fills_null() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with one required and one nullable field
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the nullable "name" field
+        let value = json!({"id": 42});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(
+            result.is_ok(),
+            "Should succeed when nullable field is missing"
+        );
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 42);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+    }
+
+    #[test]
+    fn test_append_value_missing_required_field_fails() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("status", DataType::Utf8, false), // not nullable
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message is missing the required "status" field
+        let value = json!({"id": 42});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(
+            result.is_err(),
+            "Should fail when required field is missing"
+        );
+    }
+
+    #[test]
+    fn test_append_value_extra_fields_ignored() {
+        use crate::arrow::struct_builder::StructBuilder;
+
+        // Schema only has "id"
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 1);
+
+        // Message has extra field "removed_column" not in schema
+        let value = json!({"id": 42, "removed_column": "old_value"});
+        let result = append_value_to_struct_builder(value, &mut builder);
+        assert!(result.is_ok(), "Extra fields in message should be ignored");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_append_value_multiple_missing_nullable_fields() {
+        use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
+
+        // Schema with multiple nullable fields added via schema evolution
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+
+        let mut builder = StructBuilder::from_fields(schema.fields().clone(), 2);
+
+        // Old message with only "id" (before schema evolution)
+        let old_value = json!({"id": 1});
+        append_value_to_struct_builder(old_value, &mut builder)
+            .expect("old message should process successfully");
+
+        // New message with all fields
+        let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
+        append_value_to_struct_builder(new_value, &mut builder)
+            .expect("new message should process successfully");
+
+        let struct_array = builder.finish();
+        let record_batch: RecordBatch = struct_array.into();
+        assert_eq!(record_batch.num_rows(), 2);
+
+        // First row: id=1, rest null
+        let id_col = record_batch
+            .column_by_name("id")
+            .expect("id column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("id column should be Int32Array");
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+
+        let name_col = record_batch
+            .column_by_name("name")
+            .expect("name column should exist")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("name column should be StringArray");
+        assert!(name_col.is_null(0));
+        assert_eq!(name_col.value(1), "Alice");
     }
 }

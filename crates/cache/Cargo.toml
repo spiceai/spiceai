@@ -2,7 +2,7 @@
 description = "Spice cache"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "cache"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,24 +11,45 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+async-compression = { version = "0.4", features = [
+    "tokio",
+    "zstd",
+], default-features = false }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 byte-unit.workspace = true
+bytes.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
-moka.workspace = true
+moka = { workspace = true, features = ["future"] }
 opentelemetry.workspace = true
+parking_lot.workspace = true
+pingora-lru = { workspace = true, optional = true }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
-twox-hash = { workspace = true, optional = true }
+twox-hash = { workspace = true }
 
 [dev-dependencies]
+blake3.workspace = true
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+rand.workspace = true
 rstest = "0.25.0"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+twox-hash = { workspace = true }
 
 [features]
 default = []
-xxhash = ["dep:twox-hash"]
+pingora = ["dep:pingora-lru"]
+
+[[bench]]
+harness = false
+name = "cache_throughput"
+
+[[bench]]
+harness = false
+name = "hash_algorithms"

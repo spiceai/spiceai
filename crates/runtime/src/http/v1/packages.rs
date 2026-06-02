@@ -23,6 +23,7 @@ use object_store::{ObjectStore, path::Path};
 use runtime_object_store::store::github::GitHubRawObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -74,6 +75,10 @@ pub struct GeneratePackageRequest {
     )
 ))]
 pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Response {
+    if let Some(response) = super::require_write_access().await {
+        return response;
+    }
+
     if !payload.from.starts_with("github:") {
         return (
             StatusCode::BAD_REQUEST,
@@ -99,7 +104,8 @@ pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Res
 
     let github_token = payload.params.get("github_token").map(String::as_str);
 
-    let store = match GitHubRawObjectStore::try_new(org, repo, sha, github_token) {
+    let store = match GitHubRawObjectStore::try_new(org, repo, sha, github_token, Handle::current())
+    {
         Ok(store) => Arc::new(store) as Arc<dyn ObjectStore>,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();

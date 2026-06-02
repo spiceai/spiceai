@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::error::{InvalidFilterSnafu, InvalidValueTypeSnafu, Result};
 use crate::filter::{FieldOperation, FilterExpression, LogicalOperation, MetadataFilter, Operator};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, Operator as DFOperator, binary_expr, col, lit};
 use datafusion::prelude::{and, or};
@@ -35,12 +36,38 @@ pub fn convert_to_datafusion_expr(filter: &MetadataFilter) -> Result<Expr> {
 /// Checks that an arbitrary [`Expr`] can be successfully converted to a [`MetadataFilter`] and that all columns referenced are within `columns`.
 #[must_use]
 pub fn supports_filter_expr(columns: &[String], filter: &Expr) -> bool {
-    match filter {
-        Expr::BinaryExpr(binary) => supports_binary_expr(columns, binary),
-        Expr::IsNull(expr) | Expr::IsNotNull(expr) => supports_column_ref(columns, expr),
-        Expr::InList(in_list) => supports_in_list(columns, in_list),
-        _ => false, // Unsupported expression type
-    }
+    let mut supported = true;
+    let _ = filter.apply(|e| {
+        let leaf_ok = match e {
+            Expr::BinaryExpr(binary) => match binary.op {
+                DFOperator::And | DFOperator::Or => {
+                    // Recurse into children to validate sub-expressions.
+                    return Ok(TreeNodeRecursion::Continue);
+                }
+                DFOperator::Eq
+                | DFOperator::NotEq
+                | DFOperator::Lt
+                | DFOperator::LtEq
+                | DFOperator::Gt
+                | DFOperator::GtEq => {
+                    supports_column_ref(columns, &binary.left) && is_literal(&binary.right)
+                }
+                _ => false,
+            },
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => supports_column_ref(columns, inner),
+            Expr::InList(in_list) => supports_in_list(columns, in_list),
+            _ => false,
+        };
+
+        if leaf_ok {
+            // Comparison/IS NULL/IN-list leaves are fully validated; skip their children.
+            Ok(TreeNodeRecursion::Jump)
+        } else {
+            supported = false;
+            Ok(TreeNodeRecursion::Stop)
+        }
+    });
+    supported
 }
 
 /// Converts `DataFusion` Expr filters to S3 Vectors API filter format.
@@ -83,29 +110,6 @@ pub fn convert_datafusion_filters_to_s3_vectors(
         Ok(Some(MetadataFilter::Complex(FilterExpression::Logical(
             logical_op,
         ))))
-    }
-}
-
-/// Checks if a binary expression is supported
-fn supports_binary_expr(columns: &[String], binary: &datafusion::logical_expr::BinaryExpr) -> bool {
-    use datafusion::logical_expr::Operator;
-
-    match binary.op {
-        Operator::And | Operator::Or => {
-            // Logical operators - check both sides
-            supports_filter_expr(columns, &binary.left)
-                && supports_filter_expr(columns, &binary.right)
-        }
-        Operator::Eq
-        | Operator::NotEq
-        | Operator::Lt
-        | Operator::LtEq
-        | Operator::Gt
-        | Operator::GtEq => {
-            // Comparison operators - check left is column and right is literal
-            supports_column_ref(columns, &binary.left) && is_literal(&binary.right)
-        }
-        _ => false, // Unsupported operator
     }
 }
 
@@ -593,7 +597,6 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn test_valid_datafusion_expressions() {
         let columns = vec![
             "genre".to_string(),
@@ -704,7 +707,7 @@ mod tests {
             let result = convert_datafusion_filters_to_s3_vectors(&[expr])
                 .expect("Failed to convert DataFusion filters to S3 Vectors filters");
             if let Some(filter) = result {
-                assert!(filter.validate().is_ok());
+                filter.validate().expect("Should be a valid filter");
 
                 let json_result = filter.to_json().expect("Failed to convert filter to JSON");
                 let parsed_value: serde_json::Value =

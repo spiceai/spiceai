@@ -1,9 +1,9 @@
 [package]
-name = "runtime-datafusion-udfs"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
+name = "runtime-datafusion-udfs"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -11,24 +11,45 @@ version.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+arrow-ipc = { workspace = true, optional = true }
+arrow-json.workspace = true
 arrow-schema.workspace = true
 async-openai.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
+datafusion-datasource.workspace = true
 futures.workspace = true
-llms = { path = "../llms" }
+blake3 = { workspace = true, optional = true }
+llms = { path = "../llms", default-features = false, optional = true }
+reqwest = { workspace = true, optional = true }
+runtime-auth = { path = "../runtime-auth", optional = true }
+runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
+opentelemetry.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+simsimd = "6.5"
 snafu.workspace = true
+spicepod = { path = "../spicepod", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
-tract-core = "0.22.0"
-once_cell = "1.21.3"
-runtime-request-context = {path="../runtime-request-context"}
+url = { workspace = true, optional = true }
+util = { path = "../util" }
+wasmtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-stream.workspace = true
+axum.workspace = true
+governor.workspace = true
 insta.workspace = true
-tracing-test = "0.2"
 tracing-subscriber.workspace = true
+tracing-test = "0.2"
+tempfile.workspace = true
+wat.workspace = true
 
 [features]
-models = []
+default = []
+http-functions = ["dep:reqwest", "dep:runtime-auth", "dep:url"]
+models = ["dep:llms"]
+wasm-functions = ["dep:arrow-ipc", "dep:wasmtime"]
+wasm-functions-compile = ["wasm-functions", "dep:blake3"]

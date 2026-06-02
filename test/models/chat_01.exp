@@ -1,7 +1,7 @@
 #!/usr/bin/expect -f
 
 # Runtime response timeout
-set timeout 30:
+set timeout 30
 
 spawn spice chat
 
@@ -77,7 +77,10 @@ proc verify_num_issues {} {
 proc verify_catalog_page {} {
     global timeout
 
-    send "find top 3 exclusive deals in catalog pages\r"
+    set original_timeout $timeout
+    set timeout 60
+
+    send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
         " ERROR " {
@@ -94,6 +97,8 @@ proc verify_catalog_page {} {
             exit 1
         }
     }
+
+    set timeout $original_timeout
 
     send_user "Model returned expected response\n"
 }

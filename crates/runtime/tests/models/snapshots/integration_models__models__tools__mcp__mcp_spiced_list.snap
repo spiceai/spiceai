@@ -4,67 +4,17 @@ expression: tools_list
 ---
 [
   {
-    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "search",
-    "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "additional_columns": {
-          "default": [],
-          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "datasets": {
-          "default": null,
-          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "limit": {
-          "default": null,
-          "description": "Number of documents to return for each dataset",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "text": {
-          "description": "The text to search documents for similarity",
-          "type": "string"
-        },
-        "where": {
-          "default": null,
-          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "title": "SearchRequestBaseJson",
-      "type": "object"
-    }
+    "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
+    "name": "get_current_datetime",
+    "parameters": null
   },
   {
-    "description": "Get the readiness status of the Spice.ai runtime",
+    "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').",
     "name": "get_readiness",
     "parameters": null
   },
   {
-    "description": "List available datasets",
+    "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
     "name": "list_datasets",
     "parameters": null
   },
@@ -75,8 +25,22 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "last": {
-          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
           "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum number of memories to return.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Number of memories to skip for pagination.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -87,62 +51,18 @@ expression: tools_list
     }
   },
   {
-    "description": "Search Spice.ai datasets using Vector Similarity Search (VSS)",
-    "name": "mcp_from_spiced/search",
+    "description": "Return the current UTC date and time as an ISO 8601 timestamp. Call this whenever the model needs the actual current time to compute relative durations, evaluate freshness, or stamp generated content; do not guess or rely on training-data dates. Takes no arguments. Returns a string like '2026-05-06T13:45:00Z'.",
+    "name": "mcp_from_spiced/get_current_datetime",
     "parameters": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "additional_columns": {
-          "default": [],
-          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "datasets": {
-          "default": null,
-          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "limit": {
-          "default": null,
-          "description": "Number of documents to return for each dataset",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "text": {
-          "description": "The text to search documents for similarity",
-          "type": "string"
-        },
-        "where": {
-          "default": null,
-          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "title": "SearchRequestBaseJson",
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {},
+      "required": [],
+      "title": "empty",
       "type": "object"
     }
   },
   {
-    "description": "Get the readiness status of the Spice.ai runtime",
+    "description": "Report the readiness state of every Spice runtime component (datasets, accelerators, models, embeddings, catalogs). Call this when diagnosing why a query, model, or search call is failing or returning empty results, or to verify the runtime is healthy before issuing other tool calls. Takes no arguments. Returns a JSON object mapping component name to status (e.g. 'Ready', 'Initializing', 'Error').",
     "name": "mcp_from_spiced/get_readiness",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -153,7 +73,7 @@ expression: tools_list
     }
   },
   {
-    "description": "List available datasets",
+    "description": "List every dataset, view, and catalog visible to this runtime, with each entry's fully-qualified table name, description, columns, and capability flags (e.g. `can_search_documents`). Call this first whenever you need to discover what data is available before issuing `sql`, `search`, `table_schema`, or sample tools. Takes no arguments. Returns a JSON array; use the `table` field as the identifier for follow-up tool calls.",
     "name": "mcp_from_spiced/list_datasets",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -170,8 +90,22 @@ expression: tools_list
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "last": {
-          "description": "Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: \"1h\", \"2m30s\".",
+          "description": "Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. \"1h\", \"2m30s\".",
           "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum number of memories to return.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Number of memories to skip for pagination.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -242,13 +176,68 @@ expression: tools_list
     }
   },
   {
-    "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
+    "description": "Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.",
+    "name": "mcp_from_spiced/search",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "SearchRequestBaseJson",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
     "name": "mcp_from_spiced/sql",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "query": {
-          "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
           "type": "string"
         }
       },
@@ -281,7 +270,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Get the schema of the Spice.ai dataset",
+    "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
     "name": "mcp_from_spiced/table_schema",
     "parameters": {
       "$defs": {
@@ -407,13 +396,68 @@ expression: tools_list
     }
   },
   {
-    "description": "Execute SQL queries (PostgreSQL dialect) using the Spice.ai runtime",
+    "description": "Run a hybrid (vector + keyword) similarity search over datasets configured with embeddings. Use this for natural-language or semantic lookups (e.g. 'find documents about X') instead of exact SQL filtering. Provide `text` for the query; optionally restrict with `datasets` (only datasets whose `can_search_documents=true` in `list_datasets` are valid), `where_cond` (a SQL predicate without the `WHERE` keyword), `additional_columns`, and `limit`. Returns matched rows grouped per dataset with similarity scores.",
+    "name": "search",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "additional_columns": {
+          "default": [],
+          "description": "Additional columns to return from the dataset. If the column is a primary key, it will be\n returned within the response under `.primary_key`, not `.data`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "datasets": {
+          "default": null,
+          "description": "The datasets to search for similarity. If None, search across all datasets. For available datasets, use the `list_datasets` tool and ensure `can_search_documents==true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Number of documents to return for each dataset",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "The text to search documents for similarity",
+          "type": "string"
+        },
+        "where": {
+          "default": null,
+          "description": "An SQL filter predicate to apply. Format: 'WHERE `where_cond`'.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "SearchRequestBaseJson",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Execute an SQL query in the Spice.ai SQL Dialect (DataFusion SQL using PostgreSQL-dialect with Spice.ai functions) against the Spice runtime and return the result rows as JSON. Use this for any deterministic lookup, aggregation, or filter where exact column names are known; prefer `search` for semantic or natural-language lookups. Quote identifiers containing capitals or reserved keywords, and quote each part of `catalog.schema.table` separately (e.g. \"spice\".\"public\".\"my_table\"). Avoid `SELECT *` and columns ending in `_offset` or `_embedding`. Write statements (INSERT/UPDATE/DELETE/DDL) require the request to be authenticated with a ReadWrite API key AND the target dataset to be configured `access: read_write`; otherwise they are rejected. Use `list_datasets` and `table_schema` first to discover tables and columns.",
     "name": "sql",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
         "query": {
-          "description": "The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query",
+          "description": "The SQL query to run, written in the Spice.ai SQL Dialect (`DataFusion` SQL using PostgreSQL-dialect with Spice.ai functions). Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query.",
           "type": "string"
         }
       },
@@ -446,7 +490,7 @@ expression: tools_list
     }
   },
   {
-    "description": "Get the schema of the Spice.ai dataset",
+    "description": "Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).",
     "name": "table_schema",
     "parameters": {
       "$defs": {

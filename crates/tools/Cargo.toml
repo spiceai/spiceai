@@ -3,7 +3,7 @@ description = "Tools for the Spice runtime"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "tools"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,6 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-reqwest.workspace = true
 rmcp = { workspace = true, optional = true }
 serde_json.workspace = true
 [features]

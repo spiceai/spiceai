@@ -19,7 +19,9 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Check for existing PR
         id: check_pr
@@ -38,9 +40,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust stable
+      - name: Install Rust 1.94.1
         if: steps.check_pr.outputs.skip != 'true'
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
+
+      - name: Set up make
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
+        uses: ./.github/actions/setup-cc
 
       - name: Build Cargo project
         if: steps.check_pr.outputs.skip != 'true'
@@ -63,7 +73,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openapi.json
           path: .schema/openapi.json
@@ -80,7 +90,7 @@ jobs:
           else
             git add .schema/openapi.json
             git commit -m "Update openapi.json"
-            git push origin openapi/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:openapi/${GITHUB_RUN_ID}
             gh pr create \
               --title "Update openapi.json" \
               --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \

@@ -1,0 +1,11 @@
+---
+source: crates/cayenne/src/optimizer_rules.rs
+expression: plan_snapshot(&optimized)
+---
+HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(top_id@0, nested_left_id@0)]
+  DataSourceExec: file_groups={1 group: [[top.vortex]]}, projection=[top_id], file_type=test
+  HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=ExactLeftAccumulator, on=[(nested_left_id@0, nested_right_id@0)]
+    CayenneAccelerationExec
+      DataSourceExec: file_groups={1 group: [[nested-left.vortex]]}, projection=[nested_left_id], file_type=test
+    CayenneAccelerationExec
+      DataSourceExec: file_groups={1 group: [[nested-right.vortex]]}, projection=[nested_right_id], file_type=test

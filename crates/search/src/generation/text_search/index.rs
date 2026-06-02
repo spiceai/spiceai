@@ -29,7 +29,7 @@ use runtime_datafusion_index::Index;
 use snafu::ResultExt;
 use tantivy::schema::{DocParsingError, SchemaBuilder};
 use tantivy::{TantivyDocument, TantivyError};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use crate::aggregation::write_to_json_string;
 use crate::generation::text_search::query::FullTextSearchQuery;
@@ -41,8 +41,10 @@ use crate::generation::text_search::{
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
 
-/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
-pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
+/// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
+/// A larger budget reduces the number of segment flushes and subsequent merges,
+/// significantly improving bulk-indexing throughput.
+pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 #[derive(Clone)]
@@ -50,7 +52,9 @@ pub struct FullTextDatabaseIndex {
     pub search_fields: Vec<String>,
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
-    pub index: Arc<RwLock<tantivy::Index>>,
+
+    pub writer: Arc<Mutex<tantivy::IndexWriter>>,
+    pub reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for FullTextDatabaseIndex {
@@ -120,12 +124,17 @@ impl FullTextDatabaseIndex {
         } else {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
+        let reader = index.reader().context(TextSearchIndexingSnafu)?;
+        let writer = index
+            .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+            .context(IndexCreationSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
-            index: Arc::new(RwLock::new(index)),
+            writer: Arc::new(Mutex::new(writer)),
             primary_key: pks,
+            reader,
         })
     }
 
@@ -156,13 +165,8 @@ impl FullTextDatabaseIndex {
         &self,
         search_field: &str,
     ) -> Result<FullTextSearchFieldIndex, super::Error> {
-        let index_read = self
-            .index
-            .try_read()
-            .map_err(|_| super::Error::TemporarilyFailedToAccessSearchIndex {})?;
-
         let mut search_index = FullTextSearchFieldIndex::try_new(
-            &index_read,
+            self.reader.searcher(),
             search_field.to_string(),
             self.primary_key.clone(),
         )?;
@@ -232,30 +236,43 @@ impl FullTextDatabaseIndex {
             rb.to_vec()
         };
 
-        let index_writable = self.index.write().await;
         // Updates in tantivy are a deletion then insertion.
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
-
-        // Deletion.
-        for t in self.existing_terms_to_delete(&index_writable.schema(), &rb)? {
-            index_writer.delete_term(t);
-        }
-
-        // Insertion.
+        // Prepare documents to insert/delete with read lock.
+        let index_schema = self.reader.searcher().schema().clone();
+        let terms_to_delete = self.existing_terms_to_delete(&index_schema, &rb)?;
         let doc_json = write_to_json_string(&rb).context(InvalidIndexingSnafu {
             context: "Failed to write data to intermediate JSON string for indexing".to_string(),
         })?;
-        let docs = parse_json_array(&index_writable.schema(), doc_json.as_str())
+        let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        for doc in docs {
-            index_writer.add_document(doc).context(IndexCreationSnafu)?;
+
+        let mut index_writer = self.writer.lock().await;
+        // Deletion.
+        for t in terms_to_delete {
+            index_writer.delete_term(t);
         }
-        index_writer
-            .commit()
-            .context(FailedToInsertDataIntoIndexSnafu)?;
-        Ok(())
+        // Insertion and commit. On failure, rollback to discard staged operations
+        // so they don't leak into the next batch's commit.
+        let commit_result = (|| {
+            for doc in docs {
+                index_writer.add_document(doc).context(IndexCreationSnafu)?;
+            }
+            index_writer
+                .commit()
+                .context(FailedToInsertDataIntoIndexSnafu)
+        })();
+        if let Err(e) = &commit_result {
+            tracing::warn!("Rolling back index writer after failed commit: {e}");
+            if let Err(rb_err) = index_writer.rollback() {
+                tracing::error!("Failed to rollback index writer: {rb_err}");
+            }
+        }
+        drop(index_writer);
+        commit_result?;
+
+        self.reader.reload().boxed().context(InvalidIndexingSnafu {
+            context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
+        })
     }
 
     #[must_use]
@@ -276,8 +293,9 @@ impl FullTextDatabaseIndex {
         Self {
             search_fields: self.search_fields.clone(),
             primary_key: self.primary_key.clone(),
-            index: Arc::clone(&self.index),
+            writer: Arc::clone(&self.writer),
             base_table,
+            reader: self.reader.clone(),
         }
     }
 
@@ -462,55 +480,296 @@ fn parse_json_array(
 mod tests {
 
     use super::*;
-    use arrow::{
-        array::{Int32Array, StringArray},
-        datatypes::{DataType, Field, Schema},
-    };
+    use arrow::{array::record_batch, util::pretty::pretty_format_batches};
+    use arrow_schema::{ArrowError, Schema};
     use datafusion::datasource::{MemTable, TableProvider};
+    use futures::{StreamExt, TryStreamExt};
     use runtime_datafusion_index::Index;
 
+    /// Create a basic [`MemTable`] with fields: `id`, `content`.
     fn create_test_table() -> Arc<dyn TableProvider> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("content", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec![
-                    "test content 1",
-                    "test content 2",
-                    "test content 3",
-                ])),
-            ],
+        let batch = record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            (
+                "content",
+                Utf8,
+                ["test content 1", "test content 2", "test content 3"]
+            )
         )
         .expect("Failed to create test batch");
 
-        Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("Failed to create test table"))
+        Arc::new(
+            MemTable::try_new(batch.schema(), vec![vec![batch]])
+                .expect("Failed to create test table"),
+        )
+    }
+
+    /// Returns a [`RecordBatch`] where the fields are sorted into alphabetical order.
+    ///
+    /// An error is returned only if [`RecordBatch::try_new`] returns an error (which it should not).
+    fn sort_columns_alphabetically(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let mut fields_with_indices: Vec<(usize, Field)> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| (idx, field.as_ref().clone()))
+            .collect();
+
+        fields_with_indices.sort_by(|a, b| a.1.name().cmp(b.1.name()));
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(
+                fields_with_indices
+                    .iter()
+                    .map(|(_, field)| field.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            fields_with_indices
+                .iter()
+                .map(|(original_idx, _)| Arc::clone(batch.column(*original_idx)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    async fn search_and_format(idx: &FullTextSearchFieldIndex, query: impl Into<String>) -> String {
+        let rb: Vec<RecordBatch> = idx
+            .search(query.into(), &[], 1000)
+            .await
+            .expect("Failed to search")
+            .map(|res| match res {
+                Ok(rb) => sort_columns_alphabetically(&rb)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None)),
+                Err(e) => Err(e),
+            })
+            .try_collect()
+            .await
+            .expect("Failed to collect search results");
+
+        format!("{}", pretty_format_batches(&rb).expect("failed to format"))
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index() {
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Use distinct content so each document is independently verifiable.
+        index
+            .compute_index(vec![
+                record_batch!(
+                    ("id", Int32, [1, 2, 3]),
+                    (
+                        "content",
+                        Utf8,
+                        [
+                            "apple banana cherry",
+                            "dog elephant frog",
+                            "guitar harmonica instrument"
+                        ]
+                    )
+                )
+                .expect("Failed to create test batch"),
+            ])
+            .await
+            .expect("failed to compute_index");
+
+        // All three documents are indexed
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(
+                "initial_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "initial_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+            insta::assert_snapshot!(
+                "initial_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
+        }
+
+        // Overwrite id=1 and id=3 with new content
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id", Int32, [1, 3]),
+                        (
+                            "content",
+                            Utf8,
+                            ["mango nectarine orange", "piano quartet rhythm"]
+                        )
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            // Old content for id=1 and id=3 should be gone (expects empty results).
+            insta::assert_snapshot!(
+                "after_update_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "after_update_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
+
+            // id=2 unchanged.
+            insta::assert_snapshot!(
+                "after_update_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+
+            // New content is searchable.
+            insta::assert_snapshot!(
+                "after_update_mango",
+                search_and_format(&search_index, "mango").await
+            );
+            insta::assert_snapshot!(
+                "after_update_piano",
+                search_and_format(&search_index, "piano").await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_updates_overwrites_on_compute_index_composite_pk() {
+        let batch = record_batch!(
+            ("id1", Utf8, ["a", "a", "b"]),
+            ("id2", Int32, [1, 2, 1]),
+            (
+                "content",
+                Utf8,
+                [
+                    "apple banana cherry",
+                    "dog elephant frog",
+                    "guitar harmonica instrument"
+                ]
+            )
+        )
+        .expect("Failed to create test batch");
+
+        let index = FullTextDatabaseIndex::try_new(
+            Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
+                    .expect("Failed to create test table"),
+            ),
+            vec!["content".to_string()],
+            Some(vec!["id1".to_string(), "id2".to_string()]),
+            None,
+            &["content".to_string()],
+        )
+        .expect("Failed to create FullTextDatabaseIndex");
+
+        // Initial table
+        index
+            .compute_index(vec![batch])
+            .await
+            .expect("failed to compute_index");
+
+        // All three documents are indexed
+        {
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            insta::assert_snapshot!(
+                "cpk_initial_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "cpk_initial_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+            insta::assert_snapshot!(
+                "cpk_initial_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
+        }
+
+        // Overwrite (a,1) and (b,1) with new content
+        {
+            index
+                .compute_index(vec![
+                    record_batch!(
+                        ("id1", Utf8, ["a", "b"]),
+                        ("id2", Int32, [1, 1]),
+                        (
+                            "content",
+                            Utf8,
+                            ["mango nectarine orange", "piano quartet rhythm"]
+                        )
+                    )
+                    .expect("Failed to create test record_batch"),
+                ])
+                .await
+                .expect("failed to compute_index");
+
+            let search_index = index
+                .full_text_search_field_index("content")
+                .expect("Failed to create FullTextSearchFieldIndex");
+
+            // Old content for (a,1) and (b,1) should be gone (expects empty results).
+            insta::assert_snapshot!(
+                "cpk_after_update_apple",
+                search_and_format(&search_index, "apple").await
+            );
+            insta::assert_snapshot!(
+                "cpk_after_update_guitar",
+                search_and_format(&search_index, "guitar").await
+            );
+
+            // (a,2) unchanged.
+            insta::assert_snapshot!(
+                "cpk_after_update_elephant",
+                search_and_format(&search_index, "elephant").await
+            );
+
+            // New content is searchable.
+            insta::assert_snapshot!(
+                "cpk_after_update_mango",
+                search_and_format(&search_index, "mango").await
+            );
+            insta::assert_snapshot!(
+                "cpk_after_update_piano",
+                search_and_format(&search_index, "piano").await
+            );
+        }
     }
 
     #[tokio::test]
     async fn test_compute_index_returns_batches_unchanged() {
-        let table = create_test_table();
-        let search_fields = vec!["content".to_string()];
-        let primary_key = Some(vec!["id".to_string()]);
-
-        let index = FullTextDatabaseIndex::try_new(table, search_fields, primary_key, None, &[])
-            .expect("Failed to create index");
-
-        let input_batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("content", DataType::Utf8, false),
-            ])),
-            vec![
-                Arc::new(Int32Array::from(vec![4, 5])),
-                Arc::new(StringArray::from(vec!["new content 1", "new content 2"])),
-            ],
+        let index = FullTextDatabaseIndex::try_new(
+            create_test_table(),
+            vec!["content".to_string()],
+            Some(vec!["id".to_string()]),
+            None,
+            &[],
         )
-        .expect("Failed to create input batch");
+        .expect("Failed to create index");
+
+        let input_batch = record_batch!(
+            ("id", Int32, [4, 5]),
+            ("content", Utf8, ["new content 1", "new content 2"])
+        )
+        .expect("Failed to create test batch");
 
         let input_batches = vec![input_batch.clone()];
         let result_batches = index

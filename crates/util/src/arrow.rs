@@ -49,7 +49,7 @@ macro_rules! convert_string_arrow_to_iterator {
 /// # Errors
 ///
 /// This function will return an [`ArrowError`] if `arr` and `repeats` are unequal.
-#[allow(clippy::checked_conversions, clippy::cast_possible_truncation)]
+#[expect(clippy::checked_conversions, clippy::cast_possible_truncation)]
 pub fn repeat(arr: &ArrayRef, repeats: &[usize]) -> Result<ArrayRef, ArrowError> {
     let len = arr.len();
     if repeats.len() != len {

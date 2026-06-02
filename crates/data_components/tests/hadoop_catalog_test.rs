@@ -27,10 +27,12 @@ use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuil
 use futures::TryStreamExt;
 use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
 use iceberg::{Catalog, NamespaceIdent};
+use iceberg_storage_opendal::OpenDalStorageFactory;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::docker::DockerCompose;
 #[cfg(feature = "test_hadoop_catalog_docker")]
 use iceberg_test_utils::normalize_test_name;
+use opendal::Configurator;
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 const MINIO_PORT: u16 = 9000;
@@ -39,11 +41,21 @@ const MINIO_PORT: u16 = 9000;
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
+#[expect(clippy::expect_used)]
 fn get_file_hadoop_catalog() -> HadoopCatalogBuilder {
-    HadoopCatalogBuilder::default().with_warehouse_root("file:///tmp/hadoop_warehouse")
+    let mut fs_config = opendal::services::FsConfig::default();
+    fs_config.root = Some("/tmp/hadoop_warehouse".to_string());
+    let operator = opendal::Operator::new(fs_config.into_builder())
+        .expect("Should build FS operator")
+        .finish();
+
+    HadoopCatalogBuilder::default()
+        .with_warehouse_root("file:///tmp/hadoop_warehouse")
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+        .with_operator(operator)
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     #[cfg(not(feature = "test_hadoop_catalog_docker"))]
     let minio_endpoint = std::env::var("MINIO_ENDPOINT")
@@ -63,8 +75,79 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
     let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
 
+    let mut s3_config = opendal::services::S3Config::default();
+    s3_config.bucket = "hadoop".to_string();
+    s3_config.root = Some("/".to_string());
+    s3_config.endpoint = Some(minio_endpoint.clone());
+    s3_config.region = Some("us-east-1".to_string());
+    s3_config.access_key_id = Some(access_key.clone());
+    s3_config.secret_access_key = Some(secret_key.clone());
+
+    let operator = opendal::Operator::new(s3_config.into_builder())
+        .expect("Should build S3 operator")
+        .finish();
+
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3a".to_string(),
+            customized_credential_load: None,
+        }))
+        .with_operator(operator)
+        .set_property(S3_REGION, "us-east-1")
+        .set_property(S3_ENDPOINT, minio_endpoint)
+        .set_property(S3_ACCESS_KEY_ID, access_key)
+        .set_property(S3_SECRET_ACCESS_KEY, secret_key)
+}
+
+/// Regression test helper for scheme inference: configures the warehouse root
+/// as `s3://hadoop/` while the underlying table metadata uses `s3a://hadoop/`.
+///
+/// Uses `with_storage_factory_builder` so that when the Hadoop catalog infers the
+/// `s3a` scheme from the metadata locations, the storage factory is rebuilt with
+/// `configured_scheme: "s3a"`. Without this rebuild, the rebuilt `FileIO` would
+/// reject `s3a://...` paths because the original factory was configured for `s3`.
+#[expect(clippy::expect_used)]
+fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
+    #[cfg(not(feature = "test_hadoop_catalog_docker"))]
+    let minio_endpoint = std::env::var("MINIO_ENDPOINT")
+        .expect("Should have MINIO_ENDPOINT environment variable set");
+
+    #[cfg(feature = "test_hadoop_catalog_docker")]
+    let minio_endpoint = {
+        let guard = DOCKER_COMPOSE_ENV
+            .read()
+            .expect("Should acquire read lock on DOCKER_COMPOSE_ENV");
+        let docker_compose = guard.as_ref().expect("Should have DockerCompose instance");
+        let minio_ip = docker_compose.get_container_ip("minio");
+        let minio_socket_addr = SocketAddr::new(minio_ip, MINIO_PORT);
+        format!("http://{minio_socket_addr}")
+    };
+
+    let access_key = std::env::var("MINIO_ACCESS_KEY_ID").unwrap_or("admin".to_string());
+    let secret_key = std::env::var("MINIO_SECRET_ACCESS_KEY").unwrap_or("password".to_string());
+
+    let mut s3_config = opendal::services::S3Config::default();
+    s3_config.bucket = "hadoop".to_string();
+    s3_config.root = Some("/".to_string());
+    s3_config.endpoint = Some(minio_endpoint.clone());
+    s3_config.region = Some("us-east-1".to_string());
+    s3_config.access_key_id = Some(access_key.clone());
+    s3_config.secret_access_key = Some(secret_key.clone());
+
+    let operator = opendal::Operator::new(s3_config.into_builder())
+        .expect("Should build S3 operator")
+        .finish();
+
+    HadoopCatalogBuilder::default()
+        .with_warehouse_root("s3://hadoop/")
+        .with_storage_factory_builder(|scheme| {
+            Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: scheme.to_string(),
+                customized_credential_load: None,
+            })
+        })
+        .with_operator(operator)
         .set_property(S3_REGION, "us-east-1")
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
@@ -73,7 +156,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 #[ctor]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn before_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -89,7 +172,7 @@ fn before_all() {
 
 #[cfg(feature = "test_hadoop_catalog_docker")]
 #[dtor]
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn after_all() {
     let mut guard = DOCKER_COMPOSE_ENV
         .write()
@@ -100,7 +183,7 @@ fn after_all() {
     }
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
     vec![
         #[cfg(feature = "test_hadoop_catalog_docker")]
@@ -117,6 +200,13 @@ async fn build_catalogs() -> Vec<(&'static str, HadoopCatalog)> {
                 .build()
                 .await
                 .expect("Should build S3A catalog"),
+        ),
+        (
+            "s3-to-s3a-inferred",
+            get_s3_to_s3a_inferred_hadoop_catalog()
+                .build()
+                .await
+                .expect("Should build S3-to-S3A inferred catalog (regression test for scheme inference rebuilding the storage factory)"),
         ),
     ]
 }
@@ -313,7 +403,7 @@ mod tests {
         }
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     async fn load_table_and_check_results(
         namespace: NamespaceIdent,
         catalog: &HadoopCatalog,

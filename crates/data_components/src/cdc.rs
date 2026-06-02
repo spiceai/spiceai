@@ -22,14 +22,35 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use arrow_buffer::OffsetBuffer;
+use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
+///
+/// # Readiness contract
+///
+/// It is the responsibility of each connector implementation to indicate when
+/// the dataset can be considered ready for queries by producing at least one
+/// [`ChangeEnvelope`] with [`ChangeEnvelope::is_dataset_ready`] returning
+/// `true`. The runtime treats the dataset as not ready and rejects queries
+/// (with `AccelerationNotReady`) until that signal arrives.
+///
+/// Connectors MUST emit a ready signal even when the source has no new data
+/// (e.g. on restart with an already-populated accelerator, or against a quiet
+/// topic). For sources that may stay quiet indefinitely, use
+/// [`build_ready_signal_envelope`] to emit a zero-row, no-op envelope as soon
+/// as the connector determines it has caught up to the source (for example,
+/// when Kafka consumer lag reaches zero, or when a Postgres logical
+/// replication slot resumes from an existing position).
+///
+/// Failing to honor this contract causes the runtime to wait for an event
+/// that may never arrive — see <https://github.com/spiceai/spiceai/issues/5201>.
 pub type ChangesStream = BoxStream<'static, Result<ChangeEnvelope, StreamError>>;
 
 #[derive(Debug, Snafu)]
 pub enum CommitError {
-    #[snafu(display("Unable to commit change: {source}"))]
+    #[snafu(display("Failed to commit CDC change to dataset: {source}"))]
     UnableToCommitChange {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -39,7 +60,7 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
-    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    #[snafu(display("Failed to process change data capture update: {source}"))]
     Arrow { source: ArrowError },
 }
 
@@ -56,6 +77,12 @@ pub enum StreamError {
     Arrow(String),
     /// External error not originating from `ChangesStream` core logic, such as index processing failure.
     External(String),
+    #[cfg(feature = "dynamodb")]
+    /// Error from `DynamoDB`, such as failure during streaming or subscription.
+    DynamoDB(crate::dynamodb::stream::StreamError),
+    #[cfg(feature = "mongodb")]
+    /// Error from `MongoDB`, such as failure during change stream processing.
+    MongoDB(crate::mongodb::stream::StreamError),
 }
 
 impl std::error::Error for StreamError {}
@@ -69,48 +96,128 @@ impl std::fmt::Display for StreamError {
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
             StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
             StreamError::External(e) => write!(f, "External error: {e}"),
+            #[cfg(feature = "dynamodb")]
+            StreamError::DynamoDB(e) => write!(f, "DynamoDB error: {e}"),
+            #[cfg(feature = "mongodb")]
+            StreamError::MongoDB(e) => write!(f, "MongoDB error: {e}"),
         }
     }
 }
 
 /// Allows to commit a change that has been processed.
+#[async_trait]
 pub trait CommitChange {
-    fn commit(&self) -> Result<(), CommitError>;
+    async fn commit(&self) -> Result<(), CommitError>;
 }
 
 pub struct ChangeEnvelope {
-    change_committer: Box<dyn CommitChange + Send>,
+    change_committer: Box<dyn CommitChange + Send + Sync>,
     pub change_batch: ChangeBatch,
+    is_dataset_ready: bool,
 }
 
 impl ChangeEnvelope {
     #[must_use]
-    pub fn new(change_committer: Box<dyn CommitChange + Send>, change_batch: ChangeBatch) -> Self {
-        Self {
-            change_committer,
-            change_batch,
-        }
-    }
-
-    pub fn commit(self) -> Result<(), CommitError> {
-        self.change_committer.commit()
-    }
-
-    #[must_use]
-    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
-        (self.change_committer, self.change_batch)
-    }
-
-    #[must_use]
-    pub fn from_parts(
-        change_committer: Box<dyn CommitChange + Send>,
+    pub fn new(
+        change_committer: Box<dyn CommitChange + Send + Sync>,
         change_batch: ChangeBatch,
+        is_dataset_ready: bool,
     ) -> Self {
         Self {
             change_committer,
             change_batch,
+            is_dataset_ready,
         }
     }
+
+    pub async fn commit(self) -> Result<(), CommitError> {
+        self.change_committer.commit().await
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Box<dyn CommitChange + Send + Sync>, ChangeBatch, bool) {
+        (
+            self.change_committer,
+            self.change_batch,
+            self.is_dataset_ready,
+        )
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        change_committer: Box<dyn CommitChange + Send + Sync>,
+        change_batch: ChangeBatch,
+        is_dataset_ready: bool,
+    ) -> Self {
+        Self {
+            change_committer,
+            change_batch,
+            is_dataset_ready,
+        }
+    }
+
+    /// Returns `true` if processing this envelope means the dataset can be
+    /// marked ready for queries.
+    ///
+    /// See the [`ChangesStream`] documentation for the connector readiness
+    /// contract.
+    #[must_use]
+    pub fn is_dataset_ready(&self) -> bool {
+        self.is_dataset_ready
+    }
+}
+
+/// A [`CommitChange`] implementation that does nothing. Useful when emitting
+/// synthetic envelopes (e.g. ready signals) that have no underlying source
+/// offset to commit.
+pub struct NoOpCommitter;
+
+#[async_trait]
+impl CommitChange for NoOpCommitter {
+    async fn commit(&self) -> Result<(), CommitError> {
+        Ok(())
+    }
+}
+
+/// Construct an empty [`ChangeEnvelope`] whose only job is to flip
+/// `is_dataset_ready=true`. The batch contains zero rows and uses a no-op
+/// committer.
+///
+/// Connectors should emit one of these envelopes once they consider
+/// themselves caught up to the source if no real change events are available
+/// to carry the ready signal. See the [`ChangesStream`] documentation for the
+/// readiness contract.
+pub fn build_ready_signal_envelope(schema: &SchemaRef) -> Result<ChangeEnvelope, ChangeBatchError> {
+    // Build zero-row versions of each dataset column.
+    let empty_data_columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    let data_struct = StructArray::new(schema.fields().clone(), empty_data_columns, None);
+
+    let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+    let pk_list = ListArray::new(
+        Arc::clone(&pk_field),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+        None,
+    );
+
+    let wrapper_schema = Arc::new(changes_schema(schema));
+    let record = RecordBatch::try_new(
+        wrapper_schema,
+        vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
+    )
+    .context(ArrowSnafu)?;
+    let batch = ChangeBatch::try_new(record)?;
+
+    Ok(ChangeEnvelope::new(
+        Box::new(NoOpCommitter),
+        batch,
+        true, // is_dataset_ready
+    ))
 }
 
 /// The Arrow schema that represents a `ChangeEvent`

@@ -1,6 +1,6 @@
 #syntax=docker/dockerfile:1.7
 
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.0-cudnn-runtime-ubuntu24.04
 
 FROM ${CUDA_RUNTIME_IMAGE} AS binary
 
@@ -18,7 +18,7 @@ ENV REL_VERSION=${REL_VERSION}
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
 
 RUN set -eux; \
-    asset="spiced_models_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
+    asset="spiced_cuda_${CUDA_COMPUTE_CAP}_linux_x86_64.tar.gz"; \
     base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
     curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
@@ -29,14 +29,14 @@ FROM ${CUDA_RUNTIME_IMAGE} AS runtime
 
 ENV CUDA_NVCC_FLAGS=-fPIE
 
-ARG CARGO_FEATURES
+ARG CARGO_FEATURES=default
 ARG CUDA_COMPUTE_CAP=80
 
 # Allow DuckDB to load extensions
 RUN mkdir /.duckdb/ && chmod 777 /.duckdb/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 tzdata cuda-compat-12-6 \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
@@ -48,6 +48,7 @@ RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
 COPY --from=binary /root/spiced /usr/local/bin/spiced
 
 ENV CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.6/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /app
 

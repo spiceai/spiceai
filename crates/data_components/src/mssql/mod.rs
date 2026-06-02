@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod provider;
+
 use async_trait::async_trait;
 use connection_manager::SqlServerConnectionPool;
 use convert::{map_column_type_to_arrow_type, map_type_name_to_column_type};
@@ -31,44 +33,56 @@ use datafusion::{
     prelude::Expr,
     sql::TableReference,
 };
+use util::format_datafusion_error;
 
 use std::{any::Any, sync::Arc};
 pub mod connection_manager;
 mod convert;
+pub mod dialect;
 mod execution_plan;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error executing query: {source}"))]
+    #[snafu(display("Failed to execute query on SQL Server: {source}"))]
     QueryError { source: tiberius::error::Error },
 
-    #[snafu(display("Unable to connect: {source}"))]
+    #[snafu(display("Failed to connect to SQL Server: {source}"))]
     SqlServerAccessError { source: tiberius::error::Error },
 
-    #[snafu(display("Unable to connect: {source}"))]
+    #[snafu(display("Failed to connect to SQL Server: {source}"))]
     ConnectionPoolError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to retrieve table schema"))]
+    #[snafu(display("Failed to retrieve table schema from SQL Server"))]
     SchemaRetrieval,
 
-    #[snafu(display("Unable to retrieve schema: table '{table}' does not exist"))]
+    #[snafu(display(
+        "Unable to retrieve schema: table '{table}' does not exist in the SQL Server database"
+    ))]
     SchemaRetrievalTableNotFound { table: String },
 
-    #[snafu(display("Unsupported data type: {data_type}"))]
+    #[snafu(display("Unsupported SQL Server data type: {data_type}"))]
     UnsupportedType { data_type: String },
 
-    #[snafu(display("Failed to build record batch: {source}"))]
+    #[snafu(display("Failed to process SQL Server query result: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
-    #[snafu(display("No builder found for index {index}"))]
+    #[snafu(display("Failed to process SQL Server query result: no column at index {index}"))]
     NoBuilderForIndex { index: usize },
 
-    #[snafu(display("Failed to downcast builder for {mssql_type}"))]
+    #[snafu(display("Failed to process SQL Server query result: unsupported type '{mssql_type}'"))]
     FailedToDowncastBuilder { mssql_type: String },
 
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display(
+        "Failed to convert SQL Server timestamp {v} to Arrow nanosecond timestamp: value is outside the supported range (~1677-2262)"
+    ))]
+    FailedToConvertTimestampToNanos { v: String },
+
+    #[snafu(display(
+        "Failed to generate SQL for SQL Server query: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToGenerateSQL { source: DataFusionError },
 }
 
@@ -99,16 +113,14 @@ impl SqlServerTableProvider {
         let table_name = table.table();
         let table_schema = table.schema().unwrap_or("dbo");
 
-        let columns_meta_query: String = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS \
-            WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'"
-        );
+        let columns_meta_query = "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
+            WHERE TABLE_NAME = @P1 AND TABLE_SCHEMA = @P2";
         tracing::debug!("Executing schema query for dataset {table_name}: {columns_meta_query}");
 
         let mut conn = conn.get().await.boxed().context(ConnectionPoolSnafu)?;
 
         let mut query_res = conn
-            .simple_query(columns_meta_query)
+            .query(columns_meta_query, &[&table_name, &table_schema])
             .await
             .context(QuerySnafu)?
             .into_row_stream();
@@ -122,6 +134,7 @@ impl SqlServerTableProvider {
             let data_type: &str = row.get(1).context(SchemaRetrievalSnafu)?;
             let numeric_precision: Option<u8> = row.get(2);
             let numeric_scale: Option<i32> = row.get(3);
+            let is_nullable: &str = row.get(4).unwrap_or("YES");
 
             let Some(column_type) = map_type_name_to_column_type(data_type) else {
                 tracing::warn!(
@@ -136,7 +149,11 @@ impl SqlServerTableProvider {
                 numeric_scale.map(|v| i8::try_from(v).unwrap_or_default()),
             );
 
-            fields.push(Field::new(column_name, arrow_data_type, true));
+            fields.push(Field::new(
+                column_name,
+                arrow_data_type,
+                is_nullable == "YES",
+            ));
         }
 
         if fields.is_empty() {
@@ -172,25 +189,7 @@ impl TableProvider for SqlServerTableProvider {
         let mut results = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            match filter {
-                Expr::BinaryExpr(binary_expr) => match binary_expr.op {
-                    Operator::Eq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq => {
-                        if is_time_related_expr(&binary_expr.left)
-                            || is_time_related_expr(&binary_expr.right)
-                        {
-                            results.push(TableProviderFilterPushDown::Unsupported);
-                        } else {
-                            results.push(TableProviderFilterPushDown::Exact);
-                        }
-                    }
-                    _ => results.push(TableProviderFilterPushDown::Unsupported),
-                },
-                _ => results.push(TableProviderFilterPushDown::Unsupported),
-            }
+            results.push(classify_mssql_filter(filter));
         }
         Ok(results)
     }
@@ -230,6 +229,73 @@ pub fn project_schema(
     Ok(schema)
 }
 
+fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
+    match filter {
+        Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                if is_time_related_expr(&binary_expr.left)
+                    || is_time_related_expr(&binary_expr.right)
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Exact
+                }
+            }
+            Operator::And | Operator::Or => {
+                let left = classify_mssql_filter(&binary_expr.left);
+                let right = classify_mssql_filter(&binary_expr.right);
+                if left == TableProviderFilterPushDown::Unsupported
+                    || right == TableProviderFilterPushDown::Unsupported
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            }
+            _ => TableProviderFilterPushDown::Unsupported,
+        },
+        Expr::Not(inner) => classify_mssql_filter(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            if is_time_related_expr(inner) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::Like(like) => {
+            if is_time_related_expr(&like.expr) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::Between(between) => {
+            if is_time_related_expr(&between.expr)
+                || is_time_related_expr(&between.low)
+                || is_time_related_expr(&between.high)
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::InList(in_list) => {
+            if is_time_related_expr(&in_list.expr) || in_list.list.iter().any(is_time_related_expr)
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        _ => TableProviderFilterPushDown::Unsupported,
+    }
+}
+
 fn is_time_related_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Cast(cast) => {
@@ -244,9 +310,9 @@ fn is_time_related_expr(expr: &Expr) -> bool {
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }
-        Expr::ScalarVariable(dara_type, _) => {
+        Expr::ScalarVariable(field, _) => {
             matches!(
-                dara_type,
+                field.data_type(),
                 DataType::Time32(_) | DataType::Time64(_) | DataType::Timestamp(_, _)
             )
         }

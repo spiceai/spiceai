@@ -35,7 +35,7 @@ impl From<Arc<View>> for ViewRefreshTask {
 impl ScheduledTask for ViewRefreshTask {
     async fn execute(&self) -> Result<()> {
         let view = Arc::clone(&self.0);
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "accelerated_refresh", input = %view.name.to_string());
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "acceleration_refresh", input = %view.name.to_string());
         async {
             let runtime = Arc::clone(&view.runtime);
 

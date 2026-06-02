@@ -24,7 +24,7 @@ use crate::{
 };
 use arrow::{
     array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder},
-    datatypes::SchemaRef,
+    datatypes::{Schema, SchemaRef},
 };
 use snafu::prelude::*;
 
@@ -38,14 +38,97 @@ pub fn to_change_batch(
 
     let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), 1);
 
+    append_change_event(&mut struct_builder, &schema, primary_key, change)?;
+
+    let struct_array = struct_builder.finish();
+    let record_batch: RecordBatch = struct_array.into();
+
+    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
+        unreachable!(
+            "We constructed the record batch with the correct schema, so this shouldn't fail"
+        );
+    };
+
+    Ok(change_batch)
+}
+
+pub fn vector_to_change_batch(
+    table_schema: &SchemaRef,
+    primary_key: &[String],
+    changes: &[&ChangeEvent],
+) -> super::Result<ChangeBatch> {
+    let schema = changes_schema(table_schema);
+
+    let mut struct_builder = StructBuilder::from_fields(schema.fields().clone(), changes.len());
+
+    for change in changes {
+        append_change_event(&mut struct_builder, &schema, primary_key, change)?;
+    }
+
+    let struct_array = struct_builder.finish();
+    let record_batch: RecordBatch = struct_array.into();
+
+    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
+        unreachable!(
+            "Record batch was constructed with the correct schema, so this shouldn't fail"
+        );
+    };
+
+    Ok(change_batch)
+}
+
+fn append_change_event(
+    struct_builder: &mut StructBuilder,
+    schema: &Schema,
+    primary_key: &[String],
+    change: &ChangeEvent,
+) -> super::Result<()> {
+    if primary_key.is_empty() && matches!(change.payload.op, Op::Update) {
+        let before = change
+            .payload
+            .before
+            .clone()
+            .context(super::UpdateOpWithoutBeforeFieldSnafu)?;
+        append_change_row(struct_builder, schema, primary_key, "d", before)?;
+        append_change_row(
+            struct_builder,
+            schema,
+            primary_key,
+            "c",
+            change.payload.after.clone(),
+        )?;
+        return Ok(());
+    }
+
+    let op = change.payload.op.to_string();
+    let change_data = match change.payload.op {
+        Op::Delete => change
+            .payload
+            .before
+            .clone()
+            .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
+        _ => change.payload.after.clone(),
+    };
+
+    append_change_row(struct_builder, schema, primary_key, &op, change_data)
+}
+
+fn append_change_row(
+    struct_builder: &mut StructBuilder,
+    schema: &Schema,
+    primary_key: &[String],
+    op: &str,
+    change_data: serde_json::Value,
+) -> super::Result<()> {
     struct_builder.append(true);
+    let mut change_data = Some(change_data);
 
     for (idx, field) in schema.fields().iter().enumerate() {
         let field_builder = struct_builder.field_builder_array(idx);
         match field.name().as_str() {
             "op" => {
                 let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                str_builder.append_value(change.payload.op.to_string());
+                str_builder.append_value(op);
             }
             "primary_keys" => {
                 let list_builder =
@@ -61,31 +144,25 @@ pub fn to_change_batch(
                 }
             }
             "data" => {
-                let change_data = match change.payload.op {
-                    Op::Delete => change
-                        .payload
-                        .before
-                        .clone()
-                        .context(super::DeleteOpWithoutBeforeFieldSnafu)?,
-                    _ => change.payload.after.clone(),
-                };
-
                 let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)?;
-
+                let change_data =
+                    change_data
+                        .take()
+                        .context(super::InvalidChangeEventSchemaSnafu {
+                            reason: "data field appears more than once",
+                        })?;
                 super::append_value_to_struct_builder(change_data, data_struct_builder)?;
             }
             _ => unreachable!("Unexpected field in changes schema {}", field.name()),
         }
     }
 
-    let struct_array = struct_builder.finish();
-    let record_batch: RecordBatch = struct_array.into();
+    ensure!(
+        change_data.is_none(),
+        super::InvalidChangeEventSchemaSnafu {
+            reason: "data field is missing"
+        }
+    );
 
-    let Ok(change_batch) = ChangeBatch::try_new(record_batch) else {
-        unreachable!(
-            "We constructed the record batch with the correct schema, so this shouldn't fail"
-        );
-    };
-
-    Ok(change_batch)
+    Ok(())
 }

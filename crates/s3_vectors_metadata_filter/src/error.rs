@@ -47,6 +47,11 @@ pub enum Error {
 
     #[snafu(display("Empty array not allowed for {aggregate}"))]
     EmptyArray { aggregate: String },
+
+    #[snafu(display(
+        "Maximum recursion depth of {max_depth} exceeded while processing nested S3 Vectors data"
+    ))]
+    MaxRecursionDepthExceeded { max_depth: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

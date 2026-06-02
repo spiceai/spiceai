@@ -1,0 +1,15 @@
+version: v1
+kind: Spicepod
+name: postgres[catalog]-federated
+catalogs:
+  - from: pg
+    name: pg
+    include:
+      - 'public.*'
+    params:
+      pg_host: ${secrets:POSTGRES_HOST}
+      pg_port: 5432
+      pg_user: postgres
+      pg_pass: ${secrets:POSTGRES_PASSWORD}
+      pg_db: tpch_sf1
+      pg_sslmode: disable

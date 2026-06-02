@@ -30,19 +30,15 @@ use snafu::prelude::*;
 use spicepod::{
     component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
     metric::Metrics,
-    semantic::{Column, FullTextSearchConfig, IndexStore},
+    semantic::{Column, IndexStore},
     vector::VectorStore,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Duration};
 
 pub mod acceleration;
 pub mod builder;
+pub mod declared_schema;
+pub mod declared_type;
 pub mod metadata;
 pub mod replication;
 
@@ -64,12 +60,12 @@ pub enum Error {
         valid_columns: String,
     },
 
-    #[snafu(display("Unable to get table constraints: {source}"))]
+    #[snafu(display("Failed to retrieve table constraints for the dataset: {source}"))]
     UnableToGetTableConstraints {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to convert a SchemaRef to a DFSchema: {source}"))]
+    #[snafu(display("Failed to convert the dataset schema for query planning: {source}"))]
     UnableToConvertSchemaRefToDFSchema {
         source: datafusion::error::DataFusionError,
     },
@@ -91,6 +87,9 @@ pub enum Error {
         source: fundu::ParseError,
     },
 
+    #[snafu(display("Error parsing 'snapshots_batches` as integer: {source}"))]
+    UnableToParseSnapshotsBatches { source: std::num::ParseIntError },
+
     #[snafu(display("Error parsing `from` path {path} as table reference: {source}"))]
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
@@ -111,6 +110,14 @@ pub enum Error {
         "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
     ))]
     ChunkingNotSupportedForVectorEngine { column: String },
+
+    #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
+    InvalidConfiguration { config_key: String, message: String },
+
+    #[snafu(display(
+        "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
+    ))]
+    SnapshotTriggerIntervalRequiresInterval,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -181,6 +188,37 @@ impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedType
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OnSchemaChange {
+    #[default]
+    Block,
+    Fail,
+    AppendNewColumns,
+    SyncAllColumns,
+}
+
+impl From<spicepod_dataset::OnSchemaChange> for OnSchemaChange {
+    fn from(on_schema_change: spicepod_dataset::OnSchemaChange) -> Self {
+        match on_schema_change {
+            spicepod_dataset::OnSchemaChange::Block => OnSchemaChange::Block,
+            spicepod_dataset::OnSchemaChange::Fail => OnSchemaChange::Fail,
+            spicepod_dataset::OnSchemaChange::AppendNewColumns => OnSchemaChange::AppendNewColumns,
+            spicepod_dataset::OnSchemaChange::SyncAllColumns => OnSchemaChange::SyncAllColumns,
+        }
+    }
+}
+
+impl Display for OnSchemaChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnSchemaChange::Block => write!(f, "block"),
+            OnSchemaChange::Fail => write!(f, "fail"),
+            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
+            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
+    }
+}
+
 /// Controls when the table is marked ready for queries.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ReadyState {
@@ -189,6 +227,10 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+    /// The table is ready once the federated source's schema has been resolved (which also implies access
+    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
+    /// fall back to the federated source until the initial load completes.
+    OnSchemaResolved,
 }
 
 impl From<spicepod_dataset::ReadyState> for ReadyState {
@@ -196,6 +238,7 @@ impl From<spicepod_dataset::ReadyState> for ReadyState {
         match ready_state {
             spicepod_dataset::ReadyState::OnLoad => ReadyState::OnLoad,
             spicepod_dataset::ReadyState::OnRegistration => ReadyState::OnRegistration,
+            spicepod_dataset::ReadyState::OnSchemaResolved => ReadyState::OnSchemaResolved,
         }
     }
 }
@@ -205,6 +248,7 @@ impl Display for ReadyState {
         match self {
             ReadyState::OnLoad => write!(f, "on_load"),
             ReadyState::OnRegistration => write!(f, "on_registration"),
+            ReadyState::OnSchemaResolved => write!(f, "on_schema_resolved"),
         }
     }
 }
@@ -255,10 +299,12 @@ pub struct Dataset {
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Arc<App>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub on_schema_change: OnSchemaChange,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub full_text_search: Option<spicepod::fts::FtsStore>,
     pub check_availability: CheckAvailability,
 }
 
@@ -281,9 +327,11 @@ impl std::fmt::Debug for Dataset {
             .field("embeddings", &self.embeddings)
             .field("app", &self.app)
             .field("unsupported_type_action", &self.unsupported_type_action)
+            .field("on_schema_change", &self.on_schema_change)
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
+            .field("full_text_search", &self.full_text_search)
             .field("check_availability", &self.check_availability)
             .finish_non_exhaustive()
     }
@@ -308,7 +356,9 @@ impl PartialEq for Dataset {
             && self.embeddings == other.embeddings
             && self.columns == other.columns
             && self.metrics == other.metrics
+            && self.on_schema_change == other.on_schema_change
             && self.vectors == other.vectors
+            && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
     }
 }
@@ -330,7 +380,7 @@ impl Dataset {
         self
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -555,7 +605,13 @@ impl Dataset {
                 return true;
             }
 
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File
+                        | acceleration::Mode::FileCreate
+                        | acceleration::Mode::FileUpdate
+                );
         }
 
         false
@@ -616,97 +672,14 @@ impl Dataset {
             .any(|c| c.full_text_search.as_ref().is_some_and(|cfg| cfg.enabled))
     }
 
-    #[allow(clippy::type_complexity)] // From a two-part `.unzip()`.
+    /// Returns the dataset-level FTS engine name if configured and enabled.
+    /// e.g. `Some("elasticsearch")` when `full_text_search.engine: elasticsearch`.
     #[must_use]
-    pub fn full_text_search_config(&self) -> Option<FullTextSearchDatasetConfig> {
-        let (search_fields_and_primary_key_overrides, indexes): (
-            Vec<(String, Option<Vec<String>>)>,
-            Vec<(IndexStore, Option<String>)>,
-        ) = self
-            .columns
-            .iter()
-            .filter_map(|c| {
-                let Some(FullTextSearchConfig {
-                    enabled: true,
-                    row_ids,
-                    index_store,
-                    index_directory,
-                }) = &c.full_text_search
-                else {
-                    return None;
-                };
-
-                if index_store.is_some_and(|is| is == IndexStore::Memory) && index_directory.is_some() {
-                    tracing::warn!("Dataset '{}' column '{}' has `index_store: memory` but also sets `index_directory`. These options are mutually exclusive. Defaulting to `index_store: memory`.", self.name, c.name);
-                }
-                Some(((c.name.clone(), row_ids.clone()), (index_store.unwrap_or_default(), index_directory.clone())))
-            })
-            .unzip();
-        let (search_fields, primary_key_overrides): (Vec<String>, Vec<Option<Vec<String>>>) =
-            search_fields_and_primary_key_overrides.into_iter().unzip();
-
-        // No columns have full text search fields defined.
-        if search_fields.is_empty() {
-            return None;
-        }
-
-        // For all full text search columns, find the first with a non-null primary key override and
-        // if there are multiple, warn if they are different.
-        let mut first_pks: Option<Vec<String>> = None;
-        let mut first_search_field: Option<String> = None;
-        for (search_field, pk_overrides) in search_fields.iter().zip(primary_key_overrides.iter()) {
-            let Some(mut pks) = pk_overrides.clone() else {
-                continue;
-            };
-            pks.sort();
-
-            // If this is not the first FTS column that defined row ids, check if they match the previous.
-            // Otherwise set to be used for next comparison.
-            if let (Some(f), Some(s)) = (&first_pks, &first_search_field) {
-                if *pks != *f {
-                    tracing::warn!(
-                        "Dataset '{}' has different primary keys for different full-text search columns. Using first.\n  Column '{}'. Key: {}.\n  Column '{}'. Key: {}.",
-                        self.name(),
-                        s,
-                        f.join(", "),
-                        search_field,
-                        pks.join(", "),
-                    );
-                }
-            } else {
-                first_pks = Some(pks.clone());
-                first_search_field = Some(search_field.clone());
-            }
-        }
-
-        let index_paths: HashSet<String> = indexes
-            .iter()
-            .filter_map(|(_, directory)| directory.clone())
-            .collect();
-        let index_path_len = index_paths.len();
-        let index_path: Option<String> = index_paths.into_iter().next();
-
-        if let Some(ref path) = index_path
-            && index_path_len > 1
-        {
-            tracing::warn!(
-                "Dataset '{}' has several full text search index directories provided. Using '{path}'.",
-                self.name
-            );
-        }
-
-        let index_store = if indexes.iter().any(|(store, _)| *store == IndexStore::File) {
-            IndexStore::File
-        } else {
-            IndexStore::Memory
-        };
-
-        Some(FullTextSearchDatasetConfig {
-            index_store,
-            index_path,
-            search_fields,
-            primary_key: first_pks.unwrap_or_default(),
-        })
+    pub fn fts_engine(&self) -> Option<&str> {
+        self.full_text_search
+            .as_ref()
+            .filter(|fts| fts.enabled)
+            .and_then(|fts| fts.engine.as_deref())
     }
 
     /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
@@ -777,6 +750,14 @@ impl AccelerationSource for Dataset {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn time_column(&self) -> Option<&str> {
+        self.time_column.as_deref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -789,6 +770,12 @@ mod tests {
     use super::builder::DatasetBuilder;
     use super::*;
     use app::AppBuilder;
+    use spicepod::{
+        fts::FtsStore,
+        param::Params,
+        semantic::{ColumnLevelEmbeddingConfig, FullTextSearchConfig},
+        vector::VectorStore,
+    };
 
     #[test]
     fn test_indexes_roundtrip() {
@@ -879,6 +866,199 @@ mod tests {
 
         dataset.params = params;
         dataset
+    }
+
+    fn params(entries: &[(&str, &str)]) -> Params {
+        Params::from_string_map(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        )
+    }
+
+    async fn build_dataset(
+        spicepod_dataset: spicepod::component::dataset::Dataset,
+        app: app::App,
+    ) -> Result<Dataset> {
+        let runtime = crate::Runtime::builder().build().await;
+
+        DatasetBuilder::try_from(spicepod_dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(runtime))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_dataset_level_search_engine_configuration_is_preserved() {
+        let app = AppBuilder::new("test").build();
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.vectors = Some(VectorStore {
+            enabled: true,
+            engine: Some("elasticsearch".to_string()),
+            partition_by: Vec::new(),
+            params: Some(params(&[("endpoint", "http://es:9200"), ("metric", "dot")])),
+        });
+        spicepod_dataset.full_text_search = Some(FtsStore {
+            enabled: true,
+            engine: Some("elasticsearch".to_string()),
+            params: Some(params(&[
+                ("endpoint", "http://es:9200"),
+                ("index", "docs_text"),
+            ])),
+        });
+
+        let dataset = build_dataset(spicepod_dataset, app)
+            .await
+            .expect("direct search engine configuration should build");
+
+        let vector_store = dataset.vectors.as_ref().expect("vectors should be enabled");
+        assert_eq!(vector_store.engine.as_deref(), Some("elasticsearch"));
+        let vector_params = vector_store
+            .params
+            .as_ref()
+            .expect("vector params should merge")
+            .as_string_map();
+        assert_eq!(
+            vector_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(vector_params.get("metric").map(String::as_str), Some("dot"));
+
+        let fts_store = dataset
+            .full_text_search
+            .as_ref()
+            .expect("full text search should be enabled");
+        assert_eq!(fts_store.engine.as_deref(), Some("elasticsearch"));
+        let fts_params = fts_store
+            .params
+            .as_ref()
+            .expect("fts params should merge")
+            .as_string_map();
+        assert_eq!(
+            fts_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            fts_params.get("index").map(String::as_str),
+            Some("docs_text")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_column_level_search_engine_overrides_enable_stores() {
+        let app = AppBuilder::new("test").build();
+
+        let mut column_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        column_fts.engine = Some("elasticsearch".to_string());
+        column_fts.params = Some(params(&[
+            ("endpoint", "http://es:9200"),
+            ("index", "body_text"),
+        ]));
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.columns = vec![
+            spicepod::semantic::Column::new("body")
+                .with_embedding(ColumnLevelEmbeddingConfig {
+                    model: "openai_embeddings".to_string(),
+                    chunking: None,
+                    row_ids: Some(vec!["id".to_string()]),
+                    vector_size: None,
+                    engine: Some("elasticsearch".to_string()),
+                    params: Some(params(&[
+                        ("endpoint", "http://es:9200"),
+                        ("index", "body_vectors"),
+                    ])),
+                    aggregation: None,
+                    max_elements_per_row: None,
+                })
+                .with_full_text_search(column_fts),
+        ];
+
+        let dataset = build_dataset(spicepod_dataset, app)
+            .await
+            .expect("column search engine overrides should build");
+
+        let vector_store = dataset.vectors.as_ref().expect("vectors should be enabled");
+        assert!(vector_store.enabled);
+        assert_eq!(vector_store.engine, None);
+
+        let column_embedding = dataset.columns[0]
+            .embeddings
+            .first()
+            .expect("embedding should remain on column");
+        assert_eq!(column_embedding.engine.as_deref(), Some("elasticsearch"));
+        let embedding_params = column_embedding
+            .params
+            .as_ref()
+            .expect("embedding params should merge")
+            .as_string_map();
+        assert_eq!(
+            embedding_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            embedding_params.get("index").map(String::as_str),
+            Some("body_vectors")
+        );
+
+        let fts_store = dataset
+            .full_text_search
+            .as_ref()
+            .expect("column text engine should enable dataset fts store");
+        assert_eq!(fts_store.engine.as_deref(), Some("elasticsearch"));
+        let fts_store_params = fts_store
+            .params
+            .as_ref()
+            .expect("column fts params should be promoted")
+            .as_string_map();
+        assert_eq!(
+            fts_store_params.get("endpoint").map(String::as_str),
+            Some("http://es:9200")
+        );
+        assert_eq!(
+            fts_store_params.get("index").map(String::as_str),
+            Some("body_text")
+        );
+
+        let column_fts = dataset.columns[0]
+            .full_text_search
+            .as_ref()
+            .expect("column fts config should remain");
+        assert_eq!(column_fts.engine.as_deref(), Some("elasticsearch"));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_column_fts_params_error() {
+        let app = AppBuilder::new("test").build();
+
+        let mut first_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        first_fts.engine = Some("elasticsearch".to_string());
+        first_fts.params = Some(params(&[("index", "body_text")]));
+
+        let mut second_fts = FullTextSearchConfig::enabled().with_row_id("id");
+        second_fts.engine = Some("elasticsearch".to_string());
+        second_fts.params = Some(params(&[("index", "title_text")]));
+
+        let mut spicepod_dataset =
+            spicepod::component::dataset::Dataset::new("file:data.csv", "docs");
+        spicepod_dataset.columns = vec![
+            spicepod::semantic::Column::new("body").with_full_text_search(first_fts),
+            spicepod::semantic::Column::new("title").with_full_text_search(second_fts),
+        ];
+
+        let err = build_dataset(spicepod_dataset, app)
+            .await
+            .expect_err("mixed column fts params should fail safely");
+
+        assert!(
+            err.to_string().contains("different parameters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

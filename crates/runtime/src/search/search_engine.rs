@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,24 +23,29 @@ use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
 use crate::search::candidate::vector_udtf::VectorUDTFGeneration;
 use crate::search::{DataFusionSnafu, FormattingSnafu};
-use datafusion::common::DFSchema;
+use datafusion::common::{Column, DFSchema, SchemaError};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion_expr::sqlparser::ast::Ident;
-use datafusion_expr::{LogicalPlan, ident};
+use datafusion_expr::sqlparser::ast;
+use datafusion_expr::{Expr, LogicalPlan};
+#[cfg(feature = "models")]
 use runtime_datafusion_udfs::embed::EMBED_UDF_NAME;
+#[cfg(not(feature = "models"))]
+const EMBED_UDF_NAME: &str = "embed";
 use runtime_request_context::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
+#[cfg(feature = "duckdb")]
+use search::index::duckdb::DuckDBVectorIndex;
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 use search::pipeline::QueryEngine;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, resolved_equality};
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::ChunkedNonIndexVectorGeneration,
     util::{
-        embedding_columns_from_table, find_concrete_table_provider, full_text_search_candidates,
-        get_primary_keys_with_overrides,
+        embedding_columns_from_table, find_concrete_table_provider, find_index_in_table_provider,
+        full_text_search_candidates, get_primary_keys_with_overrides,
     },
 };
 use arrow::array::RecordBatch;
@@ -55,9 +60,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::IndexedTableProvider;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::native_vector::NativeVectorIndex;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -93,21 +98,41 @@ impl SearchEngine {
         tbl: &Arc<dyn TableProvider>,
         embedding_column: &str,
     ) -> Option<Arc<dyn SearchIndex>> {
-        let tbl = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
-        tbl.get_all_indexes().into_iter().find_map(|idx| {
-            if let Some(chunked) = idx.as_any().downcast_ref::<ChunkedSearchIndex>()
-                && chunked.search_column() == embedding_column
-            {
-                return Some(Arc::new(chunked.clone()) as Arc<dyn SearchIndex>);
-            }
-            #[cfg(feature = "s3_vectors")]
-            if let Some(s3v) = idx.as_any().downcast_ref::<S3Vector>()
-                && s3v.search_column() == embedding_column
-            {
-                return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
-            }
-            None
-        })
+        if let Some((indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        #[cfg(feature = "s3_vectors")]
+        if let Some((indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        #[cfg(feature = "duckdb")]
+        if let Some((indexes, _)) = find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        if let Some((indexes, _)) = find_index_in_table_provider::<NativeVectorIndex>(tbl)
+            && let Some(index) = indexes
+                .into_iter()
+                .find(|idx| idx.search_column() == embedding_column)
+        {
+            return Some(Arc::new(index.clone()) as Arc<dyn SearchIndex>);
+        }
+
+        None
     }
 
     // Prepare an individual [`impl search::CandidateGeneration`] (specifically a [`VectorGeneration`]) based on the [`TableReference`].
@@ -146,8 +171,11 @@ impl SearchEngine {
                 });
             };
 
-            // Use UDTF for non-chunked `EmbeddingTable`.
-            if !embedding_table.is_chunked(embedding_column) {
+            // Use UDTF for scalar non-chunked `EmbeddingTable`. Both
+            // chunked-scalar and multi-vector (list-typed) sources need
+            // the UNNEST-based non-indexed search path.
+            let is_multi_vector = embedding_table.is_multi_vector(embedding_column);
+            if !embedding_table.is_chunked(embedding_column) && !is_multi_vector {
                 return Ok(Arc::new(VectorUDTFGeneration::new(
                     &self.df,
                     tbl,
@@ -172,14 +200,29 @@ impl SearchEngine {
                 });
             };
 
-            Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
-                &table_provider,
-                tbl,
-                embed_udf,
-                model_name,
-                primary_keys.to_vec(),
-                embedding_column,
-            )))
+            if is_multi_vector {
+                let aggregation = embedding_table
+                    .multi_vector_aggregation(embedding_column)
+                    .unwrap_or_default();
+                Ok(Arc::new(ChunkedNonIndexVectorGeneration::new_list_multi(
+                    &table_provider,
+                    tbl,
+                    embed_udf,
+                    model_name,
+                    primary_keys.to_vec(),
+                    embedding_column,
+                    aggregation,
+                )))
+            } else {
+                Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
+                    &table_provider,
+                    tbl,
+                    embed_udf,
+                    model_name,
+                    primary_keys.to_vec(),
+                    embedding_column,
+                )))
+            }
         }
     }
 
@@ -194,16 +237,22 @@ impl SearchEngine {
             let search_key = SearchKey::from(req.clone());
             let cache_control = request_context.cache_control();
 
-            let cache_key = match request_context.client_supplied_cache_key() {
-                Some(cache_key)
-                    if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
-                {
-                    CacheKey::ClientSupplied(cache_key)
-                }
+            let scoped_user_cache_key =
+                if cache_control.cache_key_type() == Some(CacheKeyType::ClientSupplied) {
+                    request_context.scoped_client_supplied_cache_key()
+                } else {
+                    None
+                };
+            let cache_key = match scoped_user_cache_key.as_deref() {
+                Some(cache_key) => CacheKey::ClientSupplied(cache_key),
                 _ => CacheKey::Search(&search_key),
             };
 
-            let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
+            let raw_cache_key = {
+                let ns = request_context.cache_namespace();
+                let (ns_tag, ns_id) = ns.hash_inputs();
+                cache_key.as_raw_key_in_namespace(cache_provider.hasher(), ns_tag, ns_id)
+            };
 
             match (
                 cache_control,
@@ -217,7 +266,13 @@ impl SearchEngine {
                         CacheStatus::CacheBypass,
                     )
                 }
-                (CacheControl::Cache(_), None) => {
+                (
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
+                    None,
+                ) => {
                     tracing::trace!("Search cache miss");
                     let results = self.search(req).await?;
                     (
@@ -225,7 +280,13 @@ impl SearchEngine {
                         CacheStatus::CacheMiss,
                     )
                 }
-                (CacheControl::Cache(_), Some(cached_result)) => {
+                (
+                    CacheControl::Cache(_)
+                    | CacheControl::MaxStale(_, _)
+                    | CacheControl::MinFresh(_, _)
+                    | CacheControl::OnlyIfCached(_),
+                    Some(cached_result),
+                ) => {
                     tracing::trace!("Search cache hit");
                     // each CachedAggregationResult needs to be re-mapped to an AggregationResult
                     let mut results = HashMap::new();
@@ -260,6 +321,7 @@ impl SearchEngine {
             additional_columns,
             keywords,
         } = req;
+        let explicit_datasets_requested = data_source_opt.is_some();
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
@@ -308,25 +370,27 @@ impl SearchEngine {
                         generators.append(&mut fts);
                     }
 
-                    // This is actually infallible
-                    let filters = if let Ok(schm) = DFSchema::try_from(self
-                        .df
-                        .get_table(&tbl)
-                        .await
-                        .ok_or(Error::DataSourcesNotFound {
-                            data_source: vec![tbl.clone()],
-                        })?.schema()) {
-                            let state = self.df.ctx.state();
-                            where_cond.iter().map(|f| state.create_logical_expr(&f.to_string(), &schm)).collect::<Result<_, DataFusionError>>().context(DataFusionSnafu)?
-                    } else {
-                        vec![]
-                    };
+                    if explicit_datasets_requested && generators.is_empty() {
+                        return Err(Error::CannotSearchDataset {
+                            data_source: tbl.clone(),
+                        });
+                    }
 
-                    let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df)))).run(
+                    // Ensure columns for a specific table aren't used on all tables.
+                    let table_cols: Vec<_> = additional_columns
+                        .iter()
+                        .filter(|&c| c.relation.as_ref().is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone())))
+                        .cloned()
+                        .map(Expr::Column)
+                        .collect();
+
+                    let pipe = SearchPipeline::new(generators, ReciprocalRankFusion, Arc::new(DatafusionQueryEngine(Arc::clone(&self.df))));
+                    let agg_result = pipe.run(
                         query.clone(),
-                        filters,
-                        additional_columns.iter().map(|Ident{value,..}| ident(value.clone())).collect(),
-                        primary_keys.to_vec(),
+                        &tbl,
+                        get_filter_for_table(&self.df, &tbl, where_cond.as_ref()).await?,
+                        table_cols,
+                        primary_keys.iter().map(|pk| Column::from_name(pk.clone()) ).collect::<Vec<Column>>(),
                         keywords,
                         *limit
                     ).await.context(SearchPipelineSnafu)?;
@@ -357,6 +421,60 @@ impl SearchEngine {
             }
         }
     }
+}
+
+async fn get_filter_for_table(
+    df: &Arc<DataFusion>,
+    tbl: &TableReference,
+    filter_opt: Option<&ast::Expr>,
+) -> Result<Option<Expr>, super::Error> {
+    let Some(filter) = filter_opt else {
+        return Ok(None);
+    };
+
+    let table = df.get_table(tbl).await.ok_or(Error::DataSourcesNotFound {
+        data_source: vec![tbl.clone()],
+    })?;
+    let schema = DFSchema::try_from_qualified_schema(tbl.clone(), &table.schema())
+        .context(DataFusionSnafu)?;
+
+    match df
+        .ctx
+        .state()
+        .create_logical_expr(&filter.to_string(), &schema)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if is_field_not_found_on_unrelated_table(tbl, &e) => {
+            tracing::debug!(
+                "Ignoring SQL filter ('{}') on table {tbl:?} for search request as its columns do not reference this table",
+                filter
+            );
+            Ok(None)
+        }
+        Err(e) => Err(super::Error::DataFusionError { source: e }),
+    }
+}
+
+/// Checks if the [`DataFusionError`] is about a specific field not being found in a schema (i.e [`SchemaError`]).
+///
+/// Returns true iff the error is of this nature AND the field is unrelated (i.e. an explicit
+/// [`Column::relation`] to a different table) to the provided `tbl`
+fn is_field_not_found_on_unrelated_table(tbl: &TableReference, e: &DataFusionError) -> bool {
+    let DataFusionError::Diagnostic(_, inner) = e else {
+        return false;
+    };
+    let DataFusionError::SchemaError(err, _) = &**inner else {
+        return false;
+    };
+    let SchemaError::FieldNotFound { field, .. } = &**err else {
+        return false;
+    };
+
+    // Unrelated table is only if a different relation is explicit set on the column.
+    !field
+        .relation
+        .as_ref()
+        .is_none_or(|rel| resolved_equality(tbl.clone(), rel.clone()))
 }
 
 fn wrap_cache_to_result(
@@ -445,12 +563,7 @@ fn wrap_cache_to_result(
         if results.is_empty() {
             tracing::trace!("No results to cache for tables: {expected_keys:?}");
             return;
-        } else if !expected_keys
-            .iter()
-            .filter(|key| !results.contains_key(key))
-            .collect::<Vec<_>>()
-            .is_empty()
-        {
+        } else if expected_keys.iter().any(|key| !results.contains_key(key)) {
             tracing::trace!(
                 "Not all expected keys were found in the cached results: {expected_keys:?}"
             );

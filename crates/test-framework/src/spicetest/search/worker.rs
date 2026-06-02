@@ -24,6 +24,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use crate::constants::{HTTP_BASE_URL, SEARCH_ENDPOINT};
+
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct SearchRequest {
     #[serde(skip)]
@@ -125,7 +127,6 @@ pub(crate) struct VectorSearchWorkerResult {
     pub(crate) search_results: BTreeMap<String, SearchResult>,
 }
 
-#[allow(dead_code)]
 pub struct SearchResult {
     pub response: SearchResponse,
     pub score: f64,
@@ -139,18 +140,19 @@ pub(crate) struct VectorSearchWorker {
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub struct SearchResponse {
     pub results: Vec<SearchResponseResult>,
     pub duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 pub struct SearchResponseResult {
     // `matches` is left as a generic JSON value (`serde_json::Value`) instead of a strongly typed struct.
     // The search API can return different sets of fields here depending on dataset or configuration
     pub matches: serde_json::Value,
+    // The runtime serializes this field as `_score` (see `crates/runtime/src/search/types.rs`).
+    // Accept the legacy `score` name as an alias to stay compatible with older runtimes.
+    #[serde(rename = "_score", alias = "score")]
     pub score: f64,
     pub dataset: String,
     /// Primary key can be different types depending on the dataset. Default to empty map, if not present.
@@ -180,9 +182,10 @@ impl VectorSearchWorker {
 
             for (index, request) in self.config.requests.into_iter().enumerate() {
                 let start = Instant::now();
+                let search_url = format!("{HTTP_BASE_URL}{SEARCH_ENDPOINT}");
                 let res = self
                     .http_client
-                    .post("http://localhost:8090/v1/search")
+                    .post(&search_url)
                     .json(&request)
                     .send()
                     .await?;
@@ -206,7 +209,7 @@ impl VectorSearchWorker {
                 // Trace progress every 10 seconds
                 if last_progress_time.elapsed() >= Duration::from_secs(10) {
                     let completed = index + 1;
-                    #[allow(clippy::cast_precision_loss)]
+                    #[expect(clippy::cast_precision_loss)]
                     let completed_percent = (completed as f64 / total_requests as f64) * 100.0;
                     println!(
                         "[SearchWorker-{:02}]: {completed}/{total_requests} completed ({completed_percent:.1}%)",

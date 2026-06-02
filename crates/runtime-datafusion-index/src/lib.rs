@@ -19,10 +19,22 @@ use std::{any::Any, fmt::Debug};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::error::Result;
+use snafu::prelude::*;
 
 pub mod analyzer;
 mod provider;
 pub use provider::*;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Index table scans should have only one input. Received {input_len} inputs."))]
+    MultipleInputs { input_len: usize },
+
+    #[snafu(display(
+        "Index table scans should have no expressions. Received {expr_len} expressions."
+    ))]
+    NoExpressions { expr_len: usize },
+}
 
 #[async_trait]
 pub trait Index: Debug + Send + Sync + 'static {
@@ -35,6 +47,33 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// "*_embedding" column) then modify the provided batches to include the computed column.
     async fn compute_index(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         Ok(batches)
+    }
+
+    /// Called before data is written via the [`TableSink`] path (full refresh or append).
+    ///
+    /// Default is a no-op. Implementations use this to prepare external index state for a
+    /// bounded write window. Not called for CDC writes.
+    async fn on_write_start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called if a [`TableSink`] write fails after [`Index::on_write_start`] ran.
+    ///
+    /// Default is a no-op. Implementations use this to restore temporary external index
+    /// settings when a refresh or append fails before [`Index::on_write_complete`] can run.
+    async fn on_write_failed(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called after data has been written via the [`TableSink`] path (full refresh or append).
+    ///
+    /// Default is a no-op. Implementations use this to create or verify persistent structures
+    /// (e.g. a vector HNSW index) after each write. Using `IF NOT EXISTS` semantics makes it
+    /// safe to call on both overwrite (recreates on new table) and append (no-op if index
+    /// already exists). Not called for CDC writes — those maintain indexes automatically via
+    /// `DuckDB` VSS on each insert.
+    async fn on_write_complete(&self) -> Result<()> {
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn Any;

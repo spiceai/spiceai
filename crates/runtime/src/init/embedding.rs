@@ -29,9 +29,8 @@ use snafu::prelude::*;
 use spicepod::component::embeddings::Embeddings;
 
 impl Runtime {
-    #[allow(dead_code)]
     pub(crate) async fn load_embeddings(&self) {
-        let app_opt = self.app.read().await;
+        let app_opt = self.read_app().await;
 
         if !cfg!(feature = "models") && app_opt.as_ref().is_some_and(|s| !s.embeddings.is_empty()) {
             tracing::error!(
@@ -69,8 +68,10 @@ impl Runtime {
                     }
                     Err(e) => {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
-                        self.status
-                            .update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        self.status.update_embedding(
+                            &in_embed.name,
+                            status::ComponentStatus::error_with_message(e.to_string()),
+                        );
                         tracing::warn!(
                             "Failed to load Embedding Model {}. {} Verify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings",
                             in_embed.name,
@@ -82,7 +83,6 @@ impl Runtime {
         }
     }
 
-    #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<TaskEmbed> {
         let l = try_to_embedding(

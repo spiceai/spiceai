@@ -6,12 +6,15 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 
 ## RC Quality Accelerators
 
-| Accelerator | RC   Quality | DRI Sign-off |
-| ----------- | ------------ | ------------ |
-| Arrow       | ✅           | @sgrebnov    |
-| DuckDB      | ✅           | @peasee      |
-| SQLite      | ✅           | @peasee      |
-| PostgreSQL  | ✅           | @peasee      |
+| Accelerator             | RC Quality | DRI Sign-off |
+| ----------------------- | ---------- | ------------ |
+| Arrow                   | ✅          | @sgrebnov    |
+| Cayenne                 | ✅          | @peasee      |
+| DuckDB                  | ✅          | @peasee      |
+| SQLite                  | ✅          | @peasee      |
+| PostgreSQL<sup>\*</sup> | ✅          | @peasee      |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## RC Release Criteria
 

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 /// Represents a path to a field in the original nested schema
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::doc_link_with_quotes)]
+#[expect(clippy::doc_link_with_quotes)]
 pub struct FieldPath {
     /// The field names along the path (e.g., ["person", "name"])
     pub field_names: Vec<String>,
@@ -165,7 +165,7 @@ pub fn nest_struct_schema(flattened_schema: &Schema, separator: &str) -> Schema 
 ///
 /// // Find which column in the nested schema the flattened "person.name" field belongs to
 /// let person_name_field = flattened_schema.field(1); // "person.name"
-/// let col_index = find_col_index(person_name_field, &nested_schema).unwrap();
+/// let col_index = find_col_index(person_name_field, &nested_schema, ".").unwrap();
 /// assert_eq!(col_index, 1); // The "person" struct is at index 1
 /// ```
 #[must_use]
@@ -247,7 +247,7 @@ fn flatten_json(
 /// ];
 /// let filtered_flattened = Schema::new(subset_fields);
 ///
-/// let projected_nested = project_nested_schema(&filtered_flattened, &original_nested);
+/// let projected_nested = project_nested_schema(&filtered_flattened, &original_nested, ".");
 /// // Result: [person{name, age, email}, status] - complete original fields
 /// ```
 #[must_use]
@@ -932,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     fn test_find_col_index_complex_structure() {
         // Test the complex structure from earlier tests
         let a_field = Field::new("a", DataType::Int32, false);
@@ -1408,7 +1408,7 @@ mod tests {
         let name_field = Field::new("name", DataType::Utf8, false);
         let age_field = Field::new("age", DataType::Int32, false);
         let email_field = Field::new("email", DataType::Utf8, false);
-        let person_fields = Fields::from(vec![name_field.clone(), age_field, email_field]);
+        let person_fields = Fields::from(vec![name_field, age_field, email_field]);
         let person_field = Field::new("person", DataType::Struct(person_fields.clone()), false);
         let id_field = Field::new("id", DataType::Int32, false);
         let status_field = Field::new("status", DataType::Utf8, false);

@@ -15,16 +15,14 @@ limitations under the License.
 */
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use app::AppBuilder;
 use runtime::Runtime;
 use spicepod::semantic::{Column, FullTextSearchConfig};
 
 use super::bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
-use tokio::time::sleep;
 
-use super::run_and_snapshot_query;
+use super::{run_and_snapshot_query, wait_for_query_rows};
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
 use crate::{init_tracing, utils::test_request_context};
@@ -69,18 +67,14 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 
             runtime_ready_check(&rt).await;
 
-            // Ensure all messages are processed
-            sleep(Duration::from_secs(2)).await;
-
             let table = "stack_qa";
             let data_snapshot = format!("{table}_data");
+            let query = format!(
+                "SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY _score DESC LIMIT 10"
+            );
 
-            run_and_snapshot_query(
-                &rt,
-                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
-                &data_snapshot,
-            )
-            .await?;
+            wait_for_query_rows(&rt, &query, 1).await?;
+            run_and_snapshot_query(&rt, &query, &data_snapshot).await?;
 
             rt.shutdown().await;
             drop(rt);
@@ -96,7 +90,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
         .await
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn stack_qa_json() -> Vec<serde_json::Value> {
     include_str!("./test_data/stack_qa.json")
         .lines()

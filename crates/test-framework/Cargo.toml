@@ -2,55 +2,62 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "test-framework"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ahash.workspace = true
-anyhow = "1.0.99"
+anyhow.workspace = true
 app = { path = "../app" }
-arrow = { workspace = true, features = ["prettyprint"] }
-arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow = { workspace = true, features = ["prettyprint", "chrono-tz"] }
+arrow_tools = { path = "../arrow_tools" }
+arrow-json.workspace = true
+arrow-schema = { workspace = true, features = ["serde"] }
+async-channel = "2.3"
 async-openai.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
-clap.workspace = true
 dashmap = "6.1.0"
+datafusion.workspace = true
 duckdb = { optional = true, workspace = true, features = [
     "bundled",
     "r2d2",
     "vtab",
     "vtab-arrow",
-]}
+] }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
-indicatif = "0.18.0"
+indicatif = "0.18.4"
 insta.workspace = true
-octocrab = "0.47.0"
+object_store = { workspace = true, features = ["aws", "http", "azure", "gcp"] }
+octocrab = "0.49.5"
 opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
 rand.workspace = true
+rcgen = { version = "0.14", features = ["x509-parser"] }
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
+spiceai = { workspace = true }
 spicepod = { path = "../spicepod" }
-sysinfo = "0.35.2"
+sysinfo = "0.38.4"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
+time = "0.3"
 tokio.workspace = true
-tonic.workspace = true
 tokio-util.workspace = true
-util = { path = "../util" }
+tonic.workspace = true
+util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v4"] }
-spiceai = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 nix = { version = "0.30", features = ["signal"] }
@@ -69,8 +76,8 @@ dremio = []
 duckdb = []
 flightsql = []
 ftp = []
-keyring-secret-store = []
 imap = []
+keyring-secret-store = []
 models = []
 mssql = []
 mysql = []
@@ -80,5 +87,6 @@ sharepoint = []
 snowflake = []
 spark = []
 sqlite = []
+turso = []
 
 file_append = ["dep:duckdb"]

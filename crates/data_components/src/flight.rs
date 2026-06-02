@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{Read, ReadWrite, sql_expr::to_sql_preserving_precedence};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
@@ -24,7 +24,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{TableReference, project_schema},
+    common::{TableReference, project_schema, utils::quote_identifier},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -191,7 +191,6 @@ impl std::fmt::Debug for FlightTable {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
         name: &'static str,
@@ -209,11 +208,11 @@ impl FlightTable {
 
         Ok(Self {
             name,
+            join_push_down_context,
             client: client.clone(),
             schema,
-            table_reference,
             dialect,
-            join_push_down_context,
+            table_reference,
         })
     }
 
@@ -234,11 +233,11 @@ impl FlightTable {
 
         Self {
             name,
-            client: client.clone(),
-            schema,
-            table_reference,
-            dialect,
             join_push_down_context,
+            client,
+            schema,
+            dialect,
+            table_reference,
         }
     }
 
@@ -355,8 +354,12 @@ impl TableProvider for FlightTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+            match to_sql_preserving_precedence(filter) {
+                Ok(_) => {
+                    // Keep remote filtering for performance, but mark it inexact so
+                    // DataFusion re-applies the predicate locally for correctness.
+                    filter_push_down.push(TableProviderFilterPushDown::Inexact);
+                }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
@@ -415,7 +418,7 @@ impl FlightExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -430,7 +433,7 @@ impl FlightExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| to_sql_preserving_precedence(f).map(|sql| format!("({sql})")))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
@@ -499,7 +502,6 @@ impl ExecutionPlan for FlightExec {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     client: FlightClient,
     sql: String,
@@ -521,7 +523,6 @@ fn query_to_stream(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: Error) -> DataFusionError {
     match e {
         Error::Flight { source } => match source {

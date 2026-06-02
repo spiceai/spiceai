@@ -17,17 +17,18 @@ limitations under the License.
 use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+        ChatCompletionStreamResponseDelta, CompletionTokensDetails, CompletionUsage,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, FunctionType,
+        PromptTokensDetails, Role,
     },
 };
 use futures::{Stream, StreamExt};
 use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::Mutex;
 
@@ -74,6 +75,10 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse(ContentBlockToolUse),
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 impl ContentBlock {
@@ -93,12 +98,21 @@ impl ContentBlock {
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                         index: 0,
                         id: Some(id),
-                        r#type: Some(ChatCompletionToolType::Function),
+                        r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
                             name: Some(name),
                             arguments: None,
                         }),
                     }]),
+                    refusal: None,
+                    role: None,
+                }
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
                     refusal: None,
                     role: None,
                 }
@@ -152,7 +166,7 @@ impl Delta {
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                     index: 0,
                     id: Some(id.clone()),
-                    r#type: Some(ChatCompletionToolType::Function),
+                    r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
@@ -185,60 +199,6 @@ impl Delta {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct AnthropicStreamError {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub error: ErrorPayload,
-}
-
-impl fmt::Display for AnthropicStreamError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "AnthropicStreamError: {:?}", self.error)
-    }
-}
-
-impl From<reqwest_eventsource::Error> for AnthropicStreamError {
-    fn from(e: reqwest_eventsource::Error) -> Self {
-        let message = if let reqwest_eventsource::Error::InvalidStatusCode(
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            _,
-        ) = &e
-        {
-            "Anthropic API limit exceeded. Check limits: https://console.anthropic.com/settings/limits.".to_string()
-        } else {
-            e.to_string()
-        };
-
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "reqwest_eventsource_error".to_string(),
-                message,
-            },
-        }
-    }
-}
-
-impl From<serde_json::Error> for AnthropicStreamError {
-    fn from(e: serde_json::Error) -> Self {
-        AnthropicStreamError {
-            event_type: "error".to_string(),
-            error: ErrorPayload {
-                error_type: "serde_json_error".to_string(),
-                message: e.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ErrorPayload {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
     pub stop_sequence: Option<String>,
@@ -259,11 +219,8 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
-#[allow(clippy::too_many_lines)]
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -302,13 +259,7 @@ pub fn transform_stream(
                     }) => {
                         state.role = MessageRole::from_opt(&inner_role);
                         state.id = Some(inner_id);
-                        state.usage = Some(CompletionUsage {
-                            prompt_tokens: inner_usage.input_tokens,
-                            completion_tokens: inner_usage.output_tokens,
-                            total_tokens: inner_usage.input_tokens + inner_usage.output_tokens,
-                            prompt_tokens_details: None,
-                            completion_tokens_details: None,
-                        });
+                        state.usage = Some(inner_usage.into());
                         state.model = Some(model);
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -362,9 +313,7 @@ pub fn transform_stream(
                     }) => {
                         // Update usage
                         if let Some(ref mut u) = state.usage {
-                            u.prompt_tokens += inner_usage.input_tokens;
-                            u.completion_tokens += inner_usage.output_tokens;
-                            u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
+                            add_usage_delta(u, inner_usage);
                         }
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
@@ -374,11 +323,17 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: match stop_reason {
-                                    Some(StopReason::EndTurn | StopReason::StopSequence) => {
-                                        Some(FinishReason::Stop)
-                                    }
-                                    Some(StopReason::MaxTokens) => Some(FinishReason::Length),
+                                    Some(
+                                        StopReason::EndTurn
+                                        | StopReason::StopSequence
+                                        | StopReason::PauseTurn,
+                                    ) => Some(FinishReason::Stop),
+                                    Some(
+                                        StopReason::MaxTokens
+                                        | StopReason::ModelContextWindowExceeded,
+                                    ) => Some(FinishReason::Length),
                                     Some(StopReason::ToolUse) => Some(FinishReason::ToolCalls),
+                                    Some(StopReason::Refusal) => Some(FinishReason::ContentFilter),
                                     None => None,
                                 },
                                 delta: ChatCompletionStreamResponseDelta {
@@ -397,13 +352,12 @@ pub fn transform_stream(
                         | MessageCreateStreamResponse::MessageStop,
                     ) => None,
                     Err(e) => {
-                        tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
-                            message: e.error.message,
-                            r#type: Some("AnthropicStreamError".to_string()),
-                            param: None,
-                            code: None,
-                        })))
+                        let formatted_error = format_anthropic_stream_error(e);
+                        tracing::debug!(
+                            "Received an anthropic error stream packet: {:?}",
+                            formatted_error
+                        );
+                        Some(Err(formatted_error))
                     }
                 }
             }
@@ -415,6 +369,109 @@ pub fn transform_stream(
         });
 
     Box::pin(transformed_stream)
+}
+
+fn add_usage_delta(usage: &mut CompletionUsage, delta: Usage) {
+    let delta = CompletionUsage::from(delta);
+
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(delta.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(delta.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(delta.total_tokens);
+    usage.prompt_tokens_details = combine_prompt_token_details(
+        usage.prompt_tokens_details.take(),
+        delta.prompt_tokens_details,
+    );
+    usage.completion_tokens_details = combine_completion_token_details(
+        usage.completion_tokens_details.take(),
+        delta.completion_tokens_details,
+    );
+}
+
+fn combine_prompt_token_details(
+    current: Option<PromptTokensDetails>,
+    delta: Option<PromptTokensDetails>,
+) -> Option<PromptTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(PromptTokensDetails {
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            cached_tokens: combine_opt_u32(current.cached_tokens, delta.cached_tokens),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_completion_token_details(
+    current: Option<CompletionTokensDetails>,
+    delta: Option<CompletionTokensDetails>,
+) -> Option<CompletionTokensDetails> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(CompletionTokensDetails {
+            accepted_prediction_tokens: combine_opt_u32(
+                current.accepted_prediction_tokens,
+                delta.accepted_prediction_tokens,
+            ),
+            audio_tokens: combine_opt_u32(current.audio_tokens, delta.audio_tokens),
+            reasoning_tokens: combine_opt_u32(current.reasoning_tokens, delta.reasoning_tokens),
+            rejected_prediction_tokens: combine_opt_u32(
+                current.rejected_prediction_tokens,
+                delta.rejected_prediction_tokens,
+            ),
+        }),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn combine_opt_u32(current: Option<u32>, delta: Option<u32>) -> Option<u32> {
+    match (current, delta) {
+        (Some(current), Some(delta)) => Some(current.saturating_add(delta)),
+        (Some(current), None) => Some(current),
+        (None, Some(delta)) => Some(delta),
+        (None, None) => None,
+    }
+}
+
+fn format_anthropic_stream_error(error: OpenAIError) -> OpenAIError {
+    let OpenAIError::ApiError(api_error) = error else {
+        return error;
+    };
+
+    let lowered = api_error.message.to_lowercase();
+
+    if lowered.contains("too many requests") || lowered.contains("429") {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic API rate limit exceeded. Check your limits at https://console.anthropic.com/settings/limits and retry shortly.".to_string(),
+            r#type: Some("AnthropicRateLimitError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    if lowered.contains("401")
+        || lowered.contains("403")
+        || lowered.contains("authentication")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+    {
+        return OpenAIError::ApiError(ApiError {
+            message: "Anthropic authentication failed. Verify your Anthropic API key and workspace permissions.".to_string(),
+            r#type: Some("AnthropicAuthenticationError".to_string()),
+            param: api_error.param,
+            code: api_error.code,
+        });
+    }
+
+    OpenAIError::ApiError(ApiError {
+        message: format!("Anthropic streaming error: {}", api_error.message),
+        r#type: Some("AnthropicStreamError".to_string()),
+        param: api_error.param,
+        code: api_error.code,
+    })
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
@@ -430,4 +487,84 @@ fn create_anthropic_stream_response(
     };
 
     crate::streaming_utils::create_stream_response(id, model, choices, usage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_delta_accumulates_cache_tokens() {
+        let mut usage = Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_read_input_tokens: Some(3),
+            ..Usage::default()
+        }
+        .into();
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 4,
+                cache_creation_input_tokens: Some(5),
+                cache_read_input_tokens: Some(7),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, 27);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 32);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn usage_delta_saturates_token_counts() {
+        let mut usage = CompletionUsage {
+            prompt_tokens: u32::MAX - 1,
+            completion_tokens: u32::MAX - 1,
+            total_tokens: u32::MAX - 1,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(u32::MAX - 1),
+                audio_tokens: Some(u32::MAX - 1),
+            }),
+            completion_tokens_details: None,
+        };
+
+        add_usage_delta(
+            &mut usage,
+            Usage {
+                input_tokens: 2,
+                output_tokens: 2,
+                cache_read_input_tokens: Some(2),
+                ..Usage::default()
+            },
+        );
+
+        assert_eq!(usage.prompt_tokens, u32::MAX);
+        assert_eq!(usage.completion_tokens, u32::MAX);
+        assert_eq!(usage.total_tokens, u32::MAX);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.audio_tokens),
+            Some(u32::MAX - 1)
+        );
+    }
 }

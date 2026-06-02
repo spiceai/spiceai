@@ -1,0 +1,289 @@
+[package]
+authors = ["Spice.ai OSS Authors"]
+description = "Cayenne: A lakehouse format using SQLite or Turso for metadata and Vortex files for data storage"
+edition = "2024"
+license = "Apache-2.0"
+name = "cayenne"
+repository = "https://github.com/spiceai/spiceai"
+version.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+arrow = { workspace = true }
+arrow_tools = { path = "../arrow_tools" }
+datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
+regex = "1.12.3"
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+base64.workspace = true
+bytes = { workspace = true }
+chrono = { workspace = true }
+data_components = { path = "../data_components" }
+datafusion = { workspace = true }
+datafusion-catalog = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-execution = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-table-providers = { workspace = true }
+futures = { workspace = true }
+hash-index = { path = "../hash-index" }
+object_store = { workspace = true }
+parking_lot = { workspace = true }
+roaring = { workspace = true }
+runtime-datafusion = { path = "../runtime-datafusion" }
+runtime-table-partition = { path = "../runtime-table-partition", optional = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+telemetry = { path = "../telemetry" }
+tokio-rusqlite = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
+tracing = { workspace = true }
+turso = { workspace = true, optional = true }
+turso-shared = { workspace = true }
+url = { workspace = true }
+util = { path = "../util", features = ["datafusion"] }
+uuid = { workspace = true, features = ["v7"] }
+flatbuffers = { workspace = true }
+vortex = { workspace = true }
+vortex-datafusion = { workspace = true }
+vortex-scan = { workspace = true }
+vortex-session = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"], optional = true }
+# Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
+[target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
+aegis = { version = "0.9.3", default-features = false, features = [
+    "std",
+    "pure-rust",
+] }
+
+[features]
+default = []
+turso = ["dep:turso"]
+partition-table-provider = ["dep:runtime-table-partition"]
+duckdb-bench = ["dep:duckdb"]
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
+datafusion-federation.workspace = true
+datafusion-functions = { workspace = true }
+insta = { workspace = true, features = ["json"] }
+paste.workspace = true
+rstest = "0.26.1"
+tempfile = { workspace = true }
+test-framework = { path = "../test-framework" }
+test-log = { version = "0.2", features = ["trace"] }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "fs"] }
+tokio-stream = { workspace = true }
+
+[[bench]]
+harness = false
+name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "deletion_strategies"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe"
+
+[[bench]]
+harness = false
+name = "position_vs_key_deletion_scan"
+
+[[bench]]
+harness = false
+name = "mutation_writer"
+
+[[bench]]
+harness = false
+name = "listing_fence_overhead"
+
+[[bench]]
+harness = false
+name = "sorted_append_overhead"
+
+[[bench]]
+harness = false
+name = "inner_join_sort_merge_rewrite"
+
+[[bench]]
+harness = false
+name = "staging_move_concurrency"
+
+[[bench]]
+harness = false
+name = "column_stats_contention"
+
+[[bench]]
+harness = false
+name = "checkpoint_fence_stall"
+
+[[bench]]
+harness = false
+name = "metastore_connection_contention"
+
+[[bench]]
+harness = false
+name = "stats_persistence_rpc_ceiling"
+
+[[bench]]
+harness = false
+name = "apply_partial_deletion_filter_per_scan"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_rpc_ceiling"
+
+[[bench]]
+harness = false
+name = "validate_on_conflict_buffering"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_per_row_alloc"
+
+[[bench]]
+harness = false
+name = "compaction_sort_serialization"
+
+[[bench]]
+harness = false
+name = "inline_memtable_read_overhead"
+
+[[bench]]
+harness = false
+name = "inline_upsert_rewrite_overhead"
+
+[[bench]]
+harness = false
+name = "cached_table_statistics_wide"
+
+[[bench]]
+harness = false
+name = "deletion_index_extend_map_clone"
+
+[[bench]]
+harness = false
+name = "deletion_vector_bitmap_to_treemap"
+
+[[bench]]
+harness = false
+name = "wide_table_key_probe_scan"
+
+[[bench]]
+harness = false
+name = "load_existing_keyset_cap_disabled"
+
+[[bench]]
+harness = false
+name = "vs_duckdb_in_list_delete"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_ingest"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_pk_lookup"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_delete"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_burst"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_upsert"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_upsert_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_groupby"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_join"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_concurrent"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "compaction_picker"
+
+[[bench]]
+harness = false
+name = "scan_listing_cache_invalidation"
+
+[[bench]]
+harness = false
+name = "int64_pk_filter_keep_mask_alloc"
+
+[[bench]]
+harness = false
+name = "position_delete_redundant_walks"
+
+[[bench]]
+harness = false
+name = "apply_partial_filter_empty_alloc"
+
+[[bench]]
+harness = false
+name = "pk_lookup_file_group_fanout"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_lookup_session_cache_warmup"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "pk_in_list_vs_range_rewrite"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "get_max_delete_sequence_walk"
+
+[[bench]]
+harness = false
+name = "apply_on_conflict_keys_double_clone"

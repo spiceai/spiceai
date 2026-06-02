@@ -23,22 +23,26 @@ use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
-use iceberg::{TableIdent, io::CustomAwsCredentialLoader};
+use iceberg::{Catalog, TableIdent, io::StorageFactory};
 use iceberg_datafusion::IcebergTableProvider;
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
+use util::concat_arrays;
+
+#[cfg(feature = "iceberg-write")]
+use iceberg::NamespaceIdent;
 
 use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
-        parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
+        parse_hadoop_table_url, parse_table_url, s3_scheme_from_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
         ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError as Error,
-        parameters::aws::load_config,
+        parameters::aws::initiate_config_with_credentials,
     },
-    model::params::concat_arrays,
     parameters::{ParameterSpec, Parameters},
 };
 
@@ -100,6 +104,17 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
     }
 }
 
+/// Holds the components needed for both read and read-write Iceberg providers.
+struct IcebergTableParts {
+    provider: Arc<dyn TableProvider>,
+    #[cfg(feature = "iceberg-write")]
+    catalog: Arc<dyn Catalog>,
+    #[cfg(feature = "iceberg-write")]
+    namespace: NamespaceIdent,
+    #[cfg(feature = "iceberg-write")]
+    table_name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct IcebergDataConnector {
     params: Parameters,
@@ -113,11 +128,20 @@ impl IcebergDataConnector {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn create_iceberg_table_provider(
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let parts = self.create_iceberg_table_parts(dataset).await?;
+        Ok(parts.provider)
+    }
+
+    /// Creates the Iceberg table provider along with the catalog, namespace, and table name.
+    /// This is used by `read_write_provider` to create a deletion-capable wrapper.
+    async fn create_iceberg_table_parts(
+        &self,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
 
         let mut props = HashMap::new();
@@ -129,49 +153,60 @@ impl IcebergDataConnector {
             }
         }
 
-        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
-            verify_s3_endpoint(endpoint)
+        let storage_factory: Option<Arc<dyn StorageFactory>> =
+            if let Some(endpoint) = props.get("s3.endpoint") {
+                verify_s3_endpoint(endpoint)
+                    .await
+                    .map_err(|e| Error::InvalidConfiguration {
+                        dataconnector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: Box::new(e),
+                    })?;
+
+                let aws_sdk_config = initiate_config_with_credentials(
+                    "IcebergDataConnector",
+                    "s3_region",
+                    "s3_access_key_id",
+                    "s3_secret_access_key",
+                    "s3_session_token",
+                    &self.params,
+                    self.params.get("s3_iam_role_source").expose().ok(),
+                )
                 .await
                 .map_err(|e| Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
                     message: e.to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
-                })?;
+                })?
+                .load()
+                .await;
 
-            let aws_sdk_config = load_config(
-                "IcebergDataConnector",
-                "s3_region",
-                "s3_access_key_id",
-                "s3_secret_access_key",
-                "s3_session_token",
-                &self.params,
-            )
-            .await
-            .map_err(|e| Error::InvalidConfiguration {
-                dataconnector: "iceberg".into(),
-                message: e.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
-
-            Some(
-                S3CredentialProvider::from_config(&aws_sdk_config)
+                let custom_loader = S3CredentialProvider::from_config(&aws_sdk_config)
                     .map_err(|e| Error::InvalidConfiguration {
                         dataconnector: "iceberg".into(),
                         message: e.to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         source: Box::new(e),
                     })?
-                    .into_custom_loader(),
-            )
-        } else {
-            None
-        };
+                    .into_custom_loader();
+
+                let configured_scheme = s3_scheme_from_url(source);
+
+                Some(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme,
+                    customized_credential_load: Some(custom_loader),
+                }) as Arc<dyn StorageFactory>)
+            } else {
+                None
+            };
 
         if source.starts_with("file://")
             || source.starts_with("s3://")
             || source.starts_with("s3a://")
+            || source.starts_with("gs://")
+            || source.starts_with("gcs://")
         {
             let metadata_mode = self
                 .params
@@ -182,7 +217,7 @@ impl IcebergDataConnector {
 
             return IcebergDataConnector::load_hadoop_catalog(
                 props,
-                custom_credential_loader,
+                storage_factory,
                 dataset,
                 source,
                 metadata_mode,
@@ -212,25 +247,7 @@ impl IcebergDataConnector {
 
         props.extend(new_props);
 
-        let mut catalog_client = get_rest_catalog(base_uri, props).await.map_err(|e| {
-            Error::UnableToGetReadProvider {
-                dataconnector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
-        if let Some(custom_loader) = custom_credential_loader {
-            catalog_client = catalog_client.with_file_io_extension(custom_loader);
-        }
-
-        let catalog_client = Arc::new(catalog_client);
-
-        // Load the specific table
-        let namespace_ident = namespace.name().clone();
-        let table_identifier = TableIdent::new(namespace_ident, table_name);
-
-        // Create a DataFusion TableProvider from the Iceberg table
-        let table_provider = IcebergTableProvider::try_new(catalog_client, table_identifier)
+        let catalog_client = get_rest_catalog(base_uri, props, storage_factory.clone())
             .await
             .map_err(|e| Error::UnableToGetReadProvider {
                 dataconnector: "iceberg".into(),
@@ -238,60 +255,117 @@ impl IcebergDataConnector {
                 source: Box::new(e),
             })?;
 
-        Ok(Arc::new(table_provider))
+        let catalog_client: Arc<dyn Catalog> = Arc::new(catalog_client);
+
+        // Load the specific table
+        let namespace_ident = namespace.name().clone();
+        let table_identifier = TableIdent::new(namespace_ident, table_name.clone());
+
+        // Create IcebergTableProvider with catalog reference for read/write support
+        let table_provider = IcebergTableProvider::try_new(
+            Arc::clone(&catalog_client),
+            table_identifier.namespace().clone(),
+            table_identifier.name().to_string(),
+        )
+        .await
+        .map_err(|e| Error::UnableToGetReadProvider {
+            dataconnector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
+
+        Ok(IcebergTableParts {
+            provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
+            catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
+            namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
+            table_name,
+        })
     }
 
     async fn load_hadoop_catalog(
         props: HashMap<String, String>,
-        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
         dataset: &Dataset,
         source: &str,
         metadata_mode: MetadataMode,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<IcebergTableParts> {
         let (base_uri, namespace, table_name) = parse_hadoop_table_url(source, None).map_err(|e| {
                 Error::InvalidConfiguration {
                     dataconnector: "iceberg".into(),
-                    message: format!(
-                        "A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name> or s3://<bucket>/<namespace>/<table_name>.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from\n{e}"
-                    ),
+                    message: format!("A Dataset Path is required for Iceberg in the format of: file:///tmp/hadoop_warehouse/<namespace>/<table_name>, s3://<bucket>/<namespace>/<table_name>, gs://<bucket>/<namespace>/<table_name>, or gcs://<bucket>/<namespace>/<table_name>. For details, visit: https://spiceai.org/docs/components/data-connectors/iceberg#from. {e}"),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
                 }
             })?;
 
         // Load the specific table
+        #[cfg(feature = "iceberg-write")]
+        let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 
-        let mut catalog_builder = HadoopCatalogBuilder::default()
+        // Determine storage factory from scheme if not explicitly provided
+        let factory = storage_factory.unwrap_or_else(|| {
+            if source.starts_with("gs://") || source.starts_with("gcs://") {
+                Arc::new(OpenDalStorageFactory::Gcs)
+            } else if source.starts_with("s3://") || source.starts_with("s3a://") {
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: s3_scheme_from_url(source),
+                    customized_credential_load: None,
+                })
+            } else {
+                Arc::new(iceberg::io::LocalFsStorageFactory) as Arc<dyn StorageFactory>
+            }
+        });
+
+        // Build an opendal operator for directory listing (scoped to the warehouse root, not the table URL)
+        let operator = crate::catalogconnector::iceberg::build_opendal_operator(&base_uri, &props)
+            .map_err(|e| Error::UnableToGetReadProvider {
+                dataconnector: "iceberg".into(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })?;
+
+        let catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(base_uri)
             .with_metadata_mode(metadata_mode)
+            .with_storage_factory(factory)
+            .with_operator(operator)
             .with_properties(props);
 
-        if let Some(custom_loader) = custom_credential_loader {
-            catalog_builder = catalog_builder.with_file_io_extension(custom_loader);
-        }
-
-        let catalog_client =
-            catalog_builder
-                .build()
-                .await
-                .map_err(|e| Error::UnableToGetReadProvider {
+        let catalog_client: Arc<dyn Catalog> =
+            Arc::new(catalog_builder.build().await.map_err(|e| {
+                Error::UnableToGetReadProvider {
                     dataconnector: "iceberg".into(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
-                })?;
+                }
+            })?);
 
-        // Create a DataFusion TableProvider from the Iceberg table
-        let table_provider =
-            IcebergTableProvider::try_new(Arc::new(catalog_client), table_identifier)
-                .await
-                .map_err(|e| Error::UnableToGetReadProvider {
-                    dataconnector: "iceberg".into(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                })?;
+        // Create IcebergTableProvider with catalog reference for read/write support
+        let table_provider = IcebergTableProvider::try_new(
+            Arc::clone(&catalog_client),
+            table_identifier.namespace().clone(),
+            table_identifier.name().to_string(),
+        )
+        .await
+        .map_err(|e| Error::UnableToGetReadProvider {
+            dataconnector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
 
-        Ok(Arc::new(table_provider))
+        Ok(IcebergTableParts {
+            provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
+            catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
+            namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
+            table_name: table_name_str,
+        })
     }
 }
 
@@ -313,7 +387,21 @@ impl DataConnector for IcebergDataConnector {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        // Iceberg supports read and write operations through the same TableProvider interface.
-        Some(self.create_iceberg_table_provider(dataset).await)
+        // Create the table parts which include catalog + identity for delete support
+        let parts = match self.create_iceberg_table_parts(dataset).await {
+            Ok(parts) => parts,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Wrap in IcebergDeletionProvider for DELETE FROM support.
+        let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
+            parts.catalog,
+            parts.namespace,
+            parts.table_name,
+            parts.provider,
+        );
+        Some(Ok(Arc::new(deletion_provider)))
     }
 }
+
+register_data_connector!("iceberg", IcebergDataConnectorFactory);

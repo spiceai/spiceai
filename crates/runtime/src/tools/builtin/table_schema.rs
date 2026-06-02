@@ -22,16 +22,17 @@ use arrow_schema::{Field, Schema};
 use arrow_tools::format::table_schemas_to_markdown_table;
 use async_openai::{
     error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
-        ChatCompletionToolType, FunctionCall,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestToolMessageContent, FunctionCall,
     },
 };
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::{error::DataFusionError, sql::TableReference};
 use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -74,6 +75,8 @@ pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
     rt: Arc<Runtime>,
+
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl TableSchemaTool {
@@ -83,11 +86,18 @@ impl TableSchemaTool {
             name: name.unwrap_or("table_schema").to_string(),
             description: Some(
                 description
-                    .unwrap_or("Retrieve the schema of all available SQL tables")
+                    .unwrap_or("Return the column schema of one or more datasets. Call this before writing a `sql` query so you know exact column names, types, nullability, and (with `output=full`) descriptions and semantic metadata. Pass `tables` as fully-qualified names from `list_datasets`. `output` is `full` (default, includes metadata) or `minimal` (names + types only).")
                     .to_string(),
             ),
             rt,
+            table_allowlist: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
     }
 
     pub async fn get_schema(
@@ -98,13 +108,13 @@ impl TableSchemaTool {
         let TableSchemaToolParams { tables, output } = req;
 
         // Precompute extra column details only if needed (for `full` output).
-        let column_info = match (output, self.rt.app.read().await.clone()) {
+        let column_info = match (output, self.rt.read_app().await) {
             (OutputType::Full, Some(app)) => tables
                 .iter()
                 .map(|t| {
                     let tbl = TableReference::parse_str(t);
                     let cols = Self::table_column_information_for_table(&tbl, &Arc::clone(&app));
-                    (tbl.clone(), cols)
+                    (tbl, cols)
                 })
                 .collect_vec(),
             _ => vec![],
@@ -115,6 +125,14 @@ impl TableSchemaTool {
                 let mut table_schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
 
                 for (i, t) in tables.iter().enumerate() {
+                    if self.table_allowlist.as_ref().is_some_and(|list| {
+                        !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
+                    }) {
+                        return Err(crate::datafusion::Error::UnableToGetTable {
+                            source: DataFusionError::Plan(format!("No table named {t}")),
+                        })
+                        .boxed();
+                    }
                     let base_schema = self
                         .rt
                         .datafusion()
@@ -143,7 +161,7 @@ impl TableSchemaTool {
                                                     f.data_type().clone(),
                                                     f.is_nullable(),
                                                 )
-                                                .with_metadata(c.metadata().clone()),
+                                                .with_metadata(c.metadata()),
                                             ),
                                             None => Arc::clone(f),
                                         }
@@ -157,7 +175,7 @@ impl TableSchemaTool {
                         }
                     };
 
-                    table_schemas.push((t.to_string(), schema));
+                    table_schemas.push((t.clone(), schema));
                 }
 
                 Ok(table_schemas)
@@ -221,16 +239,16 @@ impl TableSchemaTool {
         params: &TableSchemaToolParams,
     ) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
         ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(vec![ChatCompletionMessageToolCall {
-                id: id.to_string(),
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionCall {
-                    name: self.name().to_string(),
-                    arguments: serde_json::to_string(&params)
-                        .map_err(OpenAIError::JSONDeserialize)?
-                        .to_string(),
+            .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: id.to_string(),
+                    function: FunctionCall {
+                        name: self.name().to_string(),
+                        arguments: serde_json::to_string(&params)
+                            .map_err(|e| OpenAIError::JSONDeserialize(e, String::new()))?,
+                    },
                 },
-            }])
+            )])
             .build()
     }
 }

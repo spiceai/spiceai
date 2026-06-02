@@ -18,7 +18,7 @@ use crate::embeddings::{
     Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
     candle::ModelConfig,
 };
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use hf_hub::{
     Repo, RepoType,
     api::tokio::{ApiBuilder, ApiRepo},
@@ -29,6 +29,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{self, Path, PathBuf},
+    sync::Arc,
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
@@ -85,7 +86,7 @@ pub(crate) fn position_offset(config: &ModelConfig) -> usize {
 /// Converts the `OpenAI` format to the TEI format
 pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     match input {
-        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.to_string())],
+        EmbeddingInput::String(s) => vec![EncodingInput::Single(s.clone())],
         EmbeddingInput::StringArray(arr) => arr
             .iter()
             .map(|s| EncodingInput::Single(s.clone()))
@@ -126,7 +127,7 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     Ok(api_repo)
 }
@@ -164,7 +165,7 @@ pub(crate) async fn download_hf_artifacts(
     revision: Option<&str>,
     hf_token: Option<&str>,
 ) -> Result<PathBuf> {
-    let api_repo = get_api(model_id, revision, hf_token)?;
+    let api_repo = Arc::new(get_api(model_id, revision, hf_token)?);
     let repo_url = api_repo.url("");
 
     tracing::trace!("Downloading artifacts for {repo_url}");
@@ -172,7 +173,7 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(&api_repo)
+    let _ = download_safetensors(Arc::clone(&api_repo))
         .await
         .context(FailedWithHFApiSnafu)?;
 
@@ -217,7 +218,7 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```
 ///
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()

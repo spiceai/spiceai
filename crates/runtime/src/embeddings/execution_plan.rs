@@ -15,14 +15,15 @@ limitations under the License.
 */
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, LargeStringArray, ListArray,
-    PrimitiveBuilder, RecordBatch, StringArray, StringViewArray,
+    Array, ArrayRef, FixedSizeListArray, FixedSizeListBuilder, GenericListArray, LargeListArray,
+    LargeStringArray, ListArray, OffsetSizeTrait, PrimitiveBuilder, RecordBatch, StringArray,
+    StringViewArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Float32Type, Int32Type, SchemaRef};
 
 use arrow::error::ArrowError;
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use async_stream::stream;
 use chunking::Chunker;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -41,7 +42,7 @@ use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc, thread};
 
-use super::table::EmbeddingColumnConfig;
+use super::table::{EmbeddingColumnConfig, EmbeddingInputMode};
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
 use rayon::ThreadPool;
@@ -259,6 +260,7 @@ pub(crate) async fn compute_additional_embedding_columns(
         let EmbeddingColumnConfig {
             model_name,
             chunker: chunker_opt,
+            input_mode,
             ..
         } = cfg;
         tracing::trace!("Embedding column '{col}' with model {model_name}");
@@ -275,6 +277,38 @@ pub(crate) async fn compute_additional_embedding_columns(
             tracing::debug!("When embedding col='{col}', column not found in record batch");
             continue;
         };
+
+        // Multi-vector path (list-of-strings source): decompose the
+        // list column into per-row strings, embed each, and rebuild as
+        // `List<FixedSizeList<F32, D>>`. No offsets column is emitted.
+        if let EmbeddingInputMode::ListMulti {
+            max_elements_per_row,
+            ..
+        } = *input_mode
+        {
+            let Some(rows) = decompose_list_of_strings(raw_data, max_elements_per_row) else {
+                tracing::warn!(
+                    "Expected a list-of-strings column for '{col}' in multi-vector mode, got {}",
+                    raw_data.data_type()
+                );
+                continue;
+            };
+
+            let list_array = if model.supports_sync_embeddings() {
+                let task_model = Arc::clone(model);
+                let vector_size = cfg.vector_size;
+                task::spawn_blocking(move || {
+                    get_vectors_per_list_element_in_process(rows, &task_model, vector_size)
+                })
+                .await??
+            } else {
+                get_vectors_per_list_element(rows, &**model, cfg.vector_size).await?
+            };
+
+            tracing::trace!("Successfully embedded column '{col}' in multi-vector mode");
+            embed_arrays.insert(embedding_col!(col), Arc::new(list_array) as ArrayRef);
+            continue;
+        }
 
         let Some(arr_iter) = convert_string_arrow_to_iterator!(raw_data) else {
             tracing::warn!(
@@ -350,11 +384,7 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///
 ///                 [`FixedSizeListArray`]
 /// ```
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
+#[expect(clippy::cast_sign_loss)]
 pub(super) async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
@@ -419,7 +449,7 @@ pub(super) async fn get_vectors(
 /// Similar to [`get_vectors`] but runs synchronously and processes embeddings in parallel
 /// across multiple threads using [`rayon::par_iter`]. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 pub(super) fn get_vectors_in_process(
     arr: Vec<Option<String>>,
     model: &Arc<dyn Embed>,
@@ -477,6 +507,286 @@ pub(super) fn get_vectors_in_process(
     Ok(builder.finish())
 }
 
+// ===== Multi-vector (list-of-strings) embedding path =====
+//
+// For list-typed source columns, each list element gets its own
+// embedding. The output Arrow shape is `List<FixedSizeList<F32, D>>`:
+// one outer list per row, inner element is one vector per source-list
+// element. See `EmbeddingInputMode::ListMulti` in `table.rs` for the
+// configuration contract, and `EmbeddingTable::embedding_fields` for
+// the schema.
+//
+// The search path at query time (M3) unnests these into per-element
+// rows and aggregates per-row scores via MaxSim / mean / sum.
+
+/// Per-row decomposition of a list-of-strings column.
+///  - Outer `None`: source row was null (produces an empty output list).
+///  - Inner `None`: element was null or empty (produces a null vector).
+///  - Inner `Some(s)`: element is a valid non-empty string to embed.
+type DecomposedListOfStrings = Vec<Option<Vec<Option<String>>>>;
+
+/// Decompose a list-of-strings Arrow column into owned per-row vecs,
+/// applying `max_elements_per_row` truncation. Returns `None` for
+/// unsupported input shapes (caller should emit a descriptive error).
+fn decompose_list_of_strings(
+    arr: &ArrayRef,
+    max_elements_per_row: usize,
+) -> Option<DecomposedListOfStrings> {
+    if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
+        return decompose_generic_list(list, max_elements_per_row);
+    }
+    if let Some(list) = arr.as_any().downcast_ref::<LargeListArray>() {
+        return decompose_generic_list(list, max_elements_per_row);
+    }
+    None
+}
+
+fn decompose_generic_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    max_elements_per_row: usize,
+) -> Option<DecomposedListOfStrings> {
+    let values = list.values();
+    let offsets = list.value_offsets();
+    let values_any = values.as_any();
+
+    if let Some(arr) = values_any.downcast_ref::<StringArray>() {
+        Some(build_rows(list, offsets, max_elements_per_row, |j| {
+            if arr.is_null(j) {
+                None
+            } else {
+                let v = arr.value(j);
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            }
+        }))
+    } else if let Some(arr) = values_any.downcast_ref::<LargeStringArray>() {
+        Some(build_rows(list, offsets, max_elements_per_row, |j| {
+            if arr.is_null(j) {
+                None
+            } else {
+                let v = arr.value(j);
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            }
+        }))
+    } else {
+        values_any.downcast_ref::<StringViewArray>().map(|arr| {
+            build_rows(list, offsets, max_elements_per_row, |j| {
+                if arr.is_null(j) {
+                    None
+                } else {
+                    let v = arr.value(j);
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                }
+            })
+        })
+    }
+}
+
+fn build_rows<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    offsets: &[O],
+    max_elements_per_row: usize,
+    get_str: impl Fn(usize) -> Option<String>,
+) -> DecomposedListOfStrings {
+    let mut rows = Vec::with_capacity(list.len());
+    let mut any_truncated = false;
+
+    for i in 0..list.len() {
+        if list.is_null(i) {
+            rows.push(None);
+            continue;
+        }
+        let start = offsets[i].as_usize();
+        let end = offsets[i + 1].as_usize();
+        let raw_len = end.saturating_sub(start);
+        let effective_end = if raw_len > max_elements_per_row {
+            any_truncated = true;
+            start + max_elements_per_row
+        } else {
+            end
+        };
+        let mut row = Vec::with_capacity(effective_end - start);
+        for j in start..effective_end {
+            row.push(get_str(j));
+        }
+        rows.push(Some(row));
+    }
+
+    if any_truncated {
+        tracing::warn!(
+            "Multi-vector column truncated to max_elements_per_row={max_elements_per_row}; excess elements dropped."
+        );
+    }
+    rows
+}
+
+/// Flatten a decomposed row set into: the strings to send to the
+/// embedding model, a per-row length (for outer list offsets), and a
+/// per-position validity flag (`true` = an embedding slot, `false` = a
+/// null-vector slot).
+fn flatten_rows_for_embedding(
+    rows: DecomposedListOfStrings,
+) -> (Vec<String>, Vec<Vec<bool>>, Vec<usize>) {
+    let mut flat: Vec<String> = Vec::new();
+    let mut validity: Vec<Vec<bool>> = Vec::with_capacity(rows.len());
+    let mut lengths: Vec<usize> = Vec::with_capacity(rows.len());
+
+    for row_opt in rows {
+        match row_opt {
+            None => {
+                lengths.push(0);
+                validity.push(Vec::new());
+            }
+            Some(elements) => {
+                let mut v = Vec::with_capacity(elements.len());
+                for elem in elements {
+                    match elem {
+                        Some(s) => {
+                            flat.push(s);
+                            v.push(true);
+                        }
+                        None => v.push(false),
+                    }
+                }
+                lengths.push(v.len());
+                validity.push(v);
+            }
+        }
+    }
+
+    (flat, validity, lengths)
+}
+
+/// Build the final `List<FixedSizeList<F32, D>>` output array from the
+/// flattened embeddings plus per-row length and per-position validity.
+#[expect(clippy::cast_sign_loss)]
+fn build_multi_vector_list_array(
+    positions_validity: &[Vec<bool>],
+    row_lengths: &[usize],
+    embedded: &[Vec<f32>],
+    vector_length: i32,
+) -> Result<ListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let total_elements: usize = row_lengths.iter().sum();
+
+    let mut inner_builder = FixedSizeListBuilder::with_capacity(
+        PrimitiveBuilder::<Float32Type>::with_capacity(total_elements * (vector_length as usize)),
+        vector_length,
+        total_elements,
+    )
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+
+    let expected_slots: usize = positions_validity
+        .iter()
+        .flat_map(|v| v.iter())
+        .filter(|&&valid| valid)
+        .count();
+    if embedded.len() != expected_slots {
+        return Err(format!(
+            "embedding count mismatch: expected {expected_slots} vectors but got {}",
+            embedded.len()
+        )
+        .into());
+    }
+
+    let expected_dims = vector_length as usize;
+    let mut embed_ptr: usize = 0;
+    for validity in positions_validity {
+        for &valid in validity {
+            if valid {
+                let vec = &embedded[embed_ptr];
+                if vec.len() != expected_dims {
+                    return Err(format!(
+                        "embedding vector length mismatch at index {embed_ptr}: expected {expected_dims} dimensions but got {}",
+                        vec.len()
+                    )
+                    .into());
+                }
+                inner_builder.values().append_slice(vec);
+                inner_builder.append(true);
+                embed_ptr += 1;
+            } else {
+                // The inner Float32 field is declared non-nullable; the
+                // outer FixedSizeList slot encodes nullness. Append
+                // placeholder zeros and mark only the parent slot null.
+                for _ in 0..expected_dims {
+                    inner_builder.values().append_value(0.0);
+                }
+                inner_builder.append(false);
+            }
+        }
+    }
+
+    let inner_field = Arc::new(Field::new_fixed_size_list(
+        "item",
+        Field::new("item", DataType::Float32, false),
+        vector_length,
+        true,
+    ));
+
+    let offsets = OffsetBuffer::<i32>::from_lengths(row_lengths.iter().copied());
+
+    Ok(ListArray::try_new(
+        inner_field,
+        offsets,
+        Arc::new(inner_builder.finish()),
+        None,
+    )?)
+}
+
+/// Embed each element of a list-of-strings column via the async
+/// [`Embed`] trait. Produces `List<FixedSizeList<F32, D>>`.
+pub(super) async fn get_vectors_per_list_element(
+    rows: DecomposedListOfStrings,
+    model: &dyn Embed,
+    vector_length: i32,
+) -> Result<ListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let (flat, validity, lengths) = flatten_rows_for_embedding(rows);
+
+    let embedded: Vec<Vec<f32>> = if flat.is_empty() {
+        Vec::new()
+    } else {
+        model.embed(EmbeddingInput::StringArray(flat)).await?
+    };
+
+    build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
+}
+
+/// Sync counterpart to [`get_vectors_per_list_element`], using rayon
+/// for in-process embedding models.
+pub(super) fn get_vectors_per_list_element_in_process(
+    rows: DecomposedListOfStrings,
+    model: &Arc<dyn Embed>,
+    vector_length: i32,
+) -> Result<ListArray, Box<dyn std::error::Error + Send + Sync>> {
+    let (flat, validity, lengths) = flatten_rows_for_embedding(rows);
+
+    let embedded: Vec<Vec<f32>> = if flat.is_empty() {
+        Vec::new()
+    } else {
+        let pool = build_embedding_pool(model.parallelism())?;
+        let batches = pool.install(|| {
+            flat.into_par_iter()
+                .chunks(32)
+                .map(|chunk| model.embed_sync(EmbeddingInput::StringArray(chunk)))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        batches.into_iter().flatten().collect()
+    };
+
+    build_multi_vector_list_array(&validity, &lengths, &embedded, vector_length)
+}
+
 /// Embed a [`StringArray`] using the provided [`Embed`] model and [`Chunker`]. The output is a [`ListArray`],
 /// where each input [`String`] gets chunked and embedded into a [`FixedSizeListArray`].
 ///
@@ -497,11 +807,6 @@ pub(super) fn get_vectors_in_process(
 ///                          | [[0, 10], [10, 21]]           |
 ///                          +-------------------------------+
 /// ```
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::too_many_lines
-)]
 async fn get_vectors_with_chunker(
     arr: impl Iterator<Item = Option<&str>>,
     chunker: Arc<dyn Chunker>,
@@ -548,11 +853,10 @@ async fn get_vectors_with_chunker(
             .boxed()?
     };
 
-    #[allow(clippy::cast_sign_loss)]
     let vector_length = model.size();
     let capacity = chunks_per_row.iter().sum();
 
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     let mut vectors_builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(capacity * (vector_length as usize)),
         vector_length,
@@ -569,11 +873,7 @@ async fn get_vectors_with_chunker(
 
     let mut lengths = Vec::with_capacity(chunks_per_row.len());
     let mut curr = 0;
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for chunkz_in_row in chunks_per_row {
         // Get the actual vectors
         for i in curr..curr + chunkz_in_row {
@@ -655,7 +955,7 @@ fn build_embedding_pool(
         .map_err(Into::into)
 }
 
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 #[cfg(test)]
 mod tests {
     use crate::embeddings::execution_plan::get_vectors;
@@ -663,7 +963,7 @@ mod tests {
         array::{Array, AsArray},
         datatypes::Float32Type,
     };
-    use async_openai::types::EmbeddingInput;
+    use async_openai::types::embeddings::EmbeddingInput;
     use async_trait::async_trait;
     use llms::embeddings::{self, Embed};
     use std::collections::HashMap;
@@ -756,6 +1056,274 @@ mod tests {
         assert_eq!(values.value(3), 0.4);
         assert_eq!(values.value(6), 0.1);
         assert_eq!(values.value(7), 0.2);
+
+        Ok(())
+    }
+
+    // ===== M2: multi-vector (per-list-element) embedding =====
+
+    use crate::embeddings::execution_plan::{
+        DecomposedListOfStrings, build_multi_vector_list_array, decompose_list_of_strings,
+        flatten_rows_for_embedding, get_vectors_per_list_element,
+    };
+    use arrow::array::{
+        ArrayRef, FixedSizeListArray, LargeListBuilder, ListBuilder, StringBuilder,
+    };
+    use std::sync::Arc;
+
+    fn mk_list_array(rows: &[Option<Vec<Option<&str>>>]) -> ArrayRef {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            match row {
+                None => builder.append(false),
+                Some(elements) => {
+                    for e in elements {
+                        match e {
+                            Some(s) => builder.values().append_value(s),
+                            None => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true);
+                }
+            }
+        }
+        Arc::new(builder.finish())
+    }
+
+    fn mk_large_list_array(rows: &[Option<Vec<Option<&str>>>]) -> ArrayRef {
+        let mut builder = LargeListBuilder::new(StringBuilder::new());
+        for row in rows {
+            match row {
+                None => builder.append(false),
+                Some(elements) => {
+                    for e in elements {
+                        match e {
+                            Some(s) => builder.values().append_value(s),
+                            None => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true);
+                }
+            }
+        }
+        Arc::new(builder.finish())
+    }
+
+    #[test]
+    fn test_decompose_list_of_strings_basic() {
+        let arr = mk_list_array(&[
+            Some(vec![Some("red"), Some("round")]),
+            Some(vec![Some("blue")]),
+        ]);
+        let rows = decompose_list_of_strings(&arr, 32).expect("list-of-strings supported");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].as_ref().expect("row 0 should be Some"),
+            &vec![Some("red".to_string()), Some("round".to_string())]
+        );
+        assert_eq!(
+            rows[1].as_ref().expect("row 1 should be Some"),
+            &vec![Some("blue".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_decompose_list_of_strings_null_row() {
+        let arr = mk_list_array(&[Some(vec![Some("a")]), None, Some(vec![Some("b")])]);
+        let rows = decompose_list_of_strings(&arr, 32).expect("ok");
+        assert!(rows[0].is_some());
+        assert!(rows[1].is_none());
+        assert!(rows[2].is_some());
+    }
+
+    #[test]
+    fn test_decompose_list_of_strings_null_and_empty_element() {
+        // Empty string and null element should both become None inside
+        // the row so the embedder isn't asked to embed them.
+        let arr = mk_list_array(&[Some(vec![Some("x"), Some(""), None, Some("y")])]);
+        let rows = decompose_list_of_strings(&arr, 32).expect("ok");
+        let row = rows[0].as_ref().expect("row 0 should be Some");
+        assert_eq!(
+            row,
+            &vec![Some("x".to_string()), None, None, Some("y".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_decompose_list_of_strings_truncates_to_cap() {
+        let arr = mk_list_array(&[Some(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            Some("d"),
+            Some("e"),
+        ])]);
+        let rows = decompose_list_of_strings(&arr, 2).expect("ok");
+        let row = rows[0].as_ref().expect("row 0 should be Some");
+        assert_eq!(row.len(), 2);
+        assert_eq!(row[0], Some("a".to_string()));
+        assert_eq!(row[1], Some("b".to_string()));
+    }
+
+    #[test]
+    fn test_decompose_large_list_of_strings() {
+        // LargeList must also be supported.
+        let arr = mk_large_list_array(&[Some(vec![Some("red"), Some("green")])]);
+        let rows = decompose_list_of_strings(&arr, 32).expect("LargeList supported");
+        assert_eq!(
+            rows[0].as_ref().expect("row 0 should be Some"),
+            &vec![Some("red".to_string()), Some("green".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_decompose_unsupported_type() {
+        let arr: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
+        let res = decompose_list_of_strings(&arr, 32);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_decompose_list_of_non_strings_rejected() {
+        // A `List<Int32>` column must be rejected at the decomposition
+        // boundary, not silently treated as an all-null multi-vector
+        // column.
+        use arrow::array::{Int32Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow_schema::{DataType, Field};
+        let values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let offsets = OffsetBuffer::<i32>::from_lengths([3usize]);
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list: ArrayRef = Arc::new(ListArray::new(field, offsets, Arc::new(values), None));
+        assert!(decompose_list_of_strings(&list, 32).is_none());
+    }
+
+    #[test]
+    fn test_flatten_rows_for_embedding_preserves_validity() {
+        let rows: DecomposedListOfStrings = vec![
+            Some(vec![Some("a".to_string()), None]),
+            None,
+            Some(vec![Some("b".to_string())]),
+        ];
+        let (flat, validity, lengths) = flatten_rows_for_embedding(rows);
+
+        assert_eq!(flat, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(validity, vec![vec![true, false], vec![], vec![true]]);
+        assert_eq!(lengths, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn test_build_multi_vector_list_array_shapes()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let validity = vec![vec![true, false], vec![], vec![true]];
+        let lengths = vec![2, 0, 1];
+        let embedded = vec![vec![0.1, 0.2], vec![0.9, 0.8]];
+        let out = build_multi_vector_list_array(&validity, &lengths, &embedded, 2)?;
+
+        assert_eq!(out.len(), 3);
+        // Row 0: two elements, second is null
+        let out_row0 = out.value(0);
+        let fsl0 = out_row0
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("row 0 should be FixedSizeListArray");
+        assert_eq!(fsl0.len(), 2);
+        assert!(!fsl0.is_null(0));
+        assert!(fsl0.is_null(1));
+
+        // Row 1: empty list
+        let out_row1 = out.value(1);
+        assert_eq!(out_row1.len(), 0);
+
+        // Row 2: single element
+        let out_row2 = out.value(2);
+        let fsl2 = out_row2
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("row 2 should be FixedSizeListArray");
+        assert_eq!(fsl2.len(), 1);
+        assert!(!fsl2.is_null(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_per_list_element_basic()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rows: DecomposedListOfStrings = vec![
+            Some(vec![Some("red".to_string()), Some("round".to_string())]),
+            Some(vec![Some("blue".to_string())]),
+        ];
+        let model = MockEmbedder::default()
+            .with_pair("red", vec![0.1, 0.2])
+            .with_pair("round", vec![0.3, 0.4])
+            .with_pair("blue", vec![0.5, 0.6]);
+        let out = get_vectors_per_list_element(rows, &model, 2).await?;
+
+        assert_eq!(out.len(), 2);
+        let out_row0 = out.value(0);
+        let fsl0 = out_row0
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("row 0 should be FixedSizeListArray");
+        assert_eq!(fsl0.len(), 2);
+        let v0 = fsl0.value(0);
+        let p0 = v0.as_primitive::<Float32Type>();
+        assert_eq!(p0.value(0), 0.1);
+        assert_eq!(p0.value(1), 0.2);
+        let v1 = fsl0.value(1);
+        let p1 = v1.as_primitive::<Float32Type>();
+        assert_eq!(p1.value(0), 0.3);
+        assert_eq!(p1.value(1), 0.4);
+
+        let out_row1 = out.value(1);
+        let fsl1 = out_row1
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("row 1 should be FixedSizeListArray");
+        assert_eq!(fsl1.len(), 1);
+        let v2 = fsl1.value(0);
+        let p2 = v2.as_primitive::<Float32Type>();
+        assert_eq!(p2.value(0), 0.5);
+        assert_eq!(p2.value(1), 0.6);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_vectors_per_list_element_mixed_nulls()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Null source row → empty output list.
+        // Null/empty string element → null vector in output.
+        let rows: DecomposedListOfStrings = vec![
+            None,
+            Some(vec![
+                Some("hello".to_string()),
+                None,
+                Some("world".to_string()),
+            ]),
+            Some(vec![]),
+        ];
+        let model = MockEmbedder::default()
+            .with_pair("hello", vec![1.0, 2.0])
+            .with_pair("world", vec![3.0, 4.0]);
+        let out = get_vectors_per_list_element(rows, &model, 2).await?;
+
+        assert_eq!(out.len(), 3);
+        // Row 0: null source → empty list
+        assert_eq!(out.value(0).len(), 0);
+        // Row 1: 3 elements, middle is null
+        let out_row1 = out.value(1);
+        let fsl1 = out_row1
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("row 1 should be FixedSizeListArray");
+        assert_eq!(fsl1.len(), 3);
+        assert!(!fsl1.is_null(0));
+        assert!(fsl1.is_null(1));
+        assert!(!fsl1.is_null(2));
+        // Row 2: empty input list → empty output list
+        assert_eq!(out.value(2).len(), 0);
 
         Ok(())
     }

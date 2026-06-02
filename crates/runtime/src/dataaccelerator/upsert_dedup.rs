@@ -1,0 +1,396 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! A wrapper `TableProvider` that applies deduplication to incoming batches
+//! before passing them to the underlying accelerator table provider.
+//!
+//! This handles the `UpsertDedup` `on_conflict` behavior by removing duplicate rows
+//! within incoming batches before they are inserted into the accelerator.
+
+use std::{any::Any, sync::Arc};
+
+use arrow::{compute::concat_batches, datatypes::SchemaRef};
+use async_trait::async_trait;
+use datafusion::{
+    catalog::Session,
+    common::Constraints,
+    datasource::TableProvider,
+    error::DataFusionError,
+    execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{Expr, TableType, dml::InsertOp},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, metrics::MetricsSet,
+        stream::RecordBatchStreamAdapter,
+    },
+};
+use datafusion_table_providers::util::constraints::UpsertOptions;
+use futures::StreamExt;
+
+/// A wrapper `TableProvider` that applies batch deduplication based on `UpsertOptions`
+/// before passing data to the underlying provider.
+///
+/// This is used to handle the `UpsertDedup` `on_conflict` behavior, which removes
+/// duplicate rows (based on primary key) from incoming batches before insertion.
+pub struct UpsertDedupTableProvider {
+    /// The underlying table provider for write and delete operations
+    inner: Arc<dyn TableProvider>,
+    /// Options controlling deduplication behavior
+    upsert_options: UpsertOptions,
+    /// Constraints for deduplication (e.g., primary key)
+    /// Stored explicitly because the inner provider may not expose constraints
+    constraints: Constraints,
+}
+
+impl UpsertDedupTableProvider {
+    /// Creates a new `UpsertDedupTableProvider` wrapping the given provider.
+    ///
+    /// # Arguments
+    /// * `inner` - The underlying table provider to wrap
+    /// * `upsert_options` - Options controlling deduplication behavior
+    /// * `constraints` - Constraints for deduplication (e.g., primary key)
+    #[must_use]
+    pub fn new(
+        inner: Arc<dyn TableProvider>,
+        upsert_options: UpsertOptions,
+        constraints: Constraints,
+    ) -> Self {
+        Self {
+            inner,
+            upsert_options,
+            constraints,
+        }
+    }
+
+    /// Returns true if deduplication is needed based on the upsert options.
+    fn needs_dedup(&self) -> bool {
+        self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins
+    }
+
+    /// Returns a reference to the inner table provider.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn TableProvider> {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for UpsertDedupTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpsertDedupTableProvider")
+            .field("upsert_options", &self.upsert_options)
+            .finish_non_exhaustive()
+    }
+}
+
+#[deny(clippy::missing_trait_methods)]
+#[async_trait]
+impl TableProvider for UpsertDedupTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn statistics(&self) -> Option<datafusion::common::Statistics> {
+        self.inner.statistics()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        if self.constraints.is_empty() {
+            None
+        } else {
+            Some(&self.constraints)
+        }
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        op: InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // If no deduplication is needed, pass through to the underlying provider
+        if !self.needs_dedup() {
+            return self.inner.insert_into(state, input, op).await;
+        }
+
+        // Get constraints from the underlying provider
+        let constraints = self.constraints().cloned().unwrap_or_default();
+
+        // If there are no constraints, no deduplication is possible
+        if constraints.is_empty() {
+            return self.inner.insert_into(state, input, op).await;
+        }
+
+        // Wrap the input with a deduplication execution plan
+        let dedup_exec = Arc::new(UpsertDedupExec::new(
+            input,
+            constraints,
+            self.upsert_options.clone(),
+        ));
+
+        self.inner.insert_into(state, dedup_exec, op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
+    fn get_logical_plan(
+        &self,
+    ) -> Option<std::borrow::Cow<'_, datafusion::logical_expr::LogicalPlan>> {
+        self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> datafusion::error::Result<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn Session,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.truncate(state).await
+    }
+}
+
+/// An execution plan that applies deduplication to batches before passing them downstream.
+#[derive(Debug)]
+struct UpsertDedupExec {
+    input: Arc<dyn ExecutionPlan>,
+    constraints: Constraints,
+    upsert_options: UpsertOptions,
+    properties: PlanProperties,
+}
+
+impl UpsertDedupExec {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        constraints: Constraints,
+        upsert_options: UpsertOptions,
+    ) -> Self {
+        let properties = input.properties().clone();
+        Self {
+            input,
+            constraints,
+            upsert_options,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for UpsertDedupExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "UpsertDedupExec: remove_duplicates={}, last_write_wins={}",
+                    self.upsert_options.remove_duplicates, self.upsert_options.last_write_wins
+                )
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for UpsertDedupExec {
+    fn name(&self) -> &'static str {
+        "UpsertDedupExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "UpsertDedupExec requires exactly one child".to_string(),
+            ));
+        }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            self.constraints.clone(),
+            self.upsert_options.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let schema = self.schema();
+        let constraints = self.constraints.clone();
+        let upsert_options = self.upsert_options.clone();
+
+        // Create a stream that validates constraints and applies deduplication to each batch.
+        // The validate_batch_with_constraints function handles both constraint validation and
+        // deduplication based on UpsertOptions (remove_duplicates, last_write_wins).
+        let stream_schema = Arc::clone(&schema);
+        let validated_stream = input_stream.then(move |batch_result| {
+            let constraints = constraints.clone();
+            let upsert_options = upsert_options.clone();
+            let schema = Arc::clone(&stream_schema);
+            async move {
+                let batch = batch_result?;
+
+                // Apply constraint validation
+                let validated_batches =
+                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
+                        vec![batch],
+                        &constraints,
+                        &upsert_options,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                // Concatenate all returned batches into a single batch.
+                // The validate_batch_with_constraints function may return multiple batches
+                // after deduplication (e.g., from df.collect()), so we need to merge them.
+                if validated_batches.is_empty() {
+                    return Err(DataFusionError::Internal(
+                        "Expected validated batch".to_string(),
+                    ));
+                }
+                concat_batches(&schema, &validated_batches)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            }
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            validated_stream,
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.input.metrics()
+    }
+}
+
+/// Extracts `UpsertOptions` from the command options.
+#[must_use]
+pub fn extract_upsert_options<S: std::hash::BuildHasher>(
+    options: &std::collections::HashMap<String, String, S>,
+) -> UpsertOptions {
+    let remove_duplicates = options
+        .get("upsert_remove_duplicates")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let last_write_wins = options
+        .get("upsert_last_write_wins")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    UpsertOptions {
+        remove_duplicates,
+        last_write_wins,
+    }
+}
+
+/// Wraps a table provider with upsert deduplication if needed based on the options.
+///
+/// Returns the original provider if deduplication is not needed.
+#[must_use]
+pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash::BuildHasher>(
+    provider: Arc<T>,
+    options: &std::collections::HashMap<String, String, S>,
+    constraints: Constraints,
+) -> Arc<dyn TableProvider> {
+    let upsert_options = extract_upsert_options(options);
+
+    if upsert_options.remove_duplicates || upsert_options.last_write_wins {
+        Arc::new(UpsertDedupTableProvider::new(
+            provider,
+            upsert_options,
+            constraints,
+        ))
+    } else {
+        provider
+    }
+}

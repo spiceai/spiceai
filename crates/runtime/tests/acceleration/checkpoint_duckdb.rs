@@ -32,7 +32,7 @@ use std::sync::Arc;
 use crate::{
     acceleration::get_params,
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 fn get_dataset() -> Dataset {
@@ -42,6 +42,7 @@ fn get_dataset() -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -77,13 +78,13 @@ async fn test_acceleration_duckdb_checkpoint() -> Result<(), anyhow::Error> {
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

@@ -37,7 +37,7 @@ impl RateLimits {
 impl Default for RateLimits {
     fn default() -> Self {
         Self {
-            // Allow 100 Flight DoPut requests every 60 seconds by default
+            // Allow 100 Flight `DoPut` requests every 60 seconds by default
             flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
                 unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
             })),

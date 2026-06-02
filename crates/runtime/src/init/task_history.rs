@@ -14,65 +14,149 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::DistributedNode;
 use crate::{
     Error, Result, Runtime, UnableToCreateBackendSnafu, datafusion::SPICE_RUNTIME_SCHEMA,
     task_history,
 };
+use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
+use std::fmt::Write;
 use std::sync::Arc;
 
 impl Runtime {
     pub async fn init_task_history(self: Arc<Self>) -> Result<()> {
-        let app = self.app.read().await;
+        // Skip task history initialization if there's no valid spicepod
+        // Task history requires App infrastructure (datasets, table providers) to function
+        let Some(app) = self.read_app().await else {
+            tracing::debug!(
+                "Task history initialization skipped: no valid spicepod configuration."
+            );
+            return Ok(());
+        };
 
-        if let Some(app) = app.as_ref()
-            && !app.runtime.task_history.enabled
-        {
+        if !app.runtime.task_history.enabled {
             tracing::debug!("Task history is disabled via configuration.");
             return Ok(());
         }
 
-        let (retention_period_secs, retention_check_interval_secs) = match app.as_ref() {
-            Some(app) => (
-                app.runtime
-                    .task_history
-                    .retention_period_as_secs()
-                    .map_err(|e| Error::UnableToTrackTaskHistory {
-                        source: task_history::Error::InvalidConfiguration { source: e }, // keeping the spicepod detached but still want to return snafu errors
-                    })?,
-                app.runtime
-                    .task_history
-                    .retention_check_interval_as_secs()
-                    .map_err(|e| Error::UnableToTrackTaskHistory {
-                        source: task_history::Error::InvalidConfiguration { source: e },
-                    })?,
-            ),
-            None => (
-                task_history::DEFAULT_TASK_HISTORY_RETENTION_PERIOD_SECS,
-                task_history::DEFAULT_TASK_HISTORY_RETENTION_CHECK_INTERVAL_SECS,
-            ),
-        };
+        let retention_period_secs = app
+            .runtime
+            .task_history
+            .retention_period_as_secs()
+            .map_err(|e| Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration { source: e },
+            })?;
 
-        match task_history::TaskSpan::instantiate_table(
+        let retention_check_interval_secs = app
+            .runtime
+            .task_history
+            .retention_check_interval_as_secs()
+            .map_err(|e| Error::UnableToTrackTaskHistory {
+                source: task_history::Error::InvalidConfiguration { source: e },
+            })?;
+
+        // Log task history configuration details
+        let mut config_details = format!(
+            "Task history enabled: retention_period={retention_period_secs}s, retention_check_interval={retention_check_interval_secs}s"
+        );
+
+        if app.runtime.task_history.captured_context.as_ref() != "truncated" {
+            let captured_context = &app.runtime.task_history.captured_context;
+            let _ = write!(config_details, ", captured_context={captured_context}");
+        }
+
+        // Add min_sql_duration if configured
+        if let Some(min_sql_duration) = &app.runtime.task_history.min_sql_duration {
+            let _ = write!(config_details, ", min_sql_duration={min_sql_duration}");
+        }
+
+        // Add captured_plan and min_plan_duration if configured
+        if let Some(captured_plan) = &app.runtime.task_history.captured_plan
+            && captured_plan.as_ref() != "none"
+        {
+            let _ = write!(config_details, ", captured_plan={captured_plan}");
+
+            if let Some(min_plan_duration) = &app.runtime.task_history.min_plan_duration {
+                let _ = write!(config_details, ", min_plan_duration={min_plan_duration}");
+            }
+        }
+
+        tracing::info!("{}", config_details);
+
+        // Determine if we're in cluster mode (node_id column needed)
+        let effective_role = self.df.cluster_config.effective_role();
+        let is_cluster_mode = effective_role.is_some();
+
+        let local_table = task_history::TaskSpan::instantiate_table(
             self.status(),
             retention_period_secs,
             retention_check_interval_secs,
             Arc::clone(&self),
+            is_cluster_mode,
         )
         .await
-        {
-            Ok(table) => self
-                .df
-                .register_table_as_writable_and_with_schema(
-                    TableReference::partial(
-                        SPICE_RUNTIME_SCHEMA,
-                        task_history::DEFAULT_TASK_HISTORY_TABLE,
-                    ),
-                    table,
-                )
-                .context(UnableToCreateBackendSnafu),
-            Err(source) => Err(Error::UnableToTrackTaskHistory { source }),
-        }
+        .map_err(|source| Error::UnableToTrackTaskHistory { source })?;
+
+        // In cluster scheduler mode, wrap the local table with FederatedTaskHistoryTable
+        // to enable cluster-wide task history queries, and also register the local table
+        // separately for use by the GetTaskHistory RPC handler
+        let table_to_register: Arc<dyn TableProvider> = match &self.distributed {
+            Some(DistributedNode::Scheduler {
+                peers,
+                executor_registry,
+                ..
+            }) => {
+                let schema = local_table.schema();
+
+                // Compute node_id: {advertise_host}:{bind_port}
+                let node_id =
+                    if let Some(advertise_host) = self.df.cluster_config.node_advertise_address() {
+                        let bind_port = self.df.cluster_config.node_bind_address().port();
+                        format!("{advertise_host}:{bind_port}")
+                    } else {
+                        // Fallback: use bind address directly (shouldn't happen in valid scheduler config)
+                        self.df.cluster_config.node_bind_address().to_string()
+                    };
+
+                tracing::debug!("Registering federated task_history table with node_id={node_id}");
+
+                // Register the local table under a separate name for RPC handlers to use
+                // This avoids infinite recursion when peers query each other
+                let local_table_provider: Arc<dyn TableProvider> =
+                    local_table as Arc<dyn TableProvider>;
+                self.df
+                    .register_table_as_writable_and_with_schema(
+                        TableReference::partial(
+                            SPICE_RUNTIME_SCHEMA,
+                            task_history::LOCAL_TASK_HISTORY_TABLE,
+                        ),
+                        Arc::clone(&local_table_provider),
+                    )
+                    .context(UnableToCreateBackendSnafu)?;
+
+                let federated = task_history::federated::FederatedTaskHistoryTable::new(
+                    schema,
+                    local_table_provider,
+                    Arc::clone(peers),
+                    executor_registry.flight_sql_clients_handle(),
+                    self.df.cluster_config.client_tls_config(),
+                    node_id,
+                );
+                Arc::new(federated)
+            }
+            _ => local_table,
+        };
+
+        self.df
+            .register_table_as_writable_and_with_schema(
+                TableReference::partial(
+                    SPICE_RUNTIME_SCHEMA,
+                    task_history::DEFAULT_TASK_HISTORY_TABLE,
+                ),
+                table_to_register,
+            )
+            .context(UnableToCreateBackendSnafu)
     }
 }

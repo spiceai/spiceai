@@ -36,7 +36,7 @@ pub enum Error {
     #[snafu(display("Unsupported scalar value type: {data_type}"))]
     UnsupportedType { data_type: DataType },
 
-    #[snafu(display("Unsupported partition key: {value}"))]
+    #[snafu(display("Unsupported partition key: {value:?}"))]
     UnsupportedPartitionKey { value: ScalarValue },
 
     #[snafu(display("Failed to parse partition key: {source}"))]
@@ -66,7 +66,14 @@ pub fn to_hive_partition_dir(pairings: &[(PartitionedBy, ScalarValue)]) -> Resul
     Ok(path)
 }
 
-fn encode_key(key: &ScalarValue) -> Result<String, Error> {
+/// Encodes a [`ScalarValue`] partition key into a Hive-style string representation.
+///
+/// NULL values are encoded as `"none"` following Hive partitioning conventions.
+///
+/// # Errors
+/// Returns [`Error::UnsupportedPartitionKey`] if the scalar value type is not supported
+/// for partitioning.
+pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
     let key = match key {
         ScalarValue::Boolean(v) => v.map(|v| format!("{v}")),
         ScalarValue::Int8(v) => v.map(|v| format!("{v}")),
@@ -77,7 +84,13 @@ fn encode_key(key: &ScalarValue) -> Result<String, Error> {
         ScalarValue::UInt16(v) => v.map(|v| format!("{v}")),
         ScalarValue::UInt32(v) => v.map(|v| format!("{v}")),
         ScalarValue::UInt64(v) => v.map(|v| format!("{v}")),
-        ScalarValue::Utf8(v) => v.clone(),
+        ScalarValue::TimestampSecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampMillisecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampMicrosecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::TimestampNanosecond(v, _) => v.map(|v| format!("{v}")),
+        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => {
+            v.as_ref().map(std::string::ToString::to_string)
+        }
         value => {
             return Err(Error::UnsupportedPartitionKey {
                 value: value.clone(),
@@ -86,6 +99,26 @@ fn encode_key(key: &ScalarValue) -> Result<String, Error> {
     };
 
     Ok(key.unwrap_or("none".to_string()))
+}
+
+/// Encodes multiple [`ScalarValue`] partition keys into a composite key string.
+///
+/// This is used for hierarchical partitions where the partition is identified
+/// by multiple values (e.g., year=2025 and month=10).
+///
+/// The composite key is encoded by joining individual keys with "/",
+/// e.g., `"2025/10"` for the example above. This provides a unique, stable
+/// identifier for the partition that can be used as a `HashMap` key.
+///
+/// Note: This function produces a compact key format (e.g., "2025/10") without
+/// column names. For Hive-style partition directories with column names
+/// (e.g., "year=2025/month=10"), see [`to_hive_partition_dir`].
+///
+/// # Errors
+/// Returns [`Error::UnsupportedPartitionKey`] if any scalar value type is not supported.
+pub fn encode_composite_key(keys: &[ScalarValue]) -> Result<String, Error> {
+    let encoded: Result<Vec<String>, Error> = keys.iter().map(encode_key).collect();
+    Ok(encoded?.join("/"))
 }
 
 /// Discover hive style partitions in the `base_dir` recursively.
@@ -190,7 +223,7 @@ fn discover_partitions_recursive(
 
 macro_rules! parse_numeric_scalar {
     ($value_str:expr, $scalar_type:ident, $parse_type:ty) => {
-        if $value_str == "none" {
+        if $value_str == "none" || $value_str == "NULL" {
             ScalarValue::$scalar_type(None)
         } else {
             let parsed: $parse_type = $value_str.parse()?;
@@ -199,7 +232,21 @@ macro_rules! parse_numeric_scalar {
     };
 }
 
-fn parse_partition_value(
+/// Converts string values from hive-style partition directories (e.g., "year=2025") into
+/// strongly-typed [`ScalarValue`].
+///
+/// # Arguments
+/// * `schema` - Schema context for type resolution
+/// * `partition_by` - Partition definition containing the expression and name
+/// * `value_str` - String value to parse (e.g., "2025", "october", "none")
+///
+/// # Returns
+/// A [`ScalarValue`] of the appropriate type matching the partition's data type
+///
+/// # Errors
+/// Returns `Error::Parsing` if the string cannot be parsed to the expected type,
+/// or `Error::UnsupportedType` if the partition's data type is not supported.
+pub fn parse_partition_value(
     schema: &dyn ExprSchema,
     partition_by: &PartitionedBy,
     value_str: &str,
@@ -214,7 +261,7 @@ fn parse_partition_value(
         .map_err(|e| Error::Parsing { source: e.into() })?;
     let scalar_value = match data_type {
         DataType::Boolean => {
-            if value_str == "none" {
+            if value_str == "none" || value_str == "NULL" {
                 ScalarValue::Boolean(None)
             } else {
                 let b = value_str.parse()?;
@@ -242,10 +289,24 @@ fn parse_partition_value(
             }
         },
         DataType::Utf8 => {
-            if value_str == "none" {
+            if value_str == "none" || value_str == "NULL" {
                 ScalarValue::Utf8(None)
             } else {
                 ScalarValue::Utf8(Some(value_str.to_string()))
+            }
+        }
+        DataType::LargeUtf8 => {
+            if value_str == "none" || value_str == "NULL" {
+                ScalarValue::LargeUtf8(None)
+            } else {
+                ScalarValue::LargeUtf8(Some(value_str.to_string()))
+            }
+        }
+        DataType::Utf8View => {
+            if value_str == "none" || value_str == "NULL" {
+                ScalarValue::Utf8View(None)
+            } else {
+                ScalarValue::Utf8View(Some(value_str.to_string()))
             }
         }
         data_type => return Err(Error::UnsupportedType { data_type }),
@@ -316,6 +377,133 @@ mod tests {
         for (want, got) in ["year=2025", "month=10", "day=15"].iter().zip(parts) {
             assert_eq!(*want, got.to_str().expect("to_str"));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_key_with_nulls() -> Result<(), Error> {
+        // Test NULL values are encoded as "none"
+        assert_eq!(encode_key(&ScalarValue::Int32(None))?, "none");
+        assert_eq!(encode_key(&ScalarValue::Int64(None))?, "none");
+        assert_eq!(encode_key(&ScalarValue::Utf8(None))?, "none");
+        assert_eq!(encode_key(&ScalarValue::Boolean(None))?, "none");
+        assert_eq!(encode_key(&ScalarValue::UInt32(None))?, "none");
+
+        // Test non-NULL values are encoded correctly
+        assert_eq!(encode_key(&ScalarValue::Int32(Some(42)))?, "42");
+        assert_eq!(encode_key(&ScalarValue::Int64(Some(-100)))?, "-100");
+        assert_eq!(
+            encode_key(&ScalarValue::Utf8(Some("test".to_string())))?,
+            "test"
+        );
+        assert_eq!(encode_key(&ScalarValue::Boolean(Some(true)))?, "true");
+        assert_eq!(encode_key(&ScalarValue::UInt32(Some(99)))?, "99");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_partition_value_with_none() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![
+            Field::new("int_col", DataType::Int32, true),
+            Field::new("str_col", DataType::Utf8, true),
+            Field::new("bool_col", DataType::Boolean, true),
+        ]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        // Test parsing "none" as NULL
+        let partition_by_int = PartitionedBy {
+            name: "int_col".to_string(),
+            expression: col("int_col"),
+        };
+        let result = parse_partition_value(&df_schema, &partition_by_int, "none")?;
+        assert_eq!(result, ScalarValue::Int32(None));
+
+        let partition_by_str = PartitionedBy {
+            name: "str_col".to_string(),
+            expression: col("str_col"),
+        };
+        let result = parse_partition_value(&df_schema, &partition_by_str, "none")?;
+        assert_eq!(result, ScalarValue::Utf8(None));
+
+        let partition_by_bool = PartitionedBy {
+            name: "bool_col".to_string(),
+            expression: col("bool_col"),
+        };
+        let result = parse_partition_value(&df_schema, &partition_by_bool, "none")?;
+        assert_eq!(result, ScalarValue::Boolean(None));
+
+        // Test parsing actual values
+        let result = parse_partition_value(&df_schema, &partition_by_int, "42")?;
+        assert_eq!(result, ScalarValue::Int32(Some(42)));
+
+        let result = parse_partition_value(&df_schema, &partition_by_str, "hello")?;
+        assert_eq!(result, ScalarValue::Utf8(Some("hello".to_string())));
+
+        let result = parse_partition_value(&df_schema, &partition_by_bool, "true")?;
+        assert_eq!(result, ScalarValue::Boolean(Some(true)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_partition_value_large_utf8() -> Result<(), Box<dyn std::error::Error>> {
+        // Cayenne represents strings as LargeUtf8, so inferring existing partitions
+        // reads the partition value back as LargeUtf8. partition_key_to_string already
+        // handles all three string types; this is the matching string -> scalar
+        // direction.
+        let schema = Schema::new(vec![Field::new("str_col", DataType::LargeUtf8, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+        let partition_by = PartitionedBy {
+            name: "str_col".to_string(),
+            expression: col("str_col"),
+        };
+
+        // NULL sentinels
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "none")?,
+            ScalarValue::LargeUtf8(None)
+        );
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "NULL")?,
+            ScalarValue::LargeUtf8(None)
+        );
+
+        // Actual value
+        assert_eq!(
+            parse_partition_value(&df_schema, &partition_by, "MONTH")?,
+            ScalarValue::LargeUtf8(Some("MONTH".to_string()))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_null_values() -> Result<(), Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![Field::new("bucket_col", DataType::Int32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let partition_by = PartitionedBy {
+            name: "bucket_col".to_string(),
+            expression: col("bucket_col"),
+        };
+
+        // Test roundtrip: ScalarValue::Int32(None) -> "none" -> ScalarValue::Int32(None)
+        let null_value = ScalarValue::Int32(None);
+        let encoded = encode_key(&null_value)?;
+        assert_eq!(encoded, "none");
+
+        let decoded = parse_partition_value(&df_schema, &partition_by, &encoded)?;
+        assert_eq!(decoded, null_value);
+
+        // Test roundtrip with actual value
+        let value = ScalarValue::Int32(Some(5));
+        let encoded = encode_key(&value)?;
+        assert_eq!(encoded, "5");
+
+        let decoded = parse_partition_value(&df_schema, &partition_by, &encoded)?;
+        assert_eq!(decoded, value);
 
         Ok(())
     }

@@ -1,0 +1,38 @@
+name: Setup CH-benCH PostgreSQL
+description: 'Starts a PostgreSQL container configured for CH-benCH benchmarking'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Start PostgreSQL for CH-benCH
+      shell: bash
+      run: |
+        docker run -d --name chbench-pg \
+          -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
+          -p 5432:5432 \
+          --shm-size=4g \
+          postgres:16 \
+          -c max_connections=200 \
+          -c wal_level=logical \
+          -c synchronous_commit=off \
+          -c max_replication_slots=20 \
+          -c max_wal_senders=20 \
+          -c shared_buffers=8GB \
+          -c wal_buffers=64MB \
+          -c full_page_writes=off \
+          -c checkpoint_timeout=30min \
+          -c max_wal_size=8GB
+
+    - name: Wait for CH-benCH PostgreSQL
+      shell: bash
+      run: |
+        for _ in {1..30}; do
+          if docker exec chbench-pg pg_isready -U bench > /dev/null 2>&1; then
+            echo "PostgreSQL is ready"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "PostgreSQL did not become ready in time."
+        docker logs chbench-pg
+        exit 1

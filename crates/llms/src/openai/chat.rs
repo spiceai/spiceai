@@ -20,7 +20,7 @@ use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{SqlGeneration, json::JsonSchemaSqlGeneration};
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
     CreateChatCompletionRequest, CreateChatCompletionResponse,
@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use tracing_futures::Instrument;
 
-use super::Openai;
+use super::{ChatBackend, Openai, responses_adapter};
 
 #[async_trait]
 impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
@@ -46,6 +46,10 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        if self.chat_backend == ChatBackend::Responses {
+            return self.chat_completions_stream_using_responses_api(req).await;
+        }
+
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -54,7 +58,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let stream = self.client.chat().create_stream(inner_req).await?;
 
@@ -68,7 +72,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
     }
 
     // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn health(&self) -> Result<(), crate::chat::Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -85,7 +89,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
         };
 
         if self.supports_reasoning_effort() {
-            req.reasoning_effort = Some(async_openai::types::ReasoningEffort::Low);
+            req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::Low);
         }
 
         if self.supports_max_completion_tokens() {
@@ -109,6 +113,10 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        if self.chat_backend == ChatBackend::Responses {
+            return self.chat_completions_request_using_responses_api(req).await;
+        }
+
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
@@ -117,7 +125,7 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
             .rate_controller
             .acquire()
             .await
-            .map_err(|e| OpenAIError::StreamError(e.to_string()))?;
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
 
         let mut resp = self.client.chat().create(inner_req).await?;
 
@@ -125,5 +133,49 @@ impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
 
         resp.model = outer_model;
         Ok(resp)
+    }
+}
+
+impl<C: Config + Send + Sync + Clone> Openai<C> {
+    async fn chat_completions_stream_using_responses_api(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let outer_model = req.model.clone();
+        let inner_req =
+            responses_adapter::responses_request_from_chat_completion_request(req, &self.model)?;
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+        let stream = self.client.responses().create_stream(inner_req).await?;
+
+        drop(permit);
+
+        Ok(responses_adapter::chat_completion_stream_from_response_stream(stream, outer_model))
+    }
+
+    async fn chat_completions_request_using_responses_api(
+        &self,
+        req: CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        let outer_model = req.model.clone();
+        let inner_req =
+            responses_adapter::responses_request_from_chat_completion_request(req, &self.model)?;
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
+        let response = self.client.responses().create(inner_req).await?;
+
+        drop(permit);
+
+        responses_adapter::chat_completion_response_from_response(response, outer_model)
     }
 }

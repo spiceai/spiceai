@@ -20,7 +20,13 @@ on:
           - 'bench'
           - 'load'
           - 'throughput'
+          - 'append'
           - 'http-consistency'
+          - 'nas'
+          - 'text-to-sql'
+          - 'streaming-bench'
+          - 'streaming-correctness'
+          - 'htap'
       update_snapshots:
         description: 'Update snapshots?'
         required: false
@@ -42,13 +48,14 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/1.8'
+          - 'release/2.0'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          persist-credentials: false
           ref: ${{ matrix.branch }}
 
       - name: Install MinIO
@@ -74,6 +81,65 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      - name: Validate spicepods - TPCH - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - ClickBench - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - CH-BenCHmark
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/chbench/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCH - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF1
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow bench
@@ -98,9 +164,49 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      - name: Dispatch Testoperator - Scheduled Append - TPCH - SF1
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpch/sf1 --workflow append
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       - name: Dispatch Testoperator - Scheduled Bench - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Bench - TPCDS - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Streaming - Bench
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled Streaming - Correctness
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 --workflow htap
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -114,7 +220,9 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -139,6 +247,66 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        id: build-spicepod-validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Set spicepod validator path
+        run: echo "SPICEPOD_VALIDATOR=${{ steps.build-spicepod-validator.outputs.validator-path }}" >> $GITHUB_ENV
+
+      - name: Validate spicepods - TPCH - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - ClickBench - SF1
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/clickbench/sf1/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - CH-BenCHmark
+        if: ${{ github.event.inputs.workflow_type == 'htap' }}
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/chbench/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCH - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpch/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
+
+      - name: Validate spicepods - TPCDS - SF100
+        run: |
+          shopt -s globstar nullglob
+          for file in ./test/spicepods/tpcds/sf100/**/*.yaml; do
+            echo "Validating $file"
+            "$SPICEPOD_VALIDATOR" "$file"
+          done
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF1
         run: |
@@ -173,6 +341,46 @@ jobs:
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCH - SF100
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/tpch/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - TPCDS - SF100
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/tpcds/sf100 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Text to SQL
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/text_to_sql \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/streaming \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - CH-BenCHmark - SF10
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 \
             --workflow ${{ github.event.inputs.workflow_type }} \
             --update-snapshots ${{ github.event.inputs.update_snapshots }}
         env:

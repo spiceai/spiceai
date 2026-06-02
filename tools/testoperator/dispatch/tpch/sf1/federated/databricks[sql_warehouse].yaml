@@ -4,6 +4,7 @@ tests:
     query_set: tpch
     query_overrides: spark
     runner_type: spiceai-dev-runners
+    ready_wait: 600
     validate_results: true
   throughput:
     spicepod_path: federated/databricks[sql_warehouse].yaml

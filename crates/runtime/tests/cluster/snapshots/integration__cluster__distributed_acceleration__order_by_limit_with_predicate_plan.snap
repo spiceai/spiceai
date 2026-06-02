@@ -1,0 +1,26 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: pred_plan_fmt
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                      |
++---------------+---------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test_data.id ASC NULLS LAST, fetch=5                                                                                |
+|               |   SubqueryAlias: test_data                                                                                                |
+|               |     Union                                                                                                                 |
+|               |       Sort: test_data.id ASC NULLS LAST, fetch=5                                                                          |
+|               |         SubqueryAlias: test_data                                                                                          |
+|               |           TableScan: test_data projection=[id, name, score], full_filters=[test_data.score > Int64(80)]                   |
+|               |       Sort: test_data.id ASC NULLS LAST, fetch=5                                                                          |
+|               |         SubqueryAlias: test_data                                                                                          |
+|               |           TableScan: test_data projection=[id, name, score], full_filters=[test_data.score > Int64(80)]                   |
+| physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST], fetch=5                                                                   |
+|               |   UnionExec                                                                                                               |
+|               |     CooperativeExec                                                                                                       |
+|               |       BytesProcessedExec                                                                                                  |
+|               |         FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE (("score" > 80)) ORDER BY id ASC NULLS LAST LIMIT 5 |
+|               |     CooperativeExec                                                                                                       |
+|               |       BytesProcessedExec                                                                                                  |
+|               |         FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE (("score" > 80)) ORDER BY id ASC NULLS LAST LIMIT 5 |
+|               |                                                                                                                           |
++---------------+---------------------------------------------------------------------------------------------------------------------------+

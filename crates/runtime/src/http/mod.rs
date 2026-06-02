@@ -20,7 +20,7 @@ use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::{Builder, Connection};
 use hyper_util::service::TowerToHyperService;
-use runtime_auth::{HttpAuth, layer::http::AuthLayer};
+use runtime_auth::{HttpAuth, IdentitySource, layer::http::AuthLayer};
 use snafu::prelude::*;
 use spicepod::component::runtime::CorsConfig;
 use tokio::net::TcpStream;
@@ -38,6 +38,7 @@ use crate::{
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
 mod metrics;
+mod mtls;
 mod routes;
 pub mod traceparent;
 
@@ -54,12 +55,71 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Starts a minimal HTTP server that only serves the `/health` endpoint.
+///
+/// This is used by cluster executors which need a health endpoint for Kubernetes
+/// probes but don't require the full HTTP API.
+pub(crate) async fn start_health_only<A>(
+    bind_address: A,
+    shutdown_signal: Option<CancellationToken>,
+) -> Result<()>
+where
+    A: ToSocketAddrs + Debug,
+{
+    use axum::routing::get;
+
+    let routes = Router::new().route("/health", get(|| async { "ok\n" }));
+
+    let listener = TcpListener::bind(&bind_address)
+        .await
+        .context(UnableToBindServerToPortSnafu)?;
+    tracing::info!("Spice Runtime HTTP health endpoint listening on {bind_address:?}");
+
+    let shutdown_signal = shutdown_signal.unwrap_or_default();
+
+    let (shutdown_notify, _) = watch::channel(());
+
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let stream = match conn {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        tracing::debug!("Error accepting connection to serve HTTP request: {e}");
+                        continue;
+                    }
+                };
+
+                process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
+            },
+            () = shutdown_signal.cancelled() => {
+                tracing::debug!("Health HTTP server received shutdown signal");
+                drop(listener);
+                let num_active = shutdown_notify.receiver_count();
+                if num_active > 0 {
+                    tracing::info!(
+                        "Detected {num_active} active health check requests. Waiting for completion before shutting down..."
+                    );
+                }
+                shutdown_notify.send(()).ok();
+                shutdown_notify.closed().await;
+                break;
+            }
+        }
+    }
+
+    tracing::debug!("Health HTTP server stopped");
+
+    Ok(())
+}
+
 pub(crate) async fn start<A>(
     bind_address: A,
     rt: Arc<Runtime>,
     config: Arc<config::Config>,
     tls_config: Option<Arc<TlsConfig>>,
     auth_provider: Option<Arc<dyn HttpAuth + Send + Sync>>,
+    identity_source: IdentitySource,
     shutdown_signal: Option<CancellationToken>,
 ) -> Result<()>
 where
@@ -74,12 +134,26 @@ where
         Some(app) => Cow::Borrowed(&app.runtime.cors),
         None => Cow::Owned(CorsConfig::default()),
     };
+    // Resolve effective MCP config following the same pattern as builder.rs (L208-212):
+    // Config.runtime, if present, replaces the whole runtime — read .mcp from that.
+    // Otherwise fall back to the app's runtime .mcp. This mirrors how all other runtime
+    // fields are resolved: one effective SpicepodRuntime is chosen, then fields are read
+    // from it, rather than merging individual fields from both sources.
+    #[cfg(feature = "mcp")]
+    let mcp_config: Option<spicepod::component::runtime::McpConfig> =
+        config.runtime.as_ref().map_or_else(
+            || app.as_ref().and_then(|a| a.runtime.mcp.clone()),
+            |r| r.mcp.clone(),
+        );
+    let auth_layer = auth_provider.map(AuthLayer::new);
     let routes = routes::routes(
         &rt,
         config,
         vsearch,
-        auth_provider.map(AuthLayer::new),
+        auth_layer,
         &cors_config,
+        #[cfg(feature = "mcp")]
+        mcp_config.as_ref(),
     );
     drop(app);
 
@@ -107,8 +181,15 @@ where
 
                 match tls_config {
                     Some(ref config) => {
-                        let acceptor = TlsAcceptor::from(Arc::clone(&config.server_config));
-                        process_tls_tcp_stream(stream, acceptor, routes.clone(), shutdown_notify.subscribe());
+                        let acceptor = TlsAcceptor::from(Arc::clone(&config.http_server_config));
+                        process_tls_tcp_stream(
+                            stream,
+                            acceptor,
+                            routes.clone(),
+                            identity_source,
+                            config.client_auth,
+                            shutdown_notify.subscribe(),
+                        );
                     }
                     None => {
                         process_tcp_stream(stream, routes.clone(), shutdown_notify.subscribe());
@@ -141,11 +222,25 @@ fn process_tls_tcp_stream(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     routes: Router,
+    identity_source: IdentitySource,
+    client_auth: crate::tls::ClientAuthEnforcement,
     on_shutdown: Receiver<()>,
 ) {
     tokio::spawn(async move {
         match acceptor.accept(stream).await {
             Ok(tls_stream) => {
+                // Pre-compute the per-connection mTLS identities
+                // (`ChannelIdentity` always; `MtlsPrincipal` only in
+                // `Channel` mode) once at accept-time so per-request
+                // middleware does no X.509 parsing on the hot path.
+                // Every request served on this TLS connection then
+                // sees the same `Arc<PerConnTls>` in its extensions.
+                let per_conn = mtls::PerConnTls::build(
+                    tls_stream.get_ref().1.peer_certificates(),
+                    identity_source,
+                    client_auth,
+                );
+                let routes = mtls::install_per_conn_extension(routes, per_conn);
                 let conn = serve_connection(tls_stream, routes);
                 handle_connection(conn, on_shutdown).await;
             }
@@ -242,7 +337,7 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("to accept connection");
             process_tcp_stream(stream, ok_router(), shutdown_rx);
         });
-        let client = reqwest::Client::new();
+        let client = build_test_http_client();
         let resp = timeout(
             Duration::from_secs(2),
             client.get(format!("http://{addr}/")).send(),
@@ -265,11 +360,9 @@ mod tests {
 
         // Verify that the shutdown does not fail if there are no active connections
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
     }
 
     #[tokio::test]
@@ -288,7 +381,7 @@ mod tests {
 
         // the request handler will hang until the connection is closed
         let request_completion_handle = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = build_test_http_client();
             client.get(format!("http://{addr}/")).send().await
         });
 
@@ -304,15 +397,19 @@ mod tests {
 
         // Verify that the shutdown will close the active request and drop all receivers
         shutdown_notify.send(()).ok();
-        assert!(
-            timeout(Duration::from_secs(5), request_completion_handle)
-                .await
-                .is_ok()
-        );
-        assert!(
-            timeout(Duration::from_secs(1), shutdown_notify.closed())
-                .await
-                .is_ok()
-        );
+        let _ = timeout(Duration::from_secs(5), request_completion_handle)
+            .await
+            .expect("should complete request after shutdown");
+        timeout(Duration::from_secs(1), shutdown_notify.closed())
+            .await
+            .expect("should complete shutdown notification");
+    }
+
+    fn build_test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|err| panic!("failed to build test http client: {err}"))
     }
 }

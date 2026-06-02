@@ -1,0 +1,420 @@
+# yaml-language-server: $schema=../../../.schema/spicepod.schema.json
+version: v1
+kind: Spicepod
+name: schema-test-datasets
+
+# =============================================================================
+# DATA CONNECTORS - All known connectors with runtime parameters
+# =============================================================================
+datasets:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL connector
+  # Runtime params: connection_pool_size
+  # ---------------------------------------------------------------------------
+  - name: test_postgres
+    from: postgres:public.users
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+      pg_sslmode: prefer
+      pg_connection_pool_min_idle: "1"
+      connection_pool_size: "10"
+    acceleration:
+      enabled: true
+      refresh_mode: full
+      engine: duckdb
+
+  # Multiple postgres datasets to verify anyOf works
+  - name: test_postgres_2
+    from: postgres:public.orders
+    params:
+      pg_host: localhost
+      pg_port: "5432"
+      pg_db: testdb
+      pg_user: postgres
+      pg_pass: secret
+      pg_sslmode: require
+      connection_pool_size: "5"
+
+  # ---------------------------------------------------------------------------
+  # DuckDB connector
+  # ---------------------------------------------------------------------------
+  - name: test_duckdb
+    from: duckdb:data.parquet
+    params:
+      duckdb_open: data/test.db
+
+  # ---------------------------------------------------------------------------
+  # File connector
+  # Runtime params: file_format, file_extension, schema_infer_max_records,
+  #                 csv_*, tsv_*, file_compression_type, hive_partitioning_enabled,
+  #                 schema_source_path, json_format, flatten_json, refresh_skip
+  # ---------------------------------------------------------------------------
+  - name: test_file_csv
+    from: file:data/sample.csv
+    params:
+      file_format: csv
+      csv_has_header: "true"
+      csv_delimiter: ","
+      csv_quote: '"'
+      csv_escape: "\\"
+      schema_infer_max_records: "1000"
+      file_compression_type: UNCOMPRESSED
+
+  - name: test_file_parquet
+    from: file:data/sample.parquet
+    params:
+      file_format: parquet
+      hive_partitioning_enabled: "true"
+      schema_source_path: data/schema_sample.parquet
+
+  - name: test_file_json
+    from: file:data/sample.json
+    params:
+      file_format: json
+      json_format: jsonl
+      flatten_json: "true"
+      schema_infer_max_records: "100"
+
+  - name: test_file_tsv
+    from: file:data/sample.tsv
+    params:
+      file_format: csv
+      tsv_has_header: "true"
+      tsv_quote: '"'
+      tsv_escape: "\\"
+      csv_delimiter: "\t"
+
+  - name: test_file_compressed
+    from: file:data/sample.csv.gz
+    params:
+      file_format: csv
+      file_compression_type: GZIP
+      csv_has_header: "true"
+
+  # ---------------------------------------------------------------------------
+  # S3 connector
+  # Runtime params: client_timeout, allow_http, refresh_skip, + listing params
+  # ---------------------------------------------------------------------------
+  - name: test_s3
+    from: s3://my-bucket/data/
+    params:
+      endpoint: https://s3.amazonaws.com
+      client_timeout: "30s"
+      allow_http: "false"
+      file_format: parquet
+      hive_partitioning_enabled: "true"
+      refresh_skip: enabled
+
+  - name: test_s3_csv
+    from: s3://my-bucket/csv-data/
+    params:
+      endpoint: https://s3.amazonaws.com
+      file_format: csv
+      csv_has_header: "true"
+      schema_infer_max_records: "500"
+
+  # ---------------------------------------------------------------------------
+  # Azure Blob Storage (ABFS) connector
+  # Runtime params: allow_http, + listing params
+  # ---------------------------------------------------------------------------
+  - name: test_abfs
+    from: abfs://container@account.dfs.core.windows.net/path/
+    params:
+      abfs_account: mystorageaccount
+      abfs_access_key: secret-key
+      allow_http: "false"
+      file_format: parquet
+
+  # ---------------------------------------------------------------------------
+  # Delta Lake connector
+  # Runtime params: client_timeout
+  # ---------------------------------------------------------------------------
+  - name: test_delta_lake
+    from: delta_lake:s3://bucket/delta-table/
+    params:
+      delta_s3_region: us-east-1
+      client_timeout: "60s"
+
+  # ---------------------------------------------------------------------------
+  # Databricks connector
+  # Runtime params: mode, client_timeout
+  # ---------------------------------------------------------------------------
+  - name: test_databricks_spark
+    from: databricks:catalog.schema.table
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: spark_connect
+      databricks_client_timeout: "120s"
+      databricks_cluster_id: cluster-123
+
+  - name: test_databricks_delta
+    from: databricks:catalog.schema.delta_table
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: delta_lake
+      databricks_client_timeout: "60s"
+
+  - name: test_databricks_warehouse
+    from: databricks:catalog.schema.warehouse_table
+    params:
+      databricks_endpoint: https://my-workspace.databricks.com
+      databricks_token: dapi123
+      databricks_mode: sql_warehouse
+      databricks_http_path: /sql/1.0/warehouses/abc123
+
+  # ---------------------------------------------------------------------------
+  # GitHub connector
+  # Runtime params: include (for files)
+  # ---------------------------------------------------------------------------
+  - name: test_github_issues
+    from: github:github.com/spiceai/spiceai/issues
+    params:
+      github_token: ghp_xxx
+
+  - name: test_github_pulls
+    from: github:github.com/spiceai/spiceai/pulls
+    params:
+      github_token: ghp_xxx
+
+  - name: test_github_commits
+    from: github:github.com/spiceai/spiceai/commits
+    params:
+      github_token: ghp_xxx
+
+  - name: test_github_files
+    from: github:github.com/spiceai/spiceai/files
+    params:
+      github_token: ghp_xxx
+      include: "*.md"
+      github_fetch_commit_info: "true"
+
+  # ---------------------------------------------------------------------------
+  # Git connector
+  # Runtime params: include, fetch_content, cache_path, max_files, max_file_bytes
+  # ---------------------------------------------------------------------------
+  - name: test_git
+    from: git:https://github.com/spiceai/spiceai.git
+    params:
+      include: "*.rs;*.md"
+      fetch_content: "true"
+      cache_path: /tmp/git-cache
+      max_files: "1000"
+      max_file_bytes: "524288"
+
+  # ---------------------------------------------------------------------------
+  # GraphQL connector
+  # Runtime params: json_pointer, unnest_depth
+  # ---------------------------------------------------------------------------
+  - name: test_graphql
+    from: graphql:https://api.example.com/graphql
+    params:
+      graphql_query: "query { users { id name } }"
+      graphql_auth_header: "Bearer token123"
+      json_pointer: /data/users
+      unnest_depth: "2"
+
+  # ---------------------------------------------------------------------------
+  # HTTP/HTTPS connector
+  # Runtime params: client_timeout, connect_timeout, pool_max_idle_per_host,
+  #                 pool_idle_timeout, http_headers, max_retries, retry_backoff_method,
+  #                 retry_max_duration, retry_jitter, allowed_request_paths,
+  #                 request_query_filters, max_request_query_length,
+  #                 request_body_filters, max_request_body_bytes, health_probe
+  # ---------------------------------------------------------------------------
+  - name: test_https
+    from: https://api.example.com/data.json
+    params:
+      client_timeout: "30"
+      connect_timeout: "10"
+      pool_max_idle_per_host: "10"
+      pool_idle_timeout: "90"
+      http_headers: "Authorization: Bearer token, X-Custom: value"
+      max_retries: "3"
+      retry_backoff_method: fibonacci
+      retry_max_duration: "60s"
+      retry_jitter: "0.3"
+      health_probe: /health
+
+  - name: test_https_with_filters
+    from: https://api.example.com/search
+    params:
+      client_timeout: "30"
+      request_query_filters: enabled
+      max_request_query_length: "2048"
+      request_body_filters: enabled
+      max_request_body_bytes: "32768"
+      allowed_request_paths: "/api/v1,/api/v2"
+
+  - name: test_http
+    from: http://localhost:8080/data.csv
+    params:
+      file_format: csv
+      csv_has_header: "true"
+
+  # ---------------------------------------------------------------------------
+  # Iceberg connector
+  # Runtime params: metadata_path (for Hadoop catalog)
+  # ---------------------------------------------------------------------------
+  - name: test_iceberg_rest
+    from: iceberg:catalog.db.table
+    params:
+      iceberg_catalog_type: rest
+      iceberg_rest_uri: http://localhost:8181
+
+  - name: test_iceberg_hadoop
+    from: iceberg:db.table
+    params:
+      iceberg_catalog_type: hadoop
+      metadata_path: s3a://my-bucket/warehouse/db/table/metadata/v1.metadata.json
+
+  # ---------------------------------------------------------------------------
+  # Glue connector
+  # ---------------------------------------------------------------------------
+  - name: test_glue
+    from: glue:database.table
+
+  # ---------------------------------------------------------------------------
+  # Spice.ai connector
+  # ---------------------------------------------------------------------------
+  - name: test_spiceai
+    from: spice.ai/spiceai/quickstart/taxi_trips
+    params:
+      spiceai_api_key: spice-key
+
+  # ---------------------------------------------------------------------------
+  # Memory connector
+  # ---------------------------------------------------------------------------
+  - name: test_memory
+    from: memory:temp_table
+
+  # ---------------------------------------------------------------------------
+  # Sink connector
+  # ---------------------------------------------------------------------------
+  - name: test_sink
+    from: sink:null
+
+  # ---------------------------------------------------------------------------
+  # Localpod connector
+  # ---------------------------------------------------------------------------
+  - name: test_localpod
+    from: localpod:other_dataset
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse connector
+  # Runtime params: connection_timeout
+  # ---------------------------------------------------------------------------
+  - name: test_clickhouse
+    from: clickhouse:database.table
+    params:
+      clickhouse_connection_string: tcp://localhost:9000
+      connection_timeout: "30000"
+
+  # ---------------------------------------------------------------------------
+  # ODBC connector
+  # Runtime params: sql_dialect
+  # ---------------------------------------------------------------------------
+  - name: test_odbc
+    from: odbc:table
+    params:
+      odbc_connection_string: "Driver={SQL Server};Server=localhost;Database=test"
+      sql_dialect: mssql
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB connector
+  # Runtime params: unnest_depth, schema_infer_max_records, scan_segments,
+  #                 scan_interval, time_format, ready_lag, endpoint_url
+  # ---------------------------------------------------------------------------
+  - name: test_dynamodb
+    from: dynamodb:my_table
+    params:
+      dynamodb_aws_region: us-east-1
+      dynamodb_aws_access_key_id: AKIAIOSFODNN7EXAMPLE
+      dynamodb_aws_secret_access_key: secret
+      unnest_depth: "3"
+      schema_infer_max_records: "100"
+      scan_segments: auto
+      scan_interval: "1s"
+      time_format: "2006-01-02T15:04:05Z07:00"
+      ready_lag: "5s"
+      endpoint_url: http://localhost:8000
+
+  # ---------------------------------------------------------------------------
+  # FTP connector
+  # Runtime params: client_timeout
+  # ---------------------------------------------------------------------------
+  - name: test_ftp
+    from: ftp://ftp.example.com/data/
+    params:
+      ftp_user: anonymous
+      ftp_pass: guest
+      ftp_port: "21"
+      client_timeout: "30s"
+      file_format: csv
+
+  # ---------------------------------------------------------------------------
+  # SFTP connector
+  # Runtime params: client_timeout
+  # ---------------------------------------------------------------------------
+  - name: test_sftp
+    from: sftp://sftp.example.com/data/
+    params:
+      sftp_user: user
+      sftp_pass: password
+      sftp_port: "22"
+      client_timeout: "30s"
+      file_format: parquet
+
+  # ---------------------------------------------------------------------------
+  # SharePoint connector
+  # Runtime params: file_format
+  # ---------------------------------------------------------------------------
+  - name: test_sharepoint
+    from: sharepoint:sites/MySite/Shared Documents/data.xlsx
+    params:
+      sharepoint_client_id: client-id
+      sharepoint_tenant_id: tenant-id
+      sharepoint_client_secret: client-secret
+      file_format: xlsx
+
+  # ---------------------------------------------------------------------------
+  # Kafka connector
+  # Runtime params: schema_infer_max_records, flatten_json, kafka_* params
+  # ---------------------------------------------------------------------------
+  - name: test_kafka
+    from: kafka:my_topic
+    params:
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: user
+      kafka_sasl_password: password
+      kafka_ssl_endpoint_identification_algorithm: https
+      schema_infer_max_records: "10"
+      flatten_json: "true"
+
+  # ---------------------------------------------------------------------------
+  # Debezium connector
+  # Runtime params: kafka_bootstrap_servers, kafka_security_protocol,
+  #                 kafka_sasl_mechanism, kafka_sasl_username, kafka_sasl_password,
+  #                 kafka_ssl_ca_location, kafka_enable_ssl_certificate_verification,
+  #                 kafka_ssl_endpoint_identification_algorithm, kafka_consumer_group_id
+  # ---------------------------------------------------------------------------
+  - name: test_debezium
+    from: debezium:my_table
+    params:
+      debezium_transport: kafka
+      debezium_message_format: json
+      kafka_bootstrap_servers: localhost:9092
+      kafka_security_protocol: sasl_ssl
+      kafka_sasl_mechanism: SCRAM-SHA-512
+      kafka_sasl_username: debezium
+      kafka_sasl_password: secret
+      kafka_enable_ssl_certificate_verification: "true"
+      kafka_ssl_endpoint_identification_algorithm: https
+      kafka_consumer_group_id: spice-debezium-consumer

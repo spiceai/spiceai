@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: customer_secondary_lookup"
+---
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                           |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: customer.c_name = LargeUtf8("Customer#000000001")                                                                                                                                      |
+|               |   TableScan: customer projection=[c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment], partial_filters=[customer.c_name = LargeUtf8("Customer#000000001")] |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                                                                                    |
+|               |   FilterExec: c_name@1 = Customer#000000001                                                                                                                                                    |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                                                                                      |
+|               |       SchemaCastScanExec                                                                                                                                                                       |
+|               |         CooperativeExec                                                                                                                                                                        |
+|               |           BytesProcessedExec                                                                                                                                                                   |
+|               |             IndexedLookupExec: indexed_scan on [c_name]                                                                                                                                        |
+|               |                                                                                                                                                                                                |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

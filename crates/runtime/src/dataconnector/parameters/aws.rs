@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_credential_types::Credentials;
+use crate::parameters::{ParamLookup, Parameters};
+use aws_config::ConfigLoader;
+#[cfg(feature = "dynamodb")]
+use aws_sdk_credential_bridge::{
+    initiate_config_auth_iam_env, initiate_config_auth_iam_metadata, initiate_config_auth_key,
+    initiate_config_default_auth,
+};
 use snafu::prelude::*;
 use tonic::async_trait;
-
-use crate::parameters::{ParamLookup, Parameters};
 
 use super::{ConnectorParams, Validator};
 
@@ -61,16 +64,20 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid endpoint: {endpoint}"))]
+    #[snafu(display("Invalid endpoint URL '{endpoint}'. Provide a valid HTTP or HTTPS URL."))]
     InvalidEndpoint { endpoint: String },
 
-    #[snafu(display("Insecure endpoint without allow_http: {endpoint}"))]
+    #[snafu(display(
+        "Insecure HTTP endpoint '{endpoint}' requires 'allow_http: true' in the dataset parameters."
+    ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 
-    #[snafu(display("Invalid region: {region}"))]
+    #[snafu(display(
+        "Invalid AWS region '{region}'. Specify a valid AWS region (e.g., 'us-east-1')."
+    ))]
     InvalidRegion { region: String },
 
-    #[snafu(display("Invalid region corrected: {region}"))]
+    #[snafu(display("Invalid AWS region corrected to '{region}'."))]
     InvalidRegionCorrected { region: String },
 
     #[snafu(display(
@@ -78,17 +85,30 @@ pub enum Error {
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
-    #[snafu(display("No region specified using {region}"))]
+    #[snafu(display("No AWS region specified; defaulting to '{region}'."))]
     NoRegionSpecified { region: String },
 
-    #[snafu(display("Missing access key"))]
+    #[snafu(display("No auth method specified; defaulting to '{auth_name}'."))]
+    NoAuthSpecified { auth_name: String },
+
+    #[snafu(display("Missing required AWS access key. Set the 'aws_access_key_id' parameter."))]
     NoAccessKey,
 
-    #[snafu(display("Missing access secret"))]
+    #[snafu(display(
+        "Missing required AWS secret access key. Set the 'aws_secret_access_key' parameter."
+    ))]
     NoAccessSecret,
 
-    #[snafu(display("Unsupported authentication method: {method}"))]
+    #[snafu(display(
+        "Unsupported authentication method '{method}'. Supported methods: 'key', 'iam_role', 'public'."
+    ))]
     UnsupportedAuthenticationMethod { method: String },
+
+    #[snafu(display("Invalid {key}: {method}. Valid values are 'auto', 'metadata' and 'env'"))]
+    InvalidAuth { key: String, method: String },
+
+    #[snafu(display("Invalid {key}: {iam_source}. Valid values are 'auto', 'metadata' and 'env'"))]
+    InvalidIamRoleSource { key: String, iam_source: String },
 }
 
 pub(crate) struct S3EndpointValidator;
@@ -99,7 +119,7 @@ impl Validator for S3EndpointValidator {
 
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-            let endpoint = endpoint.to_string();
+            let endpoint: String = endpoint.to_string();
             if endpoint.ends_with('/') {
                 tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
                 params.parameters.insert(
@@ -187,18 +207,33 @@ impl Validator for AuthValidator {
                 });
             }
         }
+
+        // Validate iam_role_source if present
+        if let Some(iam_role_source) = params.parameters.get("iam_role_source").expose().ok()
+            && !matches!(iam_role_source, "auto" | "metadata" | "env")
+        {
+            return Err(Error::InvalidIamRoleSource {
+                key: "iam_role_source".to_string(),
+                iam_source: iam_role_source.to_string(),
+            });
+        }
+
         Ok(())
     }
 }
 
-pub async fn load_config(
+/// Initiate a [`ConfigLoader`] with AWS credentials as we'd expect them to be defined in [`Parameters`] (for a given `provider_name`).
+///
+/// Return [`ConfigLoader`] to allow further customisation.
+pub async fn initiate_config_with_credentials(
     provider_name: &'static str,
     region_name: &'static str,
     key_name: &'static str,
     secret_name: &'static str,
     token_name: &'static str,
     params: &Parameters,
-) -> Result<SdkConfig, Error> {
+    iam_role_source: Option<&str>,
+) -> Result<ConfigLoader, Error> {
     let region = params
         .get(region_name)
         .expose()
@@ -208,41 +243,110 @@ pub async fn load_config(
         .to_string();
 
     let access_key_id = params.get(key_name).expose().ok().map(ToString::to_string);
-
     let secret_access_key = params
         .get(secret_name)
         .expose()
         .ok()
         .map(ToString::to_string);
-
     let session_token = params
         .get(token_name)
         .expose()
         .ok()
         .map(ToString::to_string);
 
-    Ok(match (access_key_id, secret_access_key) {
-        (Some(access_key_id), Some(secret_access_key)) => {
-            let credentials = Credentials::new(
+    // Delegate to the common implementation in aws-sdk-credential-bridge
+    Ok(aws_sdk_credential_bridge::initiate_config_with_credentials(
+        provider_name,
+        region,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        iam_role_source,
+    )
+    .await)
+}
+
+/// Initiate a [`ConfigLoader`] with AWS credentials using an explicit authentication method from [`Parameters`].
+///
+/// Supports two authentication methods:
+/// - `iam_role`: IAM role-based authentication with configurable source (`auto`, `metadata`, `env`)
+/// - `key`: Explicit access key credentials
+///
+/// Return [`ConfigLoader`] to allow further customisation.
+#[cfg(feature = "dynamodb")]
+#[expect(clippy::too_many_arguments)]
+pub async fn initiate_config_with_auth_method(
+    provider_name: &'static str,
+    auth_name: &'static str,
+    iam_role_source_name: &'static str,
+    region_name: &'static str,
+    key_name: &'static str,
+    secret_name: &'static str,
+    token_name: &'static str,
+    params: &Parameters,
+) -> Result<ConfigLoader, Error> {
+    let region = params
+        .get(region_name)
+        .expose()
+        .ok_or_else(|_| Error::NoRegionSpecified {
+            region: region_name.to_string(),
+        })?
+        .to_string();
+
+    let auth = params
+        .get(auth_name)
+        .expose()
+        .ok_or_else(|_| Error::NoAuthSpecified {
+            auth_name: auth_name.to_string(),
+        })?
+        .to_string();
+
+    Ok(match auth.as_str() {
+        "iam_role" => {
+            let iam_role_source = params.get(iam_role_source_name).expose().ok();
+
+            match iam_role_source {
+                Some("metadata") => initiate_config_auth_iam_metadata(region),
+                Some("env") => initiate_config_auth_iam_env(region),
+                Some("auto") | None => initiate_config_default_auth(region).await,
+                Some(other) => {
+                    return Err(Error::InvalidIamRoleSource {
+                        key: iam_role_source_name.to_string(),
+                        iam_source: other.to_string(),
+                    });
+                }
+            }
+        }
+        "key" => {
+            let access_key_id = params
+                .get(key_name)
+                .expose()
+                .ok_or_else(|_| Error::NoAccessKey)?
+                .to_string();
+            let secret_access_key = params
+                .get(secret_name)
+                .expose()
+                .ok_or_else(|_| Error::NoAccessSecret)?
+                .to_string();
+            let session_token = params
+                .get(token_name)
+                .expose()
+                .ok()
+                .map(ToString::to_string);
+
+            initiate_config_auth_key(
+                provider_name,
+                region,
                 access_key_id,
                 secret_access_key,
                 session_token,
-                None,
-                provider_name,
-            );
-
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .credentials_provider(credentials)
-                .load()
-                .await
+            )
         }
         _ => {
-            // This will automatically load AWS credentials from the environment, via IAM roles if configured.
-            aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .region(Region::new(region))
-                .load()
-                .await
+            return Err(Error::InvalidAuth {
+                key: auth_name.to_string(),
+                method: auth,
+            });
         }
     })
 }

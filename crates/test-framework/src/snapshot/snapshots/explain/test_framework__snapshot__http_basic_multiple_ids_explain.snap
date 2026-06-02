@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: multiple_ids"
+snapshot_kind: text
+---
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Filter: httpbin_status_200.request_path LIKE Utf8("/status/%")                                                      |
+|               |   TableScan: httpbin_status_200 projection=[request_path, content]                                                  |
+| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                         |
+|               |   FilterExec: request_path@0 LIKE /status/%                                                                         |
+|               |     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1                                           |
+|               |       CooperativeExec                                                                                               |
+|               |         BytesProcessedExec                                                                                          |
+|               |           HttpExec: base_url=https://httpbin.org/status/200, format=auto, partitions=[(path="", query="", body="")] |
+|               |                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------+

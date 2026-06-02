@@ -120,6 +120,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 vector_workers: workers,
             },
@@ -148,6 +149,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Completed {
                 end_time: SystemTime::now(),
                 search_results,
@@ -170,7 +172,7 @@ impl SpiceTest<Completed> {
             .map(|result| result.duration) // Convert to milliseconds
             .collect::<Vec<_>>();
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let p95 = durations.percentile(95.0)?.as_millis() as f64;
         Ok(p95)
     }
@@ -178,7 +180,7 @@ impl SpiceTest<Completed> {
     pub fn get_rps_metric(&self) -> Result<f64> {
         let total_duration = self.state.end_time.duration_since(self.start_time)?;
 
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let total_requests = self.state.search_results.len() as f64;
         if total_duration.as_secs() == 0 {
             return Ok(total_requests);

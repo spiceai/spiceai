@@ -107,7 +107,7 @@ impl RefreshableCatalogProvider for UnityCatalogProvider {
         let futures = self
             .schemas
             .values()
-            .cloned()
+            .map(Arc::clone)
             .map(|schema| async move { schema.refresh().await });
 
         futures::stream::iter(futures)
@@ -153,20 +153,27 @@ impl UnityCatalogSchemaProvider {
             .list_tables(&schema.catalog_name, &schema.name)
             .await?
             .context(super::SchemaDoesntExistSnafu {
-                schema: schema.name.to_string(),
-                catalog_id: schema.catalog_name.to_string(),
+                schema: schema.name.clone(),
+                catalog_id: schema.catalog_name.clone(),
             })?;
 
-        let mut tables_map = HashMap::new();
+        // First pass: filter to queryable, included tables with valid references.
+        let mut candidates: Vec<(UCTable, TableReference)> = Vec::new();
         for table in tables {
-            let table_name = table.name.to_string();
-            let table_reference = table_reference_creator(&table);
+            if !table.is_queryable() {
+                tracing::debug!(
+                    table = %table.full_name(),
+                    table_type = %table.table_type,
+                    "Skipping unsupported Unity Catalog table type"
+                );
+                continue;
+            }
 
-            let Some(table_reference) = table_reference else {
+            let Some(table_reference) = table_reference_creator(&table) else {
                 continue;
             };
 
-            let schema_with_table = format!("{}.{}", schema.name, table_name);
+            let schema_with_table = format!("{}.{}", schema.name, table.name);
             tracing::debug!("Checking if table {} should be included", schema_with_table);
             if let Some(include) = &include
                 && !include.is_match(&schema_with_table)
@@ -175,6 +182,62 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
+            candidates.push((table, table_reference));
+        }
+
+        // Second pass: check permissions concurrently (bounded). Explicitly
+        // denied tables are excluded; ambiguous/unreachable cases are kept.
+        let max_concurrent_permission_checks = 5;
+        let permission_results: Vec<Option<(UCTable, TableReference)>> =
+            futures::stream::iter(candidates.into_iter().map(|(table, table_ref)| {
+                let client = Arc::clone(&client);
+                async move {
+                    if !table.requires_read_permission_validation() {
+                        tracing::debug!(
+                            table = %table.full_name(),
+                            table_type = %table.table_type,
+                            "Skipping strict Unity Catalog permission precheck for foreign table during catalog discovery"
+                        );
+                        return Some((table, table_ref));
+                    }
+
+                    match client.get_effective_permissions(&table.full_name()).await {
+                        Ok(Some(perms)) if !perms.has_read_permission() => {
+                            // Explicit denial: skip this table for the current
+                            // catalog discovery pass. It can be discovered on a
+                            // later refresh or restart if permissions change.
+                            tracing::warn!(
+                                table = %table.full_name(),
+                                "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
+                            );
+                            return None;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                table = %table.full_name(),
+                                "Permission check returned no table during catalog discovery; proceeding without permission validation"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                table = %table.full_name(),
+                                error = %e,
+                                "Failed to check permissions during catalog discovery; proceeding without permission validation"
+                            );
+                        }
+                        Ok(Some(_)) => {}
+                    }
+
+                    Some((table, table_ref))
+                }
+            }))
+            .buffer_unordered(max_concurrent_permission_checks)
+            .collect()
+            .await;
+
+        // Third pass: create table providers for permitted tables.
+        let mut tables_map = HashMap::new();
+        for (table, table_reference) in permission_results.into_iter().flatten() {
             let table_provider = match table_creator.table_provider(table_reference.clone()).await {
                 Ok(provider) => provider,
                 Err(source) => {
@@ -182,7 +245,7 @@ impl UnityCatalogSchemaProvider {
                     continue;
                 }
             };
-            tables_map.insert(table_name, table_provider);
+            tables_map.insert(table.name.clone(), table_provider);
         }
 
         Ok(Self {
@@ -202,8 +265,8 @@ impl UnityCatalogSchemaProvider {
             .list_tables(&self.schema.catalog_name, &self.schema.name)
             .await?
             .context(super::SchemaDoesntExistSnafu {
-                schema: self.schema.name.to_string(),
-                catalog_id: self.schema.catalog_name.to_string(),
+                schema: self.schema.name.clone(),
+                catalog_id: self.schema.catalog_name.clone(),
             })?;
 
         let mut new_tables = Vec::new();
@@ -229,12 +292,13 @@ impl UnityCatalogSchemaProvider {
                 Arc::clone(&self.table_creator),
                 self.table_reference_creator,
                 self.include.clone(),
+                Arc::clone(&self.client),
             )
             .await
             else {
                 continue;
             };
-            new_table_providers.insert(table.name.to_string(), provider);
+            new_table_providers.insert(table.name.clone(), provider);
         }
 
         let mut guard = match self.tables.write() {
@@ -282,8 +346,18 @@ impl UnityCatalogSchemaProvider {
         table_creator: Arc<dyn Read>,
         table_reference_creator: fn(&UCTable) -> Option<TableReference>,
         include: Option<Arc<GlobSet>>,
+        client: Arc<UnityCatalog>,
     ) -> Option<Arc<dyn TableProvider>> {
-        let table_name = table.name.to_string();
+        if !table.is_queryable() {
+            tracing::debug!(
+                table = %table.full_name(),
+                table_type = %table.table_type,
+                "Skipping unsupported Unity Catalog table type"
+            );
+            return None;
+        }
+
+        let table_name = table.name.clone();
         let table_reference = table_reference_creator(table)?;
 
         let schema_with_table = format!("{}.{}", schema.name, table_name);
@@ -293,6 +367,40 @@ impl UnityCatalogSchemaProvider {
         {
             tracing::debug!("Table {} is not included", schema_with_table);
             return None;
+        }
+
+        if table.requires_read_permission_validation() {
+            match client.get_effective_permissions(&table.full_name()).await {
+                Ok(Some(perms)) if !perms.has_read_permission() => {
+                    // Explicit denial: skip this table so a later refresh or
+                    // restart can discover it if permissions change.
+                    tracing::warn!(
+                        table = %table.full_name(),
+                        "Skipping table during catalog refresh: no read-compatible privilege found in effective-permissions response"
+                    );
+                    return None;
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %table.full_name(),
+                        "Permission check returned no table during catalog refresh; proceeding without permission validation"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        table = %table.full_name(),
+                        error = %e,
+                        "Failed to check permissions during catalog refresh; proceeding without permission validation"
+                    );
+                }
+                Ok(Some(_)) => {}
+            }
+        } else {
+            tracing::debug!(
+                table = %table.full_name(),
+                table_type = %table.table_type,
+                "Skipping strict Unity Catalog permission precheck for foreign table during catalog refresh"
+            );
         }
 
         let table_provider = match table_creator.table_provider(table_reference.clone()).await {

@@ -1,0 +1,5 @@
+tests:
+  append:
+    spicepod_path: accelerated/append/file[parquet]-cayenne[file]-append_retention_sql.yaml
+    query_set: tpch
+    with_retention_data: true

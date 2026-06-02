@@ -31,12 +31,13 @@ use crate::utils::test_request_context;
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common::{self, get_pg_params, get_random_port},
-    utils::runtime_ready_check,
+    utils::{register_test_connectors, runtime_ready_check},
 };
 
 #[tokio::test]
 async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -82,13 +83,13 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

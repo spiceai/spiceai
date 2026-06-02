@@ -20,8 +20,9 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
+use futures::TryStreamExt;
 
 use runtime::Runtime;
 use spicepod::{component::catalog::Catalog, param::Params};
@@ -32,7 +33,7 @@ fn make_catalog(path: &str, name: &str) -> Catalog {
     catalog
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let _ = std::env::var("TEST_DATABRICKS_HOST").expect("TEST_DATABRICKS_HOST is not set");
@@ -72,6 +73,7 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -131,6 +133,135 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
+async fn databricks_spark_schema_inference_test() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_spark_schema_test")
+                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify databricks_demo columns appear in information_schema
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT column_name FROM information_schema.columns \
+                     WHERE table_catalog = 'db_uc' AND table_schema = 'default' \
+                     AND table_name = 'databricks_demo' \
+                     ORDER BY ordinal_position",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let total_columns: usize = result
+                .iter()
+                .map(datafusion::arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                total_columns, 7,
+                "Expected 7 columns in databricks_demo schema, got {total_columns}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
+async fn databricks_spark_dataset_registration_test() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_spark_registration_test")
+                .with_catalog(make_catalog("catalog-dash-test", "db_uc"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify the catalog datasets are registered in information_schema.tables
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT COUNT(*) as cnt FROM information_schema.tables \
+                     WHERE table_catalog = 'db_uc'",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let table_count: i64 = result
+                .first()
+                .and_then(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .map(|a| a.value(0))
+                })
+                .unwrap_or(0);
+            assert!(
+                table_count > 0,
+                "Expected at least one table registered under db_uc catalog, found {table_count}"
+            );
 
             Ok(())
         })

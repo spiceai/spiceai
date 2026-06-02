@@ -6,6 +6,7 @@ datasets:
     name: customer
     params: &spicecloud_params
       spiceai_api_key: ${secrets:SPICEAI_TEST_TPCH_API_KEY}
+      spiceai_region: us-east-1
       spiceai_endpoint: ${secrets:SPICEAI_TEST_ENDPOINT}
     acceleration: &acceleration
       enabled: true

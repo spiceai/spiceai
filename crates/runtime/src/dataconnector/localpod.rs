@@ -109,3 +109,5 @@ impl DataConnector for LocalPodConnector {
         )
     }
 }
+
+register_data_connector!("localpod", LocalPodFactory);

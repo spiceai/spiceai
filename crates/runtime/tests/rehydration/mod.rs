@@ -20,9 +20,13 @@ use crate::{
     configure_test_datafusion,
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
-use std::sync::Arc;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::init_tracing;
 
@@ -54,6 +58,7 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let running_container = prepare_test_environment()
@@ -77,10 +82,13 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
                     .start()
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
-                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
             }
-            execute_spill_to_disk_and_rehydration(Arc::clone(&running_container), engine, db_file_path)
-                .await?;
+            execute_spill_to_disk_and_rehydration(
+                Arc::clone(&running_container),
+                engine,
+                db_file_path,
+            )
+            .await?;
         }
 
         running_container
@@ -109,27 +117,22 @@ async fn execute_spill_to_disk_and_rehydration(
 ) -> Result<(), anyhow::Error> {
     // retrieve number of rows using native mysql connection
     // this also ensures that federated dataset is available
-    let pool = get_mysql_conn(MYSQL_PORT)?;
-    let res: Vec<Row> = pool
-        .get_conn()
-        .await?
-        .exec("SELECT COUNT(*) FROM lineitem", Params::Empty)
-        .await?;
-    let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
-    assert!(num_rows > 0);
+    let num_rows = get_lineitem_count().await?;
+    anyhow::ensure!(num_rows > 0, "lineitem table should contain rows");
 
-    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
+    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path);
     tracing::debug!(
         "Expected accelerated database location: {}",
-        &accelerated_db_file_path
+        accelerated_db_file_path.display()
     );
 
     // clean up: delete local database file if exists before running the test
+    let accelerated_db_file_path_str = accelerated_db_file_path.display().to_string();
     for file_path in [
         accelerated_db_file_path.clone(),
-        format!("{accelerated_db_file_path}-wal"),
-        format!("{accelerated_db_file_path}.wal"),
-        format!("{accelerated_db_file_path}-shm"),
+        path_with_appended_suffix(&accelerated_db_file_path, "-wal"),
+        accelerated_db_file_path.with_added_extension("wal"),
+        path_with_appended_suffix(&accelerated_db_file_path, "-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
             std::fs::remove_file(&file_path).context("should remove local database")?;
@@ -141,7 +144,7 @@ async fn execute_spill_to_disk_and_rehydration(
 
     if std::fs::metadata(&accelerated_db_file_path).is_err() {
         return Err(anyhow::anyhow!(
-            "Accelerated database file not found at path: {accelerated_db_file_path}"
+            "Accelerated database file not found at path: {accelerated_db_file_path_str}"
         ));
     }
 
@@ -157,10 +160,8 @@ async fn execute_spill_to_disk_and_rehydration(
     // ensure data has been loaded correctly
     assert_eq!(num_rows_loaded as u64, 10);
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
     retry(retry_strategy, || async {
@@ -187,10 +188,8 @@ async fn execute_spill_to_disk_and_rehydration(
     let restart1_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart1_items).expect("pretty format");
     insta::assert_snapshot!("records", restart1_items_pretty);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Restart the runtime with updated app definition that includes primary key and indexes
     let rt = init_spice_app(engine, db_file_path, true).await?;
@@ -199,10 +198,8 @@ async fn execute_spill_to_disk_and_rehydration(
         arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
     insta::assert_snapshot!("records", restart2_items_pretty);
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     rt.shutdown().await;
     drop(rt);
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
     let rt = init_spice_app(engine, db_file_path, false).await?;
@@ -212,17 +209,45 @@ async fn execute_spill_to_disk_and_rehydration(
         arrow::util::pretty::pretty_format_batches(&restart3_items).expect("pretty format");
     insta::assert_snapshot!("records", restart3_items_pretty);
 
+    rt.shutdown().await;
+    drop(rt);
+
     Ok(())
+}
+
+async fn get_lineitem_count() -> Result<u64, anyhow::Error> {
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        get_lineitem_count_once()
+            .await
+            .map_err(RetryError::transient)
+    })
+    .await
+}
+
+async fn get_lineitem_count_once() -> Result<u64, anyhow::Error> {
+    let pool = get_mysql_conn(MYSQL_PORT)?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .context("Unable to connect to MySQL lineitem database")?;
+    let num_rows: Option<u64> = conn
+        .exec_first("SELECT COUNT(*) FROM lineitem", Params::Empty)
+        .await
+        .context("Unable to count rows in lineitem")?;
+
+    num_rows.context("Unable to retrieve number of rows")
 }
 
 async fn get_locally_persisted_records(
     engine: &str,
-    db_file_path: &str,
+    db_file_path: &Path,
     query: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let db_file_path = db_file_path.to_string_lossy();
     let query_result = match engine {
-        "duckdb" => duckdb::query_local_db(db_file_path, query).await?,
-        "sqlite" => sqlite::query_local_db(db_file_path, query).await?,
+        "duckdb" => duckdb::query_local_db(db_file_path.as_ref(), query).await?,
+        "sqlite" => sqlite::query_local_db(db_file_path.as_ref(), query).await?,
         _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
     };
 
@@ -232,22 +257,22 @@ async fn get_locally_persisted_records(
         .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
 }
 
-fn resolve_local_db_file_path(
-    engine: &str,
-    db_file_path: Option<&str>,
-) -> Result<String, anyhow::Error> {
+fn resolve_local_db_file_path(engine: &str, db_file_path: Option<&str>) -> PathBuf {
     if let Some(db_file_path) = db_file_path {
         let working_dir = std::env::current_dir().unwrap_or(".".into());
-        return Ok(format!(
-            "{}/{db_file_path}",
-            working_dir.to_str().context("Unable to get current dir")?
-        ));
+        return working_dir.join(db_file_path);
     }
 
-    Ok(format!(
-        "{}/accelerated_{engine}.db",
-        spice_data_base_path()
-    ))
+    PathBuf::from(spice_data_base_path()).join(format!("accelerated_{engine}.db"))
+}
+
+fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .expect("database path should include a file name");
+    file_name.push(suffix);
+    path.with_file_name(file_name)
 }
 
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -257,13 +282,13 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
         .build()
         .run()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to run query: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to run query: {e:?}"))?;
 
     let collected_data = query_result
         .data
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to collect query results: {e:?}"))?;
 
     Ok(collected_data)
 }
@@ -273,6 +298,9 @@ async fn init_spice_app(
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
 ) -> Result<Runtime, anyhow::Error> {
+    // Re-register connectors in case a previous runtime shutdown cleared them
+    register_test_connectors().await;
+
     let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
@@ -353,7 +381,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
     tracing::debug!("INSERT INTO lineitem...");
     let insert_stmt =
-        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
+        InsertBuilder::new(&TableReference::from("lineitem"), &tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 

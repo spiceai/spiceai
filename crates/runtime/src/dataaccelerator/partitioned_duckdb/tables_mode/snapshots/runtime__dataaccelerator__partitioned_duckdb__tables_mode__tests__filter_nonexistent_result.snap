@@ -1,0 +1,6 @@
+---
+source: crates/runtime/src/dataaccelerator/partitioned_duckdb/tables_mode/mod.rs
+expression: result_pretty
+---
+++
+++

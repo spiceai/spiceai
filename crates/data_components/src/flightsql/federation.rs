@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
     sql::{
         TableReference,
@@ -67,14 +69,35 @@ impl SQLExecutor for FlightSQLTable {
         Arc::new(DefaultDialect {})
     }
 
+    fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+        // FlightSQL federation currently cannot safely unparse arbitrary custom
+        // extension nodes. If any are present in the subtree — including inside
+        // subquery expressions (IN, EXISTS, scalar subqueries) — do not federate.
+        let mut found = false;
+        let _ = logical_plan.apply_with_subqueries(|p| {
+            if matches!(p, LogicalPlan::Extension(_)) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        });
+        !found
+    }
+
     fn execute(
         &self,
         query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            query_to_stream(self.client.clone(), query.to_string()),
+            query_to_stream(
+                self.client.clone(),
+                query.to_string(),
+                Arc::clone(&self.cookie_store),
+            ),
         )))
     }
 

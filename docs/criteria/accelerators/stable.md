@@ -6,12 +6,15 @@ All criteria must be met for the accelerator to be considered Stable, with excep
 
 ## Stable Quality Accelerators
 
-| Accelerator | Stable Quality | DRI Sign-off |
-| ----------- | -------------- | ------------ |
-| Arrow       | ✅            | @peasee      |
-| DuckDB      | ✅            | @peasee      |
-| SQLite      | ❌            |              |
-| PostgreSQL  | ❌            |              |
+| Accelerator             | Stable Quality | DRI Sign-off |
+| ----------------------- | -------------- | ------------ |
+| Arrow                   | ✅              | @peasee      |
+| Cayenne                 | ✅              | @peasee      |
+| DuckDB                  | ✅              | @peasee      |
+| SQLite                  | ➖              |              |
+| PostgreSQL<sup>\*</sup> | ➖              |              |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## Stable Release Criteria
 
@@ -26,6 +29,7 @@ Stable quality accelerators should be able to run test packages derived from the
 - [TPC-H](https://www.tpc.org/TPC-H/)
 - [TPC-DS](https://www.tpc.org/TPC-DS/)
 - [ClickBench](https://github.com/ClickHouse/ClickBench)
+- [SpiceBench](https://github.com/spiceai/spicebench)
 
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
@@ -40,7 +44,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall accelerator.
 
 #### TPC-DS
 
@@ -58,7 +62,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
     - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
     - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
     - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
-  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall accelerator.
 
 #### ClickBench
 
@@ -69,6 +73,13 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
   - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
 
+#### SpiceBench
+
+- [ ] A [SpiceBench](https://github.com/spiceai/spicebench) scenario runs end-to-end against the accelerator, covering concurrent ingestion, materialization, and query execution from a hybrid data lake + database topology.
+- [ ] The SpiceBench run completes with no [Major or Minor Bugs](../definitions.md) and without service unavailability.
+- [ ] Results are published to [SpiceBench.com](https://spicebench.com/) with run metadata (executor instance type, scale factor, scenario, table format) sufficient for reproduction.
+- [ ] Primary metric (`test_duration_ms`) and secondary metrics (query latency p99, ingestion throughput, resource efficiency) are reported.
+
 ### AI Workloads Support
 
 - [ ] Accelerator supports accelerating datasets with embeddings (including chunking)
@@ -78,4 +89,5 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 - [ ] Documentation includes all known issues/limitations for the accelerator.
 - [ ] Documentation includes any exceptions made to allow this accelerator to reach Stable quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment topology, configuration, sizing, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
 - [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).

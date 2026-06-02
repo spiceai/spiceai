@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -99,6 +99,22 @@ impl GraphQLContext for PullRequestTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
     }
+
+    fn query_cost(&self) -> Option<u32> {
+        // first 100 pull requests could retrieve up to 100 PRs
+        // each query returns labels, commits and assignees which are each additional requests
+        // if review threads are enabled, 1 PR retrieves 20 review threads, which could each have comments that are also retrieved
+        // if discussion comments are enabled, each PR also retrieves discussion comments
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        match self.include_comments {
+            PullRequestCommentType::None => Some(226), // 1 + 100 (labels) + 25 (commits) + 100 (assignees) = 226
+            PullRequestCommentType::Review => Some(226 + (20 * self.max_comments_fetched)), // 226 + (20 review threads * comments_to_fetch)
+            PullRequestCommentType::Discussion => Some(226 + self.max_comments_fetched), // 226 + comments_to_fetch (discussion comments)
+            PullRequestCommentType::All => {
+                Some(226 + (20 * self.max_comments_fetched) + self.max_comments_fetched)
+            }
+        }
+    }
 }
 
 impl PullRequestTableArgs {
@@ -114,14 +130,13 @@ impl PullRequestTableArgs {
             updated_at: updatedAt
             merged_at: mergedAt
             closed_at: closedAt
-            number
             reviews { reviews_count: totalCount }
             author: author { author: login }
             additions
             deletions
             changed_files: changedFiles
             labels(first: 100) { labels: nodes { name } }
-            commits(first: 100) { commits_count: totalCount, hashes: nodes { id } }
+            commits(first: 25) { commits_count: totalCount, hashes: nodes { id } }
             assignees(first: 100) { assignees: nodes { login } }
             comments_count_wrapper: comments { comments_count: totalCount }
         "
@@ -188,17 +203,127 @@ impl PullRequestTableArgs {
     }
 }
 
+impl PullRequestTableArgs {
+    /// GitHub's hard limit on the number of nodes a single GraphQL query may
+    /// request. Queries that exceed this limit are rejected with
+    /// `MAX_NODE_LIMIT_EXCEEDED`.
+    ///
+    /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
+    const GITHUB_NODE_LIMIT: u32 = 500_000;
+
+    /// Default outer `first:` value for the pull request connection when
+    /// `include_comments` is not enabled.
+    const DEFAULT_PAGE_SIZE: u32 = 100;
+
+    /// Reduced outer `first:` value when `include_comments` is enabled.
+    ///
+    /// With comments enabled, each PR can expand to up to `20 * max_comments_fetched`
+    /// review-thread comments plus `max_comments_fetched` discussion comments.
+    /// Keeping the outer page at 25 keeps the total node count safely under
+    /// GitHub's 500,000 node hard limit and within secondary rate limits.
+    ///
+    /// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
+    const COMMENTS_PAGE_SIZE: u32 = 25;
+
+    /// Upper bound on the number of review threads fetched per PR.
+    const REVIEW_THREADS_PER_PR: u32 = 20;
+
+    /// Conservative upper bound on the number of nodes contributed by a
+    /// single PR's non-comment fields. Kept as a constant so
+    /// `estimated_node_count` and the base query cannot drift out of sync.
+    ///
+    /// Includes:
+    /// - 1 root PR node
+    /// - 100 `labels` nodes
+    /// - 25 `commits` nodes (hashes)
+    /// - 100 `assignees` nodes
+    /// - 3 wrapper/object nodes the GraphQL node counter charges for:
+    ///   `reviews`, `comments_count_wrapper`, `author`
+    ///
+    /// When review threads are enabled this count does NOT include the
+    /// `reviewThreads` nodes themselves — those are added in
+    /// `estimated_node_count` along with their nested comments.
+    const BASE_INNER_NODE_COUNT: u32 = 1 /* root PR */
+        + 100 /* labels */
+        + 25 /* commits */
+        + 100 /* assignees */
+        + 3 /* reviews + comments_count_wrapper + author wrapper objects */;
+
+    /// Returns the outer `first:` page size for the pull request connection.
+    ///
+    /// When comments are included (review, discussion, or both), the page size
+    /// is reduced to keep total node count well under GitHub's 500,000 node
+    /// hard limit on a single GraphQL query.
+    fn outer_page_size(&self) -> u32 {
+        match self.include_comments {
+            PullRequestCommentType::None => Self::DEFAULT_PAGE_SIZE,
+            PullRequestCommentType::Review
+            | PullRequestCommentType::Discussion
+            | PullRequestCommentType::All => Self::COMMENTS_PAGE_SIZE,
+        }
+    }
+
+    /// Conservative upper bound on the number of nodes a single page of this
+    /// query will request from GitHub. Used to validate that a caller-supplied
+    /// configuration (most notably a high `max_comments_fetched`) cannot push
+    /// the query over GitHub's 500,000 node hard limit.
+    ///
+    /// The estimate intentionally over-counts rather than under-counts:
+    /// when review threads are enabled it charges for `REVIEW_THREADS_PER_PR`
+    /// thread nodes *plus* `REVIEW_THREADS_PER_PR × max_comments_fetched`
+    /// comment nodes, and always includes the full `BASE_INNER_NODE_COUNT`.
+    ///
+    /// Returns `outer_page_size × (base_inner + per_PR_comment_expansion)`.
+    fn estimated_node_count(&self) -> u32 {
+        let per_pr_comment_nodes: u32 = match self.include_comments {
+            PullRequestCommentType::None => 0,
+            PullRequestCommentType::Review => Self::REVIEW_THREADS_PER_PR.saturating_add(
+                Self::REVIEW_THREADS_PER_PR.saturating_mul(self.max_comments_fetched),
+            ),
+            PullRequestCommentType::Discussion => self.max_comments_fetched,
+            PullRequestCommentType::All => Self::REVIEW_THREADS_PER_PR
+                .saturating_add(
+                    Self::REVIEW_THREADS_PER_PR.saturating_mul(self.max_comments_fetched),
+                )
+                .saturating_add(self.max_comments_fetched),
+        };
+
+        self.outer_page_size()
+            .saturating_mul(Self::BASE_INNER_NODE_COUNT.saturating_add(per_pr_comment_nodes))
+    }
+
+    /// Returns `Ok(())` if the query's estimated node count fits within
+    /// GitHub's 500,000 node hard limit; otherwise returns an error describing
+    /// how to reduce the request.
+    pub(crate) fn check_node_limit(&self) -> std::result::Result<(), String> {
+        let estimated = self.estimated_node_count();
+        if estimated > Self::GITHUB_NODE_LIMIT {
+            return Err(format!(
+                "GitHub pull request query for {owner}/{repo} is estimated at {estimated} nodes, which exceeds GitHub's {limit} node hard limit. \
+                 Reduce 'github_max_comments_fetched' (currently {max_comments}) or disable 'github_include_comments'. \
+                 See: https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit",
+                owner = self.owner,
+                repo = self.repo,
+                limit = Self::GITHUB_NODE_LIMIT,
+                max_comments = self.max_comments_fetched,
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl GitHubTableArgs for PullRequestTableArgs {
     fn get_component(&self) -> ConnectorComponent {
         self.component.clone()
     }
 
     fn get_graphql_values(&self) -> GitHubTableGraphQLParams {
+        let page_size = self.outer_page_size();
         let query = match self.query_mode {
             GitHubQueryMode::Search => {
                 format!(
                     r#"{{
-                search(query:"repo:{owner}/{name} type:pr", first:100, type:ISSUE) {{
+                search(query:"repo:{owner}/{name} type:pr", first:{page_size}, type:ISSUE) {{
                     pageInfo {{
                         hasNextPage
                         endCursor
@@ -220,7 +345,7 @@ impl GitHubTableArgs for PullRequestTableArgs {
                     r#"
             {{
                 repository(owner: "{owner}", name: "{name}") {{
-                    pullRequests(first: 100) {{
+                    pullRequests(first: {page_size}) {{
                         pageInfo {{
                             hasNextPage
                             endCursor
@@ -423,4 +548,93 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
     add_fields_based_on_comment_type(&mut field_vector, comments_type);
 
     Arc::new(Schema::new(field_vector))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PullRequestCommentType, PullRequestTableArgs};
+    use crate::builder::RuntimeBuilder;
+    use crate::component::dataset::builder::DatasetBuilder;
+    use crate::dataconnector::ConnectorComponent;
+    use crate::dataconnector::github::GitHubQueryMode;
+    use app::AppBuilder;
+    use std::sync::{Arc, OnceLock};
+
+    /// Building a `ConnectorComponent` requires a full runtime + app
+    /// construction. Cache a single shared instance so the unit tests don't
+    /// spin up a tokio runtime per invocation.
+    fn shared_component() -> ConnectorComponent {
+        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
+        COMPONENT
+            .get_or_init(|| {
+                let app = AppBuilder::new("test").build();
+                let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
+                let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
+                let dataset = DatasetBuilder::try_new("github".to_string(), "test.pulls")
+                    .expect("to create dataset builder")
+                    .with_app(Arc::new(app))
+                    .with_runtime(Arc::new(spice_runtime))
+                    .build()
+                    .expect("to create dataset");
+                ConnectorComponent::from(&dataset)
+            })
+            .clone()
+    }
+
+    fn args(include: PullRequestCommentType, max_comments: u32) -> PullRequestTableArgs {
+        PullRequestTableArgs {
+            owner: "spiceai".to_string(),
+            repo: "spiceai".to_string(),
+            query_mode: GitHubQueryMode::Auto,
+            component: shared_component(),
+            include_comments: include,
+            max_comments_fetched: max_comments,
+        }
+    }
+
+    #[test]
+    fn outer_page_size_uses_default_when_no_comments() {
+        let a = args(PullRequestCommentType::None, 25);
+        assert_eq!(a.outer_page_size(), 100);
+    }
+
+    #[test]
+    fn outer_page_size_shrinks_when_comments_enabled() {
+        for include in [
+            PullRequestCommentType::Review,
+            PullRequestCommentType::Discussion,
+            PullRequestCommentType::All,
+        ] {
+            let a = args(include, 25);
+            assert_eq!(a.outer_page_size(), 25);
+        }
+    }
+
+    #[test]
+    fn node_limit_passes_for_sane_defaults() {
+        let a = args(PullRequestCommentType::All, 25);
+        let estimated = a.estimated_node_count();
+        // outer=25, base_inner=229 (1+100+25+100+3), per-PR comments for All:
+        // 20 thread nodes + 20×25 review comments + 25 discussion = 545
+        // total = 25 × (229 + 545) = 25 × 774 = 19_350
+        assert_eq!(estimated, 19_350);
+        a.check_node_limit().expect("defaults must fit under 500K");
+    }
+
+    #[test]
+    fn node_limit_passes_at_max_comments_cap() {
+        // With the current MAX_COMMENTS_FETCHED=75 cap, worst-case still fits.
+        let a = args(PullRequestCommentType::All, 75);
+        a.check_node_limit()
+            .expect("75 comments must fit under 500K");
+    }
+
+    #[test]
+    fn node_limit_rejects_abusively_large_configurations() {
+        // Construct a synthetically oversized config that bypasses the mod.rs
+        // clamp to verify the guard itself rejects it.
+        let mut a = args(PullRequestCommentType::All, 1_000);
+        a.max_comments_fetched = 2_000;
+        assert!(a.check_node_limit().is_err());
+    }
 }

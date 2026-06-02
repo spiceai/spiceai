@@ -2,29 +2,28 @@
 description = "Request context for the Spice runtime"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "runtime-request-context"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 app = { path = "../app" }
-spicepod = { path = "../spicepod" }
-percent-encoding.workspace = true
+async-trait.workspace = true
 axum.workspace = true
-tonic.workspace = true
-tower.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 futures.workspace = true
-base64.workspace = true
-pin-project.workspace = true
+headers = "0.4"
 http.workspace = true
-runtime-auth = { path = "../runtime-auth" }
-regex.workspace = true
 opentelemetry.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+runtime-auth = { path = "../runtime-auth" }
+sha2.workspace = true
+spicepod = { path = "../spicepod" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winver = "1.0.0"

@@ -2,14 +2,18 @@
 description = "All loaded components from the root Spicepod and its dependencies"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "app"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
+
+[features]
+default = []

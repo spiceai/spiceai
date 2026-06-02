@@ -31,25 +31,25 @@ pub mod session;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error fetching messages: {source}"))]
+    #[snafu(display("Failed to fetch messages from IMAP mailbox: {source}"))]
     FetchMessages { source: imap::Error },
-    #[snafu(display("Error examining mailbox: {source}"))]
+    #[snafu(display("Failed to open IMAP mailbox for reading: {source}"))]
     ExamineMailbox { source: imap::Error },
-    #[snafu(display("Error getting mailbox status: {source}"))]
+    #[snafu(display("Failed to get IMAP mailbox status: {source}"))]
     GetMailboxStatus { source: imap::Error },
-    #[snafu(display("Could not find message at index"))]
+    #[snafu(display("Message not found at the specified index in the IMAP mailbox"))]
     MessageNotFound,
-    #[snafu(display("Could not find envelope segment: {segment}"))]
+    #[snafu(display("Could not find envelope segment '{segment}' in the IMAP message"))]
     EnvelopeNotFound { segment: String },
-    #[snafu(display("Could not find header"))]
+    #[snafu(display("Could not find the message header in the IMAP message"))]
     HeaderNotFound,
     #[snafu(display("Failed to parse header: {source}"))]
     FailedToParseHeader { source: mailparse::MailParseError },
     #[snafu(display("Failed to login. Verify the username and password, and try again. {source}"))]
     FailedToLogin { source: imap::Error },
-    #[snafu(display("Failed to connect: {source}"))]
+    #[snafu(display("Failed to connect to the IMAP server: {source}"))]
     FailedToConnect { source: imap::Error },
-    #[snafu(display("Failed to logout: {source}"))]
+    #[snafu(display("Failed to logout from the IMAP server: {source}"))]
     FailedToLogout { source: imap::Error },
     #[snafu(display("An invalid SSL mode was provided: {ssl_mode}"))]
     InvalidSSLMode { ssl_mode: String },

@@ -3,29 +3,96 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint'
-    required: true
-    type: string
-  os:
-    description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'darwin', 'windows'
+    description: 'MinIO endpoint (used for Linux and Windows)'
+    required: false
+  spiceio_endpoint:
+    description: 'Spiceio S3-compatible endpoint (used for macOS)'
+    required: false
+
 runs:
   using: 'composite'
   steps:
-    - name: Set up sccache
-      if: inputs.os == 'linux'
+    - name: Set sccache environment variables
+      if: runner.os == 'macOS' || inputs.minio_endpoint != ''
+      shell: bash
+      run: |
+        echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
+        echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
+
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
+      uses: ./.github/actions/configure-apt
+
+    - name: Set up sccache (Linux)
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
       run: |
         sudo apt-get update && sudo apt-get install wget -y
         wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        server_side_encryption = false
-        no_credentials = false
-        region = "auto"
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
+
+    - name: Set up sccache (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if ! command -v sccache &> /dev/null; then
+          echo "Error: sccache is not installed on this macOS runner"
+          exit 1
+        fi
+        sccache --version
+
+        SCCACHE_ENDPOINT="http://localhost:9000"
+        SCCACHE_REGION="us-east-1"
+        SCCACHE_NO_CREDS="false"
+
+        # Use spiceio if its endpoint was provided
+        if [ -n "${{ inputs.spiceio_endpoint }}" ]; then
+          SCCACHE_ENDPOINT="${{ inputs.spiceio_endpoint }}"
+          SCCACHE_REGION="us-west-1"
+          SCCACHE_NO_CREDS="true"
+          echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
+          echo "Using spiceio at $SCCACHE_ENDPOINT"
+        else
+          echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
+          echo "spiceio not available, using local MinIO"
+        fi
+
+        rm -rf ~/.config/sccache/config
+        mkdir -p ~/.config/sccache
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > ~/.config/sccache/config
+
+    - name: Set up sccache (Windows)
+      if: runner.os == 'Windows' && inputs.minio_endpoint != ''
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Download and install sccache
+        $sccacheVersion = "v0.9.1"
+        $sccacheUrl = "https://github.com/mozilla/sccache/releases/download/$sccacheVersion/sccache-$sccacheVersion-x86_64-pc-windows-msvc.zip"
+        $sccacheZip = "$env:TEMP\sccache.zip"
+        $sccacheDir = "$env:USERPROFILE\sccache"
+
+        Invoke-WebRequest -Uri $sccacheUrl -OutFile $sccacheZip
+        Expand-Archive -Path $sccacheZip -DestinationPath $sccacheDir -Force
+        $sccacheExtractedDir = Join-Path $sccacheDir "sccache-$sccacheVersion-x86_64-pc-windows-msvc"
+        $sccacheExePath = Join-Path $sccacheExtractedDir "sccache.exe"
+        if (-not (Test-Path $sccacheExePath)) {
+          Write-Error "sccache.exe not found at expected path: $sccacheExePath"
+          exit 1
+        }
+        $sccacheBinDir = Split-Path $sccacheExePath -Parent
+        echo "$sccacheBinDir" >> $env:GITHUB_PATH
+
+        # Configure sccache
+        $configDir = "$env:APPDATA\Mozilla\sccache"
+        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
+        $config | Out-File -FilePath "$configDir\config" -Encoding utf8

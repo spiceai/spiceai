@@ -49,6 +49,7 @@ Core Connector Data Types depend on the specific connector, but in general can b
 Defines the supported access modes for a particular accelerator:
 
 - Arrow: in-memory only.
+- Cayenne: file based only.
 - DuckDB: in-memory or file based.
 - SQLite: in-memory or file based.
 - PostgreSQL: database only.
@@ -80,6 +81,7 @@ The following table defines how many parallel queries are required at a given sc
 | Scale Factor | Parallel Queries |
 | ------------ | ---------------- |
 | 1            | 8                |
+| 5            | 12               |
 | 10           | 16               |
 | 100          | 32               |
 | 1000         | 64               |
@@ -97,6 +99,7 @@ The following table defines how many parallel queries are required at a given sc
 | Scale Factor | Parallel Queries |
 | ------------ | ---------------- |
 | 1            | 4                |
+| 5            | 6                |
 | 10           | 8                |
 | 100          | 16               |
 | 1000         | 32               |
@@ -112,5 +115,5 @@ The system is provided with no delays or pauses between throughput test repetiti
 The load test uses a stop-light system to determine severity of timing measurements compared against the baseline:
 
 - 🟢: Green - an increase of the 99th percentile of less than 10% compared to the baseline
-- 🟡: Yellow - an increase of the 99th percentile between 10-20% compared to the baseline
-- 🔴: Red - an increase of the 99th percentile of more then 20% compared to the baseline
+- 🟡: Yellow - an increase of the 99th percentile greater than or equal to 10% and less than 20% compared to the baseline
+- 🔴: Red - an increase of the 99th percentile of 20% or more compared to the baseline

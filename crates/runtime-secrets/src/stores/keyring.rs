@@ -34,6 +34,11 @@ pub enum Error {
 
 pub struct KeyringSecretStore {}
 
+/// Parameters accepted by the `keyring` secret store. The keyring store has
+/// no configurable parameters today; the empty list is kept here so the
+/// validation pipeline can still reject typos.
+pub const PARAMETERS: &[runtime_parameter_spec::ParameterSpec] = &[];
+
 impl Default for KeyringSecretStore {
     fn default() -> Self {
         Self::new()

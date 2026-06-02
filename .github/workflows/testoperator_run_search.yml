@@ -22,11 +22,13 @@ on:
 
 jobs:
   run-bench:
-    name: Run vector search tests
+    name: Run Search tests
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Validate spicepod file exists
         run: |
@@ -42,6 +44,17 @@ jobs:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -69,7 +82,7 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         run: |
           rm -rf .spice/data
-          testoperator run vector-search \
+          testoperator run search \
             --ready-wait 1800 \
             --concurrency 10 \
             --benchmark-dataset quora_retrieval \

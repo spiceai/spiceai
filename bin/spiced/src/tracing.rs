@@ -14,19 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use app::spicepod::component::runtime::OutputLevel;
 use app::{App, spicepod::component::runtime::TracingConfig};
-use futures::future::BoxFuture;
-use opentelemetry::InstrumentationScope;
+use opentelemetry::{InstrumentationScope, trace::TracerProvider as _};
 use opentelemetry_sdk::{
     Resource,
-    export::trace::{ExportResult, SpanData, SpanExporter},
-    trace::TracerProvider,
+    error::OTelSdkResult,
+    trace::{
+        SdkTracerProvider, SpanData, SpanExporter,
+        span_processor_with_async_runtime::BatchSpanProcessor,
+    },
 };
+use opentelemetry_zipkin::ZipkinExporter;
 use reqwest::Client;
 use runtime::{datafusion::DataFusion, task_history};
+use runtime_datafusion::query_engine::QueryEngine;
 use std::time::Duration;
 use tracing::Subscriber;
 use tracing_log::LogTracer;
@@ -81,36 +85,67 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "tpc_extension",
     "workers",
     "search",
+    "ballista",
     "datafusion",
+    "runtime_rate_control",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry=warn,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn";
+
+fn specific_env_filter(filter: &str) -> String {
+    format!("{OFF_FILTERS},{filter}")
+}
+
+fn env_filter_string(v: &LogVerbosity) -> String {
+    fn internal_components(level: &str) -> String {
+        INTERNAL_COMPONENTS
+            .iter()
+            .map(|component| format!("{component}={level}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    match v {
+        LogVerbosity::Default => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
+            internal_components("INFO")
+        ),
+        LogVerbosity::Verbose => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
+            internal_components("DEBUG")
+        ),
+        LogVerbosity::VeryVerbose => {
+            format!("{},{OFF_FILTERS},DEBUG", internal_components("TRACE"))
+        }
+        LogVerbosity::Specific(filter) => specific_env_filter(filter),
+    }
+}
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
-        fn internal_components(level: &str) -> String {
-            INTERNAL_COMPONENTS
-                .iter()
-                .map(|component| format!("{component}={level}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
+        EnvFilter::new(env_filter_string(&v))
+    }
+}
 
-        match v {
-            LogVerbosity::Default => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},WARN",
-                internal_components("INFO")
-            )),
-            LogVerbosity::Verbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},INFO",
-                internal_components("DEBUG")
-            )),
-            LogVerbosity::VeryVerbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},DEBUG",
-                internal_components("TRACE")
-            )),
-            LogVerbosity::Specific(filter) => EnvFilter::new(filter),
-        }
+fn specific_filter_enables_trace_logging(filter: &str) -> bool {
+    filter.split(',').map(str::trim).any(|directive| {
+        matches!(
+            directive.rsplit('=').next().map(str::trim),
+            Some(level) if level.eq_ignore_ascii_case("trace")
+        )
+    })
+}
+
+fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity) -> bool {
+    if !is_release_build {
+        return true;
+    }
+
+    match verbosity {
+        LogVerbosity::Default | LogVerbosity::Verbose => false,
+        LogVerbosity::VeryVerbose => true,
+        LogVerbosity::Specific(filter) => specific_filter_enables_trace_logging(filter),
     }
 }
 
@@ -120,6 +155,7 @@ pub(crate) async fn init_tracing(
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
 
     if let Some(app) = app.as_ref()
@@ -140,7 +176,7 @@ pub(crate) async fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(datafusion_task_history_tracing(df, app, config).await?)
+        .with(datafusion_task_history_tracing(df, app, config, include_otel_location).await?)
         .with(
             event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(
                 |metadata| metadata.target() == "task_history",
@@ -164,6 +200,7 @@ async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
+    include_otel_location: bool,
 ) -> Result<impl Layer<S> + use<S>, Box<dyn std::error::Error + Send + Sync>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
@@ -176,27 +213,75 @@ where
         .transpose()?
         .unwrap_or_default();
 
-    let mut exporters: Vec<Box<dyn SpanExporter>> = vec![Box::new(
-        task_history::otel_exporter::TaskHistoryExporter::new(df, captured_output),
-    )];
+    let captured_context = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_context())
+        .transpose()?
+        .unwrap_or_default();
 
-    if let Ok(Some(zipkin_exporter)) = zipkin_task_history_otel_exporter(app_name, config).await {
-        exporters.push(zipkin_exporter);
-    }
+    let min_sql_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_sql_duration_as_millis())
+        .transpose()?
+        .flatten();
 
-    let exporter = OtelExportMultiplexer::new(exporters);
+    let captured_plan = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_plan())
+        .transpose()?
+        .unwrap_or_default();
 
-    let mut provider_builder =
-        TracerProvider::builder().with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
-    provider_builder = provider_builder.with_resource(Resource::default());
-    let provider = provider_builder.build();
+    let min_plan_duration_ms = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.min_plan_duration_as_millis())
+        .transpose()?
+        .flatten();
+
+    // Compute node_id for cluster mode: "host:port"
+    let node_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
+        let host = df.cluster_config.node_advertise_address()?;
+        let port = df.cluster_config.node_bind_address().port();
+        Some(format!("{host}:{port}").into())
+    });
+
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
+    let query_engine = std::sync::Arc::clone(&df) as std::sync::Arc<dyn QueryEngine>;
+    let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
+        query_engine,
+        captured_output,
+        captured_context,
+        min_sql_duration_ms,
+        captured_plan,
+        min_plan_duration_ms,
+        node_id,
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
+
+    let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
+
+    let exporter = OtelExportMultiplexer::new(task_history_exporter, zipkin_exporter);
+
+    let service_name = app_name
+        .as_ref()
+        .map_or_else(|| "Spice.ai".to_string(), Clone::clone);
+
+    let processor =
+        BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio).build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(processor)
+        .with_resource(Resource::builder().with_service_name(service_name).build())
+        .build();
     let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
+    let tracer = provider.tracer_with_scope(scope);
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
+        .with_location(include_otel_location)
         .with_filter(filter::filter_fn(|metadata| {
             metadata.target() == "task_history"
         }));
@@ -205,9 +290,8 @@ where
 }
 
 async fn zipkin_task_history_otel_exporter(
-    app_name: Option<String>,
     config: Option<&TracingConfig>,
-) -> Result<Option<Box<dyn SpanExporter>>, Box<dyn std::error::Error>> {
+) -> Result<Option<ZipkinExporter>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(config) = config else {
         return Ok(None);
     };
@@ -226,27 +310,33 @@ async fn zipkin_task_history_otel_exporter(
         return Ok(None);
     }
 
-    let service_name: Cow<'static, str> = match app_name {
-        Some(name) => Cow::Owned(name),
-        None => Cow::Borrowed("Spice.ai"),
-    };
+    let collector_endpoint: String = zipkin_endpoint.clone();
 
-    Ok(Some(Box::new(
-        opentelemetry_zipkin::new_pipeline()
-            .with_service_name(service_name)
-            .with_collector_endpoint(zipkin_endpoint)
-            .with_http_client(Client::new())
-            .init_exporter()?,
-    )))
+    Ok(Some(
+        ZipkinExporter::builder()
+            .with_collector_endpoint(collector_endpoint)
+            .with_http_client(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .build()?,
+            )
+            .build()?,
+    ))
 }
 
 async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
-    let client = Client::new();
-    let timeout = Duration::from_secs(5);
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
 
     let url = format!("{endpoint}?serviceName=test");
 
-    match client.get(&url).timeout(timeout).send().await {
+    match client.get(&url).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
@@ -254,52 +344,68 @@ async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
 
 #[derive(Debug)]
 struct OtelExportMultiplexer {
-    exporters: Vec<Box<dyn SpanExporter>>,
+    task_history: task_history::otel_exporter::TaskHistoryExporter,
+    zipkin: Option<ZipkinExporter>,
 }
 
 impl OtelExportMultiplexer {
-    pub fn new(exporters: Vec<Box<dyn SpanExporter>>) -> Self {
-        Self { exporters }
+    pub fn new(
+        task_history: task_history::otel_exporter::TaskHistoryExporter,
+        zipkin: Option<ZipkinExporter>,
+    ) -> Self {
+        Self {
+            task_history,
+            zipkin,
+        }
     }
 }
 
 impl SpanExporter for OtelExportMultiplexer {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-        let mut futures = Vec::new();
-        for exporter in &mut self.exporters {
-            futures.push(exporter.export(batch.clone()));
-        }
+    fn export(&self, batch: Vec<SpanData>) -> impl futures::Future<Output = OTelSdkResult> + Send {
+        let history_future = self.task_history.export(batch.clone());
+        let zipkin_future = self.zipkin.as_ref().map(|exporter| exporter.export(batch));
 
-        Box::pin(async move {
-            futures::future::join_all(futures).await;
+        async move {
+            if let Some(zipkin_future) = zipkin_future
+                && let Err(e) = zipkin_future.await
+            {
+                tracing::warn!("Failed to send traces to Zipkin: {e}");
+            }
 
-            Ok(())
-        })
-    }
-
-    fn shutdown(&mut self) {
-        for exporter in &mut self.exporters {
-            exporter.shutdown();
-        }
-    }
-
-    fn force_flush(&mut self) -> BoxFuture<'static, ExportResult> {
-        let mut futures = Vec::new();
-        for exporter in &mut self.exporters {
-            futures.push(exporter.force_flush());
-        }
-
-        Box::pin(async move {
-            futures::future::join_all(futures).await;
+            if let Err(e) = history_future.await {
+                tracing::warn!("Failed to write to task history: {e}");
+            }
 
             Ok(())
-        })
+        }
+    }
+
+    fn shutdown(&mut self) -> OTelSdkResult {
+        if let Some(exporter) = &mut self.zipkin {
+            let _ = exporter.shutdown();
+        }
+
+        let _ = self.task_history.shutdown();
+
+        Ok(())
+    }
+
+    fn force_flush(&mut self) -> OTelSdkResult {
+        if let Some(exporter) = &mut self.zipkin {
+            let _ = exporter.force_flush();
+        }
+
+        let _ = self.task_history.force_flush();
+
+        Ok(())
     }
 
     fn set_resource(&mut self, resource: &Resource) {
-        for exporter in &mut self.exporters {
+        if let Some(exporter) = &mut self.zipkin {
             exporter.set_resource(resource);
         }
+
+        self.task_history.set_resource(resource);
     }
 }
 
@@ -359,5 +465,59 @@ mod tests {
         let result =
             LogVerbosity::from_flags_and_env_and_config(false, false, "NON_EXISTENT_ENV", None);
         assert_eq!(result, LogVerbosity::Default);
+    }
+
+    #[test]
+    fn includes_otel_location_for_non_release_builds() {
+        assert!(should_include_otel_location(false, &LogVerbosity::Default));
+    }
+
+    #[test]
+    fn excludes_otel_location_for_release_builds_without_trace_logging() {
+        assert!(!should_include_otel_location(true, &LogVerbosity::Default));
+        assert!(!should_include_otel_location(true, &LogVerbosity::Verbose));
+        assert!(!should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=info".to_string())
+        ));
+        assert!(!should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=debug".to_string())
+        ));
+    }
+
+    #[test]
+    fn includes_otel_location_for_release_trace_logging() {
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::VeryVerbose
+        ));
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("trace".to_string())
+        ));
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=trace".to_string())
+        ));
+    }
+
+    #[test]
+    fn specific_filter_keeps_off_filters() {
+        assert_eq!(specific_env_filter("trace"), format!("{OFF_FILTERS},trace"));
+    }
+
+    #[test]
+    fn verbose_filter_suppresses_opentelemetry_info() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("opentelemetry=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("opentelemetry=warn"));
+        assert!(env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
+    }
+
+    #[test]
+    fn filters_tantivy_to_error() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
+        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
     }
 }

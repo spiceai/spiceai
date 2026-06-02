@@ -31,13 +31,11 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_catalogs(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(ref app) = self.read_app().await else {
             return;
         };
 
         let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(true));
-        drop(app_lock);
         let mut futures = vec![];
         for catalog in &valid_catalogs {
             self.status
@@ -58,8 +56,10 @@ impl Runtime {
                 Ok(connector) => connector,
                 Err(err) => {
                     let catalog_name = &catalog.name;
-                    self.status
-                        .update_catalog(catalog_name, status::ComponentStatus::Error);
+                    self.status.update_catalog(
+                        catalog_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::catalogs::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
                     return Err(RetryError::transient(err));
@@ -68,6 +68,20 @@ impl Runtime {
 
             if let Err(err) = Arc::clone(&self).register_catalog(catalog, connector).await {
                 tracing::error!("{err}");
+                if matches!(
+                    &err,
+                    crate::Error::UnableToInitializeCatalogConnector { source }
+                        if source.downcast_ref::<catalogconnector::Error>()
+                            .is_some_and(catalogconnector::Error::is_configuration_error)
+                ) {
+                    let catalog_name = &catalog.name;
+                    self.status.update_catalog(
+                        catalog_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
+                    metrics::catalogs::LOAD_ERROR.add(1, &[]);
+                    return Err(RetryError::permanent(err));
+                }
                 return Err(RetryError::transient(err));
             }
 
@@ -85,19 +99,25 @@ impl Runtime {
 
         let source = catalog.provider.clone();
         let params = ConnectorParamsBuilder::new(source.clone().into(), (&catalog).into())
-            .build(self.secrets())
+            .build(self.secrets(), self.tokio_io_runtime())
             .await
             .context(UnableToInitializeCatalogConnectorSnafu)?;
 
         let Some(catalog_connector) = catalogconnector::create_new_connector(&source, params).await
         else {
             let catalog_name = &catalog.name;
-            self.status
-                .update_catalog(catalog_name, status::ComponentStatus::Error);
             metrics::catalogs::LOAD_ERROR.add(1, &[]);
+            let suggestion = catalogconnector::suggest_catalog_connector(&source).await;
+            let available = catalogconnector::registered_catalog_names().await;
             let err = crate::Error::UnknownCatalogConnector {
                 catalog_connector: source,
+                suggestion,
+                available,
             };
+            self.status.update_catalog(
+                catalog_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             warn_spaced!(spaced_tracer, "{} {err}", catalog_name);
             return Err(err);
         };
@@ -105,6 +125,7 @@ impl Runtime {
         Ok(catalog_connector)
     }
 
+    #[expect(clippy::result_large_err)]
     fn catalogs_iter(
         self: Arc<Self>,
         app: &Arc<App>,
@@ -115,7 +136,7 @@ impl Runtime {
             .map(CatalogBuilder::try_from)
             .map(move |catalog_builder_result| {
                 catalog_builder_result.and_then(|catalog_builder| {
-                    let catalog_name = catalog_builder.name.to_string();
+                    let catalog_name = catalog_builder.name.clone();
                     catalog_builder
                         .with_app(Arc::clone(app))
                         .with_runtime(Arc::clone(&self))

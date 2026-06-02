@@ -18,18 +18,20 @@ limitations under the License.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
     Spicepod,
     component::{
-        caching::{CacheConfig, ResultsCache},
+        caching::{CacheConfig, SQLResultsCacheConfig},
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
-        eval::Eval,
+        function::Function,
         management::Management,
         model::Model,
+        rerankers::Reranker,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
         snapshot::Snapshots,
@@ -43,7 +45,7 @@ use util::in_tracing_context;
 
 pub mod runtime;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct App {
     pub name: String,
 
@@ -61,11 +63,13 @@ pub struct App {
 
     pub embeddings: Vec<Embeddings>,
 
-    pub evals: Vec<Eval>,
+    pub rerankers: Vec<Reranker>,
 
     pub tools: Vec<Tool>,
 
     pub workers: Vec<Worker>,
+
+    pub functions: Vec<Function>,
 
     pub spicepods: Vec<Spicepod>,
 
@@ -85,6 +89,29 @@ impl App {
             .filter(|d| d.from.starts_with(format!("{prefix}:").as_str()))
             .map(|d| d.name.clone())
             .collect()
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        App {
+            name: "DEFAULT".to_string(),
+            secrets: vec![],
+            extensions: HashMap::default(),
+            catalogs: vec![],
+            datasets: vec![],
+            views: vec![],
+            models: vec![],
+            embeddings: vec![],
+            rerankers: vec![],
+            tools: vec![],
+            workers: vec![],
+            functions: vec![],
+            spicepods: vec![],
+            runtime: Runtime::default(),
+            management: None,
+            snapshots: None,
+        }
     }
 }
 
@@ -108,9 +135,10 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
-    evals: Vec<Eval>,
+    rerankers: Vec<Reranker>,
     tools: Vec<Tool>,
     workers: Vec<Worker>,
+    functions: Vec<Function>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
     management: Option<Management>,
@@ -128,32 +156,71 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
-            evals: vec![],
+            rerankers: vec![],
             tools: vec![],
             workers: vec![],
+            functions: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
             management: None,
             snapshots: None,
         }
     }
-
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.runtime = spicepod.runtime.clone();
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
-        self.management.clone_from(&spicepod.management);
-        self.snapshots.clone_from(&spicepod.snapshots);
+        if let Some(ref management) = spicepod.management {
+            self.management = Some(management.clone());
+        }
+        if let Some(ref snapshot) = spicepod.snapshots {
+            self.snapshots = Some(snapshot.clone());
+        }
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
-        self.evals.extend(spicepod.evals.clone());
+        self.rerankers.extend(spicepod.rerankers.clone());
         self.tools.extend(spicepod.tools.clone());
         self.workers.extend(spicepod.workers.clone());
+        self.functions.extend(spicepod.functions.clone());
         self.spicepods.push(spicepod);
+        self
+    }
+
+    /// Load a spicepod dependency into the app builder.
+    ///
+    /// As a dependency, `.runtime`, `.management`, and `.snapshots` configurations will be ignored.
+    #[must_use]
+    pub fn with_spicepod_dependency(mut self, mut spicepod: Spicepod) -> AppBuilder {
+        if spicepod.runtime != Runtime::default() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'runtime' field(s) defined. Runtime configuration must be set in primary spicepod. runtime configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.runtime = self.runtime.clone();
+
+        if spicepod.management.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'management' field(s) defined. Management configuration must be set in primary spicepod. management configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.management = None;
+        if spicepod.snapshots.is_some() {
+            in_tracing_context(|| {
+                tracing::warn!(
+                    "Spicepod dependency has 'snapshots' field(s) defined. Snapshot configuration must be set in primary spicepod. snapshots configuration from dependency will be ignored."
+                );
+            });
+        }
+        spicepod.snapshots = None;
+        self = self.with_spicepod(spicepod);
         self
     }
 
@@ -194,12 +261,6 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_eval(mut self, eval: Eval) -> AppBuilder {
-        self.evals.push(eval);
-        self
-    }
-
-    #[must_use]
     pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
         self.embeddings.push(embedding);
         self
@@ -218,8 +279,14 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
-        self.runtime.results_cache = Some(results_cache);
+    pub fn with_function(mut self, function: Function) -> AppBuilder {
+        self.functions.push(function);
+        self
+    }
+
+    #[must_use]
+    pub fn with_sql_cache(mut self, sql_results: SQLResultsCacheConfig) -> AppBuilder {
+        self.runtime.caching.sql_results = Some(sql_results);
         self
     }
 
@@ -288,9 +355,10 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
-            evals: self.evals,
+            rerankers: self.rerankers,
             tools: self.tools,
             workers: self.workers,
+            functions: self.functions,
             spicepods: self.spicepods,
             runtime: self.runtime,
             management: self.management,
@@ -306,7 +374,6 @@ impl AppBuilder {
         Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let secrets = spicepod.secrets.clone();
@@ -319,9 +386,10 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
-        let mut evals: Vec<Eval> = vec![];
+        let mut rerankers: Vec<Reranker> = vec![];
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
+        let mut functions: Vec<Function> = vec![];
 
         for catalog in &spicepod.catalogs {
             catalogs.push(catalog.clone());
@@ -343,8 +411,8 @@ impl AppBuilder {
             embeddings.push(embedding.clone());
         }
 
-        for eval in &spicepod.evals {
-            evals.push(eval.clone());
+        for reranker in &spicepod.rerankers {
+            rerankers.push(reranker.clone());
         }
 
         for tool in &spicepod.tools {
@@ -353,6 +421,10 @@ impl AppBuilder {
 
         for worker in &spicepod.workers {
             workers.push(worker.clone());
+        }
+
+        for function in &spicepod.functions {
+            functions.push(function.clone());
         }
 
         let root_spicepod_name = spicepod.name.clone();
@@ -382,8 +454,8 @@ impl AppBuilder {
                 embeddings.push(embedding.clone());
             }
 
-            for eval in &dependent_spicepod.evals {
-                evals.push(eval.clone());
+            for reranker in &dependent_spicepod.rerankers {
+                rerankers.push(reranker.clone());
             }
 
             for tool in &dependent_spicepod.tools {
@@ -392,6 +464,10 @@ impl AppBuilder {
 
             for worker in &dependent_spicepod.workers {
                 workers.push(worker.clone());
+            }
+
+            for function in &dependent_spicepod.functions {
+                functions.push(function.clone());
             }
 
             if dependent_spicepod.runtime != Runtime::default() {
@@ -423,14 +499,6 @@ impl AppBuilder {
 
         spicepods.push(spicepod);
 
-        if snapshots.is_some() {
-            in_tracing_context(|| {
-                tracing::warn!(
-                    "Snapshots configuration is defined. Acceleration snapshots (preview) enabled."
-                );
-            });
-        }
-
         Ok(App {
             name: root_spicepod_name,
             secrets,
@@ -440,9 +508,10 @@ impl AppBuilder {
             views,
             models,
             embeddings,
-            evals,
+            rerankers,
             tools,
             workers,
+            functions,
             spicepods,
             runtime,
             management,

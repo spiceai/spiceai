@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(dead_code, clippy::allow_attributes)]
 
 use std::{
     collections::HashMap,
@@ -53,12 +54,10 @@ impl RunningContainer<'_> {
         remove(&self.docker, self.name).await
     }
 
-    #[allow(dead_code)]
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         stop(&self.docker, self.name).await
     }
 
-    #[allow(dead_code)]
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         start(&self.docker, self.name).await
     }
@@ -156,7 +155,6 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    #[allow(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self
@@ -243,7 +241,7 @@ impl<'a> ContainerRunner<'a> {
         let (exposed_ports, port_bindings) = if port_bindings_map.is_empty() {
             (None, None)
         } else {
-            #[allow(clippy::zero_sized_map_values)]
+            #[expect(clippy::zero_sized_map_values)]
             let exposed_ports = port_bindings_keys
                 .iter()
                 .map(|k| (k.as_str(), HashMap::new()))
@@ -364,4 +362,42 @@ impl<'a> ContainerRunner<'a> {
 
         Ok(false)
     }
+}
+
+/// Check if Docker is available on this system.
+///
+/// Returns `true` if Docker daemon is accessible, `false` otherwise.
+/// This is useful for tests that require Docker to skip gracefully
+/// when Docker is not available (e.g., on certain CI runners).
+pub async fn is_docker_available() -> bool {
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return false;
+    };
+
+    // Try to ping the Docker daemon to verify it's actually running
+    docker.ping().await.is_ok()
+}
+
+pub async fn wait_for_tcp_port(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let start_time = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start_time.elapsed() <= timeout {
+        match tokio::net::TcpStream::connect((host, port)).await {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Timed out waiting for TCP port {host}:{port} within {}s. Last error: {}",
+        timeout.as_secs(),
+        last_error.unwrap_or_else(|| "none".to_string())
+    ))
 }

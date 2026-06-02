@@ -27,19 +27,21 @@ use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::streaming_utils::{create_stream_response, generate_stream_id};
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatChoice, ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestDeveloperMessage,
-    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
     ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionToolType,
+    ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionTools,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FunctionCall, FunctionCallStream, Role, Stop,
+    FunctionCall, FunctionCallStream, FunctionType, ResponseFormat, ResponseFormatJsonSchema, Role,
+    StopConfiguration,
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::error::{BuildError, SdkError};
@@ -52,12 +54,14 @@ use aws_sdk_bedrockruntime::types::builders::{
 };
 use aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
-    ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
-    ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration, Message,
-    MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
-    ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
+    CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta as ContentBlockDeltaType,
+    ContentBlockDeltaEvent, ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent,
+    ConversationRole, ConverseStreamMetadataEvent,
+    ConverseStreamOutput as ConverseStreamOutputPacket, GuardrailConfiguration,
+    GuardrailStreamConfiguration, InferenceConfiguration, JsonSchemaDefinition, Message,
+    MessageStartEvent, MessageStopEvent, OutputConfig, OutputFormat, OutputFormatStructure,
+    OutputFormatType, SystemContentBlock, ToolResultContentBlock, ToolResultStatus,
+    ToolUseBlockDelta, ToolUseBlockStart,
 };
 use aws_smithy_types::Document;
 use futures::stream::StreamExt;
@@ -100,8 +104,10 @@ impl BedrockConverse {
         // Must be done explicitly.
         if let Some(ref mut tools) = req.tools {
             for t in tools.iter_mut() {
-                if t.function.parameters.is_none() {
-                    t.function.parameters.replace(json!(
+                if let ChatCompletionTools::Function(tool) = t
+                    && tool.function.parameters.is_none()
+                {
+                    tool.function.parameters.replace(json!(
                         {
                             "$schema": "http://json-schema.org/draft-07/schema#",
                             "properties": {},
@@ -119,7 +125,6 @@ impl BedrockConverse {
     /// Convert [`ChatCompletionRequestMessage`] that are neither [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`Message`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
     fn convert_non_system_messages(
         msgs: Vec<ChatCompletionRequestMessage>,
     ) -> Result<Vec<Message>, BuildError> {
@@ -130,13 +135,13 @@ impl BedrockConverse {
                     ..
                 }) => MessageBuilder::default()
                     .set_content(Some(vec![ContentBlock::Text(match content {
-                        ChatCompletionRequestUserMessageContent::Text(s) => s.clone(),
+                        ChatCompletionRequestUserMessageContent::Text(s) => s,
                         ChatCompletionRequestUserMessageContent::Array(arr) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestUserMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 _ => None,
                             })
                             .join(""),
@@ -152,15 +157,13 @@ impl BedrockConverse {
                 ) => {
                     let mut message_content = vec![];
                     let text_content: Option<String> = match content {
-                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => {
-                            Some(s.clone())
-                        }
+                        Some(ChatCompletionRequestAssistantMessageContent::Text(s)) => Some(s),
                         Some(ChatCompletionRequestAssistantMessageContent::Array(arr)) => arr
                             .into_iter()
                             .filter_map(|p| match p {
                                 ChatCompletionRequestAssistantMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
-                                ) => Some(text.clone()),
+                                ) => Some(text),
                                 ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => {
                                     None
                                 }
@@ -174,11 +177,16 @@ impl BedrockConverse {
                         tools
                             .iter()
                             .filter_map(|t| {
-                                let ChatCompletionMessageToolCall {
-                                    id,
-                                    function: FunctionCall { name, arguments },
-                                    ..
-                                } = t;
+                                let ChatCompletionMessageToolCalls::Function(
+                                    ChatCompletionMessageToolCall {
+                                        id,
+                                        function: FunctionCall { name, arguments },
+                                        ..
+                                    },
+                                ) = t
+                                else {
+                                    return None;
+                                };
 
                                 let tool_input = serde_json::from_str(arguments).ok().map_or(
                                     Document::Object(HashMap::default()),
@@ -214,7 +222,7 @@ impl BedrockConverse {
                 }) => {
                     let block_content = match content {
                         ChatCompletionRequestToolMessageContent::Text(t) => {
-                            vec![ToolResultContentBlock::Text(t.clone())]
+                            vec![ToolResultContentBlock::Text(t)]
                         }
                         ChatCompletionRequestToolMessageContent::Array(arr) => arr
                             .into_iter()
@@ -222,7 +230,7 @@ impl BedrockConverse {
                                 let ChatCompletionRequestToolMessageContentPart::Text(
                                     ChatCompletionRequestMessageContentPartText { text },
                                 ) = s;
-                                ToolResultContentBlock::Text(text.clone())
+                                ToolResultContentBlock::Text(text)
                             })
                             .collect(),
                     };
@@ -230,7 +238,7 @@ impl BedrockConverse {
                         .set_content(
                             ToolResultBlockBuilder::default()
                                 .set_content(Some(block_content))
-                                .set_tool_use_id(Some(tool_call_id.clone()))
+                                .set_tool_use_id(Some(tool_call_id))
                                 .set_status(Some(ToolResultStatus::Success))
                                 .build()
                                 .ok()
@@ -246,12 +254,59 @@ impl BedrockConverse {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()
+            .map(Self::merge_consecutive_tool_result_messages)?
+    }
+
+    /// Bedrock requires all `ToolResult` blocks for a multi-tool-use assistant turn to be
+    /// in a single `User` message. `OpenAI` sends each tool result as a separate `Tool` message,
+    /// which we convert into separate `User` messages. This function merges consecutive `User`
+    /// messages that contain only `ToolResult` content blocks into a single `User` message.
+    fn merge_consecutive_tool_result_messages(
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>, BuildError> {
+        let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
+
+        for msg in messages {
+            let is_tool_result_user_msg = msg.role == ConversationRole::User
+                && msg
+                    .content
+                    .iter()
+                    .all(|c| matches!(c, ContentBlock::ToolResult(_)));
+
+            if is_tool_result_user_msg {
+                // Check if the previous message is also a tool-result-only User message
+                let should_merge = merged.last().is_some_and(|prev| {
+                    prev.role == ConversationRole::User
+                        && prev
+                            .content
+                            .iter()
+                            .all(|c| matches!(c, ContentBlock::ToolResult(_)))
+                });
+
+                if should_merge {
+                    // Merge into the previous message
+                    if let Some(prev) = merged.last_mut() {
+                        let mut combined = prev.content.clone();
+                        combined.extend(msg.content);
+                        *prev = MessageBuilder::default()
+                            .set_content(Some(combined))
+                            .set_role(Some(ConversationRole::User))
+                            .build()?;
+                    }
+                } else {
+                    merged.push(msg);
+                }
+            } else {
+                merged.push(msg);
+            }
+        }
+
+        Ok(merged)
     }
 
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
     ///
     /// Other enum variants will be ignored.
-    #[allow(clippy::cast_possible_wrap)]
     fn convert_system_messages(msgs: Vec<ChatCompletionRequestMessage>) -> Vec<SystemContentBlock> {
         msgs.into_iter()
             .flat_map(|m| match m {
@@ -275,7 +330,7 @@ impl BedrockConverse {
                 | ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                     content: ChatCompletionRequestSystemMessageContent::Text(s),
                     name: _,
-                }) => vec![SystemContentBlock::Text(s.to_string())],
+                }) => vec![SystemContentBlock::Text(s)],
                 ChatCompletionRequestMessage::Developer(
                     ChatCompletionRequestDeveloperMessage {
                         content: ChatCompletionRequestDeveloperMessageContent::Array(arr),
@@ -284,7 +339,9 @@ impl BedrockConverse {
                 ) => arr
                     .into_iter()
                     .map(|s| {
-                        let ChatCompletionRequestMessageContentPartText { text } = s;
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(
+                            ChatCompletionRequestMessageContentPartText { text },
+                        ) = s;
                         SystemContentBlock::Text(text)
                     })
                     .collect(),
@@ -293,7 +350,65 @@ impl BedrockConverse {
             .collect()
     }
 
-    #[allow(clippy::cast_possible_wrap, deprecated)]
+    fn prompt_cache_point() -> Result<CachePointBlock, BuildError> {
+        CachePointBlock::builder()
+            .r#type(CachePointType::Default)
+            .build()
+    }
+
+    fn add_prompt_cache_point(
+        system: &mut Vec<SystemContentBlock>,
+        messages: &mut [Message],
+    ) -> Result<(), BuildError> {
+        let cache_point = Self::prompt_cache_point()?;
+        if let Some(last_message) = messages.last_mut() {
+            last_message
+                .content
+                .push(ContentBlock::CachePoint(cache_point));
+        } else {
+            system.push(SystemContentBlock::CachePoint(cache_point));
+        }
+        Ok(())
+    }
+
+    fn output_config(
+        response_format: Option<ResponseFormat>,
+    ) -> Result<Option<OutputConfig>, OpenAIError> {
+        match response_format {
+            Some(ResponseFormat::JsonObject) => Err(to_api_error(
+                "Bedrock does not support 'response_format.type: json_object', only 'json_schema'.",
+            )),
+            Some(ResponseFormat::JsonSchema {
+                json_schema:
+                    ResponseFormatJsonSchema {
+                        name,
+                        schema: Some(schema),
+                        description,
+                        strict: _,
+                    },
+            }) => Ok(Some(
+                OutputConfig::builder()
+                    .text_format(
+                        OutputFormat::builder()
+                            .r#type(OutputFormatType::JsonSchema)
+                            .structure(OutputFormatStructure::JsonSchema(
+                                JsonSchemaDefinition::builder()
+                                    .set_schema(Some(schema.to_string()))
+                                    .name(name)
+                                    .set_description(description)
+                                    .build()
+                                    .map_err(|e| to_api_error(e.to_string()))?,
+                            ))
+                            .build()
+                            .map_err(|e| to_api_error(e.to_string()))?,
+                    )
+                    .build(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    #[expect(clippy::cast_possible_wrap, deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
             .set_max_tokens(
@@ -302,8 +417,8 @@ impl BedrockConverse {
                     .map(|u| u as i32),
             )
             .set_stop_sequences(req.stop.as_ref().map(|stop| match stop {
-                Stop::String(s) => vec![s.clone()],
-                Stop::StringArray(arr) => arr.clone(),
+                StopConfiguration::String(s) => vec![s.clone()],
+                StopConfiguration::StringArray(arr) => arr.clone(),
             }))
             .set_temperature(req.temperature)
             .set_top_p(req.top_p)
@@ -321,6 +436,8 @@ impl BedrockConverse {
             metadata,
             tool_choice,
             tools,
+            response_format,
+            prompt_cache_key,
             ..
         } = req;
 
@@ -336,9 +453,13 @@ impl BedrockConverse {
             )
         });
 
-        let system = Self::convert_system_messages(system);
-        let messages =
+        let mut system = Self::convert_system_messages(system);
+        let mut messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
+        if prompt_cache_key.is_some() {
+            Self::add_prompt_cache_point(&mut system, &mut messages)
+                .map_err(|e| to_api_error(e.to_string()))?;
+        }
 
         let guardrails: Option<GuardrailStreamConfiguration> = self
             .guardrail
@@ -355,18 +476,21 @@ impl BedrockConverse {
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
+            .set_output_config(Self::output_config(response_format)?)
             .set_tool_config(tool_config(tools, tool_choice));
 
-        if let Some(Value::Object(m)) = metadata {
-            bldr = bldr.set_request_metadata(Some(
-                m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
-            ));
+        if let Some(metadata) = metadata {
+            // Metadata is a newtype around serde_json::Value - convert and extract object
+            if let Ok(Value::Object(m)) = serde_json::to_value(&metadata) {
+                bldr = bldr.set_request_metadata(Some(
+                    m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+                ));
+            }
         }
 
         Ok(bldr)
     }
 
-    #[allow(deprecated)]
     fn to_converse(
         &self,
         client: &Arc<BedrockClient>,
@@ -378,6 +502,8 @@ impl BedrockConverse {
             metadata,
             tools,
             tool_choice,
+            response_format,
+            prompt_cache_key,
             ..
         } = req;
 
@@ -393,9 +519,13 @@ impl BedrockConverse {
             )
         });
 
-        let system = Self::convert_system_messages(system);
-        let messages =
+        let mut system = Self::convert_system_messages(system);
+        let mut messages =
             Self::convert_non_system_messages(messages).map_err(|e| to_api_error(e.to_string()))?;
+        if prompt_cache_key.is_some() {
+            Self::add_prompt_cache_point(&mut system, &mut messages)
+                .map_err(|e| to_api_error(e.to_string()))?;
+        }
 
         let guardrails: Option<GuardrailConfiguration> = self
             .guardrail
@@ -412,18 +542,22 @@ impl BedrockConverse {
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
+            .set_output_config(Self::output_config(response_format)?)
             .set_tool_config(tool_config(tools, tool_choice));
 
-        if let Some(Value::Object(m)) = metadata {
-            bldr = bldr.set_request_metadata(Some(
-                m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
-            ));
+        if let Some(metadata) = metadata {
+            // Metadata is a newtype around serde_json::Value - convert and extract object
+            if let Ok(Value::Object(m)) = serde_json::to_value(&metadata) {
+                bldr = bldr.set_request_metadata(Some(
+                    m.into_iter().map(|(k, v)| (k, v.to_string())).collect(),
+                ));
+            }
         }
 
         Ok(bldr)
     }
 
-    #[allow(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
+    #[expect(clippy::cast_possible_truncation, deprecated, clippy::type_complexity)]
     fn convert_converse_output(
         &self,
         output: ConverseOutput,
@@ -446,12 +580,24 @@ impl BedrockConverse {
                 let (content_and_refusal, tool_calls): (Vec<_>, Vec<_>) = data.into_iter().unzip();
                 let (content, refusals): (Vec<_>, Vec<_>) = content_and_refusal.into_iter().unzip();
 
+                // Convert tool_calls from Vec<ChatCompletionMessageToolCall> to Vec<ChatCompletionMessageToolCalls>
+                let tool_calls_enum: Vec<ChatCompletionMessageToolCalls> = tool_calls
+                    .into_iter()
+                    .flatten()
+                    .map(ChatCompletionMessageToolCalls::Function)
+                    .collect();
+
                 Ok::<_, OpenAIError>(ChatChoice {
                     index: 0,
                     message: ChatCompletionResponseMessage {
                         content: Some(content.into_iter().flatten().join("\n")),
                         refusal: Some(refusals.into_iter().flatten().join("\n")),
-                        tool_calls: Some(tool_calls.into_iter().flatten().collect()),
+                        tool_calls: if tool_calls_enum.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls_enum)
+                        },
+                        annotations: None,
                         role: try_convert_role(role)?,
                         function_call: None,
                         audio: None,
@@ -482,7 +628,6 @@ impl BedrockConverse {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn process_stream(
         model: &str,
         input_stream: EventReceiver<ConverseStreamOutputPacket, ConverseStreamOutputError>,
@@ -511,18 +656,37 @@ impl BedrockConverse {
                let mut state_ = state.write().await;
                let zz: Option<Result<CreateChatCompletionStreamResponse, OpenAIError>> = match packet {
                     Err(SdkError::ServiceError(e)) => {
-                        match &e.err() {
-                            &ConverseStreamOutputError::InternalServerException(e) => {
-                                Some(Err(to_api_error(e.to_string())))
+                        match e.into_err() {
+                            ConverseStreamOutputError::InternalServerException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock internal server error: {e}"))))
+                            }
+                            ConverseStreamOutputError::ThrottlingException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock rate limit exceeded: {e}"))))
+                            }
+                            ConverseStreamOutputError::ValidationException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock validation error: {e}"))))
+                            }
+                            ConverseStreamOutputError::ModelStreamErrorException(e) => {
+                                Some(Err(to_api_error(format!("Bedrock model stream error: {e}"))))
                             }
                             ee => {
-                                // TODO specialise
-                                Some(Err(to_api_error(ee.to_string())))
+                                Some(Err(to_api_error(format!("Bedrock error: {ee}"))))
                             }
                         }
                     }
                     Err(e) => {
-                        Some(Err(to_api_error(e.to_string())))
+                        let err_str = e.to_string();
+                        let msg = if err_str.contains("UnrecognizedClientException")
+                            || err_str.contains("InvalidSignatureException")
+                            || err_str.contains("AccessDeniedException")
+                            || err_str.contains("ExpiredTokenException")
+                            || err_str.contains("IncompleteSignature")
+                        {
+                            format!("Bedrock authentication failed. Check that your AWS credentials are valid and have permission to access Bedrock. Details: {err_str}")
+                        } else {
+                            format!("Bedrock error: {err_str}")
+                        };
+                        Some(Err(to_api_error(msg)))
                     }
                     Ok(None) => None, // Natural end-of-stream.
                     Ok(Some(pkt)) => {
@@ -600,7 +764,7 @@ impl BedrockConverse {
                                                 Some(vec![ChatCompletionMessageToolCallChunk {
                                                     index: tool_delta_idx,
                                                     id: Some(tool_use_id.clone()),
-                                                    r#type: Some(ChatCompletionToolType::Function),
+                                                    r#type: Some(FunctionType::Function),
                                                     function: Some(FunctionCallStream {
                                                         name: Some(name.clone()),
                                                         arguments: Some(input),
@@ -665,7 +829,6 @@ impl BedrockConverse {
 
 #[async_trait]
 impl Chat for BedrockConverse {
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -694,5 +857,51 @@ impl Chat for BedrockConverse {
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::chat::ChatCompletionRequestUserMessageArgs;
+
+    #[test]
+    fn prompt_cache_point_is_added_to_last_message() {
+        let messages = vec![
+            ChatCompletionRequestUserMessageArgs::default()
+                .content("Reusable context")
+                .build()
+                .expect("user message should build")
+                .into(),
+        ];
+        let mut system = vec![];
+        let mut messages = BedrockConverse::convert_non_system_messages(messages)
+            .expect("bedrock messages should convert");
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            messages
+                .last()
+                .and_then(|message| message.content.last()),
+            Some(ContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
+    }
+
+    #[test]
+    fn prompt_cache_point_is_added_to_system_when_messages_are_empty() {
+        let mut system = vec![];
+        let mut messages = vec![];
+
+        BedrockConverse::add_prompt_cache_point(&mut system, &mut messages)
+            .expect("cache point should build");
+
+        assert!(matches!(
+            system.last(),
+            Some(SystemContentBlock::CachePoint(cache_point))
+                if cache_point.r#type == CachePointType::Default
+        ));
     }
 }

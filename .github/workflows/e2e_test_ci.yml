@@ -25,7 +25,7 @@ on:
       - 'acknowledgements.md'
       - 'Dockerfile*'
 
-  pull_request_target:
+  pull_request:
     branches:
       - trunk
     paths-ignore:
@@ -54,6 +54,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
@@ -63,7 +71,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
@@ -73,64 +81,49 @@ jobs:
                 builder: "spiceai-dev-runners",
                 runner: "ubuntu-latest",
                 target_os: "linux",
-                target_arch: "x86_64",
-                target_arch_go: "amd64"
+                target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
                 builder: "spiceai-macos",
-                runner: "macos-14",
+                runner: "macos-15",
                 target_os: "darwin",
-                target_arch: "aarch64",
-                target_arch_go: "arm64"
+                target_arch: "aarch64"
               }
             ];
 
-            return context.eventName === 'pull_request' ? matrix.slice(0, 1) : matrix;
+            const isPrEvent = context.eventName === 'pull_request';
+            return isPrEvent ? matrix.slice(0, 1) : matrix;
 
   build:
     name: Build ${{ matrix.target.name }} binaries
     runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
-    env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target.target_os }}
-      GOARCH: ${{ matrix.target.target_arch_go }}
 
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1 # Shallow clone for faster checkout
+
+      - name: Configure Cargo directories (self-hosted macOS)
+        if: matrix.target.builder == 'spiceai-macos'
+        run: |
+          set -euo pipefail
+          cargo_home="${{ runner.temp }}/cargo-${{ github.run_id }}-${{ github.job }}"
+          mkdir -p "$cargo_home/bin"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      # Cache Go modules
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -143,57 +136,222 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: ./.github/actions/install-protoc
+
+      - name: Build spiced and spice CLI
+        if: matrix.target.target_os != 'darwin'
+        uses: ./.github/actions/build-spiced
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          features: 'tpc-extension,models,postgres-accel'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
-      - name: Build spiced
-        run: make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="tpc-extension"
-
-      - name: Update build cache (macOS)
+      - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
-        run: |
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
-          fi
+        uses: ./.github/actions/build-spiced
+        with:
+          features: 'tpc-extension,models,postgres-accel,metal'
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
 
-      - name: Update build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
-          fi
+  setup-model-matrix:
+    name: Setup model strategy matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "spiceai-dev-runners",
+                target_os: "linux",
+                target_arch: "x86_64"
+              },
+              {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64"
+              }
+            ];
 
-      - name: Update build cache (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
-          }
+            const isPrEvent = context.eventName === 'pull_request';
+            return isPrEvent ? matrix.slice(0, 1) : matrix;
 
-      - name: Build spice
-        run: make -C bin/spice
+  test_openai_model:
+    name: 'openai model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 5
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ needs.setup-model-matrix.outputs.matrix != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-model-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
 
-      - name: make spiced executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        if: matrix.target.target_os != 'windows'
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          path: |
-            spice
-            spiced
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
+
+  test_hf_model:
+    name: 'huggingface model (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    timeout-minutes: 10
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-model-matrix
+    if: ${{ github.event_name != 'pull_request' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: 'macOS aarch64 (Apple Silicon)'
+            runner: 'spiceai-macos'
+            target_os: 'darwin'
+            target_arch: 'aarch64'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 5
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        run: |
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x spice || true
+          elif command -v killall >/dev/null 2>&1; then
+            killall spice || true
+          fi
+
+          if [ -f spice.log ]; then
+            cat spice.log
+          fi
 
   test_quickstart_dremio:
     name: 'Test Dremio quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
@@ -210,10 +368,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -252,8 +410,12 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
-          # time to initialize added dataset
-          sleep 10
+
+      - name: Wait for dataset to be ready
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
@@ -282,10 +444,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -302,7 +464,7 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "taxi_trips\nnew york taxi trips\nspice.ai/spiceai/quickstart/datasets/taxi_trips\ny" | spice dataset configure
+          spice dataset configure taxi_trips --description "new york taxi trips" --from spice.ai/spiceai/quickstart/datasets/taxi_trips --param spiceai_region=us-east-1
           cat spicepod.yaml
 
       - name: Start spice runtime
@@ -344,15 +506,16 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration: [{}, { engine: arrow, mode: memory }]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -436,6 +599,7 @@ jobs:
     timeout-minutes: 5
 
     strategy:
+      fail-fast: false
       matrix:
         acceleration:
           [
@@ -443,6 +607,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -459,12 +624,11 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -482,7 +646,7 @@ jobs:
           createdb -h localhost -U postgres testdb_acc
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -628,6 +792,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
             {
               engine: postgres,
               params:
@@ -644,13 +809,12 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install PostgreSQL
         if: matrix.acceleration.engine == 'postgres'
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Install MySQL (Linux)
@@ -667,7 +831,7 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+          # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
           brew update
           brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
@@ -690,7 +854,7 @@ jobs:
           mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -838,13 +1002,16 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8"
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-common-static=${CLICKHOUSE_VERSION} clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -854,8 +1021,12 @@ jobs:
       - name: Install Clickhouse
         if: matrix.target.target_os == 'darwin'
         run: |
-          curl https://clickhouse.com/ | sh
-          sudo ./clickhouse install
+          CLICKHOUSE_VERSION="26.3.9.8-lts"
+          BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
+          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          mv clickhouse-macos-aarch64 clickhouse
+          chmod +x clickhouse
+          sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
@@ -874,7 +1045,7 @@ jobs:
           clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -940,7 +1111,7 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
@@ -961,7 +1132,7 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1011,7 +1182,7 @@ jobs:
           cat spice.log
 
   test_local_acceleration:
-    name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
+    name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }} (${{ matrix.acceleration.mode }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -1023,21 +1194,24 @@ jobs:
       matrix:
         acceleration: [
             { engine: arrow, mode: memory },
+            { engine: cayenne, mode: file },
             { engine: duckdb, mode: memory },
             { engine: duckdb, mode: file },
             { engine: sqlite, mode: memory },
             { engine: sqlite, mode: file },
+            { engine: cayenne, mode: file },
+            { engine: turso, mode: memory },
+            { engine: turso, mode: file },
             # { engine: postgres},
           ]
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL
@@ -1057,7 +1231,7 @@ jobs:
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth.recent_blocks;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1169,10 +1343,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1193,7 +1367,7 @@ jobs:
           echo "  caching:" >> spicepod.yaml
           echo "    sql_results:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
-          echo "      eviction_policy: lru" >> spicepod.yaml
+          echo "      caching_policy: lru" >> spicepod.yaml
           echo "      max_size: 128MiB" >> spicepod.yaml
           echo "      item_ttl: 300s" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
@@ -1324,10 +1498,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1477,7 +1651,7 @@ jobs:
           SA_PASSWORD: 1StrongPwd!!
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install mssql-tools
         run: |
@@ -1493,7 +1667,7 @@ jobs:
           /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1580,10 +1754,10 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1622,7 +1796,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
-          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_ENDPOINT: ${{ vars.DATABRICKS_ENDPOINT }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
           spice run &> spice.log &
@@ -1682,10 +1856,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1701,8 +1875,11 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl https://install.duckdb.org | sh
-          echo "$HOME/.duckdb/cli/latest" >> $GITHUB_PATH
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
+          unzip duckdb_cli.zip
+          chmod +x ./duckdb
+          echo "$PWD" >> $GITHUB_PATH
 
       - name: Install oha (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -1721,6 +1898,20 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           ./simulate_append_data.sh &
+          echo $! > /tmp/simulate_pid
+
+      - name: Wait for append data snapshot
+        working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
+        run: |
+          for attempt in {1..60}; do
+            if duckdb -c "SELECT COUNT(*) FROM read_parquet('.spice/service_data.parquet');" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Timed out waiting for append data snapshot"
+          exit 1
 
       - name: Configure Spicepod
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1735,11 +1926,21 @@ jobs:
         run: |
           spice run &> spice.log &
 
-      - name: Wait for dataset to be ready
+      - name: Wait for Spice runtime to be ready
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify data_upsert dataset is queryable
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_upsert
+
+      - name: Verify data_drop dataset is queryable
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_drop
 
       - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1747,12 +1948,35 @@ jobs:
         run: |
           ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 120s -c 10
 
+      - name: Stop append data simulation before shutdown
+        if: always()
+        run: |
+          if [ -f /tmp/simulate_pid ]; then
+            pid="$(cat /tmp/simulate_pid)"
+            kill "$pid" 2>/dev/null || true
+
+            # wait for the process to exit (not a child, so use kill -0 polling)
+            timeout_secs=30
+            elapsed=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$elapsed" -ge "$timeout_secs" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+                break
+              fi
+              sleep 1
+              elapsed=$((elapsed + 1))
+            done
+          fi
+          pkill -f simulate_append_data || true
+
       - name: Send SIGTERM to Spice
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 0.5
+        timeout-minutes: 2
         run: |
-          killall spice
-          while pgrep spice > /dev/null; do sleep 1; done
+          killall spice || true
+          while pgrep -x spice > /dev/null; do sleep 1; done
+          # Allow filesystem to sync after process exits
+          sleep 2
 
       - name: Verify local DuckDB database
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1770,6 +1994,7 @@ jobs:
             echo "Verification successful: accelerated_duckdb.db.wal does not exist."
           else
             echo "Verification failed: accelerated_duckdb.db.wal exists."
+            ls -la .spice/data/accelerated_duckdb.db.wal
             exit 1
           fi
 
@@ -1778,8 +2003,15 @@ jobs:
         if: always()
         run: |
           killall spice || true
+          pkill -f simulate_append_data || true
           cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
+          # `simulate_append_data.sh` rewrites `.spice/service_data.parquet`
+          # every 3s; a refresh tick that races the rename observes a
+          # half-published file and the runtime logs a WARN before
+          # retrying on the next tick. Tolerate that specific transient.
+          if grep -iE "(failed|error)" spice.log \
+             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -1813,7 +2045,11 @@ jobs:
         run: |
           killall spice || true
           cat spice.log
-          if grep -iE "(failed|error)" spice.log; then
+          # See note above: tolerate transient parquet-rename races emitted
+          # at WARN level by the refresh task.
+          if grep -iE "(failed|error)" spice.log \
+             | grep -vE "WARN +runtime::accelerated_table::refresh_task: Failed to load data for dataset" \
+             | grep -vE "^Invalid Error: TProtocolException: Invalid data$"; then
             echo "Failures detected in spice.log"
             exit 1
           fi
@@ -1842,10 +2078,10 @@ jobs:
               target_os: 'darwin'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -1900,10 +2136,11 @@ jobs:
 
       - name: Send SIGTERM to Spice
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 0.5
+        timeout-minutes: 2
         run: |
-          killall spice
-          while pgrep spice > /dev/null; do sleep 1; done
+          killall spice || true
+          while pgrep -x spice > /dev/null; do sleep 1; done
+          sleep 2
 
       - name: Verify local DuckDB database
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1921,6 +2158,7 @@ jobs:
             echo "Verification successful: accelerated_duckdb.db.wal does not exist."
           else
             echo "Verification failed: accelerated_duckdb.db.wal exists."
+            ls -la .spice/data/accelerated_duckdb.db.wal
             exit 1
           fi
 

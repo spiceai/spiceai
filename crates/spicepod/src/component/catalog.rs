@@ -26,6 +26,7 @@ use crate::{metric::Metrics, param::Params};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Catalog {
     pub from: String,
 
@@ -72,6 +73,12 @@ impl Catalog {
             depends_on: Vec::default(),
             metrics: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_access(mut self, access: AccessMode) -> Self {
+        self.access = access;
+        self
     }
 }
 

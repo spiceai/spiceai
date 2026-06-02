@@ -1,0 +1,31 @@
+---
+source: crates/runtime-object-store/src/store/common.rs
+expression: result
+---
+ListResult {
+    common_prefixes: [
+        Path {
+            raw: "data/subdir",
+        },
+    ],
+    objects: [
+        ObjectMeta {
+            location: Path {
+                raw: "data/file1.txt",
+            },
+            last_modified: 2023-11-14T22:13:20Z,
+            size: 100,
+            e_tag: None,
+            version: None,
+        },
+        ObjectMeta {
+            location: Path {
+                raw: "data/file2.csv",
+            },
+            last_modified: 2023-11-14T22:13:20Z,
+            size: 2048,
+            e_tag: None,
+            version: None,
+        },
+    ],
+}

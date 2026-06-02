@@ -1,0 +1,25 @@
+---
+source: crates/runtime/tests/models/search.rs
+description: "SELECT subject FROM text_search(qs, 'second') order by _score desc LIMIT 4"
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                             |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: text_search(qs, Utf8("second")).subject                                                                                              |
+|               |   Sort: text_search(qs, Utf8("second"))._score DESC NULLS FIRST, fetch=4                                                                         |
+|               |     Projection: text_search(qs, Utf8("second")).subject, text_search(qs, Utf8("second"))._score                                                  |
+|               |       TableScan: text_search(qs, Utf8("second")) projection=[_score, subject]                                                                    |
+| physical_plan | ProjectionExec: expr=[subject@2 as subject]                                                                                                      |
+|               |   SortExec: TopK(fetch=4), expr=[_score@1 DESC NULLS LAST, id@0 ASC], preserve_partitioning=[false]                                              |
+|               |     HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, _score@1, subject@3] |
+|               |       CoalescePartitionsExec                                                                                                                     |
+|               |         CooperativeExec                                                                                                                          |
+|               |           BytesProcessedExec                                                                                                                     |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                 |
+|               |               CooperativeExec                                                                                                                    |
+|               |                 FullTextSearchTableExec q=second                                                                                                 |
+|               |       SchemaCastScanExec                                                                                                                         |
+|               |         BytesProcessedExec                                                                                                                       |
+|               |           DataSourceExec: partitions=1, partition_sizes=[2]                                                                                      |
+|               |                                                                                                                                                  |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+

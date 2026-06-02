@@ -1,0 +1,191 @@
+---
+name: pr-develop
+
+on:
+  pull_request:
+    branches:
+      - develop
+  merge_group:
+    branches:
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'develop' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: lint
+  # CI performance optimizations
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  check_changes:
+    name: Check for code changes
+    runs-on: spiceai-macos
+    outputs:
+      relevant_changes: ${{ steps.check.outputs.relevant_changes }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+      - name: Check for code changes
+        id: check
+        uses: ./.github/actions/check-code-changes
+
+  check:
+    name: Rust Lint
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
+      - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo check
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp,snapshots,rate-control --workspace --exclude libnfs --locked
+
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
+
+      - name: Show sccache stats
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        run: sccache --show-stats
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-check-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
+
+  build-and-test:
+    name: Build and Test
+    needs: check_changes
+    if: needs.check_changes.outputs.relevant_changes == 'true'
+    runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@e31c63cbe88a6e284fc187875261106a05034775 # v0.5.4
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
+      - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Build CLI and run nextest
+        run: make build-cli nextest
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+          NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
+
+      - name: Build testoperator
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+        run: cargo build -p testoperator --all-features --locked
+
+      - name: Show sccache stats
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
+        run: sccache --show-stats
+
+      - name: Check if Cargo.lock is updated
+        run: |
+          if git diff --exit-code Cargo.lock; then
+            echo "Cargo.lock is up to date"
+          else
+            echo "Update Cargo.lock"
+            exit 1
+          fi
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore

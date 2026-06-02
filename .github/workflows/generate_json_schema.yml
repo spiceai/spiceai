@@ -7,6 +7,17 @@ on:
       - 'crates/spicepod/**'
 
   workflow_dispatch:
+    inputs:
+      run_build:
+        description: 'Run build and generation'
+        required: false
+        type: boolean
+        default: true
+      create_pr:
+        description: 'Create PR'
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,21 +29,30 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Set up make
-        if: runner.os != 'macOS'
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: runner.os != 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.run_build)
+        uses: ./.github/actions/setup-cc
+
       - name: Build Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo build --manifest-path tools/spicepodschema/Cargo.toml
 
       - name: Run Cargo project
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: cargo run --manifest-path tools/spicepodschema/Cargo.toml -- .schema/spicepod.schema.json
 
       - name: Verify JSON schema file
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
         run: |
           if [ -f ".schema/spicepod.schema.json" ]; then
             echo ".schema/spicepod.schema.json file was successfully created."
@@ -43,13 +63,14 @@ jobs:
           fi
 
       - name: Upload JSON schema artifact
-        uses: actions/upload-artifact@v4
+        if: github.event_name != 'workflow_dispatch' || inputs.run_build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spicepod.schema
           path: .schema/spicepod.schema.json
 
       - name: Create PR
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.create_pr && inputs.run_build
         run: |
           git config --global user.name 'Spice Schema Bot'
           git config --global user.email 'schema-bot@spice.ai'
@@ -58,10 +79,49 @@ jobs:
           if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
             git add .schema/spicepod.schema.json
             git commit -m "Update spicepod.schema.json"
-            git push origin schema/${GITHUB_RUN_ID}
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
             gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate schema against test files
+        continue-on-error: true
+        run: |
+          set +e
+          python3 -m venv .venv
+          .venv/bin/python -m pip install check-jsonschema
+
+          echo "## Schema Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          VALIDATION_FAILED=0
+          for file in tools/spicepodschema/tests/*.yaml; do
+            filename=$(basename "$file")
+            if .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" 2>&1; then
+              echo "✅ \`$filename\` - Valid" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ \`$filename\` - Invalid" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "<details><summary>Validation errors</summary>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              { .venv/bin/check-jsonschema --schemafile .schema/spicepod.schema.json "$file" --verbose 2>&1 || true; } >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "</details>" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            fi
+          done
+
+          if [ $VALIDATION_FAILED -eq 1 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **Some test files failed validation. Please fix the errors above.**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All test files passed validation.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          exit 0

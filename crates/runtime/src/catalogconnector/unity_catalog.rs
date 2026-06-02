@@ -51,7 +51,7 @@ impl UnityCatalog {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token").secret().description(
         "The personal access token used to authenticate against the Unity Catalog API.",
     ),
@@ -68,6 +68,8 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("Enables insecure HTTP connections to the AWS endpoint. Defaults to false."),
     // Azure storage options
     ParameterSpec::component("azure_storage_account_name")
         .description("The storage account to use for Azure storage.")
@@ -131,7 +133,14 @@ impl CatalogConnector for UnityCatalog {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
-        let client = Arc::new(UnityCatalogClient::new(endpoint, token_provider));
+        let client = UnityCatalogClient::new(endpoint, token_provider, None).map_err(|source| {
+            super::Error::InternalWithSource {
+                connector: "unity_catalog".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(source),
+            }
+        })?;
+        let client = Arc::new(client);
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
@@ -157,8 +166,10 @@ impl CatalogConnector for UnityCatalog {
             connector_component: ConnectorComponent::from(catalog),
         })?;
 
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(
+            params.to_secret_map(),
+            runtime.tokio_io_runtime(),
+        )) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,
@@ -185,5 +196,151 @@ impl CatalogConnector for UnityCatalog {
 
 fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
-    Some(TableReference::bare(format!("{storage_location}/")))
+    // Don't append a trailing slash here — `DeltaTable::from` calls
+    // `ensure_folder_location` which already adds one when needed.
+    // Unconditionally appending caused double-slash paths (e.g.
+    // "file:///path/to/table//") when the Unity Catalog API returned
+    // locations that already ended with '/'.
+    Some(TableReference::bare(storage_location.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_uc_table(storage_location: Option<&str>) -> UCTable {
+        UCTable {
+            name: "my_table".to_string(),
+            catalog_name: "my_catalog".to_string(),
+            schema_name: "my_schema".to_string(),
+            table_type: "MANAGED".to_string(),
+            data_source_format: "DELTA".to_string(),
+            columns: vec![],
+            storage_location: storage_location.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_with_storage_location() {
+        let table = make_uc_table(Some("s3://my-bucket/warehouse/table"));
+        let reference = table_reference_creator(&table)
+            .expect("should return Some when storage_location is present");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "s3://my-bucket/warehouse/table");
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_without_storage_location() {
+        let table = make_uc_table(None);
+        assert!(
+            table_reference_creator(&table).is_none(),
+            "should return None when storage_location is None"
+        );
+    }
+
+    #[test]
+    fn test_table_reference_creator_preserves_location_as_is() {
+        let table = make_uc_table(Some("gs://bucket/path"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(
+                    table.as_ref(),
+                    "gs://bucket/path",
+                    "reference should preserve storage location without modification"
+                );
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    #[test]
+    fn test_table_reference_creator_preserves_full_uri() {
+        let table = make_uc_table(Some(
+            "abfss://container@account.dfs.core.windows.net/warehouse/table",
+        ));
+        let reference = table_reference_creator(&table).expect("should return Some for abfss URI");
+        assert!(
+            matches!(reference, TableReference::Bare { .. }),
+            "Expected Bare table reference"
+        );
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(
+                    table.as_ref(),
+                    "abfss://container@account.dfs.core.windows.net/warehouse/table"
+                );
+            }
+            _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/7904>
+    /// Unity Catalog API returns `storage_location` with a trailing slash.
+    /// Previously, `table_reference_creator` unconditionally appended another
+    /// slash, creating a double-slash path like `file:///path/to/table//`
+    /// which caused Delta Lake to fail with "Path does not exist".
+    #[test]
+    fn test_table_reference_creator_no_double_slash_when_location_ends_with_slash() {
+        let table = make_uc_table(Some(
+            "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/",
+        ));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "reference must not end with double slash, got: {}",
+                    table.as_ref()
+                );
+                assert_eq!(
+                    table.as_ref(),
+                    "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    /// Edge case: `storage_location` pointing to a bucket root with no key/path.
+    #[test]
+    fn test_table_reference_creator_bucket_root() {
+        let table = make_uc_table(Some("s3://bucket"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "s3://bucket");
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    /// Edge case: `storage_location` with `file://` scheme for local paths.
+    #[test]
+    fn test_table_reference_creator_file_scheme() {
+        let table = make_uc_table(Some("file:///tmp/marksheet_uniform/"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "file:///tmp/marksheet_uniform/");
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "must not produce double trailing slash"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
 }

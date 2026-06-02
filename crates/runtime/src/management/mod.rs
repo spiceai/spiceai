@@ -64,7 +64,9 @@ pub enum Error {
     #[snafu(display("Missing required secret: {name}. Specify a value."))]
     MissingRequiredSecret { name: String },
 
-    #[snafu(display("Table provider does not support read_write mode"))]
+    #[snafu(display(
+        "Dataset does not support read-write mode. Ensure the acceleration engine supports writes."
+    ))]
     NoReadWriteProvider {},
 
     #[snafu(display(
@@ -74,10 +76,10 @@ pub enum Error {
         source: Box<dyn std::error::Error + Sync + Send>,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to create data connector for cloud management: {source}"))]
     UnableToCreateCloudTableProvider { source: DataConnectorError },
 
-    #[snafu(display("Error exporting task_history records: {source}"))]
+    #[snafu(display("Failed to export runtime task history records: {source}"))]
     UnableToExportTaskHistoryData {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -204,6 +206,13 @@ impl Management {
             );
         }
 
+        if let Some(region) = self.params.get("region") {
+            params.insert(
+                "spiceai_region".to_string(),
+                region.expose_secret().to_string(),
+            );
+        }
+
         let sink = get_spiceai_table_provider(
             TASK_HISTORY_SINK_TABLE,
             TASK_HISTORY_SINK_REMOTE_TABLE,
@@ -275,6 +284,7 @@ async fn get_spiceai_table_provider(
     };
 
     let secrets = runtime.secrets();
+    let tokio_io_runtime = runtime.tokio_io_runtime();
 
     let mut dataset = DatasetBuilder::try_new(format!("spice.ai/{cloud_dataset_path}"), name)
         .boxed()
@@ -289,7 +299,7 @@ async fn get_spiceai_table_provider(
     dataset.access = AccessMode::ReadWrite;
 
     let params = ConnectorParamsBuilder::new("spice.ai".into(), (&dataset).into())
-        .build(secrets)
+        .build(secrets, tokio_io_runtime)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 

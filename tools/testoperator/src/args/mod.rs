@@ -16,47 +16,71 @@ limitations under the License.
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-
-mod http;
-pub use http::{HttpConsistencyTestArgs, HttpOverheadTestArgs, HttpTestArgs};
+use clap::{ArgAction, Parser, Subcommand};
 
 mod dataset;
 pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
 
+#[cfg(feature = "append")]
+mod append;
+#[cfg(feature = "append")]
+pub use append::AppendTestArgs;
+
 pub mod dispatch;
 use dispatch::DispatchArgs;
-
-mod evals;
-pub use evals::EvalsTestArgs;
 
 mod search;
 pub use search::SearchTestArgs;
 
+mod text_to_sql;
+pub use text_to_sql::TextToSqlArgs;
+
+mod schema;
+pub use schema::SchemaTestArgs;
+
+mod htap;
+pub use htap::HtapArgs;
+
+mod streaming;
+pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
+
 #[derive(Subcommand)]
 pub enum Commands {
-    // Run a test
+    /// Run a test
     #[command(subcommand)]
     Run(TestCommands),
-    // Export the spicepod environment that would run for a test
+    /// Export the spicepod environment that would run for a test
     #[command(subcommand)]
     Export(TestCommands),
-    // Dispatch a number of tests in GitHub Actions
+    /// Dispatch a number of tests in GitHub Actions
     Dispatch(DispatchArgs),
 }
 
 #[derive(Subcommand)]
 pub enum TestCommands {
+    /// Run a throughput test
     Throughput(DatasetTestArgs),
+    /// Run an extended load test
     Load(LoadTestArgs),
+    /// Run a single-run benchmark
     Bench(DatasetTestArgs),
+    /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    HttpConsistency(HttpConsistencyTestArgs),
-    HttpOverhead(HttpOverheadTestArgs),
-    Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
-    Append(DatasetTestArgs),
+    Append(AppendTestArgs),
     Search(SearchTestArgs),
+    /// Execute benchmark queries against a pre-existing spiced instance
+    Query(DatasetTestArgs),
+    /// Run a text-to-sql test
+    TextToSql(TextToSqlArgs),
+    /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams
+    StreamingDynamodb(StreamingDynamodbArgs),
+    /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
+    StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Validate catalog connector schema discovery via `information_schema`
+    Schema(SchemaTestArgs),
+    /// Run an HTAP test: concurrent TPC-C OLTP workload + CH-benCH analytical queries
+    Htap(HtapArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -73,9 +97,10 @@ pub struct CommonArgs {
     #[arg(long, default_value = "1")]
     pub(crate) concurrency: usize,
 
-    /// Path to the spiced binary
+    /// Path to the spiced binary, or URL to an already-running spiced instance's Flight endpoint
+    /// (e.g., `http://localhost:50051` to connect to an external instance)
     #[arg(short, long, default_value = "spiced")]
-    pub(crate) spiced_path: PathBuf,
+    pub(crate) spiced_path: String,
 
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
@@ -96,4 +121,81 @@ pub struct CommonArgs {
     /// Whether to enable metrics collection
     #[arg(long)]
     pub(crate) metrics: bool,
+
+    /// Whether to enable scraping spiced metrics (automatically enables --metrics for spiced)
+    #[arg(long)]
+    pub(crate) scrape_spiced_metrics: bool,
+
+    /// OTLP metrics collector endpoint (HTTP or gRPC). If unset, falls back to Arrow telemetry.
+    #[arg(long)]
+    pub(crate) otlp_endpoint: Option<String>,
+
+    /// Additional OTLP headers in key=value form. Can be repeated.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, requires = "otlp_endpoint", value_name = "KEY=VALUE")]
+    pub(crate) otlp_header: Vec<(String, String)>,
+
+    /// Logical name for the system adapter connection. Surfaced as a metric
+    /// attribute and to the adapter via setup metadata.
+    #[arg(long, default_value = "system_adapter", env = "SYSTEM_ADAPTER")]
+    pub(crate) system_adapter_name: String,
+
+    /// Command to run for a stdio JSON-RPC system adapter. When set, testoperator
+    /// acquires its SUT through the adapter's `setup()` response instead of spawning
+    /// a local spiced or connecting via `--spiced-path`. Mutually exclusive with
+    /// `--system-adapter-http-url`.
+    #[arg(long, group = "system_adapter_option")]
+    pub(crate) system_adapter_stdio_cmd: Option<String>,
+
+    /// Space-delimited argument string passed to the stdio system adapter command.
+    #[arg(long, requires = "system_adapter_stdio_cmd")]
+    pub(crate) system_adapter_stdio_args: Option<String>,
+
+    /// HTTP URL for a remote JSON-RPC system adapter.
+    #[arg(
+        long,
+        conflicts_with = "system_adapter_stdio_cmd",
+        group = "system_adapter_option"
+    )]
+    pub(crate) system_adapter_http_url: Option<String>,
+
+    /// Additional system adapter parameters in key=value form. Forwarded to the
+    /// adapter inside the `setup()` metadata map. Can be repeated.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, value_name = "KEY=VALUE", requires = "system_adapter_option")]
+    pub(crate) system_adapter_param: Vec<(String, String)>,
+
+    /// Environment variables for stdio system adapter in key=value form. Can be
+    /// repeated. Only applies when --system-adapter-stdio-cmd is set.
+    #[arg(long, value_parser = parse_key_val, action = ArgAction::Append, value_name = "KEY=VALUE", requires = "system_adapter_stdio_cmd")]
+    pub(crate) system_adapter_env: Vec<(String, String)>,
+}
+
+impl CommonArgs {
+    /// Check if `spiced_path` is a URL to an external instance
+    #[must_use]
+    pub fn is_external_instance(&self) -> bool {
+        self.spiced_path.starts_with("http://") || self.spiced_path.starts_with("https://")
+    }
+
+    /// Check whether a system adapter has been configured to acquire the SUT.
+    ///
+    /// When true, testoperator drives `setup()` / `teardown()` over JSON-RPC and
+    /// uses the returned Flight URL instead of spawning a local spiced or honoring
+    /// `--spiced-path`.
+    #[must_use]
+    pub fn is_system_adapter(&self) -> bool {
+        self.system_adapter_stdio_cmd.is_some() || self.system_adapter_http_url.is_some()
+    }
+
+    /// Get the spiced path as a `PathBuf` (only valid when not an external instance)
+    #[must_use]
+    pub fn spiced_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.spiced_path)
+    }
+}
+
+fn parse_key_val(s: &str) -> Result<(String, String), String> {
+    let pos = s
+        .find('=')
+        .ok_or_else(|| "expected KEY=VALUE formatted header".to_string())?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }

@@ -18,17 +18,31 @@ use crate::{
     App,
     secrets::{ParamStr, Secrets},
 };
-use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, api_key::ApiKeyAuth};
+use runtime_auth::{FlightBasicAuth, GrpcAuth, HttpAuth, IdentitySource, api_key::ApiKeyAuth};
 use secrecy::ExposeSecret;
 use spicepod::component::runtime::{ApiKey, ApiKeyAuth as SpicepodApiKeyAuth};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+mod anonymous;
+pub mod no_auth;
 
 #[derive(Clone)]
 pub struct EndpointAuth {
     pub http_auth: Option<Arc<dyn HttpAuth + Send + Sync>>,
     pub flight_basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     pub grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    /// Where the request's auth principal originates. Computed once
+    /// at startup by the binary entrypoint from the combination of
+    /// `runtime.auth` and `runtime.tls.client_auth`. Threaded into
+    /// the per-protocol mTLS layers so HTTP and Flight know whether
+    /// to promote a verified client cert to the request's auth
+    /// principal (`Channel`) or just record it as a
+    /// `ChannelIdentity` for audit (`RuntimeAuth`).
+    /// Defaults to [`IdentitySource::Anonymous`] so existing tests
+    /// and callers that don't set it explicitly preserve today's
+    /// behavior.
+    pub identity_source: IdentitySource,
 }
 
 impl EndpointAuth {
@@ -53,6 +67,7 @@ impl EndpointAuth {
                 http_auth: Some(http_auth),
                 flight_basic_auth: Some(flight_basic_auth),
                 grpc_auth: Some(grpc_auth),
+                identity_source: IdentitySource::RuntimeAuth,
             };
         }
 
@@ -65,7 +80,22 @@ impl EndpointAuth {
             http_auth: None,
             flight_basic_auth: None,
             grpc_auth: None,
+            identity_source: IdentitySource::Anonymous,
         }
+    }
+
+    /// Override the [`IdentitySource`] decided by [`Self::new`]. The
+    /// binary entrypoint calls this after computing the effective
+    /// `client_auth` mode: `client_auth: required` with no
+    /// `runtime.auth` flips an `Anonymous` posture into
+    /// [`IdentitySource::Channel`] (mTLS-as-identity).
+    /// `runtime.auth` plus `client_auth: required` stays
+    /// [`IdentitySource::RuntimeAuth`] (mTLS-as-channel) — the cert
+    /// only contributes a `ChannelIdentity` for audit.
+    #[must_use]
+    pub fn with_identity_source(mut self, source: IdentitySource) -> Self {
+        self.identity_source = source;
+        self
     }
 
     #[must_use]
@@ -135,6 +165,153 @@ impl std::fmt::Debug for EndpointAuth {
         } else {
             builder.field("grpc_auth", &ABSENT);
         }
+        builder.field("identity_source", &self.identity_source);
         builder.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::request::Builder;
+    use runtime_auth::AuthVerdict;
+
+    fn create_request_parts(api_key: Option<&str>) -> axum::http::request::Parts {
+        let mut builder = Builder::new().uri("https://example.com");
+
+        if let Some(key) = api_key {
+            builder = builder.header("X-API-Key", key);
+        }
+
+        let request = builder.body(()).expect("Failed to build request");
+        request.into_parts().0
+    }
+
+    #[tokio::test]
+    async fn test_api_key_secret_replacement() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key = format!("TEST_API_KEY_SECRET_{}", rand::random::<u64>());
+        let secret_value = "my-super-secret-api-key";
+
+        // SAFETY: Setting environment variable for test purposes only
+        unsafe { std::env::set_var(&secret_key, secret_value) };
+
+        // Test read-write key with secret replacement
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:rw"))],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify the secret was replaced and the key works
+        let parts = create_request_parts(Some(secret_value));
+        let result = auth.http_verify(&parts);
+        assert!(
+            matches!(result, Ok(AuthVerdict::Allow(_))),
+            "API key with secret replacement should authenticate successfully"
+        );
+
+        // Verify the original secret placeholder does NOT work
+        let parts_with_placeholder = create_request_parts(Some(&format!("${{env:{secret_key}}}")));
+        let result_placeholder = auth.http_verify(&parts_with_placeholder);
+        assert!(
+            matches!(result_placeholder, Ok(AuthVerdict::Deny)),
+            "Unexpanded secret placeholder should be denied"
+        );
+
+        // SAFETY: Cleaning up environment variable
+        unsafe { std::env::remove_var(&secret_key) };
+    }
+
+    #[tokio::test]
+    async fn test_api_key_secret_replacement_read_only() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key = format!("TEST_API_KEY_RO_SECRET_{}", rand::random::<u64>());
+        let secret_value = "my-readonly-api-key";
+
+        // SAFETY: Setting environment variable for test purposes only
+        unsafe { std::env::set_var(&secret_key, secret_value) };
+
+        // Test read-only key with secret replacement (no :rw suffix)
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:ro"))],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify the secret was replaced and the key works
+        let parts = create_request_parts(Some(secret_value));
+        let result = auth.http_verify(&parts);
+        assert!(
+            matches!(result, Ok(AuthVerdict::Allow(_))),
+            "Read-only API key with secret replacement should authenticate successfully"
+        );
+
+        // SAFETY: Cleaning up environment variable
+        unsafe { std::env::remove_var(&secret_key) };
+    }
+
+    #[tokio::test]
+    async fn test_api_key_multiple_secrets_replacement() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key_1 = format!("TEST_API_KEY_1_{}", rand::random::<u64>());
+        let secret_key_2 = format!("TEST_API_KEY_2_{}", rand::random::<u64>());
+        let secret_value_1 = "first-api-key";
+        let secret_value_2 = "second-api-key";
+
+        // SAFETY: Setting environment variables for test purposes only
+        unsafe {
+            std::env::set_var(&secret_key_1, secret_value_1);
+            std::env::set_var(&secret_key_2, secret_value_2);
+        };
+
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![
+                ApiKey::parse_str(&format!("${{env:{secret_key_1}}}:rw")),
+                ApiKey::parse_str(&format!("${{env:{secret_key_2}}}:ro")),
+            ],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify first key works
+        let parts_1 = create_request_parts(Some(secret_value_1));
+        let result_1 = auth.http_verify(&parts_1);
+        assert!(
+            matches!(result_1, Ok(AuthVerdict::Allow(_))),
+            "First API key should authenticate successfully"
+        );
+
+        // Verify second key works
+        let parts_2 = create_request_parts(Some(secret_value_2));
+        let result_2 = auth.http_verify(&parts_2);
+        assert!(
+            matches!(result_2, Ok(AuthVerdict::Allow(_))),
+            "Second API key should authenticate successfully"
+        );
+
+        // SAFETY: Cleaning up environment variables
+        unsafe {
+            std::env::remove_var(&secret_key_1);
+            std::env::remove_var(&secret_key_2);
+        };
     }
 }

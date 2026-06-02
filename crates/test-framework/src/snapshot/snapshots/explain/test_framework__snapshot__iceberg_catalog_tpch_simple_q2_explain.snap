@@ -17,16 +17,16 @@ description: "Query: tpch_simple_q2"
 |               |   HashJoinExec: mode=Partitioned, join_type=Inner, on=[(l_linenumber@0, max(ice.tpch_sf1.lineitem.l_linenumber)@0)], projection=[l_linenumber@0] |
 |               |     CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
 |               |       RepartitionExec: partitioning=Hash([l_linenumber@0], 24), input_partitions=24                                                              |
-|               |         RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                    |
-|               |           BytesProcessedExec                                                                                                                     |
+|               |         BytesProcessedExec                                                                                                                       |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                                  |
 |               |             IcebergTableScan projection:[l_linenumber] predicate:[]                                                                              |
 |               |     CoalesceBatchesExec: target_batch_size=8192                                                                                                  |
 |               |       RepartitionExec: partitioning=Hash([max(ice.tpch_sf1.lineitem.l_linenumber)@0], 24), input_partitions=1                                    |
 |               |         AggregateExec: mode=Final, gby=[], aggr=[max(ice.tpch_sf1.lineitem.l_linenumber)]                                                        |
 |               |           CoalescePartitionsExec                                                                                                                 |
 |               |             AggregateExec: mode=Partial, gby=[], aggr=[max(ice.tpch_sf1.lineitem.l_linenumber)]                                                  |
-|               |               RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                              |
-|               |                 BytesProcessedExec                                                                                                               |
+|               |               BytesProcessedExec                                                                                                                 |
+|               |                 RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                                            |
 |               |                   IcebergTableScan projection:[l_linenumber] predicate:[]                                                                        |
 |               |                                                                                                                                                  |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+

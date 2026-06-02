@@ -5,22 +5,64 @@ inputs:
   minio_endpoint:
     description: 'MinIO endpoint'
     required: true
-    type: string
   minio_access_key:
     description: 'MinIO access key'
     required: true
-    type: string
   minio_secret_key:
     description: 'MinIO secret key'
     required: true
-    type: string
+
 runs:
   using: 'composite'
   steps:
-    - name: Install MinIO
+    - name: Install MinIO on Linux
+      shell: bash
+      if: runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        if command -v mc >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        mc_url="https://dl.min.io/client/mc/release/linux-amd64/mc"
+        tmp_mc="$(mktemp)"
+        if command -v curl >/dev/null 2>&1; then
+          curl --fail --silent --show-error --location --output "$tmp_mc" "$mc_url"
+        elif command -v wget >/dev/null 2>&1; then
+          wget --quiet --output-document="$tmp_mc" "$mc_url"
+        else
+          echo "curl or wget is required to install the MinIO client" >&2
+          exit 1
+        fi
+        sudo install -m 0755 "$tmp_mc" /usr/local/bin/mc
+
+    - name: Install MinIO on macOS
+      shell: bash
+      if: runner.os == 'macOS'
+      run: |
+        brew update
+        brew install minio/stable/mc
+
+    - name: Install MinIO on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mcPath = "$env:USERPROFILE\mc"
+        New-Item -ItemType Directory -Force -Path $mcPath | Out-Null
+        Invoke-WebRequest -Uri "https://dl.min.io/client/mc/release/windows-amd64/mc.exe" -OutFile "$mcPath\mc.exe"
+        echo "$mcPath" >> $env:GITHUB_PATH
+
+    - name: Set MinIO alias (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
-        sudo apt update && sudo apt install wget -y
-        sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
-        sudo chmod +x /usr/local/bin/mc
         mc alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}
+
+    - name: Set MinIO alias (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mcExePath = Join-Path $env:USERPROFILE 'mc\mc.exe'
+        & $mcExePath alias set spice-minio ${{ inputs.minio_endpoint }} ${{ inputs.minio_access_key }} ${{ inputs.minio_secret_key }}

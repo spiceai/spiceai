@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
+pub const PARAMETERS: &[ParameterSpec] =
     &concat_arrays::<ParameterSpec, OPENAI_PARAM_LEN, PARAM_LEN, { OPENAI_PARAM_LEN + PARAM_LEN }>(
         OPENAI_PARAMETERS,
         COMMON_MODEL_PARAMETERS,
@@ -41,7 +43,8 @@ pub(crate) const OPENAI_PARAMETERS: [ParameterSpec; OPENAI_PARAM_LEN] = [
         .one_of(&["free", "tier1", "tier2", "tier3", "tier4", "tier5"])
         .default("tier1"),
     ParameterSpec::runtime("responses_api")
-        .description("Whether to enable use of this model via the Responses API. `disabled` by default.")
+        .description("Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.")
+        .one_of(&["enabled", "disabled"])
         .default("disabled"),
     ParameterSpec::component("responses_tools")
         .description("The OpenAI Responses tools to use when calling the model from the Responses API")

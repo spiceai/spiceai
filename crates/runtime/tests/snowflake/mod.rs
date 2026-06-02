@@ -20,8 +20,10 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
+use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
@@ -32,7 +34,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let warehouse =
@@ -71,6 +73,7 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -131,6 +134,126 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn snowflake_schema_inference_test() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("snowflake_schema_test")
+                .with_dataset(make_dataset(
+                    "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.LINEITEM",
+                    "lineitem",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify all 16 LINEITEM columns appear in information_schema
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT column_name, data_type FROM information_schema.columns \
+                     WHERE table_name = 'lineitem' ORDER BY ordinal_position",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let total_columns: usize = result
+                .iter()
+                .map(datafusion::arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                total_columns, 16,
+                "Expected 16 columns in LINEITEM schema, got {total_columns}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn snowflake_dataset_registration_test() -> Result<(), anyhow::Error> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("snowflake_registration_test")
+                .with_dataset(make_dataset(
+                    "SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.LINEITEM",
+                    "lineitem",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify the dataset appears in information_schema.tables
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_name = 'lineitem'",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let expected = [
+                "+------------+",
+                "| table_name |",
+                "+------------+",
+                "| lineitem   |",
+                "+------------+",
+            ];
+            assert_batches_eq!(expected, &result);
 
             Ok(())
         })

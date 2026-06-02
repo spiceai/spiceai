@@ -78,15 +78,53 @@ pub enum Error {
 
     #[snafu(transparent)]
     IcebergSnafu { source: iceberg::Error },
+
+    #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
+    RefreshTaskAlreadyStarted {},
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {schema_name}.{table_name}: {source}"
+    ))]
+    PartitionMetadataRead {
+        schema_name: String,
+        table_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl Error {
+    /// Returns `true` for configuration errors that will not resolve with retries.
+    pub fn is_configuration_error(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidConfiguration { .. } | Error::InvalidConfigurationNoSource { .. }
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(feature = "adbc")]
+pub mod adbc;
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
 pub mod glue;
 pub mod iceberg;
+#[cfg(feature = "mssql")]
+pub mod mssql;
+#[cfg(feature = "mysql")]
+pub mod mysql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
 pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
 pub mod unity_catalog;
@@ -111,6 +149,20 @@ pub async fn create_new_connector(
     let factory = connector_factory?;
 
     Some(factory.connector(params))
+}
+
+/// Names of every registered catalog connector, for "did you mean?" suggestions.
+pub async fn registered_catalog_names() -> Vec<String> {
+    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    let mut names: Vec<String> = guard.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Closest-match suggestion for an unknown catalog connector name. Reuses the
+/// same scoring/threshold helper as data connectors so behaviour is consistent.
+pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
+    crate::dataconnector::closest_name(name, &registered_catalog_names().await)
 }
 
 pub async fn register_all() {
@@ -160,6 +212,76 @@ pub async fn register_all() {
             spice_cloud::SpiceCloudPlatformCatalog::new_connector,
             "spiceai",
             spice_cloud::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "duckdb")]
+    registry.insert(
+        ducklake::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            ducklake::DuckLakeCatalog::new_connector,
+            ducklake::PREFIX,
+            ducklake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "snowflake")]
+    registry.insert(
+        snowflake::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            snowflake::SnowflakeCatalog::new_connector,
+            snowflake::PREFIX,
+            snowflake::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "postgres")]
+    registry.insert(
+        postgres::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            postgres::PostgresCatalog::new_connector,
+            postgres::PREFIX,
+            postgres::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "mysql")]
+    registry.insert(
+        mysql::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            mysql::MySQLCatalog::new_connector,
+            mysql::PREFIX,
+            mysql::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "mssql")]
+    registry.insert(
+        mssql::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            mssql::MssqlCatalog::new_connector,
+            mssql::PREFIX,
+            mssql::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "oracle")]
+    registry.insert(
+        oracle::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            oracle::OracleCatalog::new_connector,
+            oracle::PREFIX,
+            oracle::PARAMETERS,
+        ),
+    );
+
+    #[cfg(feature = "adbc")]
+    registry.insert(
+        adbc::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            adbc::AdbcCatalog::new_connector,
+            adbc::PREFIX,
+            adbc::PARAMETERS,
         ),
     );
 }
@@ -216,8 +338,27 @@ pub trait CatalogConnector: Send + Sync {
 
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
     }
+}
+
+/// Trait for catalog providers that can report partition metadata labels for their tables.
+///
+/// Implementations read partition metadata from the catalog's own persistent storage,
+/// ensuring partition information survives runtime restarts.
+#[async_trait]
+pub trait PartitionAwareCatalog: Send + Sync {
+    /// Returns the partition metadata label for a table, if one was defined at creation time.
+    ///
+    /// The returned string is the partition column/label value as stored in catalog metadata
+    /// (e.g. `"region"` for `PARTITION BY region`).
+    ///
+    /// Returns `Ok(None)` only when no partition metadata is present.
+    async fn table_partition_expr(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<String>>;
 }
 
 pub async fn get_catalog_provider(
@@ -239,7 +380,7 @@ pub async fn get_catalog_provider(
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )
-    .start_refresh(refresh_interval);
+    .start_refresh(refresh_interval)?;
     Ok(Arc::new(provider))
 }
 
@@ -251,13 +392,6 @@ pub struct RefreshingCatalogProvider {
 }
 
 impl RefreshingCatalogProvider {
-    pub fn new_with_refresh(
-        inner: Arc<dyn RefreshableCatalogProvider>,
-        refresh_interval: Duration,
-    ) -> Self {
-        Self::new(inner).start_refresh(Some(refresh_interval))
-    }
-
     fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
         Self {
             inner,
@@ -265,8 +399,11 @@ impl RefreshingCatalogProvider {
         }
     }
 
-    fn start_refresh(mut self, interval: Option<Duration>) -> Self {
-        assert!(self.refresh_task.is_none(), "Refresh task already running");
+    fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
+        if self.refresh_task.is_some() {
+            return Err(Error::RefreshTaskAlreadyStarted {});
+        }
+
         let interval = interval.unwrap_or(Duration::from_secs(60));
         let inner = Arc::clone(&self.inner);
         self.refresh_task = Some(tokio::spawn(async move {
@@ -280,10 +417,11 @@ impl RefreshingCatalogProvider {
                 }
             }
         }));
-        self
+        Ok(self)
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl CatalogProvider for RefreshingCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
@@ -296,6 +434,22 @@ impl CatalogProvider for RefreshingCatalogProvider {
     fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
         self.inner.schema(name)
     }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn datafusion::catalog::SchemaProvider>,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.register_schema(name, schema)
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        cascade: bool,
+    ) -> datafusion::error::Result<Option<Arc<dyn datafusion::catalog::SchemaProvider>>> {
+        self.inner.deregister_schema(name, cascade)
+    }
 }
 
 impl Drop for RefreshingCatalogProvider {
@@ -303,5 +457,130 @@ impl Drop for RefreshingCatalogProvider {
         if let Some(task) = self.refresh_task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::LazyLock;
+
+    static REGISTRY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[tokio::test]
+    async fn test_catalog_connector_registry_lifecycle() {
+        let _test_guard = REGISTRY_TEST_LOCK.lock().await;
+
+        // Start clean
+        unregister_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            assert!(
+                guard.is_empty(),
+                "registry should be empty after unregister_all"
+            );
+        }
+
+        // Register all connectors
+        register_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+
+            // Always-registered connectors (no feature gates)
+            assert!(
+                guard.contains_key("iceberg"),
+                "iceberg should be registered"
+            );
+            assert!(
+                guard.contains_key(glue::PREFIX),
+                "glue should be registered"
+            );
+            assert!(
+                guard.contains_key("spice.ai"),
+                "spice.ai should be registered"
+            );
+
+            // Feature-gated connectors
+            #[cfg(feature = "delta_lake")]
+            assert!(
+                guard.contains_key("unity_catalog"),
+                "unity_catalog should be registered"
+            );
+            #[cfg(feature = "databricks")]
+            assert!(
+                guard.contains_key("databricks"),
+                "databricks should be registered"
+            );
+            #[cfg(feature = "duckdb")]
+            assert!(
+                guard.contains_key(ducklake::PREFIX),
+                "ducklake should be registered"
+            );
+            #[cfg(feature = "snowflake")]
+            assert!(
+                guard.contains_key(snowflake::PREFIX),
+                "snowflake should be registered"
+            );
+            #[cfg(feature = "postgres")]
+            assert!(
+                guard.contains_key(postgres::PREFIX),
+                "postgres should be registered"
+            );
+            #[cfg(feature = "mysql")]
+            assert!(
+                guard.contains_key(mysql::PREFIX),
+                "mysql should be registered"
+            );
+            #[cfg(feature = "mssql")]
+            assert!(
+                guard.contains_key(mssql::PREFIX),
+                "mssql should be registered"
+            );
+            #[cfg(feature = "oracle")]
+            assert!(
+                guard.contains_key(oracle::PREFIX),
+                "oracle should be registered"
+            );
+        }
+
+        // Verify factory metadata for a known connector
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            let iceberg_factory = guard.get("iceberg").expect("iceberg factory should exist");
+            assert_eq!(iceberg_factory.prefix(), "iceberg");
+            assert!(
+                !iceberg_factory.parameters().is_empty(),
+                "iceberg should have parameters"
+            );
+        }
+
+        // Unregister and verify empty
+        unregister_all().await;
+        {
+            let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+            assert!(
+                guard.is_empty(),
+                "registry should be empty after final unregister_all"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_new_connector_unknown_returns_none() {
+        let _test_guard = REGISTRY_TEST_LOCK.lock().await;
+
+        unregister_all().await;
+        register_all().await;
+
+        // Trying to look up the factory for a nonexistent connector
+        let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        assert!(
+            guard.get("nonexistent_connector").is_none(),
+            "unknown connector name should not be found"
+        );
+
+        drop(guard);
+        unregister_all().await;
     }
 }

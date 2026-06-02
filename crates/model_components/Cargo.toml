@@ -3,7 +3,7 @@ description = "Downloading, loading and using models"
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "model_components"
 repository.workspace = true
 rust-version.workspace = true
@@ -12,21 +12,21 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.99"
+anyhow.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
-dirs = "6.0.0"
 ndarray = "0.15.6"
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
+tokio.workspace = true
 tracing.workspace = true
-tract-core = "0.22.0"
 tract-onnx = "0.22.0"
+util = { path = "../util", features = ["datafusion"] }
 
 [features]
 dev = []

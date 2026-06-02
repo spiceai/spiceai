@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,6 @@ use tower::{Layer, Service};
 /// # Errors
 ///
 /// Returns an error if the authorization header is missing, the header is not a valid bearer token, or the credentials are invalid.
-#[allow(clippy::result_large_err)]
 pub fn validate_basic_auth_handshake(
     metadata: &MetadataMap,
     basic_auth: Option<&Arc<dyn FlightBasicAuth + Send + Sync>>,
@@ -59,7 +58,7 @@ pub fn validate_basic_auth_handshake(
         return Err(Status::unauthenticated("Invalid handshake request"));
     };
 
-    let [username, password] = decoded_auth_str.splitn(2, ':').collect::<Vec<&str>>()[..2] else {
+    let Some((username, password)) = decoded_auth_str.split_once(':') else {
         return Err(Status::unauthenticated("Invalid credentials"));
     };
     match basic_auth.validate(username, password) {
@@ -68,7 +67,6 @@ pub fn validate_basic_auth_handshake(
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn get_authorization_value<'a>(
     metadata: &'a MetadataMap,
     prefix: &'static str,
@@ -76,14 +74,17 @@ fn get_authorization_value<'a>(
     let Some(auth_header) = metadata.get("authorization") else {
         return Err(Status::unauthenticated("Missing authorization header"));
     };
+
     let Ok(auth_header_str) = auth_header.to_str() else {
         return Err(Status::unauthenticated("Invalid authorization header"));
     };
-    let auth_header_split = auth_header_str.splitn(2, ' ').collect::<Vec<&str>>();
-    if auth_header_split.len() != 2 || auth_header_split[0] != prefix {
+    let Some((actual_prefix, auth_value)) = auth_header_str.split_once(' ') else {
+        return Err(Status::unauthenticated("Invalid authorization header"));
+    };
+    if actual_prefix != prefix {
         return Err(Status::unauthenticated("Invalid authorization header"));
     }
-    Ok(auth_header_split[1])
+    Ok(auth_value)
 }
 
 #[derive(Clone)]
@@ -148,6 +149,29 @@ where
         let method = req.method().clone();
         let version = req.version();
         let req = tonic::Request::from_http(req);
+
+        // Short-circuit when an upstream layer (e.g. the mTLS layer
+        // in mTLS-as-identity mode) has already established the auth
+        // principal. Without this check we would still demand a
+        // bearer token even though a verified client cert is
+        // sufficient on its own. We check via the request's
+        // `AuthRequestContext` extension; if it's not present we fall
+        // through to the bearer-token path so misconfiguration cannot
+        // accidentally open the endpoint.
+        if let Some(ctx) = req
+            .extensions()
+            .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+            && ctx.auth_principal().is_some()
+        {
+            let (metadata, extensions, msg) = req.into_parts();
+            let mut request = http::Request::new(msg);
+            *request.version_mut() = version;
+            *request.method_mut() = method;
+            *request.uri_mut() = uri;
+            *request.headers_mut() = metadata.into_headers();
+            *request.extensions_mut() = extensions;
+            return ResponseFuture::future(inner.call(request));
+        }
 
         let bearer_token = match get_authorization_value(req.metadata(), "Bearer") {
             Ok(bearer_token) => bearer_token,

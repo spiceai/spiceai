@@ -13,7 +13,7 @@ The principles guiding this work are as follows:
 
 ### Style
 
-**Error handling**: Error handling in Rust is a nuanced topic with many different approaches. The [Snafu design philosophy](https://docs.rs/snafu/latest/snafu/guide/philosophy/index.html#snafus-design-philosophy) is followed, utilizing the the [Snafu crate](https://docs.rs/snafu/latest/snafu/index.html) for defining and using error types.
+**Error handling**: Error handling in Rust is a nuanced topic with many different approaches. The [Snafu design philosophy](https://docs.rs/snafu/latest/snafu/guide/philosophy/index.html#snafus-design-philosophy) is followed, utilizing the [Snafu crate](https://docs.rs/snafu/latest/snafu/index.html) for defining and using error types.
 
 ### All errors use SNAFU functionality
 
@@ -239,7 +239,7 @@ Accessing the newtype value directly through a `Copy`:
 #[derive(Clone, Copy)]
 struct MyStruct(u64);
 
-fn consumes_value(v: MyStruct) -> {
+fn consumes_value(v: MyStruct) {
     v.0;
 }
 
@@ -254,6 +254,6 @@ Rust can make some compiler optimisations that result in more stack operations w
 
 ### Notes
 
-**Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.
+**Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[expect(...)]` is acceptable when the lint is not applicable in certain contexts.
 
 **API Guidelines**: The [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/about.html) are followed for all public interfaces.

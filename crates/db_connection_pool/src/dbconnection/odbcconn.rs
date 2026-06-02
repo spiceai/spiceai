@@ -41,6 +41,7 @@ use odbc_api::CursorImpl;
 use odbc_api::handles::SqlResult;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
+use odbc_api::handles::{Diagnostics, Record};
 use odbc_api::parameter::InputParameter;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::Snafu;
@@ -74,11 +75,11 @@ pub type ODBCDbConnectionPool<'a> =
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ArrowError { source: arrow::error::ArrowError },
-    #[snafu(display("arrow_odbc error: {source}"))]
+    #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
-    #[snafu(display("odbc_api Error: {source}"))]
+    #[snafu(display("ODBC connection error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
-    #[snafu(display("odbc_api Error: {message}"))]
+    #[snafu(display("{message}"))]
     ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },
@@ -125,11 +126,26 @@ impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self {
-        ODBCConnection {
-            conn: Arc::new(conn.into()),
-            params: Arc::new(HashMap::new()),
-        }
+    fn new(_: Connection<'a>) -> Self {
+        unimplemented!(
+            "ODBCConnection::new() is not used; use the constructor with parameters instead"
+        )
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "ODBC tables() requires driver-specific implementation".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        // ODBC catalog functions are driver-specific and require complex C API calls.
+        // Each ODBC driver has different capabilities, so this method is not implemented.
+        Err(dbconnection::Error::UnableToGetSchemas {
+            source: "ODBC schemas() requires driver-specific implementation".into(),
+        })
     }
 
     async fn get_schema(
@@ -147,7 +163,7 @@ where
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
 
         let schema = Arc::new(
-            arrow_schema_from(&mut prepared, false)
+            arrow_schema_from(&mut prepared, None, false)
                 .boxed()
                 .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?,
         );
@@ -194,20 +210,66 @@ where
             let cxn = handle.block_on(async { conn.lock().await });
 
             let mut prepared = cxn.prepare(&sql)?;
-            let schema = Arc::new(arrow_schema_from(&mut prepared, false)?);
+            let schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
-            let mut statement = prepared.into_statement();
+            let mut statement = prepared.into_handle();
 
             bind_parameters(&mut statement, &params)?;
 
             // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
             let cursor = unsafe {
-                if let SqlResult::Error { function } = statement.execute() {
-                    return Err(Error::ODBCAPIErrorNoSource {
-                        message: function.to_string(),
+                match statement.execute() {
+                    SqlResult::Success(()) | SqlResult::SuccessWithInfo(()) => {}
+                    SqlResult::Error { function } => {
+                        let detail = odbc_error_message(&statement, function);
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("SQLExecute failed: {detail}"),
+                        }
+                        .into());
                     }
-                    .into());
+                    SqlResult::NoData => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: "Query returned NoData (no result set)".to_string(),
+                        }
+                        .into());
+                    }
+                    state @ (SqlResult::NeedData | SqlResult::StillExecuting) => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Unexpected ODBC state after execute: {state:?}"),
+                        }
+                        .into());
+                    }
+                }
+
+                // Verify the statement actually produced a result set before creating a cursor
+                // Reading from an invalid cursor would segfault in the ODBC C driver.
+                match statement.num_result_cols() {
+                    SqlResult::Success(cols) | SqlResult::SuccessWithInfo(cols) => {
+                        if cols == 0 {
+                            return Err(Error::ODBCAPIErrorNoSource {
+                                message:
+                                    "Statement did not produce a result set (0 columns reported)"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                    SqlResult::Error { function } => {
+                        let detail = odbc_error_message(&statement, function);
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Failed to determine result column count: {detail}"),
+                        }
+                        .into());
+                    }
+                    state => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!(
+                                "Unexpected ODBC state checking result columns: {state:?}"
+                            ),
+                        }
+                        .into());
+                    }
                 }
 
                 Ok::<_, GenericError>(CursorImpl::new(statement.as_stmt_ref()))
@@ -250,10 +312,18 @@ where
                 yield Ok(batch);
             }
 
-            if let Err(e) = join_handle.await {
-                yield Err(DataFusionError::Execution(format!(
-                    "Failed to execute ODBC query: {e}"
-                )))
+            match join_handle.await {
+                Err(e) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Ok(())) => {}
             }
         };
 
@@ -266,16 +336,39 @@ where
     async fn execute(&self, query: &str, params: &[ODBCParameter]) -> Result<u64> {
         let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
-        let mut statement = prepared.into_statement();
+        let mut statement = prepared.into_handle();
 
         bind_parameters(&mut statement, params)?;
 
         let row_count = unsafe {
-            statement.execute().unwrap();
-            statement.row_count()
+            if let SqlResult::Error { function } = statement.execute() {
+                let detail = odbc_error_message(&statement, function);
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to execute statement: {detail}"),
+                }
+                .into());
+            }
+
+            match statement.row_count() {
+                SqlResult::Success(count) | SqlResult::SuccessWithInfo(count) => count,
+                SqlResult::NoData => 0,
+                SqlResult::Error { function } => {
+                    let detail = odbc_error_message(&statement, function);
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: format!("Failed to get row count: {detail}"),
+                    }
+                    .into());
+                }
+                SqlResult::NeedData | SqlResult::StillExecuting => {
+                    return Err(Error::ODBCAPIErrorNoSource {
+                        message: "Unexpected SQL state when getting row count".to_string(),
+                    }
+                    .into());
+                }
+            }
         };
 
-        Ok(row_count.unwrap().try_into().context(TryFromSnafu)?)
+        Ok(row_count.try_into().context(TryFromSnafu)?)
     }
 }
 
@@ -318,18 +411,47 @@ fn build_odbc_reader<C: Cursor>(
     builder.build(cursor).context(ArrowODBCSnafu)
 }
 
+/// Extracts diagnostic error messages from an ODBC handle after a failed call.
+///
+/// Returns a formatted string containing all diagnostic records, or the function name
+/// if no diagnostic records are available.
+fn odbc_error_message(handle: &(impl Diagnostics + ?Sized), function: &str) -> String {
+    let mut messages = Vec::new();
+    let mut record = Record::with_capacity(512);
+    let mut rec_number: i16 = 1;
+    while record.fill_from(handle, rec_number) {
+        messages.push(format!("{record}"));
+        rec_number += 1;
+
+        if rec_number > 10 {
+            // A failed ODBC call typically produces 1–3 diagnostic records; cap at 10 to guard
+            // against misbehaving drivers that could cause an infinite loop or an overflow.
+            messages.push("...".to_string());
+            break;
+        }
+    }
+    if messages.is_empty() {
+        function.to_string()
+    } else {
+        messages.join("; ")
+    }
+}
+
 /// Binds parameter to an ODBC statement.
 ///
 /// `StatementImpl<'_>::bind_input_parameter` is unsafe.
 fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<(), Error> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
-            statement
-                .bind_input_parameter(
-                    (i + 1).try_into().context(UnableToBindIntParameterSnafu)?,
-                    param.as_input_parameter(),
-                )
-                .unwrap();
+            let param_index = (i + 1).try_into().context(UnableToBindIntParameterSnafu)?;
+            if let SqlResult::Error { function } =
+                statement.bind_input_parameter(param_index, param.as_input_parameter())
+            {
+                let detail = odbc_error_message(statement, function);
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to bind parameter {}: {detail}", i + 1),
+                });
+            }
         }
     }
 
@@ -346,12 +468,21 @@ mod tests {
 
     use super::*;
 
-    // This test crudely validates that parameters are being received by the ODBC driver
+    // This test crudely validates that parameters are being received by the ODBC driver.
+    // Requires SQLite ODBC driver to be installed: `apt install libsqliteodbc` or equivalent.
+    #[ignore = "Requires SQLite ODBC driver"]
     #[cfg(feature = "odbc")]
     #[tokio::test]
     async fn test_bind_parameters() -> Result<()> {
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(HashMap::new()).expect("Must create ODBC pool");
+        // We provide a dummy connection_string since ODBCPool::new requires it,
+        // but we use driver_connect directly which ignores it
+        let mut params = HashMap::new();
+        params.insert(
+            "connection_string".to_string(),
+            secrecy::SecretString::from("Driver={SQLite}"),
+        );
+        let pool = ODBCPool::new(params).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(
@@ -367,7 +498,7 @@ mod tests {
         let mut statement = driver_cxn
             .prepare("select * from (select 'hopper' as name, 100 as age) as cats where name = ? and age = ?")
             .expect("Must prepare")
-            .into_statement();
+            .into_handle();
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),

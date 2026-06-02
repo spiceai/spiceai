@@ -12,14 +12,13 @@ updates:
     labels:
       - 'rust'
       - 'kind/dependencies'
-
-  - package-ecosystem: 'gomod' # See documentation for possible values
-    directory: '/' # Location of package manifests
-    schedule:
-      interval: 'weekly'
-    labels:
-      - 'go'
-      - 'kind/dependencies'
+    groups:
+      aws-sdk:
+        patterns:
+          - 'aws-*'
+      rust-dependencies:
+        patterns:
+          - '*'
 
   - package-ecosystem: 'github-actions' # See documentation for possible values
     directory: '/' # Location of package manifests
@@ -28,6 +27,10 @@ updates:
     labels:
       - 'github_actions'
       - 'kind/dependencies'
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - '*'
 
   - package-ecosystem: 'docker' # See documentation for possible values
     directory: '/' # Location of package manifests
@@ -36,3 +39,7 @@ updates:
     labels:
       - 'docker'
       - 'kind/dependencies'
+    groups:
+      docker-dependencies:
+        patterns:
+          - '*'

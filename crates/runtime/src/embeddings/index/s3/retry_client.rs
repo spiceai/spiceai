@@ -14,8 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Retry middleware for S3 Vectors API client.
+//!
+//! This module provides a retry middleware that wraps an `S3Vectors` implementation
+//! and adds retry logic with configurable backoff strategy and parallelism control.
+
 use std::error::Error;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_credential_types::provider::error::CredentialsError;
@@ -27,797 +34,443 @@ use s3_vectors::{
     DeleteVectorsError, DeleteVectorsInput, DeleteVectorsOutput, GetIndexError, GetIndexInput,
     GetIndexOutput, GetVectorBucketError, GetVectorBucketInput, GetVectorBucketOutput,
     GetVectorBucketPolicyError, GetVectorBucketPolicyInput, GetVectorBucketPolicyOutput,
-    GetVectorsError, GetVectorsInput, GetVectorsOutput, ListIndexesError, ListIndexesInput,
-    ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput, ListVectorBucketsOutput,
-    ListVectorsError, ListVectorsInput, ListVectorsOutput, PutVectorBucketPolicyError,
-    PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput, PutVectorsError, PutVectorsInput,
-    PutVectorsOutput, QueryVectorsError, QueryVectorsInput, QueryVectorsOutput, S3Vectors,
-    SdkError,
+    GetVectorsError, GetVectorsInput, GetVectorsOutput, HttpResponse, ListIndexesError,
+    ListIndexesInput, ListIndexesOutput, ListVectorBucketsError, ListVectorBucketsInput,
+    ListVectorBucketsOutput, ListVectorsError, ListVectorsInput, ListVectorsOutput,
+    PutVectorBucketPolicyError, PutVectorBucketPolicyInput, PutVectorBucketPolicyOutput,
+    PutVectorsError, PutVectorsInput, PutVectorsOutput, QueryVectorsError, QueryVectorsInput,
+    QueryVectorsOutput, S3Vectors, SdkError,
 };
 use tokio::sync::Semaphore;
 use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
 use util::{RetryError, retry};
 
-pub struct S3VectorRetryClientBuilder {
-    client: Arc<dyn S3Vectors + Send + Sync>,
-    retry_strategy: FibonacciBackoff,
-    max_parallelism: usize,
+/// Classifies an SDK error as transient or permanent for retry purposes.
+fn classify_error<E>(
+    error: SdkError<E, HttpResponse>,
+    is_transient_service_error: impl FnOnce(&E) -> bool,
+) -> RetryError<SdkError<E>> {
+    match &error {
+        SdkError::TimeoutError(_) => RetryError::transient(error),
+        SdkError::ServiceError(service_error) => {
+            if is_transient_service_error(service_error.err()) {
+                RetryError::transient(error)
+            } else {
+                RetryError::permanent(error)
+            }
+        }
+        SdkError::DispatchFailure(d) => {
+            let credentials_not_loaded = d
+                .as_connector_error()
+                .and_then(|e| e.source())
+                .and_then(|s| s.downcast_ref::<CredentialsError>())
+                .is_some_and(|ce| matches!(ce, CredentialsError::CredentialsNotLoaded(_)));
+
+            if credentials_not_loaded {
+                RetryError::permanent(error)
+            } else {
+                RetryError::transient(error)
+            }
+        }
+        _ => RetryError::permanent(error),
+    }
 }
 
-impl S3VectorRetryClientBuilder {
+/// Builder for `S3VectorsRetryMiddleware`.
+pub struct S3VectorsRetryMiddlewareBuilder<T: S3Vectors + Send + Sync + ?Sized> {
+    inner: Arc<T>,
+    retry_strategy: FibonacciBackoff,
+    max_parallelism: usize,
+    operation_timeout: Duration,
+}
+
+impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddlewareBuilder<T> {
+    /// Creates a new builder with the given inner client.
     #[must_use]
-    pub fn new(client: Arc<dyn S3Vectors + Send + Sync>) -> Self {
+    pub fn new(inner: Arc<T>) -> Self {
         Self {
-            client,
+            inner,
             retry_strategy: FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             max_parallelism: 10,
+            operation_timeout: Duration::from_secs(300),
         }
     }
 
+    /// Sets the retry strategy.
     #[must_use]
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn retry_strategy(mut self, retry_strategy: FibonacciBackoff) -> Self {
         self.retry_strategy = retry_strategy;
         self
     }
 
+    /// Sets the maximum parallelism (concurrent operations).
     #[must_use]
-    #[allow(unused)]
+    #[expect(unused)]
     pub fn max_parallelism(mut self, max_parallelism: usize) -> Self {
         self.max_parallelism = max_parallelism;
         self
     }
 
+    /// Sets the operation timeout.
     #[must_use]
-    pub fn build(self) -> S3VectorRetryClient {
-        S3VectorRetryClient {
-            client: self.client,
+    #[expect(unused)]
+    pub fn operation_timeout(mut self, timeout: Duration) -> Self {
+        self.operation_timeout = timeout;
+        self
+    }
+
+    /// Builds the retry middleware.
+    #[must_use]
+    pub fn build(self) -> S3VectorsRetryMiddleware<T> {
+        S3VectorsRetryMiddleware {
+            inner: self.inner,
             retry_strategy: self.retry_strategy,
             semaphore: Semaphore::new(self.max_parallelism),
+            operation_timeout: self.operation_timeout,
         }
     }
 }
 
-pub struct S3VectorRetryClient {
-    client: Arc<dyn S3Vectors + Send + Sync>,
+/// Retry middleware for S3 Vectors API.
+///
+/// Wraps an `S3Vectors` implementation and adds:
+/// - Automatic retry with configurable backoff strategy
+/// - Parallelism control via semaphore
+/// - Operation timeout
+pub struct S3VectorsRetryMiddleware<T: S3Vectors + Send + Sync + ?Sized> {
+    inner: Arc<T>,
     retry_strategy: FibonacciBackoff,
     semaphore: Semaphore,
+    operation_timeout: Duration,
 }
 
+impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddleware<T> {
+    /// Returns a reference to the inner client.
+    #[must_use]
+    #[expect(unused)]
+    pub fn inner(&self) -> &Arc<T> {
+        &self.inner
+    }
+
+    /// Executes an operation with retry, timeout, and parallelism control.
+    async fn execute_with_retry<O, E, F, Fut>(
+        &self,
+        operation: F,
+        is_transient: impl Fn(&E) -> bool + Clone,
+    ) -> Result<O, SdkError<E>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<O, SdkError<E>>>,
+        E: std::fmt::Debug,
+    {
+        tokio::time::timeout(
+            self.operation_timeout,
+            retry(self.retry_strategy.clone(), || async {
+                let _permit = self.semaphore.acquire().await;
+                match operation().await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(classify_error(e, |err| is_transient(err))),
+                }
+            }),
+        )
+        .await
+        .map_err(|_| {
+            SdkError::construction_failure(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Operation timed out",
+            ))
+        })?
+    }
+}
+
+/// Trait for checking if an error is a transient service error.
+trait IsTransientError {
+    fn is_transient(&self) -> bool;
+}
+
+macro_rules! impl_is_transient {
+    ($error_type:ty, $($variant:ident),+ $(,)?) => {
+        impl IsTransientError for $error_type {
+            fn is_transient(&self) -> bool {
+                matches!(
+                    self,
+                    $(Self::$variant(_))|+
+                ) || self.meta().code() == Some("RequestTimeoutException")
+            }
+        }
+    };
+}
+
+impl_is_transient!(
+    CreateIndexError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    CreateVectorBucketError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    DeleteIndexError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    DeleteVectorBucketError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    DeleteVectorBucketPolicyError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    DeleteVectorsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    GetIndexError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    GetVectorBucketError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    GetVectorBucketPolicyError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    GetVectorsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    ListIndexesError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    ListVectorBucketsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    ListVectorsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    PutVectorBucketPolicyError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    PutVectorsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+impl_is_transient!(
+    QueryVectorsError,
+    ServiceUnavailableException,
+    TooManyRequestsException,
+    InternalServerException
+);
+
 #[async_trait]
-impl S3Vectors for S3VectorRetryClient {
+impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetryMiddleware<T> {
     async fn create_index(
         &self,
-        input: CreateIndexInput,
+        input: &CreateIndexInput,
     ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.create_index(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        CreateIndexError::ServiceUnavailableException(_)
-                        | CreateIndexError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        CreateIndexError::AccessDeniedException(_)
-                        | CreateIndexError::ConflictException(_)
-                        | CreateIndexError::InternalServerException(_)
-                        | CreateIndexError::NotFoundException(_)
-                        | CreateIndexError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.create_index(input),
+            CreateIndexError::is_transient,
+        )
         .await
     }
 
     async fn create_vector_bucket(
         &self,
-        input: CreateVectorBucketInput,
+        input: &CreateVectorBucketInput,
     ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.create_vector_bucket(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        CreateVectorBucketError::ServiceUnavailableException(_)
-                        | CreateVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        CreateVectorBucketError::AccessDeniedException(_)
-                        | CreateVectorBucketError::ConflictException(_)
-                        | CreateVectorBucketError::InternalServerException(_)
-                        | CreateVectorBucketError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.create_vector_bucket(input),
+            CreateVectorBucketError::is_transient,
+        )
         .await
     }
 
     async fn delete_index(
         &self,
-        input: DeleteIndexInput,
+        input: &DeleteIndexInput,
     ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.delete_index(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::TimeoutError(_) => Err(RetryError::transient(e)),
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        DeleteIndexError::ServiceUnavailableException(_)
-                        | DeleteIndexError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        DeleteIndexError::AccessDeniedException(_)
-                        | DeleteIndexError::InternalServerException(_)
-                        | DeleteIndexError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.delete_index(input),
+            DeleteIndexError::is_transient,
+        )
         .await
     }
 
     async fn delete_vector_bucket(
         &self,
-        input: DeleteVectorBucketInput,
+        input: &DeleteVectorBucketInput,
     ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.delete_vector_bucket(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        DeleteVectorBucketError::ServiceUnavailableException(_)
-                        | DeleteVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        DeleteVectorBucketError::AccessDeniedException(_)
-                        | DeleteVectorBucketError::ConflictException(_)
-                        | DeleteVectorBucketError::InternalServerException(_)
-                        | DeleteVectorBucketError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.delete_vector_bucket(input),
+            DeleteVectorBucketError::is_transient,
+        )
         .await
     }
 
     async fn delete_vector_bucket_policy(
         &self,
-        input: DeleteVectorBucketPolicyInput,
+        input: &DeleteVectorBucketPolicyInput,
     ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.delete_vector_bucket_policy(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        DeleteVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | DeleteVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        DeleteVectorBucketPolicyError::AccessDeniedException(_)
-                        | DeleteVectorBucketPolicyError::InternalServerException(_)
-                        | DeleteVectorBucketPolicyError::NotFoundException(_)
-                        | DeleteVectorBucketPolicyError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.delete_vector_bucket_policy(input),
+            DeleteVectorBucketPolicyError::is_transient,
+        )
         .await
     }
 
     async fn delete_vectors(
         &self,
-        input: DeleteVectorsInput,
+        input: &DeleteVectorsInput,
     ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.delete_vectors(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        DeleteVectorsError::ServiceUnavailableException(_)
-                        | DeleteVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        DeleteVectorsError::AccessDeniedException(_)
-                        | DeleteVectorsError::InternalServerException(_)
-                        | DeleteVectorsError::NotFoundException(_)
-                        | DeleteVectorsError::KmsDisabledException(_)
-                        | DeleteVectorsError::KmsInvalidKeyUsageException(_)
-                        | DeleteVectorsError::KmsInvalidStateException(_)
-                        | DeleteVectorsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.delete_vectors(input),
+            DeleteVectorsError::is_transient,
+        )
         .await
     }
 
     async fn get_index(
         &self,
-        input: GetIndexInput,
+        input: &GetIndexInput,
     ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.get_index(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        GetIndexError::ServiceUnavailableException(_)
-                        | GetIndexError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        GetIndexError::AccessDeniedException(_)
-                        | GetIndexError::InternalServerException(_)
-                        | GetIndexError::NotFoundException(_)
-                        | GetIndexError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
-        .await
+        self.execute_with_retry(|| self.inner.get_index(input), GetIndexError::is_transient)
+            .await
     }
 
     async fn get_vector_bucket(
         &self,
-        input: GetVectorBucketInput,
+        input: &GetVectorBucketInput,
     ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.get_vector_bucket(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        GetVectorBucketError::ServiceUnavailableException(_)
-                        | GetVectorBucketError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        GetVectorBucketError::AccessDeniedException(_)
-                        | GetVectorBucketError::InternalServerException(_)
-                        | GetVectorBucketError::NotFoundException(_)
-                        | GetVectorBucketError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.get_vector_bucket(input),
+            GetVectorBucketError::is_transient,
+        )
         .await
     }
 
     async fn get_vector_bucket_policy(
         &self,
-        input: GetVectorBucketPolicyInput,
+        input: &GetVectorBucketPolicyInput,
     ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.get_vector_bucket_policy(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        GetVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | GetVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        GetVectorBucketPolicyError::AccessDeniedException(_)
-                        | GetVectorBucketPolicyError::InternalServerException(_)
-                        | GetVectorBucketPolicyError::NotFoundException(_)
-                        | GetVectorBucketPolicyError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.get_vector_bucket_policy(input),
+            GetVectorBucketPolicyError::is_transient,
+        )
         .await
     }
 
     async fn get_vectors(
         &self,
-        input: GetVectorsInput,
+        input: &GetVectorsInput,
     ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.get_vectors(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        GetVectorsError::ServiceUnavailableException(_)
-                        | GetVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        GetVectorsError::AccessDeniedException(_)
-                        | GetVectorsError::InternalServerException(_)
-                        | GetVectorsError::NotFoundException(_)
-                        | GetVectorsError::KmsDisabledException(_)
-                        | GetVectorsError::KmsInvalidKeyUsageException(_)
-                        | GetVectorsError::KmsInvalidStateException(_)
-                        | GetVectorsError::KmsNotFoundException(_)
-                        | GetVectorsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.get_vectors(input),
+            GetVectorsError::is_transient,
+        )
         .await
     }
 
     async fn list_indexes(
         &self,
-        input: ListIndexesInput,
+        input: &ListIndexesInput,
     ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.list_indexes(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        ListIndexesError::ServiceUnavailableException(_)
-                        | ListIndexesError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        ListIndexesError::AccessDeniedException(_)
-                        | ListIndexesError::InternalServerException(_)
-                        | ListIndexesError::NotFoundException(_)
-                        | ListIndexesError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.list_indexes(input),
+            ListIndexesError::is_transient,
+        )
         .await
     }
 
     async fn list_vector_buckets(
         &self,
-        input: ListVectorBucketsInput,
+        input: &ListVectorBucketsInput,
     ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.list_vector_buckets(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        ListVectorBucketsError::ServiceUnavailableException(_)
-                        | ListVectorBucketsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        ListVectorBucketsError::AccessDeniedException(_)
-                        | ListVectorBucketsError::InternalServerException(_)
-                        | ListVectorBucketsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.list_vector_buckets(input),
+            ListVectorBucketsError::is_transient,
+        )
         .await
     }
 
     async fn list_vectors(
         &self,
-        input: ListVectorsInput,
+        input: &ListVectorsInput,
     ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.list_vectors(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        ListVectorsError::ServiceUnavailableException(_)
-                        | ListVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        ListVectorsError::AccessDeniedException(_)
-                        | ListVectorsError::InternalServerException(_)
-                        | ListVectorsError::NotFoundException(_)
-                        | ListVectorsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.list_vectors(input),
+            ListVectorsError::is_transient,
+        )
         .await
     }
 
     async fn put_vector_bucket_policy(
         &self,
-        input: PutVectorBucketPolicyInput,
+        input: &PutVectorBucketPolicyInput,
     ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.put_vector_bucket_policy(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        PutVectorBucketPolicyError::ServiceUnavailableException(_)
-                        | PutVectorBucketPolicyError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        PutVectorBucketPolicyError::AccessDeniedException(_)
-                        | PutVectorBucketPolicyError::InternalServerException(_)
-                        | PutVectorBucketPolicyError::NotFoundException(_)
-                        | PutVectorBucketPolicyError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.put_vector_bucket_policy(input),
+            PutVectorBucketPolicyError::is_transient,
+        )
         .await
     }
 
     async fn put_vectors(
         &self,
-        input: PutVectorsInput,
+        input: &PutVectorsInput,
     ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.put_vectors(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        PutVectorsError::ServiceUnavailableException(_)
-                        | PutVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        PutVectorsError::AccessDeniedException(_)
-                        | PutVectorsError::InternalServerException(_)
-                        | PutVectorsError::NotFoundException(_)
-                        | PutVectorsError::KmsDisabledException(_)
-                        | PutVectorsError::KmsInvalidKeyUsageException(_)
-                        | PutVectorsError::KmsInvalidStateException(_)
-                        | PutVectorsError::KmsNotFoundException(_)
-                        | PutVectorsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.put_vectors(input),
+            PutVectorsError::is_transient,
+        )
         .await
     }
 
     async fn query_vectors(
         &self,
-        input: QueryVectorsInput,
+        input: &QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
-        retry(self.retry_strategy.clone(), || async {
-            let _permit = self.semaphore.acquire().await;
-            match self.client.query_vectors(input.clone()).await {
-                Ok(result) => Ok(result),
-                Err(e) => match &e {
-                    SdkError::ServiceError(service_error) => match service_error.err() {
-                        QueryVectorsError::ServiceUnavailableException(_)
-                        | QueryVectorsError::TooManyRequestsException(_) => {
-                            Err(RetryError::transient(e))
-                        }
-                        err if err.meta().code() == Some("RequestTimeoutException") => {
-                            Err(RetryError::transient(e))
-                        }
-                        QueryVectorsError::AccessDeniedException(_)
-                        | QueryVectorsError::InternalServerException(_)
-                        | QueryVectorsError::NotFoundException(_)
-                        | QueryVectorsError::KmsDisabledException(_)
-                        | QueryVectorsError::KmsInvalidKeyUsageException(_)
-                        | QueryVectorsError::KmsInvalidStateException(_)
-                        | QueryVectorsError::KmsNotFoundException(_)
-                        | QueryVectorsError::ServiceQuotaExceededException(_)
-                        | _ => Err(RetryError::permanent(e)),
-                    },
-                    SdkError::DispatchFailure(d) => {
-                        let credentials_not_loaded = d
-                            .as_connector_error()
-                            .and_then(|e| e.source())
-                            .and_then(|s| s.downcast_ref::<CredentialsError>())
-                            .is_some_and(|ce| {
-                                matches!(ce, CredentialsError::CredentialsNotLoaded(_))
-                            });
-
-                        if credentials_not_loaded {
-                            Err(RetryError::permanent(e))
-                        } else {
-                            Err(RetryError::transient(e))
-                        }
-                    }
-                    _ => Err(RetryError::permanent(e)),
-                },
-            }
-        })
+        self.execute_with_retry(
+            || self.inner.query_vectors(input),
+            QueryVectorsError::is_transient,
+        )
         .await
     }
 }

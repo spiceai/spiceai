@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 use super::get_params;
@@ -50,9 +50,9 @@ fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope_retry(3, || async {
@@ -87,13 +87,13 @@ async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error>
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

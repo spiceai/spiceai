@@ -1,0 +1,13 @@
+version: v1
+kind: Spicepod
+name: mysql[catalog]-federated
+catalogs:
+  - from: mysql
+    name: mysql
+    params:
+      mysql_host: ${env:MYSQL_HOST}
+      mysql_tcp_port: ${env:MYSQL_TCP_PORT}
+      mysql_db: ${env:MYSQL_DB}
+      mysql_user: ${env:MYSQL_USER}
+      mysql_pass: ${env:MYSQL_PASSWORD}
+      mysql_sslmode: disabled

@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: customer_pk_lookup"
+---
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                  |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: customer projection=[c_custkey, c_name, c_address, c_nationkey, c_phone, c_acctbal, c_mktsegment, c_comment], full_filters=[customer.c_custkey = Int64(1)] |
+| physical_plan | SchemaCastScanExec                                                                                                                                                    |
+|               |   CooperativeExec                                                                                                                                                     |
+|               |     BytesProcessedExec                                                                                                                                                |
+|               |       IndexedLookupExec: indexed_scan on [c_custkey]                                                                                                                  |
+|               |                                                                                                                                                                       |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+

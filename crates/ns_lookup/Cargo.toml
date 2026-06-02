@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "ns_lookup"
 repository.workspace = true
 rust-version.workspace = true
@@ -12,5 +12,5 @@ version.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-trust-dns-resolver = "0.23.2"
-url = "2.5.4"
+hickory-resolver = "0.25.2"
+url.workspace = true

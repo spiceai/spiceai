@@ -20,7 +20,10 @@ use crate::{
         create_api_bindings_config, get_anthropic_model, get_local_model, get_mega_science_dataset,
         get_xai_model, openai::get_openai_model,
     },
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::{
+        ModelVerificationBuilder, runtime_ready_check, test_request_context,
+        verify_env_secret_exists,
+    },
 };
 use app::AppBuilder;
 use datafusion::common::DataFusionError;
@@ -28,12 +31,17 @@ use runtime::{Runtime, auth::EndpointAuth};
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
+const DEFAULT_AI_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
+const LOCAL_MODEL_AI_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_MODEL_MULTI_QUERY_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[tokio::test]
 async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -41,10 +49,18 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .anthropic("claude-haiku-4-5-20251001")
+                .verify()
+                .await
+                .map_err(anyhow::Error::msg)?;
+
             let app = AppBuilder::new("ai_udf_test")
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
                 .with_model(get_anthropic_model(
-                    "claude-3-5-haiku-latest",
+                    "claude-haiku-4-5-20251001",
                     "claude-haiku",
                 ))
                 .build();
@@ -142,6 +158,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -152,11 +169,20 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .xai("grok-4.20-non-reasoning")
+                .anthropic("claude-haiku-4-5-20251001")
+                .verify()
+                .await
+                .map_err(anyhow::Error::msg)?;
+
             let app = AppBuilder::new("ai_udf_test")
                 .with_dataset(get_mega_science_dataset(None, None, None))
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-fast-non-reasoning", "grok-4"))
-                .with_model(get_anthropic_model("claude-3-5-haiku-latest", "claude-haiku"))
+                .with_model(get_xai_model("grok-4.20-non-reasoning", "grok-4"))
+                .with_model(get_anthropic_model("claude-haiku-4-5-20251001", "claude-haiku"))
                 .build();
 
             let api_config = create_api_bindings_config();
@@ -209,6 +235,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
+            // Verify API keys exist
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -219,10 +246,19 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(anyhow::Error::msg)?;
 
+            // Verify models are available before starting the test
+            ModelVerificationBuilder::new()
+                .openai("gpt-4o-mini")
+                .xai("grok-4.20-non-reasoning")
+                .anthropic("claude-haiku-4-5-20251001")
+                .verify()
+                .await
+                .map_err(anyhow::Error::msg)?;
+
             let app = AppBuilder::new("ai_udf_test")
                 .with_model(get_openai_model("gpt-4o-mini", "gpt-4o-mini"))
-                .with_model(get_xai_model("grok-4-fast-non-reasoning", "grok-4"))
-                .with_model(get_anthropic_model("claude-3-5-haiku-latest", "claude-haiku"))
+                .with_model(get_xai_model("grok-4.20-non-reasoning", "grok-4"))
+                .with_model(get_anthropic_model("claude-haiku-4-5-20251001", "claude-haiku"))
                 .build();
 
             let api_config = create_api_bindings_config();
@@ -292,9 +328,9 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
                 Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
             });
 
-            // Local models take longer to load
+            // Local models take longer to load, especially on uncached machines.
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(180)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(360)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for local model to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -305,7 +341,8 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
             // Test 8: Basic query with local model
             let query = "SELECT ai('Say hello in one word', 'llama3')";
             tracing::info!("Testing: Local model (Phi-3.5-mini)");
-            let result = run_ai_query(&rt, query).await?;
+            let result =
+                run_ai_query_with_timeout(&rt, query, LOCAL_MODEL_AI_QUERY_TIMEOUT).await?;
             tracing::info!("✓ Test 8 result (Phi-3.5-mini): {}", result);
             assert!(
                 !result.is_empty(),
@@ -315,7 +352,9 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
             // Test 9: Verify local model works synchronously
             let query = "SELECT ai('hi', 'llama3'), ai('hello', 'llama3')";
             tracing::info!("Testing: Multiple calls to local model");
-            let results = run_ai_query_multiple(&rt, query).await?;
+            let results =
+                run_ai_query_multiple_with_timeout(&rt, query, LOCAL_MODEL_MULTI_QUERY_TIMEOUT)
+                    .await?;
             tracing::info!("✓ Test 9 results (multiple local model calls):");
             tracing::info!("  - First call ('hi'): {}", results[0]);
             tracing::info!("  - Second call ('hello'): {}", results[1]);
@@ -336,10 +375,18 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
 
 /// Helper to run a query that returns a single string value
 async fn run_ai_query(rt: &Arc<Runtime>, query: &str) -> Result<String, anyhow::Error> {
+    run_ai_query_with_timeout(rt, query, DEFAULT_AI_QUERY_TIMEOUT).await
+}
+
+async fn run_ai_query_with_timeout(
+    rt: &Arc<Runtime>,
+    query: &str,
+    query_timeout: Duration,
+) -> Result<String, anyhow::Error> {
     use arrow::array::StringArray;
     use futures::TryStreamExt;
 
-    let batches: Vec<_> = match timeout(Duration::from_secs(20), async {
+    let batches: Vec<_> = match timeout(query_timeout, async {
         let result = rt
             .datafusion()
             .query_builder(query)
@@ -353,7 +400,12 @@ async fn run_ai_query(rt: &Arc<Runtime>, query: &str) -> Result<String, anyhow::
     {
         Ok(Ok(batches)) => batches,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("Executing query timed out")),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Executing query timed out after {}s",
+                query_timeout.as_secs()
+            ));
+        }
     };
 
     if batches.is_empty() || batches[0].num_rows() == 0 {
@@ -375,10 +427,18 @@ async fn run_ai_query_multiple(
     rt: &Arc<Runtime>,
     query: &str,
 ) -> Result<Vec<String>, anyhow::Error> {
+    run_ai_query_multiple_with_timeout(rt, query, DEFAULT_AI_QUERY_TIMEOUT).await
+}
+
+async fn run_ai_query_multiple_with_timeout(
+    rt: &Arc<Runtime>,
+    query: &str,
+    query_timeout: Duration,
+) -> Result<Vec<String>, anyhow::Error> {
     use arrow::array::{Array, Int64Array, StringArray};
     use futures::TryStreamExt;
 
-    let batches: Vec<_> = match timeout(Duration::from_secs(20), async {
+    let batches: Vec<_> = match timeout(query_timeout, async {
         let result = rt
             .datafusion()
             .query_builder(query)
@@ -392,7 +452,12 @@ async fn run_ai_query_multiple(
     {
         Ok(Ok(batches)) => batches,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("Executing query timed out")),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Executing query timed out after {}s",
+                query_timeout.as_secs()
+            ));
+        }
     };
 
     if batches.is_empty() || batches[0].num_rows() == 0 {

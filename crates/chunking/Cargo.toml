@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "chunking"
 repository.workspace = true
 rust-version.workspace = true
@@ -10,18 +10,19 @@ version.workspace = true
 
 
 [dependencies]
+snafu.workspace = true
 text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "58f9c21006e01e5e968c5de80a0398b3f5ec439a", features = [
     "markdown",
     "tokenizers",
     "tiktoken-rs",
 ] }
-
+tiktoken-rs = "0.9.1"
+tokenizers.workspace = true
 tracing.workspace = true
-tracing-futures.workspace = true
-tokenizers = "0.21.2"
 
-pulldown-cmark = "0.13.0"
-tiktoken-rs = "0.6.0"
+[dev-dependencies]
+criterion = "0.7"
 
-snafu.workspace = true
-async-trait.workspace = true
+[[bench]]
+harness = false
+name = "chunking"

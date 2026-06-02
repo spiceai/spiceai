@@ -18,7 +18,7 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use crate::{
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::runtime_ready_check,
+    utils::{register_test_connectors, runtime_ready_check},
 };
 use std::sync::Arc;
 
@@ -28,6 +28,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
+use futures::TryStreamExt;
 use mysql_async::{Params, Row, prelude::Queryable};
 
 use runtime::Runtime;
@@ -58,17 +59,50 @@ async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
 
     tracing::debug!("INSERT INTO lineitem...");
     let insert_stmt =
-        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
+        InsertBuilder::new(&TableReference::from("lineitem"), &tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 
     Ok(())
 }
 
+async fn wait_for_query_rows(rt: &Runtime, sql: &str, expected_rows: usize) -> Result<(), String> {
+    let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+    retry(retry_strategy, || async {
+        let query_result = rt
+            .datafusion()
+            .query_builder(sql)
+            .build()
+            .run()
+            .await
+            .map_err(|e| RetryError::transient(anyhow::anyhow!(e)))?;
+
+        let batches = query_result
+            .data
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| RetryError::transient(anyhow::anyhow!(e)))?;
+        let actual_rows: usize = batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        if actual_rows >= expected_rows {
+            return Ok(());
+        }
+
+        Err(RetryError::transient(anyhow::anyhow!(
+            "query returned {actual_rows} rows; expected at least {expected_rows}"
+        )))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tokio::test]
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -163,10 +197,10 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope_retry(3, || async {
         let running_container = start_mysql_docker_container(
@@ -195,11 +229,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             .build();
 
         configure_test_datafusion();
-        let mut rt =
-            Runtime::builder()
-                .with_app(app)
-                .build()
-                .await;
+        let mut rt = Runtime::builder().with_app(app).build().await;
 
         let cloned_rt = Arc::new(rt.clone());
         // Set a timeout for the test
@@ -212,7 +242,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
 
         runtime_ready_check(&rt).await;
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        wait_for_query_rows(&rt, "SELECT * FROM acc_line LIMIT 10", 10).await?;
 
         let queries: QueryTests = vec![
             (

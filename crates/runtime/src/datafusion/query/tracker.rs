@@ -25,6 +25,7 @@ use runtime_request_context::RequestContext;
 
 use super::{error_code::ErrorCode, metrics};
 
+#[derive(Clone)]
 pub(crate) struct QueryTracker {
     pub(crate) schema: Option<SchemaRef>,
     pub(crate) query_duration_secs: Option<f32>,
@@ -79,16 +80,17 @@ impl QueryTracker {
             tags.push("error");
         }
 
+        let mut dataset_names: Vec<String> =
+            self.datasets.iter().map(ToString::to_string).collect();
+        // Sort so that the same set of datasets always produces the same
+        // joined string. Without this, HashSet iteration order would cause
+        // identical workloads to land on multiple distinct telemetry series
+        // (e.g. "a,b" vs "b,a").
+        dataset_names.sort();
+
         let mut labels = vec![
             KeyValue::new("tags", tags.join(",")),
-            KeyValue::new(
-                "datasets",
-                self.datasets
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<String>>()
-                    .join(","),
-            ),
+            KeyValue::new("datasets", dataset_names.join(",")),
         ];
 
         labels.extend(request_context.to_dimensions());
@@ -151,11 +153,11 @@ fn trace_query(
 
     tracing::info!(target: "task_history", rows_produced = %query_tracker.rows_produced, "labels");
 
-    if let Some(true) = query_tracker.results_cache_hit {
+    if query_tracker.results_cache_hit == Some(true) {
         tracing::info!(target: "task_history", results_cache_hit = true, "labels");
     }
 
-    if let Some(true) = &query_tracker.is_accelerated {
+    if matches!(&query_tracker.is_accelerated, Some(true)) {
         tracing::info!(target: "task_history", accelerated = true, "labels");
     }
 

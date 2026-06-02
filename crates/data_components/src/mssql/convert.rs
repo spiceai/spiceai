@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
+use snafu::OptionExt;
 use tiberius::{ColumnType, Row, numeric::Numeric, xml::XmlData};
 use uuid::Uuid;
 
@@ -48,8 +49,6 @@ macro_rules! handle_primitive_type {
         }
     }};
 }
-
-#[allow(clippy::too_many_lines)]
 pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<RecordBatch> {
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut mssql_types: Vec<ColumnType> = Vec::new();
@@ -149,8 +148,12 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                     };
                     let v = row.get::<NaiveDateTime, usize>(i);
                     match v {
-                        Some(v) => builder
-                            .append_value(v.and_utc().timestamp_nanos_opt().unwrap_or_default()),
+                        Some(v) => {
+                            // DATETIME2 supports years 0001-9999, but Arrow's nanosecond
+                            // timestamps only cover ~1677-2262. Error on overflow rather
+                            // than silently defaulting to epoch 0.
+                            builder.append_value(naive_datetime_to_nanos(v)?);
+                        }
                         None => builder.append_null(),
                     }
                 }
@@ -168,9 +171,10 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
                     let v = row.get::<DateTime<chrono::FixedOffset>, usize>(i);
                     match v {
                         Some(v) => {
-                            let utc_value = v.with_timezone(&chrono::Utc);
-                            builder
-                                .append_value(utc_value.timestamp_nanos_opt().unwrap_or_default());
+                            // See DATETIME2 comment: DATETIMEOFFSET also supports
+                            // years 0001-9999, so we reject overflow instead of silently
+                            // returning epoch 0.
+                            builder.append_value(datetime_to_nanos(v)?);
                         }
                         None => builder.append_null(),
                     }
@@ -309,6 +313,24 @@ pub(crate) fn rows_to_arrow(rows: &[Row], schema: &SchemaRef) -> super::Result<R
         .map_err(|err| super::Error::FailedToBuildRecordBatch { source: err })
 }
 
+/// Convert a [`NaiveDateTime`] (interpreted as UTC) to nanoseconds since epoch.
+/// Returns [`super::Error::FailedToConvertTimestampToNanos`] if the value is outside
+/// the i64 nanosecond range (~1677-2262).
+fn naive_datetime_to_nanos(v: NaiveDateTime) -> super::Result<i64> {
+    v.and_utc()
+        .timestamp_nanos_opt()
+        .context(super::FailedToConvertTimestampToNanosSnafu { v: v.to_string() })
+}
+
+/// Convert a [`DateTime`] with a fixed offset to nanoseconds since epoch (UTC).
+/// Returns [`super::Error::FailedToConvertTimestampToNanos`] if the value is outside
+/// the i64 nanosecond range (~1677-2262).
+fn datetime_to_nanos(v: DateTime<chrono::FixedOffset>) -> super::Result<i64> {
+    v.with_timezone(&chrono::Utc)
+        .timestamp_nanos_opt()
+        .context(super::FailedToConvertTimestampToNanosSnafu { v: v.to_string() })
+}
+
 pub(crate) fn map_column_type_to_arrow_type(
     column_type: ColumnType,
     decimal_precision: Option<u8>,
@@ -397,5 +419,96 @@ fn get_column_precision_and_scale(
     match field.data_type() {
         DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{FixedOffset, NaiveDate, TimeZone};
+
+    #[test]
+    fn test_naive_datetime_to_nanos_in_range() {
+        // Year 2020 is well within the i64 nanosecond range.
+        let v = NaiveDate::from_ymd_opt(2020, 1, 1)
+            .expect("valid date")
+            .and_hms_opt(12, 34, 56)
+            .expect("valid time");
+        let nanos = naive_datetime_to_nanos(v).expect("in-range timestamp should convert");
+        assert_eq!(
+            nanos,
+            v.and_utc().timestamp_nanos_opt().expect("chrono nanos")
+        );
+    }
+
+    #[test]
+    fn test_naive_datetime_to_nanos_overflow_errors_not_silent() {
+        // Year 2300 overflows the i64 nanosecond range. Previously `unwrap_or_default()`
+        // silently returned 0 (epoch 1970-01-01), corrupting query results. The fix
+        // returns an error instead.
+        let v = NaiveDate::from_ymd_opt(2300, 1, 1)
+            .expect("valid date")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid time");
+
+        let result = naive_datetime_to_nanos(v);
+
+        match result {
+            Err(super::super::Error::FailedToConvertTimestampToNanos { v: msg }) => {
+                assert!(
+                    msg.contains("2300"),
+                    "error should mention the offending value, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected FailedToConvertTimestampToNanos, got {other:?}"),
+            Ok(nanos) => panic!(
+                "expected error for year-2300 timestamp, but got nanos={nanos} \
+                 (this indicates the bug has regressed — out-of-range timestamps \
+                 are silently converting to epoch 0 again)"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_datetime_to_nanos_in_range() {
+        let offset = FixedOffset::east_opt(3600).expect("valid offset");
+        let v = offset
+            .with_ymd_and_hms(2020, 1, 1, 12, 34, 56)
+            .single()
+            .expect("valid datetime");
+        let nanos = datetime_to_nanos(v).expect("in-range timestamp should convert");
+        assert_eq!(
+            nanos,
+            v.with_timezone(&chrono::Utc)
+                .timestamp_nanos_opt()
+                .expect("chrono nanos")
+        );
+    }
+
+    #[test]
+    fn test_datetime_to_nanos_overflow_errors_not_silent() {
+        // Year 2300 with a non-zero offset still overflows i64 nanoseconds.
+        let offset = FixedOffset::east_opt(3600).expect("valid offset");
+        let v = offset
+            .with_ymd_and_hms(2300, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let result = datetime_to_nanos(v);
+
+        match result {
+            Err(super::super::Error::FailedToConvertTimestampToNanos { v: msg }) => {
+                assert!(
+                    msg.contains("2300"),
+                    "error should mention the offending value, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected FailedToConvertTimestampToNanos, got {other:?}"),
+            Ok(nanos) => panic!(
+                "expected error for year-2300 DATETIMEOFFSET, but got nanos={nanos} \
+                 (this indicates the bug has regressed — out-of-range timestamps \
+                 are silently converting to epoch 0 again)"
+            ),
+        }
     }
 }

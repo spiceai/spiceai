@@ -1,0 +1,58 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "runtime-datafusion"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+async-stream.workspace = true
+async-trait.workspace = true
+dashmap = "6.1.0"
+datafusion.workspace = true
+datafusion-catalog.workspace = true
+datafusion-datasource.workspace = true
+datafusion-federation = { workspace = true }
+datafusion-table-providers.workspace = true
+futures.workspace = true
+globset.workspace = true
+itertools.workspace = true
+opentelemetry.workspace = true
+parking_lot.workspace = true
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-request-context = { path = "../runtime-request-context" }
+search = { path = "../search", default-features = false }
+serde_json.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-futures.workspace = true
+url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
+uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+criterion = { version = "0.7", features = ["html_reports"] }
+datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
+datafusion-pruning.workspace = true
+insta.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+
+[[bench]]
+harness = false
+name = "data_source_tree_display"
+
+[[bench]]
+harness = false
+name = "join_accumulator"

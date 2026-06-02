@@ -4,6 +4,7 @@ Spice is built upon a foundation of first principles.
 
 ## Summary
 
+- **Data correctness is non-negotiable**
 - Secure by default
 - Developer experience first
 - Bring data and ML to your application
@@ -12,6 +13,18 @@ Spice is built upon a foundation of first principles.
 - First class extensibility
 - Leverage model versioning
 - Align to industry standards
+
+### Data correctness is non-negotiable
+
+**As an AI-native database and search engine, data correctness is the foundational principle upon which all others depend. Data can NEVER be wrong.**
+
+Every query must return correct results. Incorrect data is unacceptable under any circumstances. This principle supersedes all other considerations including performance, developer experience, and feature velocity.
+
+- Never sacrifice data accuracy for speed or convenience—a slow correct answer is infinitely better than a fast wrong one.
+- Any data transformation, aggregation, or computation must preserve data integrity.
+- NULL handling, boundary conditions, type coercions, and overflow scenarios must all produce correct results.
+- When in doubt, fail safely—return an error rather than potentially incorrect data.
+- Never allow silent data corruption—always surface errors visibly.
 
 ### Secure by default
 

@@ -17,15 +17,14 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
-    acceleration, replication, validate_identifier,
+    CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, OnSchemaChange, ReadyState,
+    Result, TimeFormat, UnsupportedTypeAction, acceleration, replication, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
 use runtime_acceleration::snapshot::SnapshotBehavior;
-use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
     acceleration as spicepod_acceleration,
@@ -33,8 +32,9 @@ use spicepod::{
         dataset::{self as spicepod_dataset},
         embeddings::ColumnEmbeddingConfig,
     },
+    fts::FtsStore,
     metric::Metrics,
-    param::Params,
+    param::{Params, merge_params},
     semantic::Column,
     vector::VectorStore,
 };
@@ -53,14 +53,17 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
-    pub acceleration_snapshot: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
+    pub acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub on_schema_change: OnSchemaChange,
     pub ready_state: ReadyState,
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
+    pub full_text_search: Option<FtsStore>,
     pub check_availability: CheckAvailability,
 }
 
@@ -68,7 +71,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
             Some(Some(ready_state)) => {
                 tracing::warn!(
@@ -80,12 +83,21 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let acceleration_snapshot = dataset
+        let acceleration_snapshot_behavior = dataset
             .acceleration
             .as_ref()
             .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
                 a.snapshots
             });
+
+        let acceleration_snapshot_compaction = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotsCompaction::Disabled, |a| {
+                a.snapshots_compaction
+            });
+
+        let metadata = dataset.metadata();
 
         let acceleration = dataset
             .acceleration
@@ -100,8 +112,8 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
         if let Some(vector_engine) = &dataset.vectors {
             // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
-                tracing::debug!(
-                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                tracing::warn!(
+                    "Dataset {} configured with 'vector_engine: enabled' but acceleration is disabled. Vector indexing will not occur. Enable acceleration with `acceleration.enabled: true` to use vector search.",
                     dataset.name
                 );
             }
@@ -116,11 +128,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
-            metadata: dataset
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_string(v)))
-                .collect(),
+            metadata,
             columns: dataset.columns,
             has_metadata_table: dataset
                 .has_metadata_table
@@ -132,22 +140,25 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
-            acceleration_snapshot,
+            acceleration_snapshot_behavior,
+            acceleration_snapshot_compaction,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
                 .map(UnsupportedTypeAction::from),
+            on_schema_change: OnSchemaChange::from(dataset.on_schema_change),
             ready_state,
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
+            full_text_search: dataset.full_text_search,
             check_availability: CheckAvailability::from(dataset.check_availability),
         })
     }
 }
 
 impl DatasetBuilder {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -163,19 +174,22 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
-            acceleration_snapshot: spicepod_acceleration::SnapshotBehavior::Disabled,
+            acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
+            acceleration_snapshot_compaction: spicepod_acceleration::SnapshotsCompaction::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
+            on_schema_change: OnSchemaChange::default(),
             ready_state: ReadyState::default(),
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
+            full_text_search: None,
             check_availability: CheckAvailability::default(),
         })
     }
 
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -238,12 +252,18 @@ impl DatasetBuilder {
         })?;
 
         if let Some(acceleration) = self.acceleration.as_mut() {
-            acceleration.snapshots = SnapshotBehavior::from(
+            acceleration.snapshot_behavior = SnapshotBehavior::from(
                 app.snapshots.clone(),
-                self.acceleration_snapshot,
+                self.acceleration_snapshot_behavior,
                 runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+                self.acceleration_snapshot_compaction,
             );
         }
+
+        self.vectors = enable_vector_store_from_column_overrides(self.vectors, &self.columns);
+        self.full_text_search =
+            fts_store_from_column_overrides(self.full_text_search, &self.columns, &self.name)?;
 
         let dataset = Dataset {
             from: self.from,
@@ -262,10 +282,12 @@ impl DatasetBuilder {
             embeddings: self.embeddings,
             app,
             unsupported_type_action: self.unsupported_type_action,
+            on_schema_change: self.on_schema_change,
             ready_state: self.ready_state,
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
+            full_text_search: self.full_text_search,
             check_availability: self.check_availability,
         };
 
@@ -273,9 +295,96 @@ impl DatasetBuilder {
     }
 }
 
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        _ => value.to_string(),
+fn enable_vector_store_from_column_overrides(
+    vector_store: Option<VectorStore>,
+    columns: &[Column],
+) -> Option<VectorStore> {
+    if vector_store.is_some() {
+        return vector_store;
     }
+
+    let has_column_vector_engine = columns
+        .iter()
+        .flat_map(|column| &column.embeddings)
+        .any(|embedding| embedding.engine.is_some());
+
+    has_column_vector_engine.then(|| VectorStore {
+        enabled: true,
+        engine: None,
+        partition_by: Vec::new(),
+        params: None,
+    })
+}
+
+fn fts_store_from_column_overrides(
+    mut fts_store: Option<FtsStore>,
+    columns: &[Column],
+    dataset_name: &TableReference,
+) -> Result<Option<FtsStore>> {
+    let mut column_engine: Option<(String, Option<Params>)> = None;
+
+    for column in columns {
+        let Some(fts) = column.full_text_search.as_ref().filter(|fts| fts.enabled) else {
+            continue;
+        };
+        let Some(engine) = fts.engine.as_ref() else {
+            continue;
+        };
+
+        if let Some((first_engine, first_params)) = &column_engine {
+            ensure!(
+                first_engine == engine,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.engine".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text columns that reference different text search engines ('{first_engine}' and '{engine}'). Configure a single dataset-level `full_text_search.engine` or use matching column engines."
+                    )
+                }
+            );
+            ensure!(
+                first_params == &fts.params,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.params".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text columns that use the same text search engine '{engine}' with different parameters. Configure a single dataset-level `full_text_search.params` or use matching column parameters."
+                    )
+                }
+            );
+        } else {
+            column_engine = Some((engine.clone(), fts.params.clone()));
+        }
+    }
+
+    let Some((column_engine, column_params)) = column_engine else {
+        return Ok(fts_store);
+    };
+
+    if let Some(store) = fts_store.as_mut() {
+        if let Some(dataset_engine) = store.engine.as_ref() {
+            ensure!(
+                dataset_engine == &column_engine,
+                InvalidConfigurationSnafu {
+                    config_key: "columns[].full_text_search.engine".to_string(),
+                    message: format!(
+                        "Dataset '{dataset_name}' has full-text column engine '{column_engine}' that does not match dataset full_text_search.engine '{dataset_engine}'."
+                    )
+                }
+            );
+        }
+
+        let mut params = store.params.clone().unwrap_or_default();
+        merge_params(&mut params, column_params.as_ref());
+        store.params = if params.data.is_empty() {
+            None
+        } else {
+            Some(params)
+        };
+        return Ok(fts_store);
+    }
+
+    Ok(Some(FtsStore {
+        enabled: true,
+        engine: Some(column_engine),
+        params: column_params,
+    }))
 }

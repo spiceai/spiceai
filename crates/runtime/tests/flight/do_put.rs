@@ -19,7 +19,7 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use crate::{
     flight::{
         RepeatingStream, create_flight_client, large_test_record_batch, start_spice_test_app,
-        test_record_batch, write_record_batches,
+        start_spice_test_app_with_metrics_port, test_record_batch, write_record_batches,
     },
     init_tracing,
     utils::test_request_context,
@@ -246,7 +246,61 @@ async fn test_flight_do_put_rate_limit() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
+async fn test_metrics_endpoint_rate_limit_e2e() -> Result<(), anyhow::Error> {
+    // End-to-end coverage that the wiring in `Runtime::start_servers` actually
+    // applies `RateLimits::metrics_endpoint_limit` to the live HTTP listener.
+    // Mirrors the structure of `test_flight_do_put_rate_limit` for the metrics
+    // endpoint instead of Flight DoPut.
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let metrics_quota = Quota::with_period(Duration::from_secs(60))
+                .expect("to create quota")
+                .allow_burst(NonZeroU32::new(1).expect("should convert 1 to NonZeroU32"));
+
+            let (_channel, _df, metrics_port) = start_spice_test_app_with_metrics_port(
+                None,
+                Some(RateLimits::new().with_metrics_endpoint_limit(metrics_quota)),
+                None,
+            )
+            .await?;
+
+            let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
+            let health_url = format!("http://127.0.0.1:{metrics_port}/health");
+            let http_client = reqwest::Client::new();
+
+            // First /metrics request consumes the only token in the bucket.
+            let first = http_client.get(&metrics_url).send().await?;
+            assert_eq!(first.status().as_u16(), 200, "first /metrics should be 200");
+
+            // Second /metrics request must hit the limiter and include Retry-After.
+            let second = http_client.get(&metrics_url).send().await?;
+            assert_eq!(
+                second.status().as_u16(),
+                429,
+                "second /metrics should be 429 (quota exhausted)"
+            );
+            assert!(
+                second.headers().contains_key(reqwest::header::RETRY_AFTER),
+                "429 response should include Retry-After header"
+            );
+
+            // /health must still bypass the limiter — readiness probes cannot be throttled.
+            let health = http_client.get(&health_url).send().await?;
+            assert_eq!(
+                health.status().as_u16(),
+                200,
+                "/health must bypass the metrics rate limiter"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_flight_do_put_large_batch_slicing() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     test_request_context()
@@ -258,24 +312,22 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
 
             let mut client = create_flight_client(channel, Some("valid"))?;
 
-            assert!(
-                // Simulate a normal batch, followed by a batch that exceeds the allowed number of rows, and then another normal batch.
-                write_record_batches(
-                    &mut client,
-                    vec![
-                        test_record_batch()?,
-                        large_test_record_batch()?,
-                        test_record_batch()?
-                    ]
-                    .into_iter()
-                )
-                .await
-                .is_err(),
-                "Expected an error but got a successful result"
-            );
+            // Simulate a normal batch, followed by a batch that exceeds the per-batch
+            // row limit (35,000 rows), and then another normal batch. The large batch
+            // should be automatically sliced rather than rejected.
+            write_record_batches(
+                &mut client,
+                vec![
+                    test_record_batch()?,
+                    large_test_record_batch()?,
+                    test_record_batch()?,
+                ]
+                .into_iter(),
+            )
+            .await?;
 
             let query = df
-                .query_builder("SELECT * from my_table")
+                .query_builder("SELECT count(*) AS row_count from my_table")
                 .build()
                 .run()
                 .await?;
@@ -283,7 +335,8 @@ async fn test_flight_do_put_max_rows_allowed() -> Result<(), anyhow::Error> {
             let results: Vec<RecordBatch> = query.data.try_collect::<Vec<RecordBatch>>().await?;
             let results_str =
                 arrow::util::pretty::pretty_format_batches(&results).expect("pretty batches");
-            insta::assert_snapshot!("max_rows_allowed_table_content", results_str);
+            // 3 rows (test_record_batch) + 35,000 rows (large_test_record_batch) + 3 rows (test_record_batch) = 35,006
+            insta::assert_snapshot!("large_batch_slicing_row_count", results_str);
 
             Ok(())
         })

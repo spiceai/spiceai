@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::sql::TableReference;
+use tokio::sync::RwLock;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::accelerated_table::refresh::Refresher;
@@ -28,6 +29,10 @@ pub struct SynchronizedTable {
     child_dataset_name: TableReference,
     child_accelerator: Arc<dyn TableProvider>,
     refresher: Arc<Refresher>,
+    /// Reference to parent's synchronized children list (for caching mode registration)
+    parent_synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
+    /// Reference to parent's accelerator (for initializing child from existing data)
+    parent_accelerator: Arc<dyn TableProvider>,
 }
 
 impl std::fmt::Debug for SynchronizedTable {
@@ -51,6 +56,8 @@ impl SynchronizedTable {
             child_dataset_name,
             child_accelerator,
             refresher: accelerated_table.refresher(),
+            parent_synchronized_children: accelerated_table.synchronized_children(),
+            parent_accelerator: accelerated_table.get_accelerator(),
         }
     }
 
@@ -66,7 +73,20 @@ impl SynchronizedTable {
         Arc::clone(&self.child_accelerator)
     }
 
+    pub fn parent_accelerator(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.parent_accelerator)
+    }
+
     pub fn refresher(&self) -> Arc<Refresher> {
         Arc::clone(&self.refresher)
+    }
+
+    /// Register the child accelerator with the parent for caching mode synchronization.
+    /// This allows the parent to propagate cached data to the child.
+    pub async fn register_child_with_parent(&self) {
+        self.parent_synchronized_children
+            .write()
+            .await
+            .push(Arc::clone(&self.child_accelerator));
     }
 }

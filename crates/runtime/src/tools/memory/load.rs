@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{AsArray, RecordBatch};
+use arrow::array::AsArray;
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use datafusion::{
+    prelude::{col, lit},
+    scalar::ScalarValue,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::ResultExt;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
@@ -31,10 +34,45 @@ use crate::{
 
 use super::memory_table_name;
 
+const DEFAULT_MEMORY_LOAD_LIMIT: usize = 100;
+const MAX_MEMORY_LOAD_LIMIT: usize = 500;
+const MAX_MEMORY_LOAD_OFFSET: usize = 10_000;
+
+const fn default_memory_load_limit() -> usize {
+    DEFAULT_MEMORY_LOAD_LIMIT
+}
+
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct LoadMemoryParams {
-    /// Retrieve memories created in the 'last' interval. ISO 8601 Format, e.g: "1h", "2m30s".
+    /// Retrieve memories created in the 'last' interval as a human-readable duration string, e.g. "1h", "2m30s".
     pub last: String,
+
+    /// Maximum number of memories to return.
+    #[serde(default = "default_memory_load_limit")]
+    pub limit: usize,
+
+    /// Number of memories to skip for pagination.
+    #[serde(default)]
+    pub offset: usize,
+}
+
+fn validate_load_memory_params(
+    params: &LoadMemoryParams,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if params.limit == 0 || params.limit > MAX_MEMORY_LOAD_LIMIT {
+        return Err(format!(
+            "Invalid limit. Provide a value between 1 and {MAX_MEMORY_LOAD_LIMIT}"
+        )
+        .into());
+    }
+
+    if params.offset > MAX_MEMORY_LOAD_OFFSET {
+        return Err(
+            format!("Invalid offset. Maximum allowed offset is {MAX_MEMORY_LOAD_OFFSET}").into(),
+        );
+    }
+
+    Ok(())
 }
 
 pub struct LoadMemoryTool {
@@ -50,7 +88,7 @@ impl LoadMemoryTool {
             rt,
             name: name.unwrap_or("load_memory").to_string(),
             description: description
-                .unwrap_or("Load memories previously saved by the language model.")
+                .unwrap_or("Retrieve thoughts previously persisted via `store_memory`. Call this at the start of a conversation, or whenever the user references prior context (e.g. 'as we discussed', 'like last time'), to recover relevant background. `last` is a duration string (e.g. '1h', '24h', '7d') bounding how far back to look. Use `limit` (1-500, default 100) and `offset` for pagination. Returns the matching memory entries with their timestamps.")
                 .to_string(),
         }
     }
@@ -82,22 +120,41 @@ impl SpiceModelTool for LoadMemoryTool {
         let table_name = memory_table_name(&self.rt).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let params: LoadMemoryParams = serde_json::from_str(arg).boxed()?;
+            validate_load_memory_params(&params)?;
             let last_interval = fundu::parse_duration(params.last.as_str()).boxed()?;
+            let last_interval_secs = i64::try_from(last_interval.as_secs()).boxed()?;
+            let created_after = chrono::Utc::now()
+                .timestamp()
+                .checked_sub(last_interval_secs)
+                .ok_or_else(|| io::Error::other("Failed to compute memory cutoff timestamp"))?;
 
-            let batches = self.rt
+            let Some(provider) = self.rt.datafusion().get_table(&table_name).await else {
+                return Err(
+                    io::Error::other(format!("Memory table not found: {table_name}")).into(),
+                );
+            };
+
+            let batches = self
+                .rt
                 .datafusion()
-                .query_builder(
-                    &format!(
-                        "SELECT value FROM {table_name} WHERE created_at > (NOW() - INTERVAL '{}' SECOND);",
-                        last_interval.as_secs()
-                    ),
-                )
-                .build()
-                .run()
-                .await
+                .ctx
+                .read_table(provider)
                 .boxed()?
-                .data
-                .try_collect::<Vec<RecordBatch>>()
+                .filter(
+                    col("created_at")
+                        .gt(lit(ScalarValue::TimestampSecond(Some(created_after), None))),
+                )
+                .boxed()?
+                .sort(vec![
+                    col("created_at").sort(false, false),
+                    col("id").sort(false, false),
+                ])
+                .boxed()?
+                .limit(params.offset, Some(params.limit))
+                .boxed()?
+                .select(vec![col("value")])
+                .boxed()?
+                .collect()
                 .await
                 .boxed()?;
 
@@ -133,5 +190,57 @@ impl SpiceModelTool for LoadMemoryTool {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_MEMORY_LOAD_LIMIT, LoadMemoryParams, MAX_MEMORY_LOAD_LIMIT, MAX_MEMORY_LOAD_OFFSET,
+        default_memory_load_limit, validate_load_memory_params,
+    };
+
+    #[test]
+    fn test_default_memory_load_limit_matches_constant() {
+        assert_eq!(default_memory_load_limit(), DEFAULT_MEMORY_LOAD_LIMIT);
+    }
+
+    #[test]
+    fn test_load_memory_rejects_zero_limit() {
+        let params = LoadMemoryParams {
+            last: "1h".to_string(),
+            limit: 0,
+            offset: 0,
+        };
+
+        let err = validate_load_memory_params(&params).expect_err("must reject zero limit");
+        assert!(err.to_string().contains(&MAX_MEMORY_LOAD_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn test_load_memory_rejects_excessive_limit() {
+        let params = LoadMemoryParams {
+            last: "1h".to_string(),
+            limit: MAX_MEMORY_LOAD_LIMIT + 1,
+            offset: 0,
+        };
+
+        let err = validate_load_memory_params(&params).expect_err("must reject large limit");
+        assert!(err.to_string().contains(&MAX_MEMORY_LOAD_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn test_load_memory_rejects_excessive_offset() {
+        let params = LoadMemoryParams {
+            last: "1h".to_string(),
+            limit: DEFAULT_MEMORY_LOAD_LIMIT,
+            offset: MAX_MEMORY_LOAD_OFFSET + 1,
+        };
+
+        let err = validate_load_memory_params(&params).expect_err("must reject large offset");
+        assert!(
+            err.to_string()
+                .contains(&MAX_MEMORY_LOAD_OFFSET.to_string())
+        );
     }
 }

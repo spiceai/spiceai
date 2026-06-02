@@ -20,7 +20,7 @@ use crate::configure_test_datafusion;
 use crate::{
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::test_request_context,
+    utils::{register_test_connectors, test_request_context},
 };
 use std::{sync::Arc, time::Duration};
 
@@ -39,6 +39,7 @@ use runtime::{
     accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
+use tokio::runtime::Handle;
 use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -66,7 +67,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
     tracing::debug!("INSERT INTO lineitem...");
     let insert_stmt =
-        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
+        InsertBuilder::new(&TableReference::from("lineitem"), &tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 
@@ -118,8 +119,10 @@ async fn create_refresh_task(
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
-            None,
+            Handle::current(),
+            Arc::new(tokio::sync::Mutex::new(())),
         )
+        .with_cpu_runtime(rt.datafusion().refresh_runtime().cloned())
         .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
@@ -141,8 +144,9 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn mysql_refresh_retries() -> Result<(), String> {
+    register_test_connectors().await;
+
     test_request_context()
         .scope(async {
             let running_container = prepare_test_environment().await?;
@@ -207,23 +211,21 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 // restore connectivity after few seconds
                 time::sleep(Duration::from_secs(2)).await;
                 tracing::debug!("Restoring connectivity...");
-                assert!(
-                    running_container_reference_copy
-                        .start()
-                        .await
-                        .map_err(|e| {
-                            tracing::error!("running_container.start: {e}");
-                            e.to_string()
-                        })
-                        .is_ok()
-                );
+                running_container_reference_copy
+                    .start()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("running_container.start: {e}");
+                        e.to_string()
+                    })
+                    .expect("should start container");
             });
 
             // set custom refresh sql to check number of items loaded later
             rt.datafusion()
                 .update_refresh_sql(
                     TableReference::parse_str("lineitem_retries"),
-                    Some("SELECT * from lineitem_retries limit 10".to_string()),
+                    "SELECT * from lineitem_retries limit 10".to_string(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;

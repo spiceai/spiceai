@@ -15,57 +15,33 @@ limitations under the License.
 */
 
 use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
+
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
-use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
-/// Represents the status of a component (e.g. dataset, model, etc).
-#[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub enum ComponentStatus {
-    /// The component is initializing and not yet ready
-    Initializing = 0,
+// Re-export ComponentStatus from the shared API types crate
+pub use runtime_api_types::v1::ComponentStatus;
 
-    /// The component is ready to accept connections
-    Ready = 1,
-
-    /// The component is disabled and not running
-    Disabled = 2,
-
-    /// An error occurred in the component
-    Error = 3,
-
-    /// The component is in the process of refreshing its state
-    Refreshing = 4,
-
-    /// The component is in the process of shutting down
-    ShuttingDown = 5,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeReadyState {
+    #[default]
+    OnLoad,
+    OnRegistration,
 }
 
-impl Display for ComponentStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComponentStatus::Initializing => write!(f, "Initializing"),
-            ComponentStatus::Ready => write!(f, "Ready"),
-            ComponentStatus::Disabled => write!(f, "Disabled"),
-            ComponentStatus::Error => write!(f, "Error"),
-            ComponentStatus::Refreshing => write!(f, "Refreshing"),
-            ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components.
     statuses: Arc<RwLock<HashMap<String, ComponentStatus>>>,
@@ -73,6 +49,26 @@ pub struct RuntimeStatus {
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
+    /// Controls how runtime readiness is computed.
+    ready_state: Arc<RwLock<RuntimeReadyState>>,
+    /// Per-component notifiers for status change subscriptions.
+    notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
+    /// Cancellation token that is cancelled when the runtime is shutting down.
+    /// Used to make background retry loops promptly exit on shutdown.
+    shutdown_token: CancellationToken,
+}
+
+impl Default for RuntimeStatus {
+    fn default() -> Self {
+        Self {
+            statuses: Arc::new(RwLock::new(HashMap::new())),
+            ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
+            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
+            notifiers: Arc::new(RwLock::new(HashMap::new())),
+            shutdown_token: CancellationToken::new(),
+        }
+    }
 }
 
 impl RuntimeStatus {
@@ -82,83 +78,136 @@ impl RuntimeStatus {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
+            ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
+            notifiers: Arc::new(RwLock::new(HashMap::new())),
+            shutdown_token: CancellationToken::new(),
         })
+    }
+
+    pub fn set_ready_state(&self, ready_state: RuntimeReadyState) {
+        let mut configured_ready_state = self
+            .ready_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *configured_ready_state = ready_state;
     }
 
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.is_shutdown.load(Ordering::Relaxed)
+        self.is_shutdown.load(Ordering::SeqCst)
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
-    fn update_component_status(&self, component_name: String, status: ComponentStatus) {
+    pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
         let mut statuses = match self.statuses.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        statuses.insert(component_name.clone(), status);
+        statuses.insert(component_name.to_string(), status.clone());
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            ever_ready.insert(component_name);
+            ever_ready.insert(component_name.to_string());
+        }
+
+        // Notify subscribers of the status change
+        let notifiers = self
+            .notifiers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sender) = notifiers.get(component_name) {
+            let _ = sender.send(status); // Ignore error if no receivers
         }
     }
 
     pub fn update_catalog(&self, catalog_name: impl Into<String>, status: ComponentStatus) {
         let catalog_name = catalog_name.into();
-        self.update_component_status(format!("catalog:{catalog_name}"), status);
-        metrics::catalogs::STATUS.record(status as u64, &[KeyValue::new("catalog", catalog_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("catalog:{catalog_name}"), status);
+        metrics::catalogs::STATUS.record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
         let ds_name = dataset.to_string();
-        self.update_component_status(format!("dataset:{ds_name}"), status);
-        metrics::datasets::STATUS.record(status as u64, &[KeyValue::new("dataset", ds_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("dataset:{ds_name}"), status);
+        metrics::datasets::STATUS.record(metric_value, &[KeyValue::new("dataset", ds_name)]);
     }
 
     pub fn update_model(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
-        self.update_component_status(format!("model:{model_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("model:{model_name}"), status);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_tool(&self, tool_name: &str, status: ComponentStatus) {
         let tool_name = tool_name.to_string();
-        self.update_component_status(format!("tool:{tool_name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool", tool_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("tool:{tool_name}"), status);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool", tool_name)]);
     }
 
     pub fn update_tool_catalog(&self, catalog_name: &str, status: ComponentStatus) {
         let name = catalog_name.to_string();
-        self.update_component_status(format!("tool_catalog:{name}"), status);
-        metrics::tools::STATUS.record(status as u64, &[KeyValue::new("tool_catalog", name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("tool_catalog:{name}"), status);
+        metrics::tools::STATUS.record(metric_value, &[KeyValue::new("tool_catalog", name)]);
     }
 
     pub fn update_llm(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
-        self.update_component_status(format!("llm:{model_name}"), status);
-        metrics::llms::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("llm:{model_name}"), status);
+        metrics::llms::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
 
     pub fn update_embedding(&self, model_name: &str, status: ComponentStatus) {
         let model_name = model_name.to_string();
-        self.update_component_status(format!("embedding:{model_name}"), status);
-        metrics::embeddings::STATUS.record(status as u64, &[KeyValue::new("model", model_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("embedding:{model_name}"), status);
+        metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+    }
+
+    pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
+        let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("reranker:{model_name}"), status);
+        metrics::rerankers::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
-        self.update_component_status(format!("view:{view_name}"), status);
-        metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("view:{view_name}"), status);
+        metrics::views::STATUS.record(metric_value, &[KeyValue::new("view", view_name)]);
     }
 
     /// Update the status of a worker
     pub fn update_worker(&self, name: &str, status: ComponentStatus) {
         let worker_name = name.to_string();
-        self.update_component_status(format!("worker:{worker_name}"), status);
-        metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("worker:{worker_name}"), status);
+        metrics::models::STATUS.record(metric_value, &[KeyValue::new("worker", worker_name)]);
+    }
+
+    /// Update the status of a cluster node
+    pub fn update_cluster(&self, node_name: &str, status: ComponentStatus) {
+        let cluster_node_name = node_name.to_string();
+
+        // Record cluster node status metric
+        // Map ComponentStatus to cluster status values: 0=Unknown, 1=Healthy, 2=Unhealthy, 3=Draining
+        let status_value = match &status {
+            ComponentStatus::Initializing | ComponentStatus::NotLoaded => 0,
+            ComponentStatus::Ready | ComponentStatus::Refreshing => 1, // Refreshing is still healthy
+            ComponentStatus::Disabled | ComponentStatus::Error(_) => 2,
+            ComponentStatus::ShuttingDown => 3, // Draining
+        };
+
+        self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
+        metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
     }
 
     /// Get the status of a worker
@@ -169,7 +218,7 @@ impl RuntimeStatus {
             Err(poisoned) => poisoned.into_inner(),
         };
         let full_name = format!("worker:{name}");
-        components.get(&full_name).copied()
+        components.get(&full_name).cloned()
     }
 
     /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
@@ -193,11 +242,12 @@ impl RuntimeStatus {
             return false;
         }
 
+        let ready_state = *self
+            .ready_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let statuses = match self.statuses.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let ever_ready = match self.ever_ready_components.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -206,10 +256,25 @@ impl RuntimeStatus {
             return false; // No components registered yet
         }
 
-        // Check if all registered components have been ready at least once
-        statuses
-            .keys()
-            .all(|component| ever_ready.contains(component))
+        match ready_state {
+            RuntimeReadyState::OnLoad => {
+                let ever_ready = match self.ever_ready_components.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                // OnLoad readiness: a component counts as ready if it has been ready at least once.
+                // All registered components must appear in the ever-ready set before we report ready.
+                statuses
+                    .keys()
+                    .all(|component| ever_ready.contains(component))
+            }
+            // OnRegistration readiness: treat Error/Disabled/Initializing as ready-enough.
+            // Only components in ShuttingDown state block overall readiness.
+            RuntimeReadyState::OnRegistration => statuses
+                .values()
+                .all(|status| !matches!(status, ComponentStatus::ShuttingDown)),
+        }
     }
 
     /// Returns the status of all registered components.
@@ -230,10 +295,22 @@ impl RuntimeStatus {
         self.get_statuses_of_prefix("model:")
     }
 
+    /// Returns the status of all registered catalogs.
+    #[must_use]
+    pub fn get_catalog_statuses(&self) -> HashMap<String, ComponentStatus> {
+        self.get_statuses_of_prefix("catalog:")
+    }
+
     /// Returns the status of all registered datasets.
     #[must_use]
     pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
         self.get_statuses_of_prefix("dataset:")
+    }
+
+    /// Returns the status of all registered views.
+    #[must_use]
+    pub fn get_view_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        self.get_statuses_of_prefix("view:")
     }
 
     /// Returns the status of all registered workers.
@@ -254,12 +331,424 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), *v)))
+            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), v.clone())))
             .collect()
     }
 
     /// Sets the runtime to the shutting down state.
     pub fn mark_shutdown(&self) {
-        self.is_shutdown.store(true, Ordering::Relaxed);
+        self.is_shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_token.cancel();
+    }
+
+    /// Returns a child of the shutdown cancellation token.
+    ///
+    /// The returned token is cancelled when the runtime shuts down (via
+    /// `mark_shutdown`), but calling `cancel()` on it will **not** cancel
+    /// the runtime's own token. This preserves the invariant that only
+    /// `mark_shutdown` triggers a runtime-wide shutdown.
+    ///
+    /// Use `token.cancelled()` in `tokio::select!` to make async operations
+    /// (e.g. backoff sleeps) immediately interruptible on shutdown.
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown_token.child_token()
+    }
+
+    /// Returns the status of a specific component by its full name.
+    #[must_use]
+    pub fn get_component_status(&self, component_name: &str) -> Option<ComponentStatus> {
+        let statuses = self
+            .statuses
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        statuses.get(component_name).cloned()
+    }
+
+    /// Gets or creates a notifier for a component, returning a receiver to watch for status changes.
+    fn get_or_create_notifier(&self, component_name: &str) -> watch::Receiver<ComponentStatus> {
+        let mut notifiers = self
+            .notifiers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        match notifiers.entry(component_name.to_string()) {
+            Entry::Occupied(e) => e.get().subscribe(),
+            Entry::Vacant(e) => {
+                let current = self
+                    .get_component_status(component_name)
+                    .unwrap_or(ComponentStatus::Initializing);
+                let (tx, rx) = watch::channel(current);
+                e.insert(tx);
+                rx
+            }
+        }
+    }
+
+    /// Internal helper to wait for a component to become ready.
+    async fn wait_for_component_ready(&self, component_name: &str) {
+        let mut receiver = self.get_or_create_notifier(component_name);
+
+        loop {
+            // Check current value (handles already-ready case)
+            if *receiver.borrow() == ComponentStatus::Ready {
+                return;
+            }
+
+            // Wait for next change; return if channel closed (runtime shutting down)
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits for a component to leave the `Initializing` state — used by
+    /// callers that only need the component registered, not fully ready.
+    async fn wait_for_component_registered(&self, component_name: &str) {
+        let mut receiver = self.get_or_create_notifier(component_name);
+
+        loop {
+            if !matches!(*receiver.borrow(), ComponentStatus::Initializing) {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits for a dataset to become ready.
+    pub async fn wait_for_dataset_ready(&self, dataset: &TableReference) {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a dataset to be registered (any status other than
+    /// `Initializing`). Useful when the caller only needs the table
+    /// provider to exist, not for the dataset to be fully loaded — e.g.
+    /// scheduler-side partition discovery, where waiting for `Ready`
+    /// would deadlock because `Ready` is gated on executor data loads.
+    pub async fn wait_for_dataset_registered(&self, dataset: &TableReference) {
+        let component_name = format!("dataset:{dataset}");
+        self.wait_for_component_registered(&component_name).await;
+    }
+
+    /// Waits for a model to become ready.
+    pub async fn wait_for_model_ready(&self, model_name: &str) {
+        let component_name = format!("model:{model_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a catalog to become ready.
+    pub async fn wait_for_catalog_ready(&self, catalog_name: &str) {
+        let component_name = format!("catalog:{catalog_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a tool to become ready.
+    pub async fn wait_for_tool_ready(&self, tool_name: &str) {
+        let component_name = format!("tool:{tool_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a tool catalog to become ready.
+    pub async fn wait_for_tool_catalog_ready(&self, catalog_name: &str) {
+        let component_name = format!("tool_catalog:{catalog_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for an LLM to become ready.
+    pub async fn wait_for_llm_ready(&self, model_name: &str) {
+        let component_name = format!("llm:{model_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for an embedding model to become ready.
+    pub async fn wait_for_embedding_ready(&self, model_name: &str) {
+        let component_name = format!("embedding:{model_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a view to become ready.
+    pub async fn wait_for_view_ready(&self, view_name: &TableReference) {
+        let component_name = format!("view:{view_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a worker to become ready.
+    pub async fn wait_for_worker_ready(&self, worker_name: &str) {
+        let component_name = format!("worker:{worker_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for a cluster node to become ready.
+    pub async fn wait_for_cluster_ready(&self, node_name: &str) {
+        let component_name = format!("cluster:{node_name}");
+        self.wait_for_component_ready(&component_name).await;
+    }
+
+    /// Waits for the entire runtime to be ready (all registered components have been ready at least once).
+    ///
+    /// This polls the `is_ready()` status at a regular interval until the runtime is ready.
+    /// If the runtime is already ready, this returns immediately.
+    pub async fn wait_for_ready(&self) {
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        loop {
+            if self.is_ready() {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_get_component_status() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Initially no status
+        assert!(
+            status
+                .get_component_status("dataset:test_dataset")
+                .is_none()
+        );
+
+        // Set status
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert_eq!(
+            status.get_component_status("dataset:test_dataset"),
+            Some(ComponentStatus::Initializing)
+        );
+
+        // Update status
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(
+            status.get_component_status("dataset:test_dataset"),
+            Some(ComponentStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_requires_registered_component() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        // Empty statuses are not ready.
+        assert!(!status.is_ready());
+
+        // Initializing still counts as registered.
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(status.is_ready());
+
+        // Refreshing stays ready.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+
+        // Error still counts as registered for on_registration mode.
+        status.update_dataset(&dataset, ComponentStatus::error());
+        assert!(status.is_ready());
+
+        // Explicit shutting down state for a component is not ready.
+        status.update_dataset(&dataset, ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+
+        // Runtime-level shutdown always forces not ready.
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+        status.mark_shutdown();
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_allows_mixed_component_states() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("test_model", ComponentStatus::Initializing);
+        status.update_tool("test_tool", ComponentStatus::Disabled);
+
+        assert!(status.is_ready());
+
+        status.update_tool("test_tool", ComponentStatus::ShuttingDown);
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn test_is_ready_on_registration_all_component_types() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("dataset_a");
+        let view = TableReference::bare("view_a");
+
+        status.set_ready_state(RuntimeReadyState::OnRegistration);
+
+        status.update_catalog("catalog_a", ComponentStatus::Initializing);
+        status.update_dataset(&dataset, ComponentStatus::error());
+        status.update_model("model_a", ComponentStatus::Disabled);
+        status.update_tool("tool_a", ComponentStatus::Refreshing);
+        status.update_tool_catalog("tool_catalog_a", ComponentStatus::Ready);
+        status.update_llm("llm_a", ComponentStatus::error());
+        status.update_embedding("embedding_a", ComponentStatus::Initializing);
+        status.update_view(&view, ComponentStatus::Ready);
+        status.update_worker("worker_a", ComponentStatus::Disabled);
+        status.update_cluster("cluster_node_a", ComponentStatus::error());
+
+        assert!(
+            status.is_ready(),
+            "on_registration should be ready when all components are registered and none are ShuttingDown"
+        );
+
+        status.update_embedding("embedding_a", ComponentStatus::ShuttingDown);
+        assert!(
+            !status.is_ready(),
+            "any component in ShuttingDown should make runtime not ready"
+        );
+    }
+
+    #[test]
+    fn test_is_ready_on_load_still_requires_ever_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.set_ready_state(RuntimeReadyState::OnLoad);
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+        assert!(!status.is_ready());
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert!(status.is_ready());
+
+        // Once ever-ready is achieved, transient non-ready states still satisfy OnLoad mode.
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+        assert!(status.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_already_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Set dataset to ready before waiting
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        // Should return immediately
+        status.wait_for_dataset_ready(&dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_becomes_ready() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Set dataset to initializing
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        // Spawn a task to set the dataset ready after a short delay
+        let status_clone = Arc::clone(&status);
+        let dataset_clone = dataset.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
+        });
+
+        // Wait for ready
+        status.wait_for_dataset_ready(&dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_not_yet_registered() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Dataset not registered - should start with Initializing and wait
+        // Spawn a task to register and set ready after a delay
+        let status_clone = Arc::clone(&status);
+        let dataset_clone = dataset.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
+        });
+
+        status.wait_for_dataset_ready(&dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_multiple_subscribers() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        // Create multiple waiters
+        let status1 = Arc::clone(&status);
+        let status2 = Arc::clone(&status);
+        let dataset1 = dataset.clone();
+        let dataset2 = dataset.clone();
+
+        let handle1 = tokio::spawn(async move { status1.wait_for_dataset_ready(&dataset1).await });
+
+        let handle2 = tokio::spawn(async move { status2.wait_for_dataset_ready(&dataset2).await });
+
+        // Give tasks time to start waiting
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Set ready - both should wake up
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+
+        handle1.await.expect("task 1 should complete");
+        handle2.await.expect("task 2 should complete");
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_dataset_ready_waits_indefinitely() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Set dataset to initializing
+        status.update_dataset(&dataset, ComponentStatus::Initializing);
+
+        // Spawn a task to set the dataset ready after a short delay
+        let status_clone = Arc::clone(&status);
+        let dataset_clone = dataset.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
+        });
+
+        // Wait indefinitely
+        status.wait_for_dataset_ready(&dataset).await;
+    }
+
+    #[tokio::test]
+    async fn test_notifier_updates_on_status_change() {
+        let status = RuntimeStatus::new();
+        let dataset = TableReference::bare("test_dataset");
+
+        // Get a receiver before any status is set
+        let mut receiver = status.get_or_create_notifier("dataset:test_dataset");
+        assert_eq!(*receiver.borrow(), ComponentStatus::Initializing);
+
+        // Update status
+        status.update_dataset(&dataset, ComponentStatus::Refreshing);
+
+        // Wait for change
+        receiver.changed().await.expect("should receive change");
+        assert_eq!(*receiver.borrow(), ComponentStatus::Refreshing);
+
+        // Update to ready
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        receiver.changed().await.expect("should receive change");
+        assert_eq!(*receiver.borrow(), ComponentStatus::Ready);
     }
 }

@@ -1,0 +1,1599 @@
+/*
+Copyright 2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+use super::{Error, JsonNesting, Result};
+use crate::arrow::struct_builder::StructBuilder;
+use crate::cdc::{ChangeBatch, ChangeBatchError, changes_schema};
+use crate::dynamodb::arrow::append_item_to_struct_builder;
+use crate::dynamodb::json_nest::json_nest_row_except_fields;
+use crate::dynamodb::unnest::unnest_dynamodb_row;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::error::ArrowError;
+use arrow_array::builder::{ArrayBuilder, ListBuilder, StringBuilder, make_builder};
+use arrow_array::{ListArray, RecordBatch, StringArray, StructArray};
+use aws_sdk_dynamodb::types::AttributeValue as DynamoDbAttributeValue;
+use aws_sdk_dynamodbstreams::types::AttributeValue as StreamsAttributeValue;
+use aws_sdk_dynamodbstreams::types::OperationType;
+use datafusion::error::DataFusionError;
+use dynamodb_streams::DynamoDBStreamBatch;
+use dynamodb_streams::checkpoint::Checkpoint;
+use snafu::prelude::*;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::SystemTime;
+use util::format_datafusion_error;
+
+#[derive(Debug, Snafu)]
+pub enum StreamError {
+    #[snafu(display("Failed to receive DynamoDB Stream record: {source}"))]
+    FailedToReceiveMessage { source: dynamodb_streams::Error },
+
+    #[snafu(display("Unable to downcast ArrayBuilder"))]
+    DowncastBuilder,
+
+    #[snafu(display("Failed to unnest DynamoDB Stream record: {source}"))]
+    FailedToUnnest { source: Error },
+
+    #[snafu(display("Failed to deserialize DynamoDB Stream record: {source}"))]
+    FailedToCreateChangeBatch { source: ChangeBatchError },
+
+    #[snafu(display("Failed to add item to struct: {source}"))]
+    FailedToAddItemToStruct { source: Error },
+
+    #[snafu(display("Failed to build ChangeBatch: {source}"))]
+    FailedToCreateRecordBatch { source: ArrowError },
+
+    #[snafu(display("Failed to read RecordBatch: {}", format_datafusion_error(source)))]
+    FailedToReadRecordBatch { source: DataFusionError },
+}
+
+// This function is used for bootstrapping stream which doesn't have checkpoints.
+// Incoming batches are from TableProvider.scan() method.
+pub fn record_batch_to_change_batch(
+    batch: RecordBatch,
+    table_schema: &Arc<Schema>,
+    primary_keys: &[String],
+) -> Result<ChangeBatch, StreamError> {
+    let row_count = batch.num_rows();
+
+    // "c" stands for ChangeOperation::Create
+    let op_data = vec!["c"; row_count];
+    let op_array = StringArray::from(op_data);
+
+    let primary_keys_array = get_primary_keys_array(primary_keys, row_count);
+
+    let data_array = StructArray::from(batch);
+    let new_schema = Arc::new(changes_schema(table_schema.as_ref()));
+    let new_record_batch = RecordBatch::try_new(
+        Arc::clone(&new_schema),
+        vec![
+            Arc::new(op_array),
+            Arc::new(primary_keys_array),
+            Arc::new(data_array),
+        ],
+    )
+    .context(FailedToCreateRecordBatchSnafu)?;
+
+    let change_batch =
+        ChangeBatch::try_new(new_record_batch).context(FailedToCreateChangeBatchSnafu)?;
+
+    Ok(change_batch)
+}
+
+fn get_primary_keys_array(primary_keys: &[String], row_count: usize) -> ListArray {
+    let mut list_builder_generic = make_builder(
+        &DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+        row_count,
+    );
+    let list_builder = list_builder_generic
+        .as_any_mut()
+        .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+        .unwrap_or_else(|| unreachable!("created above as a list builder"));
+    for _ in 0..row_count {
+        let str_builder = list_builder
+            .values()
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap_or_else(|| unreachable!("created above as a string builder"));
+        for key in primary_keys {
+            str_builder.append_value(key);
+        }
+        list_builder.append(true);
+    }
+    list_builder.finish()
+}
+
+// This function is used for processing stream batches which have checkpoints.
+// Incoming batches are from DynamoDB Streams.
+pub fn process_batch(
+    batch: DynamoDBStreamBatch,
+    table_schema: &Arc<Schema>,
+    primary_keys: &[String],
+    unnest_depth: Option<usize>,
+    time_format: &str,
+    json_nesting: Option<&JsonNesting>,
+) -> Result<(ChangeBatch, Checkpoint, Option<SystemTime>), StreamError> {
+    let records = batch.records;
+
+    let changes_schema = changes_schema(table_schema);
+
+    let mut changes_struct_builder =
+        StructBuilder::from_fields(changes_schema.fields().clone(), records.len());
+
+    for record in records {
+        let (op_str, item_data) = match (&record.event_name, &record.dynamodb) {
+            (Some(event_name), Some(dynamodb)) => match event_name {
+                OperationType::Insert | OperationType::Modify => {
+                    let Some(item) = &dynamodb.new_image else {
+                        tracing::warn!(
+                            "No new_image in DynamoDB Streams record. Make sure stream is configured with either NewImage or NewAndOldImages. https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html#Streams.Enabling"
+                        );
+                        continue;
+                    };
+                    let streams_item = streams_to_dynamodb_item(item.clone());
+
+                    let (unnested_streams_item, _) = match unnest_depth {
+                        None => (streams_item, HashSet::new()),
+                        Some(depth) => unnest_dynamodb_row(&streams_item, depth)
+                            .context(FailedToUnnestSnafu)?,
+                    };
+
+                    let final_streams_item = match json_nesting {
+                        None => unnested_streams_item,
+                        Some(json_nesting) => {
+                            json_nest_row_except_fields(unnested_streams_item, json_nesting)
+                                .context(FailedToUnnestSnafu)?
+                        }
+                    };
+
+                    let op = if matches!(event_name, OperationType::Insert) {
+                        "c"
+                    } else {
+                        "u"
+                    };
+
+                    (op, final_streams_item)
+                }
+                OperationType::Remove => {
+                    let Some(keys_item) = &dynamodb.keys else {
+                        continue;
+                    };
+                    let streams_keys_item = streams_to_dynamodb_item(keys_item.clone());
+                    ("d", streams_keys_item)
+                }
+                operation => {
+                    tracing::debug!("Unexpected OperationType from DynamoDB Streams: {operation}",);
+                    continue;
+                }
+            },
+            _ => continue,
+        };
+
+        // Append row to changes struct
+        changes_struct_builder.append(true);
+
+        // Populate each field in the changes schema
+        for (idx, field) in changes_schema.fields().iter().enumerate() {
+            let field_builder = changes_struct_builder.field_builder_array(idx);
+
+            match field.name().as_str() {
+                "op" => {
+                    let str_builder = downcast_builder::<StringBuilder>(field_builder)
+                        .context(DowncastBuilderSnafu)?;
+                    str_builder.append_value(op_str);
+                }
+                "primary_keys" => {
+                    let list_builder =
+                        downcast_builder::<ListBuilder<Box<dyn ArrayBuilder>>>(field_builder)
+                            .context(DowncastBuilderSnafu)?;
+                    if primary_keys.is_empty() {
+                        list_builder.append(false);
+                    } else {
+                        let str_builder = downcast_builder::<StringBuilder>(list_builder.values())
+                            .context(DowncastBuilderSnafu)?;
+                        for key in primary_keys {
+                            str_builder.append_value(key);
+                        }
+                        list_builder.append(true);
+                    }
+                }
+                "data" => {
+                    let data_struct_builder = downcast_builder::<StructBuilder>(field_builder)
+                        .context(DowncastBuilderSnafu)?;
+                    append_item_to_struct_builder(&item_data, data_struct_builder, time_format)
+                        .context(FailedToAddItemToStructSnafu)?;
+                }
+                _ => unreachable!("Unexpected field in changes schema {}", field.name()),
+            }
+        }
+    }
+
+    let struct_array = changes_struct_builder.finish();
+    let record_batch: RecordBatch = struct_array.into();
+
+    let change_batch =
+        ChangeBatch::try_new(record_batch).context(FailedToCreateChangeBatchSnafu)?;
+
+    Ok((change_batch, batch.checkpoint, batch.watermark))
+}
+
+fn streams_to_dynamodb_item(
+    item: HashMap<String, StreamsAttributeValue>,
+) -> HashMap<String, DynamoDbAttributeValue> {
+    item.into_iter()
+        .map(|(k, v)| (k, streams_to_dynamodb_attribute(&v)))
+        .collect()
+}
+
+fn streams_to_dynamodb_attribute(value: &StreamsAttributeValue) -> DynamoDbAttributeValue {
+    match value {
+        StreamsAttributeValue::B(blob) => DynamoDbAttributeValue::B(blob.clone()),
+        StreamsAttributeValue::Bool(b) => DynamoDbAttributeValue::Bool(*b),
+        StreamsAttributeValue::Bs(blobs) => DynamoDbAttributeValue::Bs(blobs.clone()),
+        StreamsAttributeValue::L(list) => {
+            DynamoDbAttributeValue::L(list.iter().map(streams_to_dynamodb_attribute).collect())
+        }
+        StreamsAttributeValue::M(map) => DynamoDbAttributeValue::M(
+            map.iter()
+                .map(|(k, v)| (k.clone(), streams_to_dynamodb_attribute(v)))
+                .collect(),
+        ),
+        StreamsAttributeValue::N(n) => DynamoDbAttributeValue::N(n.clone()),
+        StreamsAttributeValue::Ns(ns) => DynamoDbAttributeValue::Ns(ns.clone()),
+        StreamsAttributeValue::Null(n) => DynamoDbAttributeValue::Null(*n),
+        StreamsAttributeValue::S(s) => DynamoDbAttributeValue::S(s.clone()),
+        StreamsAttributeValue::Ss(ss) => DynamoDbAttributeValue::Ss(ss.clone()),
+        _ => DynamoDbAttributeValue::Null(true),
+    }
+}
+
+fn downcast_builder<T: ArrayBuilder>(builder: &mut dyn ArrayBuilder) -> Option<&mut T> {
+    builder.as_any_mut().downcast_mut::<T>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdc::ChangeOperation;
+    use arrow::datatypes::{DataType, Field, SchemaRef};
+    use aws_sdk_dynamodbstreams::types::{
+        AttributeValue as StreamsAttributeValue, OperationType, Record, StreamRecord,
+    };
+    use dynamodb_streams::DynamoDBStreamBatch;
+    use dynamodb_streams::checkpoint::Checkpoint;
+    use std::collections::HashMap;
+
+    const TIME_FORMAT: &str = "2006-01-02T15:04:05.000Z07:00";
+
+    // Helper function to create the table schema
+    fn create_test_table_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    // Helper to create a test record
+    fn create_test_record(
+        operation: OperationType,
+        new_image: Option<HashMap<String, StreamsAttributeValue>>,
+        keys: Option<HashMap<String, StreamsAttributeValue>>,
+    ) -> Record {
+        Record::builder()
+            .event_name(operation)
+            .dynamodb(
+                StreamRecord::builder()
+                    .set_new_image(new_image)
+                    .set_keys(keys)
+                    .build(),
+            )
+            .build()
+    }
+
+    fn create_stream_result(records: Vec<Record>) -> DynamoDBStreamBatch {
+        DynamoDBStreamBatch {
+            records,
+            checkpoint: Checkpoint {
+                shards: HashMap::default(),
+            },
+            watermark: None,
+        }
+    }
+
+    mod process_batch {
+        use super::*;
+
+        #[test]
+        fn test_process_batch_insert_operation() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test Item".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify the batch has 1 row
+            assert_eq!(change_batch.record.num_rows(), 1);
+
+            // Verify the op field is "c" for create
+            let op = change_batch.op(0);
+            assert!(matches!(op, ChangeOperation::Create));
+        }
+
+        #[test]
+        fn test_process_batch_modify_operation() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("456".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Updated Item".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Modify, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify the batch has 1 row
+            assert_eq!(change_batch.record.num_rows(), 1);
+
+            // Verify the op field is "u" for update
+            let op = change_batch.op(0);
+            assert!(matches!(op, ChangeOperation::Update));
+        }
+
+        #[test]
+        fn test_process_batch_remove_operation() {
+            let mut keys = HashMap::new();
+            keys.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("789".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Remove, None, Some(keys));
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify the batch has 1 row
+            assert_eq!(change_batch.record.num_rows(), 1);
+
+            // Verify the op field is "d" for delete
+            let op = change_batch.op(0);
+            assert!(matches!(op, ChangeOperation::Delete));
+        }
+
+        #[test]
+        fn test_process_batch_empty_batch() {
+            let batch: Vec<Record> = vec![];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Empty batch should produce 0 rows
+            assert_eq!(change_batch.record.num_rows(), 0);
+        }
+
+        #[test]
+        fn test_process_batch_multiple_records() {
+            let mut new_image1 = HashMap::new();
+            new_image1.insert("id".to_string(), StreamsAttributeValue::S("1".to_string()));
+            new_image1.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("First".to_string()),
+            );
+
+            let mut new_image2 = HashMap::new();
+            new_image2.insert("id".to_string(), StreamsAttributeValue::S("2".to_string()));
+            new_image2.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Second".to_string()),
+            );
+
+            let mut keys = HashMap::new();
+            keys.insert("id".to_string(), StreamsAttributeValue::S("3".to_string()));
+
+            let batch = vec![
+                create_test_record(OperationType::Insert, Some(new_image1), None),
+                create_test_record(OperationType::Modify, Some(new_image2), None),
+                create_test_record(OperationType::Remove, None, Some(keys)),
+            ];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Should have 3 rows
+            assert_eq!(change_batch.record.num_rows(), 3);
+
+            // Verify operations
+            assert!(matches!(change_batch.op(0), ChangeOperation::Create));
+            assert!(matches!(change_batch.op(1), ChangeOperation::Update));
+            assert!(matches!(change_batch.op(2), ChangeOperation::Delete));
+        }
+
+        #[test]
+        fn test_process_batch_with_unnest_depth() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                Some(2),
+                TIME_FORMAT,
+                None,
+            );
+
+            result.expect("Should create change envelope with unnesting");
+        }
+
+        #[test]
+        fn test_process_batch_with_empty_primary_keys() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec![]; // Empty primary keys
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify we can extract primary keys (should be empty)
+            let pks = change_batch.primary_keys(0);
+            assert_eq!(pks.len(), 0);
+        }
+
+        #[test]
+        fn test_process_batch_skips_record_without_event_name() {
+            let record = Record::builder().build();
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Should skip the record and produce 0 rows
+            assert_eq!(change_batch.record.num_rows(), 0);
+        }
+
+        #[test]
+        fn test_process_batch_skips_insert_without_new_image() {
+            let record = Record::builder()
+                .event_name(OperationType::Insert)
+                .dynamodb(StreamRecord::builder().build())
+                .build();
+
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Should skip the record and produce 0 rows
+            assert_eq!(change_batch.record.num_rows(), 0);
+        }
+
+        #[test]
+        fn test_process_batch_skips_remove_without_keys() {
+            let record = Record::builder()
+                .event_name(OperationType::Remove)
+                .dynamodb(StreamRecord::builder().build())
+                .build();
+
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Should skip the record and produce 0 rows
+            assert_eq!(change_batch.record.num_rows(), 0);
+        }
+
+        #[test]
+        fn test_process_batch_with_multiple_primary_keys() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string(), "sort_key".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify primary keys
+            let pks = change_batch.primary_keys(0);
+            assert_eq!(pks.len(), 2);
+            assert_eq!(pks[0], "id");
+            assert_eq!(pks[1], "sort_key");
+        }
+
+        #[test]
+        fn test_process_batch_mixed_valid_and_invalid_records() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Valid".to_string()),
+            );
+
+            let valid_record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let invalid_record = Record::builder().build(); // No event name
+
+            let batch = vec![valid_record, invalid_record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Should only process the valid record
+            assert_eq!(change_batch.record.num_rows(), 1);
+        }
+
+        #[test]
+        fn test_process_batch_primary_keys_extraction() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("pk-123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify primary keys can be extracted
+            let extracted_pks = change_batch.primary_keys(0);
+            assert_eq!(extracted_pks, primary_keys);
+        }
+
+        #[test]
+        fn test_process_batch_data_extraction() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test Name".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = create_test_table_schema();
+            let primary_keys = vec!["id".to_string()];
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                None,
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            // Verify data can be extracted
+            let data_batch = change_batch.data(0);
+            assert_eq!(data_batch.num_rows(), 1);
+            assert_eq!(data_batch.num_columns(), 2); // id and name
+        }
+
+        use arrow::array::StringArray;
+
+        #[test]
+        fn test_process_batch_with_json_nesting_verifies_data() {
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test Item".to_string()),
+            );
+            new_image.insert(
+                "count".to_string(),
+                StreamsAttributeValue::N("42".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("Data", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["id".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["id".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            assert_eq!(change_batch.record.num_rows(), 1);
+
+            // Extract and verify the data
+            let data_batch = change_batch.data(0);
+            assert_eq!(data_batch.num_rows(), 1);
+
+            // Verify "id" is a top-level field
+            let id_col = data_batch
+                .column_by_name("id")
+                .expect("id column should exist");
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(id_array.value(0), "123");
+
+            // Verify "Data" contains nested JSON with "name" and "count"
+            let data_col = data_batch
+                .column_by_name("Data")
+                .expect("Data column should exist");
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            let json_str = data_array.value(0);
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_str).expect("Data should be valid JSON");
+            assert_eq!(parsed["name"], "Test Item");
+            assert_eq!(parsed["count"], 42.0); // Numbers are parsed as f64
+        }
+
+        #[test]
+        fn test_process_batch_with_json_nesting_complex_types_verifies_data() {
+            let mut nested_map = HashMap::new();
+            nested_map.insert(
+                "nested_key".to_string(),
+                StreamsAttributeValue::S("nested_value".to_string()),
+            );
+
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "PK".to_string(),
+                StreamsAttributeValue::S("pk123".to_string()),
+            );
+            new_image.insert(
+                "SK".to_string(),
+                StreamsAttributeValue::S("sk456".to_string()),
+            );
+            new_image.insert("MapField".to_string(), StreamsAttributeValue::M(nested_map));
+            new_image.insert(
+                "ListField".to_string(),
+                StreamsAttributeValue::L(vec![
+                    StreamsAttributeValue::S("item1".to_string()),
+                    StreamsAttributeValue::S("item2".to_string()),
+                ]),
+            );
+            new_image.insert("BoolField".to_string(), StreamsAttributeValue::Bool(true));
+
+            let record = create_test_record(OperationType::Modify, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("PK", DataType::Utf8, true),
+                Field::new("SK", DataType::Utf8, true),
+                Field::new("Data", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["PK".to_string(), "SK".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["PK".to_string(), "SK".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            let data_batch = change_batch.data(0);
+
+            // Verify static fields
+            let pk_col = data_batch.column_by_name("PK").expect("PK should exist");
+            let pk_array = pk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(pk_array.value(0), "pk123");
+
+            let sk_col = data_batch.column_by_name("SK").expect("SK should exist");
+            let sk_array = sk_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(sk_array.value(0), "sk456");
+
+            // Verify nested JSON contains complex types
+            let data_col = data_batch
+                .column_by_name("Data")
+                .expect("Data should exist");
+            let data_array = data_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            let json_str = data_array.value(0);
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(json_str).expect("Data should be valid JSON");
+
+            // Verify nested map
+            assert_eq!(parsed["MapField"]["nested_key"], "nested_value");
+
+            // Verify list
+            assert_eq!(parsed["ListField"], serde_json::json!(["item1", "item2"]));
+
+            // Verify bool
+            assert_eq!(parsed["BoolField"], true);
+        }
+
+        #[test]
+        fn test_process_batch_with_json_nesting_all_fields_static() {
+            // When all fields are static, no "Data" field should be created
+            let mut new_image = HashMap::new();
+            new_image.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            new_image.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("Test".to_string()),
+            );
+
+            let record = create_test_record(OperationType::Insert, Some(new_image), None);
+            let batch = vec![record];
+
+            let table_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, true),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let primary_keys = vec!["id".to_string()];
+
+            let json_nesting = JsonNesting {
+                static_fields: HashSet::from(["id".to_string(), "name".to_string()]),
+                json_field_name: "Data".to_string(),
+            };
+
+            let result = process_batch(
+                create_stream_result(batch),
+                &table_schema,
+                &primary_keys,
+                None,
+                TIME_FORMAT,
+                Some(&json_nesting),
+            );
+
+            let (change_batch, _checkpoint, _watermark) =
+                result.expect("Should create change envelope");
+
+            let data_batch = change_batch.data(0);
+
+            // Verify both fields are at top level
+            let id_col = data_batch.column_by_name("id").expect("id should exist");
+            let id_array = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(id_array.value(0), "123");
+
+            let name_col = data_batch
+                .column_by_name("name")
+                .expect("name should exist");
+            let name_array = name_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result");
+            assert_eq!(name_array.value(0), "Test");
+
+            // Data field should not exist (or be null/empty)
+            assert!(data_batch.column_by_name("Data").is_none());
+        }
+    }
+
+    #[cfg(test)]
+    mod record_batch_to_change_envelope {
+        use super::*;
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow_array::Array;
+        use std::sync::Arc;
+
+        fn create_test_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ]))
+        }
+
+        fn create_test_batch(schema: Arc<Schema>, row_count: usize) -> RecordBatch {
+            let ids: Int32Array =
+                (0..i32::try_from(row_count).expect("row_count fits in i32")).collect();
+            let names: Vec<String> = (0..row_count).map(|i| format!("name_{i}")).collect();
+            let names_array: StringArray = names.iter().map(|s| Some(s.as_str())).collect();
+
+            RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(names_array)])
+                .expect("valid record batch")
+        }
+
+        #[test]
+        fn test_basic_conversion_single_row() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 1);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
+            assert_eq!(change_batch.num_rows(), 1);
+        }
+
+        #[test]
+        fn test_basic_conversion_multiple_rows() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 100);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 100);
+        }
+
+        #[test]
+        fn test_empty_batch() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 0);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 0);
+        }
+
+        #[test]
+        fn test_multiple_primary_keys() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 5);
+            let primary_keys = vec!["id".to_string(), "name".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
+
+            // Verify the primary keys column is a list array
+            let pk_column = change_batch.column(1);
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
+
+            // Each row should have 2 primary keys
+            for i in 0..change_batch.num_rows() {
+                let list_value = pk_list.value(i);
+                assert_eq!(list_value.len(), 2);
+            }
+        }
+
+        #[test]
+        fn test_no_primary_keys() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 3);
+            let primary_keys: Vec<String> = vec![];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
+
+            let pk_column = change_batch.column(1);
+            let pk_list = pk_column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("pk_column is ListArray");
+
+            // Each row should have an empty list
+            for i in 0..change_batch.num_rows() {
+                let list_value = pk_list.value(i);
+                assert_eq!(list_value.len(), 0);
+            }
+        }
+
+        #[test]
+        fn test_operation_column_all_creates() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 10);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
+
+            // First column should be the operation column
+            let op_column = change_batch.column(0);
+            let op_array = op_column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column is StringArray");
+
+            // All operations should be "c" (Create)
+            for i in 0..change_batch.num_rows() {
+                assert_eq!(op_array.value(i), "c");
+            }
+        }
+
+        #[test]
+        fn test_data_column_preservation() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 5);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            let change_batch = change_batch.record;
+
+            // Third column should be the data as a struct
+            let data_column = change_batch.column(2);
+            let struct_array = data_column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("data_column is StructArray");
+
+            assert_eq!(struct_array.len(), 5);
+            assert_eq!(struct_array.num_columns(), 2); // id and name
+        }
+
+        #[test]
+        fn test_get_primary_keys_array_consistency() {
+            let primary_keys = vec!["id".to_string(), "user_id".to_string()];
+            let row_count = 10;
+
+            let pk_array = get_primary_keys_array(&primary_keys, row_count);
+
+            assert_eq!(pk_array.len(), row_count);
+
+            // Verify all rows have the same primary keys
+            for i in 0..row_count {
+                let list_value = pk_array.value(i);
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column is StringArray");
+
+                assert_eq!(string_array.len(), 2);
+                assert_eq!(string_array.value(0), "id");
+                assert_eq!(string_array.value(1), "user_id");
+            }
+        }
+
+        #[test]
+        fn test_get_primary_keys_array_single_key() {
+            let primary_keys = vec!["id".to_string()];
+            let row_count = 5;
+
+            let pk_array = get_primary_keys_array(&primary_keys, row_count);
+
+            for i in 0..row_count {
+                let list_value = pk_array.value(i);
+                let string_array = list_value
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("column is StringArray");
+
+                assert_eq!(string_array.len(), 1);
+                assert_eq!(string_array.value(0), "id");
+            }
+        }
+
+        #[test]
+        fn test_get_primary_keys_array_zero_rows() {
+            let primary_keys = vec!["id".to_string()];
+            let row_count = 0;
+
+            let pk_array = get_primary_keys_array(&primary_keys, row_count);
+
+            assert_eq!(pk_array.len(), 0);
+        }
+
+        #[test]
+        fn test_large_batch() {
+            let schema = create_test_schema();
+            let batch = create_test_batch(Arc::clone(&schema), 10000);
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+
+            let change_batch = result.expect("valid change batch");
+            assert_eq!(change_batch.record.num_rows(), 10000);
+        }
+
+        #[test]
+        fn test_schema_with_nullable_fields() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("optional_field", DataType::Utf8, true),
+                Field::new("another_optional", DataType::Int32, true),
+            ]));
+
+            let ids: Int32Array = (0..5).collect();
+            let optional_strs: StringArray = vec![Some("a"), None, Some("c"), None, Some("e")]
+                .into_iter()
+                .collect();
+            let optional_ints: Int32Array = vec![Some(1), Some(2), None, None, Some(5)]
+                .into_iter()
+                .collect();
+
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(ids),
+                    Arc::new(optional_strs),
+                    Arc::new(optional_ints),
+                ],
+            )
+            .expect("valid record batch");
+
+            let primary_keys = vec!["id".to_string()];
+
+            let result = record_batch_to_change_batch(batch, &schema, &primary_keys);
+            let _change_batch = result.expect("valid change batch");
+        }
+    }
+
+    #[cfg(test)]
+    mod streams_to_dynamodb_attribute_tests {
+        use super::*;
+        use aws_sdk_dynamodbstreams::primitives::Blob;
+
+        #[test]
+        fn test_convert_string_attribute() {
+            let input = StreamsAttributeValue::S("hello".to_string());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::S(s) = result {
+                assert_eq!(s, "hello");
+            } else {
+                panic!("Expected S variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_number_attribute() {
+            let input = StreamsAttributeValue::N("12345".to_string());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::N(n) = result {
+                assert_eq!(n, "12345");
+            } else {
+                panic!("Expected N variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_bool_true_attribute() {
+            let input = StreamsAttributeValue::Bool(true);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bool(b) = result {
+                assert!(b);
+            } else {
+                panic!("Expected Bool variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_bool_false_attribute() {
+            let input = StreamsAttributeValue::Bool(false);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bool(b) = result {
+                assert!(!b);
+            } else {
+                panic!("Expected Bool variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_null_true_attribute() {
+            let input = StreamsAttributeValue::Null(true);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Null(n) = result {
+                assert!(n);
+            } else {
+                panic!("Expected Null variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_null_false_attribute() {
+            let input = StreamsAttributeValue::Null(false);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Null(n) = result {
+                assert!(!n);
+            } else {
+                panic!("Expected Null variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_binary_attribute() {
+            let data = vec![1u8, 2, 3, 4, 5];
+            let input = StreamsAttributeValue::B(Blob::new(data.clone()));
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::B(blob) = result {
+                assert_eq!(blob.as_ref(), data.as_slice());
+            } else {
+                panic!("Expected B variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_string_set_attribute() {
+            let input = StreamsAttributeValue::Ss(vec![
+                "apple".to_string(),
+                "banana".to_string(),
+                "cherry".to_string(),
+            ]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ss(ss) = result {
+                assert_eq!(ss.len(), 3);
+                assert!(ss.contains(&"apple".to_string()));
+                assert!(ss.contains(&"banana".to_string()));
+                assert!(ss.contains(&"cherry".to_string()));
+            } else {
+                panic!("Expected Ss variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_number_set_attribute() {
+            let input =
+                StreamsAttributeValue::Ns(vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ns(ns) = result {
+                assert_eq!(ns.len(), 3);
+                assert!(ns.contains(&"1".to_string()));
+                assert!(ns.contains(&"2".to_string()));
+                assert!(ns.contains(&"3".to_string()));
+            } else {
+                panic!("Expected Ns variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_binary_set_attribute() {
+            let blobs = vec![Blob::new(vec![1u8, 2]), Blob::new(vec![3u8, 4])];
+            let input = StreamsAttributeValue::Bs(blobs);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Bs(bs) = result {
+                assert_eq!(bs.len(), 2);
+            } else {
+                panic!("Expected Bs variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_list_attribute() {
+            let list = vec![
+                StreamsAttributeValue::S("item1".to_string()),
+                StreamsAttributeValue::N("42".to_string()),
+                StreamsAttributeValue::Bool(true),
+            ];
+            let input = StreamsAttributeValue::L(list);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert_eq!(l.len(), 3);
+
+                if let DynamoDbAttributeValue::S(s) = &l[0] {
+                    assert_eq!(s, "item1");
+                } else {
+                    panic!("Expected S for first item");
+                }
+
+                if let DynamoDbAttributeValue::N(n) = &l[1] {
+                    assert_eq!(n, "42");
+                } else {
+                    panic!("Expected N for second item");
+                }
+
+                if let DynamoDbAttributeValue::Bool(b) = &l[2] {
+                    assert!(*b);
+                } else {
+                    panic!("Expected Bool for third item");
+                }
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_map_attribute() {
+            let mut map = HashMap::new();
+            map.insert(
+                "name".to_string(),
+                StreamsAttributeValue::S("John".to_string()),
+            );
+            map.insert(
+                "age".to_string(),
+                StreamsAttributeValue::N("30".to_string()),
+            );
+
+            let input = StreamsAttributeValue::M(map);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                assert_eq!(m.len(), 2);
+
+                if let Some(DynamoDbAttributeValue::S(name)) = m.get("name") {
+                    assert_eq!(name, "John");
+                } else {
+                    panic!("Expected S for name");
+                }
+
+                if let Some(DynamoDbAttributeValue::N(age)) = m.get("age") {
+                    assert_eq!(age, "30");
+                } else {
+                    panic!("Expected N for age");
+                }
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_nested_map_in_list() {
+            let mut inner_map = HashMap::new();
+            inner_map.insert(
+                "key".to_string(),
+                StreamsAttributeValue::S("value".to_string()),
+            );
+
+            let list = vec![StreamsAttributeValue::M(inner_map)];
+            let input = StreamsAttributeValue::L(list);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert_eq!(l.len(), 1);
+                if let DynamoDbAttributeValue::M(m) = &l[0] {
+                    if let Some(DynamoDbAttributeValue::S(v)) = m.get("key") {
+                        assert_eq!(v, "value");
+                    } else {
+                        panic!("Expected S for inner key");
+                    }
+                } else {
+                    panic!("Expected M for first list item");
+                }
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_nested_list_in_map() {
+            let inner_list = vec![
+                StreamsAttributeValue::N("1".to_string()),
+                StreamsAttributeValue::N("2".to_string()),
+            ];
+            let mut map = HashMap::new();
+            map.insert("numbers".to_string(), StreamsAttributeValue::L(inner_list));
+
+            let input = StreamsAttributeValue::M(map);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                if let Some(DynamoDbAttributeValue::L(l)) = m.get("numbers") {
+                    assert_eq!(l.len(), 2);
+                } else {
+                    panic!("Expected L for numbers");
+                }
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_list() {
+            let input = StreamsAttributeValue::L(vec![]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::L(l) = result {
+                assert!(l.is_empty());
+            } else {
+                panic!("Expected L variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_map() {
+            let input = StreamsAttributeValue::M(HashMap::new());
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::M(m) = result {
+                assert!(m.is_empty());
+            } else {
+                panic!("Expected M variant");
+            }
+        }
+
+        #[test]
+        fn test_convert_empty_string_set() {
+            let input = StreamsAttributeValue::Ss(vec![]);
+            let result = streams_to_dynamodb_attribute(&input);
+
+            if let DynamoDbAttributeValue::Ss(ss) = result {
+                assert!(ss.is_empty());
+            } else {
+                panic!("Expected Ss variant");
+            }
+        }
+
+        #[test]
+        fn test_streams_to_dynamodb_item_multiple_attributes() {
+            let mut item = HashMap::new();
+            item.insert(
+                "id".to_string(),
+                StreamsAttributeValue::S("123".to_string()),
+            );
+            item.insert(
+                "count".to_string(),
+                StreamsAttributeValue::N("42".to_string()),
+            );
+            item.insert("active".to_string(), StreamsAttributeValue::Bool(true));
+
+            let result = streams_to_dynamodb_item(item);
+
+            assert_eq!(result.len(), 3);
+            assert!(result.contains_key("id"));
+            assert!(result.contains_key("count"));
+            assert!(result.contains_key("active"));
+        }
+
+        #[test]
+        fn test_streams_to_dynamodb_item_empty() {
+            let item = HashMap::new();
+            let result = streams_to_dynamodb_item(item);
+            assert!(result.is_empty());
+        }
+    }
+}

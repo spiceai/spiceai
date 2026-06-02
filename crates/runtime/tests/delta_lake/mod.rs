@@ -16,7 +16,8 @@ limitations under the License.
 
 use crate::RecordBatch;
 use crate::configure_test_datafusion;
-use crate::utils::test_request_context;
+use crate::init_tracing;
+use crate::utils::{register_test_connectors, test_request_context};
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
@@ -44,7 +45,7 @@ impl Drop for FileCleanup {
     }
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn setup_test_data(zip_url: &str, dir_name: &str) -> Result<String, String> {
     let tmp_dir = std::env::temp_dir();
     let path = format!("{}/{}", tmp_dir.display(), dir_name);
@@ -112,6 +113,9 @@ async fn run_delta_lake_test(
 
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
     test_request_context().scope(async {
         let path = setup_test_data(
             "https://public-data.spiceai.org/delta-lake-nation-with-partitionkey.zip",
@@ -169,6 +173,9 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(
@@ -222,6 +229,9 @@ async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(
@@ -258,6 +268,9 @@ async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
 
 #[tokio::test]
 async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
     test_request_context()
         .scope(async {
             let path = setup_test_data(
@@ -308,6 +321,472 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
             assert!(pretty_explain_plan.contains("date_col=2030-06-15"));
             assert!(!pretty_explain_plan.contains("date_col=2025-01-01"));
             assert!(!pretty_explain_plan.contains("date_col=2024-02-04"));
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests min/max file-level pruning on a non-partitioned Delta Lake table with timestamp columns.
+///
+/// Dataset: 500 rows across 10 Parquet files, each file covers one day (2025-01-01 .. 2025-01-10)
+/// with non-overlapping `event_ts` ranges, enabling file-level pruning via Parquet column statistics.
+#[tokio::test]
+async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_firewall_events.zip",
+                "delta_firewall_events",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_timestamp_pruning")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/firewall_events"),
+                    "events",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let pruning_queries = [
+                (
+                    "ts_lte_jan03",
+                    "SELECT * FROM events WHERE event_ts <= '2025-01-03'",
+                ),
+                (
+                    "ts_lt_jan03",
+                    "SELECT * FROM events WHERE event_ts < '2025-01-03'",
+                ),
+                (
+                    "ts_gte_jan10",
+                    "SELECT * FROM events WHERE event_ts >= '2025-01-10'",
+                ),
+                (
+                    "ts_between_jan03_jan05",
+                    "SELECT * FROM events WHERE event_ts BETWEEN '2025-01-03' AND '2025-01-05'",
+                ),
+            ];
+
+            // We use `FORMAT TREE` to verify file-level pruning as it reports the number of files to scan in concise aggregated manner: `files: 2`.
+            for (snapshot_name, query) in pruning_queries {
+                let explain_query = format!("EXPLAIN FORMAT TREE {query}");
+                let explain_result = rt
+                    .datafusion()
+                    .query_builder(&explain_query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("EXPLAIN query failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("EXPLAIN query results: {e}"))?;
+
+                let explain_plan = pretty_format_batches(&explain_result)
+                    .expect("failed to format explain plan")
+                    .to_string();
+
+                insta::with_settings!({
+                    description => format!("Query: {query}"),
+                    omit_expression => true
+                }, {
+                    insta::assert_snapshot!(snapshot_name, explain_plan);
+                });
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests that Delta Lake tables with `columnMapping.mode = name` return data with correct
+/// logical column names, including nested struct fields which are stored under physical UUIDs.
+/// Runs multiple queries to verify projections, filters, aggregations, and nested type access.
+#[tokio::test]
+async fn query_delta_lake_column_mapping_mode_name() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_name.zip",
+                "delta_column_mapping_name",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_column_mapping_name")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/table-with-columnmapping-mode-name"),
+                    "col_mapping_name",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let test_cases: Vec<(&str, Vec<&str>)> = vec![
+                // Full scan with all column types + nested struct + array
+                (
+                    "SELECT ByteType, ShortType, IntegerType, LongType, BooleanType, StringType, nested_struct, array_of_prims FROM col_mapping_name ORDER BY IntegerType",
+                    vec![
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                        "| ByteType | ShortType | IntegerType | LongType | BooleanType | StringType | nested_struct         | array_of_prims |",
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                        "| 0        | 0         | 0           | 0        | true        | 0          | {aa: 0, ac: {aca: 0}} | [0, 1]         |",
+                        "| 1        | 1         | 1           | 1        | false       | 1          | {aa: 1, ac: {aca: 1}} | [1, 2]         |",
+                        "| 2        | 2         | 2           | 2        | true        | 2          | {aa: 2, ac: {aca: 2}} | [2, 3]         |",
+                        "| 3        | 3         | 3           | 3        | false       | 3          | {aa: 3, ac: {aca: 3}} | [3, 4]         |",
+                        "| 4        | 4         | 4           | 4        | true        | 4          | {aa: 4, ac: {aca: 4}} | [4, 5]         |",
+                        "|          |           |             |          |             |            |                       |                |",
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                    ],
+                ),
+                // Projection: subset of columns
+                (
+                    "SELECT IntegerType, StringType FROM col_mapping_name ORDER BY IntegerType",
+                    vec![
+                        "+-------------+------------+",
+                        "| IntegerType | StringType |",
+                        "+-------------+------------+",
+                        "| 0           | 0          |",
+                        "| 1           | 1          |",
+                        "| 2           | 2          |",
+                        "| 3           | 3          |",
+                        "| 4           | 4          |",
+                        "|             |            |",
+                        "+-------------+------------+",
+                    ],
+                ),
+                // Filter pushdown with logical column names
+                (
+                    "SELECT IntegerType, StringType FROM col_mapping_name WHERE IntegerType > 2 ORDER BY IntegerType",
+                    vec![
+                        "+-------------+------------+",
+                        "| IntegerType | StringType |",
+                        "+-------------+------------+",
+                        "| 3           | 3          |",
+                        "| 4           | 4          |",
+                        "+-------------+------------+",
+                    ],
+                ),
+                // Aggregation
+                (
+                    "SELECT count(*) as cnt, sum(IntegerType) as total FROM col_mapping_name",
+                    vec![
+                        "+-----+-------+",
+                        "| cnt | total |",
+                        "+-----+-------+",
+                        "| 6   | 10    |",
+                        "+-----+-------+",
+                    ],
+                ),
+                // Nested struct field access
+                (
+                    "SELECT nested_struct['aa'] as aa, nested_struct['ac']['aca'] as aca FROM col_mapping_name WHERE IntegerType <= 2 ORDER BY IntegerType",
+                    vec![
+                        "+----+-----+",
+                        "| aa | aca |",
+                        "+----+-----+",
+                        "| 0  | 0   |",
+                        "| 1  | 1   |",
+                        "| 2  | 2   |",
+                        "+----+-----+",
+                    ],
+                ),
+            ];
+
+            for (query, expected_results) in &test_cases {
+                let query_result = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+                assert_batches_eq!(expected_results, &data);
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests that Delta Lake tables with `columnMapping.mode = id` return data with correct
+/// logical column names.
+#[tokio::test]
+async fn query_delta_lake_column_mapping_mode_id() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_id.zip",
+                "delta_column_mapping_id",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_column_mapping_id")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/table-with-columnmapping-mode-id"),
+                    "col_mapping_id",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let test_cases: Vec<(&str, Vec<&str>)> = vec![
+                // Full scan with all column types + nested struct + array
+                (
+                    "SELECT ByteType, ShortType, IntegerType, LongType, BooleanType, StringType, nested_struct, array_of_prims FROM col_mapping_id ORDER BY IntegerType",
+                    vec![
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                        "| ByteType | ShortType | IntegerType | LongType | BooleanType | StringType | nested_struct         | array_of_prims |",
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                        "| 0        | 0         | 0           | 0        | true        | 0          | {aa: 0, ac: {aca: 0}} | [0, 1]         |",
+                        "| 1        | 1         | 1           | 1        | false       | 1          | {aa: 1, ac: {aca: 1}} | [1, 2]         |",
+                        "| 2        | 2         | 2           | 2        | true        | 2          | {aa: 2, ac: {aca: 2}} | [2, 3]         |",
+                        "| 3        | 3         | 3           | 3        | false       | 3          | {aa: 3, ac: {aca: 3}} | [3, 4]         |",
+                        "| 4        | 4         | 4           | 4        | true        | 4          | {aa: 4, ac: {aca: 4}} | [4, 5]         |",
+                        "|          |           |             |          |             |            |                       |                |",
+                        "+----------+-----------+-------------+----------+-------------+------------+-----------------------+----------------+",
+                    ],
+                ),
+                // Filter pushdown with logical column names
+                (
+                    "SELECT IntegerType, StringType FROM col_mapping_id WHERE IntegerType > 2 ORDER BY IntegerType",
+                    vec![
+                        "+-------------+------------+",
+                        "| IntegerType | StringType |",
+                        "+-------------+------------+",
+                        "| 3           | 3          |",
+                        "| 4           | 4          |",
+                        "+-------------+------------+",
+                    ],
+                ),
+                // Nested struct field access
+                (
+                    "SELECT nested_struct['aa'] as aa, nested_struct['ac']['aca'] as aca FROM col_mapping_id WHERE IntegerType <= 2 ORDER BY IntegerType",
+                    vec![
+                        "+----+-----+",
+                        "| aa | aca |",
+                        "+----+-----+",
+                        "| 0  | 0   |",
+                        "| 1  | 1   |",
+                        "| 2  | 2   |",
+                        "+----+-----+",
+                    ],
+                ),
+            ];
+
+            for (query, expected_results) in &test_cases {
+                let query_result = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+                assert_batches_eq!(expected_results, &data);
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests that Delta Lake tables with column mapping and partitions correctly translate
+/// physical partition keys to logical column names. Also exercises deletion vectors.
+#[tokio::test]
+async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_partitioned.zip",
+                "delta_column_mapping_partitioned",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_column_mapping_partitions")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/dv-with-columnmapping/delta"),
+                    "cm_partitioned",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let test_cases: Vec<(&str, Vec<&str>)> = vec![
+                // Full scan with limit — verifies partition column values are correctly populated
+                (
+                    "SELECT part, col1, col2 FROM cm_partitioned ORDER BY part, col1 LIMIT 10",
+                    vec![
+                        "+------+------+------+",
+                        "| part | col1 | col2 |",
+                        "+------+------+------+",
+                        "| 0    | 30   | foo0 |",
+                        "| 0    | 40   | foo0 |",
+                        "| 1    | 1    | foo1 |",
+                        "| 1    | 11   | foo1 |",
+                        "| 1    | 21   | foo1 |",
+                        "| 1    | 31   | foo1 |",
+                        "| 1    | 41   | foo1 |",
+                        "| 2    | 32   | foo2 |",
+                        "| 2    | 42   | foo2 |",
+                        "| 3    | 3    | foo3 |",
+                        "+------+------+------+",
+                    ],
+                ),
+                // Filter on partition column (logical name)
+                (
+                    "SELECT part, col1 FROM cm_partitioned WHERE part = 3 ORDER BY col1",
+                    vec![
+                        "+------+------+",
+                        "| part | col1 |",
+                        "+------+------+",
+                        "| 3    | 3    |",
+                        "| 3    | 13   |",
+                        "| 3    | 23   |",
+                        "| 3    | 33   |",
+                        "| 3    | 43   |",
+                        "+------+------+",
+                    ],
+                ),
+                // Aggregation — row count confirms deletion vectors are applied
+                (
+                    "SELECT count(*) as cnt FROM cm_partitioned",
+                    vec![
+                        "+-----+",
+                        "| cnt |",
+                        "+-----+",
+                        "| 35  |",
+                        "+-----+",
+                    ],
+                ),
+            ];
+
+            for (query, expected_results) in &test_cases {
+                let query_result = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+                assert_batches_eq!(expected_results, &data);
+            }
+
+            // Verify partition pruning: EXPLAIN for `part = 3` should only scan
+            // the physical partition directory for partition 3 and not others.
+            let partition_query =
+                "SELECT part, col1 FROM cm_partitioned WHERE part = 3 ORDER BY col1";
+            let explain_plan = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {partition_query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query EXPLAIN to plan: {e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("query EXPLAIN to results: {e}"))?;
+
+            let pretty_explain_plan = pretty_format_batches(&explain_plan)
+                .expect("failed to format explain plan")
+                .to_string();
+
+            // Only the physical partition dir for part=3 should appear
+            for i in 0..10 {
+                let pattern = format!("col-60c949ca-b8bc-4330-b931-b73fb4c60037={i}");
+                if i == 3 {
+                    assert!(
+                        pretty_explain_plan.contains(&pattern),
+                        "EXPLAIN should show partition {i} directory"
+                    );
+                } else {
+                    assert!(
+                        !pretty_explain_plan.contains(&pattern),
+                        "EXPLAIN should not show partition {i} directory"
+                    );
+                }
+            }
 
             Ok(())
         })

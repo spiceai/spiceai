@@ -20,6 +20,7 @@ use arrow::error::ArrowError;
 use client::GraphQLQuery;
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use http::{HeaderMap, HeaderValue};
+use reqwest::StatusCode;
 use serde_json::Value;
 use snafu::Snafu;
 
@@ -28,9 +29,12 @@ pub mod client;
 pub mod provider;
 pub mod rate_limit;
 
+/// Maximum number of retry attempts for a single page fetch during pagination.
+pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to send GraphQL HTTP request: {source}"))]
     ReqwestInternal { source: reqwest::Error },
 
     #[snafu(display("HTTP {status}: {message}"))]
@@ -39,16 +43,18 @@ pub enum Error {
         message: String,
     },
 
-    #[snafu(display("JSON pointer could not be inferred, and none provided"))]
+    #[snafu(display(
+        "GraphQL JSON pointer could not be inferred. Specify a 'json_pointer' parameter in the dataset configuration."
+    ))]
     NoJsonPointerFound {},
 
     #[snafu(display("Invalid GraphQL 'json_pointer': '{pointer}'"))]
     InvalidJsonPointer { pointer: String },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to process GraphQL response: {source}"))]
     ArrowInternal { source: ArrowError },
 
-    #[snafu(display("Invalid object access. {message}"))]
+    #[snafu(display("Invalid GraphQL object access: {message}"))]
     InvalidObjectAccess { message: String },
 
     #[snafu(display("{message}"))]
@@ -60,35 +66,100 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RateLimited { message: String },
 
-    #[snafu(display("Query response transformation failed. {source}"))]
+    #[snafu(display("GraphQL query failed: failed to transform response data: {source}"))]
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The upstream server returned an error (HTTP {status}). {detail}"))]
+    JsonDecodeError {
+        status: reqwest::StatusCode,
+        detail: String,
+        response_preview: String,
+    },
+
     #[snafu(display(
         "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
     ))]
     InternalError { message: String },
 
-    #[snafu(display(
-        "GraphQL Query Error:
-Details:
-- Error: {message}
-- Location: Line {line}, Column {column}
-- Query:
-
-{query}
-
-Verify the syntax of your GraphQL query."
-    ))]
+    #[snafu(display("Server returned an error: {message}"))]
     InvalidGraphQLQuery {
         message: String,
         line: usize,
         column: usize,
         query: String,
     },
+
+    #[snafu(display(
+        "Failed to build a valid regex from pagination parameters due to the resource name {resource_name}. {source}"
+    ))]
+    InvalidPaginationRegex {
+        source: regex::Error,
+        resource_name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Determines if a GraphQL error is retriable (transient).
+///
+/// Retriable errors include:
+/// - All HTTP 5xx server errors (500, 502, 503, 504, etc.)
+/// - HTTP 408 Request Timeout
+/// - Connection/timeout errors from reqwest
+/// - JSON decode errors (often due to truncated responses from timeouts)
+///
+/// Note: `Error::RateLimited` is NOT retriable here because rate limiting is handled
+/// proactively by the `RateLimiter` trait via `check_rate_limit()`, which sleeps until
+/// the rate limit reset time. Any `RateLimited` error reaching this point indicates
+/// an unexpected issue that shouldn't be retried with additional backoff delays.
+#[must_use]
+pub fn is_retriable_error(error: &Error) -> bool {
+    match error {
+        Error::InvalidReqwestStatus { status, .. } => {
+            status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
+        }
+        Error::JsonDecodeError { status, .. } => {
+            // JSON decode errors with server error status codes are often due to
+            // truncated responses from timeouts or server issues.
+            // A non-JSON 403 is also retriable: it indicates a transient upstream
+            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
+            // administrative rules"), not a genuine credentials/permissions error
+            // (which would return valid JSON).
+            status.is_server_error() || *status == StatusCode::FORBIDDEN
+        }
+        Error::ReqwestInternal { source } => {
+            // Check for transient network/connection errors:
+            // - is_timeout(): Connection or request timeouts
+            // - is_connect(): Failed to establish connection
+            // - is_body(): Error reading response body
+            // - is_decode(): Error decoding response body (e.g., gzip/brotli decompression
+            //   failures, HTTP/2 stream errors - "error decoding response body")
+            source.is_timeout()
+                || source.is_connect()
+                || source.is_body()
+                || source.is_decode()
+                // Also check if the underlying status code is a retriable server error
+                || source.status().is_some_and(|s| s.is_server_error() || s == StatusCode::REQUEST_TIMEOUT)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the error is a gateway error (502 Bad Gateway or 504 Gateway Timeout)
+/// that may benefit from closing the current connection and establishing a fresh one.
+#[must_use]
+pub fn is_gateway_error(error: &Error) -> bool {
+    let status = match error {
+        Error::InvalidReqwestStatus { status, .. } | Error::JsonDecodeError { status, .. } => {
+            Some(*status)
+        }
+        Error::ReqwestInternal { source } => source.status(),
+        _ => None,
+    };
+    status.is_some_and(|s| s == StatusCode::BAD_GATEWAY || s == StatusCode::GATEWAY_TIMEOUT)
+}
 
 #[derive(Debug, Clone)]
 pub struct FilterPushdownResult {
@@ -129,5 +200,334 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     /// A custom implementation can override this function to process the headers and response, and return custom errors or warnings
     fn error_checker(&self) -> Option<ErrorChecker> {
         None
+    }
+
+    /// If the query has a cost associated with it, return it
+    /// This value is only used when a rate controller with a weighted quota is configured.
+    /// When query cost is None, only non-weighted quotas are checked.
+    fn query_cost(&self) -> Option<u32> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_all_server_errors_retriable_via_json_decode() {
+        // All 5xx errors should be retriable when they cause JSON decode failures
+        let server_error_codes = [
+            StatusCode::INTERNAL_SERVER_ERROR,      // 500
+            StatusCode::NOT_IMPLEMENTED,            // 501
+            StatusCode::BAD_GATEWAY,                // 502
+            StatusCode::SERVICE_UNAVAILABLE,        // 503
+            StatusCode::GATEWAY_TIMEOUT,            // 504
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED, // 505
+        ];
+
+        for status in server_error_codes {
+            let error = Error::JsonDecodeError {
+                status,
+                detail: "expected value at line 1 column 1".to_string(),
+                response_preview: "<html>Server Error</html>".to_string(),
+            };
+            assert!(
+                is_retriable_error(&error),
+                "JsonDecodeError with status {status} should be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_server_errors_retriable_via_invalid_reqwest_status() {
+        // All 5xx errors should be retriable via InvalidReqwestStatus
+        let server_error_codes = [
+            StatusCode::INTERNAL_SERVER_ERROR,           // 500
+            StatusCode::NOT_IMPLEMENTED,                 // 501
+            StatusCode::BAD_GATEWAY,                     // 502
+            StatusCode::SERVICE_UNAVAILABLE,             // 503
+            StatusCode::GATEWAY_TIMEOUT,                 // 504
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,      // 505
+            StatusCode::VARIANT_ALSO_NEGOTIATES,         // 506
+            StatusCode::INSUFFICIENT_STORAGE,            // 507
+            StatusCode::LOOP_DETECTED,                   // 508
+            StatusCode::NOT_EXTENDED,                    // 510
+            StatusCode::NETWORK_AUTHENTICATION_REQUIRED, // 511
+        ];
+
+        for status in server_error_codes {
+            let error = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Server error: {status}"),
+            };
+            assert!(
+                is_retriable_error(&error),
+                "InvalidReqwestStatus with status {status} should be retriable"
+            );
+        }
+
+        // 408 Request Timeout is also retriable (special case, not a 5xx)
+        let timeout_error = Error::InvalidReqwestStatus {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: "Request Timeout".to_string(),
+        };
+        assert!(
+            is_retriable_error(&timeout_error),
+            "408 Request Timeout should be retriable"
+        );
+    }
+
+    #[test]
+    fn test_json_decode_client_error_not_retriable() {
+        // JSON decode errors with client status codes (4xx) should NOT be retriable
+        // (except 403, which is retriable — see test_json_decode_forbidden_retriable)
+        let client_error_codes = [
+            StatusCode::BAD_REQUEST,          // 400
+            StatusCode::UNAUTHORIZED,         // 401
+            StatusCode::NOT_FOUND,            // 404
+            StatusCode::UNPROCESSABLE_ENTITY, // 422
+        ];
+
+        for status in client_error_codes {
+            let error = Error::JsonDecodeError {
+                status,
+                detail: "expected value at line 1 column 1".to_string(),
+                response_preview: "invalid response".to_string(),
+            };
+            assert!(
+                !is_retriable_error(&error),
+                "JsonDecodeError with client status {status} should NOT be retriable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_decode_forbidden_retriable() {
+        // A non-JSON 403 response indicates a transient upstream proxy or abuse-detection
+        // block (e.g. GitHub's "Request forbidden by administrative rules"), not a genuine
+        // credentials/permissions error (which returns valid JSON and is handled separately).
+        let error = Error::JsonDecodeError {
+            status: StatusCode::FORBIDDEN,
+            detail: "expected value at line 2 column 1".to_string(),
+            response_preview: "Request forbidden by administrative rules.".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "JsonDecodeError with 403 Forbidden should be retriable (transient abuse detection)"
+        );
+    }
+
+    #[test]
+    fn test_non_status_errors_not_retriable() {
+        // Test that non-HTTP-status error types are not retriable
+        // (HTTP status errors are covered by the status-specific tests above)
+        let non_retriable_errors = vec![
+            Error::InvalidCredentialsOrPermissions {
+                message: "Invalid credentials".to_string(),
+            },
+            Error::ResourceNotFound {
+                message: "Resource not found".to_string(),
+            },
+            Error::InvalidGraphQLQuery {
+                message: "Syntax error".to_string(),
+                line: 1,
+                column: 1,
+                query: "{ invalid }".to_string(),
+            },
+            Error::NoJsonPointerFound {},
+            Error::InvalidJsonPointer {
+                pointer: "/invalid".to_string(),
+            },
+            Error::InvalidObjectAccess {
+                message: "Invalid access".to_string(),
+            },
+            Error::InternalError {
+                message: "Internal error".to_string(),
+            },
+        ];
+
+        for error in &non_retriable_errors {
+            assert!(
+                !is_retriable_error(error),
+                "Error should NOT be retriable: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fibonacci_backoff_with_retry_strategy() {
+        use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+
+        // Verify the FibonacciBackoff produces expected Fibonacci delays
+        // This mirrors the configuration used in execute_with_retry
+        // Fibonacci intervals array: [1000, 1000, 2000, 3000, 5000, 8000, ...] (indices 0, 1, 2, 3, ...)
+        // next_backoff() increments num_retries first, then uses it as index:
+        //   Call 1: num_retries=1, index 1 -> 1000ms
+        //   Call 2: num_retries=2, index 2 -> 2000ms
+        //   Call 3: num_retries=3, index 3 -> 3000ms
+        //   Call 4: num_retries=4, index 4 -> 5000ms
+        //   Call 5: num_retries=5, index 5 -> 8000ms
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .randomization_factor(0.0) // No randomization for predictable testing
+            .build();
+
+        // Call 1: num_retries=1, index 1 -> 1000ms (1s)
+        let delay_1 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_1, Duration::from_secs(1));
+
+        // Call 2: num_retries=2, index 2 -> 2000ms (2s)
+        let delay_2 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_2, Duration::from_secs(2));
+
+        // Call 3: num_retries=3, index 3 -> 3000ms (3s)
+        let delay_3 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_3, Duration::from_secs(3));
+
+        // Call 4: num_retries=4, index 4 -> 5000ms (5s)
+        let delay_4 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_4, Duration::from_secs(5));
+
+        // Call 5: num_retries=5, index 5 -> 8000ms (8s)
+        let delay_5 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_5, Duration::from_secs(8));
+
+        // After max_retries (5), should return None
+        assert!(
+            backoff.next_backoff().is_none(),
+            "Should return None after max retries"
+        );
+    }
+
+    #[test]
+    fn test_max_attempts_boundary() {
+        use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
+
+        // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly with FibonacciBackoff.
+        // PAGE_RETRY_MAX_ATTEMPTS represents the maximum number of retry attempts,
+        // excluding the initial attempt. With PAGE_RETRY_MAX_ATTEMPTS = 5:
+        // - Attempt 1: initial try
+        // - Attempt 2: first retry (after first failure) - backoff call 1
+        // - Attempt 3: second retry (after second failure) - backoff call 2
+        // - Attempt 4: third retry (after third failure) - backoff call 3
+        // - Attempt 5: fourth retry (after fourth failure) - backoff call 4
+        // - Attempt 6: fifth retry (after fifth failure) - backoff call 5
+        // - After attempt 6 fails, backoff returns None, give up
+
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .build();
+
+        // Should allow 5 retries (backoff returns Some 5 times)
+        assert!(
+            backoff.next_backoff().is_some(),
+            "First retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Second retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Third retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Fourth retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Fifth retry should be allowed"
+        );
+
+        // Sixth call should return None (max retries exhausted)
+        assert!(
+            backoff.next_backoff().is_none(),
+            "Sixth retry should NOT be allowed (max retries exhausted)"
+        );
+    }
+
+    #[test]
+    fn test_gateway_errors_detected() {
+        // 502 Bad Gateway and 504 Gateway Timeout should be detected as gateway errors
+        let gateway_codes = [
+            StatusCode::BAD_GATEWAY,     // 502
+            StatusCode::GATEWAY_TIMEOUT, // 504
+        ];
+
+        for status in gateway_codes {
+            let invalid_status_err = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Gateway error: {status}"),
+            };
+            assert!(
+                is_gateway_error(&invalid_status_err),
+                "InvalidReqwestStatus with {status} should be a gateway error"
+            );
+
+            let json_decode_err = Error::JsonDecodeError {
+                status,
+                detail: "unexpected EOF".to_string(),
+                response_preview: "<html>Bad Gateway</html>".to_string(),
+            };
+            assert!(
+                is_gateway_error(&json_decode_err),
+                "JsonDecodeError with {status} should be a gateway error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_gateway_server_errors_not_detected() {
+        // Other 5xx errors should NOT be detected as gateway errors
+        let non_gateway_codes = [
+            StatusCode::INTERNAL_SERVER_ERROR,      // 500
+            StatusCode::NOT_IMPLEMENTED,            // 501
+            StatusCode::SERVICE_UNAVAILABLE,        // 503
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED, // 505
+        ];
+
+        for status in non_gateway_codes {
+            let error = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Server error: {status}"),
+            };
+            assert!(
+                !is_gateway_error(&error),
+                "InvalidReqwestStatus with {status} should NOT be a gateway error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_and_non_status_errors_not_gateway() {
+        // 4xx errors and non-status errors should NOT be gateway errors
+        let client_error = Error::InvalidReqwestStatus {
+            status: StatusCode::NOT_FOUND,
+            message: "Not Found".to_string(),
+        };
+        assert!(
+            !is_gateway_error(&client_error),
+            "404 should not be a gateway error"
+        );
+
+        let non_status_errors = vec![
+            Error::InvalidCredentialsOrPermissions {
+                message: "bad creds".to_string(),
+            },
+            Error::InternalError {
+                message: "internal".to_string(),
+            },
+            Error::NoJsonPointerFound {},
+        ];
+
+        for error in &non_status_errors {
+            assert!(
+                !is_gateway_error(error),
+                "Non-status error should not be a gateway error: {error:?}"
+            );
+        }
     }
 }

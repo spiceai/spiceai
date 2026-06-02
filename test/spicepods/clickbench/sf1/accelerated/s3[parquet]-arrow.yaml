@@ -14,4 +14,18 @@ datasets:
     acceleration:
       enabled: true
       engine: arrow
-      refresh_sql: "SELECT * FROM hits LIMIT 50000000" # dev-runners do not have enough memory for full clickbench in-memory
+      # dev-runners do not have enough memory for full clickbench in-memory.
+      # Limit data but ensure certain questions have sufficient data
+      refresh_sql: |
+        SELECT *
+        FROM hits
+        WHERE "UserID" = 435090932899640449 -- q20
+        -- q42
+        OR (
+          "CounterID" = 62 AND to_timestamp("EventDate" * 86400) >= '2013-07-01' AND to_timestamp("EventDate" * 86400) <= '2013-07-31' AND "IsRefresh" = 0 AND "DontCountHits" = 0 AND "URLHash" = 2868770270353813622
+        )
+        -- Add more generic data to get close to limit
+        OR (
+          date_trunc('day', from_unixtime("EventTime")) >= '2013-07-01' AND date_trunc('day', from_unixtime("EventTime")) <= '2013-07-14'
+        )
+        LIMIT 50000000

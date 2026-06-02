@@ -18,12 +18,12 @@ description: "Query: tpch_simple_q2"
 |               |     AggregateExec: mode=Final, gby=[], aggr=[max(lineitem.l_linenumber)]                                                            |
 |               |       CoalescePartitionsExec                                                                                                        |
 |               |         AggregateExec: mode=Partial, gby=[], aggr=[max(lineitem.l_linenumber)]                                                      |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                     |
-|               |             BytesProcessedExec                                                                                                      |
+|               |           BytesProcessedExec                                                                                                        |
+|               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                   |
 |               |               CooperativeExec                                                                                                       |
 |               |                 MongoDBExec projection=[l_linenumber] filters=[{}]                                                                  |
-|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                           |
-|               |       BytesProcessedExec                                                                                                            |
+|               |     BytesProcessedExec                                                                                                              |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                         |
 |               |         CooperativeExec                                                                                                             |
 |               |           MongoDBExec projection=[l_linenumber] filters=[{}]                                                                        |
 |               |                                                                                                                                     |

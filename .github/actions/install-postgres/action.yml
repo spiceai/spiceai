@@ -1,9 +1,6 @@
 name: Install PostgreSQL
 description: 'Performs PostgreSQL installation and setup on the target operating system'
 inputs:
-  os:
-    description: 'Operating system to install PostgreSQL'
-    default: 'linux' # 'linux', 'darwin', 'windows'
   pg-db:
     description: 'Name of the database to create'
     default: 'postgres'
@@ -11,8 +8,12 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/configure-apt
+
     - name: Install PostgreSQL (Linux)
-      if: inputs.os == 'linux'
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
@@ -24,13 +25,15 @@ runs:
         sudo -u postgres createdb ${{ inputs.pg-db }}
 
     - name: Install PostgreSQL (macOS)
-      if: inputs.os == 'darwin'
+      if: runner.os == 'macOS'
       shell: bash
       run: |
-        # macos-14 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
+        # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
         brew update
         brew install postgresql
-        brew services start postgresql
+        export PATH="/opt/homebrew/opt/postgresql@18/bin:$PATH"
+        echo "/opt/homebrew/opt/postgresql@18/bin" >> $GITHUB_PATH
+        brew services start postgresql@18
         sleep 5
         createuser -s postgres
         psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"

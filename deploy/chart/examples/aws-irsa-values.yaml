@@ -1,0 +1,37 @@
+# AWS IRSA (IAM Roles for Service Accounts) Example
+#
+# This example configures the Spice.ai Helm chart to use AWS IRSA for
+# authenticating to AWS services (e.g. S3) without static credentials.
+#
+# IRSA works on any EKS cluster (EC2, Fargate, or Outposts) with an OIDC provider.
+#
+# Prerequisites:
+#   1. A Kubernetes cluster with an OIDC provider (EKS enables this by default).
+#   2. An IAM role with:
+#      - A trust policy allowing the OIDC provider and this ServiceAccount.
+#      - Permissions for the AWS resources Spice.ai needs (e.g. s3:GetObject).
+#
+# Usage:
+#   helm install spiceai deploy/chart -f deploy/chart/examples/aws-irsa-values.yaml
+#
+# See: https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html
+
+serviceAccount:
+  create: true
+  name: spiceai
+  annotations:
+    # Replace with your IAM role ARN
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-spice-role
+
+spicepod:
+  name: app
+  version: v1
+  kind: Spicepod
+  datasets:
+    - from: s3://my-bucket/data/
+      name: my_data
+      params:
+        file_format: parquet
+      acceleration:
+        enabled: true
+        engine: duckdb

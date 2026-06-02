@@ -94,6 +94,9 @@ impl SpiceToolCatalog for MemoryToolCatalog {
     fn name(&self) -> &str {
         Self::name()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     async fn all(&self) -> Vec<Arc<dyn SpiceModelTool>> {
         vec![

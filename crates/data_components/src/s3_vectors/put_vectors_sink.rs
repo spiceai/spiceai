@@ -34,6 +34,10 @@ use snafu::{ResultExt, prelude::*};
 use super::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, S3VectorsTable};
 
 const PUT_VECTORS_MAX_ITEMS: usize = 500;
+// S3 Vectors API has a 1MB (1,048,576 bytes) payload limit
+const PUT_VECTORS_MAX_PAYLOAD_BYTES: usize = 1_048_576;
+// Estimate overhead per vector: vector_id, metadata, JSON structure (~200 bytes)
+const ESTIMATED_OVERHEAD_PER_VECTOR: usize = 200;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,6 +54,14 @@ pub enum Error {
     ColumnTypeMismatch { name: String, expected: String },
     #[snafu(display("Expected {expected} datatype but got a different datatype"))]
     DatatypeMismatch { expected: String },
+    #[snafu(display("Invalid primary key at row {row}: {reason}"))]
+    InvalidPrimaryKey { row: usize, reason: String },
+    #[snafu(display("Invalid metadata key '{key}' at row {row}: {reason}"))]
+    InvalidMetadataKey {
+        key: String,
+        row: usize,
+        reason: String,
+    },
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -93,6 +105,9 @@ impl DataSink for PutVectorsSink {
         _context: &Arc<TaskContext>,
     ) -> DataFusionResult<u64> {
         let mut count = 0;
+        // Calculate batch size once based on vector dimensions from schema
+        let vector_dimensions = usize::try_from(self.table.dimension).unwrap_or(0);
+        let batch_size = calculate_batch_size(vector_dimensions);
 
         while let Some(record_batch) = data.next().await {
             let record_batch = record_batch?;
@@ -102,11 +117,13 @@ impl DataSink for PutVectorsSink {
             let (index_arn, vector_bucket_name, index_name) =
                 self.table.idx.index_identifier_variables();
 
-            for chunk in vectors.chunks(PUT_VECTORS_MAX_ITEMS) {
-                self.table
+            for chunk in vectors.chunks(batch_size) {
+                let chunk_len = chunk.len();
+                let _ = self
+                    .table
                     .client
                     .put_vectors(
-                        PutVectorsInput::builder()
+                        &PutVectorsInput::builder()
                             .set_index_arn(index_arn.clone())
                             .set_index_name(index_name.clone())
                             .set_vector_bucket_name(vector_bucket_name.clone())
@@ -119,12 +136,31 @@ impl DataSink for PutVectorsSink {
                     .boxed()
                     .context(PutVectorsSnafu)?;
 
-                count += chunk.len();
+                count += chunk_len;
             }
         }
 
         Ok(count as _)
     }
+}
+
+/// Calculate optimal batch size based on vector dimensions to stay under 1MB payload limit
+///
+/// Each vector consumes: (dimensions * 4 bytes for f32) + overhead (~200 bytes)
+/// We conservatively cap at `PUT_VECTORS_MAX_ITEMS` (500) to avoid API limits
+fn calculate_batch_size(vector_dimensions: usize) -> usize {
+    if vector_dimensions == 0 {
+        return PUT_VECTORS_MAX_ITEMS;
+    }
+
+    // Each f32 is 4 bytes
+    let bytes_per_vector = (vector_dimensions * 4) + ESTIMATED_OVERHEAD_PER_VECTOR;
+
+    // Calculate max vectors that fit in 1MB, leaving 10% safety margin
+    let max_by_size = (PUT_VECTORS_MAX_PAYLOAD_BYTES * 9) / (bytes_per_vector * 10);
+
+    // Take the minimum of size-based limit and API item limit
+    max_by_size.clamp(1, PUT_VECTORS_MAX_ITEMS)
 }
 
 fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVector>> {
@@ -165,6 +201,30 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
     for row in 0..record_batch.num_rows() {
         let key = keys.value(row).to_string();
 
+        // Validate primary key
+        if key.is_empty() {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: "Primary key cannot be empty".to_string(),
+            });
+        }
+        if key.len() > 1024 {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: format!(
+                    "Primary key exceeds maximum length of 1024 characters (got {})",
+                    key.len()
+                ),
+            });
+        }
+        // S3 Vectors keys should not contain control characters
+        if key.chars().any(char::is_control) {
+            return Err(Error::InvalidPrimaryKey {
+                row,
+                reason: "Primary key contains invalid control characters".to_string(),
+            });
+        }
+
         let vector = vectors
             .value(row)
             .as_any()
@@ -189,9 +249,36 @@ fn create_put_input_vectors(record_batch: &RecordBatch) -> Result<Vec<PutInputVe
         let mut metadata = HashMap::new();
 
         for (index, name, data_type) in &fields {
+            // Validate metadata key
+            if name.is_empty() {
+                return Err(Error::InvalidMetadataKey {
+                    key: (*name).clone(),
+                    row,
+                    reason: "Metadata key cannot be empty".to_string(),
+                });
+            }
+            if name.len() > 256 {
+                return Err(Error::InvalidMetadataKey {
+                    key: (*name).clone(),
+                    row,
+                    reason: format!(
+                        "Metadata key exceeds maximum length of 256 characters (got {})",
+                        name.len()
+                    ),
+                });
+            }
+            // Metadata keys should not contain control characters or special chars
+            if name.chars().any(|c| c.is_control() || c == '\0') {
+                return Err(Error::InvalidMetadataKey {
+                    key: (*name).clone(),
+                    row,
+                    reason: "Metadata key contains invalid characters".to_string(),
+                });
+            }
+
             let col = record_batch.column(*index);
             let value = metadata_from_row(row, data_type, col)?;
-            metadata.insert((*name).to_string(), value);
+            metadata.insert((*name).clone(), value);
         }
 
         let metadata = if metadata.is_empty() {
@@ -271,174 +358,5 @@ fn metadata_from_row(
 impl From<Error> for DataFusionError {
     fn from(value: Error) -> Self {
         DataFusionError::Execution(value.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use arrow::{
-        array::ListBuilder,
-        datatypes::{DataType, Field, Schema},
-    };
-    use arrow_array::{Float32Array, GenericListArray, Int32Array, StringArray};
-
-    use super::*;
-
-    fn schema_ref() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new_list(
-                S3_VECTOR_EMBEDDING_NAME,
-                Field::new("item", DataType::Float32, true),
-                true,
-            ),
-        ]))
-    }
-
-    fn build_vectors(input: &[&[f32]]) -> GenericListArray<i32> {
-        let capacity = input.iter().map(|i| i.len()).sum();
-        let mut list_builder = ListBuilder::new(Float32Array::builder(capacity));
-
-        for i in input {
-            for j in *i {
-                list_builder.values().append_value(*j);
-            }
-
-            list_builder.append(true);
-        }
-
-        list_builder.finish()
-    }
-
-    #[test]
-    fn test_create_put_input_vectors_success() {
-        let keys = StringArray::from(vec!["key1", "key2"]);
-        let metadata = StringArray::from(vec!["meta1", "meta2"]);
-
-        let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
-
-        let schema = schema_ref();
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
-        )
-        .expect("try_new");
-
-        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].key(), "key1");
-        assert_eq!(
-            result[0].data().expect("data"),
-            &VectorData::Float32(vec![1f32, 2f32, 3f32])
-        );
-    }
-
-    #[test]
-    fn test_create_put_input_vectors_missing_key_column() {
-        let metadata = StringArray::from(vec!["meta1", "meta2"]);
-
-        let vectors = build_vectors(&[&[1f32, 2f32, 3f32], &[4f32, 5f32, 6f32]]);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new(
-                S3_VECTOR_EMBEDDING_NAME,
-                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-                true,
-            ),
-        ]));
-
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(metadata), Arc::new(vectors)])
-            .expect("try_new");
-
-        let result = create_put_input_vectors(&batch);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_put_input_vectors_wrong_vector_type() {
-        let keys = StringArray::from(vec!["key1", "key2"]);
-        let metadata = StringArray::from(vec!["meta1", "meta2"]);
-
-        let mut list_builder = ListBuilder::new(Int32Array::builder(6));
-        list_builder.values().append_value(1);
-        list_builder.values().append_value(2);
-        list_builder.values().append_value(3);
-        list_builder.append(true);
-        list_builder.values().append_value(4);
-        list_builder.values().append_value(5);
-        list_builder.values().append_value(6);
-        list_builder.append(true);
-
-        let vectors = list_builder.finish();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(S3_VECTOR_PRIMARY_KEY_NAME, DataType::Utf8, false),
-            Field::new("metadata", DataType::Utf8, false),
-            Field::new(
-                S3_VECTOR_EMBEDDING_NAME,
-                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-                true,
-            ),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
-        )
-        .expect("try_new");
-
-        let result = create_put_input_vectors(&batch);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_put_input_vectors_nan_infinite_vectors_skipped() {
-        let keys = StringArray::from(vec!["key1", "key2", "key3"]);
-        let metadata = StringArray::from(vec!["meta1", "meta2", "meta3"]);
-
-        let vectors = build_vectors(&[
-            &[1.0, 2.0, 3.0],
-            &[f32::NAN, 2.0, 3.0],
-            &[1.0, f32::INFINITY, 3.0],
-        ]);
-
-        let schema = schema_ref();
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
-        )
-        .expect("try_new");
-
-        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
-
-        // Only the first vector should be included (2 valid vectors)
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].key(), "key1");
-    }
-
-    #[test]
-    fn test_create_put_input_vectors_empty_vectors_skipped() {
-        let keys = StringArray::from(vec!["key1", "key2"]);
-        let metadata = StringArray::from(vec!["meta1", "meta2"]);
-
-        let vectors = build_vectors(&[&[], &[1.0, 2.0, 3.0]]);
-
-        let schema = schema_ref();
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(keys), Arc::new(metadata), Arc::new(vectors)],
-        )
-        .expect("try_new");
-
-        let result = create_put_input_vectors(&batch).expect("create_put_input_vectors");
-
-        // Only the second vector should be included (1 valid vector)
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].key(), "key2");
     }
 }

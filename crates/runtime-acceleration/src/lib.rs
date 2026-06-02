@@ -10,6 +10,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use snafu::Snafu;
 
 pub mod dataset_checkpoint;
+mod engine;
+pub mod layout;
 pub mod snapshot;
+
+pub use engine::Engine;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    AcceleratorEngineNotAvailable { name: String },
+}

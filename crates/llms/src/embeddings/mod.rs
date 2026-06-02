@@ -12,8 +12,8 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-pub use async_openai::types::EmbeddingInput;
-use async_openai::types::{
+pub use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
     EncodingFormat,
 };
@@ -27,6 +27,7 @@ use std::{fmt::Debug, sync::Arc};
 use tokio::runtime::Handle;
 use tokio::task;
 
+#[cfg(feature = "local_embed")]
 pub mod candle;
 
 #[derive(Debug, Snafu)]
@@ -39,12 +40,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to prepare input for embedding. {source}"))]
+    #[snafu(display("Failed to prepare input for embedding: {source}"))]
     FailedToPrepareInput {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create embedding. {source}."))]
+    #[snafu(display("Failed to create embedding: {source}"))]
     FailedToCreateEmbedding {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -59,17 +60,17 @@ pub enum Error {
     ))]
     InvalidPoolingMode { value: String },
 
-    #[snafu(display("Failed to create chunker. {source}."))]
+    #[snafu(display("Failed to create text chunker for embedding: {source}"))]
     FailedToCreateChunker {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to create tokenizer. {source}."))]
+    #[snafu(display("Failed to create tokenizer for embedding: {source}"))]
     FailedToCreateTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load embedding model. {source}."))]
+    #[snafu(display("Failed to load embedding model: {source}"))]
     FailedToInstantiateEmbeddingModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -88,6 +89,11 @@ pub enum Error {
         "The specified model '{model_name}' does not exist. Verify the model name and try again."
     ))]
     ModelDoesNotExist { model_name: String },
+
+    #[snafu(display(
+        "The specified local model path '{path}' does not exist. Verify the path and try again."
+    ))]
+    LocalModelPathDoesNotExist { path: String },
 
     #[snafu(display(
         "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
@@ -109,7 +115,7 @@ pub enum Error {
     ))]
     ModelNotProvided { model_source: String },
 
-    #[snafu(display("Failed to acquire a rate controller permit. {source}"))]
+    #[snafu(display("Embedding rate limit exceeded. Retry after a short delay: {source}"))]
     FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
 
     #[snafu(display(
@@ -221,7 +227,7 @@ pub trait Embed: Debug + Sync + Send {
 
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         let format = req.encoding_format.unwrap_or_default();
         let result = self.embed(req.input).await?;
@@ -246,7 +252,7 @@ pub trait Embed: Debug + Sync + Send {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub async fn get_or_infer_size(inner: &Arc<dyn Embed>) -> Result<i32> {
     let size = inner.size();
     if size != -1 {

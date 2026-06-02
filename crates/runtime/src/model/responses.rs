@@ -21,20 +21,28 @@ use crate::model::tool_use_responses::OpenAIResponsesTools;
 use crate::model::wrapper::responses::ResponsesWrapper;
 use crate::parameters::Parameters;
 use crate::tools::options::SpiceToolsOptions;
-use crate::tools::utils::get_tools;
+use crate::tools::registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools};
+use crate::tools::utils::{create_table_allowlist, get_tools_with_allowlist};
+use async_openai::error::{ApiError, OpenAIError};
+use async_trait::async_trait;
 use llms::chat::Error as LlmError;
 use llms::openai::{DEFAULT_LLM_MODEL, UsageTier};
 use llms::responses::Responses;
 use secrecy::SecretString;
 use serde_json::Value;
 use spicepod::component::model::{Model, ModelSource};
-use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, LazyLock},
+};
 
 pub type LLMResponsesModelStore = HashMap<String, Arc<dyn Responses>>;
 
 const DEFAULT_SPICE_TOOL_RECURSION_LIMIT: usize = 10;
+
+static OPENAI_RESPONSES_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| HashSet::from(["prompt_cache_key", "prompt_cache_retention"]));
 
 macro_rules! extract_secret {
     ($params:expr, $key:expr) => {
@@ -43,7 +51,7 @@ macro_rules! extract_secret {
 }
 
 /// Attempt to derive a runnable Responses model from a given component from the Spicepod definition.
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub async fn try_to_responses_model(
     component: &Model,
     params: &HashMap<String, SecretString>,
@@ -52,6 +60,16 @@ pub async fn try_to_responses_model(
     let source = component.get_source().ok_or(LlmError::UnknownModelSource {
         from: component.from.clone(),
     })?;
+
+    if !matches!(
+        source,
+        ModelSource::OpenAi | ModelSource::Azure | ModelSource::Xai
+    ) {
+        return Ok(Arc::new(UnsupportedResponsesModel::new(
+            component.name.clone(),
+            source.short_name(),
+        )));
+    }
 
     let param_spec = get_params_spec(&source).ok_or(LlmError::UnsupportedTaskForModel {
         from: component.from.clone(),
@@ -103,13 +121,27 @@ pub async fn try_to_responses_model(
         .transpose()
         .map_err(|_| unreachable!("SpiceToolsOptions::from_str has no error condition"))?;
 
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
+
     let tool_model = match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingResponses::new(
-            model,
-            openai_responses_tools.unwrap_or_default(),
-            get_tools(Arc::clone(&rt), &opts).await,
-            spice_recursion_limit,
-        )),
+        Some(opts) if opts.can_use_tools() => {
+            let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
+                LlmError::ModelParameterFailed {
+                    model: component.name.clone(),
+                    source: e,
+                }
+            })?;
+            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+            Arc::new(ToolUsingResponses::new(
+                model,
+                openai_responses_tools.unwrap_or_default(),
+                tools,
+                spice_recursion_limit,
+            ))
+        }
         Some(_) | None => model,
     };
 
@@ -128,6 +160,8 @@ fn construct_model(
     let model = match prefix {
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+
+        ModelSource::Xai => xai(model_id.as_deref(), params),
         _ => Err(LlmError::ResponsesNotSupported {
             from: component.get_source().ok_or(LlmError::UnknownModelSource {
                 from: component.from.clone(),
@@ -150,7 +184,70 @@ fn construct_model(
         model,
         component.name.as_str(),
         system_prompt,
+        get_openai_responses_request_overrides(component, params.prefix()),
     )))
+}
+
+pub fn get_openai_responses_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
+    let mut request_overrides: HashMap<String, Value> = HashMap::new();
+    for &key in OPENAI_RESPONSES_DEFAULT_PARAM_KEYS.iter() {
+        if let Some(value) = model.params.get(key) {
+            request_overrides.insert(key.to_string(), value.clone());
+        } else if let Some(value) = model.params.get(&format!("{prefix}_{key}")) {
+            request_overrides.insert(key.to_string(), value.clone());
+        } else if let Some(value) = model.params.get(&format!("openai_{key}")) {
+            request_overrides.insert(key.to_string(), value.clone());
+        }
+    }
+
+    request_overrides.into_iter().collect()
+}
+
+struct UnsupportedResponsesModel {
+    model_name: String,
+    provider: &'static str,
+}
+
+impl UnsupportedResponsesModel {
+    fn new(model_name: String, provider: &'static str) -> Self {
+        Self {
+            model_name,
+            provider,
+        }
+    }
+
+    fn error(&self) -> OpenAIError {
+        OpenAIError::ApiError(ApiError {
+            message: format!(
+                "Model '{}' uses provider '{}' which does not support the OpenAI Responses API. Use /v1/chat/completions for this model or configure a model provider that supports Responses.",
+                self.model_name, self.provider
+            ),
+            r#type: Some("invalid_request_error".to_string()),
+            param: Some("model".to_string()),
+            code: Some("invalid_request_error".to_string()),
+        })
+    }
+}
+
+#[async_trait]
+impl Responses for UnsupportedResponsesModel {
+    async fn health(&self) -> llms::responses::Result<()> {
+        Ok(())
+    }
+
+    async fn responses_stream(
+        &self,
+        _req: async_openai::types::responses::CreateResponse,
+    ) -> Result<async_openai::types::responses::ResponseStream, OpenAIError> {
+        Err(self.error())
+    }
+
+    async fn responses_request(
+        &self,
+        _req: async_openai::types::responses::CreateResponse,
+    ) -> Result<async_openai::types::responses::Response, OpenAIError> {
+        Err(self.error())
+    }
 }
 
 fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
@@ -250,4 +347,77 @@ fn azure(
         entra_token,
         api_key,
     )) as Arc<dyn Responses>)
+}
+
+fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
+    let Some(api_key) = params.get("api_key").expose().ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Arc::new(llms::xai::Xai::new(model_id, api_key)) as Arc<dyn Responses>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::CreateResponseArgs;
+    use spicepod::component::model::Model;
+
+    #[test]
+    fn test_get_openai_responses_request_overrides_with_prompt_cache() {
+        let mut model = Model::new("openai:gpt-4o", "test_model");
+        model.params.insert(
+            "prompt_cache_key".to_string(),
+            Value::String("default-key".to_string()),
+        );
+        model.params.insert(
+            "openai_prompt_cache_retention".to_string(),
+            Value::String("24h".to_string()),
+        );
+
+        let overrides = get_openai_responses_request_overrides(&model, "openai");
+
+        assert_eq!(overrides.len(), 2);
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "prompt_cache_key"
+                    && value == &Value::String("default-key".to_string()))
+        );
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "prompt_cache_retention"
+                    && value == &Value::String("24h".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_responses_model_returns_invalid_request_error() {
+        let model = UnsupportedResponsesModel::new("anthropic_model".to_string(), "anthropic");
+        let req = CreateResponseArgs::default()
+            .model("anthropic_model")
+            .input("hello")
+            .build()
+            .expect("response request should build");
+
+        let err = model
+            .responses_request(req)
+            .await
+            .expect_err("unsupported provider should return an error");
+
+        let OpenAIError::ApiError(api_error) = err else {
+            panic!("unsupported provider should return an OpenAI API error");
+        };
+
+        assert_eq!(api_error.r#type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(api_error.param.as_deref(), Some("model"));
+        assert_eq!(api_error.code.as_deref(), Some("invalid_request_error"));
+        assert!(
+            api_error
+                .message
+                .contains("does not support the OpenAI Responses API")
+        );
+    }
 }

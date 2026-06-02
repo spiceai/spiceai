@@ -15,16 +15,19 @@ limitations under the License.
 */
 
 use arrow::{array::StringArray, util::pretty::pretty_format_batches};
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Client, header::HeaderMap};
 use runtime::{Runtime, config::Config};
 use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::{
+    component::{dataset::Dataset, view::View},
+    param::Params,
+};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -35,13 +38,15 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod bedrock;
 mod embedding;
-mod hf;
+pub(crate) mod hf;
+#[cfg(feature = "duckdb")]
+mod hnsw_index;
 mod local;
 mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
-mod search;
+pub(crate) mod search;
 mod tools;
 
 mod nsql {
@@ -50,7 +55,7 @@ mod nsql {
         HeaderMap, HeaderValue,
         header::{ACCEPT, CONTENT_TYPE},
     };
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     use crate::models::http_post;
 
@@ -62,7 +67,7 @@ mod nsql {
     pub async fn run_nsql_test(
         base_url: &str,
         ts: &TestCase,
-        trace_provider: &TracerProvider,
+        trace_provider: &SdkTracerProvider,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();
@@ -107,7 +112,7 @@ mod nsql {
             format!(
                 "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
-                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                WHERE task NOT IN ('ai_completion', 'health', 'acceleration_refresh')
                 AND start_time > '{}'
                 ORDER BY task, input;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
@@ -117,7 +122,7 @@ mod nsql {
             format!(
                 "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
                 FROM runtime.task_history
-                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                WHERE task NOT IN ('ai_completion', 'health', 'acceleration_refresh')
                 AND start_time > '{}'
                 ORDER BY start_time, task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
@@ -138,22 +143,20 @@ mod nsql {
     }
 }
 
-fn create_api_bindings_config() -> Config {
+pub(crate) fn create_api_bindings_config() -> Config {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
     let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(localhost, http_port))
-        .with_flight_bind_address(SocketAddr::new(localhost, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(localhost, otel_port));
+        .with_flight_bind_address(SocketAddr::new(localhost, flight_port));
 
     tracing::debug!(
-        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
     );
 
     api_config
@@ -206,6 +209,17 @@ pub fn get_mega_science_dataset(
     question_column: Option<spicepod::semantic::Column>,
     answer_column: Option<spicepod::semantic::Column>,
 ) -> Dataset {
+    let mut dataset = mega_science_dataset(spice_name, true);
+
+    dataset.columns = [question_column, answer_column]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    dataset
+}
+
+fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
     let mut dataset = Dataset::new(
         // Can use this to run efficiently, locally:
         // "file:../../data/mega-science-small.jsonl",
@@ -217,17 +231,70 @@ pub fn get_mega_science_dataset(
             .into_iter()
             .collect(),
     ));
+
     dataset.acceleration = Some(Acceleration {
+        enabled: accelerate,
+        ..Default::default()
+    });
+
+    dataset
+}
+
+// This dataset view is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
+//
+// ```sql
+//   SELECT *
+//   FROM (
+//      SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'
+//   ) v1
+//   INNER JOIN (
+//     SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'
+//   ) v2
+//   ON v1.id = v2.id
+//   UNION ALL (
+//     SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'
+//   )
+// ```
+pub fn get_mega_science_view(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> (Dataset, Vec<View>) {
+    let ds = mega_science_dataset(Some("mega_science_ds"), false);
+
+    let mut v1 = View::new("v1".to_string());
+    v1.sql = Some(
+        "SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'"
+            .to_string(),
+    );
+
+    let mut v2 = View::new("v2".to_string());
+    v2.sql = Some(
+        "SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'".to_string(),
+    );
+    v2.acceleration = Some(Acceleration {
         enabled: true,
         ..Default::default()
     });
 
-    dataset.columns = [question_column, answer_column]
+    let mut v3 = View::new("v3".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
+
+    let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
+
+    v.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    v.columns = [question_column, answer_column]
         .into_iter()
         .flatten()
         .collect();
 
-    dataset
+    (ds, vec![v1, v2, v3, v])
 }
 
 pub fn get_tpcds_dataset(
@@ -334,7 +401,7 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
 }
 
 /// Sorts the keys of a JSON object in place for consistent snapshot testing
-fn sort_json_keys(value: &mut Value) {
+pub(crate) fn sort_json_keys(value: &mut Value) {
     match value {
         Value::Object(map) => {
             let mut sorted_map = serde_json::Map::new();
@@ -497,7 +564,7 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     let data = rt
         .datafusion()
@@ -583,7 +650,7 @@ pub(crate) fn get_local_model(
         .insert("model_type".to_string(), model_type.into().into());
     model
         .params
-        .insert("hf_max_completion_tokens".to_string(), 10.into());
+        .insert("hf_max_completion_tokens".to_string(), 4.into());
     // Local models don't require HF token for public models like Phi
     model
 }

@@ -57,6 +57,9 @@ spec:
           image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
           imagePullPolicy: Always
           workingDir: /app
+          {{- if .Values.command }}
+          command: {{ toYaml .Values.command | nindent 12 }}
+          {{- else }}
           command:
             [
               "/usr/local/bin/spiced",
@@ -65,10 +68,9 @@ spec:
               "--metrics",
               "0.0.0.0:9090",
               "--flight",
-              "0.0.0.0:50051",
-              "--open_telemetry",
-              "0.0.0.0:50052"
+              "0.0.0.0:50051"
             ]
+          {{- end }}
           env:
             {{- if .Values.additionalEnv }}
             {{- .Values.additionalEnv | toYaml | nindent 12 }}
@@ -80,20 +82,12 @@ spec:
               name: metrics
             - containerPort: 50051
               name: flight
-            - containerPort: 50052
-              name: otel
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.livenessProbe "path" "/health" "port" 8090) | nindent 12 }}
           readinessProbe:
-            httpGet:
-              path: /v1/ready
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.readinessProbe "path" "/v1/ready" "port" 8090) | nindent 12 }}
           startupProbe:
-            httpGet:
-              path: /health
-              port: 8090
+            {{- include "spiceai.probe" (dict "probe" .Values.startupProbe "path" "/health" "port" 8090) | nindent 12 }}
           volumeMounts:
             {{- if .Values.volumeMounts }}
             {{- .Values.volumeMounts | toYaml | nindent 12 }}

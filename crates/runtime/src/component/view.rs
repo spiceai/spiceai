@@ -16,9 +16,8 @@ limitations under the License.
 
 use app::App;
 use datafusion::sql::TableReference;
-use serde_json::Value;
 use snafu::prelude::*;
-use spicepod::component::view as spicepod_view;
+use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
@@ -37,11 +36,12 @@ use spicepod::semantic::Column;
 pub struct View {
     pub name: TableReference,
     pub sql: Arc<str>,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
     pub runtime: Arc<Runtime>,
+    pub vectors: Option<VectorStore>,
     pub app: Arc<App>,
 }
 
@@ -52,6 +52,7 @@ impl PartialEq for View {
             && self.metadata == other.metadata
             && self.columns == other.columns
             && self.acceleration == other.acceleration
+            && self.vectors == other.vectors
             && self.ready_state == other.ready_state
     }
 }
@@ -65,12 +66,13 @@ impl std::fmt::Debug for View {
             .field("columns", &self.columns)
             .field("acceleration", &self.acceleration)
             .field("ready_state", &self.ready_state)
+            .field("vectors", &self.vectors)
             .finish_non_exhaustive()
     }
 }
 
 impl View {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
@@ -143,6 +145,11 @@ impl View {
     }
 
     #[must_use]
+    pub fn has_embeddings(&self) -> bool {
+        self.columns.iter().any(|c| !c.embeddings.is_empty())
+    }
+
+    #[must_use]
     pub fn has_full_text_column(&self) -> bool {
         self.columns
             .iter()
@@ -153,10 +160,11 @@ impl View {
 pub struct ViewBuilder {
     pub name: TableReference,
     pub sql: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub ready_state: ReadyState,
+    pub vectors: Option<VectorStore>,
 }
 
 impl TryFrom<spicepod_view::View> for ViewBuilder {
@@ -168,7 +176,7 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         let table_reference = Dataset::parse_table_reference(&view.name)?;
 
         let sql = if let Some(view_sql) = &view.sql {
-            view_sql.to_string()
+            view_sql.clone()
         } else if let Some(sql_ref) = &view.sql_ref {
             View::load_sql_ref(sql_ref)?
         } else {
@@ -176,6 +184,8 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 name: table_reference.to_string(),
             });
         };
+
+        let metadata = view.metadata();
 
         let acceleration = view
             .acceleration
@@ -188,22 +198,15 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
                 && acc.refresh_mode != Some(acceleration::RefreshMode::Full)
             {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "Only 'refresh_mode: full' is supported".to_string(),
                 });
             }
 
             if acc.refresh_sql.is_some() {
                 return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
+                    view_name: view.name,
                     reason: "'refresh_sql' is not supported".to_string(),
-                });
-            }
-
-            if acc.on_zero_results == acceleration::ZeroResultsAction::UseSource {
-                return Err(crate::Error::AcceleratedViewInvalidConfiguration {
-                    view_name: view.name.to_string(),
-                    reason: "Only 'on_zero_results: return_empty' is supported".to_string(),
                 });
             }
         }
@@ -211,10 +214,11 @@ impl TryFrom<spicepod_view::View> for ViewBuilder {
         Ok(ViewBuilder {
             name: table_reference,
             sql,
-            metadata: view.metadata,
+            metadata,
             columns: view.columns,
             acceleration,
             ready_state: ReadyState::from(view.ready_state),
+            vectors: view.vectors,
         })
     }
 }
@@ -229,7 +233,11 @@ impl AccelerationSource for View {
             if acceleration.engine == acceleration::Engine::PostgreSQL {
                 return false;
             }
-            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+            return acceleration.enabled
+                && matches!(
+                    acceleration.mode,
+                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                );
         }
         false
     }
@@ -249,6 +257,14 @@ impl AccelerationSource for View {
     fn name(&self) -> &TableReference {
         &self.name
     }
+
+    fn time_column(&self) -> Option<&str> {
+        None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl ViewBuilder {
@@ -261,6 +277,7 @@ impl ViewBuilder {
             columns: vec![],
             acceleration: None,
             ready_state: ReadyState::default(),
+            vectors: None,
         }
     }
 
@@ -273,6 +290,7 @@ impl ViewBuilder {
             columns: self.columns,
             acceleration: self.acceleration,
             ready_state: self.ready_state,
+            vectors: self.vectors,
             runtime,
             app,
         }

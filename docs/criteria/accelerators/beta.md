@@ -6,12 +6,15 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 ## Beta Quality Accelerators
 
-| Accelerator | Beta Quality | DRI Sign-off |
-| ----------- | ------------ | ------------ |
-| Arrow       | ✅           | @Sevenannn   |
-| DuckDB      | ✅           | @peasee      |
-| SQLite      | ✅           | @sgrebnov    |
-| PostgreSQL  | ✅           | @sgrebnov    |
+| Accelerator             | Beta Quality | DRI Sign-off    |
+| ----------------------- | ------------ | --------------- |
+| Arrow                   | ✅            | @Sevenannn      |
+| Cayenne                 | ✅            | @phillipleblanc |
+| DuckDB                  | ✅            | @peasee         |
+| SQLite                  | ✅            | @sgrebnov       |
+| PostgreSQL<sup>\*</sup> | ✅            | @sgrebnov       |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## Beta Release Criteria
 
@@ -27,7 +30,7 @@ The Beta release criteria expand on and require that all [Alpha release criteria
 - [ ] The accelerator supports full federation within a single dataset (e.g. `select * from my_dataset`)
 - [ ] The accelerator supports federation push down across multiple datasets within the same accelerator (e.g. `select * from first_dataset, second_dataset`)
 - [ ] The accelerator supports resolving on conflict behaviors (e.g. Drop/Upsert)
-- [ ] Embdedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
+- [ ] Embedded accelerators support file-mode storage (e.g. SQLite, DuckDB)
 - [ ] [Core Arrow Data Types](../definitions.md) are supported
 - [ ] All known [Major Bugs](../definitions.md) are resolved
 - [ ] The accelerator supports reading datasets with the same max column count as the accelerator source.

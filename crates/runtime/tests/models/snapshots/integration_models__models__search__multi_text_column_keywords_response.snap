@@ -1,0 +1,21 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp, round_scores)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "5.06",
+      "dataset": "qs",
+      "matches": {
+        "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        ]
+      },
+      "primary_key": {
+        "id": 361
+      }
+    }
+  ]
+}

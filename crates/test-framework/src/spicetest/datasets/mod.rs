@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -25,11 +25,14 @@ use crate::{
         DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
         ThroughputMetrics, system_time_to_unix_epoch_ms,
     },
-    queries::Query,
+    queries::{Query, QueryOverrides, QuerySet},
+    telemetry::streaming::QueryMetricEvent,
 };
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
@@ -40,6 +43,7 @@ pub(crate) use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 pub enum EndCondition {
     Duration(Duration),
     QuerySetCompleted(usize),
+    Unlimited,
 }
 
 impl Default for EndCondition {
@@ -54,20 +58,45 @@ impl EndCondition {
         match self {
             EndCondition::Duration(duration) => start.elapsed() >= *duration,
             EndCondition::QuerySetCompleted(count) => query_set_count >= *count,
+            EndCondition::Unlimited => false,
         }
     }
 }
 
-#[derive(Default)]
 pub struct NotStarted {
     query_set: Vec<Query>,
     end_condition: EndCondition,
     query_count: usize,
     parallel_count: usize,
     validate: bool,
-    disable_caching: bool,
     scale_factor: f64,
-    http_client: bool,
+    query_executor: Option<Box<dyn crate::execution::QueryExecutor>>,
+    validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
+    reference_schema: Option<String>,
+    streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
+    query_duration_threshold: Option<Duration>,
+    query_set_type: Option<QuerySet>,
+    query_overrides: Option<QueryOverrides>,
+}
+
+impl Default for NotStarted {
+    fn default() -> Self {
+        Self {
+            query_set: Vec::new(),
+            end_condition: EndCondition::default(),
+            query_count: 0,
+            parallel_count: 0,
+            validate: false,
+            scale_factor: 1.0,
+            query_executor: None,
+            validation_data: None,
+            reference_schema: None,
+            streaming_metrics_sender: None,
+            query_duration_threshold: None,
+            query_set_type: None,
+            query_overrides: None,
+        }
+    }
 }
 
 impl NotStarted {
@@ -77,8 +106,11 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_disable_caching(mut self, disable_caching: bool) -> Self {
-        self.disable_caching = disable_caching;
+    pub fn with_query_executor(
+        mut self,
+        executor: Box<dyn crate::execution::QueryExecutor>,
+    ) -> Self {
+        self.query_executor = Some(executor);
         self
     }
 
@@ -114,8 +146,43 @@ impl NotStarted {
     }
 
     #[must_use]
-    pub fn with_http_client(mut self, http_client: bool) -> Self {
-        self.http_client = http_client;
+    pub fn with_validation_data(
+        mut self,
+        validation_data: HashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Self {
+        self.validation_data = Some(validation_data);
+        self
+    }
+
+    #[must_use]
+    pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
+        self.reference_schema = reference_schema;
+        self
+    }
+
+    #[must_use]
+    pub fn with_streaming_metrics(mut self, sender: mpsc::Sender<QueryMetricEvent>) -> Self {
+        self.streaming_metrics_sender = Some(sender);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_duration_threshold(mut self, threshold: Option<Duration>) -> Self {
+        self.query_duration_threshold = threshold;
+        self
+    }
+
+    /// Set the query set type (e.g., Tpch, Tpcds, Clickbench).
+    #[must_use]
+    pub fn with_query_set_type(mut self, query_set_type: QuerySet) -> Self {
+        self.query_set_type = Some(query_set_type);
+        self
+    }
+
+    /// Set query overrides for the query set.
+    #[must_use]
+    pub fn with_query_overrides(mut self, query_overrides: Option<QueryOverrides>) -> Self {
+        self.query_overrides = query_overrides;
         self
     }
 }
@@ -129,6 +196,7 @@ pub struct Running {
     query_count: usize,
     parallel_count: usize,
     end_condition: EndCondition,
+    shutdown_token: tokio_util::sync::CancellationToken,
 }
 pub struct Completed {
     pub(crate) query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
@@ -164,10 +232,14 @@ impl SpiceTest<NotStarted> {
             EndCondition::QuerySetCompleted(count) => {
                 ProgressBar::new((self.state.query_set.len() * count) as u64)
             }
+            EndCondition::Unlimited => {
+                // For unlimited tests, use a spinner-style progress bar
+                ProgressBar::new_spinner()
+            }
         }
     }
 
-    pub async fn start(self) -> Result<SpiceTest<Running>> {
+    pub fn start(mut self) -> Result<SpiceTest<Running>> {
         if self.state.query_set.is_empty() {
             return Err(anyhow::anyhow!("Query set is empty"));
         }
@@ -176,45 +248,75 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
+        // Ensure executor is configured
+        let executor = self
+            .state
+            .query_executor
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Query executor not configured"))?;
+
         let multi = if self.use_progress_bars {
             Some(MultiProgress::new())
         } else {
             None
         };
 
-        let spice_client = self
-            .get_spiced()?
-            .spice_client(self.api_key.clone(), self.state.disable_caching)
-            .await?;
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
 
-        let http_client = self.get_spiced()?.http_client()?;
-
-        let query_workers = (0..self.state.parallel_count)
-            .map(|id| {
-                let mut worker = SpiceTestQueryWorker::new(
-                    id,
-                    self.state.query_set.clone(),
-                    self.state.end_condition,
-                    spice_client.clone(),
-                    self.name.clone(),
+        let row_count_validation_skip_queries: Vec<String> = self
+            .state
+            .query_set_type
+            .as_ref()
+            .map(|qs| {
+                qs.get_row_count_validation_skip_queries(
+                    self.state.query_overrides,
+                    self.state.scale_factor,
                 )
-                .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate)
-                .with_validate(self.state.validate)
-                .with_scale_factor(self.state.scale_factor);
-
-                if let Some(multi) = &multi {
-                    worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
-                }
-
-                if self.state.http_client {
-                    worker = worker.with_http_client(http_client.clone());
-                }
-
-                worker
+                .into_iter()
+                .map(String::from)
+                .collect()
             })
-            .map(SpiceTestQueryWorker::start)
-            .collect();
+            .unwrap_or_default();
+
+        let mut query_workers = Vec::new();
+        for id in 0..self.state.parallel_count {
+            let mut worker = SpiceTestQueryWorker::new(
+                id,
+                self.state.query_set.clone(),
+                self.state.end_condition,
+                self.name.clone(),
+                executor.clone(),
+            )
+            .with_explain_plan_snapshot(self.explain_plan_snapshot)
+            .with_results_snapshot(self.results_snapshot_predicate)
+            .with_validate(self.state.validate)
+            .with_scale_factor(self.state.scale_factor)
+            .with_shutdown_token(shutdown_token.clone())
+            .with_skip_row_count_validation(row_count_validation_skip_queries.clone())
+            .with_validate_row_count(self.validate_row_count);
+
+            if let Some(multi) = &multi {
+                worker = worker.with_progress_bar(multi.add(self.get_new_progress_bar()));
+            }
+
+            if let Some(validation_data) = &self.state.validation_data {
+                worker = worker.with_validation_data(validation_data.clone());
+            }
+
+            if let Some(reference_schema) = &self.state.reference_schema {
+                worker = worker.with_reference_schema(Some(reference_schema.clone()));
+            }
+
+            if let Some(sender) = &self.state.streaming_metrics_sender {
+                worker = worker.with_streaming_metrics(sender.clone());
+            }
+
+            if let Some(threshold) = self.state.query_duration_threshold {
+                worker = worker.with_query_duration_threshold(threshold);
+            }
+
+            query_workers.push(worker.start());
+        }
 
         Ok(SpiceTest {
             name: self.name,
@@ -224,6 +326,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -231,12 +334,22 @@ impl SpiceTest<NotStarted> {
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
                 end_condition: self.state.end_condition,
+                shutdown_token,
             },
         })
     }
 }
 
 impl SpiceTest<Running> {
+    #[must_use]
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.state.shutdown_token.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.state.shutdown_token.cancel();
+    }
+
     pub async fn wait(self) -> Result<SpiceTest<Completed>> {
         let mut query_durations = BTreeMap::new();
         let mut query_iteration_durations = BTreeMap::new();
@@ -299,6 +412,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Completed {
                 query_durations,
                 query_iteration_durations,
@@ -355,6 +469,11 @@ impl SpiceTest<Completed> {
                     "Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."
                 ));
             }
+            EndCondition::Unlimited => {
+                return Err(anyhow::anyhow!(
+                    "Throughput metric calculation is not supported for unlimited tests."
+                ));
+            }
             EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
         };
 
@@ -369,11 +488,10 @@ impl SpiceTest<Completed> {
         for (query, counts) in &self.state.row_counts {
             let first = counts
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {}", query))?;
+                .ok_or_else(|| anyhow::anyhow!("No row counts found for query {query}"))?;
             if !counts.iter().all(|count| count == first) {
                 return Err(anyhow::anyhow!(
-                    "Row counts for query {} are inconsistent",
-                    query
+                    "Row counts for query {query} are inconsistent"
                 ));
             }
 

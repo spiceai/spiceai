@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spice-cloud"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,6 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 datafusion.workspace = true
-futures.workspace = true
-globset.workspace = true
 reqwest.workspace = true
 runtime = { path = "../runtime" }
 serde.workspace = true

@@ -1,0 +1,14 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: orders_pk_lookup"
+---
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                             |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | TableScan: orders projection=[o_orderkey, o_custkey, o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, o_shippriority, o_comment], full_filters=[orders.o_orderkey = Int64(1)] |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                               |
+|               |   CooperativeExec                                                                                                                                                                                |
+|               |     BytesProcessedExec                                                                                                                                                                           |
+|               |       IndexedLookupExec: indexed_scan on [o_orderkey]                                                                                                                                            |
+|               |                                                                                                                                                                                                  |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

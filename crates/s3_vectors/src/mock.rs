@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![expect(clippy::expect_used)]
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -54,16 +55,24 @@ use aws_sdk_s3vectors::{
         put_vectors::{PutVectorsError, PutVectorsInput, PutVectorsOutput},
         query_vectors::{QueryVectorsError, QueryVectorsInput, QueryVectorsOutput},
     },
-    types::ListOutputVector,
+    types::{
+        DataType, DistanceMetric, Index, IndexSummary, ListOutputVector,
+        error::{ConflictException, NotFoundException, ServiceQuotaExceededException},
+    },
 };
-pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildError};
+use aws_smithy_runtime_api::{client::result::ServiceError, http::StatusCode};
+use aws_smithy_types::body::SdkBody;
 
-use crate::S3Vectors;
+use crate::{DateTime, S3Vectors};
 
 #[derive(Default, Debug)]
 pub struct MockData {
     pub indexes: HashMap<String, Vec<aws_sdk_s3vectors::types::IndexSummary>>,
     pub vectors: HashMap<String, Vec<ListOutputVector>>,
+    pub vector_counts: HashMap<String, usize>, // Track number of vectors per index
+    pub quota_limits: HashMap<String, usize>,  // Configurable quota limits per index
+    pub list_indexes_calls: HashMap<String, usize>, // bucket -> call count
+    pub create_index_calls: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,92 +85,234 @@ impl MockClient {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Set a quota limit for a specific index (number of vectors allowed)
+    pub fn set_quota_limit(&self, index_name: &str, limit: usize) {
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.quota_limits.insert(index_name.to_string(), limit);
+    }
+
+    /// Get the current vector count for an index
+    #[must_use]
+    pub fn get_vector_count(&self, index_name: &str) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        *data.vector_counts.get(index_name).unwrap_or(&0)
+    }
+
+    /// Get the call count for `list_indexes` on a specific bucket
+    #[must_use]
+    pub fn get_list_indexes_call_count(&self, bucket: &str) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        *data.list_indexes_calls.get(bucket).unwrap_or(&0)
+    }
+
+    /// Get the total call count for `create_index`
+    #[must_use]
+    pub fn get_create_index_call_count(&self) -> usize {
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.create_index_calls
+    }
+
+    /// Reset all call counts
+    pub fn reset_call_counts(&self) {
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+        data.list_indexes_calls.clear();
+        data.create_index_calls = 0;
+    }
 }
 
 #[async_trait]
 impl S3Vectors for MockClient {
     async fn create_index(
         &self,
-        _input: CreateIndexInput,
-    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError, HttpResponse>> {
-        unimplemented!()
+        input: &CreateIndexInput,
+    ) -> Result<CreateIndexOutput, SdkError<CreateIndexError>> {
+        let bucket_name = input.vector_bucket_name().unwrap_or_default();
+        let index_name = input.index_name().unwrap_or_default();
+
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+
+        // Only reinitialise if not exists.
+        if data.vector_counts.contains_key(index_name) {
+            return Err(SdkError::service_error(
+                CreateIndexError::ConflictException(
+                    ConflictException::builder()
+                        .message(format!("index '{index_name}' exists"))
+                        .build()
+                        .expect("msg"),
+                ),
+                HttpResponse::new(
+                    StatusCode::try_from(403).expect("403 is an okay status code"),
+                    SdkBody::empty(),
+                ),
+            ));
+        }
+        let bucket_indexes = data.indexes.entry(bucket_name.to_string()).or_default();
+
+        let index_summary = IndexSummary::builder()
+            .index_name(index_name)
+            .vector_bucket_name(bucket_name)
+            .index_arn(format!("arn:aws:s3vectors:::{bucket_name}:{index_name}"))
+            .creation_time(DateTime::from_secs(0))
+            .build()
+            .map_err(|_| SdkError::construction_failure("build"))?;
+
+        bucket_indexes.push(index_summary);
+
+        data.vector_counts.insert(index_name.to_string(), 0);
+        data.create_index_calls += 1;
+
+        Ok(CreateIndexOutput::builder().build())
     }
 
     async fn create_vector_bucket(
         &self,
-        _input: CreateVectorBucketInput,
-    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError, HttpResponse>> {
-        unimplemented!()
+        _input: &CreateVectorBucketInput,
+    ) -> Result<CreateVectorBucketOutput, SdkError<CreateVectorBucketError>> {
+        Ok(CreateVectorBucketOutput::builder().build())
     }
 
     async fn delete_index(
         &self,
-        _input: DeleteIndexInput,
-    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError, HttpResponse>> {
+        _input: &DeleteIndexInput,
+    ) -> Result<DeleteIndexOutput, SdkError<DeleteIndexError>> {
         unimplemented!()
     }
 
     async fn delete_vector_bucket(
         &self,
-        _input: DeleteVectorBucketInput,
-    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError, HttpResponse>> {
+        _input: &DeleteVectorBucketInput,
+    ) -> Result<DeleteVectorBucketOutput, SdkError<DeleteVectorBucketError>> {
         unimplemented!()
     }
 
     async fn delete_vector_bucket_policy(
         &self,
-        _input: DeleteVectorBucketPolicyInput,
-    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError, HttpResponse>>
-    {
+        _input: &DeleteVectorBucketPolicyInput,
+    ) -> Result<DeleteVectorBucketPolicyOutput, SdkError<DeleteVectorBucketPolicyError>> {
         unimplemented!()
     }
 
     async fn delete_vectors(
         &self,
-        _input: DeleteVectorsInput,
-    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError, HttpResponse>> {
+        _input: &DeleteVectorsInput,
+    ) -> Result<DeleteVectorsOutput, SdkError<DeleteVectorsError>> {
         unimplemented!()
     }
 
     async fn get_index(
         &self,
-        _input: GetIndexInput,
-    ) -> Result<GetIndexOutput, SdkError<GetIndexError, HttpResponse>> {
-        unimplemented!()
+        input: &GetIndexInput,
+    ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
+        let bucket_name = input.vector_bucket_name().unwrap_or_default();
+        let index_name = input.index_name().unwrap_or_default();
+
+        let data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+
+        let empty = Vec::<IndexSummary>::new();
+        let bucket_indexes = data
+            .indexes
+            .get(bucket_name)
+            .map_or(empty.as_slice(), Vec::as_slice);
+        let index_summary = bucket_indexes
+            .iter()
+            .find(|idx| idx.index_name() == index_name);
+
+        match index_summary {
+            Some(index) => {
+                let index_details = Index::builder()
+                    .index_name(index.index_name())
+                    .vector_bucket_name(bucket_name)
+                    .index_arn(format!(
+                        "arn:aws:s3vectors:::{bucket_name}:{}",
+                        index.index_name()
+                    ))
+                    .creation_time(DateTime::from_secs(1))
+                    .data_type(DataType::Float32)
+                    .dimension(384)
+                    .distance_metric(DistanceMetric::Cosine)
+                    .build()
+                    .map_err(|_| SdkError::construction_failure("build"))?;
+
+                Ok(GetIndexOutput::builder().index(index_details).build())
+            }
+            None => Err(SdkError::service_error(
+                GetIndexError::NotFoundException(
+                    NotFoundException::builder()
+                        .message(format!("Index '{bucket_name}/{index_name}' not found"))
+                        .build()
+                        .expect("msg"),
+                ),
+                HttpResponse::new(
+                    StatusCode::try_from(404).expect("404 is an okay status code"),
+                    SdkBody::empty(),
+                ),
+            )),
+        }
     }
 
     async fn get_vector_bucket(
         &self,
-        _input: GetVectorBucketInput,
-    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError, HttpResponse>> {
-        unimplemented!()
+        _input: &GetVectorBucketInput,
+    ) -> Result<GetVectorBucketOutput, SdkError<GetVectorBucketError>> {
+        Ok(GetVectorBucketOutput::builder().build())
     }
 
     async fn get_vector_bucket_policy(
         &self,
-        _input: GetVectorBucketPolicyInput,
-    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError, HttpResponse>>
-    {
+        _input: &GetVectorBucketPolicyInput,
+    ) -> Result<GetVectorBucketPolicyOutput, SdkError<GetVectorBucketPolicyError>> {
         unimplemented!()
     }
 
     async fn get_vectors(
         &self,
-        _input: GetVectorsInput,
-    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError, HttpResponse>> {
+        _input: &GetVectorsInput,
+    ) -> Result<GetVectorsOutput, SdkError<GetVectorsError>> {
         unimplemented!()
     }
 
     async fn list_indexes(
         &self,
-        input: ListIndexesInput,
-    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError, HttpResponse>> {
+        input: &ListIndexesInput,
+    ) -> Result<ListIndexesOutput, SdkError<ListIndexesError>> {
         let bucket_name = input.vector_bucket_name().unwrap_or_default();
-        let data = match self.data.lock() {
+        let mut data = match self.data.lock() {
             Ok(lock) => lock,
             Err(e) => e.into_inner(),
         };
-        let bucket_indexes = data.indexes.get(bucket_name).cloned().unwrap_or_default();
+        let mut bucket_indexes = data.indexes.get(bucket_name).cloned().unwrap_or_default();
+
+        // Filter by prefix if provided
+        if let Some(prefix) = input.prefix() {
+            bucket_indexes.retain(|idx| idx.index_name().starts_with(prefix));
+        }
+
+        *data
+            .list_indexes_calls
+            .entry(bucket_name.to_string())
+            .or_insert(0) += 1;
 
         Ok(ListIndexesOutput::builder()
             .set_indexes(Some(bucket_indexes))
@@ -170,15 +321,15 @@ impl S3Vectors for MockClient {
 
     async fn list_vector_buckets(
         &self,
-        _input: ListVectorBucketsInput,
-    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError, HttpResponse>> {
+        _input: &ListVectorBucketsInput,
+    ) -> Result<ListVectorBucketsOutput, SdkError<ListVectorBucketsError>> {
         unimplemented!()
     }
 
     async fn list_vectors(
         &self,
-        input: ListVectorsInput,
-    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError, HttpResponse>> {
+        input: &ListVectorsInput,
+    ) -> Result<ListVectorsOutput, SdkError<ListVectorsError>> {
         let index_name = input.index_name().unwrap_or_default();
         let data = match self.data.lock() {
             Ok(lock) => lock,
@@ -193,23 +344,53 @@ impl S3Vectors for MockClient {
 
     async fn put_vector_bucket_policy(
         &self,
-        _input: PutVectorBucketPolicyInput,
-    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError, HttpResponse>>
-    {
+        _input: &PutVectorBucketPolicyInput,
+    ) -> Result<PutVectorBucketPolicyOutput, SdkError<PutVectorBucketPolicyError>> {
         unimplemented!()
     }
 
     async fn put_vectors(
         &self,
-        _input: PutVectorsInput,
-    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError, HttpResponse>> {
-        unimplemented!()
+        input: &PutVectorsInput,
+    ) -> Result<PutVectorsOutput, SdkError<PutVectorsError>> {
+        let index_name = input.index_name().unwrap_or_default();
+        let num_vectors = input.vectors().len();
+
+        let mut data = match self.data.lock() {
+            Ok(lock) => lock,
+            Err(e) => e.into_inner(),
+        };
+
+        let current_count = *data.vector_counts.get(index_name).unwrap_or(&0);
+        let quota_limit = *data.quota_limits.get(index_name).unwrap_or(&usize::MAX);
+
+        if current_count + num_vectors > quota_limit {
+            return Err(SdkError::ServiceError(
+                ServiceError::builder()
+                    .source(PutVectorsError::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException::builder()
+                            .message("Vector quota exceeded")
+                            .build()
+                            .map_err(|_| SdkError::construction_failure("build"))?,
+                    ))
+                    .raw(HttpResponse::new(
+                        StatusCode::try_from(402)
+                            .map_err(|_| SdkError::construction_failure("status code"))?,
+                        SdkBody::empty(),
+                    ))
+                    .build(),
+            ));
+        }
+
+        let new_count = current_count + num_vectors;
+        data.vector_counts.insert(index_name.to_string(), new_count);
+        Ok(PutVectorsOutput::builder().build())
     }
 
     async fn query_vectors(
         &self,
-        _input: QueryVectorsInput,
-    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError, HttpResponse>> {
+        _input: &QueryVectorsInput,
+    ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
         unimplemented!()
     }
 }

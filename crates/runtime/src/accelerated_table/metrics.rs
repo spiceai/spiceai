@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
-
 use opentelemetry::{
     global,
     metrics::{Counter, Gauge, Histogram, Meter},
 };
+use std::sync::LazyLock;
+use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_before_refresh_ms";
@@ -27,6 +27,7 @@ pub const METRIC_MAX_TIMESTAMP_AFTER_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_after_refresh_ms";
 pub const METRIC_REFRESH_LAG_MS: &str = "dataset_acceleration_refresh_lag_ms";
 pub const METRIC_INGESTION_LAG_MS: &str = "dataset_acceleration_ingestion_lag_ms";
+pub const METRIC_REFRESH_WORKER_PANICS: &str = "dataset_acceleration_refresh_worker_panics";
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("dataset_acceleration"));
 
@@ -37,10 +38,31 @@ pub(crate) static REFRESH_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub(crate) static REFRESH_DATA_FETCHES_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_data_fetches_skipped")
+        .with_description("Number of refresh data fetches skipped due to unchanged file metadata.")
+        .build()
+});
+
+pub(crate) static REFRESH_PROCESSED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_processed_rows")
+        .with_description("Number of rows processed during dataset refresh.")
+        .build()
+});
+
+pub(crate) static REFRESH_PROCESSED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_processed_bytes")
+        .with_description("Number of bytes processed during dataset refresh.")
+        .build()
+});
+
 pub(crate) static LAST_REFRESH_TIME_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
-        .f64_gauge("dataset_acceleration_last_refresh_time_ms")
-        .with_description("Unix timestamp in seconds when the last refresh completed.")
+        .f64_gauge("dataset_acceleration_last_refresh_unix_time_ms")
+        .with_description("Unix timestamp in milliseconds when the last refresh completed.")
         .with_unit("ms")
         .build()
 });
@@ -50,6 +72,14 @@ pub(crate) static REFRESH_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(
         .f64_histogram("dataset_acceleration_refresh_duration_ms")
         .with_description("Duration in milliseconds to load a full or appended refresh data.")
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+pub(crate) static REFRESH_WORKER_PANICS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter(METRIC_REFRESH_WORKER_PANICS)
+        .with_description("Number of times a refresh worker panicked while refreshing a dataset.")
         .build()
 });
 
@@ -85,5 +115,67 @@ pub(crate) static INGESTION_LAG_MS: LazyLock<Gauge<i64>> = LazyLock::new(|| {
     METER
         .i64_gauge(METRIC_INGESTION_LAG_MS)
         .with_description("Lag between the current wall-clock time and the maximum time_column value after the refresh operation, in milliseconds.")
+        .build()
+});
+
+pub(crate) static SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("dataset_acceleration_size_bytes")
+        .with_description("Size of the accelerated table storage in bytes.")
+        .with_unit("By")
+        .build()
+});
+
+pub(crate) static REFRESH_ROWS_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_rows_written")
+        .with_description(
+            "Cumulative number of rows read from the federated source and written into the accelerated table.",
+        )
+        .with_unit("rows")
+        .build()
+});
+
+pub(crate) static REFRESH_BYTES_WRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("dataset_acceleration_refresh_bytes_written")
+        .with_description(
+            "Cumulative number of bytes (Arrow in-memory size) read from the federated source and written into the accelerated table.",
+        )
+        .with_unit("By")
+        .build()
+});
+
+pub(crate) static CDC_APPLY_BURST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_apply_burst_duration_ms")
+        .with_description("Duration in milliseconds to apply one coalesced CDC burst.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+pub(crate) static CDC_APPLY_BURST_BYTES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("dataset_acceleration_cdc_apply_burst_bytes")
+        .with_description("Arrow in-memory bytes in one coalesced CDC apply burst.")
+        .with_unit("By")
+        .build()
+});
+
+pub(crate) static CDC_APPLY_BURST_ENVELOPES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("dataset_acceleration_cdc_apply_burst_envelopes")
+        .with_description("Number of source envelopes in one coalesced CDC apply burst.")
+        .with_unit("envelopes")
+        .build()
+});
+
+pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_apply_fixed_cost_ms")
+        .with_description("Duration in milliseconds for fixed-cost phases of CDC apply.")
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });

@@ -24,12 +24,14 @@ use serde_json::Value;
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
 use crate::component::access::AccessMode;
+use crate::fts::FtsStore;
+use crate::metadata::metadata_value_to_string;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TimeFormat {
@@ -41,6 +43,34 @@ pub enum TimeFormat {
     #[serde(rename = "ISO8601")]
     ISO8601,
     Date,
+}
+
+impl<'de> serde::Deserialize<'de> for TimeFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "timestamp" => Ok(TimeFormat::Timestamp),
+            "timestamptz" => Ok(TimeFormat::Timestamptz),
+            "unix_seconds" => Ok(TimeFormat::UnixSeconds),
+            "unix_millis" => Ok(TimeFormat::UnixMillis),
+            "iso8601" => Ok(TimeFormat::ISO8601),
+            "date" => Ok(TimeFormat::Date),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &[
+                    "timestamp",
+                    "timestamptz",
+                    "unix_seconds",
+                    "unix_millis",
+                    "ISO8601",
+                    "date",
+                ],
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for TimeFormat {
@@ -60,6 +90,34 @@ pub enum UnsupportedTypeAction {
     String,
 }
 
+/// Policy for handling source schema changes after the dataset is registered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OnSchemaChange {
+    /// Block schema changes from being applied automatically. The dataset stays healthy and
+    /// continues serving queries using the registered schema.
+    #[default]
+    Block,
+    /// Fail when the projected source schema diverges from the registered dataset schema.
+    Fail,
+    /// Add new source columns to the registered schema; reject removals and incompatible changes.
+    AppendNewColumns,
+    /// Keep the registered dataset schema synchronized with the projected source schema.
+    SyncAllColumns,
+}
+
+impl std::fmt::Display for OnSchemaChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OnSchemaChange::Block => write!(f, "block"),
+            OnSchemaChange::Fail => write!(f, "fail"),
+            OnSchemaChange::AppendNewColumns => write!(f, "append_new_columns"),
+            OnSchemaChange::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
+    }
+}
+
 /// Controls when the dataset is marked ready for queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -70,6 +128,11 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+    /// The table is ready once the federated source's schema has been resolved (which also implies access
+    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
+    /// fall back to the federated source until the initial load completes. Subsequent refresh failures are
+    /// still reported via dataset status and metrics.
+    OnSchemaResolved,
 }
 
 /// Controls whether the federated table periodically has its availability checked.
@@ -139,6 +202,14 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
 
+    /// Controls how the runtime handles source schema changes after the dataset is registered.
+    ///
+    /// Options: `block` / `fail` / `append_new_columns` / `sync_all_columns`.
+    ///
+    /// `block` (default) keeps the dataset healthy and queryable using the registered schema.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub on_schema_change: OnSchemaChange,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
 
@@ -147,6 +218,12 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
+
+    /// Dataset-level full-text search store configuration.
+    /// When present, overrides the per-column `index_store` setting and routes
+    /// FTS through the specified external engine (e.g. `elasticsearch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text_search: Option<FtsStore>,
 
     /// Configures whether the dataset availability monitor is enabled for this dataset.
     /// When enabled, the runtime will periodically check dataset availability
@@ -182,10 +259,20 @@ impl Dataset {
             embeddings: Vec::default(),
             depends_on: Vec::default(),
             unsupported_type_action: None,
+            on_schema_change: OnSchemaChange::default(),
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
+            full_text_search: None,
             check_availability: CheckAvailability::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_params(self, params: Params) -> Self {
+        Self {
+            params: Some(params),
+            ..self
         }
     }
 
@@ -233,10 +320,10 @@ impl Dataset {
     pub fn metadata(&self) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
         if let Some(d) = self.description.as_ref() {
-            metadata.insert("description".to_string(), d.to_string());
+            metadata.insert("description".to_string(), d.clone());
         }
         for (k, v) in &self.metadata {
-            metadata.insert(k.to_string(), v.to_string());
+            metadata.insert(k.clone(), metadata_value_to_string(v));
         }
         metadata
     }
@@ -262,9 +349,11 @@ impl WithDependsOn<Dataset> for Dataset {
             embeddings: self.embeddings.clone(),
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
+            on_schema_change: self.on_schema_change,
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
+            full_text_search: self.full_text_search.clone(),
             check_availability: self.check_availability,
         }
     }
@@ -335,17 +424,21 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
+    on_schema_change: OnSchemaChange,
+    #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metrics: Option<Metrics>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_text_search: Option<FtsStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -390,9 +483,11 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             embeddings: deserializer.embeddings,
             depends_on: deserializer.depends_on,
             unsupported_type_action,
+            on_schema_change: deserializer.on_schema_change,
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
+            full_text_search: deserializer.full_text_search,
             check_availability: deserializer.check_availability,
         })
     }
@@ -401,7 +496,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
 #[cfg(test)]
 mod check_availability_tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_check_availability_enabled_by_default() {
@@ -409,7 +504,7 @@ mod check_availability_tests {
             name: test
             from: file://test.csv
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 
@@ -420,7 +515,7 @@ mod check_availability_tests {
             from: file://test.csv
             check_availability: disabled
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Disabled);
     }
 
@@ -431,16 +526,15 @@ mod check_availability_tests {
             from: file://test.csv
             check_availability: auto
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_invalid_type_action_migration() {
@@ -450,7 +544,7 @@ mod tests {
             from: test
             invalid_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -462,7 +556,7 @@ mod tests {
             from: test
             unsupported_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -475,7 +569,7 @@ mod tests {
             invalid_type_action: error
             unsupported_type_action: warn
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(
             dataset.unsupported_type_action,
             Some(UnsupportedTypeAction::Warn)
@@ -486,7 +580,142 @@ mod tests {
             name: test
             from: test
         ";
-        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.unsupported_type_action, None);
+    }
+
+    #[test]
+    fn test_time_format_case_insensitive_iso8601() {
+        // Uppercase ISO8601 (original format)
+        let yaml = r"
+            name: test
+            from: test
+            time_format: ISO8601
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+
+        // Lowercase iso8601
+        let yaml = r"
+            name: test
+            from: test
+            time_format: iso8601
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+
+        // Mixed case Iso8601
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Iso8601
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::ISO8601));
+    }
+
+    #[test]
+    fn test_deserialize_default_on_schema_change() {
+        let yaml = r"
+            name: test
+            from: test
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.on_schema_change, OnSchemaChange::Block);
+    }
+
+    #[test]
+    fn test_deserialize_all_on_schema_change_modes() {
+        for (yaml_value, expected) in [
+            ("block", OnSchemaChange::Block),
+            ("fail", OnSchemaChange::Fail),
+            ("append_new_columns", OnSchemaChange::AppendNewColumns),
+            ("sync_all_columns", OnSchemaChange::SyncAllColumns),
+        ] {
+            let yaml = format!(
+                r"
+                    name: test
+                    from: test
+                    on_schema_change: {yaml_value}
+                "
+            );
+            let dataset: Dataset = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse on_schema_change '{yaml_value}'"));
+            assert_eq!(
+                dataset.on_schema_change, expected,
+                "unexpected parse for '{yaml_value}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_time_format_case_insensitive_other_variants() {
+        // Uppercase TIMESTAMP
+        let yaml = r"
+            name: test
+            from: test
+            time_format: TIMESTAMP
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Timestamp));
+
+        // Mixed case Unix_Seconds
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Unix_Seconds
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixSeconds));
+
+        // Uppercase UNIX_MILLIS
+        let yaml = r"
+            name: test
+            from: test
+            time_format: UNIX_MILLIS
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::UnixMillis));
+
+        // Mixed case Timestamptz
+        let yaml = r"
+            name: test
+            from: test
+            time_format: Timestamptz
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Timestamptz));
+
+        // Uppercase DATE
+        let yaml = r"
+            name: test
+            from: test
+            time_format: DATE
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_format, Some(TimeFormat::Date));
+    }
+
+    #[test]
+    fn test_time_format_invalid_value() {
+        let yaml = r"
+            name: test
+            from: test
+            time_format: invalid_format
+        ";
+        let result: Result<Dataset, _> = yaml::from_str(yaml);
+        result.expect_err("invalid time_format should fail to parse");
+    }
+
+    #[test]
+    fn test_time_partition_format_case_insensitive() {
+        // Verify time_partition_format also benefits from case-insensitive parsing
+        let yaml = r"
+            name: test
+            from: test
+            time_partition_format: iso8601
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.time_partition_format, Some(TimeFormat::ISO8601));
     }
 }

@@ -26,7 +26,11 @@ use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
 pub mod embed;
+pub mod list_models;
 pub mod responses;
+mod responses_adapter;
+
+pub use list_models::OpenAiModelLister;
 
 pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
 
@@ -35,6 +39,13 @@ pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_LLM_MODEL: &str = GPT_4O_MINI;
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatBackend {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UsageTier {
@@ -98,6 +109,7 @@ pub struct Openai<C: Config + Clone> {
     model: String,
 
     rate_controller: Arc<RateController>,
+    chat_backend: ChatBackend,
 }
 
 pub(crate) fn default_rate_controller() -> Arc<RateController> {
@@ -121,6 +133,27 @@ pub fn new_azure_client(
     entra_token: Option<&str>,
     api_key: Option<&str>,
 ) -> Openai<AzureConfig> {
+    new_azure_client_with_chat_backend(
+        model,
+        api_base,
+        api_version,
+        deployment_name,
+        entra_token,
+        api_key,
+        ChatBackend::ChatCompletions,
+    )
+}
+
+#[must_use]
+pub fn new_azure_client_with_chat_backend(
+    model: String,
+    api_base: Option<&str>,
+    api_version: Option<&str>,
+    deployment_name: Option<&str>,
+    entra_token: Option<&str>,
+    api_key: Option<&str>,
+    chat_backend: ChatBackend,
+) -> Openai<AzureConfig> {
     let mut cfg = AzureConfig::new().with_deployment_id(deployment_name.unwrap_or(model.as_str()));
 
     if let Some(api_base) = api_base {
@@ -143,6 +176,7 @@ pub fn new_azure_client(
         client: Client::with_config(cfg),
         model,
         rate_controller: default_rate_controller(),
+        chat_backend,
     }
 }
 
@@ -154,6 +188,27 @@ pub fn new_openai_client(
     org_id: Option<&str>,
     project_id: Option<&str>,
     usage_tier: Option<UsageTier>,
+) -> Openai<OpenAIConfig> {
+    new_openai_client_with_chat_backend(
+        model,
+        api_base,
+        api_key,
+        org_id,
+        project_id,
+        usage_tier,
+        ChatBackend::ChatCompletions,
+    )
+}
+
+#[must_use]
+pub fn new_openai_client_with_chat_backend(
+    model: String,
+    api_base: Option<&str>,
+    api_key: Option<&str>,
+    org_id: Option<&str>,
+    project_id: Option<&str>,
+    usage_tier: Option<UsageTier>,
+    chat_backend: ChatBackend,
 ) -> Openai<OpenAIConfig> {
     // Default to empty API key to avoid picking up ENV variable in downstream library.
     let mut cfg = OpenAIConfig::new().with_api_key("");
@@ -177,6 +232,7 @@ pub fn new_openai_client(
         client: Client::with_config(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
+        chat_backend,
     }
 }
 
@@ -189,6 +245,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
         client: Client::with_config(cfg),
         model,
         rate_controller: default_rate_controller(),
+        chat_backend: ChatBackend::ChatCompletions,
     }
 }
 

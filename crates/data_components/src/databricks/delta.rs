@@ -24,12 +24,14 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::TokenProvider;
+use tokio::runtime::Handle;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
     endpoint: Endpoint,
     token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
+    io_runtime: Handle,
 }
 
 #[derive(Debug, Snafu)]
@@ -49,11 +51,13 @@ impl DatabricksDelta {
         endpoint: Endpoint,
         storage_options: HashMap<String, SecretString>,
         token_provider: Arc<dyn TokenProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             endpoint,
             token_provider,
             storage_options,
+            io_runtime,
         }
     }
 
@@ -71,17 +75,16 @@ impl DatabricksDelta {
                     storage_options.insert("timeout".into(), value.clone());
                 }
                 _ => {
-                    storage_options.insert(key.to_string(), value.clone());
+                    storage_options.insert(key.clone(), value.clone());
                 }
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options)?;
+        let delta_table = DeltaTable::from(table_uri, storage_options, &self.io_runtime).boxed()?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }
 
-    #[allow(clippy::implicit_hasher)]
     pub async fn resolve_table_uri(
         &self,
         table_reference: TableReference,
@@ -89,7 +92,9 @@ impl DatabricksDelta {
         let uc_client = UnityCatalog::new(
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
-        );
+            None,
+        )
+        .boxed()?;
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 

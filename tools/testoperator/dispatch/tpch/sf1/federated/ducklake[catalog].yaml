@@ -1,0 +1,11 @@
+tests:
+  bench:
+    spicepod_path: federated/ducklake[catalog].yaml
+    query_set: tpch
+    query_overrides: ducklake-catalog
+    runner_type: spiceai-dev-runners
+    validate_results: true
+  schema:
+    spicepod_path: federated/ducklake[catalog].yaml
+    runner_type: spiceai-dev-runners
+    min_tables: 1

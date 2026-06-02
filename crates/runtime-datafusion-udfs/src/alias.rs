@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -31,20 +32,20 @@ use datafusion::{
 };
 
 /// Aliases an existing Scalar UDF to a new name.
-#[derive(Debug)]
-pub struct ScalarUDFAlias {
-    scalar_udf: Arc<dyn ScalarUDFImpl>,
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct ScalarUDFAlias<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> {
+    scalar_udf: Arc<T>,
     alias: &'static str,
 }
 
-impl ScalarUDFAlias {
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFAlias<T> {
     #[must_use]
-    pub fn new(scalar_udf: Arc<dyn ScalarUDFImpl>, alias: &'static str) -> Self {
+    pub fn new(scalar_udf: Arc<T>, alias: &'static str) -> Self {
         Self { scalar_udf, alias }
     }
 }
 
-impl ScalarUDFImpl for ScalarUDFAlias {
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFImpl for ScalarUDFAlias<T> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

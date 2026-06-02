@@ -15,19 +15,42 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    hash::DefaultHasher,
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use std::time::Duration;
+use std::hash::Hash;
+use std::hash::Hasher;
 use token_provider::{Result, TokenProvider};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
+
+// Ensure the aws-lc-rs crypto provider is installed for jsonwebtoken before the first JWT
+// operation. This is required because Cargo feature unification can activate both `aws_lc_rs`
+// and `rust_crypto` features simultaneously (e.g. via a transitive dep like octocrab), causing
+// jsonwebtoken's auto-detection to panic at runtime. Calling install_default() here makes it a
+// compile error if the `aws_lc_rs` feature is ever missing, and a safe no-op if already set.
+static JWT_CRYPTO_INIT: OnceLock<()> = OnceLock::new();
+
+fn ensure_jwt_crypto_provider() {
+    JWT_CRYPTO_INIT.get_or_init(|| {
+        // install_default() returns Err only if a provider is already installed by another caller
+        // (e.g. a test harness). That is not an error — any installed provider is acceptable here.
+        // The only real failure mode (aws_lc_rs feature missing) is a compile error: the symbol
+        // jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER would not exist.
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+    });
+}
 
 #[derive(Debug, Snafu)]
 pub enum GitHubAppError {
@@ -66,9 +89,16 @@ pub struct GitHubAppTokenProvider {
     app_client_id: Arc<str>,
     private_key: Arc<str>,
     installation_id: Arc<str>,
-    tx: watch::Sender<String>,
-    rx: watch::Receiver<String>,
+    rx: watch::Receiver<SecretString>,
     _handle: Arc<JoinHandle<()>>,
+}
+
+impl Hash for GitHubAppTokenProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Only hash non-sensitive identifiers; do not include the private key.
+        self.app_client_id.hash(state);
+        self.installation_id.hash(state);
+    }
 }
 
 impl std::fmt::Debug for GitHubAppTokenProvider {
@@ -83,11 +113,37 @@ impl std::fmt::Debug for GitHubAppTokenProvider {
 
 impl TokenProvider for GitHubAppTokenProvider {
     fn get_token(&self) -> String {
-        self.rx.borrow().clone()
+        self.rx.borrow().expose_secret().to_string()
+    }
+
+    fn dyn_hash(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish().to_string()
     }
 
     fn subscribe(&self) -> Option<watch::Receiver<String>> {
-        Some(self.tx.subscribe())
+        let mut secret_rx = self.rx.clone();
+        let (tx, rx) = watch::channel(secret_rx.borrow().expose_secret().to_string());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tx.closed() => {
+                        break;
+                    }
+                    changed = secret_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let exposed = secret_rx.borrow().expose_secret().to_string();
+                        if tx.send(exposed).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
@@ -111,7 +167,7 @@ impl GitHubAppTokenProvider {
         let cloned_app_client_id = Arc::clone(&app_client_id);
         let cloned_private_key = Arc::clone(&private_key);
         let cloned_installation_id = Arc::clone(&installation_id);
-        let cloned_tx = tx.clone();
+        let cloned_tx = tx;
 
         let handle = tokio::spawn(async move {
             let mut backoff = FibonacciBackoffBuilder::new()
@@ -154,20 +210,28 @@ impl GitHubAppTokenProvider {
             app_client_id,
             private_key,
             installation_id,
-            tx,
             rx,
             _handle: Arc::new(handle),
         })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GitHubToken {
-    pub token: String,
+    pub token: SecretString,
     pub expires_at: DateTime<Utc>,
 }
+
+impl fmt::Debug for GitHubToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitHubToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
 impl GitHubToken {
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     #[must_use]
     pub fn next_wait(&self) -> Duration {
         Duration::from_secs(
@@ -188,6 +252,8 @@ async fn generate_token(
     private_key: Arc<str>,
     installation_id: Arc<str>,
 ) -> Result<GitHubToken, GitHubAppError> {
+    ensure_jwt_crypto_provider();
+
     let iat = usize::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -209,7 +275,12 @@ async fn generate_token(
     let jwt_token = encode(&Header::new(Algorithm::RS256), &claims, &encoding_key)
         .context(UnableToGenerateJWTSnafu {})?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(util::spiceai_user_agent())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
     let response = client
         .post(format!(
@@ -223,10 +294,10 @@ async fn generate_token(
         .await
         .context(UnableToGetGitHubInstallationAccessTokenSnafu {})?;
 
-    #[allow(clippy::items_after_statements)]
+    #[expect(clippy::items_after_statements)]
     #[derive(Deserialize, Debug)]
     struct TokenResponse {
-        token: String,
+        token: SecretString,
         expires_at: String,
     }
     let resp: TokenResponse = response

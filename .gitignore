@@ -16,6 +16,7 @@ Makefile.local
 *.parquet
 spicepod.yaml
 !test/tpc-bench/tpch-spicepod/spicepod.yaml
+!examples/cosmosdb-connector/spicepod.yaml
 
 target/
 
@@ -58,6 +59,7 @@ venv
 /result
 
 .env
+.make-lint.log
 .spice
 .data/
 data/
@@ -68,3 +70,24 @@ data/
 !test/nsql_bench/data
 !crates/runtime/tests/acceleration/data
 !crates/runtime/tests/acceleration/spicepods
+
+# Database files
+*.db
+*.db-wal
+*.db.wal
+*.db-shm
+*.db-log
+*.duckdb
+*.duckdb.wal
+
+# Cluster logs
+cluster_logs/
+
+# Insta snapshot artifacts
+*.pending-snap
+
+# Claude worktrees
+.claude/
+
+# Distributed helper script working directory
+.distributed/

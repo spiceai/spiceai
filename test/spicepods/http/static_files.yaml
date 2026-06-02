@@ -1,0 +1,52 @@
+version: v1
+kind: Spicepod
+name: http_static_files
+
+datasets:
+  # Direct path to a CSV file - Iris dataset
+  - from: https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv
+    name: iris_csv
+    params:
+      file_format: csv
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+
+  # Direct path to a JSON array file
+  - from: https://raw.githubusercontent.com/jdorfman/awesome-json-datasets/master/tests/relaxed.json
+    name: json_array
+    params:
+      file_format: json
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+
+  # Another CSV example - Tips dataset
+  - from: https://raw.githubusercontent.com/mwaskom/seaborn-data/master/tips.csv
+    name: tips_csv
+    params:
+      file_format: csv
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+
+  # Parquet file example - using publicly available parquet dataset
+  - from: https://datasets-server.huggingface.co/parquet
+    name: parquet_dynamic
+    params:
+      file_format: parquet
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full
+
+  # Test auto-detection with CSV
+  - from: https://raw.githubusercontent.com/mwaskom/seaborn-data/master/diamonds.csv
+    name: diamonds_auto
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: full

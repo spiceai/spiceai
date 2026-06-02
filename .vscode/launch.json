@@ -26,34 +26,11 @@
     {
       "type": "lldb",
       "request": "launch",
-      "name": "Debug testoperator",
-      "program": "${workspaceFolder}/target/debug/testoperator",
-      "args": [
-        "run",
-        "evals",
-        "--ready-wait",
-        "180",
-        "--eval",
-        "tpch_nsql",
-        "--model",
-        "gpt-4o-mini",
-        "-p",
-        "./test/nsql_bench/spicepod.yaml",
-        "-d",
-        "./test/nsql_bench/data"
-      ],
-      "env": {},
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "rust: cargo build testoperator"
-    },
-    {
-      "type": "lldb",
-      "request": "launch",
       "name": "Debug testoperator (Search)",
       "program": "${workspaceFolder}/target/debug/testoperator",
       "args": [
         "run",
-        "vector-search",
+        "search",
         "--ready-wait",
         "1800",
         "--concurrency",
@@ -68,17 +45,64 @@
       "preLaunchTask": "rust: cargo build testoperator"
     },
     {
-      "name": "spice version",
-      "type": "go",
+      "type": "lldb",
       "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}/bin/spice/main.go",
-      "args": ["version"]
+      "name": "Debug testoperator(Append)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "run",
+        "append",
+        "--ready-wait",
+        "300",
+        "--query-set",
+        "tpch",
+        "--load-steps",
+        "10",
+        "--load-interval",
+        "20",
+        "--duration",
+        "240",
+        "--with-conflict-data",
+        "--with-retention-data",
+        "-p",
+        "./test/spicepods/tpch/sf1/accelerated/append/file[parquet]-duckdb[file]-append_retention_period.yaml"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug testoperator(Dispatch)",
+      "program": "${workspaceFolder}/target/debug/testoperator",
+      "args": [
+        "dispatch",
+        "./tools/testoperator/dispatch/tpch/sf1/accelerated/append/",
+        "--workflow",
+        "append",
+        "--github-token",
+        "<GITHUB_TOKEN>"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build testoperator"
+    },
+    {
+      "name": "[Rust] spice version",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--package", "spice"],
+        "problemMatcher": "$rustc"
+      },
+      "args": ["version"],
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "attach",
-      "name": "[Rust] Attack to spiced",
+      "name": "[Rust] Attach to spiced",
       "program": "~/.spice/bin/spiced",
       "pid": "${input:pid}"
     },

@@ -20,7 +20,6 @@ use crate::{
         Service, metrics, record_batches_to_flight_stream, to_tonic_err,
         util::set_flightsql_protocol,
     },
-    timing::TimedStream,
 };
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
@@ -29,6 +28,7 @@ use arrow_schema::Schema;
 use arrow_tools::schema::to_source_native_type_name;
 use datafusion::datasource::TableType;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 use tonic::{Request, Response, Status};
 
 pub(crate) async fn get_flight_info(
@@ -63,7 +63,7 @@ pub(crate) async fn do_get(
     let catalog = &query.catalog;
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {
-        Some(catalog) => vec![catalog.to_string()],
+        Some(catalog) => vec![catalog.clone()],
         None => datafusion.ctx.catalog_names(),
     };
     let mut builder = query.into_builder();

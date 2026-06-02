@@ -27,14 +27,18 @@ use runtime::Runtime;
 use runtime::accelerated_table::refresh_task::{accelerator_table_provider, max_timestamp_df};
 use runtime::component::dataset::acceleration::Engine;
 use runtime::datafusion::builder::AnalyzerRulesBuilder;
-use runtime::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
-use runtime::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
+use runtime_datafusion::{
+    execution_plan::schema_cast::EnsureSchema, extension::ExtensionPlanQueryPlanner,
+};
 use runtime_datafusion_index::analyzer::{
     IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
 };
 use runtime_object_store::registry::default_runtime_env;
 use std::collections::HashMap;
 use std::sync::Arc;
+use telemetry::track_bytes_processed;
+use tokio::runtime::Handle;
 
 /// This test verifies:
 ///   *  `DataAccelerator::create_external_table` returns `PolyTableProvider`
@@ -80,6 +84,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -89,7 +94,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 
@@ -99,17 +104,19 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 .expect("Expected PolyTableProvider");
 
             let mut state = SessionStateBuilder::new()
-                .with_runtime_env(default_runtime_env())
+                .with_runtime_env(default_runtime_env(Handle::current()))
                 .with_default_features()
-                .with_query_planner(Arc::new(SpiceQueryPlanner::new().with_extension_planners(
-                    vec![
+                .with_query_planner(Arc::new(
+                    ExtensionPlanQueryPlanner::from_extension_planners(vec![
                         Arc::new(FederatedPlanner::new()),
-                        Arc::new(SpiceExtensionPlanner::new()),
                         Arc::new(IndexTableScanExtensionPlanner::new()),
-                    ],
-                )))
+                    ]),
+                ))
                 .with_analyzer_rules(AnalyzerRulesBuilder::default().build())
                 .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+                .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
+                    Arc::new(Box::new(track_bytes_processed)),
+                )))
                 .build();
 
             if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -175,6 +182,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -184,7 +192,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 

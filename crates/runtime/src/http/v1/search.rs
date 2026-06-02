@@ -25,7 +25,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, HeaderValue};
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 use tracing::Instrument;
@@ -50,7 +50,7 @@ struct SearchResponse {
     post,
     path = "/v1/search",
     operation_id = "post_search",
-    tag = "SQL",
+    tag = "Search",
     request_body(
         description = "Search request parameters",
         content((
@@ -78,7 +78,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
                             "data": { "timestamp": 1_724_716_542 },
-                            "score": 0.914_321
+                            "_score": 0.914_321
                         },
                         {
                             "matches": {
@@ -87,7 +87,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b" },
                             "data": { "timestamp": 1_724_715_881 },
-                            "score": 0.83221
+                            "_score": 0.83221
                         },
                         {
                             "matches": {
@@ -96,7 +96,7 @@ struct SearchResponse {
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
                             "data": { "timestamp": 1_724_716_123 },
-                            "score": 0.787_654_321
+                            "_score": 0.787_654_321
 
                         }
                     ],
@@ -167,9 +167,29 @@ pub(crate) async fn post(
                     headers.insert("Search-Results-Cache-Status", val);
                 }
 
+                // Surface the cache scope so callers can tell whether a MISS
+                // came from per-user isolation versus a true cold cache.
+                let cache_namespace = request_context.cache_namespace();
+                headers.insert(
+                    "Search-Results-Cache-Scope",
+                    HeaderValue::from_static(cache_namespace.as_header_value()),
+                );
+
                 // Tell CDN entry is unique per user cache key
                 if request_context.client_supplied_cache_key().is_some() {
-                    headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+                    super::append_vary(&mut headers, "Spice-Cache-Key");
+                }
+
+                // For per-user scope, additionally vary on every header
+                // that can identify a principal so an HTTP cache between
+                // Spice and the client never collapses entries belonging
+                // to different principals. See the matching block in
+                // `http/v1/mod.rs::add_cache_response_headers` for the
+                // rationale on each header.
+                if matches!(cache_namespace, CacheNamespace::Principal(_)) {
+                    super::append_vary(&mut headers, "Authorization");
+                    super::append_vary(&mut headers, "X-API-Key");
+                    super::append_vary(&mut headers, "Cookie");
                 }
 
                 (
@@ -187,7 +207,8 @@ pub(crate) async fn post(
         Err(e) => {
             let error_type = match e {
                 VectorSearchError::NoTablesWithSearchFound {}
-                | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                | VectorSearchError::CannotVectorSearchDataset { .. }
+                | VectorSearchError::CannotSearchDataset { .. } => StatusCode::BAD_REQUEST,
                 VectorSearchError::SearchPipelineError { ref source } if source.is_user_error() => {
                     StatusCode::BAD_REQUEST
                 }

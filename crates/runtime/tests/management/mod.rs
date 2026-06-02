@@ -23,15 +23,20 @@ use std::{
 use app::AppBuilder;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::{management::Management, runtime::ApiKey};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     init_tracing,
-    utils::{init_tracing_with_task_history, test_request_context, wait_until_true},
+    utils::{
+        init_tracing_with_task_history, register_test_connectors, test_request_context,
+        wait_until_true,
+    },
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -45,16 +50,19 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
         Some("runtime::flight::do_put=debug,runtime::management=trace,integration=debug,info");
 
     let _tracing = init_tracing(trace_levels);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
 
-            let (data_endpoint_rt, data_endpoint) = create_data_export_endpoint().await?;
+            let data_endpoint = create_data_export_endpoint().await?;
+            let data_endpoint_rt = Arc::clone(data_endpoint.runtime());
+            let data_endpoint_url = data_endpoint.endpoint().to_string();
 
             let management = Management {
                 enabled: true,
                 api_key: "auth_key_1".to_string(), // Must match the one used in the data export endpoint
-                params: vec![("data_endpoint".to_string(), data_endpoint)]
+                params: vec![("data_endpoint".to_string(), data_endpoint_url)]
                     .into_iter()
                     .collect(),
             };
@@ -71,7 +79,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             Arc::clone(&rt).load_components().await;
 
             // Verify sink table exist after components are loaded.
-            if !rt.datafusion().table_exists("scp.task_history".into()) {
+            if !rt.datafusion().table_exists(&"scp.task_history".into()) {
                 return Err(anyhow::anyhow!("There is no 'scp.task_history' table created"));
             }
 
@@ -83,7 +91,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
             let _ = execute_query(&rt, "SELECT invalid_query as test_event").await;
 
             // Ensure local events are flushed
-            trace_provider.force_flush();
+            let _ = trace_provider.force_flush();
             // Add delay to ensure flushed events are propogated (data export is done every 5 seconds)
             tracing::info!("Waiting 7s for events to be exported...");
             tokio::time::sleep(Duration::from_secs(7)).await;
@@ -94,31 +102,69 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
 
             // Verify final export during shutdown
             let _ = execute_query(&rt, "SELECT 6789 as test_event").await;
-            trace_provider.force_flush();
+            let _ = trace_provider.force_flush();
             rt.shutdown().await;
             let exported_events = execute_query(&data_endpoint_rt, "SELECT input, captured_output, error_message FROM runtime.task_history where input like '%test_event%' order by input ").await?;
             insta::assert_snapshot!("shutdown_export", pretty_format_batches(&exported_events)?);
+
+            drop(data_endpoint_rt);
+            data_endpoint.shutdown().await;
 
             Ok(())
         })
         .await
 }
 
-async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow::Error> {
+struct DataExportEndpoint {
+    runtime: Arc<Runtime>,
+    endpoint: String,
+    shutdown: CancellationToken,
+    server_handle: JoinHandle<Result<(), runtime::Error>>,
+}
+
+impl DataExportEndpoint {
+    fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    async fn shutdown(self) {
+        self.shutdown.cancel();
+        // Protect against hangs in CI by bounding shutdown waits.
+        if let Err(elapsed) =
+            tokio::time::timeout(Duration::from_secs(15), self.runtime.shutdown()).await
+        {
+            tracing::error!("Runtime shutdown timed out after {elapsed:?}");
+        }
+
+        match tokio::time::timeout(Duration::from_secs(15), self.server_handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => {
+                tracing::debug!("Data export endpoint stopped with error: {err}");
+            }
+            Ok(Err(join_err)) if join_err.is_cancelled() => {}
+            Ok(Err(join_err)) => {
+                tracing::debug!("Data export endpoint join error: {join_err}");
+            }
+            Err(elapsed) => tracing::error!("Server task shutdown timed out after {elapsed:?}"),
+        }
+    }
+}
+
+async fn create_data_export_endpoint() -> Result<DataExportEndpoint, anyhow::Error> {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
-    tracing::debug!(
-        "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
-    );
+    tracing::debug!("Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}");
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+        .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
     let app = AppBuilder::new("management_sink_app").build();
 
@@ -131,15 +177,22 @@ async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow:
     let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("auth_key_1:rw")]))
         as Arc<dyn FlightBasicAuth + Send + Sync>;
 
-    let cloned_rt = Arc::clone(&rt);
-
-    tokio::spawn(async move {
-        Box::pin(Arc::clone(&cloned_rt).start_servers(
-            api_config,
-            None,
-            EndpointAuth::default().with_flight_basic_auth(api_key_auth),
-        ))
-        .await
+    let server_shutdown = CancellationToken::new();
+    let shutdown_token = server_shutdown.clone();
+    let server_rt = Arc::clone(&rt);
+    let server_handle = tokio::spawn(async move {
+        tokio::select! {
+            result = Box::pin(Arc::clone(&server_rt).start_servers(
+                api_config,
+                None,
+                EndpointAuth::default().with_flight_basic_auth(api_key_auth),
+            )) => result,
+            () = shutdown_token.cancelled() => {
+                // Ensure runtime shutdown completes even if servers were still starting.
+                server_rt.shutdown().await;
+                Ok(())
+            },
+        }
     });
 
     tracing::info!("Waiting for servers to start...");
@@ -150,7 +203,12 @@ async fn create_data_export_endpoint() -> Result<(Arc<Runtime>, String), anyhow:
     })
     .await;
 
-    Ok((Arc::clone(&rt), format!("http://localhost:{flight_port}")))
+    Ok(DataExportEndpoint {
+        runtime: Arc::clone(&rt),
+        endpoint: format!("http://localhost:{flight_port}"),
+        shutdown: server_shutdown,
+        server_handle,
+    })
 }
 
 async fn execute_query(rt: &Runtime, query: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {

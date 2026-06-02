@@ -1,47 +1,130 @@
 name: Sets up the Rust toolchain
 description: 'composite action'
+
 inputs:
-  os:
-    description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'macos', 'windows'
+  toolchain:
+    description: 'Rust toolchain to install; defaults to the repository rust-toolchain.toml channel'
+    required: false
 
 runs:
   using: 'composite'
   steps:
-    - name: Install Rust if not installed (Linux/macOS)
-      if: inputs.os != 'windows'
+    - name: Set up Rust toolchain (Linux/macOS)
+      if: runner.os != 'Windows'
       shell: bash
       run: |
-        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
-        if [ -d $HOME/.cargo ]; then
-          source $HOME/.cargo/env || true
-        fi
-        if ! command -v rustup &> /dev/null ; then
-          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-          source $HOME/.cargo/env || true
+        set -euo pipefail
+
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        echo "$cargo_home/bin" >> "$GITHUB_PATH"
+        export PATH="$cargo_home/bin:$PATH"
+
+        if [ -f "$cargo_home/env" ]; then
+          source "$cargo_home/env" || true
         fi
 
-    - name: Install Rust if not installed (Windows)
-      if: inputs.os == 'windows'
+        # Resolve which toolchain to use.
+        toolchain='${{ inputs.toolchain }}'
+        if [ -z "$toolchain" ] && [ -f rust-toolchain.toml ]; then
+          toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+        fi
+        if [ -z "$toolchain" ]; then
+          toolchain='stable'
+        fi
+
+        # If the toolchain is already installed (e.g. spiceai-macos self-hosted
+        # runners), just verify it. Otherwise install it.
+        if rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
+          echo "Toolchain $toolchain already available, skipping install"
+        else
+          if [ ! -x "$cargo_home/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            if [ -f "$cargo_home/env" ]; then
+              source "$cargo_home/env" || true
+            fi
+          fi
+          rustup toolchain install "$toolchain" \
+            --component cargo \
+            --component rustc \
+            --component rustfmt \
+            --component clippy
+        fi
+
+        resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
+        if [ -z "$resolved" ]; then
+          echo "Failed to resolve installed Rust toolchain for $toolchain" >&2
+          exit 1
+        fi
+
+        # Export RUSTUP_TOOLCHAIN so subsequent steps use this toolchain
+        # without modifying the global default (which races when multiple
+        # runners share the same RUSTUP_HOME on one machine).
+        echo "RUSTUP_TOOLCHAIN=$resolved" >> "$GITHUB_ENV"
+
+        cargo --version
+        rustc --version
+
+    - name: Set up Rust toolchain (Windows)
+      if: runner.os == 'Windows'
       shell: pwsh
       run: |
+        echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
           Write-Host "Installing Rust..."
           Invoke-WebRequest -Uri "https://win.rustup.rs" -OutFile "rustup-init.exe"
           Start-Process -FilePath "rustup-init.exe" -ArgumentList "-q", "-y", "--default-toolchain", "none", "--profile", "default" -Wait
-          echo "$env:USERPROFILE\.cargo\bin" >> $env:GITHUB_PATH
         }
 
-    - name: Install latest Rust stable toolchain (Linux/macOS)
-      if: inputs.os != 'windows'
-      shell: bash
-      run: |
-        rustup toolchain install 1.89
-        rustup default 1.89
+        $toolchain = "${{ inputs.toolchain }}"
+        if (-not $toolchain) {
+          $activeToolchain = rustup show active-toolchain 2>$null
+          if ($activeToolchain) {
+            $toolchain = ($activeToolchain -split '\s+')[0]
+          }
+        }
+        if (-not $toolchain -and (Test-Path "rust-toolchain.toml")) {
+          $match = Select-String -Path "rust-toolchain.toml" -Pattern '^\s*channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if ($match) {
+            $toolchain = $match.Matches[0].Groups[1].Value
+          }
+        }
+        if (-not $toolchain) {
+          $toolchain = "stable"
+        }
 
-    - name: Install latest Rust stable toolchain (Windows)
-      if: inputs.os == 'windows'
-      shell: pwsh
-      run: |
-        rustup toolchain install 1.89
-        rustup default 1.89
+        # Validate that the resolved toolchain name is safe to use in paths.
+        if ($toolchain -notmatch '^[a-zA-Z0-9._-]+$') {
+          Write-Error "Invalid toolchain name: $toolchain"
+          exit 1
+        }
+
+        $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }
+
+        # Use a mutex to prevent races when multiple jobs share RUSTUP_HOME.
+        $mutex = New-Object System.Threading.Mutex($false, "Global\setup-rust-$toolchain")
+        try {
+          [void]$mutex.WaitOne()
+          Remove-Item -Recurse -Force "$rustupHome\toolchains\$toolchain", "$rustupHome\toolchains\$toolchain-*" -ErrorAction SilentlyContinue
+          Remove-Item -Force "$rustupHome\update-hashes\$toolchain", "$rustupHome\update-hashes\$toolchain-*" -ErrorAction SilentlyContinue
+          rustup toolchain install $toolchain --component cargo --component rustc --component rustfmt --component clippy
+        } finally {
+          $mutex.ReleaseMutex()
+          $mutex.Dispose()
+        }
+
+        $rustcPath = rustup which --toolchain $toolchain rustc
+        if (-not $rustcPath) {
+          Write-Error "Failed to resolve installed Rust toolchain for $toolchain"
+          exit 1
+        }
+
+        $resolved = Split-Path (Split-Path $rustcPath -Parent) -Parent | Split-Path -Leaf
+
+        "RUSTUP_TOOLCHAIN=$resolved" >> $env:GITHUB_ENV
+
+        $toolchainBin = "$rustupHome\toolchains\$resolved\bin"
+        $toolchainBin >> $env:GITHUB_PATH
+        $env:PATH = "$toolchainBin;$env:PATH"
+
+        cargo --version
+        rustc --version

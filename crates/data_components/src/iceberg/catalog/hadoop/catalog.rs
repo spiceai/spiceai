@@ -14,20 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use iceberg::io::{Extensions, FileIO, InputFile};
+use iceberg::io::{FileIO, FileIOBuilder, InputFile, StorageFactory};
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
     TableIdent,
 };
-use opendal::{Entry, EntryMode};
+use opendal::{Entry, Operator};
 
 /// Specifies the mode for identifying metadata files in a Hadoop catalog
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -41,14 +41,40 @@ pub enum MetadataMode {
     Exact(String),
 }
 
+/// A function that builds a `StorageFactory` for a given URL scheme (e.g. `s3`, `s3a`).
+///
+/// This is used by the `HadoopCatalogBuilder` to allow the storage factory to be
+/// reconstructed when scheme inference detects that the warehouse root scheme does
+/// not match the scheme used in table metadata locations.
+pub type StorageFactoryBuilderFn = Arc<dyn Fn(&str) -> Arc<dyn StorageFactory> + Send + Sync>;
+
 /// Builder for creating a new `HadoopCatalog`
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct HadoopCatalogBuilder {
     warehouse_root: Option<String>,
     file_io: Option<FileIO>,
     metadata_mode: MetadataMode,
     properties: HashMap<String, String>,
-    file_io_extensions: Extensions,
+    storage_factory: Option<Arc<dyn StorageFactory>>,
+    storage_factory_builder: Option<StorageFactoryBuilderFn>,
+    operator: Option<Operator>,
+}
+
+impl std::fmt::Debug for HadoopCatalogBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HadoopCatalogBuilder")
+            .field("warehouse_root", &self.warehouse_root)
+            .field("file_io", &self.file_io)
+            .field("metadata_mode", &self.metadata_mode)
+            .field("properties", &self.properties)
+            .field("storage_factory", &self.storage_factory)
+            .field(
+                "storage_factory_builder",
+                &self.storage_factory_builder.as_ref().map(|_| "<fn>"),
+            )
+            .field("operator", &self.operator)
+            .finish()
+    }
 }
 
 impl HadoopCatalogBuilder {
@@ -67,10 +93,36 @@ impl HadoopCatalogBuilder {
         self
     }
 
-    /// Sets the `FileIO` extensions for the Hadoop catalog.
+    /// Sets the `StorageFactory` for the Hadoop catalog.
     #[must_use]
-    pub fn with_file_io_extension<T: Any + Send + Sync>(mut self, extension: T) -> Self {
-        self.file_io_extensions.add(extension);
+    pub fn with_storage_factory(mut self, factory: Arc<dyn StorageFactory>) -> Self {
+        self.storage_factory = Some(factory);
+        self
+    }
+
+    /// Sets a builder function that produces a `StorageFactory` for a given URL scheme.
+    ///
+    /// When set, this function is invoked during scheme inference: if the inferred
+    /// scheme differs from the warehouse root scheme, the storage factory is rebuilt
+    /// using the new scheme so that the rebuilt `FileIO` accepts paths with that
+    /// scheme.
+    ///
+    /// If both `with_storage_factory` and `with_storage_factory_builder` are set,
+    /// the builder function takes precedence and is invoked with the warehouse root
+    /// scheme during the initial build.
+    #[must_use]
+    pub fn with_storage_factory_builder<F>(mut self, builder: F) -> Self
+    where
+        F: Fn(&str) -> Arc<dyn StorageFactory> + Send + Sync + 'static,
+    {
+        self.storage_factory_builder = Some(Arc::new(builder));
+        self
+    }
+
+    /// Sets the opendal `Operator` for directory listing operations.
+    #[must_use]
+    pub fn with_operator(mut self, operator: Operator) -> Self {
+        self.operator = Some(operator);
         self
     }
 
@@ -95,7 +147,7 @@ impl HadoopCatalogBuilder {
         self
     }
 
-    fn inner_build(self, infer_scheme: bool) -> BoxFuture<'static, Result<HadoopCatalog>> {
+    fn inner_build(mut self, infer_scheme: bool) -> BoxFuture<'static, Result<HadoopCatalog>> {
         async move {
             let mut cloned_self = self.clone();
             let mut warehouse_root = self.warehouse_root.ok_or_else(|| {
@@ -106,26 +158,55 @@ impl HadoopCatalogBuilder {
                 warehouse_root.push('/');
             }
 
+            // If a storage factory builder was provided, materialize the factory
+            // for the current warehouse root scheme. This lets scheme inference
+            // rebuild the factory when re-entering inner_build with a new scheme.
+            if let Some(factory_builder) = &self.storage_factory_builder {
+                if let Some((scheme, _)) = warehouse_root.split_once("://") {
+                    self.storage_factory = Some(factory_builder(scheme));
+                } else if self.file_io.is_none() && self.storage_factory.is_none() {
+                    // The builder needs a scheme to materialize a factory, and we
+                    // have no other source for the FileIO.
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Cannot materialize storage factory: warehouse root '{warehouse_root}' does not contain a URL scheme. Verify the warehouse root is in the format '<scheme>://<path>'.",
+                        ),
+                    ));
+                }
+            }
+
             let file_io = if let Some(file_io) = self.file_io {
                 file_io
+            } else if let Some(factory) = &self.storage_factory {
+                FileIOBuilder::new(Arc::clone(factory))
+                    .with_props(self.properties.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                    .build()
             } else {
-                FileIO::from_path(&warehouse_root)?
-                    .with_props(self.properties)
-                    .with_extensions(self.file_io_extensions)
-                    .build()?
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Either file_io, storage_factory, or storage_factory_builder must be provided",
+                ));
             };
 
+            let operator = self.operator.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "An opendal Operator must be provided via with_operator()",
+                )
+            })?;
+
+            // Verify the warehouse root exists using the file_io (which handles full paths)
             let root_input = file_io.new_input(&warehouse_root).map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!("Invalid warehouse root: {e}"),
                 )
             })?;
-
-            if !matches!(root_input.metadata().await?.mode, EntryMode::DIR) {
+            if !root_input.exists().await? {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
-                    "Warehouse root must be a directory",
+                    format!("Warehouse root '{warehouse_root}' does not exist"),
                 ));
             }
 
@@ -133,6 +214,7 @@ impl HadoopCatalogBuilder {
             let catalog = HadoopCatalog {
                 warehouse_root,
                 file_io,
+                operator,
                 metadata_mode: self.metadata_mode,
             };
 
@@ -200,6 +282,7 @@ impl HadoopCatalogBuilder {
 #[derive(Debug, Clone)]
 pub struct HadoopCatalog {
     file_io: FileIO,
+    operator: Operator,
     warehouse_root: String,
     metadata_mode: MetadataMode,
 }
@@ -444,12 +527,35 @@ impl Catalog for HadoopCatalog {
 }
 
 impl HadoopCatalog {
-    async fn get_directories(&self, root: &str) -> Result<Vec<Entry>> {
-        let mut directories = Vec::new();
-        let mut lister = self.file_io.lister(root).await?;
+    /// Converts a full URL path (e.g., `s3://bucket/prefix/namespace/`) to a path
+    /// relative to the opendal operator root. The operator root is configured to match
+    /// the warehouse root path, so stripping the `warehouse_root` prefix yields the
+    /// correct operator-relative path.
+    fn to_operator_path(&self, full_path: &str) -> String {
+        match full_path.strip_prefix(&self.warehouse_root) {
+            Some("") => "/".to_string(),
+            Some(relative) => relative.to_string(),
+            None => full_path.to_string(),
+        }
+    }
 
-        while let Some(entry) = lister.try_next().await? {
-            if matches!(entry.metadata().mode(), EntryMode::DIR) && !root.ends_with(entry.path()) {
+    async fn get_directories(&self, root: &str) -> Result<Vec<Entry>> {
+        let op_path = self.to_operator_path(root);
+        let mut directories = Vec::new();
+        let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to list directory: {e}"),
+            )
+        })?;
+
+        while let Some(entry) = lister.try_next().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to read directory entry: {e}"),
+            )
+        })? {
+            if entry.metadata().is_dir() {
                 directories.push(entry);
             }
         }
@@ -463,20 +569,33 @@ impl HadoopCatalog {
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
         let data_dir = format!("{path}/data/");
-        let input_data = self.file_io.new_input(&data_dir)?;
-        return Ok(input_data.exists().await?
-            && matches!(input_data.metadata().await?.mode, EntryMode::DIR)
-            && self.directory_has_metadata(path, metadata_mode).await?);
+        let op_path = self.to_operator_path(&data_dir);
+        let is_data_dir = match self.operator.stat(&op_path).await {
+            Ok(m) => m.is_dir(),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to stat: {e}"),
+                ));
+            }
+        };
+        if !is_data_dir {
+            return Ok(false);
+        }
+        self.directory_has_metadata(path, metadata_mode).await
     }
 
     async fn directory_exists(&self, path: &str) -> Result<bool> {
-        let input = self.file_io.new_input(path)?;
-        if !input.exists().await? {
-            return Ok(false);
+        let op_path = self.to_operator_path(path);
+        match self.operator.stat(&op_path).await {
+            Ok(m) => Ok(m.is_dir()),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to stat: {e}"),
+            )),
         }
-
-        let metadata = input.metadata().await?;
-        Ok(matches!(metadata.mode, EntryMode::DIR))
     }
 
     async fn directory_has_metadata(
@@ -485,30 +604,44 @@ impl HadoopCatalog {
         metadata_mode: MetadataMode,
     ) -> Result<bool> {
         let metadata_directory = format!("{path}/metadata/");
-        let input = self.file_io.new_input(&metadata_directory)?;
-        if !input.exists().await? {
-            return Ok(false);
+        let op_path = self.to_operator_path(&metadata_directory);
+
+        // Check if the metadata directory exists
+        match self.operator.stat(&op_path).await {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) | Err(_) => return Ok(false),
         }
 
-        let mut lister = self.file_io.lister(&metadata_directory).await?;
-        while let Some(entry) = lister.try_next().await? {
-            if matches!(entry.metadata().mode(), EntryMode::FILE) {
-                let (metadata_file, fail_if_exact_missing) = match metadata_mode {
-                    MetadataMode::Infer => (None, false),
-                    MetadataMode::ExactOrInfer(ref metadata_file) => (Some(metadata_file), false),
-                    MetadataMode::Exact(ref metadata_file) => (Some(metadata_file), true),
-                };
+        let (metadata_file, fail_if_exact_missing) = match &metadata_mode {
+            MetadataMode::Infer => (None, false),
+            MetadataMode::ExactOrInfer(metadata_file) => (Some(metadata_file.as_str()), false),
+            MetadataMode::Exact(metadata_file) => (Some(metadata_file.as_str()), true),
+        };
 
-                if let Some(metadata_file) = metadata_file {
-                    if entry.name() == metadata_file {
+        let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to list directory: {e}"),
+            )
+        })?;
+
+        while let Some(entry) = lister.try_next().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to read metadata entry: {e}"),
+            )
+        })? {
+            if entry.metadata().is_file() {
+                if let Some(mf) = metadata_file {
+                    // Compare by filename — metadata_file may be a full path or just a name
+                    let mf_name = mf.rsplit('/').next().unwrap_or(mf);
+                    if entry.name() == mf_name {
                         return Ok(true);
-                    } else if fail_if_exact_missing {
-                        return Ok(false);
                     }
                 }
 
-                // Naive check if the file is a metadata file
-                if entry.name().ends_with(".metadata.json") {
+                // For non-Exact modes, any .metadata.json file qualifies
+                if !fail_if_exact_missing && entry.name().ends_with(".metadata.json") {
                     return Ok(true);
                 }
             }
@@ -576,12 +709,21 @@ impl HadoopCatalog {
                     table = table_identifier.name
                 );
 
-                let mut lister = self.file_io.lister(&metadata_directory).await?;
+                let op_path = self.to_operator_path(&metadata_directory);
+                let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to list metadata directory: {e}"),
+                    )
+                })?;
                 let mut latest_metadata_file: Option<Entry> = None;
-                while let Some(entry) = lister.try_next().await? {
-                    if matches!(entry.metadata().mode(), EntryMode::FILE)
-                        && entry.name().ends_with(".metadata.json")
-                    {
+                while let Some(entry) = lister.try_next().await.map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!("Failed to read metadata entry: {e}"),
+                    )
+                })? {
+                    if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
                         if let Some(latest_file) = &latest_metadata_file {
                             match (
                                 latest_file.metadata().last_modified(),

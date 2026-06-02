@@ -8,11 +8,19 @@ All criteria must be met for the Catalog to be considered Alpha. As Alpha signif
 
 | Catalog       | Alpha Quality | DRI Sign-off    |
 | ------------- | ------------- | --------------- |
-| Databricks    | ✅            | @Sevenannn      |
-| Iceberg       | ✅            | @phillipleblanc |
-| Spice.ai      | ✅            | @peasee         |
-| Unity Catalog | ✅            | @Sevenannn      |
-| Glue          | ✅            | @kczimm         |
+| ADBC          | ➖             |                 |
+| Cayenne       | ➖             |                 |
+| Databricks    | ✅             | @Sevenannn      |
+| DuckLake      | ✅             | @sgrebnov       |
+| Glue          | ✅             | @kczimm         |
+| Iceberg       | ✅             | @phillipleblanc |
+| MS SQL        | ➖             |                 |
+| MySQL         | ➖             |                 |
+| Oracle        | ➖             |                 |
+| PostgreSQL    | ➖             |                 |
+| Snowflake     | ➖             |                 |
+| Spice.ai      | ✅             | @peasee         |
+| Unity Catalog | ✅             | @Sevenannn      |
 
 ## Alpha Release Criteria
 

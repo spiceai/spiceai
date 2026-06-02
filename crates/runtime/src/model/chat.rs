@@ -14,21 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::implicit_hasher)]
+#[cfg(feature = "bedrock")]
+use llms::bedrock::chat::{BedrockConverse, guardrail::GuardRail};
 use llms::{
     HealthCheck,
     anthropic::Anthropic,
-    bedrock::chat::{BedrockConverse, guardrail::GuardRail},
     chat::{Chat, Error as LlmError},
-    openai::UsageTier,
-    perplexity::PerplexitySonar,
+    google::Google,
+    openai::{ChatBackend, UsageTier},
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::SecretString;
 use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+#[cfg(feature = "models")]
+use spicepod::component::model::ModelFileType;
+use spicepod::component::model::{Model, ModelSource};
+#[cfg(feature = "models")]
+use std::path::PathBuf;
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
@@ -37,7 +42,11 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use crate::{
     Runtime,
     parameters::Parameters,
-    tools::{options::SpiceToolsOptions, utils::get_tools},
+    tools::{
+        options::SpiceToolsOptions,
+        registry::{TOOL_EMBEDDING_MODEL_PARAM, prepare_model_tools},
+        utils::{create_table_allowlist, get_tools_with_allowlist},
+    },
 };
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
@@ -103,13 +112,27 @@ pub async fn try_to_chat_model(
         // Prevent infinite recursion in case of circular tool calls.
         .or(Some(DEFAULT_SPICE_TOOL_RECURSION_LIMIT));
 
+    let tool_embedding_model = extract_secret!(params, TOOL_EMBEDDING_MODEL_PARAM);
+
     let tool_model = match spice_tool_opt {
-        Some(opts) if opts.can_use_tools() => Arc::new(ToolUsingChat::new(
-            model,
-            Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &opts).await,
-            spice_recursion_limit,
-        )),
+        Some(opts) if opts.can_use_tools() => {
+            let table_allowlist = create_table_allowlist(&component.datasets).map_err(|e| {
+                LlmError::ModelParameterFailed {
+                    model: component.name.clone(),
+                    source: e,
+                }
+            })?;
+            let tools = get_tools_with_allowlist(Arc::clone(&rt), &opts, table_allowlist).await;
+            let tools = prepare_model_tools(Arc::clone(&rt), &opts, tools, tool_embedding_model)
+                .await
+                .map_err(|e| LlmError::FailedToLoadModel { source: e })?;
+            Arc::new(ToolUsingChat::new(
+                model,
+                Arc::clone(&rt),
+                tools,
+                spice_recursion_limit,
+            ))
+        }
         Some(_) | None => model,
     };
     Ok(tool_model)
@@ -126,16 +149,30 @@ pub async fn construct_model(
     })?;
 
     let model = match prefix {
+        #[cfg(feature = "models")]
         ModelSource::HuggingFace => huggingface(model_id, component, params).await,
+        #[cfg(not(feature = "models"))]
+        ModelSource::HuggingFace => Err(LlmError::UnknownModelSource {
+            from: "huggingface".into(),
+        }),
+        #[cfg(feature = "models")]
         ModelSource::File => file(component, params).await,
+        #[cfg(not(feature = "models"))]
+        ModelSource::File => Err(LlmError::UnknownModelSource {
+            from: "file".into(),
+        }),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
-        ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
+        ModelSource::Google => google(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Databricks => databricks(model_id, params, Arc::clone(&token_registry)).await,
         #[cfg(feature = "bedrock")]
         ModelSource::Bedrock => bedrock(model_id, params).await,
+        #[cfg(not(feature = "bedrock"))]
+        ModelSource::Bedrock => Err(LlmError::UnknownModelSource {
+            from: "bedrock".into(),
+        }),
         ModelSource::SpiceAI => Err(LlmError::UnsupportedTaskForModel {
             from: "spiceai".into(),
             task: "llm".into(),
@@ -205,14 +242,6 @@ fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, Llm
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
 }
 
-fn perplexity(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
-    // PerplexitySonar only requires prefixed parameters for constructing the model.
-    let model = PerplexitySonar::from_unprefixed_params(model_id, &params.get_component_params())
-        .map_err(|source| LlmError::FailedToLoadModel { source })?;
-
-    Ok(Arc::new(model) as Arc<dyn Chat>)
-}
-
 fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
     let api_base = params.get("endpoint").expose().ok();
     let api_key = params.get("api_key").expose().ok();
@@ -238,6 +267,26 @@ fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
 }
 
+fn google(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
+    let Some(model_id) = model_id else {
+        return Err(LlmError::ModelNotProvided {
+            model_source: "google".to_string(),
+        });
+    };
+    let Some(api_key) = params.get("api_key").ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "`model.params.google_api_key` is required.".into(),
+        });
+    };
+
+    let google = Google::new(api_key, model_id).map_err(|e| LlmError::FailedToLoadModel {
+        source: format!("Failed to create Google client: {e}").into(),
+    })?;
+
+    Ok(Arc::new(google) as Arc<dyn Chat>)
+}
+
+#[cfg(feature = "models")]
 async fn huggingface(
     model_id: Option<String>,
     component: &spicepod::component::model::Model,
@@ -273,7 +322,10 @@ async fn huggingface(
             path.display()
         );
     }
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token).await
+
+    let chat_template_literal = params.get("chat_template").expose().ok();
+
+    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token, chat_template_literal).await
 }
 
 async fn databricks(
@@ -393,6 +445,7 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
             param: "openai_usage_tier".to_string(),
             message: "Must be 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'".to_string(),
         })?;
+    let chat_backend = chat_backend(params)?;
 
     if let Some(temperature_str) = params.get("temperature").expose().ok() {
         match temperature_str.parse::<f64>() {
@@ -413,13 +466,14 @@ fn openai(model_id: Option<String>, params: &Parameters) -> Result<Arc<dyn Chat>
         }
     }
 
-    Ok(Arc::new(llms::openai::new_openai_client(
+    Ok(Arc::new(llms::openai::new_openai_client_with_chat_backend(
         model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
         api_base,
         api_key,
         org_id,
         project_id,
         usage_tier,
+        chat_backend,
     )) as Arc<dyn Chat>)
 }
 
@@ -440,6 +494,7 @@ fn azure(
     let deployment_name = params.get("deployment_name").expose().ok();
     let api_key = params.get("api_key").expose().ok();
     let entra_token = params.get("entra_token").expose().ok();
+    let chat_backend = chat_backend(params)?;
 
     if api_base.is_none() {
         return Err(LlmError::FailedToLoadModel {
@@ -467,16 +522,38 @@ fn azure(
         });
     }
 
-    Ok(Arc::new(llms::openai::new_azure_client(
+    Ok(Arc::new(llms::openai::new_azure_client_with_chat_backend(
         model_name,
         api_base,
         api_version,
         deployment_name,
         entra_token,
         api_key,
+        chat_backend,
     )) as Arc<dyn Chat>)
 }
 
+fn chat_backend(params: &Parameters) -> Result<ChatBackend, LlmError> {
+    let value = params
+        .get("responses_api")
+        .expose()
+        .ok()
+        .unwrap_or("disabled")
+        .trim();
+
+    if value.eq_ignore_ascii_case("disabled") {
+        Ok(ChatBackend::ChatCompletions)
+    } else if value.eq_ignore_ascii_case("enabled") {
+        Ok(ChatBackend::Responses)
+    } else {
+        Err(LlmError::InvalidParamValueError {
+            param: "responses_api".to_string(),
+            message: "Must be 'enabled' or 'disabled'".to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "models")]
 async fn file(
     component: &spicepod::component::model::Model,
     params: &Parameters,
@@ -487,6 +564,13 @@ async fn file(
             source: "No 'weights_path' parameter provided".into(),
         });
     }
+
+    let trust_pickle = parse_trust_pickle(params)?;
+    llms::chat::reject_unsafe_weight_formats(model_weights.as_slice(), trust_pickle).map_err(
+        |source| LlmError::FailedToLoadModel {
+            source: Box::new(source),
+        },
+    )?;
 
     let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
     let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
@@ -506,25 +590,38 @@ async fn file(
     .await
 }
 
-// Get OpenAI compatible request parameter overrides.
-// Prioritizes parameters with the model prefix (e.g., `hf_temperature`) over deprecated (e.g. `openai_temperature`) parameters.
-pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
-    let prefix_str = format!("{prefix}_");
-    let mut request_overrides: HashMap<String, Value> = HashMap::new();
+/// Parse the boolean `trust_pickle` model parameter. Defaults to `false`
+/// — pickle weight files (.pt / .pth / .ckpt / .bin) execute arbitrary
+/// code on load, so the runtime refuses them unless the operator opts
+/// in for a fully trusted source.
+#[cfg(feature = "models")]
+fn parse_trust_pickle(params: &Parameters) -> Result<bool, LlmError> {
+    let Some(raw) = params.get("trust_pickle").expose().ok() else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" | "" => Ok(false),
+        other => Err(LlmError::InvalidParamValueError {
+            param: "trust_pickle".to_string(),
+            message: format!(
+                "Must be one of 'true', 'false', 'yes', 'no', '1', or '0', got '{other}'"
+            ),
+        }),
+    }
+}
 
-    for (k, v) in &model.params {
-        if k.starts_with(&prefix_str) {
-            if let Some(new_k) = k.strip_prefix(&prefix_str)
-                && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            {
-                request_overrides.insert(new_k.to_string(), v.clone());
-            }
-        } else if k.starts_with("openai_")
-            && let Some(new_k) = k.strip_prefix("openai_")
-            && OPENAI_DEFAULT_PARAM_KEYS.contains(&new_k)
-            && !request_overrides.contains_key(new_k)
-        {
-            request_overrides.insert(new_k.to_string(), v.clone());
+// Get OpenAI compatible request parameter overrides.
+// Prioritizes parameters without prefix, then model prefix (e.g., `hf_temperature`), then deprecated (e.g. `openai_temperature`) parameters.
+pub fn get_openai_request_overrides(model: &Model, prefix: &str) -> Vec<(String, Value)> {
+    let mut request_overrides: HashMap<String, Value> = HashMap::new();
+    for &key in OPENAI_DEFAULT_PARAM_KEYS.iter() {
+        if let Some(v) = model.params.get(key) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("{prefix}_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
+        } else if let Some(v) = model.params.get(&format!("openai_{key}")) {
+            request_overrides.insert(key.to_string(), v.clone());
         }
     }
 
@@ -536,6 +633,50 @@ mod test {
     use super::*;
     use serde_json::Number;
     use spicepod::component::model::Model;
+
+    fn parameters_with_responses_api(value: Option<&str>) -> Parameters {
+        Parameters::new(
+            value.map_or_else(Vec::new, |value| {
+                vec![(
+                    "responses_api".to_string(),
+                    SecretString::from(value.to_string()),
+                )]
+            }),
+            "openai",
+            crate::model::params::openai::PARAMETERS,
+        )
+    }
+
+    #[test]
+    fn responses_api_defaults_to_chat_completions() {
+        let params = parameters_with_responses_api(None);
+
+        let api = chat_backend(&params).expect("default responses_api should be valid");
+
+        assert_eq!(api, ChatBackend::ChatCompletions);
+    }
+
+    #[test]
+    fn responses_api_enabled_uses_responses() {
+        let params = parameters_with_responses_api(Some("enabled"));
+
+        let api = chat_backend(&params).expect("enabled responses_api should be valid");
+
+        assert_eq!(api, ChatBackend::Responses);
+    }
+
+    #[test]
+    fn responses_api_rejects_unknown_value() {
+        let params = parameters_with_responses_api(Some("legacy"));
+
+        let err = chat_backend(&params).expect_err("unknown responses_api should be invalid");
+
+        assert!(matches!(
+            err,
+            LlmError::InvalidParamValueError { ref param, .. }
+                if param == "responses_api"
+        ));
+    }
 
     #[test]
     fn test_get_openai_request_overrides_with_deprecated() {
@@ -569,6 +710,25 @@ mod test {
             overrides
                 .iter()
                 .any(|(k, v)| k == "max_completion_tokens" && v == &Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    fn test_get_openai_request_overrides_with_prompt_cache_key() {
+        let mut model = Model::new("hf:test_model", "test_model");
+        model.params.insert(
+            "hf_prompt_cache_key".to_string(),
+            Value::String("schema-context".to_string()),
+        );
+
+        let overrides = get_openai_request_overrides(&model, "hf");
+
+        assert_eq!(overrides.len(), 1);
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "prompt_cache_key"
+                    && value == &Value::String("schema-context".to_string()))
         );
     }
 

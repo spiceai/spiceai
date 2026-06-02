@@ -16,7 +16,7 @@ limitations under the License.
 
 use super::DatabaseName;
 use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
-use crate::dataconnector::parameters::aws::load_config;
+use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
 use crate::{
     Runtime,
@@ -118,16 +118,19 @@ impl GlueCatalogProvider {
     ) -> Result<Self> {
         Self::validate_parameters(&mut parameters).await?;
 
-        let config = load_config(
+        let config = initiate_config_with_credentials(
             "GlueCatalogConnector",
             "region",
             "key",
             "secret",
             "session_token",
             &parameters.parameters,
+            parameters.parameters.get("iam_role_source").expose().ok(),
         )
         .await
-        .context(ConfigurationLoadingFailedSnafu)?;
+        .context(ConfigurationLoadingFailedSnafu)?
+        .load()
+        .await;
 
         let client = Client::new(&config);
 
@@ -173,10 +176,11 @@ impl GlueCatalogProvider {
             for table in some_tables {
                 let mut parameters = self.parameters.parameters.clone();
                 if let Some(catalog_id) = &self.catalog_id {
-                    parameters.insert("catalog_id".to_string(), catalog_id.to_string().into());
+                    parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
                 }
 
-                let connector = GlueDataConnector::new(parameters);
+                let connector =
+                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())

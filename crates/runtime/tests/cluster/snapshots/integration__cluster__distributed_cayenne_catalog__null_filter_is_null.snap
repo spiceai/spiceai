@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+expression: __plan
+---
++---------------+-----------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                      |
++---------------+-----------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: ncat.ns.metrics.id ASC NULLS LAST                                                                   |
+|               |   SubqueryAlias: ncat.ns.metrics                                                                          |
+|               |     TableScan: ncat.ns.metrics projection=[id], full_filters=[ncat.ns.metrics.label IS NULL]              |
+| physical_plan | CooperativeExec                                                                                           |
+|               |   BytesProcessedExec                                                                                      |
+|               |     FlightSqlExec sql=SELECT id FROM ncat.ns.metrics WHERE (("label" IS NULL)) ORDER BY id ASC NULLS LAST |
+|               |                                                                                                           |
++---------------+-----------------------------------------------------------------------------------------------------------+

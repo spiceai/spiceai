@@ -21,7 +21,11 @@ use search::generation::{CandidateGeneration, text_search::index::FullTextDataba
 use crate::{datafusion::DataFusion, search::candidate::text::TextSearchCandidate};
 
 pub mod connector;
+pub mod table;
 pub mod udtf;
+
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
 pub async fn as_candidate_generations(
@@ -41,5 +45,28 @@ pub async fn as_candidate_generations(
         generators.push(Arc::new(candidate) as Arc<dyn CandidateGeneration>);
     }
 
+    Ok(generators)
+}
+
+/// Constructs [`CandidateGeneration`]s for Elasticsearch BM25 full-text search,
+/// one per indexed search field.
+#[cfg(feature = "elasticsearch")]
+pub async fn as_es_text_candidate_generations(
+    indexes: Vec<&search::index::elasticsearch::ElasticsearchTextIndex>,
+    df: Arc<DataFusion>,
+    tbl: TableReference,
+) -> Result<Vec<Arc<dyn CandidateGeneration>>, search::generation::Error> {
+    use crate::search::candidate::elasticsearch_text::ElasticsearchTextSearchCandidate;
+
+    let mut generators = vec![];
+    for idx in indexes {
+        for field in &idx.search_fields {
+            generators.push(Arc::new(ElasticsearchTextSearchCandidate::new(
+                field.clone(),
+                Arc::clone(&df),
+                tbl.clone(),
+            )) as Arc<dyn CandidateGeneration>);
+        }
+    }
     Ok(generators)
 }

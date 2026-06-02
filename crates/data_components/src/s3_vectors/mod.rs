@@ -15,18 +15,29 @@ limitations under the License.
 */
 
 use arrow::error::ArrowError;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::error::DataFusionError;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::prelude::Expr;
 use s3_vectors::{
     BuildError, CreateIndexError, CreateVectorBucketError, DistanceMetric, Document, GetIndexError,
-    GetVectorBucketError, ListIndexesError, PutVectorsError, QueryVectorsError,
+    GetVectorBucketError, GetVectorsError, ListIndexesError, ListIndexesInput, PutVectorsError,
+    QueryVectorsError, S3Vectors,
 };
 use s3_vectors_metadata_filter::MetadataFilter;
-use snafu::Snafu;
+use snafu::{ResultExt as _, Snafu};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
+pub mod compute_query;
 pub mod list_provider;
 pub mod partition;
 pub mod put_vectors_sink;
 pub mod query_provider;
+pub mod spill;
+pub use spill::{Error as SpillIndexError, SpillIndex};
 mod vector_table;
 pub use vector_table::{S3VectorTableResult, S3VectorsTable};
 mod metadata_column;
@@ -41,17 +52,20 @@ pub static S3_VECTOR_EMBEDDING_NAME: &str = "data";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to s3vector. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "An internal error occurred in S3 Vectors: {source}. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to write vectors to S3 Vectors. {source}"))]
-    S3VectorPutVectorError { source: PutVectorsError },
+    S3VectorPutVectorError { source: Box<PutVectorsError> },
 
     #[snafu(display("Failed to query vectors from S3 Vectors. {source}"))]
-    S3VectorQueryVectorsError { source: QueryVectorsError },
+    S3VectorQueryVectorsError { source: Box<QueryVectorsError> },
+
+    #[snafu(display("Failed to get vectors from S3 Vectors. {source}"))]
+    S3VectorGetVectorsError { source: Box<GetVectorsError> },
 
     #[snafu(display(
         "Failed to query vectors from S3 Vectors due to an unsupported filter: {filter_pre} {filter:?}"
@@ -62,16 +76,21 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to create index in S3 Vectors. {source}"))]
-    S3VectorCreateIndexError { source: CreateIndexError },
+    S3VectorCreateIndexError { source: Box<CreateIndexError> },
 
     #[snafu(display("Failed to create bucket in S3 Vectors. {source}"))]
-    S3VectorCreateBucketError { source: CreateVectorBucketError },
+    S3VectorCreateBucketError {
+        source: Box<CreateVectorBucketError>,
+    },
 
     #[snafu(display("Failed to get bucket from S3 Vectors. {source}"))]
-    S3VectorGetBucketError { source: GetVectorBucketError },
+    S3VectorGetBucketError { source: Box<GetVectorBucketError> },
 
     #[snafu(display("Failed to get index from S3 Vectors. {source}"))]
-    S3VectorGetIndexError { source: GetIndexError },
+    S3VectorGetIndexError { source: Box<GetIndexError> },
+
+    #[snafu(display("Failed to list indexes from S3 Vectors. {source}"))]
+    S3VectorListIndexesError { source: Box<ListIndexesError> },
 
     #[snafu(display("Failed to construct a request to send to S3 Vectors. {source}"))]
     S3VectorBuildError { source: BuildError },
@@ -103,8 +122,12 @@ pub enum Error {
         exists: DistanceMetric,
         specified: DistanceMetric,
     },
-    #[snafu(display("S3 vector indexes cannot be listed"))]
-    S3VectorListIndexesError { source: ListIndexesError },
+
+    #[snafu(display("Spill index error: {source}"))]
+    SpillIndexError { source: SpillIndexError },
+
+    #[snafu(display("Exceeded maximum spill attempts while writing vectors"))]
+    MaxSpillAttemptsReached,
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -132,6 +155,7 @@ impl Display for S3VectorIdentifier {
 
 impl S3VectorIdentifier {
     /// Return (index arn, bucket name and index name) based on how the vector index is identified.
+    /// For virtual indexes, returns the bucket name and virtual index name for writing operations.
     #[must_use]
     pub fn index_identifier_variables(&self) -> (Option<String>, Option<String>, Option<String>) {
         match self {
@@ -142,4 +166,62 @@ impl S3VectorIdentifier {
             Self::IndexArn(arn) => (Some(arn.clone()), None, None),
         }
     }
+
+    /// Gets the bucket name for this identifier, if available.
+    #[must_use]
+    pub fn bucket_name(&self) -> Option<&str> {
+        match self {
+            Self::Index { bucket_name, .. } => Some(bucket_name),
+            Self::IndexArn(_) => None,
+        }
+    }
+}
+
+/// Lists index names with the given prefix in the specified bucket.
+pub async fn list_index_names(
+    client: &Arc<dyn S3Vectors + Send + Sync>,
+    bucket_name: &str,
+    prefix: &str,
+) -> Result<Vec<String>, Error> {
+    let list_indexes_output = client
+        .list_indexes(
+            &ListIndexesInput::builder()
+                .set_vector_bucket_name(Some(bucket_name.to_string()))
+                .set_prefix(Some(prefix.to_string()))
+                .build()
+                .context(S3VectorBuildSnafu)?,
+        )
+        .await
+        .map_err(|e| Error::S3VectorListIndexesError {
+            source: Box::new(e.into_service_error()),
+        })?;
+
+    Ok(list_indexes_output
+        .indexes()
+        .iter()
+        .map(|idx| idx.index_name().to_string())
+        .collect())
+}
+
+/// Scans multiple table providers and combines their execution plans with a `UnionExec`.
+///
+/// Both pushes down `limit` to each [`TableProvider`], but also limits the returned [`ExecutionPlan`].
+async fn gather_and_limit_providers(
+    providers: Vec<Arc<dyn TableProvider>>,
+    state: &dyn Session,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let mut physical_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(providers.len());
+
+    for provider in providers {
+        physical_plans.push(provider.scan(state, projection, filters, limit).await?);
+    }
+
+    Ok(Arc::new(GlobalLimitExec::new(
+        UnionExec::try_new(physical_plans)?,
+        0,
+        limit,
+    )))
 }

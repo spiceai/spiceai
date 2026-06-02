@@ -117,11 +117,11 @@ impl EventStreamStore {
                 tracing::error!("EventStreamStore lock poisoned: {}", e);
                 e.into_inner()
             });
-            parents.insert(span_id.clone(), parent.clone());
+            parents.insert(span_id.clone(), parent);
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn send_event(&'static self, span_id: &Id, event: String) {
         let senders = self.senders.read().unwrap_or_else(|e| {
             tracing::error!("EventStreamStore lock poisoned: {}", e);

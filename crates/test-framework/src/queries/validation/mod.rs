@@ -24,8 +24,8 @@ use anyhow::{Result, anyhow};
 
 use arrow::{
     array::{
-        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
         StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
         UInt64Array,
@@ -39,11 +39,18 @@ use arrow::{
 };
 use chrono::{DateTime, NaiveDate};
 
+use arrow_tools::schema::schema_difference;
+
 use super::Query;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryValidationFailReason {
     NoExpectedAnswer,
+    /// A static TPCH answer exists for the query, but only at scale factor 1.0.
+    /// Validating at any other scale factor requires a configured reference
+    /// schema, so this is reported distinctly from [`Self::NoExpectedAnswer`]
+    /// (which means no expected answer exists for the query at all).
+    NoExpectedAnswerAtScaleFactor,
     NoAnswer,
     SchemaMismatch,
     RowCountMismatch {
@@ -83,7 +90,7 @@ macro_rules! generate_tpch_answers {
 }
 
 static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     {
         let mut map = BTreeMap::new();
         // Load TPCH answers from CSV files, into RecordBatches
@@ -125,32 +132,68 @@ static TPCH_ANSWERS: LazyLock<BTreeMap<Arc<str>, Vec<RecordBatch>>> = LazyLock::
     }
 });
 
-fn datatype_equivalent(expected_type: DataType, actual_type: DataType) -> bool {
+#[must_use]
+pub(crate) fn has_static_tpch_answer(query: &Query) -> bool {
+    TPCH_ANSWERS.contains_key(&query.name)
+}
+
+#[must_use]
+pub(crate) fn should_validate_with_static_tpch_answer(query: &Query, scale_factor: f64) -> bool {
+    (scale_factor - 1.0).abs() < f64::EPSILON && has_static_tpch_answer(query)
+}
+
+fn datatype_equivalent(expected_type: &DataType, actual_type: &DataType) -> bool {
     if expected_type == actual_type {
         return true;
     }
 
     // Check for logical equivalence, with a lenient set of rules
     // E.g. a number could be returned as a string, number, or float.
-    matches!(
-        (expected_type, actual_type),
-        (DataType::Float32, DataType::Float64)
-            | (
-                DataType::Float64 | DataType::Int64,
-                DataType::Decimal128(_, _)
+    match (expected_type, actual_type) {
+        // Handle timestamp timezone differences
+        (DataType::Timestamp(unit1, tz1), DataType::Timestamp(unit2, tz2)) => {
+            // Same time unit is required
+            if unit1 != unit2 {
+                return false;
+            }
+            // Allow timezone differences between None and Some("UTC")
+            matches!(
+                (tz1.as_deref(), tz2.as_deref()),
+                (None, Some("UTC" | "+00:00")) | (Some("UTC" | "+00:00"), None)
             )
-            | (DataType::Int32, DataType::Int64)
-            | (
-                DataType::Int64,
-                DataType::Int32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View
-            )
-            | (DataType::Utf8, DataType::LargeUtf8)
-            | (DataType::LargeUtf8, DataType::Utf8)
-    )
+        }
+        // Existing numeric and string type equivalences
+        _ => matches!(
+            (expected_type, actual_type),
+            (DataType::Float32, DataType::Float64)
+                | (DataType::Float64 | DataType::Int32, DataType::Int64)
+                | (
+                    DataType::Float64 | DataType::Int64,
+                    DataType::Decimal128(_, _)
+                )
+                | (
+                    DataType::Decimal128(_, _),
+                    DataType::Float64 | DataType::Int64
+                )
+                | (
+                    DataType::Int64,
+                    DataType::Int32
+                        | DataType::Int8
+                        | DataType::Float64
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                )
+                | (DataType::Utf8, DataType::LargeUtf8 | DataType::Utf8View)
+                | (DataType::Utf8View, DataType::Utf8 | DataType::LargeUtf8)
+                | (DataType::LargeUtf8, DataType::Utf8)
+                | (
+                    DataType::Date32,
+                    DataType::Date64 | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
+                | (DataType::Date64, DataType::Date32)
+        ),
+    }
 }
 
 fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) -> bool {
@@ -162,7 +205,7 @@ fn equivalent_schemas(expected_schema: &SchemaRef, actual_schema: &SchemaRef) ->
         .fields()
         .iter()
         .zip(actual_schema.fields().iter())
-        .all(|(f1, f2)| datatype_equivalent(f1.data_type().clone(), f2.data_type().clone()))
+        .all(|(f1, f2)| datatype_equivalent(f1.data_type(), f2.data_type()))
 }
 
 macro_rules! downcast_and_stringify {
@@ -211,7 +254,8 @@ macro_rules! downcast_and_stringify_ts {
 /// - `Err(anyhow::Error)`: If there is an error (e.g., invalid index, failed downcast).
 ///
 /// # Example:
-/// ```
+/// ```rust,ignore
+/// use arrow::array::Int64Array;
 /// let array = Int64Array::from(vec![12345]);
 /// let result = array_value_to_string(&array, 0);
 /// assert_eq!(result.unwrap(), Some("12345".to_string()));
@@ -223,7 +267,6 @@ macro_rules! downcast_and_stringify_ts {
 /// - If the function fails to downcast the array to the expected type (e.g., if the array's type is
 ///   mismatched), it will return an error.
 /// - If the array's data type is not supported for conversion, `None` is returned.
-#[allow(clippy::too_many_lines)]
 pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<String>> {
     if array.len() <= index {
         return Err(anyhow!("Index out of bounds: {index} >= {}", array.len()));
@@ -258,6 +301,20 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
             let date = NaiveDate::from_ymd_opt(1970, 1, 1)
                 .ok_or_else(|| anyhow!("Invalid base date"))?
                 .checked_add_signed(chrono::Duration::days(i64::from(days)))
+                .ok_or_else(|| anyhow!("Date out of range"))?;
+            Ok(Some(date.format("%Y-%m-%d").to_string()))
+        }
+
+        DataType::Date64 => {
+            let millis = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| anyhow!("Failed to downcast Date64 array"))?
+                .value(index);
+            let days = millis / 86_400_000; // Convert milliseconds to days
+            let date = NaiveDate::from_ymd_opt(1970, 1, 1)
+                .ok_or_else(|| anyhow!("Invalid base date"))?
+                .checked_add_signed(chrono::Duration::days(days))
                 .ok_or_else(|| anyhow!("Date out of range"))?;
             Ok(Some(date.format("%Y-%m-%d").to_string()))
         }
@@ -299,7 +356,7 @@ pub fn array_value_to_string(array: &dyn Array, index: usize) -> Result<Option<S
                     .ok_or_else(|| anyhow!("Failed to downcast TimestampSecondArray"))?
                     .value(index);
                 let dt = DateTime::from_timestamp(ts, 0)
-                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={}", ts))?;
+                    .ok_or_else(|| anyhow!("Invalid timestamp for seconds={ts}"))?;
                 Ok(Some(dt.format("%Y-%m-%d %H:%M:%S").to_string()))
             }
             TimeUnit::Millisecond => {
@@ -357,7 +414,7 @@ pub fn validate_batches_as_strings(
         if expected_array.len() != actual_array.len() {
             return Ok(QueryValidationResult::Fail(
                 QueryValidationFailReason::ColumnLengthMismatch {
-                    column_name: column_name.clone(),
+                    column_name,
                     left_len: expected_array.len(),
                     right_len: actual_array.len(),
                 },
@@ -373,7 +430,7 @@ pub fn validate_batches_as_strings(
                 (Some(val), None) => {
                     return Ok(QueryValidationResult::Fail(
                         QueryValidationFailReason::DataMismatch {
-                            column: column_name.clone(),
+                            column: column_name,
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: format!("{val:?}"),
                             actual: "None".to_string(),
@@ -383,7 +440,7 @@ pub fn validate_batches_as_strings(
                 (None, Some(val)) => {
                     return Ok(QueryValidationResult::Fail(
                         QueryValidationFailReason::DataMismatch {
-                            column: column_name.clone(),
+                            column: column_name,
                             row_number: row + 1, // indexes are 0-based, counts are 1-based
                             expected: "None".to_string(),
                             actual: format!("{val:?}"),
@@ -408,7 +465,7 @@ pub fn validate_batches_as_strings(
 
                         return Ok(QueryValidationResult::Fail(
                             QueryValidationFailReason::DataMismatch {
-                                column: column_name.clone(),
+                                column: column_name,
                                 row_number: row + 1, // indexes are 0-based, counts are 1-based
                                 expected: format!("{expected_val:?}"),
                                 actual: format!("{actual_val:?}"),
@@ -462,8 +519,12 @@ pub fn validate_tpch_query(
     };
 
     if !equivalent_schemas(&expected_schema, &actual_schema) {
-        println!("expected_schema: {expected_schema:?}");
-        println!("actual_schema: {actual_schema:?}");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("Schema mismatch:\n{diff}");
+        } else {
+            println!("expected_schema: {expected_schema:?}");
+            println!("actual_schema: {actual_schema:?}");
+        }
 
         return Ok(QueryValidationResult::Fail(
             QueryValidationFailReason::SchemaMismatch,
@@ -488,8 +549,127 @@ pub fn validate_tpch_query(
     validate_batches_as_strings(&expected_batches, &actual_batches)
 }
 
+pub fn validate_tpch_query_at_scale(
+    query: &Query,
+    batches: &[RecordBatch],
+    scale_factor: f64,
+) -> Result<QueryValidationResult> {
+    if has_static_tpch_answer(query)
+        && !should_validate_with_static_tpch_answer(query, scale_factor)
+    {
+        // A static answer exists, but only at scale factor 1.0. Report this
+        // distinctly from `NoExpectedAnswer` so callers can tell the query has a
+        // known SF=1 answer and that validating at this scale factor needs a
+        // reference schema instead.
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswerAtScaleFactor,
+        ));
+    }
+
+    validate_tpch_query(query, batches)
+}
+
+/// Validate a query against expected results from a custom query set
+/// This is a generic validation function that can be used for custom queries
+pub fn validate_with_expected_batches(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_batches: &[RecordBatch],
+) -> Result<QueryValidationResult> {
+    if expected_batches.is_empty() && actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Pass);
+    }
+
+    if expected_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoExpectedAnswer,
+        ));
+    }
+
+    if actual_batches.is_empty() {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    }
+
+    let Some(expected_schema) = expected_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    let Some(actual_schema) = actual_batches
+        .first()
+        .map(arrow::array::RecordBatch::schema)
+    else {
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::NoAnswer,
+        ));
+    };
+
+    if !equivalent_schemas(&expected_schema, &actual_schema) {
+        println!("Query '{query_name}' schema mismatch:");
+        if let Some(diff) = schema_difference(&expected_schema, &actual_schema) {
+            println!("{diff}");
+        } else {
+            println!("  expected_schema: {expected_schema:?}");
+            println!("  actual_schema: {actual_schema:?}");
+        }
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::SchemaMismatch,
+        ));
+    }
+
+    // combine all expected batches and all actual batches into a single RecordBatch
+    let expected_batches = arrow::compute::concat_batches(&expected_schema, expected_batches)?;
+    let actual_batches = arrow::compute::concat_batches(&actual_schema, actual_batches)?;
+
+    // check the row counts are equal
+    if expected_batches.num_rows() != actual_batches.num_rows() {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {}", expected_batches.num_rows());
+        println!("  actual: {}", actual_batches.num_rows());
+
+        return Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_batches.num_rows(),
+                actual: actual_batches.num_rows(),
+            },
+        ));
+    }
+
+    validate_batches_as_strings(&expected_batches, &actual_batches)
+}
+
+/// Validate that actual batches have the expected row count
+pub fn validate_row_count(
+    query_name: &str,
+    actual_batches: &[RecordBatch],
+    expected_row_count: usize,
+) -> Result<QueryValidationResult> {
+    let actual_row_count: usize = actual_batches.iter().map(RecordBatch::num_rows).sum();
+
+    if actual_row_count == expected_row_count {
+        Ok(QueryValidationResult::Pass)
+    } else {
+        println!("Query '{query_name}' row count mismatch:");
+        println!("  expected: {expected_row_count}");
+        println!("  actual: {actual_row_count}");
+
+        Ok(QueryValidationResult::Fail(
+            QueryValidationFailReason::RowCountMismatch {
+                expected: expected_row_count,
+                actual: actual_row_count,
+            },
+        ))
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::too_many_lines)]
 mod test {
     use crate::queries::QuerySet;
 
@@ -522,6 +702,26 @@ mod test {
             .clone();
         let schema = batches[0].schema();
         assert_eq!(schema.fields().len(), 10);
+    }
+
+    #[test]
+    fn test_static_tpch_answers_are_sf1_only() {
+        let query = Query::new("tpch_q22".into(), "SELECT 1".into(), false);
+
+        assert!(has_static_tpch_answer(&query));
+        assert!(should_validate_with_static_tpch_answer(&query, 1.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 10.0));
+        assert!(!should_validate_with_static_tpch_answer(&query, 100.0));
+
+        let batches = TPCH_ANSWERS
+            .get("tpch_q22")
+            .expect("should have q22 answer")
+            .clone();
+
+        assert_eq!(
+            validate_tpch_query_at_scale(&query, &batches, 100.0).expect("should validate"),
+            QueryValidationResult::Fail(QueryValidationFailReason::NoExpectedAnswerAtScaleFactor)
+        );
     }
 
     #[test]
@@ -587,12 +787,14 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_correct_answer_wrong_type() {
+    #[tokio::test]
+    async fn test_correct_answer_wrong_type() {
         // Use the correct answer, but a different datatype
         // Q22 from CSV, cntrycode is Utf8. Query returns it as Int64
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();
@@ -672,11 +874,13 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_wrong_answers() {
+    #[tokio::test]
+    async fn test_wrong_answers() {
         // Use the wrong answer and validate it fails
         let query = QuerySet::Tpch
-            .get_queries(None)
+            .get_queries(None, None, None, None)
+            .await
+            .expect("to get queries")
             .get(20)
             .expect("Should have q22")
             .clone();

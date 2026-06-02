@@ -136,3 +136,5 @@ impl DataConnector for MemoryConnector {
         }
     }
 }
+
+register_data_connector!("memory", MemoryConnectorFactory);

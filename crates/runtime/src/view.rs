@@ -13,10 +13,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+use crate::{
+    component::view::View,
+    embeddings::{index::table::wrap_table_as_index, table::EmbeddingTable},
+    search::full_text::table::add_full_text_search_to_table,
+};
 use ::datafusion::sql::{TableReference, parser, sqlparser::ast};
-use datafusion::{datasource::ViewTable, error::Result, prelude::SessionContext};
-use std::collections::HashSet;
+use datafusion::{
+    catalog::TableProvider,
+    datasource::ViewTable,
+    error::{DataFusionError, Result},
+    prelude::SessionContext,
+};
+use snafu::ResultExt;
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use std::{collections::HashSet, sync::Arc};
 
 pub(crate) fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
     let mut table_names = Vec::new();
@@ -90,13 +101,67 @@ fn extract_tables_from_set_expr(
     }
 }
 
-pub(crate) async fn create_view_table(
+pub(crate) async fn prepare_view(
     ctx: &SessionContext,
     statement: &parser::Statement,
-    view: impl Into<String>,
-) -> Result<ViewTable> {
+    view: &Arc<View>,
+) -> Result<Arc<dyn TableProvider>> {
     let plan = ctx.state().statement_to_plan(statement.clone()).await?;
-    Ok(ViewTable::new(plan, Some(view.into())))
+    let view_table = ViewTable::new(plan, Some(view.sql.to_string()));
+    let mut tbl_provider = Arc::new(view_table) as Arc<dyn TableProvider>;
+
+    // Add any embedding columns (and vector engine, if applicable)
+    if view.has_embeddings() {
+        if let Some(ref vectors) = view.vectors
+            && vectors.enabled
+        {
+            tbl_provider = wrap_table_as_index(
+                &Arc::new(ctx.clone()),
+                &view.runtime.embeds(),
+                &view.runtime.secrets(),
+                &view.name,
+                &view.columns,
+                None,
+                tbl_provider,
+                vectors,
+            )
+            .await?;
+        } else {
+            tbl_provider = EmbeddingTable::from_spicepod_columns(
+                tbl_provider,
+                view.columns
+                    .iter()
+                    .flat_map(|col| {
+                        col.embeddings.iter().map(|emb| ColumnEmbeddingConfig {
+                            column: col.name.clone(),
+                            model: emb.model.clone(),
+                            primary_keys: emb.row_ids.clone(),
+                            chunking: emb.chunking.clone(),
+                            vector_size: emb.vector_size,
+                            aggregation: emb.aggregation,
+                            max_elements_per_row: emb.max_elements_per_row,
+                        })
+                    })
+                    .collect(),
+                &view.runtime.embeds(),
+                None, // TODO handle file formats: `view.params.get("file_format").map(String::as_str)`.
+            )
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?;
+        }
+    }
+
+    // Configure full-text search
+    if view.has_full_text_column() {
+        tbl_provider = Arc::new(add_full_text_search_to_table(
+            tbl_provider,
+            &view.columns,
+            &view.name,
+        )?) as Arc<dyn TableProvider>;
+    }
+
+    Ok(tbl_provider)
 }
 
 #[cfg(test)]

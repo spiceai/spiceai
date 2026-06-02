@@ -17,14 +17,23 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(feature = "duckdb")]
+use arrow::array::{Array, Int32Array, StringArray};
 use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
+#[cfg(feature = "duckdb")]
+use common::{
+    get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
+    start_mongodb_replica_set_docker_container,
+};
 use mongodb::{Collection, bson::doc};
 
 use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+#[cfg(feature = "duckdb")]
+use crate::utils::wait_until_true;
+use crate::utils::{register_test_connectors, run_query, test_request_context};
 
 pub mod common;
 
@@ -34,6 +43,8 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MONGODB_PORT1: u16 = 27019;
+#[cfg(feature = "duckdb")]
+const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
@@ -107,10 +118,63 @@ async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+#[instrument]
+#[cfg(feature = "duckdb")]
+async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
+    tracing::debug!("INIT CHANGE STREAM DB: test");
+    let client = get_mongodb_replica_set_client(port).await?;
+    let database = client.database("testdb");
+
+    let _ = database
+        .collection::<mongodb::bson::Document>("change_stream_users")
+        .drop()
+        .await;
+
+    let collection: Collection<mongodb::bson::Document> =
+        database.collection("change_stream_users");
+    collection
+        .insert_many(vec![
+            doc! { "_id": 1, "name": "Ada" },
+            doc! { "_id": 2, "name": "Grace" },
+        ])
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "duckdb")]
+async fn change_stream_rows(rt: &Arc<Runtime>) -> Result<Vec<(i32, String)>, anyhow::Error> {
+    let batches = run_query(rt, "SELECT _id, name FROM change_stream_users ORDER BY _id").await?;
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| anyhow::anyhow!("_id column should be Int32"))?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("name column should be Utf8"))?;
+
+        for row_index in 0..batch.num_rows() {
+            if names.is_null(row_index) {
+                return Err(anyhow::anyhow!("name should not be null"));
+            }
+            rows.push((ids.value(row_index), names.value(row_index).to_string()));
+        }
+    }
+
+    Ok(rows)
+}
+
 #[tokio::test]
 async fn mongodb_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -187,6 +251,100 @@ async fn mongodb_integration_test() -> Result<(), String> {
                 tracing::error!("running_container.remove: {e}");
                 e.to_string()
             })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,connector_mongodb=debug,data_components=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mongodb_replica_set_docker_container(MONGODB_CHANGE_STREAM_PORT).await?;
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_change_stream_db(MONGODB_CHANGE_STREAM_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let app = AppBuilder::new("mongodb_change_streams_apply_insert_update_delete")
+                .with_dataset(make_mongodb_change_stream_dataset(
+                    "change_stream_users",
+                    "change_stream_users",
+                    MONGODB_CHANGE_STREAM_PORT,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            crate::utils::runtime_ready_check(&rt).await;
+            let rt = Arc::new(rt);
+
+            let initial_rows_loaded = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt)
+                        .await
+                        .is_ok_and(|rows| rows == vec![(1, "Ada".to_string()), (2, "Grace".to_string())])
+                }
+            })
+            .await;
+            assert!(initial_rows_loaded, "initial MongoDB snapshot should load");
+
+            let client = get_mongodb_replica_set_client(MONGODB_CHANGE_STREAM_PORT).await?;
+            let collection: Collection<mongodb::bson::Document> = client
+                .database("testdb")
+                .collection("change_stream_users");
+            collection
+                .insert_one(doc! { "_id": 3, "name": "Katherine" })
+                .await?;
+            collection
+                .update_one(
+                    doc! { "_id": 2 },
+                    doc! { "$set": { "name": "Grace Hopper" } },
+                )
+                .await?;
+            collection.delete_one(doc! { "_id": 1 }).await?;
+
+            let changes_applied = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![
+                            (2, "Grace Hopper".to_string()),
+                            (3, "Katherine".to_string()),
+                        ]
+                    })
+                }
+            })
+            .await;
+
+            assert!(
+                changes_applied,
+                "MongoDB Change Streams should apply insert, update, and delete events"
+            );
+
+            rt.shutdown().await;
+            running_container.remove().await?;
 
             Ok(())
         })

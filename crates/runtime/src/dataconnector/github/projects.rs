@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,14 +18,80 @@ use crate::dataconnector::ConnectorComponent;
 
 use super::{GitHubTableArgs, GitHubTableGraphQLParams};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use data_components::graphql::client::UnnestBehavior;
+use data_components::graphql::{ErrorChecker, GraphQLContext, client::UnnestBehavior};
+use http::{HeaderMap, HeaderValue};
+use serde_json::Value;
 use std::sync::Arc;
 
 // https://docs.github.com/en/graphql/reference/objects#projectv2
+#[derive(Debug)]
 pub struct ProjectsTableArgs {
     pub owner: String,
     pub repo: Option<String>,
     pub component: ConnectorComponent,
+}
+
+impl GraphQLContext for ProjectsTableArgs {
+    fn error_checker(&self) -> Option<ErrorChecker> {
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+
+        Some(Arc::new(
+            move |headers: &HeaderMap<HeaderValue>, response: &Value| {
+                let target = repo
+                    .as_ref()
+                    .map_or_else(|| owner.clone(), |repo| format!("{owner}/{repo}"));
+                let target_kind = if repo.is_some() {
+                    "repository projects"
+                } else {
+                    "organization projects"
+                };
+
+                // Trace the response for debugging
+                tracing::trace!(
+                    "GitHub projects GraphQL response for {target}: {}",
+                    serde_json::to_string(response)
+                        .unwrap_or_else(|_| "Unable to serialize response".to_string())
+                );
+
+                // First check standard GitHub errors (rate limits, etc.)
+                data_components::github::error_checker(headers, response)?;
+
+                // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
+                // returns "Something went wrong while executing your query" instead of a proper
+                // permission error. This appears to be a GitHub API bug where lack of permissions
+                // triggers an internal error rather than returning a proper authorization error.
+                if let Some(errors) = response.get("errors") {
+                    tracing::debug!(
+                        "GitHub projects query for {target} returned errors: {:?}",
+                        errors
+                    );
+                    if let Some(errors_array) = errors.as_array() {
+                        for error in errors_array {
+                            if let Some(message) = error.get("message").and_then(|m| m.as_str())
+                                && message
+                                    .contains("Something went wrong while executing your query")
+                            {
+                                tracing::error!(
+                                    "GitHub returned a misleading projects error for {target}; treating it as a permissions failure"
+                                );
+                                return Err(data_components::graphql::Error::InvalidCredentialsOrPermissions {
+                                message: format!("Failed to access {target_kind} for {target}: GitHub reported an internal query error, which usually means the GitHub App lacks project read permissions. Verify the app has the required project access."),
+                            });
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+        ))
+    }
+
+    fn query_cost(&self) -> Option<u32> {
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(1)
+    }
 }
 
 impl GitHubTableArgs for ProjectsTableArgs {
@@ -252,6 +318,8 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
+        assert!(query.contains("creator: creator"));
+        assert!(query.contains("creator: login"));
 
         // Should NOT contain repositoryOwner or fragments
         assert!(!query.contains("repositoryOwner"));
@@ -279,6 +347,8 @@ mod tests {
         assert!(query.contains("updated_at: updatedAt"));
         assert!(query.contains("closed_at: closedAt"));
         assert!(query.contains("short_description: shortDescription"));
+        assert!(query.contains("creator: creator"));
+        assert!(query.contains("creator: login"));
 
         // Should NOT contain repository-specific structure
         assert!(!query.contains("repository(owner:"));

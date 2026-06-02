@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::App;
 use async_trait::async_trait;
 use datafusion_table_providers::UnsupportedTypeAction;
-use tokio::sync::RwLock;
+use tokio::{runtime::Handle, sync::RwLock};
 
 use crate::{
     Runtime, catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY, parameters::Parameters,
@@ -31,6 +31,8 @@ use super::{
 };
 
 pub(crate) mod aws;
+pub(crate) mod azure;
+pub(crate) mod gcs;
 
 #[async_trait]
 pub(crate) trait Validator {
@@ -42,11 +44,12 @@ pub(crate) trait Validator {
 
 #[derive(Clone)]
 pub struct ConnectorParams {
-    pub(crate) parameters: Parameters,
-    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
-    pub(crate) component: ConnectorComponent,
-    pub(crate) app: Option<Arc<App>>,
-    pub(crate) runtime: Option<Arc<Runtime>>,
+    pub parameters: Parameters,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
+    pub component: ConnectorComponent,
+    pub app: Option<Arc<App>>,
+    pub runtime: Option<Arc<Runtime>>,
+    pub io_runtime: Handle,
 }
 
 pub struct ConnectorParamsBuilder {
@@ -66,53 +69,63 @@ impl ConnectorParamsBuilder {
     pub async fn build(
         self,
         secrets: Arc<RwLock<Secrets>>,
+        io_runtime: Handle,
     ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
         let name = self.connector.to_string();
         let mut unsupported_type_action = None;
         let (params, prefix, parameters, app, runtime) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
-                let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
+                let (prefix, parameters) = {
+                    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                    let connector_factory = guard.get(&name);
 
-                let factory =
-                    connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
-                        dataconnector: name.clone(),
-                        connector_component: self.component.clone(),
+                    let factory = connector_factory.ok_or_else(|| {
+                        DataConnectorError::InvalidConnectorType {
+                            dataconnector: name.clone(),
+                            connector_component: self.component.clone(),
+                        }
                     })?;
+
+                    (factory.prefix(), factory.parameters())
+                };
 
                 (
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
-                    factory.prefix(),
-                    factory.parameters(),
+                    prefix,
+                    parameters,
                     Some(catalog.app()),
                     Some(catalog.runtime()),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
-                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
-
                 unsupported_type_action = dataset.unsupported_type_action;
 
-                let factory = connector_factory.ok_or_else(|| {
-                    if name == ODBC_DATACONNECTOR {
-                        DataConnectorError::OdbcNotInstalled {
-                            connector_component: self.component.clone(),
+                let (prefix, parameters) = {
+                    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                    let connector_factory = guard.get(&name);
+
+                    let factory = connector_factory.ok_or_else(|| {
+                        if name == ODBC_DATACONNECTOR {
+                            DataConnectorError::OdbcNotInstalled {
+                                connector_component: self.component.clone(),
+                            }
+                        } else {
+                            DataConnectorError::InvalidConnectorType {
+                                dataconnector: name.clone(),
+                                connector_component: self.component.clone(),
+                            }
                         }
-                    } else {
-                        DataConnectorError::InvalidConnectorType {
-                            dataconnector: name.clone(),
-                            connector_component: self.component.clone(),
-                        }
-                    }
-                })?;
+                    })?;
+
+                    (factory.prefix(), factory.parameters())
+                };
 
                 let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
 
                 (
                     params,
-                    factory.prefix(),
-                    factory.parameters(),
+                    prefix,
+                    parameters,
                     Some(dataset.app()),
                     Some(dataset.runtime()),
                 )
@@ -134,6 +147,7 @@ impl ConnectorParamsBuilder {
             component: self.component,
             app,
             runtime,
+            io_runtime,
         })
     }
 }

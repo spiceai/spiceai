@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/mysql/mod.rs
+description: "null mode: zero dates coerced to NULL, schema widened"
+---
++----+-------+---------------------+---------------+
+| id | name  | date_created        | date_modified |
++----+-------+---------------------+---------------+
+| 1  | alice | 2024-01-15T10:00:00 | 2024-01-15    |
+| 2  | bob   |                     |               |
+| 3  | carol | 2024-03-20T14:30:00 | 2024-03-20    |
++----+-------+---------------------+---------------+

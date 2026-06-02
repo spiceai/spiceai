@@ -161,7 +161,8 @@ pub(crate) async fn get_namespaces(Query(params): Query<ParentNamespaceQueryPara
     tag = "Iceberg",
     responses(
         (status = 200, description = "Namespace exists"),
-        (status = 404, description = "Namespace does not exist")
+        (status = 404, description = "Namespace does not exist"),
+        (status = 400, description = "Invalid namespace format")
     )
 ))]
 pub(crate) async fn head_namespace(Path(namespace): Path<NamespacePath>) -> Response {
@@ -185,7 +186,8 @@ pub(crate) async fn head_namespace(Path(namespace): Path<NamespacePath>) -> Resp
     tag = "Iceberg",
     responses(
         (status = 200, description = "Namespace exists"),
-        (status = 404, description = "Namespace does not exist")
+        (status = 404, description = "Namespace does not exist"),
+        (status = 400, description = "Invalid namespace format")
     )
 ))]
 pub(crate) async fn get_namespace(Path(namespace): Path<NamespacePath>) -> Response {
@@ -256,8 +258,8 @@ fn get_child_namespaces_impl(
             // There are no namespaces under this schema, so we return an empty list
             Ok(vec![])
         }
-        3.. => Err(IcebergResponseError::no_such_namespace(
-            "Namespace does not exist".to_string(),
+        3.. => Err(IcebergResponseError::bad_request(
+            "Invalid namespace: maximum depth is 2 parts (catalog.schema)".to_string(),
         )),
     }
 }
@@ -290,7 +292,8 @@ struct ListTablesResponse {
                 ]
             })
         ))),
-        (status = 404, description = "Namespace does not exist")
+        (status = 404, description = "Namespace does not exist"),
+        (status = 400, description = "Invalid namespace format")
     )
 ))]
 pub(crate) async fn list_tables(Path(namespace): Path<NamespacePath>) -> Response {
@@ -364,7 +367,7 @@ pub(crate) async fn list_tables(Path(namespace): Path<NamespacePath>) -> Respons
         }
 
         // For invalid namespace lengths (0 or > 2), return error
-        _ => IcebergResponseError::no_such_namespace(
+        _ => IcebergResponseError::bad_request(
             "Invalid namespace: must specify catalog and optionally schema".to_string(),
         )
         .into_response(),

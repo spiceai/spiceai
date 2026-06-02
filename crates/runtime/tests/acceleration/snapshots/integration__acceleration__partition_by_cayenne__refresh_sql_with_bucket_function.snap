@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
+expression: formatted
+---
++----+--------------+-----+-------------+-------+
+| id | name         | age | city        | score |
++----+--------------+-----+-------------+-------+
+| 7  | Tom Anderson | 52  | San Antonio | 81    |
+| 8  | Lisa Taylor  | 29  | San Diego   | 88    |
+| 10 | Anna Garcia  | 41  | San Jose    | 90    |
++----+--------------+-----+-------------+-------+

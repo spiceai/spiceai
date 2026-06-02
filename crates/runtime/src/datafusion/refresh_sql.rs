@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
@@ -24,16 +25,20 @@ use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
+use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
+
+use crate::accelerated_table::refresh::{RefreshSQL, RefreshSQLColumns};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {} Check the SQL for syntax errors.",
+        format_datafusion_error(source)
     ))]
     UnableToParseSql { source: DataFusionError },
 
@@ -42,8 +47,13 @@ pub enum Error {
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
-    #[snafu(display("Expected a SQL query starting with SELECT <columns> FROM {expected_table}"))]
-    InvalidSqlStatement { expected_table: TableReference },
+    #[snafu(display(
+        "Expected a SQL query starting with SELECT <columns> FROM {expected_table}. {issue}"
+    ))]
+    InvalidSqlStatement {
+        expected_table: TableReference,
+        issue: String,
+    },
 
     #[snafu(display(
         "Unexpected '{expr}' in the Refresh SQL statement. Rewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
@@ -83,12 +93,13 @@ macro_rules! ensure_no_expr {
     };
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn validate_refresh_sql(
+/// Parse and validate a refresh SQL string, returning both a structured `RefreshSQL` and the
+/// validated schema. This replaces the old `validate_refresh_sql` which only returned a schema.
+pub fn parse_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,
     source_schema: Arc<Schema>,
-) -> Result<Arc<Schema>> {
+) -> Result<(RefreshSQL, Arc<Schema>)> {
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
     if statements.len() != 1 {
@@ -103,24 +114,31 @@ pub fn validate_refresh_sql(
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {
                 ensure_no_expr!(query.fetch.is_none(), "FETCH", expected_table);
-                ensure_no_expr!(query.offset.is_none(), "OFFSET", expected_table);
                 ensure_no_expr!(query.with.is_none(), "WITH", expected_table);
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
-                ensure_no_expr!(query.limit_by.is_empty(), "LIMIT BY", expected_table);
+
+                let limit_value = parse_limit(query.limit_clause.as_ref(), &expected_table)?;
+
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 
                 match query.body.as_ref() {
                     SetExpr::Select(select) => {
-                        let refresh_schema = validate_select_columns(
+                        let (columns, refresh_schema) = validate_and_extract_columns(
                             &select.projection,
                             source_schema,
                             &expected_table,
                         )?;
                         ensure!(
                             select.from.len() == 1,
-                            InvalidSqlStatementSnafu { expected_table }
+                            InvalidSqlStatementSnafu {
+                                expected_table,
+                                issue: format!(
+                                    "A single FROM clause with table reference is expected, found {}",
+                                    select.from.len()
+                                )
+                            }
                         );
 
                         ensure_no_expr!(select.cluster_by.is_empty(), "CLUSTER BY", expected_table);
@@ -168,40 +186,117 @@ pub fn validate_refresh_sql(
                                     .map(ToString::to_string)
                                     .collect::<Vec<_>>()
                                     .join(".");
-                                ensure!(
-                                    TableReference::parse_str(&table_name_with_schema)
-                                        == expected_table,
-                                    InvalidSqlStatementSnafu { expected_table }
-                                );
+                                if TableReference::parse_str(&table_name_with_schema)
+                                    != expected_table
+                                {
+                                    return InvalidSqlStatementSnafu {
+                                        expected_table: expected_table.clone(),
+                                        issue: format!(
+                                            "Table name in refresh_sql should be {expected_table}, is {name}",
+                                        ),
+                                    }
+                                    .fail();
+                                }
                             }
                             _ => {
-                                InvalidSqlStatementSnafu { expected_table }.fail()?;
+                                return InvalidSqlStatementSnafu {
+                                    expected_table,
+                                    issue:
+                                        "No FROM clause with table reference found in SQL statement"
+                                            .to_string(),
+                                }
+                                .fail();
                             }
                         }
 
-                        Ok(refresh_schema)
+                        // Extract user WHERE filters, split on top-level AND
+                        let user_filters = select
+                            .selection
+                            .as_ref()
+                            .map(|expr| split_conjunction(expr.clone()))
+                            .unwrap_or_default();
+
+                        let refresh_sql =
+                            RefreshSQL::new(expected_table, columns, user_filters, limit_value);
+
+                        Ok((refresh_sql, refresh_schema))
                     }
-                    _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+                    _ => InvalidSqlStatementSnafu {
+                        expected_table,
+                        issue: format!(
+                            "Expected a basic Select SQL query statement, found {}",
+                            query.body
+                        ),
+                    }
+                    .fail()?,
                 }
             }
-            _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+            _ => InvalidSqlStatementSnafu {
+                expected_table,
+                issue: format!("Expected a Select SQL query statement, found {statement}"),
+            }
+            .fail()?,
         },
-        _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
+        _ => InvalidSqlStatementSnafu {
+            expected_table,
+            issue: format!("Expected a SQL Statement, found {statement}"),
+        }
+        .fail()?,
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn validate_select_columns(
+/// Extract and validate the LIMIT clause, ensuring it is a simple non-negative integer literal if present, and that no unsupported features like OFFSET or LIMIT BY are used.
+fn parse_limit(limit: Option<&LimitClause>, tbl: &TableReference) -> Result<Option<usize>> {
+    let (limit, offset, limit_by) = match limit {
+        Some(LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => (limit, offset, limit_by),
+        None => return Ok(None), // No LIMIT clause specified, treated as no limit
+        _ => {
+            return UnexpectedExpressionSnafu {
+                expr: "unsupported LIMIT clause; expected LIMIT <non-negative integer literal>",
+                expected_table: tbl.clone(),
+            }
+            .fail();
+        }
+    };
+
+    ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", tbl.clone());
+    ensure_no_expr!(offset.is_none(), "OFFSET", tbl.clone());
+
+    match &limit {
+        Some(Expr::Value(v)) => v
+            .to_string()
+            .parse::<usize>()
+            .map_err(|_| Error::UnexpectedExpression {
+                expr: "non-negative integer literal LIMIT",
+                expected_table: tbl.clone(),
+            })
+            .map(Some),
+        None => Ok(None), // No LIMIT value specified, treated as no limit
+        _ => UnexpectedExpressionSnafu {
+            expr: "non-negative integer literal LIMIT",
+            expected_table: tbl.clone(),
+        }
+        .fail(),
+    }
+}
+
+/// Validate select columns and extract both the `RefreshSQLColumns` and the resulting schema.
+fn validate_and_extract_columns(
     select: &Vec<SelectItem>,
     source_schema: Arc<Schema>,
     expected_table: &TableReference,
-) -> Result<Arc<Schema>> {
+) -> Result<(RefreshSQLColumns, Arc<Schema>)> {
     // Wildcard will select all columns
     if select.len() == 1 && matches!(select[0], SelectItem::Wildcard(_)) {
-        return Ok(source_schema);
+        return Ok((RefreshSQLColumns::All, source_schema));
     }
 
     let mut fields = vec![];
+    let mut column_idents = vec![];
     for select_item in select {
         match select_item {
             SelectItem::UnnamedExpr(expr) => match expr {
@@ -218,6 +313,7 @@ fn validate_select_columns(
                         .fail();
                     };
                     fields.push(field.clone());
+                    column_idents.push(ident.clone());
                 }
                 _ => {
                     return OnlyColumnReferencesSnafu {
@@ -241,7 +337,26 @@ fn validate_select_columns(
     // are not included automatically. We verify their presence in the source schema and add them manually if needed.
     fields = include_computed_columns(&fields, &source_schema);
 
-    Ok(Arc::new(Schema::new(fields)))
+    Ok((
+        RefreshSQLColumns::Named(column_idents),
+        Arc::new(Schema::new(fields)),
+    ))
+}
+
+/// Split a WHERE expression on top-level AND into individual predicates.
+fn split_conjunction(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = split_conjunction(*left);
+            parts.extend(split_conjunction(*right));
+            parts
+        }
+        other => vec![other],
+    }
 }
 
 /// Checks the source schema for associated computed columns (e.g., embeddings)
@@ -329,8 +444,10 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT * FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 3);
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        assert!(matches!(refresh_sql.columns(), RefreshSQLColumns::All));
+        assert_eq!(refresh_sql.to_sql(), "SELECT * FROM test_table");
         Ok(())
     }
 
@@ -340,10 +457,12 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 2);
-        assert_eq!(result.field(0).name(), "id");
-        assert_eq!(result.field(1).name(), "name");
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 2);
+        assert_eq!(result_schema.field(0).name(), "id");
+        assert_eq!(result_schema.field(1).name(), "name");
+        assert!(matches!(refresh_sql.columns(), RefreshSQLColumns::Named(_)));
+        assert_eq!(refresh_sql.to_sql(), "SELECT id, name FROM test_table");
         Ok(())
     }
 
@@ -353,7 +472,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, invalid_column FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::ColumnNotFoundInSource { .. })));
     }
 
@@ -363,7 +482,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM wrong_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::InvalidSqlStatement { .. })));
     }
 
@@ -373,7 +492,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id + 1 FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
     }
 
@@ -383,7 +502,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id as user_id FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::OnlyColumnReferences { .. })));
     }
 
@@ -393,7 +512,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM test_table GROUP BY id";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(result, Err(Error::UnexpectedExpression { .. })));
     }
 
@@ -403,7 +522,7 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id FROM test_table; SELECT name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema));
+        let result = parse_refresh_sql(table, sql, Arc::clone(&schema));
         assert!(matches!(
             result,
             Err(Error::ExpectedSingleSqlStatement { .. })
@@ -416,12 +535,112 @@ mod tests {
         let table = TableReference::parse_str("test_table");
         let sql = "SELECT id, name FROM test_table";
 
-        let result = validate_refresh_sql(table, sql, Arc::clone(&schema))?;
-        assert_eq!(result.fields().len(), 4);
-        assert_eq!(result.field(0).name(), "id");
-        assert_eq!(result.field(1).name(), "name");
-        assert_eq!(result.field(2).name(), "name_embedding");
-        assert_eq!(result.field(3).name(), "name_offset");
+        let (_, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 4);
+        assert_eq!(result_schema.field(0).name(), "id");
+        assert_eq!(result_schema.field(1).name(), "name");
+        assert_eq!(result_schema.field(2).name(), "name_embedding");
+        assert_eq!(result_schema.field(3).name(), "name_offset");
+        Ok(())
+    }
+
+    #[test]
+    fn test_valid_where_with_scalar_function() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("organization_id", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        let table = TableReference::parse_str("test_table");
+
+        // bucket() in a WHERE clause should be accepted by refresh SQL validation.
+        let sql = "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0";
+        let (refresh_sql, result_schema) =
+            parse_refresh_sql(table.clone(), sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        assert_eq!(
+            refresh_sql.to_sql(),
+            "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0"
+        );
+
+        // Multiple OR'd bucket() filters (as generated by partition assignment).
+        let sql = "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0 OR bucket(50, organization_id) = 1";
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 3);
+        // The OR expression stays as a single filter since OR is not top-level AND
+        assert_eq!(
+            refresh_sql.to_sql(),
+            "SELECT * FROM test_table WHERE bucket(50, organization_id) = 0 OR bucket(50, organization_id) = 1"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_where_with_and() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table WHERE id > 10 AND name = 'foo'";
+
+        let (refresh_sql, _) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        // Should split on top-level AND into 2 user_filters
+        let reconstructed = refresh_sql.to_sql();
+        assert!(reconstructed.contains("WHERE"));
+        assert!(reconstructed.contains("id > 10"));
+        assert!(reconstructed.contains("name = 'foo'"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_limit() -> Result<()> {
+        let schema = create_test_schema();
+        let table = TableReference::parse_str("test_table");
+        let sql = "SELECT * FROM test_table LIMIT 100";
+
+        let (refresh_sql, _) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert!(refresh_sql.to_sql().contains("LIMIT 100"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_conjunction() {
+        use sqlparser::ast::{BinaryOperator, Value};
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Value(Value::Number("1".to_string(), false).into())),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Value(Value::Number("2".to_string(), false).into())),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Value(Value::Number("3".to_string(), false).into())),
+            }),
+        };
+
+        let parts = split_conjunction(expr);
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn test_quoted_identifiers_preserved() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("MyCol", DataType::Int64, false),
+            Field::new("another col", DataType::Utf8, false),
+        ]));
+        let table = TableReference::parse_str("test_table");
+        let sql = r#"SELECT "MyCol", "another col" FROM test_table"#;
+
+        let (refresh_sql, result_schema) = parse_refresh_sql(table, sql, Arc::clone(&schema))?;
+        assert_eq!(result_schema.fields().len(), 2);
+        // to_sql() should preserve the double-quoting
+        let reconstructed = refresh_sql.to_sql();
+        assert!(
+            reconstructed.contains(r#""MyCol""#),
+            "Expected quoted identifier in: {reconstructed}"
+        );
+        assert!(
+            reconstructed.contains(r#""another col""#),
+            "Expected quoted identifier in: {reconstructed}"
+        );
         Ok(())
     }
 }

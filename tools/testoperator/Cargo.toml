@@ -2,25 +2,43 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "testoperator"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-clap.workspace = true
-reqwest.workspace = true
-test-framework = { path = "../../crates/test-framework" }
-tokio.workspace = true
-serde.workspace = true
-serde_yaml.workspace = true
-serde_json.workspace = true
+arrow.workspace = true
 arrow-json.workspace = true
-spiceai.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-dynamodb.workspace = true
+bollard = "0.18.1"
+chbench-driver = { path = "../chbench-driver" }
+clap.workspace = true
+duckdb = { workspace = true, features = ["bundled"] }
+futures.workspace = true
+itertools.workspace = true
 hf-hub = { workspace = true }
+insta.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml = { path = "../../crates/yaml" }
+spiceai.workspace = true
+spicepod = { path = "../../crates/spicepod" }
+system-adapter-protocol.workspace = true
+test-framework = { path = "../../crates/test-framework" }
+rand.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
 
 [features]
+default = ["append"]
 anonymous_telemetry = []
 aws-secrets-manager = []
 clickhouse = []
@@ -31,8 +49,8 @@ dremio = []
 duckdb = []
 flightsql = []
 ftp = []
-keyring-secret-store = []
 imap = []
+keyring-secret-store = []
 models = []
 mssql = []
 mysql = []
@@ -42,5 +60,6 @@ sharepoint = []
 snowflake = []
 spark = []
 sqlite = []
+turso = []
 
 append = ["test-framework/file_append"]

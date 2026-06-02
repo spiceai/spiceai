@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use datafusion::{
@@ -25,47 +29,283 @@ use datafusion::{
     },
 };
 use object_store::{
-    ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    ClientOptions, ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector,
     http::HttpBuilder,
 };
+use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 
 #[cfg(feature = "ftp")]
 use crate::store::ftp::FTPObjectStore;
-#[cfg(feature = "ftp")]
+#[cfg(feature = "nfs")]
+use crate::store::nfs::NFSObjectStore;
+#[cfg(feature = "sftp")]
 use crate::store::sftp::SFTPObjectStore;
+#[cfg(feature = "smb")]
+use crate::store::smb::SMBObjectStore;
 
+/// S3 URL addressing style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3UrlStyle {
+    /// Virtual-hosted style: `<bucket>.endpoint`.
+    VirtualHosted,
+    /// Path style: `endpoint/<bucket>`.
+    Path,
+}
+
+impl S3UrlStyle {
+    /// Returns `true` if this is virtual-hosted style.
+    fn is_virtual_hosted(self) -> bool {
+        matches!(self, Self::VirtualHosted)
+    }
+}
+
+impl std::fmt::Display for S3UrlStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VirtualHosted => f.write_str("vhost"),
+            Self::Path => f.write_str("path"),
+        }
+    }
+}
+
+/// Internal state for S3 URL style auto-detection.
 #[derive(Debug, Default)]
+struct S3StyleState {
+    /// Cache of definitively detected S3 URL styles per endpoint. Only positive
+    /// DNS results ([`S3UrlStyle::VirtualHosted`]) are cached because they are
+    /// conclusive. [`S3UrlStyle::Path`] results (from DNS lookup failure) are
+    /// *not* cached because the failure may be transient (e.g. temporary
+    /// resolver outage) — a later probe may succeed and correctly detect vhost.
+    cache: HashMap<String, S3UrlStyle>,
+
+    /// Endpoints for which auto-detection has already been logged, so repeated
+    /// probes for the same endpoint don't produce duplicate log lines.
+    logged: HashSet<String>,
+}
+
+/// Process-wide state for S3 URL style auto-detection. Shared across every
+/// [`SpiceObjectStoreRegistry`] instance so the dedup `logged` set (and any
+/// cached `VirtualHosted` detections) survive registry creation — otherwise
+/// per-dataset registries (created via [`default_runtime_env`] and similar)
+/// each re-emit the same auto-detection log on first lookup.
+static S3_STYLE_STATE: LazyLock<Mutex<S3StyleState>> =
+    LazyLock::new(|| Mutex::new(S3StyleState::default()));
+
+#[derive(Debug)]
 pub struct SpiceObjectStoreRegistry {
     inner: DefaultObjectStoreRegistry,
+    io_runtime: Handle,
 }
 
 impl SpiceObjectStoreRegistry {
     #[must_use]
-    pub fn new() -> Self {
-        SpiceObjectStoreRegistry::default()
+    pub fn new(io_runtime: Handle) -> Self {
+        Self {
+            inner: DefaultObjectStoreRegistry::new(),
+            io_runtime,
+        }
     }
 
-    fn prepare_s3_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    /// Parse `url_style` parameter. Returns `Some(VirtualHosted)` for vhost, `Some(Path)` for path,
+    /// `None` when not explicitly set (auto-detect).
+    fn parse_s3_url_style(
+        params: &HashMap<String, String>,
+    ) -> datafusion::error::Result<Option<S3UrlStyle>> {
+        match params.get("url_style").map(String::as_str) {
+            Some("path") => Ok(Some(S3UrlStyle::Path)),
+            Some("vhost") => Ok(Some(S3UrlStyle::VirtualHosted)),
+            None => Ok(None),
+            Some(value) => Err(DataFusionError::Configuration(format!(
+                "{value} is not a valid value for url_style"
+            ))),
+        }
+    }
+
+    fn endpoint_for_s3_url_style(
+        endpoint: &str,
+        bucket_name: &str,
+        url_style: S3UrlStyle,
+    ) -> datafusion::error::Result<String> {
+        if url_style == S3UrlStyle::Path {
+            return Ok(endpoint.to_string());
+        }
+
+        let mut endpoint_url = Url::parse(endpoint).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to parse endpoint '{endpoint}' as URL: {e}"
+            ))
+        })?;
+
+        let Some(host) = endpoint_url.host_str() else {
+            return Err(DataFusionError::Configuration(format!(
+                "No host found in endpoint URL: {endpoint}"
+            )));
+        };
+
+        let virtual_hosted = format!("{bucket_name}.{host}");
+        endpoint_url.set_host(Some(&virtual_hosted)).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to set virtual-hosted endpoint host to {virtual_hosted}: {e}"
+            ))
+        })?;
+
+        Ok(endpoint_url.to_string().trim_end_matches('/').to_string())
+    }
+
+    /// Returns `true` if the endpoint host is an IP address.
+    fn endpoint_is_ip(endpoint: &str) -> bool {
+        Url::parse(endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.parse::<IpAddr>().is_ok()))
+            .unwrap_or(false)
+    }
+
+    fn prepare_s3_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(bucket_name) = url.host_str() else {
             return Err(DataFusionError::Configuration(
                 "No bucket name provided".to_string(),
             ));
         };
 
-        let mut s3_builder = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket_name)
-            .with_allow_http(true);
-        let mut client_options = ClientOptions::default();
-
         let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
+
+        let explicit_url_style = Self::parse_s3_url_style(&params)?;
+        let endpoint = params.get("endpoint");
+
+        let url_style = match explicit_url_style {
+            Some(v) => v,
+            None => {
+                // Auto-detect: IP endpoints must use path-style.
+                if endpoint.is_some_and(|e| Self::endpoint_is_ip(e)) {
+                    tracing::debug!("s3_url_style not set; using path style for IP endpoint");
+                    S3UrlStyle::Path
+                } else if let Some(ep) = endpoint {
+                    // Non-IP custom endpoint — cached result or DNS probe.
+                    Self::resolve_s3_url_style(bucket_name, ep)
+                } else {
+                    // No custom endpoint (standard AWS) — vhost.
+                    S3UrlStyle::VirtualHosted
+                }
+            }
+        };
+
+        self.build_s3_object_store(bucket_name, &params, url_style)
+    }
+
+    /// Resolve the S3 URL style for a non-IP custom endpoint, using the cache
+    /// when available. Uses a double-checked pattern so the lock is *not* held
+    /// during the (potentially slow) DNS probe.
+    ///
+    /// Only definitive results ([`S3UrlStyle::VirtualHosted`], from a successful
+    /// DNS resolution) are cached. [`S3UrlStyle::Path`] results are not cached
+    /// because a DNS failure may be transient — a later probe could succeed.
+    fn resolve_s3_url_style(bucket_name: &str, endpoint: &str) -> S3UrlStyle {
+        // Fast path: return cached result without doing any I/O.
+        {
+            let state = S3_STYLE_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(&cached) = state.cache.get(endpoint) {
+                return cached;
+            }
+        }
+        // Lock released — perform DNS probe.
+
+        let detected = match Self::detect_s3_url_style(bucket_name, endpoint) {
+            Ok(style) => style,
+            Err(e) => {
+                tracing::warn!("s3_url_style detection failed ({e:#}), defaulting to vhost");
+                return S3UrlStyle::VirtualHosted;
+            }
+        };
+
+        // Re-acquire lock for double-check and state update.
+        let mut state = S3_STYLE_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Another thread may have completed detection while we were probing.
+        if let Some(&cached) = state.cache.get(endpoint) {
+            return cached;
+        }
+
+        // Only cache definitive (VirtualHosted) results. Path results come from
+        // DNS lookup failure, which may be a transient resolver/network issue.
+        if detected == S3UrlStyle::VirtualHosted {
+            state.cache.insert(endpoint.to_string(), detected);
+        }
+
+        if state.logged.insert(endpoint.to_string()) {
+            tracing::info!("Auto-detected s3_url_style={detected} for endpoint '{endpoint}'");
+        }
+
+        detected
+    }
+
+    /// Detect whether vhost or path style should be used by performing a DNS
+    /// lookup on `<bucket>.<endpoint_host>`. If the name resolves the endpoint
+    /// supports virtual-hosted style; NXDOMAIN means path style is required.
+    fn detect_s3_url_style(
+        bucket_name: &str,
+        endpoint: &str,
+    ) -> datafusion::error::Result<S3UrlStyle> {
+        use std::net::ToSocketAddrs;
+
+        let endpoint_url = Url::parse(endpoint).map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Unable to parse endpoint '{endpoint}' as URL: {e}"
+            ))
+        })?;
+
+        let Some(host) = endpoint_url.host_str() else {
+            return Err(DataFusionError::Configuration(format!(
+                "No host found in endpoint URL: {endpoint}"
+            )));
+        };
+
+        let port = endpoint_url.port().unwrap_or(match endpoint_url.scheme() {
+            "https" => 443,
+            _ => 80,
+        });
+
+        let vhost_host = format!("{bucket_name}.{host}:{port}");
+
+        tracing::debug!(
+            "s3_url_style not set for endpoint '{endpoint}'; resolving '{vhost_host}' to detect URL style..."
+        );
+
+        if vhost_host.to_socket_addrs().is_ok() {
+            Ok(S3UrlStyle::VirtualHosted)
+        } else {
+            Ok(S3UrlStyle::Path)
+        }
+    }
+
+    fn build_s3_object_store(
+        &self,
+        bucket_name: &str,
+        params: &HashMap<String, String>,
+        url_style: S3UrlStyle,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let mut s3_builder = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket_name)
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
+            .with_allow_http(true);
+        let mut client_options = ClientOptions::default();
+
+        s3_builder = s3_builder.with_virtual_hosted_style_request(url_style.is_virtual_hosted());
 
         if let Some(region) = params.get("region") {
             s3_builder = s3_builder.with_region(region);
         }
         if let Some(endpoint) = params.get("endpoint") {
+            let endpoint = Self::endpoint_for_s3_url_style(endpoint, bucket_name, url_style)?;
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
         if let Some(timeout) = params.get("client_timeout") {
@@ -83,45 +323,85 @@ impl SpiceObjectStoreRegistry {
             client_options = client_options.with_allow_http(as_bool);
         }
 
-        let mut load_credentials_from_environment = true;
+        // Determine credential configuration using common utility
+        let credential_config = aws_sdk_credential_bridge::determine_s3_credential_config(
+            params.get("key").map(String::as_str),
+            params.get("secret").map(String::as_str),
+            params.get("auth").map(String::as_str),
+            params.get("iam_role_source").map(String::as_str),
+        )
+        .map_err(DataFusionError::Configuration)?;
 
-        if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+        // Apply explicit credentials if provided
+        if !credential_config.load_from_environment
+            && !credential_config.skip_signature
+            && let (Some(key), Some(secret)) = (params.get("key"), params.get("secret"))
+        {
             s3_builder = s3_builder.with_access_key_id(key);
             s3_builder = s3_builder.with_secret_access_key(secret);
             if let Some(token) = params.get("session_token") {
                 s3_builder = s3_builder.with_token(token);
             }
-            load_credentials_from_environment = false;
-        } else {
-            match params.get("auth") {
-                Some(auth) if auth == "iam_role" => {
-                    s3_builder = s3_builder.with_skip_signature(false);
-                }
-                Some(auth) if auth == "public" => {
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                None => {
-                    // Default to public if no auth is provided
-                    s3_builder = s3_builder.with_skip_signature(true);
-                    load_credentials_from_environment = false;
-                }
-                Some(auth) => {
-                    return Err(DataFusionError::Configuration(format!(
-                        "Unexpected S3 auth method: {auth}",
-                    )));
-                }
-            }
         }
+
+        // Configure skip signature for public access
+        if credential_config.skip_signature {
+            s3_builder = s3_builder.with_skip_signature(true);
+        }
+
         s3_builder = s3_builder.with_client_options(client_options);
 
-        if load_credentials_from_environment {
+        // Load credentials from AWS SDK environment if needed
+        if credential_config.load_from_environment {
             tracing::trace!("Loading S3 credentials from environment");
-            if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
+
+            let use_restricted_source = credential_config
+                .iam_role_source
+                .as_deref()
+                .is_some_and(|s| s == "metadata" || s == "env");
+
+            if use_restricted_source {
+                // For restricted IAM role sources (metadata/env), build a fresh config
+                // with the restricted credential chain instead of using the global cache.
+                let iam_source = credential_config
+                    .iam_role_source
+                    .as_deref()
+                    .unwrap_or("auto");
+                let region = params.get("region").cloned();
+                let restricted_config = self.io_runtime.block_on(
+                    aws_sdk_credential_bridge::build_restricted_sdk_config(iam_source, region),
+                );
+                match restricted_config {
+                    Ok(sdk_config) => {
+                        if sdk_config.credentials_provider().is_some() {
+                            tracing::trace!(
+                                "Using S3 credentials provider with restricted IAM role source: {iam_source}"
+                            );
+                            s3_builder = s3_builder.with_credentials(Arc::new(
+                                S3CredentialProvider::from_config(&sdk_config).map_err(|e| {
+                                    object_store::Error::Generic {
+                                        store: "S3",
+                                        source: e.into(),
+                                    }
+                                })?,
+                            ));
+                        } else {
+                            tracing::trace!(
+                                "No S3 credentials provider found from restricted IAM source, assuming public access"
+                            );
+                            s3_builder = s3_builder.with_skip_signature(true);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to build restricted AWS SDK config for S3: {err}");
+                        s3_builder = s3_builder.with_skip_signature(true);
+                    }
+                }
+            } else if let Some(sdk_config) = aws_sdk_credential_bridge::get_sdk_config() {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::trace!("Using S3 credentials provider from SDK config");
                     s3_builder = s3_builder.with_credentials(Arc::new(
-                        S3CredentialProvider::from_config(sdk_config).map_err(|e| {
+                        S3CredentialProvider::from_config(sdk_config.as_ref()).map_err(|e| {
                             object_store::Error::Generic {
                                 store: "S3",
                                 source: e.into(),
@@ -135,7 +415,9 @@ impl SpiceObjectStoreRegistry {
                     s3_builder = s3_builder.with_skip_signature(true);
                 }
             } else {
-                tracing::trace!("No AWS SDK loaded, assuming public access");
+                tracing::trace!(
+                    "No AWS SDK credentials provider available, assuming public access"
+                );
                 s3_builder = s3_builder.with_skip_signature(true);
             }
         }
@@ -143,7 +425,10 @@ impl SpiceObjectStoreRegistry {
         Ok(Arc::new(s3_builder.build()?))
     }
 
-    fn prepare_https_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_https_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let base_url = if url.scheme() == "https" {
             format!("https://{}/", url.authority())
         } else {
@@ -163,6 +448,7 @@ impl SpiceObjectStoreRegistry {
 
         let builder = HttpBuilder::new()
             .with_url(base_url)
+            .with_http_connector(SpawnedReqwestConnector::new(self.io_runtime.clone()))
             .with_client_options(client_options);
 
         Ok(Arc::new(builder.build()?))
@@ -209,7 +495,7 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
-    #[cfg(feature = "ftp")]
+    #[cfg(feature = "sftp")]
     fn prepare_sftp_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let Some(host) = url.host() else {
             return Err(DataFusionError::Configuration(
@@ -249,9 +535,106 @@ impl SpiceObjectStoreRegistry {
         )) as Arc<dyn ObjectStore>)
     }
 
+    #[cfg(feature = "smb")]
+    fn prepare_smb_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for SMB".to_string(),
+            ));
+        };
+
+        // Extract share name from the first path segment
+        let path = url.path();
+        let share = path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .ok_or_else(|| {
+                DataFusionError::Configuration("No share name provided for SMB".to_string())
+            })?
+            .to_string();
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No user provided for SMB".to_string())
+        })?;
+        let password = params.get("pass").map(ToOwned::to_owned).ok_or_else(|| {
+            DataFusionError::Configuration("No password provided for SMB".to_string())
+        })?;
+        let port = params
+            .get("port")
+            .map(|p| {
+                p.parse::<u16>()
+                    .map_err(|_| DataFusionError::Configuration(format!("Invalid SMB port: {p}")))
+            })
+            .transpose()?;
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(SMBObjectStore::new(
+            host.to_string(),
+            port,
+            share,
+            user,
+            password,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
+    #[cfg(feature = "nfs")]
+    fn prepare_nfs_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(host) = url.host() else {
+            return Err(DataFusionError::Configuration(
+                "No host provided for NFS".to_string(),
+            ));
+        };
+
+        // The path is the export path
+        let export_path = url.path().to_string();
+        if export_path.is_empty() || export_path == "/" {
+            return Err(DataFusionError::Configuration(
+                "No export path provided for NFS".to_string(),
+            ));
+        }
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        let client_timeout = params
+            .get("client_timeout")
+            .map(|timeout| fundu::parse_duration(timeout))
+            .transpose()
+            .map_err(|_| {
+                DataFusionError::Configuration(format!(
+                    "Unable to parse timeout: {}",
+                    params["client_timeout"]
+                ))
+            })?;
+
+        Ok(Arc::new(NFSObjectStore::new(
+            host.to_string(),
+            export_path,
+            client_timeout,
+        )) as Arc<dyn ObjectStore>)
+    }
+
     // Splitting up this function wouldn't make much sense as it's all used to create the ObjectStore
-    #[allow(clippy::too_many_lines)]
-    fn prepare_azure_object_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_azure_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         let mut url = url.clone();
 
         // Rewrite the URL Scheme
@@ -265,182 +648,41 @@ impl SpiceObjectStoreRegistry {
             .into_owned()
             .collect();
         url.set_fragment(None);
-        let mut builder = MicrosoftAzureBuilder::from_env();
 
-        if let Some(sas) = params.get("sas_string") {
-            url.set_query(Some(sas));
-        }
-
-        if let Some(use_emulator) = params.get("use_emulator") {
-            let as_bool = use_emulator.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{use_emulator} is not a valid boolean for use_emulator"
-                ))
-            })?;
-            builder = builder.with_use_emulator(as_bool);
-            if !as_bool {
-                builder = builder.with_url(url.to_string());
-            }
-        } else {
-            builder = builder.with_url(url.to_string());
-        }
-
-        builder = builder.with_url(url.to_string());
-
-        if let Some(account) = params.get("account") {
-            builder = builder.with_account(account);
-        }
-
-        if let Some(container_name) = params.get("container_name") {
-            builder = builder.with_container_name(container_name);
-        }
-
-        if let Some(access_key) = params.get("access_key") {
-            builder = builder.with_access_key(access_key);
-        }
-        if let Some(bearer_token) = params.get("bearer_token") {
-            builder = builder.with_bearer_token_authorization(bearer_token);
-        }
-        if let Some(client_id) = params.get("client_id") {
-            builder = builder.with_client_id(client_id);
-        }
-        if let Some(client_secret) = params.get("client_secret") {
-            builder = builder.with_client_secret(client_secret);
-        }
-        if let Some(tenant_id) = params.get("tenant_id") {
-            builder = builder.with_tenant_id(tenant_id);
-        }
-        if let Some(endpoint) = params.get("endpoint") {
-            builder = builder.with_endpoint(endpoint.to_string());
-        }
-
-        if let Some(use_fabric_endpoint) = params.get("use_fabric_endpoint") {
-            let as_bool = use_fabric_endpoint.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{use_fabric_endpoint} is not a valid boolean for use_fabric_endpoint"
-                ))
-            })?;
-            builder = builder.with_use_fabric_endpoint(as_bool);
-        }
-        if let Some(allow_http) = params.get("allow_http") {
-            let as_bool = allow_http.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{allow_http} is not a valid boolean for allow_http"
-                ))
-            })?;
-            builder = builder.with_allow_http(as_bool);
-        }
-        if let Some(authority_host) = params.get("authority_host") {
-            builder = builder.with_authority_host(authority_host);
-        }
-
-        // Retry and backoff configuration
-        let mut retry_config = RetryConfig::default();
-
-        if let Some(retry_timeout) = params.get("retry_timeout") {
-            let as_duration = fundu::parse_duration(retry_timeout).map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{retry_timeout} is not a valid duration for retry_timeout"
-                ))
-            })?;
-            retry_config.retry_timeout = as_duration;
-        }
-        if let Some(max_retries) = params.get("max_retries") {
-            let as_usize = max_retries.parse::<usize>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{max_retries} is not a valid usize for max_retries"
-                ))
-            })?;
-            retry_config.max_retries = as_usize;
-        }
-        if let Some(backoff_initial_duration) = params.get("backoff_initial_duration") {
-            let as_duration = fundu::parse_duration(backoff_initial_duration).map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{backoff_initial_duration} is not a valid duration for backoff_initial_duration"
-                ))
-            })?;
-            retry_config.backoff.init_backoff = as_duration;
-        }
-        if let Some(backoff_max_duration) = params.get("backoff_max_duration") {
-            let as_duration = fundu::parse_duration(backoff_max_duration).map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{backoff_max_duration} is not a valid duration for backoff_max_duration"
-                ))
-            })?;
-            retry_config.backoff.max_backoff = as_duration;
-        }
-        if let Some(backoff_base) = params.get("backoff_base") {
-            let as_f64 = backoff_base.parse::<f64>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{backoff_base} is not a valid f64 for backoff_base"
-                ))
-            })?;
-            retry_config.backoff.base = as_f64;
-        }
-        builder = builder.with_retry(retry_config);
-
-        if let Some(proxy_url) = params.get("proxy_url") {
-            builder = builder.with_proxy_url(proxy_url);
-        }
-        if let Some(proxy_ca_certificate) = params.get("proxy_ca_certificate") {
-            builder = builder.with_proxy_ca_certificate(proxy_ca_certificate);
-        }
-        if let Some(proxy_excludes) = params.get("proxy_excludes") {
-            builder = builder.with_proxy_excludes(proxy_excludes);
-        }
-        if let Some(msi_endpoint) = params.get("msi_endpoint") {
-            builder = builder.with_msi_endpoint(msi_endpoint);
-        }
-        if let Some(federated_token_file) = params.get("federated_token_file") {
-            builder = builder.with_federated_token_file(federated_token_file);
-        }
-
-        if let Some(use_cli) = params.get("use_cli") {
-            let as_bool = use_cli.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{use_cli} is not a valid boolean for use_cli"
-                ))
-            })?;
-            builder = builder.with_use_azure_cli(as_bool);
-        }
-
-        if let Some(skip_signature) = params.get("skip_signature") {
-            let as_bool = skip_signature.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{skip_signature} is not a valid boolean for skip_signature"
-                ))
-            })?;
-            builder = builder.with_skip_signature(as_bool);
-        }
-
-        if let Some(disable_tagging) = params.get("disable_tagging") {
-            let as_bool = disable_tagging.parse::<bool>().map_err(|_| {
-                DataFusionError::Configuration(format!(
-                    "{disable_tagging} is not a valid boolean for disable_tagging"
-                ))
-            })?;
-            builder = builder.with_disable_tagging(as_bool);
-        }
-
-        let azure_store = Arc::new(
-            builder
-                .build()
-                .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))?,
-        );
-
-        Ok(azure_store as Arc<dyn ObjectStore>)
+        crate::builder::build_azure_object_store(&url, &params, self.io_runtime.clone())
     }
 
-    fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn prepare_gcs_object_store(
+        &self,
+        url: &Url,
+    ) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        let Some(bucket_name) = url.host_str() else {
+            return Err(DataFusionError::Configuration(
+                "No bucket name provided".to_string(),
+            ));
+        };
+
+        let params: HashMap<String, String> = parse(url.fragment().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+
+        crate::builder::build_gcs_object_store(bucket_name, &params, self.io_runtime.clone())
+    }
+
+    fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         if url.as_str().starts_with("https://") || url.as_str().starts_with("http://") {
-            return Self::prepare_https_object_store(url);
+            return self.prepare_https_object_store(url);
         }
         if url.as_str().starts_with("s3://") {
-            return Self::prepare_s3_object_store(url);
+            return self.prepare_s3_object_store(url);
         }
 
-        if url.as_str().starts_with("abfs://") {
-            return Self::prepare_azure_object_store(url);
+        if url.as_str().starts_with("abfs://") || url.as_str().starts_with("abfss://") {
+            return self.prepare_azure_object_store(url);
+        }
+
+        if url.as_str().starts_with("gs://") || url.as_str().starts_with("gcs://") {
+            return self.prepare_gcs_object_store(url);
         }
 
         #[cfg(feature = "ftp")]
@@ -448,9 +690,19 @@ impl SpiceObjectStoreRegistry {
             return Self::prepare_ftp_object_store(url);
         }
 
-        #[cfg(feature = "ftp")]
+        #[cfg(feature = "sftp")]
         if url.as_str().starts_with("sftp://") {
             return Self::prepare_sftp_object_store(url);
+        }
+
+        #[cfg(feature = "smb")]
+        if url.as_str().starts_with("smb://") {
+            return Self::prepare_smb_object_store(url);
+        }
+
+        #[cfg(feature = "nfs")]
+        if url.as_str().starts_with("nfs://") {
+            return Self::prepare_nfs_object_store(url);
         }
 
         Err(DataFusionError::Execution(format!(
@@ -459,6 +711,7 @@ impl SpiceObjectStoreRegistry {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     fn register_store(
         &self,
@@ -470,20 +723,23 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 
     fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         self.inner.get_store(url).or_else(|_| {
-            let store = Self::get_feature_store(url)?;
+            let store = self.get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
-
             Ok(store)
         })
+    }
+
+    fn deregister_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+        self.inner.deregister_store(url)
     }
 }
 
 // This method uses unwrap_or_default, however it should never fail on the initialization. See
 // RuntimeEnv::default()
 #[must_use]
-pub fn default_runtime_env() -> Arc<RuntimeEnv> {
+pub fn default_runtime_env(io_runtime: Handle) -> Arc<RuntimeEnv> {
     match RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
         .build_arc()
     {
         Ok(runtime_env) => runtime_env,
@@ -497,8 +753,123 @@ pub fn default_runtime_env() -> Arc<RuntimeEnv> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_default_runtime_env() {
+        let _ = default_runtime_env(Handle::current());
+    }
+
     #[test]
-    fn test_default_runtime_env() {
-        let _ = default_runtime_env();
+    fn test_parse_s3_url_style_not_set_returns_none() {
+        let params = HashMap::new();
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_path() {
+        let params = HashMap::from([("url_style".to_string(), "path".to_string())]);
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(Some(S3UrlStyle::Path))
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_vhost() {
+        let params = HashMap::from([("url_style".to_string(), "vhost".to_string())]);
+        assert_eq!(
+            SpiceObjectStoreRegistry::parse_s3_url_style(&params).ok(),
+            Some(Some(S3UrlStyle::VirtualHosted))
+        );
+    }
+
+    #[test]
+    fn test_parse_s3_url_style_invalid_value() {
+        let params = HashMap::from([("url_style".to_string(), "invalid".to_string())]);
+        let _ = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
+            .expect_err("invalid url_style should error");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_path_keeps_endpoint() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "spiceai-public-datasets",
+            S3UrlStyle::Path,
+        )
+        .expect("path-style endpoint should parse");
+
+        assert_eq!(endpoint, "https://t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_adds_bucket_prefix() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "spiceai-public-datasets",
+            S3UrlStyle::VirtualHosted,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(endpoint, "https://spiceai-public-datasets.t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_always_prepends_bucket() {
+        // Even when bucket name matches the start of the host, always prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://spiceai-public-datasets.t3.storage.dev",
+            "spiceai-public-datasets",
+            S3UrlStyle::VirtualHosted,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(
+            endpoint,
+            "https://spiceai-public-datasets.spiceai-public-datasets.t3.storage.dev"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_with_port_preserves_port() {
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "http://minio:9000",
+            "bucket",
+            S3UrlStyle::VirtualHosted,
+        )
+        .expect("virtual-hosted endpoint with port should parse");
+
+        assert_eq!(endpoint, "http://bucket.minio:9000");
+    }
+
+    #[test]
+    fn test_endpoint_for_s3_url_style_vhost_bucket_matches_host_prefix() {
+        // Bucket "t3" with endpoint "t3.storage.dev" — must still prepend.
+        let endpoint = SpiceObjectStoreRegistry::endpoint_for_s3_url_style(
+            "https://t3.storage.dev",
+            "t3",
+            S3UrlStyle::VirtualHosted,
+        )
+        .expect("virtual-hosted endpoint should parse");
+
+        assert_eq!(endpoint, "https://t3.t3.storage.dev");
+    }
+
+    #[test]
+    fn test_endpoint_is_ip() {
+        assert!(SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://192.168.1.100:9000"
+        ));
+        assert!(SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!SpiceObjectStoreRegistry::endpoint_is_ip(
+            "https://t3.storage.dev"
+        ));
+        assert!(!SpiceObjectStoreRegistry::endpoint_is_ip(
+            "http://minio:9000"
+        ));
     }
 }

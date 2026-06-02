@@ -13,48 +13,41 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::changes::Indexes;
 use crate::changes::index_change_envelope;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+#[cfg(feature = "duckdb")]
+use crate::component::dataset::acceleration::Engine;
 use crate::component::metrics::MetricsProvider;
+#[cfg(feature = "duckdb")]
+use crate::component::view::View;
 use crate::dataconnector::{DataConnector, DataConnectorError, DataConnectorResult};
-use crate::embeddings::construct_chunker;
 use crate::embeddings::execution_plan::{
     compute_additional_embedding_columns, construct_record_batch,
 };
-use crate::embeddings::index::VectorScanTableProvider;
+use crate::embeddings::index::table::wrap_table_as_index;
 use crate::federated_table::FederatedTable;
 use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
-use arrow_schema::Schema;
-use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use chunking::ChunkingConfig;
 use data_components::cdc::{ChangeEnvelope, ChangesStream, StreamError, replace_change_batch_data};
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use itertools::Itertools;
-use runtime_datafusion_index::Index;
 use runtime_datafusion_index::IndexedTableProvider;
-use search::generation::util::get_primary_keys;
-#[cfg(feature = "s3_vectors")]
-use search::index::s3_vectors::S3Vector;
-use search::index::{SearchIndex, VectorIndex, chunking::ChunkedSearchIndex};
-use search::metadata::MetadataColumn;
-
-use snafu::ResultExt;
+use search::generation::text_search::index::FullTextDatabaseIndex;
+use search::index::VectorScanTableProvider;
 use spicepod::component::embeddings::ColumnEmbeddingConfig;
-#[cfg(feature = "s3_vectors")]
-use spicepod::component::embeddings::EmbeddingChunkConfig;
-use spicepod::semantic::MetadataType;
+use spicepod::semantic::Column;
+#[cfg(feature = "duckdb")]
+use spicepod::semantic::ColumnLevelEmbeddingConfig;
 use spicepod::vector::VectorStore;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::table::EmbeddingTable;
 
@@ -108,9 +101,44 @@ impl EmbeddingConnector {
         if let Some(vector_engine) = &dataset.vectors
             && vector_engine.enabled
         {
-            return self
-                .wrap_table_as_index(dataset, Arc::clone(&inner_table_provider), vector_engine)
-                .await;
+            #[cfg(feature = "duckdb")]
+            if vector_engine.engine.as_deref() == Some("duckdb")
+                && !dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.engine.to_unpartitioned() == Engine::DuckDB
+                })
+            {
+                return Err(DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: dataset.source().to_string(),
+                    connector_component: dataset.into(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "DuckDB vector engine requires DuckDB acceleration. Configure the dataset with `acceleration.engine: duckdb`.",
+                    ),
+                });
+            }
+
+            let mut provider = Arc::clone(&inner_table_provider);
+            for (effective_vector_store, columns) in vector_index_groups(vector_engine, dataset) {
+                provider = wrap_table_as_index(
+                    &dataset.runtime().datafusion().ctx,
+                    &self.embedding_models,
+                    &self.secrets,
+                    &dataset.name,
+                    &columns,
+                    dataset.params.get("file_format").map(String::as_str),
+                    provider,
+                    &effective_vector_store,
+                )
+                .await
+                .map_err(|e| {
+                    DataConnectorError::InvalidConfigurationSourceOnly {
+                        dataconnector: dataset.source().to_string(),
+                        connector_component: dataset.into(),
+                        source: e,
+                    }
+                })?;
+            }
+
+            return Ok(provider);
         }
 
         // Add in embedding columns from `dataset.columns.embeddings`.
@@ -124,58 +152,20 @@ impl EmbeddingConnector {
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
                     vector_size: e.vector_size,
+                    aggregation: e.aggregation,
+                    max_elements_per_row: e.max_elements_per_row,
                 })
             })
             .collect_vec();
-        let mut embeddings = dataset.embeddings.clone();
+
+        let mut embeddings: Vec<ColumnEmbeddingConfig> = dataset.embeddings.clone();
         embeddings.extend(from_columns);
 
-        if embeddings.is_empty() {
-            return Ok(inner_table_provider);
-        }
-
-        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
-            .iter()
-            .map(|e| (e.column.clone(), e.clone()))
-            .collect::<HashMap<_, _>>();
-
-        // Early check if embedding models are available.
-        for (column, config) in &embed_columns {
-            let model = &config.model;
-            if !self.embedding_models.read().await.contains_key(model) {
-                return Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!(
-                        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
-                    ),
-                    connector_component: dataset.into(),
-                });
-            }
-        }
-
-        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
-            .iter()
-            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
-            .filter_map(|e| {
-                e.chunking.as_ref().map(|chunk_cfg| {
-                    (
-                        e.column.clone(),
-                        ChunkingConfig {
-                            target_chunk_size: chunk_cfg.target_chunk_size,
-                            overlap_size: chunk_cfg.overlap_size,
-                            trim_whitespace: chunk_cfg.trim_whitespace,
-                            file_format: dataset.params.get("file_format").map(String::as_str),
-                        },
-                    )
-                })
-            })
-            .collect::<HashMap<_, _>>();
-
-        let embedding_table = EmbeddingTable::try_new(
+        EmbeddingTable::from_spicepod_columns(
             inner_table_provider,
-            embed_columns,
-            Arc::clone(&self.embedding_models),
-            embed_chunker_config,
+            embeddings,
+            &self.embedding_models,
+            dataset.params.get("file_format").map(String::as_str),
         )
         .await
         .map_err(|e| DataConnectorError::InvalidConfiguration {
@@ -183,174 +173,7 @@ impl EmbeddingConnector {
             message: e.to_string(),
             connector_component: dataset.into(),
             source: Box::new(e),
-        })?;
-
-        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
-    }
-
-    async fn wrap_table_as_index(
-        &self,
-        dataset: &Dataset,
-        inner_table_provider: Arc<dyn TableProvider>,
-        vector_store: &VectorStore,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        match vector_store.engine.as_deref() {
-            #[cfg(feature = "s3_vectors")]
-            Some("s3" | "s3_vectors") => {
-                self.wrap_table_as_index_s3(dataset, inner_table_provider, vector_store)
-                    .await
-            }
-            None => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                message: "No vector engine specified. Use '.datasets[].vectors.engine'".to_string(),
-            }),
-            Some(unknown_engine) => Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                message: format!("Unknown vector engine '.vectors.engine: {unknown_engine}'"),
-            }),
-        }
-    }
-
-    #[cfg(feature = "s3_vectors")]
-    async fn wrap_table_as_index_s3(
-        &self,
-        dataset: &Dataset,
-        inner_table_provider: Arc<dyn TableProvider + 'static>,
-        vector_store: &VectorStore,
-    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        tracing::info!("S3 Vectors for dataset {} initializing...", dataset.name);
-        let start = std::time::Instant::now();
-
-        let partition_by =
-            get_dataset_partition_expressions(dataset, &inner_table_provider, vector_store)?;
-
-        let embedding_columns: Vec<_> = dataset
-            .columns
-            .iter()
-            .filter_map(|c| {
-                c.embeddings
-                    .first()
-                    .map(|embed| (c.name.clone(), embed.clone()))
-            })
-            .collect();
-        let mut provider = IndexedTableProvider::new(Arc::clone(&inner_table_provider));
-        for (column, config) in embedding_columns {
-            let (dataset_columns, index_schema) = if config
-                .chunking
-                .as_ref()
-                .is_some_and(|cfg| cfg.enabled)
-            {
-                Self::updated_chunked_search_index_format(&inner_table_provider, dataset, &column)
-            } else {
-                (dataset.columns.clone(), inner_table_provider.schema())
-            };
-
-            let vector_index = super::index::s3::try_from_dataset(
-                &dataset.name,
-                column,
-                config.clone(),
-                vector_store,
-                // Primary key. Use override from spicepod, fallback to underlying [`TableProvider`].
-                get_primary_keys(&inner_table_provider)
-                    .boxed()
-                    .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                        dataconnector: dataset.source().to_string(),
-                        connector_component: dataset.into(),
-                        source: e,
-                    })?,
-                index_schema,
-                Arc::clone(&self.embedding_models),
-                dataset_columns,
-                Arc::clone(&self.secrets),
-                partition_by.clone(),
-            )
-            .await
-            .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                dataconnector: dataset.source().to_string(),
-                connector_component: dataset.into(),
-                source: e,
-            })?;
-
-            if let Some(ref chunking) = config.chunking
-                && chunking.enabled
-            {
-                provider = self
-                    .construct_s3_chunked_vector_index(
-                        provider,
-                        chunking,
-                        vector_index,
-                        config.model.as_str(),
-                        dataset.params.get("file_format").map(String::as_str),
-                    )
-                    .await
-                    .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                        dataconnector: dataset.source().to_string(),
-                        connector_component: dataset.into(),
-                        source: e,
-                    })?;
-            } else {
-                let idx = Arc::new(vector_index);
-                let vector_index = Arc::clone(&idx) as Arc<dyn VectorIndex>;
-
-                provider.underlying = Arc::new(
-                    VectorScanTableProvider::try_new(provider.underlying, &vector_index)
-                        .boxed()
-                        .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                            dataconnector: dataset.source().to_string(),
-                            connector_component: dataset.into(),
-                            source: e,
-                        })?,
-                ) as Arc<dyn TableProvider>;
-                provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
-            }
-        }
-        tracing::info!(
-            "S3 Vectors for dataset {} initialized in {:?}",
-            dataset.name,
-            start.elapsed()
-        );
-        Ok(Arc::new(provider))
-    }
-
-    #[cfg(feature = "s3_vectors")]
-    async fn construct_s3_chunked_vector_index(
-        &self,
-        mut provider: IndexedTableProvider,
-        chunking: &EmbeddingChunkConfig,
-        mut vector_index: S3Vector,
-        model_name: &str,
-        file_format: Option<&str>,
-    ) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
-        let chunker = construct_chunker(
-            model_name,
-            &ChunkingConfig {
-                target_chunk_size: chunking.target_chunk_size,
-                overlap_size: chunking.overlap_size,
-                trim_whitespace: chunking.trim_whitespace,
-                file_format,
-            },
-            &Arc::clone(&self.embedding_models),
-        )
-        .await
-        .boxed()?;
-
-        vector_index.primary_key =
-            ChunkedSearchIndex::augment_primary_key(vector_index.primary_key);
-
-        let idx = Arc::new(vector_index);
-        let chunked_idx = Arc::new(ChunkedSearchIndex::new(
-            idx as Arc<dyn SearchIndex>,
-            chunker,
-        ));
-
-        if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
-            provider.underlying = Arc::new(
-                VectorScanTableProvider::try_new(provider.underlying, &vector_index).boxed()?,
-            ) as Arc<dyn TableProvider>;
-        }
-        Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>))
+        })
     }
 
     async fn embed_change_envelope(
@@ -362,7 +185,7 @@ impl EmbeddingConnector {
             e
         })?;
 
-        let (change_committer, batch) = envelope.into_parts();
+        let (change_committer, batch, is_dataset_ready) = envelope.into_parts();
         let data_batch = batch.data_batch();
 
         let embeddings = compute_additional_embedding_columns(
@@ -390,90 +213,15 @@ impl EmbeddingConnector {
         let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
             .map_err(|e| StreamError::Arrow(e.to_string()))?;
 
-        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
-    }
-
-    /// Provide updated columns and underlying [`SchemaRef`] for a [`SearchIndex`] to use based off the index being chunked.
-    fn updated_chunked_search_index_format(
-        inner_table_provider: &Arc<dyn TableProvider>,
-        dataset: &Dataset,
-        column: &str,
-    ) -> (Vec<spicepod::semantic::Column>, SchemaRef) {
-        let mut dataset_columns = dataset.columns.clone();
-        let mut dataset_fields = inner_table_provider
-            .schema()
-            .fields()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some((_, f)) = inner_table_provider.schema().column_with_name(column) {
-            // These are internal columns that won't exist in existing columns. No need to find & replace.
-            // get search field as metadata column.
-            let search_metadata =
-                dataset_columns
-                    .iter()
-                    .find(|&c| c.name == column)
-                    .and_then(|c| match c.as_vector_metadata() {
-                        Some(MetadataType::NonFilterable) => {
-                            Some(MetadataColumn::NonFilterable(Arc::new(f.clone())))
-                        }
-                        Some(MetadataType::Filterable) => {
-                            Some(MetadataColumn::Filterable(Arc::new(f.clone())))
-                        }
-                        _ => None,
-                    });
-
-            for col in ChunkedSearchIndex::additional_metadata(column, search_metadata) {
-                dataset_columns.push(
-                    spicepod::semantic::Column::new(col.name()).with_metadata(
-                        [(
-                            "vectors".to_string(),
-                            serde_json::Value::String(col.type_display().to_string()),
-                        )]
-                        .into(),
-                    ),
-                );
-                dataset_fields.push(col.field());
-            }
-        }
-        (dataset_columns, Arc::new(Schema::new(dataset_fields)))
+        Ok(ChangeEnvelope::new(
+            change_committer,
+            new_change_batch,
+            is_dataset_ready,
+        ))
     }
 }
 
-#[cfg(feature = "s3_vectors")]
-fn get_dataset_partition_expressions(
-    dataset: &Dataset,
-    inner_table_provider: &Arc<dyn TableProvider + 'static>,
-    vector_store: &VectorStore,
-) -> Result<Vec<datafusion_expr::Expr>, DataConnectorError> {
-    use datafusion::common::ToDFSchema as _;
-    use runtime_table_partition::expression::partition_by_expressions;
-
-    let df_schema = &inner_table_provider.schema().to_dfschema().map_err(|e| {
-        DataConnectorError::InvalidConfigurationSourceOnly {
-            dataconnector: dataset.source().to_string(),
-            connector_component: dataset.into(),
-            source: e.into(),
-        }
-    })?;
-
-    let partition_by = partition_by_expressions(
-        &vector_store.partition_by,
-        &dataset.runtime().df.ctx,
-        df_schema,
-    )
-    .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-        dataconnector: dataset.source().to_string(),
-        connector_component: dataset.into(),
-        source: e.into(),
-    })?
-    .into_iter()
-    .map(|p| p.expression)
-    .collect();
-
-    Ok(partition_by)
-}
-
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl DataConnector for EmbeddingConnector {
     fn as_any(&self) -> &dyn Any {
@@ -506,12 +254,62 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.metadata_provider(dataset).await
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        self.inner_connector
+            .register_object_stores(dataset, runtime_env)
+            .await
+    }
+
     fn initialization(&self) -> ComponentInitialization {
         self.inner_connector.initialization()
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         self.inner_connector.metrics_provider()
+    }
+
+    async fn on_accelerator_setup(
+        &self,
+        dataset: &Dataset,
+        builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner_connector
+            .on_accelerator_setup(dataset, builder)
+            .await?;
+
+        #[cfg(feature = "duckdb")]
+        if let Some(vector_engine) = duckdb_vector_store_for_accelerated_table(dataset) {
+            let embedding_columns = duckdb_embedding_columns(dataset);
+            if embedding_columns.is_empty() {
+                return Ok(());
+            }
+
+            tracing::debug!(
+                dataset = %dataset.name,
+                columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
+                "Wrapping accelerator with DuckDB HNSW vector indexes"
+            );
+
+            let accelerator = builder.get_accelerator();
+            let indexed_accelerator =
+                crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
+                    &dataset.name,
+                    embedding_columns,
+                    &vector_engine,
+                    accelerator,
+                    Arc::clone(&self.embedding_models),
+                    Arc::clone(&self.secrets),
+                )
+                .await?;
+            builder.set_accelerator(indexed_accelerator);
+            return Ok(());
+        }
+
+        Ok(())
     }
 
     async fn on_accelerated_table_registration(
@@ -528,47 +326,97 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector.supports_changes_stream()
     }
 
-    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        federated_table: Arc<FederatedTable>,
+        dataset: &Dataset,
+        accelerated_table_provider: Arc<dyn TableProvider>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
+        cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<ChangesStream> {
         let table_provider = federated_table.try_table_provider_sync()?;
         if let Some(indexed_table) = table_provider
             .as_any()
             .downcast_ref::<IndexedTableProvider>()
             .cloned()
         {
-            let indexed_table = Arc::new(indexed_table);
             let Some(underlying_federated_table) =
                 underlying_federated_table_for_indexed_table(&table_provider)
             else {
-                return self.inner_connector.changes_stream(federated_table);
+                return self.inner_connector.changes_stream(
+                    federated_table,
+                    dataset,
+                    accelerated_table_provider,
+                    accelerator_write_mutex,
+                    cpu_runtime,
+                );
             };
 
-            let indexes = Indexes::new(indexed_table.get_all_indexes());
+            // Avoid reindexing full-text indexes.
+            let indexes = Indexes::new(
+                indexed_table
+                    .get_all_indexes()
+                    .into_iter()
+                    .filter(|idx| {
+                        idx.as_any()
+                            .downcast_ref::<FullTextDatabaseIndex>()
+                            .is_none()
+                    })
+                    .collect(),
+            );
 
             let stream = self
                 .inner_connector
-                .changes_stream(underlying_federated_table)?
+                .changes_stream(
+                    underlying_federated_table,
+                    dataset,
+                    accelerated_table_provider,
+                    accelerator_write_mutex,
+                    cpu_runtime,
+                )?
                 .then(move |item| index_change_envelope(item, Arc::clone(&indexes)))
                 .boxed();
 
-            return Some(stream);
+            Some(stream)
+
+        // `VectorScanTableProvider` is generally wrapped by a `IndexedTableProvider` (as above), but in the case both [`Self`] and the [`FullTextConnector`] exist, the latter will unwrap the `IndexedTableProvider` first. It will correctly handle indexing vector indexes as that point.
+        } else if let Some(vector_scan) = table_provider
+            .as_any()
+            .downcast_ref::<VectorScanTableProvider>()
+        {
+            self.inner_connector.changes_stream(
+                Arc::new(FederatedTable::Immediate(Arc::clone(
+                    &vector_scan.table_provider,
+                ))),
+                dataset,
+                accelerated_table_provider,
+                accelerator_write_mutex,
+                cpu_runtime,
+            )
+        } else if let Some(embedding_table) =
+            table_provider.as_any().downcast_ref::<EmbeddingTable>()
+        {
+            let embedding_table = Arc::new(embedding_table.clone());
+            let underlying_table = Arc::clone(&embedding_table.base_table);
+            let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+            Some(
+                self.inner_connector
+                    .changes_stream(
+                        underlying_federated_table,
+                        dataset,
+                        accelerated_table_provider,
+                        accelerator_write_mutex,
+                        cpu_runtime,
+                    )?
+                    .then(move |item| {
+                        Self::embed_change_envelope(item, Arc::clone(&embedding_table))
+                    })
+                    .boxed(),
+            )
+        } else {
+            None
         }
-
-        let embedding_table = Arc::new(
-            table_provider
-                .as_any()
-                .downcast_ref::<EmbeddingTable>()?
-                .clone(),
-        );
-        let underlying_table = Arc::clone(&embedding_table.base_table);
-        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
-
-        let stream = self
-            .inner_connector
-            .changes_stream(underlying_federated_table)?
-            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
-            .boxed();
-
-        Some(stream)
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -615,16 +463,259 @@ impl DataConnector for EmbeddingConnector {
 
         Some(stream)
     }
+
+    fn resolve_refresh_mode(
+        &self,
+        refresh_mode: Option<crate::component::dataset::acceleration::RefreshMode>,
+    ) -> crate::component::dataset::acceleration::RefreshMode {
+        self.inner_connector.resolve_refresh_mode(refresh_mode)
+    }
+
+    fn initialization_for_dataset(
+        &self,
+        dataset: &crate::component::dataset::Dataset,
+    ) -> crate::component::ComponentInitialization {
+        self.inner_connector.initialization_for_dataset(dataset)
+    }
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_vector_store_for_accelerated_table(dataset: &Dataset) -> Option<VectorStore> {
+    if let Some(vector_engine) = &dataset.vectors
+        && vector_engine.enabled
+        && vector_engine.engine.as_deref() == Some("duckdb")
+    {
+        return Some(vector_engine.clone());
+    }
+
+    if !dataset.has_embeddings()
+        || !dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
+    {
+        return None;
+    }
+
+    let acceleration = dataset.acceleration.as_ref()?;
+    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
+}
+
+fn vector_index_groups(
+    vector_store: &VectorStore,
+    dataset: &Dataset,
+) -> Vec<(VectorStore, Vec<Column>)> {
+    let has_column_overrides = dataset.columns.iter().any(|column| {
+        column
+            .embeddings
+            .first()
+            .is_some_and(|embedding| embedding.engine.is_some() || embedding.params.is_some())
+    });
+
+    if !has_column_overrides {
+        return vec![(vector_store.clone(), dataset.columns.clone())];
+    }
+
+    let mut groups: Vec<(VectorStore, Vec<Column>)> = Vec::new();
+    for column in &dataset.columns {
+        let Some(embedding) = column.embeddings.first() else {
+            continue;
+        };
+
+        let effective_vector_store = vector_store_for_embedding(vector_store, embedding);
+        let mut grouped_column = column.clone();
+        grouped_column.embeddings = vec![embedding.clone()];
+
+        if let Some((_, columns)) = groups
+            .iter_mut()
+            .find(|(group_vector_store, _)| group_vector_store == &effective_vector_store)
+        {
+            if let Some(candidate) = columns
+                .iter_mut()
+                .find(|candidate| candidate.name == grouped_column.name)
+            {
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
+            } else {
+                columns.push(grouped_column);
+            }
+        } else {
+            let mut columns = dataset.columns.clone();
+            for candidate in &mut columns {
+                candidate.embeddings.clear();
+            }
+            if let Some(candidate) = columns
+                .iter_mut()
+                .find(|candidate| candidate.name == grouped_column.name)
+            {
+                candidate.embeddings.clone_from(&grouped_column.embeddings);
+            }
+            groups.push((effective_vector_store, columns));
+        }
+    }
+
+    groups
+}
+
+fn vector_store_for_embedding(
+    vector_store: &VectorStore,
+    embedding: &spicepod::semantic::ColumnLevelEmbeddingConfig,
+) -> VectorStore {
+    let mut effective = vector_store.clone();
+    if let Some(engine) = embedding.engine.as_ref() {
+        effective.engine = Some(engine.clone());
+    }
+
+    if let Some(params) = embedding.params.as_ref() {
+        let mut merged = effective.params.clone().unwrap_or_default();
+        spicepod::param::merge_params(&mut merged, Some(params));
+        effective.params = if merged.data.is_empty() {
+            None
+        } else {
+            Some(merged)
+        };
+    }
+
+    effective
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_embedding_columns(dataset: &Dataset) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+    let mut embedding_columns = dataset
+        .embeddings
+        .iter()
+        .map(|embedding| {
+            (
+                embedding.column.clone(),
+                ColumnLevelEmbeddingConfig {
+                    model: embedding.model.clone(),
+                    chunking: embedding.chunking.clone(),
+                    row_ids: embedding.primary_keys.clone(),
+                    vector_size: embedding.vector_size,
+                    engine: None,
+                    params: None,
+                    aggregation: embedding.aggregation,
+                    max_elements_per_row: embedding.max_elements_per_row,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for column in &dataset.columns {
+        // Must be `last()` to mimic what model `EmbeddingTable`'s HashMap ends up with.
+        let Some(embedding) = column.embeddings.last() else {
+            continue;
+        };
+
+        if let Some((_, existing)) = embedding_columns
+            .iter_mut()
+            .find(|(column_name, _)| column_name == &column.name)
+        {
+            *existing = embedding.clone();
+        } else {
+            embedding_columns.push((column.name.clone(), embedding.clone()));
+        }
+    }
+
+    embedding_columns
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_vector_store_for_view(view: &View) -> Option<VectorStore> {
+    if let Some(vector_engine) = &view.vectors
+        && vector_engine.enabled
+        && vector_engine.engine.as_deref() == Some("duckdb")
+    {
+        return Some(vector_engine.clone());
+    }
+
+    if !view.has_embeddings()
+        || !view
+            .acceleration
+            .as_ref()
+            .is_some_and(|acceleration| acceleration.engine.to_unpartitioned() == Engine::DuckDB)
+    {
+        return None;
+    }
+
+    let acceleration = view.acceleration.as_ref()?;
+    crate::embeddings::index::duckdb::vector_store_from_embedding_params(&acceleration.params)
+}
+
+#[cfg(feature = "duckdb")]
+pub(crate) fn duckdb_embedding_columns_from_view(
+    view: &View,
+) -> Vec<(String, ColumnLevelEmbeddingConfig)> {
+    let mut embedding_columns = Vec::new();
+
+    for column in &view.columns {
+        let Some(embedding) = column.embeddings.last() else {
+            continue;
+        };
+
+        if let Some((_, existing)) = embedding_columns
+            .iter_mut()
+            .find(|(column_name, _): &&mut (String, _)| column_name == &column.name)
+        {
+            *existing = embedding.clone();
+        } else {
+            embedding_columns.push((column.name.clone(), embedding.clone()));
+        }
+    }
+
+    embedding_columns
+}
+
+/// Wraps the accelerator in `builder` with `DuckDB` HNSW vector indexes if the view
+/// has both a `DuckDB` vector engine configured and at least one embedding column.
+/// Returns `true` if the accelerator was wrapped, `false` otherwise.
+#[cfg(feature = "duckdb")]
+pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
+    view: &View,
+    table: &datafusion::sql::TableReference,
+    builder: &mut crate::accelerated_table::Builder,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
+        return Ok(false);
+    };
+
+    let embedding_columns = duckdb_embedding_columns_from_view(view);
+    if embedding_columns.is_empty() {
+        return Ok(false);
+    }
+
+    tracing::debug!(
+        view = %table,
+        columns = ?embedding_columns.iter().map(|(col, _)| col.as_str()).collect::<Vec<_>>(),
+        "Wrapping view accelerator with DuckDB HNSW vector indexes"
+    );
+
+    let accelerator = builder.get_accelerator();
+    let indexed_accelerator =
+        crate::embeddings::index::duckdb::wrap_accelerator_with_duckdb_vector_indexes(
+            table,
+            embedding_columns,
+            &vector_engine,
+            accelerator,
+            view.runtime.embeds(),
+            view.runtime.secrets(),
+        )
+        .await?;
+    builder.set_accelerator(indexed_accelerator);
+
+    Ok(true)
 }
 
 fn underlying_federated_table_for_indexed_table(
     src_table_provider: &Arc<dyn TableProvider>,
 ) -> Option<Arc<FederatedTable>> {
+    #[cfg(not(feature = "s3_vectors"))]
+    let _ = src_table_provider;
+
     #[cfg(feature = "s3_vectors")]
     {
         if let Some(vector_scan) = src_table_provider
             .as_any()
-            .downcast_ref::<super::index::VectorScanTableProvider>()
+            .downcast_ref::<search::index::VectorScanTableProvider>()
         {
             return underlying_federated_table_for_indexed_table(&vector_scan.table_provider);
         }

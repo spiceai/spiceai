@@ -1,0 +1,82 @@
+name: integration_http
+queries:
+  - name: create_post_json
+    sql: |
+      SELECT request_path, request_body, content
+      FROM create_post
+    expected_results:
+      row_count: 1
+
+  - name: verify_post_body
+    sql: |
+      SELECT request_path, request_body
+      FROM create_post
+      WHERE request_body = '{"title": "foo", "body": "bar", "userId": 1}'
+    expected_results:
+      row_count: 1
+
+  - name: post_form_urlencoded
+    sql: |
+      SELECT request_path, request_body, content
+      FROM post_form
+    expected_results:
+      row_count: 1
+
+  - name: verify_form_body
+    sql: |
+      SELECT request_path, request_body
+      FROM post_form
+      WHERE request_body = 'key1=value1&key2=value2'
+    expected_results:
+      row_count: 1
+
+  - name: post_json_default_content_type
+    sql: |
+      SELECT request_path, request_body, content
+      FROM post_json_default
+    expected_results:
+      row_count: 1
+
+  - name: verify_default_json_body
+    sql: |
+      SELECT request_path, request_body
+      FROM post_json_default
+      WHERE request_body = '{"test": "data"}'
+    expected_results:
+      row_count: 1
+
+  - name: multiple_post_bodies
+    sql: |
+      SELECT request_path, request_body, content
+      FROM multiple_posts
+    expected_results:
+      row_count: 2
+
+  - name: verify_multiple_bodies_with_in
+    sql: |
+      SELECT request_path, request_body
+      FROM multiple_posts
+      WHERE request_body IN (
+        '{"title": "foo", "body": "bar", "userId": 1}',
+        '{"title": "test", "body": "content", "userId": 2}'
+      )
+    expected_results:
+      row_count: 2
+
+  - name: combined_post_requests
+    sql: |
+      SELECT request_path, request_body
+      FROM create_post
+      UNION ALL
+      SELECT request_path, request_body
+      FROM post_form
+      UNION ALL
+      SELECT request_path, request_body
+      FROM post_json_default
+
+  - name: count_all_posts
+    sql: |
+      SELECT count(*) as total_count
+      FROM create_post
+    expected_results:
+      row_count: 1

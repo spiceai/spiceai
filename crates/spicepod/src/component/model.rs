@@ -27,6 +27,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub from: String,
     pub name: String,
@@ -84,9 +85,9 @@ pub enum ModelSource {
     OpenAi,
     Azure,
     Anthropic,
+    Google,
     Xai,
     HuggingFace,
-    Perplexity,
     SpiceAI,
     File,
     Databricks,
@@ -154,8 +155,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::File)
         } else if value.starts_with("anthropic") {
             Ok(ModelSource::Anthropic)
-        } else if value.starts_with("perplexity") {
-            Ok(ModelSource::Perplexity)
+        } else if value.starts_with("google") {
+            Ok(ModelSource::Google)
         } else if value.starts_with("openai") {
             Ok(ModelSource::OpenAi)
         } else if value.starts_with("azure") {
@@ -182,7 +183,7 @@ impl Display for ModelSource {
             ModelSource::Azure => write!(f, "azure"),
             ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
-            ModelSource::Perplexity => write!(f, "perplexity"),
+            ModelSource::Google => write!(f, "google"),
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
@@ -200,7 +201,7 @@ impl ModelSource {
             ModelSource::Azure => "azure",
             ModelSource::Xai => "xai",
             ModelSource::Anthropic => "anthropic",
-            ModelSource::Perplexity => "perplexity",
+            ModelSource::Google => "google",
             ModelSource::HuggingFace => "hf",
             ModelSource::File => "file",
             ModelSource::SpiceAI => "spiceai",
@@ -363,13 +364,13 @@ impl Model {
         // Some providers only support either ML or LLMs.
         if matches!(
             source,
-            ModelSource::Perplexity
-                | ModelSource::Azure
+            ModelSource::Azure
                 | ModelSource::OpenAi
                 | ModelSource::Anthropic
                 | ModelSource::Xai
                 | ModelSource::Databricks
                 | ModelSource::Bedrock
+                | ModelSource::Google
         ) {
             return Some(ModelType::Llm);
         }

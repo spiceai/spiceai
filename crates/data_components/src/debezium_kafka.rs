@@ -14,13 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::kafka::{
+    KafkaOffsetCommitHook, MessageBatchCommitter, inject_ready_signal_on_caught_up,
+};
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
         arrow::changes,
         change_event::{ChangeEvent, ChangeEventKey},
     },
-    kafka::KafkaConsumer,
+    kafka::{Error, KafkaConsumer},
 };
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -32,14 +35,17 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec},
 };
-use futures::StreamExt;
 use std::{any::Any, sync::Arc};
+use tokio::time::Duration;
+use tokio_stream::StreamExt;
 
 pub struct DebeziumKafka {
     schema: SchemaRef,
     primary_keys: Vec<String>,
     constraints: Option<Constraints>,
     consumer: &'static KafkaConsumer,
+    batching: (usize, Duration),
+    offset_commit_hook: Option<Arc<dyn KafkaOffsetCommitHook>>,
 }
 
 impl std::fmt::Debug for DebeziumKafka {
@@ -54,7 +60,12 @@ impl std::fmt::Debug for DebeziumKafka {
 
 impl DebeziumKafka {
     #[must_use]
-    pub fn new(schema: SchemaRef, primary_keys: Vec<String>, consumer: KafkaConsumer) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        primary_keys: Vec<String>,
+        consumer: KafkaConsumer,
+        batching: (usize, Duration),
+    ) -> Self {
         let Ok(df_schema) = DFSchema::try_from(Arc::clone(&schema)) else {
             unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
         };
@@ -79,7 +90,18 @@ impl DebeziumKafka {
             primary_keys,
             constraints,
             consumer: Box::leak(Box::new(consumer)),
+            batching,
+            offset_commit_hook: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_offset_commit_hook(
+        mut self,
+        offset_commit_hook: Arc<dyn KafkaOffsetCommitHook>,
+    ) -> Self {
+        self.offset_commit_hook = Some(offset_commit_hook);
+        self
     }
 
     #[must_use]
@@ -91,22 +113,45 @@ impl DebeziumKafka {
     pub fn stream_changes(&self) -> ChangesStream {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
-        let stream = self
+        let consumer = self.consumer;
+        let metrics = Arc::clone(self.consumer.metrics());
+        let offset_commit_hook = self.offset_commit_hook.clone();
+        let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
-            .map(move |msg| {
+            .chunks_timeout(self.batching.0, self.batching.1)
+            .map(move |msgs| {
                 let schema = Arc::clone(&schema);
                 let pk = primary_keys.clone();
 
-                let msg = msg.map_err(cdc::StreamError::Kafka)?;
+                if msgs.is_empty() {
+                    return Err(cdc::StreamError::Kafka(Error::EmptyBatch));
+                }
 
-                let val = msg.value();
-                changes::to_change_batch(&schema, &pk, val)
-                    .map(|rb| ChangeEnvelope::new(Box::new(msg), rb))
-                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+                let messages: Vec<_> = msgs
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(cdc::StreamError::Kafka)?;
+
+                let changes: Vec<_> = messages
+                    .iter()
+                    .map(super::kafka::KafkaMessage::value)
+                    .collect();
+
+                let rb = changes::vector_to_change_batch(&schema, &pk, &changes)
+                    .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))?;
+
+                let committer = MessageBatchCommitter::from_messages(consumer, &messages)
+                    .with_offset_commit_hook(offset_commit_hook.clone());
+
+                Ok(ChangeEnvelope::new(Box::new(committer), rb, true))
             });
 
-        Box::pin(stream)
+        Box::pin(inject_ready_signal_on_caught_up(
+            inner,
+            metrics,
+            Arc::clone(&self.schema),
+        ))
     }
 }
 

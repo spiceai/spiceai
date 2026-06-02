@@ -2,16 +2,14 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "token_provider"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-reqwest.workspace = true
 secrecy.workspace = true
-serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true

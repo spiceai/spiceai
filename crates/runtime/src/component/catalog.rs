@@ -163,6 +163,7 @@ pub struct CatalogBuilder {
 impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
     type Error = crate::Error;
 
+    #[expect(clippy::result_large_err)]
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
@@ -185,6 +186,17 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
         }
 
         validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
+
+        if catalog
+            .name
+            .eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG)
+        {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::ReservedCatalogName {
+                    name: catalog.name.clone(),
+                },
+            });
+        }
 
         Ok(CatalogBuilder {
             provider: provider.to_string(),
@@ -211,9 +223,17 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 }
 
 impl CatalogBuilder {
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         validate_identifier(name).context(crate::ComponentSnafu)?;
+
+        if name.eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG) {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::ReservedCatalogName {
+                    name: name.to_string(),
+                },
+            });
+        }
 
         let provider = Catalog::provider(from.as_str());
         let catalog_id = Catalog::catalog_id(from.as_str()).map(String::from);
@@ -247,11 +267,11 @@ impl CatalogBuilder {
 
     pub fn build(self) -> Result<Catalog> {
         let app = self.app.ok_or(Error::UnableToBuildCatalog {
-            catalog: self.name.to_string(),
+            catalog: self.name.clone(),
             missing_component: "app".to_string(),
         })?;
         let runtime = self.runtime.ok_or(Error::UnableToBuildCatalog {
-            catalog: self.name.to_string(),
+            catalog: self.name.clone(),
             missing_component: "runtime".to_string(),
         })?;
 

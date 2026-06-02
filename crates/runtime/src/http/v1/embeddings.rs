@@ -17,9 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::model::EmbeddingModelStore;
-use async_openai::types::CreateEmbeddingRequest;
+use async_openai::types::embeddings::CreateEmbeddingRequest;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateEmbeddingResponse;
+use async_openai::types::embeddings::CreateEmbeddingResponse;
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -89,7 +89,7 @@ pub(crate) async fn post(
     Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
     Json(req): Json<CreateEmbeddingRequest>,
 ) -> Response {
-    let model_id = req.model.clone().to_string();
+    let model_id = req.model.clone();
     match embeddings.read().await.get(&model_id) {
         Some(model) => {
             let resp: Response = match model.embed_request(req).await {

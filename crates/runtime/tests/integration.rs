@@ -13,11 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 use arrow::{array::RecordBatch, util::display::FormatOptions};
+#[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
+#[cfg(feature = "postgres-accel")]
+use std::sync::Arc;
 
+#[cfg(feature = "postgres-accel")]
+use crate::utils::TEST_REQUEST_CONTEXT;
 use runtime::Runtime;
 use runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG;
 use tracing::subscriber::DefaultGuard;
@@ -25,11 +29,19 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+#[cfg(feature = "adbc")]
+mod adbc;
 mod cache;
 mod catalog;
+mod cayenne;
+#[cfg(not(windows))]
+mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
+mod cluster;
 mod cors;
+#[cfg(feature = "cosmosdb")]
+mod cosmosdb;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
@@ -46,23 +58,37 @@ mod databricks_spark_catalog;
 mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
+#[cfg(feature = "databricks")]
+mod databricks_sql_warehouse;
+#[cfg(feature = "databricks")]
+mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
+mod datasets_api;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
+#[cfg(feature = "duckdb")]
+mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;
+mod gcs;
+mod git;
 mod github;
 mod glue;
 mod graphql;
+#[cfg(all(feature = "postgres", feature = "hashicorp_vault"))]
+mod hashicorp_vault;
+mod http;
 mod iceberg;
 mod iceberg_api;
+mod json;
 
+mod cluster_tls_reload;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
@@ -70,6 +96,8 @@ mod metadata;
 mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
+mod mtls_connector;
+mod mtls_public;
 #[cfg(feature = "mysql")]
 mod mysql;
 #[cfg(feature = "odbc")]
@@ -78,24 +106,42 @@ mod odbc;
 mod oracle;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod prepared_statements;
+#[cfg(feature = "rate-control")]
+mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
+mod refresh_worker_panic;
 mod results_cache;
+#[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
-#[cfg(feature = "postgres")]
+mod s3_location_pruning;
+#[cfg(any(
+    feature = "postgres",
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "turso"
+))]
 mod schema_evolution;
+#[cfg(feature = "sharepoint")]
+mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]
 mod snowflake;
+#[cfg(feature = "snowflake")]
+mod snowflake_catalog;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+mod tls_reload;
+#[cfg(feature = "postgres-accel")]
+mod tpcds_postgres;
 mod utils;
 mod view;
 
@@ -122,6 +168,13 @@ fn configure_test_datafusion() {
         _ => panic!("Must obtain write lock to defaults"),
     }
 }
+#[cfg(feature = "postgres-accel")]
+fn configure_test_datafusion_request_context() {
+    match DEFAULT_DATAFUSION_CONFIG.write() {
+        Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),
+        _ => panic!("Must obtain write lock to defaults"),
+    }
+}
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
@@ -137,6 +190,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     tracing::subscriber::set_default(subscriber)
 }
 
+#[cfg(feature = "mysql")]
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
     let lineitem_parquet_bytes =
         reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
@@ -186,7 +240,11 @@ where
     if snapshot_plan {
         insta::with_settings!({
             description => format!("Query: {query}"),
-            omit_expression => true
+            omit_expression => true,
+            filters => vec![
+                // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
+                (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+            ],
         }, {
             insta::assert_snapshot!(snapshot_name, explain_plan);
         });
@@ -289,9 +347,4 @@ where
     }
 
     Ok(())
-}
-
-fn container_registry() -> String {
-    std::env::var("CONTAINER_REGISTRY")
-        .unwrap_or_else(|_| "public.ecr.aws/docker/library/".to_string())
 }

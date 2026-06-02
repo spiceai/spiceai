@@ -17,7 +17,7 @@ use bytes::Bytes;
 use clap::Parser;
 use spicepod::component::model::ModelSource;
 use std::{path::PathBuf, str::from_utf8, sync::Arc};
-use tiktoken_rs::{get_bpe_from_tokenizer, tokenizer::get_tokenizer};
+use tiktoken_rs::tokenizer::get_tokenizer;
 use tokenizers::Tokenizer;
 
 use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper};
@@ -96,14 +96,15 @@ impl Args {
                 )
             }
             Some((Ok(ModelSource::OpenAi), Some(model_id))) => {
-                let Some(tok) = get_tokenizer(model_id.as_str()) else {
+                if get_tokenizer(model_id.as_str()).is_none() {
                     return Err(format!(
                         "Could not get tokenizer for OpenAI model: '{model_id}'"
                     ));
-                };
-                let bpe = get_bpe_from_tokenizer(tok)
-                    .map_err(|e| format!("Could not create BPE tokenizer: {e:?}"))?;
-                Arc::new(RecursiveSplittingChunker::try_new(&cfg, bpe).map_err(|e| e.to_string())?)
+                }
+                Arc::new(
+                    RecursiveSplittingChunker::for_openai_model(model_id.as_str(), &cfg)
+                        .map_err(|e| e.to_string())?,
+                )
             }
             None => Arc::new(
                 RecursiveSplittingChunker::with_character_sizer(&cfg).map_err(|e| e.to_string())?,

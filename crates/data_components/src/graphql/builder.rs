@@ -18,6 +18,7 @@ use crate::rate_limit::RateLimiter;
 
 use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
+use runtime_rate_control::RateController;
 use std::sync::Arc;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
@@ -33,7 +34,9 @@ pub struct GraphQLClientBuilder {
     pass: Option<String>,
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
+    auth_header: Option<reqwest::header::HeaderName>,
 }
 
 impl GraphQLClientBuilder {
@@ -48,7 +51,9 @@ impl GraphQLClientBuilder {
             pass: None,
             schema: None,
             rate_limiter: None,
+            rate_controller: None,
             semaphore: None,
+            auth_header: None,
         }
     }
 
@@ -89,8 +94,20 @@ impl GraphQLClientBuilder {
     }
 
     #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
+    }
+
+    #[must_use]
     pub fn with_semaphore(mut self, semaphore: Option<Arc<Semaphore>>) -> Self {
         self.semaphore = semaphore;
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_header(mut self, auth_header: Option<reqwest::header::HeaderName>) -> Self {
+        self.auth_header = auth_header;
         self
     }
 
@@ -105,7 +122,9 @@ impl GraphQLClientBuilder {
             self.unnest_behavior,
             self.schema,
             self.rate_limiter,
+            self.rate_controller,
             self.semaphore,
+            self.auth_header,
         )
     }
 }

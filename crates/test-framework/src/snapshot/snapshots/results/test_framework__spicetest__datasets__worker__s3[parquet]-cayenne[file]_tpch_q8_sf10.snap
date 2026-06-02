@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q8"
+---
++--------+------------+
+| o_year | mkt_share  |
++--------+------------+
+| 1995   | 0.03882014 |
+| 1996   | 0.03948968 |
++--------+------------+

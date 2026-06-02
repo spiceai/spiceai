@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display};
+use std::{collections::BTreeMap, collections::HashMap, fmt::Display};
 
 use arrow::error::ArrowError;
 use arrow_tools::format::to_markdown_documents;
@@ -37,7 +37,7 @@ pub type VectorSearchResult = HashMap<TableReference, AggregationResult>;
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Match {
     /// The matches for this result
-    matches: HashMap<String, MatchType>,
+    matches: HashMap<String, Vec<Value>>,
 
     /// Addditional data from the `dataset` requested by the user.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -48,6 +48,7 @@ pub struct Match {
     primary_key: HashMap<String, Value>,
 
     /// The similarity of the match to the query
+    #[serde(rename = "_score")]
     score: f64,
 
     /// The name of the dataset where the match was found
@@ -55,26 +56,6 @@ pub struct Match {
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(untagged)]
-pub enum MatchType {
-    Single(Value),
-    Multiple(Vec<Value>),
-}
-
-impl From<Vec<Value>> for MatchType {
-    fn from(mut value: Vec<Value>) -> Self {
-        if value.len() == 1 {
-            let Some(v) = value.pop() else {
-                unreachable!("The value array must have one element");
-            };
-            return MatchType::Single(v);
-        }
-        MatchType::Multiple(value)
-    }
 }
 
 impl Match {
@@ -142,11 +123,21 @@ pub async fn to_matches_sorted(result: VectorSearchResult, limit: usize) -> Resu
         matches.append(&mut o);
     }
 
-    // Sort by score in descending order
+    // Sort by score descending, then by dataset + primary key ascending for deterministic ordering on ties.
+    // Use BTreeMap for primary key serialization to ensure deterministic key ordering,
+    // since HashMap iteration order is non-deterministic due to hash randomization.
     matches.sort_by(|a, b| {
         b.score
-            .partial_cmp(&a.score())
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.dataset.cmp(&b.dataset))
+            .then_with(|| {
+                let a_pk: BTreeMap<_, _> = a.primary_key.iter().collect();
+                let b_pk: BTreeMap<_, _> = b.primary_key.iter().collect();
+                let a_str = serde_json::to_string(&a_pk).unwrap_or_default();
+                let b_str = serde_json::to_string(&b_pk).unwrap_or_default();
+                a_str.cmp(&b_str)
+            })
     });
 
     matches.truncate(limit);
@@ -203,7 +194,7 @@ pub async fn to_matches(
 /// Convert a map of {column name -> column values}, to a per-row representation.
 fn transpose_and_convert(
     column_format: HashMap<String, Vec<Vec<Value>>>,
-) -> Vec<HashMap<String, MatchType>> {
+) -> Vec<HashMap<String, Vec<Value>>> {
     let max_rows = column_format
         .values()
         .map(std::vec::Vec::len)
@@ -218,7 +209,7 @@ fn transpose_and_convert(
     for (key, vv) in column_format {
         for (i, row_values) in vv.into_iter().enumerate() {
             if !row_values.is_empty() {
-                rows[i].insert(key.clone(), row_values.into());
+                rows[i].insert(key.clone(), row_values);
             }
         }
     }
@@ -233,12 +224,12 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
-    fn sort_result(v: Vec<HashMap<String, MatchType>>) -> Vec<Vec<(String, MatchType)>> {
+    fn sort_result(v: Vec<HashMap<String, Vec<Value>>>) -> Vec<Vec<(String, Vec<Value>)>> {
         v.into_iter()
             .map(|x| {
                 x.into_iter()
                     .sorted_by_key(|(a, _)| a.clone())
-                    .collect::<Vec<(String, MatchType)>>()
+                    .collect::<Vec<(String, Vec<Value>)>>()
             })
             .collect::<Vec<_>>()
     }
@@ -302,5 +293,72 @@ mod tests {
         );
 
         assert_json_snapshot!(sort_result(transpose_and_convert(column_format)));
+    }
+
+    /// Regression test: sorting matches with composite primary keys must produce
+    /// deterministic ordering regardless of `HashMap` iteration order.
+    #[test]
+    fn test_sort_matches_deterministic_composite_pk() {
+        let make_match = |score: f64, dataset: &str, pk: Vec<(&str, Value)>| Match {
+            score,
+            dataset: dataset.to_string(),
+            primary_key: pk.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            matches: HashMap::new(),
+            data: HashMap::new(),
+            metadata: HashMap::new(),
+        };
+
+        // Two matches with the same score/dataset but different composite primary keys.
+        // The keys are "b" and "a" — HashMap might iterate them in any order,
+        // but BTreeMap-based serialization will always produce {"a":...,"b":...}.
+        let m1 = make_match(
+            0.9,
+            "ds",
+            vec![
+                ("b", Value::Number(2.into())),
+                ("a", Value::Number(1.into())),
+            ],
+        );
+        let m2 = make_match(
+            0.9,
+            "ds",
+            vec![
+                ("b", Value::Number(3.into())),
+                ("a", Value::Number(1.into())),
+            ],
+        );
+
+        let mut matches = [m2, m1];
+
+        // Sort multiple times to verify stability across runs
+        for _ in 0..10 {
+            matches.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.dataset.cmp(&b.dataset))
+                    .then_with(|| {
+                        let a_pk: BTreeMap<_, _> = a.primary_key.iter().collect();
+                        let b_pk: BTreeMap<_, _> = b.primary_key.iter().collect();
+                        let a_str = serde_json::to_string(&a_pk).unwrap_or_default();
+                        let b_str = serde_json::to_string(&b_pk).unwrap_or_default();
+                        a_str.cmp(&b_str)
+                    })
+            });
+
+            // m1 has a=1,b=2 and m2 has a=1,b=3.
+            // Serialized deterministically: {"a":1,"b":2} < {"a":1,"b":3}
+            // So m1 should always come first.
+            assert_eq!(
+                matches[0].primary_key.get("b"),
+                Some(&Value::Number(2.into())),
+                "First match should have b=2 (lower composite key)"
+            );
+            assert_eq!(
+                matches[1].primary_key.get("b"),
+                Some(&Value::Number(3.into())),
+                "Second match should have b=3 (higher composite key)"
+            );
+        }
     }
 }

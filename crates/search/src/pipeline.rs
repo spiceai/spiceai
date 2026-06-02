@@ -15,19 +15,24 @@ use std::sync::Arc;
 
 use datafusion::{
     catalog::TableProvider,
+    common::Column,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::SendableRecordBatchStream,
-    sql::sqlparser::{
-        ast::{Expr as SqlExpr, Value, ValueWithSpan},
-        dialect::GenericDialect,
-        parser::Parser,
-        tokenizer::Token,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Expr as SqlExpr, Value, ValueWithSpan},
+            dialect::GenericDialect,
+            parser::Parser,
+            tokenizer::Token,
+        },
     },
 };
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, ident, lit};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
+use util::format_datafusion_error;
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
@@ -44,7 +49,8 @@ pub enum Error {
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display(
-        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: {source}"
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {}",
+        format_datafusion_error(source)
     ))]
     SearchRequestConstructionError { source: DataFusionError },
 
@@ -91,17 +97,19 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
     }
 
     /// Runs the search pipeline with the provided parameters.
+    #[expect(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         query: String,
-        opt_filters: Vec<Expr>,
+        tbl: &TableReference,
+        opt_filter: Option<Expr>,
         addition_projection: Vec<Expr>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         keywords: Vec<String>,
         limit: usize,
     ) -> std::result::Result<Option<AggregationResult>, Error> {
         let columns: Vec<_> = [
-            primary_keys.iter().map(|pk| ident(pk.clone())).collect(),
+            primary_keys.iter().map(|c| col(c.clone())).collect(),
             addition_projection,
             vec![ident(SEARCH_SCORE_COLUMN_NAME)],
         ]
@@ -116,11 +124,10 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
                 // The column name for each `.generator` will be different, and therefore the
                 // keyword filter [`Expr`] must be made differently.
-                let filters = [
-                    prepare_keywords(&keywords.clone(), &content_col)?,
-                    opt_filters.clone(),
-                ]
-                .concat();
+                let mut filters = prepare_keywords(&keywords.clone(), &content_col)?;
+                if let Some(ref f) = opt_filter {
+                    filters.push(f.clone());
+                }
 
                 let mut columns = columns.clone();
                 columns.push(ident(g.value_projection_name()).alias(SEARCH_VALUE_COLUMN_NAME));
@@ -128,8 +135,10 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                 let lp = construct_logical_plan(
                     g.search(query.clone())
                         .context(SearchRequestConstructionSnafu)?,
+                    tbl,
                     columns,
                     filters,
+                    &primary_keys,
                     Some(limit),
                 )
                 .context(SearchRequestConstructionSnafu)?;
@@ -163,21 +172,26 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
 
 fn construct_logical_plan(
     tbl: Arc<dyn TableProvider>,
+    name: &TableReference,
     columns: Vec<Expr>,
     filters: Vec<Expr>,
+    primary_keys: &[Column],
     limit: Option<usize>,
 ) -> Result<LogicalPlan, DataFusionError> {
     let mut scan =
-        LogicalPlanBuilder::scan("base_table", Arc::new(DefaultTableSource::new(tbl)), None)?;
+        LogicalPlanBuilder::scan(name.clone(), Arc::new(DefaultTableSource::new(tbl)), None)?;
 
     if let Some(filter) = filters.into_iter().reduce(Expr::and) {
         scan = scan.filter(filter)?;
     }
+    let mut sort_exprs = vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)];
+    sort_exprs.extend(
+        primary_keys
+            .iter()
+            .map(|pk| SortExpr::new(col(pk.clone()), true, true)),
+    );
     scan.project(columns)?
-        .sort_with_limit(
-            vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)],
-            limit,
-        )?
+        .sort_with_limit(sort_exprs, limit)?
         .build()
 }
 
@@ -237,7 +251,7 @@ pub fn validate_keyword_to_ilike(k: &str, target_column: &str) -> Result<Expr, E
         }),
     ) = (*expr.clone(), *pattern.clone())
     {
-        if id.value.to_lowercase() != target_column {
+        if id.value != target_column {
             tracing::trace!(
                 "failed to parse 'keywords' for search. expected {target_column}, but got {}",
                 id.value
@@ -285,24 +299,39 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn test_search_request_prepare_keywords() {
+        let keywords = vec![
+            "keyword1".to_string(),
+            "\"key word2\"".to_string(),
+            "key word3".to_string(),
+            "keYwOrD4".to_string(),
+        ];
+        // Test all lowercase
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hello")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+
+        // Test with casing
+        insta::assert_snapshot!(format!("{:?}", prepare_keywords(&keywords, "hElLo")), @r#"Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hElLo" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])"#);
+    }
+
+    #[test]
     fn test_search_request_parse_keywords() {
         let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test keyword with a space
         let keywords = vec!["keyword 1".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test empty keyword
         let keywords = vec![String::new()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_ok());
+        result.expect("should be valid search keywords");
 
         // Test escaping keyword
         let keywords = vec!["'); DROP TABLE testing;".to_string()];
         let result = valid_keywords(&keywords);
-        assert!(result.is_err());
+        result.expect_err("should be invalid search keywords");
     }
 }

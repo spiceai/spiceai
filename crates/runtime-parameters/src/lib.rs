@@ -14,15 +14,45 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
-
 use itertools::Itertools;
 use runtime_secrets::Secrets;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 use tokio::sync::RwLock;
 
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const AWS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 6] = &[
+    ("aws_access_key_id", "key"),
+    ("aws_secret_access_key", "secret"),
+    ("aws_region", "region"),
+    ("aws_session_token", "session_token"),
+    ("aws_endpoint", "endpoint"),
+    ("aws_allow_http", "allow_http"),
+];
+
+/// Maps Azure-prefixed parameter names (used by Delta Lake and other connectors)
+/// to the names expected by `SpiceObjectStoreRegistry.prepare_azure_object_store()`.
+///
+/// See `object_store::azure::AzureConfigKey` for the full list of supported keys.
+const AZURE_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 7] = &[
+    ("azure_storage_account_name", "account"),
+    ("azure_storage_account_key", "access_key"),
+    ("azure_storage_client_id", "client_id"),
+    ("azure_storage_client_secret", "client_secret"),
+    ("azure_storage_sas_key", "sas_string"),
+    ("azure_storage_tenant_id", "tenant_id"),
+    ("azure_storage_endpoint", "endpoint"),
+];
+
+/// Maps GCS-prefixed parameter names (used by Delta Lake and other connectors)
+/// to the names expected by the object store registry.
+///
+/// Note: GCS is not currently fully supported in `SpiceObjectStoreRegistry`,
+/// but this canonicalization is added for forward compatibility.
+const GCS_PREFIXED_FRAGMENT_PARAMS: &[(&str, &str); 1] =
+    &[("google_service_account", "service_account")];
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,16 +75,31 @@ impl Parameters {
             key_to_use = &key[full_prefix.len()..];
         }
 
-        let spec = all_params.iter().find(|p| p.name == key_to_use);
+        // Find the non-deprecated spec matching the unprefixed key name
+        let spec = all_params
+            .iter()
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_none());
 
-        // Try again with the full key if the unprefixed key was not found
+        // Find deprecated spec matching the unprefixed key name (for backwards compat)
+        // e.g., component("tools").deprecated(...) allows "openai_tools" to work
+        let deprecated_spec = all_params
+            .iter()
+            .find(|p| p.name == key_to_use && p.deprecation_message.is_some());
+
+        // If no match found for unprefixed key, check for exact match on full key
         if spec.is_none() && all_params.iter().any(|p| p.name == key) {
-            // Early exit to avoid checks below.
             return Some(key.to_string());
         }
 
         let Some(spec) = spec else {
-            tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
+            let suggestion = closest_param_suggestion(all_params, prefix, key);
+            if let Some(candidate) = suggestion {
+                tracing::warn!(
+                    "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                );
+            } else {
+                tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
+            }
             return None;
         };
 
@@ -66,6 +111,10 @@ impl Parameters {
         }
 
         if prefix_removed && !spec.r#type.is_prefixed() {
+            // Allow if there's a deprecated spec for backwards compat
+            if deprecated_spec.is_some() {
+                return Some(key_to_use.to_string());
+            }
             tracing::warn!(
                 "Ignoring parameter {key}: must not be prefixed with `{full_prefix}` for {component_name}."
             );
@@ -85,6 +134,20 @@ impl Parameters {
         secrets: Arc<RwLock<Secrets>>,
         all_params: &'static [ParameterSpec],
     ) -> AnyErrorResult<Self> {
+        // Check for deprecated parameters using the original user-provided keys
+        // before normalization strips prefixes.
+        let original_keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        for parameter in all_params {
+            if let Some(deprecation_message) = parameter.deprecation_message {
+                let user_key = parameter.display_name(prefix);
+                if original_keys.contains(&user_key.as_str()) {
+                    tracing::warn!(
+                        "Parameter '{user_key}' is deprecated for {component_name}: {deprecation_message}",
+                    );
+                }
+            }
+        }
+
         // Convert the user-provided parameters into the format expected by the component
         let mut params: Vec<(String, SecretString)> = params
             .into_iter()
@@ -120,17 +183,6 @@ impl Parameters {
             }
         }
 
-        // Check for deprecated parameters
-        for parameter in all_params {
-            if let Some(deprecation_message) = parameter.deprecation_message
-                && let Some((param, _)) = params.iter().find(|p| p.0 == parameter.name)
-            {
-                tracing::warn!(
-                    "Parameter '{param}' is deprecated for {component_name}: {deprecation_message}",
-                );
-            }
-        }
-
         // If `ParameterSpec` requires the value to one of a set list, verify it is.
         for parameter in all_params {
             let Some(one_of) = parameter.one_of else {
@@ -138,7 +190,14 @@ impl Parameters {
             };
             if let Some((_, value_secret)) = params.iter().find(|p| p.0 == parameter.name) {
                 let value = value_secret.expose_secret();
-                if !one_of.contains(&value) {
+                let value_is_allowed = if parameter.one_of_ignore_ascii_case {
+                    one_of
+                        .iter()
+                        .any(|option| option.eq_ignore_ascii_case(value))
+                } else {
+                    one_of.contains(&value)
+                };
+                if !value_is_allowed {
                     return Err(Box::new(Error::InvalidConfigurationNoSource {
                         component: component_name.to_string(),
                         message: format!(
@@ -164,8 +223,9 @@ impl Parameters {
                 return Err(Box::new(Error::InvalidConfigurationNoSource {
                     component: component_name.to_string(),
                     message: format!(
-                        "Missing required parameter: {}",
-                        parameter.display_name(prefix)
+                        "Missing required parameter: {}{}",
+                        parameter.display_name(prefix),
+                        describe_missing_parameter(parameter),
                     ),
                 }));
             }
@@ -264,6 +324,78 @@ impl Parameters {
     #[must_use]
     pub fn prefix(&self) -> &'static str {
         self.prefix
+    }
+
+    /// `delta_lake` manually initializes an object store not via the registry, and it uses
+    /// `aws_` prefixed parameters. But after serialization, `ParquetExec` et al. have S3 URI schemes
+    /// so they initialize using the registry.
+    pub fn canonicalize_s3_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
+    }
+
+    /// Canonicalizes Azure-prefixed parameter names to the names expected by the object store registry.
+    ///
+    /// `delta_lake` and other connectors use `azure_storage_*` prefixed parameters, but
+    /// `SpiceObjectStoreRegistry.prepare_azure_object_store()` expects shorter names like
+    /// `account`, `access_key`, etc. This method maps the prefixed names to the expected names.
+    pub fn canonicalize_azure_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in AZURE_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
+    }
+
+    /// Canonicalizes GCS-prefixed parameter names to the names expected by the object store registry.
+    ///
+    /// `delta_lake` and other connectors use `google_*` prefixed parameters, but the object store
+    /// registry may expect different names. This method maps the prefixed names to the expected names.
+    pub fn canonicalize_gcs_fragments(&mut self) {
+        let mut params = self.params.iter().cloned().collect::<HashMap<_, _>>();
+
+        for (prefixed_key, registry_key) in GCS_PREFIXED_FRAGMENT_PARAMS {
+            if let Some(value) = params.remove(*prefixed_key) {
+                params.insert((*registry_key).to_string(), value);
+            }
+        }
+
+        self.params = params.into_iter().collect();
+    }
+
+    /// Returns the subset of params that map to `SpiceObjectStoreRegistry`
+    /// configuration keys, with the prefixed names (`aws_*`, `azure_storage_*`,
+    /// `google_*`) rewritten to the registry-facing names (`key`, `secret`,
+    /// `account`, etc.).
+    ///
+    /// Connector-internal params that aren't part of an object store mapping
+    /// (e.g. a Databricks workspace `endpoint`/`token`) are excluded, so this
+    /// is safe to encode directly into an object-store URL fragment.
+    #[must_use]
+    pub fn storage_registry_params(&self) -> Vec<(String, SecretString)> {
+        let map: HashMap<_, _> = self.params.iter().cloned().collect();
+        let mut out = Vec::new();
+        for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS
+            .iter()
+            .chain(AZURE_PREFIXED_FRAGMENT_PARAMS.iter())
+            .chain(GCS_PREFIXED_FRAGMENT_PARAMS.iter())
+        {
+            if let Some(value) = map.get(*prefixed_key) {
+                out.push(((*registry_key).to_string(), value.clone()));
+            }
+        }
+        out
     }
 }
 
@@ -370,160 +502,160 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ParameterSpec {
-    pub name: &'static str,
-    pub required: bool,
-    pub default: Option<&'static str>,
-    pub secret: bool,
-    pub description: &'static str,
-    pub help_link: &'static str,
-    pub examples: &'static [&'static str],
-    pub one_of: Option<&'static [&'static str]>,
-    pub deprecation_message: Option<&'static str>,
-    pub r#type: ParameterType,
-}
+pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
-impl ParameterSpec {
-    #[must_use]
-    pub const fn component(name: &'static str) -> Self {
-        Self {
-            name,
-            required: false,
-            default: None,
-            secret: false,
-            description: "",
-            help_link: "",
-            examples: &[],
-            deprecation_message: None,
-            r#type: ParameterType::Component,
-            one_of: None,
+/// Suggest the closest valid parameter name for a user-typo'd key.
+///
+/// Compares against the user-facing form of every spec (including prefix where relevant).
+/// Returns `Some(candidate)` only when edit distance is low enough to be useful,
+/// to avoid misleading suggestions for keys that are genuinely unknown.
+fn closest_param_suggestion(
+    all_params: &[ParameterSpec],
+    prefix: &str,
+    typo: &str,
+) -> Option<String> {
+    let typo_lower = typo.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for p in all_params {
+        if p.deprecation_message.is_some() {
+            continue;
+        }
+        let candidate = p.display_name(prefix);
+        let d = util::levenshtein::distance(&typo_lower, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, best_d)| d < *best_d) {
+            best = Some((candidate, d));
         }
     }
-
-    #[must_use]
-    pub const fn runtime(name: &'static str) -> Self {
-        Self {
-            name,
-            required: false,
-            default: None,
-            secret: false,
-            description: "",
-            help_link: "",
-            examples: &[],
-            deprecation_message: None,
-            r#type: ParameterType::Runtime,
-            one_of: None,
-        }
-    }
-
-    #[must_use]
-    pub const fn required(mut self) -> Self {
-        self.required = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn default(mut self, default: &'static str) -> Self {
-        self.default = Some(default);
-        self
-    }
-
-    #[must_use]
-    pub const fn secret(mut self) -> Self {
-        self.secret = true;
-        self
-    }
-
-    #[must_use]
-    pub const fn description(mut self, description: &'static str) -> Self {
-        self.description = description;
-        self
-    }
-
-    #[must_use]
-    pub const fn help_link(mut self, help_link: &'static str) -> Self {
-        self.help_link = help_link;
-        self
-    }
-
-    #[must_use]
-    pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
-        self.examples = examples;
-        self
-    }
-
-    #[must_use]
-    pub const fn deprecated(mut self, deprecation_message: &'static str) -> Self {
-        self.deprecation_message = Some(deprecation_message);
-        self
-    }
-
-    #[must_use]
-    pub const fn one_of(mut self, options: &'static [&'static str]) -> Self {
-        self.one_of = Some(options);
-        self
-    }
-
-    #[must_use]
-    pub const fn is_boolean(mut self) -> Self {
-        self = self.one_of(&["true", "false"]);
-        self
-    }
-
-    #[must_use]
-    pub fn display_name(&self, prefix: &str) -> String {
-        if self.r#type.is_prefixed() {
-            format!("{prefix}_{}", self.name)
-        } else {
-            self.name.to_string()
-        }
+    let (candidate, distance) = best?;
+    // Bound: at most 1/3 of the longer string (so short typos only match very close names).
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
     }
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
-pub enum ParameterType {
-    /// A parameter which tells Spice how to configure the underlying component, and is usually passed directly to the underlying component configuration.
-    ///
-    /// These parameters are automatically prefixed with the component's prefix.
-    ///
-    /// # Examples
-    ///
-    /// In Postgres, `host` is a Component parameter and would be auto-prefixed with `pg_`.
-    #[default]
-    Component,
-
-    /// Other parameters which control how the runtime interacts with the component, but does
-    /// not affect the actual component configuration.
-    ///
-    /// These parameters are not prefixed with the component's prefix.
-    ///
-    /// # Examples
-    ///
-    /// In Databricks, the `mode` parameter is used to select which connection to use, and thus is
-    /// not a component parameter.
-    Runtime,
-}
-
-impl Display for ParameterType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Component => write!(f, "Component"),
-            Self::Runtime => write!(f, "Runtime"),
-        }
+/// Build the suffix appended to "Missing required parameter: <name>" when a required
+/// parameter is absent. Renders whatever the spec carries (description, first example,
+/// doc link) as a single trailing sentence — joined with `. ` separators so reading
+/// stays natural regardless of which subset of fields is populated.
+fn describe_missing_parameter(parameter: &ParameterSpec) -> String {
+    let mut parts = Vec::<String>::new();
+    if !parameter.description.is_empty() {
+        // Strip an author-supplied trailing period so we don't produce `..` when
+        // concatenating with the next section.
+        parts.push(parameter.description.trim_end_matches('.').to_string());
     }
-}
-
-impl ParameterType {
-    #[must_use]
-    pub const fn is_prefixed(self) -> bool {
-        matches!(self, Self::Component)
+    if let Some(first_example) = parameter.examples.first() {
+        parts.push(format!("Example: `{first_example}`"));
+    }
+    if !parameter.help_link.is_empty() {
+        parts.push(format!("Docs: {}", parameter.help_link));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(". {}.", parts.join(". "))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_closest_param_suggestion_close_typo_matches() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+            ParameterSpec::component("user"),
+        ];
+        // Single-char typo against the longest match wins.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hots"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_distant_typo_returns_none() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+        ];
+        // Genuinely unrelated key should not suggest anything.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "totally_unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_ignores_deprecated() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("hostname").deprecated("use host"),
+        ];
+        // The close-but-deprecated `hostname` shouldn't win over the canonical `host`.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hostnam"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_empty_spec_is_empty_suffix() {
+        let spec = ParameterSpec::component("host");
+        assert_eq!(describe_missing_parameter(&spec), "");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_with_description() {
+        let spec = ParameterSpec::component("host").description("The DB host.");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_description_without_trailing_period() {
+        // Author-supplied descriptions without a trailing period should still
+        // render cleanly (no dangling `..`).
+        let spec = ParameterSpec::component("host").description("The DB host");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_full_suffix() {
+        let spec = ParameterSpec::component("host")
+            .description("The DB host.")
+            .examples(&["db.example.com"])
+            .help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". The DB host. Example: `db.example.com`. Docs: https://docs.example/host."
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_example_without_description() {
+        // Previously this produced a dangling leading-space ` Example: ...`; the
+        // message should start with a proper `. ` sentence boundary regardless of
+        // which subset of fields the spec carries.
+        let spec = ParameterSpec::component("host").examples(&["db.example.com"]);
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". Example: `db.example.com`."
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_help_link_only() {
+        let spec = ParameterSpec::component("host").help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". Docs: https://docs.example/host."
+        );
+    }
 
     #[test]
     fn test_validate_and_format_key_combined() {
@@ -601,6 +733,195 @@ mod test {
                 "accelerator not_file"
             ),
             Some("file_format".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_is_case_sensitive_by_default() {
+        static SPECS: &[ParameterSpec] =
+            &[ParameterSpec::component("mode").one_of(&["enabled", "disabled"])];
+        let err = Parameters::try_new(
+            "connector test",
+            vec![(
+                "test_mode".to_string(),
+                SecretString::new("ENABLED".to_string().into()),
+            )],
+            "test",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect_err("case-sensitive one_of should reject differently-cased values");
+
+        assert!(
+            err.to_string().contains(
+                "'test_mode' parameter must be one of: enabled, disabled. Found ENABLED."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_of_ignore_ascii_case_accepts_different_case() {
+        static SPECS: &[ParameterSpec] = &[ParameterSpec::component("security_protocol")
+            .one_of_ignore_ascii_case(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])];
+        let params = Parameters::try_new(
+            "connector kafka",
+            vec![(
+                "kafka_security_protocol".to_string(),
+                SecretString::new("SASL_PLAINTEXT".to_string().into()),
+            )],
+            "kafka",
+            Arc::new(RwLock::new(Secrets::new())),
+            SPECS,
+        )
+        .await
+        .expect("case-insensitive one_of should accept differently-cased values");
+
+        assert_eq!(
+            params.get("security_protocol").expose().ok(),
+            Some("SASL_PLAINTEXT")
+        );
+    }
+
+    /// Helper to create Parameters for testing canonicalization.
+    /// Uses a generic prefix and accepts any parameter names.
+    fn create_test_params(params: Vec<(&str, &str)>) -> Parameters {
+        Parameters::new(
+            params
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), SecretString::new(v.to_string().into())))
+                .collect(),
+            "test",
+            &[], // No specs needed for canonicalization tests
+        )
+    }
+
+    /// Helper to extract params as a `HashMap` for assertion.
+    fn params_to_map(params: &Parameters) -> HashMap<String, String> {
+        params
+            .params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.expose_secret().to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_canonicalize_azure_fragments() {
+        let mut params = create_test_params(vec![
+            ("azure_storage_account_name", "mystorageaccount"),
+            ("azure_storage_account_key", "secret_key_123"),
+            ("azure_storage_client_id", "client_id_456"),
+            ("azure_storage_client_secret", "client_secret_789"),
+            ("azure_storage_sas_key", "sas_token_xyz"),
+            ("azure_storage_tenant_id", "tenant_abc"),
+            (
+                "azure_storage_endpoint",
+                "https://mystorageaccount.blob.core.windows.net",
+            ),
+            ("unrelated_param", "some_value"),
+        ]);
+
+        params.canonicalize_azure_fragments();
+        let result = params_to_map(&params);
+
+        // Verify Azure params were renamed
+        assert_eq!(result.get("account"), Some(&"mystorageaccount".to_string()));
+        assert_eq!(
+            result.get("access_key"),
+            Some(&"secret_key_123".to_string())
+        );
+        assert_eq!(result.get("client_id"), Some(&"client_id_456".to_string()));
+        assert_eq!(
+            result.get("client_secret"),
+            Some(&"client_secret_789".to_string())
+        );
+        assert_eq!(result.get("sas_string"), Some(&"sas_token_xyz".to_string()));
+        assert_eq!(result.get("tenant_id"), Some(&"tenant_abc".to_string()));
+        assert_eq!(
+            result.get("endpoint"),
+            Some(&"https://mystorageaccount.blob.core.windows.net".to_string())
+        );
+
+        // Verify old names are removed
+        assert!(!result.contains_key("azure_storage_account_name"));
+        assert!(!result.contains_key("azure_storage_account_key"));
+
+        // Verify unrelated params are preserved
+        assert_eq!(
+            result.get("unrelated_param"),
+            Some(&"some_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_azure_fragments_partial() {
+        // Test with only some Azure params present
+        let mut params = create_test_params(vec![
+            ("azure_storage_account_name", "mystorageaccount"),
+            ("azure_storage_account_key", "secret_key_123"),
+        ]);
+
+        params.canonicalize_azure_fragments();
+        let result = params_to_map(&params);
+
+        assert_eq!(result.get("account"), Some(&"mystorageaccount".to_string()));
+        assert_eq!(
+            result.get("access_key"),
+            Some(&"secret_key_123".to_string())
+        );
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_canonicalize_gcs_fragments() {
+        let mut params = create_test_params(vec![
+            ("google_service_account", "/path/to/service_account.json"),
+            ("unrelated_param", "some_value"),
+        ]);
+
+        params.canonicalize_gcs_fragments();
+        let result = params_to_map(&params);
+
+        // Verify GCS params were renamed
+        assert_eq!(
+            result.get("service_account"),
+            Some(&"/path/to/service_account.json".to_string())
+        );
+
+        // Verify old names are removed
+        assert!(!result.contains_key("google_service_account"));
+
+        // Verify unrelated params are preserved
+        assert_eq!(
+            result.get("unrelated_param"),
+            Some(&"some_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_all_cloud_fragments() {
+        // Test that all three canonicalization methods can be chained
+        let mut params = create_test_params(vec![
+            ("aws_access_key_id", "aws_key"),
+            ("aws_secret_access_key", "aws_secret"),
+            ("azure_storage_account_name", "azure_account"),
+            ("azure_storage_account_key", "azure_key"),
+            ("google_service_account", "/path/to/sa.json"),
+        ]);
+
+        params.canonicalize_s3_fragments();
+        params.canonicalize_azure_fragments();
+        params.canonicalize_gcs_fragments();
+        let result = params_to_map(&params);
+
+        // All should be canonicalized
+        assert_eq!(result.get("key"), Some(&"aws_key".to_string()));
+        assert_eq!(result.get("secret"), Some(&"aws_secret".to_string()));
+        assert_eq!(result.get("account"), Some(&"azure_account".to_string()));
+        assert_eq!(result.get("access_key"), Some(&"azure_key".to_string()));
+        assert_eq!(
+            result.get("service_account"),
+            Some(&"/path/to/sa.json".to_string())
         );
     }
 }

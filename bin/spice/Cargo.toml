@@ -1,0 +1,126 @@
+[package]
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "spice"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "spice"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap.workspace = true
+clap_complete = "4"
+
+# Async runtime
+tokio.workspace = true
+
+# Async utilities
+futures.workspace = true
+
+# Error handling
+snafu.workspace = true
+
+# Logging/tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# HTTP client
+reqwest = { workspace = true, features = ["stream"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Environment files
+dotenvy.workspace = true
+
+# Cross-platform directories
+dirs = "6"
+
+# Semver comparison
+semver = "1"
+
+# Date/time formatting
+chrono = { workspace = true, features = ["serde"] }
+
+# Duration parsing
+humantime = "2"
+fundu.workspace = true
+
+# Terminal colors
+ansi_colors = { path = "../../crates/ansi_colors" }
+
+# Archive extraction
+flate2 = "1"
+tar = "0.4"
+zip = "7"
+
+# YAML parsing for spicepod
+yaml = { path = "../../crates/yaml" }
+
+# Temp file handling
+tempfile.workspace = true
+
+# Table formatting
+comfy-table = "7"
+
+# Line editor for REPL
+rustyline = "17"
+
+# Interactive CLI prompts (arrow-key selection)
+dialoguer = "0.12"
+
+# Random number generation (for auth codes)
+rand = "0.10"
+
+# Open URLs in browser
+open = "5"
+
+# Platform keyring for credential storage
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "linux-native"] }
+
+# URL encoding
+urlencoding = "2"
+
+# Certificate generation for cluster TLS
+pem = "3"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
+
+# Internal crates
+spice-cloud-client.workspace = true
+repl = { path = "../../crates/repl" }
+runtime-api-types = { path = "../../crates/runtime-api-types" }
+spicepod = { path = "../../crates/spicepod", default-features = false }
+spiceai = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
+arrow-json.workspace = true
+test-framework = { path = "../../crates/test-framework" }
+
+# Tracing/opentelemetry for trace ID handling
+opentelemetry.workspace = true
+
+# Unix signal handling
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+[build-dependencies]
+# None needed - we use include_str! for version
+
+[features]
+release = []
+
+[dev-dependencies]
+assert_cmd = "2"
+insta = { workspace = true, features = ["filters", "json"] }
+predicates = "3"
+rstest = "0.26.1"
+serde_json.workspace = true
+tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+wiremock = "0.6"

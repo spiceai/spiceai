@@ -114,20 +114,33 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // Wait for the file watcher to detect the change
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Poll until the file watcher detects the change and the refresh completes
+            let start = std::time::Instant::now();
+            let result: Vec<RecordBatch> = loop {
+                let batches: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder("SELECT * FROM names ORDER BY id")
+                    .build()
+                    .run()
+                    .await
+                    .expect("query is successful")
+                    .data
+                    .try_collect()
+                    .await
+                    .expect("collects results");
 
-            let result: Vec<RecordBatch> = rt
-                .datafusion()
-                .query_builder("SELECT * FROM names ORDER BY id")
-                .build()
-                .run()
-                .await
-                .expect("query is successful")
-                .data
-                .try_collect()
-                .await
-                .expect("collects results");
+                let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                if row_count >= 11 {
+                    break batches;
+                }
+
+                assert!(
+                    start.elapsed() <= std::time::Duration::from_secs(30),
+                    "Timed out waiting for file watcher refresh (got {row_count} rows, expected 11)"
+                );
+
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            };
 
             let pretty = arrow::util::pretty::pretty_format_batches(&result)
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?;

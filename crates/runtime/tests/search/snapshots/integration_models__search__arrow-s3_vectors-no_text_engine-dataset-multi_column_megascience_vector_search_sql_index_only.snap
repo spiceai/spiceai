@@ -1,0 +1,22 @@
+---
+source: crates/runtime/tests/search/mod.rs
+description: "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;"
+---
+[
+  {
+    "id": 1277,
+    "_score": 0.539
+  },
+  {
+    "id": 468,
+    "_score": 0.539
+  },
+  {
+    "id": 189,
+    "_score": 0.537
+  },
+  {
+    "id": 948,
+    "_score": 0.528
+  }
+]

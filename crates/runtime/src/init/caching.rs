@@ -53,13 +53,13 @@ impl Runtime {
             ) {
                 Ok(cache_provider) => {
                     in_tracing_context(|| {
-                        tracing::info!("Initialized results cache; {cache_provider}");
+                        tracing::info!("Initialized sql results cache; {cache_provider}");
                     });
                     caching = caching.with_results_cache(Arc::new(cache_provider));
                 }
                 Err(e) => {
                     in_tracing_context(|| {
-                        tracing::error!("Failed to initialize results cache: {e}");
+                        tracing::error!("Failed to initialize sql results cache: {e}");
                     });
                 }
             }

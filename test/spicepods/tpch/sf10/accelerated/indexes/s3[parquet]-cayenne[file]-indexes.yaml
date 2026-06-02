@@ -1,0 +1,74 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-cayenne[file]-indexes
+datasets:
+  - from: s3://benchmarks/tpch_sf10/customer/
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: c_custkey
+  - from: s3://benchmarks/tpch_sf10/lineitem/
+    name: lineitem
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: (l_orderkey, l_linenumber)
+  - from: s3://benchmarks/tpch_sf10/nation/
+    name: nation
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: n_nationkey
+  - from: s3://benchmarks/tpch_sf10/orders/
+    name: orders
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: o_orderkey
+  - from: s3://benchmarks/tpch_sf10/part/
+    name: part
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: p_partkey
+  - from: s3://benchmarks/tpch_sf10/partsupp/
+    name: partsupp
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: (ps_partkey, ps_suppkey)
+  - from: s3://benchmarks/tpch_sf10/region/
+    name: region
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: r_regionkey
+  - from: s3://benchmarks/tpch_sf10/supplier/
+    name: supplier
+    params: *s3_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      primary_key: s_suppkey

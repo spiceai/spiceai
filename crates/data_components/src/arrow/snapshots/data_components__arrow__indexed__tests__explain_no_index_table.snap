@@ -1,0 +1,7 @@
+---
+source: crates/data_components/src/arrow/indexed.rs
+assertion_line: 1739
+expression: plan
+---
+FilterExec: id@0 = 1
+  DataSourceExec: partitions=1, partition_sizes=[1]

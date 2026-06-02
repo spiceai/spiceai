@@ -36,11 +36,11 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("ConnectionPoolError: {source}"))]
+    #[snafu(display("Failed to connect to ClickHouse: {source}"))]
     ConnectionPoolError {
         source: clickhouse_rs::errors::Error,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to execute ClickHouse query: {source}"))]
     QueryError {
         source: clickhouse_rs::errors::Error,
     },
@@ -92,6 +92,52 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         unreachable!()
     }
 
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
+        let query = format!("SELECT name FROM system.tables WHERE database = '{escaped_schema}'");
+        let block = conn
+            .query(&query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        let tables = block
+            .rows()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        Ok(tables)
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+
+        let query = "SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')";
+        let block = conn
+            .query(query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        let schemas = block
+            .rows()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        Ok(schemas)
+    }
+
     async fn get_schema(
         &self,
         table_reference: &TableReference,
@@ -101,12 +147,15 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
 
         let (database, table) = match table_reference {
             TableReference::Full { schema, table, .. }
-            | TableReference::Partial { schema, table } => (schema, table),
-            TableReference::Bare { table } => (&self.db, table),
+            | TableReference::Partial { schema, table } => (schema.as_ref(), table.as_ref()),
+            TableReference::Bare { table } => (self.db.as_ref(), table.as_ref()),
         };
 
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_database = database.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
         let query = format!(
-            "SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{table}'",
+            "SELECT name, type FROM system.columns WHERE database = '{escaped_database}' AND table = '{escaped_table}'",
         );
 
         let block = conn
@@ -216,7 +265,7 @@ fn map_clickhouse_type_to_arrow(type_str: &str) -> Result<DataType, clickhouse_r
         "Float32" => Ok(DataType::Float32),
         "Float64" => Ok(DataType::Float64),
         s if s.starts_with("FixedString") => Ok(DataType::Utf8),
-        "Date" => Ok(DataType::Date32),
+        "Date" | "Date32" => Ok(DataType::Date32),
         "DateTime" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
         s if s.starts_with("Decimal") => {
             let parts: Vec<&str> = s
@@ -279,6 +328,8 @@ mod tests {
             ("String", DataType::Utf8),
             ("FixedString(10)", DataType::Utf8),
             ("Date", DataType::Date32),
+            ("Date32", DataType::Date32),
+            ("Nullable(Date32)", DataType::Date32),
             ("DateTime", DataType::Timestamp(TimeUnit::Second, None)),
             ("Decimal(18, 4)", DataType::Decimal128(18, 4)),
             ("Decimal(18)", DataType::Decimal128(18, 0)),

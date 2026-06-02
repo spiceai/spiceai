@@ -2,18 +2,16 @@
 description = "Spice Scheduler"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "scheduler"
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-arrow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 croner = "3.0.0"
-futures.workspace = true
 snafu.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true

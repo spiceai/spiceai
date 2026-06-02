@@ -16,8 +16,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use rmcp::{
-    ServiceError,
-    model::{CallToolRequestParam, CallToolResult, JsonObject, Tool, object},
+    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool, object},
+    service::ServiceError,
 };
 use serde_json::Value;
 use snafu::ResultExt;
@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tools::McpProxy;
 use tracing::Span;
 use tracing_futures::Instrument;
+use util::security::{MAX_SAFE_JSON_DEPTH, get_json_depth};
 
 use crate::tools::SpiceModelTool;
 
@@ -79,10 +80,19 @@ impl SpiceModelTool for McpToolWrapper {
     }
 
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Security: Validate input size to prevent excessive memory consumption or processing overhead
+        const MAX_INPUT_SIZE: usize = 1024 * 1024; // 1 MB
+        if arg.len() > MAX_INPUT_SIZE {
+            return Err(format!(
+                "Input too large ({} bytes). Maximum allowed: {MAX_INPUT_SIZE} bytes",
+                arg.len()
+            )
+            .into());
+        }
+
+        let task_name = format!("tool_use::{}/{}", self.server_name, self.spec.name);
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
-        span.in_scope(
-            || tracing::info!(target: "task_history", task_override = %format!("tool_use::{}/{}", self.server_name, self.spec.name), "labels"),
-        );
+        tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %self.server_name, "labels");
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;
@@ -90,13 +100,23 @@ impl SpiceModelTool for McpToolWrapper {
             let input: Value = if arg.is_empty() {
                 Value::Null
             } else {
+                // Security: Use controlled JSON parsing to prevent resource exhaustion
                 serde_json::from_str(arg).map_err(|e| {
                     tracing::error!(target: "task_history", parent: &span, "Failed to parse input: {e}");
                     e
                 })?
             };
+
+            // Security: Validate JSON depth to prevent stack overflow
+            if get_json_depth(&input) > MAX_SAFE_JSON_DEPTH {
+                return Err(format!(
+                    "Input JSON too deeply nested. Maximum depth: {MAX_SAFE_JSON_DEPTH}"
+                )
+                .into());
+            }
+
             let response = client
-                .call_tool(CallToolRequestParam{name: self.internal_name(), arguments: Some(object(input))})
+                .call_tool(CallToolRequestParams::new(self.internal_name()).with_arguments(object(input)))
                 .await
                 .boxed()?;
 
@@ -127,11 +147,10 @@ impl McpProxy for McpToolWrapper {
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, ServiceError> {
         let inner = self.client.read().await;
-        inner
-            .call_tool(CallToolRequestParam {
-                name: self.internal_name(),
-                arguments,
-            })
-            .await
+        let mut req = CallToolRequestParams::new(self.internal_name());
+        if let Some(args) = arguments {
+            req = req.with_arguments(args);
+        }
+        inner.call_tool(req).await
     }
 }

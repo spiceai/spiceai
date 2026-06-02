@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
 use crate::parameters::ParameterSpec;
 
-pub(crate) const PARAMETERS: &[ParameterSpec] =
+pub const PARAMETERS: &[ParameterSpec] =
     &concat_arrays::<
         ParameterSpec,
         AZURE_PARAM_LEN,
@@ -44,8 +46,7 @@ pub(crate) const AZURE_PARAMETERS: [ParameterSpec; AZURE_PARAM_LEN] = [
         )
         .default(""),
     ParameterSpec::runtime("responses_api")
-        .description(
-            "Whether to enable use of this model via the Responses API. `disabled` by default.",
-        )
+        .description("Whether to use the Responses API backend when serving `/v1/chat/completions` for this model. `disabled` proxies to backend `/v1/chat/completions`; `enabled` proxies to backend `/v1/responses`.")
+        .one_of(&["enabled", "disabled"])
         .default("disabled"),
 ];

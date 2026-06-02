@@ -14,7 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+use std::mem::size_of;
+
+// Spice runtime requires at least 64-bit pointer size (8 bytes).
+// This compile-time assertion prevents building on 32-bit platforms.
+const _: () = assert!(
+    size_of::<usize>() >= 8,
+    "Spice runtime requires a 64-bit platform (usize must be at least 8 bytes)"
+);
+
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
@@ -56,7 +66,11 @@ const fn get_allocator_name() -> Option<&'static str> {
 }
 
 fn main() {
-    let args = spiced::Args::parse();
+    let matches = spiced::Args::command().get_matches();
+    let open_telemetry_deprecated =
+        matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+    let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    args.open_telemetry_deprecated = open_telemetry_deprecated;
 
     if args.version {
         println!("{}", get_version_string());
@@ -75,7 +89,7 @@ fn main() {
     let _ = CryptoProvider::install_default(crypto::aws_lc_rs::default_provider());
 
     if args.repl {
-        if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
+        if let Err(e) = tokio_runtime.block_on(repl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
         }
         return;
@@ -87,7 +101,6 @@ fn main() {
         });
     }
 
-    global::shutdown_tracer_provider();
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");

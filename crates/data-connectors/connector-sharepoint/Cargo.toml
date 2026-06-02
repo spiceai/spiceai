@@ -1,0 +1,23 @@
+[package]
+name = "connector-sharepoint"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = "SharePoint data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+data_components = { path = "../../data_components", features = ["sharepoint"] }
+datafusion.workspace = true
+document_parse = { path = "../../document_parse" }
+graph-rs-sdk.workspace = true
+linkme.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+runtime-object-store = { path = "../../runtime-object-store" }
+secrecy.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

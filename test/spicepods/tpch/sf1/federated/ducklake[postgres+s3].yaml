@@ -1,0 +1,34 @@
+version: v1
+kind: Spicepod
+name: ducklake[postgres+s3]-federated
+datasets:
+  - from: ducklake:customer
+    name: customer
+    params: &ducklake_params
+      ducklake_connection_string: ${secrets:DUCKLAKE_CONNECTION_STRING}
+      ducklake_aws_region: us-east-1
+      ducklake_aws_access_key_id: minioadmin
+      ducklake_aws_secret_access_key: minioadmin
+      ducklake_aws_endpoint: "http://127.0.0.1:9000"
+      ducklake_aws_allow_http: "true"
+  - from: ducklake:lineitem
+    name: lineitem
+    params: *ducklake_params
+  - from: ducklake:nation
+    name: nation
+    params: *ducklake_params
+  - from: ducklake:orders
+    name: orders
+    params: *ducklake_params
+  - from: ducklake:part
+    name: part
+    params: *ducklake_params
+  - from: ducklake:partsupp
+    name: partsupp
+    params: *ducklake_params
+  - from: ducklake:region
+    name: region
+    params: *ducklake_params
+  - from: ducklake:supplier
+    name: supplier
+    params: *ducklake_params

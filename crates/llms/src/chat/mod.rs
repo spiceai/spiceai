@@ -11,27 +11,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
+use async_openai::types::chat::{
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use nsql::SqlGeneration;
+#[cfg(feature = "local_llm")]
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, Snafu};
+#[cfg(feature = "local_llm")]
+use snafu::ResultExt;
+use snafu::Snafu;
 use spicepod::component::model::ModelSource;
+use std::path::Path;
+#[cfg(any(feature = "local_llm", test))]
 use std::path::PathBuf;
+use std::pin::Pin;
+#[cfg(feature = "local_llm")]
 use std::str::FromStr;
+#[cfg(feature = "local_llm")]
 use std::sync::Arc;
-use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoice, ChatCompletionRequestAssistantMessage,
         ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
-        ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestDeveloperMessageContent,
+        ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
@@ -40,10 +49,13 @@ use async_openai::{
     },
 };
 
+#[cfg(feature = "local_llm")]
 pub mod mistral;
 pub mod nsql;
 use crate::streaming_utils::generate_stream_id;
+#[cfg(feature = "local_llm")]
 use indexmap::IndexMap;
+#[cfg(feature = "local_llm")]
 use mistralrs::MessageContent;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
@@ -55,14 +67,6 @@ static WEIGHTS_EXTENSIONS: [&str; 7] = [
     ".gguf",
     ".ggml",
 ];
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum LlmRuntime {
-    Candle,
-    Mistral,
-    Openai,
-}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -153,6 +157,14 @@ pub enum Error {
     ModelFileMissing { file_url: String },
 
     #[snafu(display(
+        "Refusing to load model weight file '{path}': '.{extension}' is a Python pickle format \
+         that executes arbitrary code on load (CVE-class: untrusted pickle deserialization → RCE). \
+         Convert the model to `.safetensors` or `.gguf`, or set `params.trust_pickle: true` if the \
+         file source is fully trusted."
+    ))]
+    UnsafePickleWeight { path: String, extension: String },
+
+    #[snafu(display(
         "Invalid parameters for model '{model}': {source} Verify the model parameters, and try again."
     ))]
     ModelParameterFailed {
@@ -230,15 +242,18 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = array
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                             i,
                         ) => i.image_url.url.clone(),
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(
                             a
                         ) => a.input_audio.data.clone(),
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(
+                            f
+                        ) => serde_json::to_string(&f.file).unwrap_or_default(),
                     })
                     .collect();
                 x.join("\n")
@@ -248,12 +263,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             content,
             ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
                     })
@@ -264,20 +281,21 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestToolMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
+                        async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(
                             t,
                         ) => t.text.clone(),
                     })
                     .collect();
                 x.join("\n")
             }
-        }
-        .clone(),
+        },
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
@@ -287,17 +305,17 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = parts
                         .iter()
                         .map(|p| match p {
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                                 t.text.clone()
                             }
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                                 i.refusal.clone()
                             }
                         })
                         .collect();
                 x.join("\n")
             }
-            None => todo!(),
+            None => unimplemented!("Assistant message with no content is not supported"),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -309,7 +327,13 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         }) => match content {
             ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
-                let x: Vec<_> = parts.iter().map(|p| p.text.clone()).collect();
+                let x: Vec<_> = parts
+                    .iter()
+                    .map(|p| {
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                        t.text.clone()
+                    })
+                    .collect();
                 x.join("\n")
             }
         },
@@ -317,13 +341,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 }
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+#[cfg(feature = "local_llm")]
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
-    use async_openai::types::{
-        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCalls, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
     use serde_json::{Value, json};
@@ -337,21 +362,23 @@ pub fn message_to_mistral(
                     either::Either::Left(text.clone())
                 }
                 ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let v = array.iter().map(|p| {
+                    let index_map = array.iter().map(|p| {
                         match p {
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
                                 ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            }
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
+                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
                             }
                         }
 
-                    }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
+                    }).collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -375,7 +402,13 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
+            let content_json = parts
+                .iter()
+                .map(|p| {
+                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                    t.text.clone()
+                })
+                .collect::<Vec<_>>();
             IndexMap::from([
                 (
                     String::from("role"),
@@ -402,7 +435,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -434,7 +467,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -469,10 +502,10 @@ pub fn message_to_mistral(
                 Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
                     // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
                     let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                             ("text".to_string(), t.text.clone())
                         }
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                             ("refusal".to_string(), i.refusal.clone())
                         }
                     }).collect::<Vec<_>>();
@@ -493,13 +526,16 @@ pub fn message_to_mistral(
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
                     .iter()
                     .filter_map(|t| {
-                        let Ok(function) = serde_json::to_value(&t.function) else {
-                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                        let ChatCompletionMessageToolCalls::Function(func_call) = t else {
+                            return None;
+                        };
+                        let Ok(function) = serde_json::to_value(&func_call.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", func_call.function);
                             return None;
                         };
 
                         let mut map = IndexMap::new();
-                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("id".to_string(), Value::String(func_call.id.clone()));
                         map.insert("function".to_string(), function);
                         map.insert("type".to_string(), Value::String("function".to_string()));
 
@@ -518,7 +554,7 @@ pub fn message_to_mistral(
             (String::from("role"), Either::Left(String::from("function"))),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default().clone()),
+                Either::Left(content.clone().unwrap_or_default()),
             ),
             ("name".to_string(), Either::Left(name.clone())),
         ]),
@@ -595,7 +631,6 @@ pub trait Chat: Sync + Send {
         Ok(Box::pin(stream! { yield resp }))
     }
 
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -626,7 +661,7 @@ pub trait Chat: Sync + Send {
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -657,6 +692,7 @@ pub trait Chat: Sync + Send {
                     audio: None,
                     function_call: None,
                     refusal: None,
+                    annotations: None,
                 },
                 index: 0,
                 finish_reason: None,
@@ -685,18 +721,26 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+#[cfg(feature = "local_llm")]
 pub async fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
     hf_token_literal: Option<&SecretString>,
+    chat_template_literal: Option<&str>,
 ) -> Result<Arc<dyn Chat>> {
-    mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
-        .await
-        .map(|x| Arc::new(x) as Arc<dyn Chat>)
+    mistral::MistralLlama::from_hf(
+        model_id,
+        model_type,
+        hf_token_literal,
+        from_gguf,
+        chat_template_literal,
+    )
+    .await
+    .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
-#[allow(unused_variables)]
+#[cfg(feature = "local_llm")]
 pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
@@ -721,4 +765,92 @@ pub async fn create_local_model(
     )
     .await
     .map(|x| Arc::new(x) as Arc<dyn Chat>)
+}
+
+/// File extensions that are conventionally Python pickle by `PyTorch`'s
+/// ecosystem and that are unsafe to load from any source the operator
+/// does not fully trust. Pickle deserialization is RCE by design.
+const PICKLE_WEIGHT_EXTENSIONS: &[&str] = &["bin", "pt", "pth", "ckpt"];
+
+/// Reject any weight path whose extension lands in [`PICKLE_WEIGHT_EXTENSIONS`]
+/// unless the caller has explicitly opted in via `trust_pickle = true`.
+///
+/// `weights` is expected to be the same slice of paths that will be handed
+/// to the model loader. Returns [`Error::UnsafePickleWeight`] on the first
+/// match, so the message identifies the offending file.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsafePickleWeight`] when `trust_pickle` is `false`
+/// and any path has a pickle-class extension.
+pub fn reject_unsafe_weight_formats<P: AsRef<Path>>(
+    weights: &[P],
+    trust_pickle: bool,
+) -> Result<()> {
+    if trust_pickle {
+        return Ok(());
+    }
+    for w in weights {
+        let path = w.as_ref();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if PICKLE_WEIGHT_EXTENSIONS.contains(&ext.as_str()) {
+                return Err(Error::UnsafePickleWeight {
+                    path: path.to_string_lossy().into_owned(),
+                    extension: ext,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_pickle_extensions_by_default() {
+        for ext in PICKLE_WEIGHT_EXTENSIONS {
+            let path = PathBuf::from(format!("/models/pytorch_model.{ext}"));
+            let err = reject_unsafe_weight_formats(&[path], false)
+                .expect_err(&format!("expected rejection for .{ext}"));
+            assert!(matches!(err, Error::UnsafePickleWeight { .. }));
+        }
+    }
+
+    #[test]
+    fn allows_safe_extensions() {
+        for ext in ["safetensors", "gguf", "ggml", "onnx"] {
+            let path = PathBuf::from(format!("/models/weights.{ext}"));
+            reject_unsafe_weight_formats(&[path], false)
+                .unwrap_or_else(|e| panic!("expected ok for .{ext}, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn opt_in_allows_pickle_extensions() {
+        let paths = [
+            PathBuf::from("/m/a.pt"),
+            PathBuf::from("/m/pytorch_model.bin"),
+        ];
+        reject_unsafe_weight_formats(&paths, true).expect("opt-in should allow pickle");
+    }
+
+    #[test]
+    fn extension_check_is_case_insensitive() {
+        let path = PathBuf::from("/m/Pytorch_Model.PT");
+        let err = reject_unsafe_weight_formats(&[path], false)
+            .expect_err("case-insensitive .PT must be rejected");
+        match err {
+            Error::UnsafePickleWeight { extension, .. } => assert_eq!(extension, "pt"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extensionless_path_is_ignored() {
+        let path = PathBuf::from("/m/no_extension_here");
+        reject_unsafe_weight_formats(&[path], false).expect("no extension → no rejection");
+    }
 }

@@ -21,14 +21,14 @@ use std::{
 };
 
 use app::AppBuilder;
-use rand::Rng;
+use rand::RngExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 use tokio::time::sleep;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check_with_timeout, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check_with_timeout, test_request_context},
 };
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
@@ -52,6 +52,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[tokio::test]
 async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -59,17 +60,15 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
             let mut rng = rand::rng();
             let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
-            let otel_port: u16 = http_port + 2;
-            let metrics_port: u16 = http_port + 3;
+            let metrics_port: u16 = http_port + 2;
 
             tracing::debug!(
-                "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+                "Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
             );
 
             let api_config = runtime::config::Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(
@@ -142,6 +141,7 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -149,17 +149,15 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
             let mut rng = rand::rng();
             let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
-            let otel_port: u16 = http_port + 2;
-            let metrics_port: u16 = http_port + 3;
+            let metrics_port: u16 = http_port + 2;
 
             tracing::debug!(
-                "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+                "Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
             );
 
             let api_config = runtime::config::Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(

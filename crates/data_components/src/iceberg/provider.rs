@@ -18,7 +18,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
@@ -41,10 +41,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// multiple [`SchemaProvider`], each associated with distinct namespaces.
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
-    /// A `HashMap` where keys are namespace names
+    /// The underlying Iceberg catalog client.
+    catalog: Arc<dyn Catalog>,
+    /// Optional root namespace to scope namespace discovery.
+    root_namespace: Option<NamespaceIdent>,
+    /// Optional glob patterns for filtering tables.
+    include: Option<GlobSet>,
+    /// A `RwLock`-protected `HashMap` where keys are namespace names
     /// and values are dynamic references to objects implementing the
     /// [`SchemaProvider`] trait.
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    schemas: RwLock<HashMap<String, Arc<dyn SchemaProvider>>>,
 }
 
 impl IcebergCatalogProvider {
@@ -55,15 +61,49 @@ impl IcebergCatalogProvider {
     /// This method retrieves the list of namespace names
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
+    ///
+    /// # Arguments
+    /// * `client` - The Iceberg catalog client
+    /// * `root_namespace` - Optional root namespace to start from
+    /// * `includes` - Optional glob patterns for filtering tables
     pub async fn try_new(
         client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
         includes: Option<&GlobSet>,
     ) -> Result<Self> {
+        let schemas =
+            Self::load_schemas(Arc::clone(&client), root_namespace.as_ref(), includes).await?;
+
+        Ok(IcebergCatalogProvider {
+            catalog: client,
+            root_namespace,
+            include: includes.cloned(),
+            schemas: RwLock::new(schemas),
+        })
+    }
+
+    /// Returns a reference to the underlying Iceberg catalog client.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// Returns the root namespace, if any.
+    #[must_use]
+    pub fn root_namespace(&self) -> Option<&NamespaceIdent> {
+        self.root_namespace.as_ref()
+    }
+
+    /// Load all schemas (namespaces) from the Iceberg catalog.
+    async fn load_schemas(
+        client: Arc<dyn Catalog>,
+        root_namespace: Option<&NamespaceIdent>,
+        includes: Option<&GlobSet>,
+    ) -> Result<HashMap<String, Arc<dyn SchemaProvider>>> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
 
-        let schema_names: Vec<_> = match client.list_namespaces(root_namespace.as_ref()).await {
+        let schema_names: Vec<_> = match client.list_namespaces(root_namespace).await {
             Ok(namespaces) => namespaces
                 .iter()
                 .flat_map(|ns| ns.as_ref().clone())
@@ -88,20 +128,15 @@ impl IcebergCatalogProvider {
             },
         };
 
-        let providers = try_join_all(
-            schema_names
-                .iter()
-                .map(|name| {
-                    let semaphore_clone = Arc::clone(&load_semaphore);
-                    IcebergSchemaProvider::try_new(
-                        Arc::clone(&client),
-                        NamespaceIdent::new(name.clone()),
-                        semaphore_clone,
-                        includes,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let providers = try_join_all(schema_names.iter().map(|name| {
+            let semaphore_clone = Arc::clone(&load_semaphore);
+            IcebergSchemaProvider::try_new(
+                Arc::clone(&client),
+                NamespaceIdent::new(name.clone()),
+                semaphore_clone,
+                includes,
+            )
+        }))
         .await?;
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
@@ -113,7 +148,7 @@ impl IcebergCatalogProvider {
             })
             .collect();
 
-        Ok(IcebergCatalogProvider { schemas })
+        Ok(schemas)
     }
 }
 
@@ -123,18 +158,39 @@ impl CatalogProvider for IcebergCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.schemas.keys().cloned().collect()
+        self.schemas
+            .read()
+            .map(|schemas| schemas.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
+        self.schemas
+            .read()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
     }
 }
 
 #[async_trait]
 impl RefreshableCatalogProvider for IcebergCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Will be implemented in a future enhancement.
+        let new_schemas = Self::load_schemas(
+            Arc::clone(&self.catalog),
+            self.root_namespace.as_ref(),
+            self.include.as_ref(),
+        )
+        .await?;
+
+        match self.schemas.write() {
+            Ok(mut schemas) => {
+                *schemas = new_schemas;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = new_schemas;
+            }
+        }
+
         Ok(())
     }
 }
@@ -142,11 +198,15 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
 #[derive(Debug)]
-pub(crate) struct IcebergSchemaProvider {
-    /// A `HashMap` where keys are table names
+pub struct IcebergSchemaProvider {
+    /// The underlying Iceberg catalog client.
+    catalog: Arc<dyn Catalog>,
+    /// The namespace this schema provider manages.
+    namespace: NamespaceIdent,
+    /// A `RwLock`-protected `HashMap` where keys are table names
     /// and values are dynamic references to objects implementing the
     /// [`TableProvider`] trait.
-    tables: HashMap<String, Arc<dyn TableProvider>>,
+    tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
 
 impl IcebergSchemaProvider {
@@ -157,14 +217,49 @@ impl IcebergSchemaProvider {
     /// This method retrieves a list of table names
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
+    ///
+    /// # Arguments
+    /// * `client` - The Iceberg catalog client
+    /// * `namespace` - The namespace containing the tables
+    /// * `load_semaphore` - Semaphore to limit concurrent table loads
+    /// * `include` - Optional glob patterns for filtering tables
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
         include: Option<&GlobSet>,
     ) -> Result<Self> {
+        let tables =
+            Self::load_tables(Arc::clone(&client), &namespace, load_semaphore, include).await?;
+
+        Ok(IcebergSchemaProvider {
+            catalog: client,
+            namespace,
+            tables: RwLock::new(tables),
+        })
+    }
+
+    /// Returns a reference to the underlying Iceberg catalog client.
+    #[must_use]
+    pub fn catalog(&self) -> &Arc<dyn Catalog> {
+        &self.catalog
+    }
+
+    /// Returns the namespace this schema provider manages.
+    #[must_use]
+    pub fn namespace(&self) -> &NamespaceIdent {
+        &self.namespace
+    }
+
+    /// Load all tables from the Iceberg catalog for this namespace.
+    async fn load_tables(
+        client: Arc<dyn Catalog>,
+        namespace: &NamespaceIdent,
+        load_semaphore: Arc<Semaphore>,
+        include: Option<&GlobSet>,
+    ) -> Result<HashMap<String, Arc<dyn TableProvider>>> {
         let table_names: Vec<_> = client
-            .list_tables(&namespace)
+            .list_tables(namespace)
             .await
             .map_err(handle_iceberg_error)?
             .into_iter()
@@ -206,11 +301,11 @@ impl IcebergSchemaProvider {
             }
         }
 
-        Ok(IcebergSchemaProvider { tables })
+        Ok(tables)
     }
 
     async fn load_table(
-        client: Arc<dyn Catalog>,
+        catalog: Arc<dyn Catalog>,
         table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -220,16 +315,28 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        match client.load_table(&table_name).await {
-            Ok(_table) => {
-                match IcebergTableProvider::try_new(client, Arc::unwrap_or_clone(table_name)).await
-                {
-                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
-                    Err(e) => Err(handle_iceberg_error(e)),
-                }
+        // Use IcebergTableProvider - it keeps a reference to the catalog for read/write support
+        match IcebergTableProvider::try_new(
+            Arc::clone(&catalog),
+            table_name.namespace().clone(),
+            table_name.name().to_string(),
+        )
+        .await
+        {
+            Ok(provider) => {
+                // Wrap in IcebergDeletionProvider so that
+                // catalog tables support DELETE FROM via equality delete files.
+                // Access control is handled by the SQL validator, not here.
+                let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
+                    Arc::clone(&catalog),
+                    table_name.namespace().clone(),
+                    table_name.name().to_string(),
+                    Arc::new(provider),
+                );
+                let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+                Ok(Some(adapted))
             }
             Err(e) => {
-                // If the table doesn't exist, return None instead of an error
                 let err_msg = e.to_string();
                 if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
                 {
@@ -254,15 +361,47 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
+        self.tables
+            .read()
+            .map(|tables| tables.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
+        self.tables
+            .read()
+            .map(|tables| tables.contains_key(name))
+            .unwrap_or(false)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        Ok(self.tables.get(name).cloned())
+        Ok(self
+            .tables
+            .read()
+            .ok()
+            .and_then(|tables| tables.get(name).cloned()))
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match self.tables.write() {
+            Ok(mut tables) => Ok(tables.insert(name, table)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on tables".to_string(),
+            )),
+        }
+    }
+
+    fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        match self.tables.write() {
+            Ok(mut tables) => Ok(tables.remove(name)),
+            Err(_) => Err(datafusion::error::DataFusionError::Internal(
+                "Failed to acquire write lock on tables".to_string(),
+            )),
+        }
     }
 }
 

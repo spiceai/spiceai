@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "data_components"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,17 +11,26 @@ version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
+arrow-row.workspace = true
+arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
-arrow_tools = { path = "../arrow_tools" }
 aws-config = { workspace = true, optional = true }
 aws-credential-types.workspace = true
 aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
+aws-sdk-dynamodbstreams = { workspace = true, optional = true }
+aws-smithy-async = { workspace = true, optional = true }
+azure_core = { version = "0.31.0", optional = true }
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+], optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
@@ -30,6 +39,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
@@ -45,38 +55,55 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
     "appender-arrow",
 ], optional = true }
+dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 flight_client = { path = "../flight_client" }
 futures.workspace = true
+git2 = { workspace = true }
 globset.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
-http = { version = "1.3.1" }
+hash-index = { path = "../hash-index", features = ["metrics"] }
+http.workspace = true
+httpdate.workspace = true
 iceberg.workspace = true
+parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
-itertools.workspace = true
 logos.workspace = true
+mysql_async = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
+num_cpus = "1.16"
 object_store = { workspace = true }
-opendal = "0.54"
+opendal.workspace = true
 oracle = { version = "0.6", optional = true }
+native-tls = { workspace = true, optional = true }
+percent-encoding.workspace = true
+pgwire-replication = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
-runtime-table-partition = { path = "../runtime-table-partition" }
+runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
+scylla = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "3044f8188176f050d930a0930f68c6c893f04362", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "75badc149f3c4d783b912c88d10bae443a7330f6", features = [
     "tls",
 ], optional = true } # spiceai
+telemetry = { path = "../telemetry" }
+tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
@@ -85,56 +112,111 @@ tokio-postgres = { workspace = true, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
-twox-hash = { workspace = true, optional = true }
 tracing.workspace = true
-url = "2.5.4"
-util = { path = "../util" }
+turso = { workspace = true, optional = true }
+turso-shared = { workspace = true, optional = true }
+twox-hash.workspace = true
+url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
+zip = "8.3.0"
+tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
-clickhouse = ["dep:clickhouse-rs"]
-databricks = ["delta_lake", "spark_connect"]
+bench = [] # Feature for benchmarking that exposes internal functions
+adbc = ["datafusion-table-providers/adbc-federation"]
+clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
+cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
+databricks = [
+    "delta_lake",
+    "spark_connect",
+    "datafusion-table-providers/federation",
+]
 debezium = ["dep:rdkafka"]
-kafka = ["dep:rdkafka"]
+default = []
 delta_lake = ["dep:delta_kernel"]
+elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
     "datafusion-table-providers/duckdb",
     "datafusion-table-providers/duckdb-federation",
 ]
-dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-config"]
+dynamodb = [
+    "dep:aws-config",
+    "dep:aws-sdk-dynamodb",
+    "dep:aws-sdk-dynamodbstreams",
+    "dep:aws-smithy-async",
+    "dep:dynamodb-streams",
+]
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
-mongodb = ["datafusion-table-providers/mongodb",]
+kafka = ["dep:rdkafka"]
+mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
-mysql = ["datafusion-table-providers/mysql"]
-odbc = []
+mysql = [
+    "dep:mysql_async",
+    "datafusion-table-providers/mysql",
+    "datafusion-table-providers/mysql-federation",
+]
+odbc = ["datafusion-table-providers/federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
+    "dep:pgwire-replication",
+    "dep:native-tls",
+    "dep:postgres-native-tls",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
-s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter", "dep:twox-hash"]
+s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
+scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
-snowflake = ["dep:snowflake-api"]
+# Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
+# accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
+sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
+snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
+turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 test_hadoop_catalog_docker = []
 
 [dev-dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
-ctor = "0.5.0"
-iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
-insta = { version = "1.43" }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+aws-smithy-types = { workspace = true }
+brotli = "8.0.2"
+chrono = { workspace = true }
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
+ctor = "0.8.0"
+flate2 = "1.1.5"
+iceberg-storage-opendal.workspace = true
+iceberg_test_utils = { workspace = true, features = ["tests"] }
+insta.workspace = true
+object_store = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zstd = "0.13.3"
+
+[[bench]]
+harness = false
+name = "arrow_write"
+required-features = ["bench"]
+
+[[bench]]
+harness = false
+name = "object_filter"
+
+[[bench]]
+harness = false
+name = "mongodb_change_stream"
+required-features = ["mongodb"]

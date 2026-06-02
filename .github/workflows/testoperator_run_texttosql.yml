@@ -1,0 +1,205 @@
+name: testoperator text-to-sql tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'spiced build commit'
+        required: false
+        type: string
+      spicepod_path:
+        description: 'The spicepod file to test with'
+        required: true
+        type: string
+      model_name:
+        description: 'The model name to call in text-to-sql operations. Must be defined in the `spicepod_path` file.'
+        required: true
+        type: string
+      queryset_file:
+        description: 'The queryset file to use for the text-to-sql benchmark'
+        required: false
+        type: string
+      queryset:
+        description: 'The queryset to use for the text-to-sql benchmark'
+        required: false
+        type: string
+      benchmark_queryset:
+        description: 'Predefined (possibly external) queryset to setup and use'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'bird-bench-small[california_schools]'
+          - 'bird-bench-small[card_games]'
+          - 'bird-bench-small[codebase_community]'
+          - 'bird-bench-small[debit_card_specializing]'
+          - 'bird-bench-small[european_football_2]'
+          - 'bird-bench-small[financial]'
+          - 'bird-bench-small[formula_1]'
+          - 'bird-bench-small[superhero]'
+          - 'bird-bench-small[thrombosis_prediction]'
+          - 'bird-bench-small[toxicology]'
+      use_evidence:
+        description: 'Include evidence in the question for bird-bench querysets'
+        required: false
+        type: boolean
+        default: false
+      runner_type:
+        description: 'Runner type'
+        required: true
+        default: 'spiceai-dev-runners'
+        type: choice
+        options:
+          - 'spiceai-dev-runners'
+          - 'spiceai-dev-large-runners'
+      limit:
+        description: 'Limit the number of text-to-SQL operations to run'
+        required: false
+        type: number
+      configuration_name:
+        description: 'Unique name for the configured testoperator run. Used to identify/group runs in telemetry.'
+        required: false
+        type: string
+
+jobs:
+  run-bench:
+    name: Run Text-to-SQL tests
+    runs-on: ${{ github.event.inputs.runner_type }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ github.event.inputs.spicepod_path }}" ]; then
+            echo "Error: Spicepod file not found at ${{ github.event.inputs.spicepod_path }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ github.event.inputs.spicepod_path }}"
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        id: setup-spiced
+        with:
+          spiced_commit: ${{ github.event.inputs.spiced_commit }}
+
+      - name: Display spiced commit
+        run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
+
+      - name: Build Testoperator
+        uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate queryset inputs
+        run: |
+          if ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.queryset_file }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]) || \
+              ([ -n "${{ github.event.inputs.queryset_file }}" ] && [ -n "${{ github.event.inputs.benchmark_queryset }}" ]); then
+              echo "Error: Only one of 'queryset', 'queryset_file' or 'benchmark_queryset' can be provided"
+              exit 1
+            fi
+
+          if [ -z "${{ github.event.inputs.queryset }}" ] && [ -z "${{ github.event.inputs.queryset_file }}" ] && [ -z "${{ github.event.inputs.benchmark_queryset }}" ]; then
+            echo "Error: Either 'queryset', 'queryset_file' or 'benchmark_queryset' must be provided"
+            exit 1
+          fi
+
+      - name: Extract spicepod filename path
+        id: extract_spicepod_filename
+        run: |
+          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
+          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
+          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+
+      - name: Prepare Bird-Bench Data
+        id: bird_bench_setup
+        uses: ./.github/actions/setup-bird-bench
+        if: ${{ github.event.inputs.benchmark_queryset != '' }}
+        with:
+          data_directory: /opt/spiced/data/
+          queryset_name: ${{ github.event.inputs.benchmark_queryset }}
+          use_evidence: ${{ github.event.inputs.use_evidence }}
+
+      - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+        run: |
+          rm -rf .spice/data
+          QUERYSET_ARG=""
+          SPICEPOD_DEPENDENCY=""
+          if [ -n "${{ github.event.inputs.queryset_file }}" ]; then
+            QUERYSET_ARG="--queryset-file ${{ github.event.inputs.queryset_file }}"
+          elif [ -n "${{ github.event.inputs.queryset }}" ]; then
+            QUERYSET_ARG="--queryset ${{ github.event.inputs.queryset }}"
+          elif [ -n "${{ github.event.inputs.benchmark_queryset }}" ]; then
+            QUERYSET_ARG='--queryset-file /opt/spiced/data/queryset.json'
+            SPICEPOD_DEPENDENCY="--spicepod-dependencies ${{ steps.bird_bench_setup.outputs.spicepod_dependency }}"
+          else
+            echo "Error: No valid queryset input provided"
+            exit 1
+          fi
+
+          LIMIT_ARG=""
+          if [ -n "${{ github.event.inputs.limit }}" ]; then
+            LIMIT_ARG="-n ${{ github.event.inputs.limit }}"
+          fi
+
+          CONFIG_NAME_ARG=""
+          if [ -n "${{ github.event.inputs.configuration_name }}" ]; then
+            CONFIG_NAME_ARG="--configuration-name ${{ github.event.inputs.configuration_name }}"
+          fi
+
+          printf '%s\n' \
+            "testoperator run text-to-sql" \
+            "  --ready-wait 1800" \
+            "  $QUERYSET_ARG" \
+            "  $SPICEPOD_DEPENDENCY" \
+            "  $LIMIT_ARG" \
+            "  $CONFIG_NAME_ARG" \
+            "  -d /opt/spiced/data" \
+            "  --model ${{ github.event.inputs.model_name }}" \
+            "  -p ${{ github.event.inputs.spicepod_path }}"
+
+          testoperator run text-to-sql \
+            --ready-wait 1800 \
+            $QUERYSET_ARG \
+            $SPICEPOD_DEPENDENCY \
+            $LIMIT_ARG \
+            $CONFIG_NAME_ARG \
+            -d /opt/spiced/data \
+            --model ${{ github.event.inputs.model_name }} \
+            -p "${{ github.event.inputs.spicepod_path }}"
+        env:
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+          SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
+          SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
+          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
+          SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}

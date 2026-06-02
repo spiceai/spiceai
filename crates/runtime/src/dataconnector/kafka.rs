@@ -14,19 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, pin::Pin, sync::Arc};
-
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
-    cdc::ChangesStream,
-    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics},
+    cdc::{ChangesStream, CommitError},
+    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use std::time::Duration;
+use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::async_trait;
 
 use crate::{
@@ -54,7 +54,9 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("Invalid configuration: {msg}"))]
+    #[snafu(display(
+        "Invalid Kafka configuration: {msg}. Docs: https://spiceai.org/docs/components/data-connectors/kafka"
+    ))]
     InvalidConfiguration { msg: String },
 }
 
@@ -62,12 +64,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 pub struct Kafka {
-    kafka_config: KafkaConfig,
+    config: KafkaConfig,
     json_options: Arc<SpiceJsonOptions>,
+    batching: (usize, Duration),
 }
 
 impl Kafka {
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new(params: Parameters) -> Result<Self> {
         let kafka_config = KafkaConfig {
             brokers: params
@@ -130,9 +133,24 @@ impl Kafka {
             metrics_store: Some(Arc::new(KafkaMetrics::new())),
         };
 
+        let batch_max_size = params
+            .get("batch_max_size")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10000);
+
+        let batch_max_duration = params
+            .get("batch_max_duration")
+            .expose()
+            .ok()
+            .and_then(|v| fundu::parse_duration(v).ok())
+            .unwrap_or(Duration::from_secs(1));
+
         Ok(Self {
-            kafka_config,
+            config: kafka_config,
             json_options: get_json_format(&params)?,
+            batching: (batch_max_size, batch_max_duration),
         })
     }
 }
@@ -180,43 +198,67 @@ impl KafkaFactory {
     }
 }
 
+const KAFKA_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/kafka";
+
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bootstrap_servers")
         .required()
         .description(
             "A list of host/port pairs for establishing the initial Kafka cluster connection.",
-        ),
+        )
+        .examples(&["broker1.kafka.internal:9092,broker2.kafka.internal:9092"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("security_protocol")
         .default("sasl_ssl")
-        .description("Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'."),
+        .description("Security protocol for Kafka connections. Default: 'sasl_ssl'.")
+        .one_of_ignore_ascii_case(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_mechanism")
         .default("SCRAM-SHA-512")
-        .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'."),
+        .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'.")
+        .one_of(&["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_username")
         .secret()
-        .description("SASL username."),
+        .description("SASL username.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_password")
         .secret()
-        .description("SASL password."),
+        .description("SASL password.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("ssl_ca_location")
         .secret()
-        .description("Path to the SSL/TLS CA certificate file for server verification."),
+        .description("Path to the SSL/TLS CA certificate file for server verification.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'.")
-        .is_boolean(),
+        .is_boolean()
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
-        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.")
-        .one_of(&["none", "https"]),
+        .description("SSL/TLS endpoint identification algorithm. Default: 'https'.")
+        .one_of(&["none", "https"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("schema_infer_max_records")
         .default("1")
-        .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
+        .description("Number of Kafka messages to sample for schema inference. Increase if your data has optional fields or varying structure.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
-        .is_boolean(),
+        .is_boolean()
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("consumer_group_id")
-        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
+        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::runtime("batch_max_size")
+        .description("Maximum number of change events to batch together before processing.")
+        .default("10000")
+        .help_link(KAFKA_DOCS),
+    ParameterSpec::runtime("batch_max_duration")
+        .description("Maximum time to wait for a batch to fill before processing.")
+        .default("1s")
+        .help_link(KAFKA_DOCS),
 ];
 
 impl DataConnectorFactory for KafkaFactory {
@@ -261,17 +303,19 @@ impl DataConnector for Kafka {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        ensure!(
-            dataset.is_accelerated(),
-            super::InvalidConfigurationNoSourceSnafu {
+        let Some(acceleration) = dataset
+            .acceleration
+            .as_ref()
+            .filter(|acceleration| acceleration.enabled)
+        else {
+            return super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
             }
-        );
-        let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("Dataset acceleration already verified. This should never be None here.");
+            .fail();
         };
+
         ensure!(
             acceleration.refresh_mode == Some(RefreshMode::Append),
             super::InvalidConfigurationNoSourceSnafu {
@@ -281,16 +325,39 @@ impl DataConnector for Kafka {
             }
         );
 
-        let dataset_name = dataset.name.to_string();
+        let kafka_sys = if dataset.is_file_accelerated() {
+            Some(Arc::new(
+                KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
+                    .await
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "kafka",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?,
+            ))
+        } else {
+            tracing::warn!(
+                dataset = %dataset.name,
+                "Kafka dataset is not file-accelerated. Connector state is ephemeral and the stream will restart on every runtime restart"
+            );
+            None
+        };
 
         let topic = dataset.path();
 
-        let (kafka_consumer, schema) =
-            init_kafka_consumer(dataset, topic, &self.kafka_config, &self.json_options).await?;
+        let (kafka_consumer, schema) = init_kafka_consumer(
+            dataset,
+            topic,
+            &self.config,
+            &self.json_options,
+            kafka_sys.as_deref(),
+        )
+        .await?;
 
         let refresh_sql = dataset.refresh_sql();
         let schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .map(|(_, schema)| schema)
                 .boxed()
                 .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "kafka".to_string(),
@@ -302,16 +369,16 @@ impl DataConnector for Kafka {
             schema
         };
 
-        if !dataset.is_file_accelerated() {
-            tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated. This may result in full message replay from Kafka on restarts. It is recommended to use file acceleration with the Kafka connector for optimal performance. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-            );
+        let mut kafka = data_components::kafka::Kafka::new(schema, kafka_consumer)
+            .with_flatten_json(self.json_options.flatten_json.clone())
+            .with_batching(self.batching);
+
+        if let Some(kafka_sys) = kafka_sys {
+            kafka =
+                kafka.with_offset_commit_hook(Arc::new(SidecarOffsetCommitHook::new(kafka_sys)));
         }
 
-        Ok(Arc::new(
-            data_components::kafka::Kafka::new(schema, kafka_consumer)
-                .with_flatten_json(self.json_options.flatten_json.clone()),
-        ))
+        Ok(Arc::new(kafka))
     }
 
     fn supports_append_stream(&self) -> bool {
@@ -334,11 +401,47 @@ impl DataConnector for Kafka {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
+        if let Some(metrics) = self.config.metrics_store.as_ref() {
             Some(Arc::new(KafkaMetricsProvider::new(Arc::clone(metrics))))
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runtime_secrets::Secrets;
+    use secrecy::SecretString;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn kafka_security_protocol_accepts_uppercase_values() {
+        let factory = KafkaFactory::new();
+        let params = Parameters::try_new(
+            "connector kafka",
+            vec![
+                (
+                    "kafka_bootstrap_servers".to_string(),
+                    SecretString::new("localhost:19093".to_string().into()),
+                ),
+                (
+                    "kafka_security_protocol".to_string(),
+                    SecretString::new("SASL_PLAINTEXT".to_string().into()),
+                ),
+            ],
+            factory.prefix(),
+            Arc::new(RwLock::new(Secrets::new())),
+            factory.parameters(),
+        )
+        .await
+        .expect("Kafka security_protocol should accept librdkafka uppercase values");
+
+        assert_eq!(
+            params.get("security_protocol").expose().ok(),
+            Some("SASL_PLAINTEXT")
+        );
     }
 }
 
@@ -347,9 +450,23 @@ async fn init_kafka_consumer(
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
+    kafka_sys: Option<&KafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
-    let Some(metadata) = get_metadata_from_accelerator(dataset).await else {
-        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config, json_options).await;
+    let metadata = if let Some(kafka_sys) = kafka_sys {
+        get_metadata_from_accelerator(kafka_sys)
+            .await
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "kafka",
+                connector_component: ConnectorComponent::from(dataset),
+            })?
+    } else {
+        None
+    };
+
+    let Some(metadata) = metadata else {
+        return bootstrap_new_kafka_consumer(dataset, topic, kafka_config, json_options, kafka_sys)
+            .await;
     };
 
     ensure!(
@@ -378,13 +495,16 @@ async fn init_kafka_consumer(
         );
     }
 
-    let kafka_consumer =
-        KafkaConsumer::create_with_existing_group_id(&metadata.consumer_group_id, kafka_config)
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "kafka",
-                connector_component: ConnectorComponent::from(dataset),
-            })?;
+    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+        &metadata.consumer_group_id,
+        kafka_config,
+        &metadata.offsets,
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "kafka",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
 
     kafka_consumer
         .subscribe(topic)
@@ -402,21 +522,57 @@ pub(crate) struct KafkaMetadata {
     pub(crate) consumer_group_id: String,
     pub(crate) topic: String,
     pub(crate) schema: SchemaRef,
+    #[serde(default)]
+    pub(crate) offsets: Vec<KafkaOffset>,
 }
 
-async fn get_metadata_from_accelerator(dataset: &Dataset) -> Option<KafkaMetadata> {
-    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::OpenExisting)
-        .await
-        .ok()?;
+async fn get_metadata_from_accelerator(
+    kafka_sys: &KafkaSys,
+) -> Result<Option<KafkaMetadata>, spice_sys::Error> {
     kafka_sys.get().await
 }
 
 async fn set_metadata_to_accelerator(
-    dataset: &Dataset,
+    kafka_sys: &KafkaSys,
     metadata: &KafkaMetadata,
 ) -> Result<(), spice_sys::Error> {
-    let kafka_sys = KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists).await?;
     kafka_sys.upsert(metadata).await
+}
+
+#[async_trait]
+pub(crate) trait SidecarOffsetStore: Send + Sync {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
+}
+
+#[async_trait]
+impl SidecarOffsetStore for KafkaSys {
+    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
+        KafkaSys::upsert_offsets(self, offsets).await
+    }
+}
+
+pub(crate) struct SidecarOffsetCommitHook<T> {
+    store: Arc<T>,
+}
+
+impl<T> SidecarOffsetCommitHook<T> {
+    pub(crate) fn new(store: Arc<T>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
+where
+    T: SidecarOffsetStore,
+{
+    async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
+        self.store
+            .upsert_offsets(offsets)
+            .await
+            .boxed()
+            .map_err(|e| CommitError::UnableToCommitChange { source: e })
+    }
 }
 
 async fn bootstrap_new_kafka_consumer(
@@ -424,6 +580,7 @@ async fn bootstrap_new_kafka_consumer(
     topic: &str,
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
+    kafka_sys: Option<&KafkaSys>,
 ) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -498,10 +655,11 @@ async fn bootstrap_new_kafka_consumer(
         consumer_group_id: kafka_consumer.group_id().to_string(),
         topic: topic.to_string(),
         schema: Arc::clone(&schema),
+        offsets: Vec::new(),
     };
 
-    if dataset.is_file_accelerated() {
-        set_metadata_to_accelerator(dataset, &metadata)
+    if let Some(kafka_sys) = kafka_sys {
+        set_metadata_to_accelerator(kafka_sys, &metadata)
             .await
             .boxed()
             .context(super::UnableToGetReadProviderSnafu {
@@ -539,18 +697,21 @@ const METRICS: &[MetricSpec] = &[
         description: Some("Total number of records consumed"),
         unit: Some("records"),
         metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
     },
     MetricSpec {
         name: "bytes_consumed_total",
         description: Some("Total bytes consumed"),
         unit: Some("bytes"),
         metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
     },
     MetricSpec {
         name: "records_lag",
         description: Some("Total consumer lag across all partitions"),
         unit: Some("records"),
         metric_type: MetricType::ObservableGaugeU64,
+        auto_register: false,
     },
 ];
 
@@ -610,3 +771,5 @@ impl MetricsProvider for KafkaMetricsProvider {
         }
     }
 }
+
+register_data_connector!("kafka", KafkaFactory);

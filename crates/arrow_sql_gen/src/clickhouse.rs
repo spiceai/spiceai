@@ -38,13 +38,15 @@ use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_arra
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to build record batch: {source}"))]
+    #[snafu(display("Failed to process ClickHouse query result: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
-    #[snafu(display("No builder found for index {index}"))]
+    #[snafu(display("Failed to process ClickHouse query result: no column at index {index}"))]
     NoBuilderForIndex { index: usize },
 
-    #[snafu(display("Failed to downcast builder for {clickhouse_type}"))]
+    #[snafu(display(
+        "Failed to process ClickHouse query result: unsupported type '{clickhouse_type}'"
+    ))]
     FailedToDowncastBuilder { clickhouse_type: SqlType },
 
     #[snafu(display("Failed to get a row value for {clickhouse_type}: {source}"))]
@@ -59,16 +61,16 @@ pub enum Error {
         source: arrow::error::ArrowError,
     },
 
-    #[snafu(display("No Arrow field found for index {index}"))]
+    #[snafu(display("No column definition found at index {index} in the ClickHouse result"))]
     NoArrowFieldForIndex { index: usize },
 
-    #[snafu(display("No column name for index: {index}"))]
+    #[snafu(display("No column name found at index {index} in the ClickHouse result"))]
     NoColumnNameForIndex { index: usize },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
-    #[snafu(display("Failed to parse decimal string as BigInterger {value}: {source}"))]
+    #[snafu(display("Failed to parse decimal string as BigInteger '{value}': {source}"))]
     FailedToParseBigDecimalFromClickhouse {
         value: String,
         source: bigdecimal::ParseBigDecimalError,
@@ -131,7 +133,6 @@ macro_rules! handle_primitive_nullable_type {
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
-#[allow(clippy::too_many_lines)]
 pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
@@ -535,6 +536,7 @@ fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
     (decimal * 10i128.pow(scale.try_into().unwrap_or_default())).to_i128()
 }
 
+#[cfg(test)]
 mod tests {
     #[test]
     fn test_block_to_arrow() {

@@ -1,26 +1,101 @@
-name: 'Add benchmark snapshots to PR'
-description: 'Commits and pushes any updated benchmark snapshots to the current branch.'
+name: 'Add snapshots to PR'
+description: 'Commits and pushes updated snapshots to an automation PR.'
 inputs:
   token:
     description: 'GitHub token with permissions to push to the repository'
     required: true
+  title:
+    description: 'Title for the PR created in this action'
+    required: false
+    default: 'fix: Update test snapshots'
+  description:
+    description: 'Body description for the PR created in this action'
+    required: false
+    default: ''
 runs:
   using: 'composite'
   steps:
-    - name: Upload benchmark snapshots to branch
+    - name: Install GH CLI if not installed
       shell: bash
       run: |
+        if ! command -v gh &> /dev/null; then
+          (type -p wget >/dev/null || (sudo apt update && sudo apt install wget -y)) \
+            && sudo mkdir -p -m 755 /etc/apt/keyrings \
+            && out=$(mktemp) && wget -nv -O"$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            && cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+            && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+            && sudo mkdir -p -m 755 /etc/apt/sources.list.d \
+            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+            && sudo apt update \
+            && sudo apt install gh -y
+        else
+          echo "GH CLI is already installed"
+        fi
+    - name: Upload snapshots to branch
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        EXISTING_PR_JSON="$(mktemp)"
+        gh pr list --state open --base trunk --limit 100 --json number,title,headRefName,author,body > "${EXISTING_PR_JSON}"
+        EXISTING_PR_NUMBER="$(jq -r --arg title "${PR_TITLE}" '
+          [.[]
+            | select(.title == $title)
+            | select(
+                .author.login == "github-actions[bot]"
+                or .author.login == "spiceaibot"
+                or ((.body // "") | contains("Automated snapshot update from workflow run"))
+                or ((.body // "") | contains("<!-- spice-snapshot-update -->"))
+              )]
+          | sort_by(.number)
+          | last
+          | .number // empty
+        ' "${EXISTING_PR_JSON}")"
+        EXISTING_PR_BRANCH="$(jq -r --argjson number "${EXISTING_PR_NUMBER:-0}" '
+          .[] | select(.number == $number) | .headRefName
+        ' "${EXISTING_PR_JSON}")"
+
+        if [[ -n "${EXISTING_PR_BRANCH}" ]]; then
+          BRANCH_NAME="${EXISTING_PR_BRANCH}"
+          echo "Found existing snapshot update PR #${EXISTING_PR_NUMBER}; updating ${BRANCH_NAME}"
+        else
+          RAW_BRANCH_NAME="${GITHUB_WORKFLOW:-snapshot-update}-${GITHUB_JOB:-job}-${PR_TITLE}"
+          BRANCH_SLUG="$(printf '%s' "${RAW_BRANCH_NAME}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' | cut -c1-80)"
+          BRANCH_NAME="snapshot-update/${BRANCH_SLUG:-${GITHUB_RUN_ID}}"
+        fi
+
         git config --global user.name 'Spice Snapshot Update Bot'
         git config --global user.email 'spiceaibot@spice.ai'
+        git checkout -b "${BRANCH_NAME}"
         git add '*.snap'
         if git diff --cached --quiet; then
           echo "No changes to commit"
         else
-          git commit -m "fix: Update the integration test snapshots"
-          if git ls-remote --exit-code --heads origin HEAD; then
-            git pull --rebase origin HEAD
+          git commit -m "${PR_TITLE}"
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}"; then
+            if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+              git fetch --unshallow origin
+            fi
+            git fetch origin "${BRANCH_NAME}"
+            git rebase -X theirs "origin/${BRANCH_NAME}"
           fi
-          git push origin HEAD
+          AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}"
+          git push "${AUTHENTICATED_REMOTE_URL}" "HEAD:${BRANCH_NAME}"
+
+          if [[ -n "${EXISTING_PR_NUMBER}" ]]; then
+            PR_URL="$(gh pr view "${EXISTING_PR_NUMBER}" --json url --jq .url)"
+            echo "Updated existing PR -> ${PR_URL}"
+            exit 0
+          else
+            BODY="${PR_DESCRIPTION}"
+            if [[ -z "${BODY}" ]]; then
+              BODY="$(printf 'Automated snapshot update from workflow run [#%s](%s/%s/actions/runs/%s).\n\n<!-- spice-snapshot-update -->' "${GITHUB_RUN_ID}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")"
+            fi
+            gh pr create --title "${PR_TITLE}" --body "${BODY}" --base trunk --head "${BRANCH_NAME}" --label kind/bug
+            gh pr merge --squash --auto "${BRANCH_NAME}" || echo "Auto-merge not available for this branch; PR created and requires manual merge."
+          fi
         fi
       env:
         GH_TOKEN: ${{ inputs.token }}
+        PR_TITLE: ${{ inputs.title }}
+        PR_DESCRIPTION: ${{ inputs.description }}

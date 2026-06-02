@@ -1,0 +1,69 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: "normalize_search_response(resp, round_scores)"
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "_score": "0.80",
+      "data": {
+        "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words."
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\n2"
+        ]
+      },
+      "primary_key": {
+        "id": 612
+      }
+    },
+    {
+      "_score": "0.79",
+      "data": {
+        "question": "Find the missing factor in the equation: \\( 42 = 21 \\times \\,? \\)."
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " is 2."
+        ]
+      },
+      "primary_key": {
+        "id": 349
+      }
+    },
+    {
+      "_score": "0.56",
+      "data": {
+        "question": "What is the fifth root of 32?"
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 948
+      }
+    },
+    {
+      "_score": "0.56",
+      "data": {
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\\times 2 \\times 2 \\times 2 = 32\\)"
+        ]
+      },
+      "primary_key": {
+        "id": 1277
+      }
+    }
+  ]
+}

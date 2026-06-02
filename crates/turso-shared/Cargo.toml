@@ -1,0 +1,13 @@
+[package]
+authors = ["Spice.ai OSS Authors"]
+description = "Shared Turso SQL and retry helpers"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "turso-shared"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]

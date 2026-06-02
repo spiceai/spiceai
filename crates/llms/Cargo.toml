@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "llms"
 repository.workspace = true
 rust-version.workspace = true
@@ -20,14 +20,15 @@ aws-sdk-bedrockruntime.workspace = true
 aws-smithy-types.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
-chunking = {path="../chunking"}
+chunking = { path = "../chunking" }
 futures = { workspace = true }
+google-genai = { path = "../google-genai" }
 governor.workspace = true
 
 hf-hub.workspace = true
 insta = { workspace = true, features = ["filters"] }
 itertools.workspace = true
-regex = "1.12.2"
+regex.workspace = true
 reqwest.workspace = true
 reqwest-eventsource = "0.6.0"
 runtime-rate-control = { path = "../runtime-rate-control" }
@@ -36,25 +37,25 @@ secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 spicepod = { path = "../spicepod" }
-tokenizers = "0.21.2"
+tokenizers.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
-mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", optional = true }
-mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "cf3749e243ebdd2d9dfa1b895261147ff9ba64e3", package = "mistralrs-core", optional = true }
+mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", optional = true } # branch: spiceai
+mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "6e64b990543ef1571ce512ca77b8ae4bae52c4c5", package = "mistralrs-core", optional = true } # branch: spiceai
 rand.workspace = true
 
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", features = [
     "candle",
 ] }
 
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "58b44fbbbde55a6ea33c8d0b4b9504942405c481", optional = true }
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3", optional = true }
 
-cudarc = { version = "0.12.2", optional = true, features = [
+cudarc = { version = "0.19", optional = true, features = [
     "cuda-version-from-build-system",
 ] }
 either = "1.15.0"
@@ -62,15 +63,17 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "dd0beab3810aebacb716d4ab6d38455e74499d13", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "f1190f1f140105f0c5ac8335fbbac402051ab072", optional = true }
 
 [dev-dependencies]
-anyhow = "1.0.99"
+anyhow.workspace = true
 aws-credential-types.workspace = true
+aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 dotenvy.workspace = true
-insta.workspace = true
+insta = {workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 paste.workspace = true
+rstest = "0.26.1"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 

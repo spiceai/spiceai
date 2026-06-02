@@ -23,7 +23,7 @@ use std::{
 
 use crate::{
     metrics::QueryStatus,
-    queries::{self, QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -39,6 +39,7 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
+use crate::queries::QueryOverrides;
 use sources::FileAppendableSource;
 
 #[derive(Default)]
@@ -49,6 +50,10 @@ pub struct NotStarted {
     parallel_count: usize,
     end_duration: Duration,
     tempdir_path: Option<PathBuf>,
+    load_interval: Option<Duration>,
+    load_steps: Option<u16>,
+    with_conflict_data: bool,
+    with_retention_test_data: bool,
 }
 
 impl NotStarted {
@@ -63,16 +68,18 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
-    pub fn with_query_set(
+    pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+        scale_factor: Option<f64>,
+    ) -> Result<Self> {
+        self.queries = query_set
+            .get_queries(overrides, None, None, scale_factor)
+            .await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -84,6 +91,30 @@ impl NotStarted {
     #[must_use]
     pub fn with_tempdir_path(mut self, tempdir_path: PathBuf) -> Self {
         self.tempdir_path = Some(tempdir_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = Some(load_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = Some(load_steps);
+        self
+    }
+
+    #[must_use]
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention_test_data(mut self, with_retention_test_data: bool) -> Self {
+        self.with_retention_test_data = with_retention_test_data;
         self
     }
 
@@ -128,11 +159,21 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let append_config = AppendConfig::new(
+        let mut append_config = AppendConfig::new(
             self.state.end_duration,
-            self.state.query_set,
+            self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        );
+        )
+        .with_conflict_data(self.state.with_conflict_data)
+        .with_retention_test_data(self.state.with_retention_test_data);
+
+        if let Some(load_interval) = self.state.load_interval {
+            append_config = append_config.with_load_interval(load_interval);
+        }
+
+        if let Some(load_steps) = self.state.load_steps {
+            append_config = append_config.with_load_steps(load_steps);
+        }
         let append_source = FileAppendableSource::new(&append_config);
 
         let append_worker = AppendWorker::new(append_config, Box::new(append_source))
@@ -147,6 +188,7 @@ impl SpiceTest<NotStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: AppendStarted {
                 queries: self.state.queries.clone(),
                 append_worker,
@@ -175,17 +217,22 @@ impl SpiceTest<AppendStarted> {
             .spice_client(self.api_key.clone(), false)
             .await?;
 
+        let executor: Box<dyn crate::execution::QueryExecutor> = Box::new(
+            crate::execution::FlightExecutor::new(Arc::new(spice_client)),
+        );
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
-                    spice_client.clone(),
                     self.name.clone(),
+                    executor.clone(),
                 )
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate_row_count(self.validate_row_count);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -204,6 +251,7 @@ impl SpiceTest<AppendStarted> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
@@ -229,14 +277,14 @@ impl SpiceTest<Running> {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             Ok(Err(e)) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             _ => {}
         }
@@ -295,6 +343,7 @@ impl SpiceTest<Running> {
             api_key: self.api_key,
             explain_plan_snapshot: self.explain_plan_snapshot,
             results_snapshot_predicate: self.results_snapshot_predicate,
+            validate_row_count: self.validate_row_count,
             state: datasets::Completed {
                 query_durations,
                 query_iteration_durations,

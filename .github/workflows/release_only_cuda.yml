@@ -18,9 +18,9 @@ jobs:
     env:
       ARTIFACT_DIR: ./release
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set REL_VERSION to ${{ inputs.target_version }}
         run: |
@@ -32,7 +32,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform from the specified run
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}

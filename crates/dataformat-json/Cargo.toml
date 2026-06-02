@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "dataformat-json"
 repository.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ futures.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
+datafusion-physical-expr.workspace = true
 object_store.workspace = true
 snafu.workspace = true
 tracing.workspace = true

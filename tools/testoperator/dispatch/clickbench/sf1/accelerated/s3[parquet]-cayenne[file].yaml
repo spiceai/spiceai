@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
+    query_set: clickbench
+    query_overrides: duckdb
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800

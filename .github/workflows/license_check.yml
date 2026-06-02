@@ -44,38 +44,18 @@ jobs:
     name: Check Rust Licenses
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: macos
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.18.3 || true
-        # TODO: Unpin cargo-deny version after upgrading to Rust 1.88.0
+        run: cargo install cargo-deny --version 0.19.6 --locked --force
 
       - name: Check Rust Licenses
         run: cargo deny check licenses
 
-  license-check-go:
-    name: Check Golang Licenses
-    runs-on: self-hosted
-    env:
-      GOVER: 1.25.3
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Install go-licences
-        run: go get github.com/google/go-licenses
-
-      - name: Check spice licenses
-        working-directory: bin/spice
-        run: |
-          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}
+      - name: Check Rust Advisories
+        run: cargo deny check advisories

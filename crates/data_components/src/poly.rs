@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, borrow::Cow, sync::Arc};
-
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::Constraints,
+    common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
@@ -28,25 +26,38 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_federation::{
-    FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+    FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+    FederationProvider,
 };
-
-use crate::delete::DeletionTableProvider;
+use std::collections::HashMap;
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct PolyTableProvider {
     write: Arc<dyn TableProvider>,
-    delete: Arc<dyn DeletionTableProvider>,
     fed: Arc<dyn TableProvider>,
+    schema_metadata: HashMap<String, String>,
 }
 
 impl PolyTableProvider {
-    pub fn new(
+    pub fn new(write: Arc<dyn TableProvider>, fed: Arc<dyn TableProvider>) -> Self {
+        PolyTableProvider {
+            write,
+            fed,
+            schema_metadata: HashMap::new(),
+        }
+    }
+
+    pub fn new_with_schema_metadata(
         write: Arc<dyn TableProvider>,
-        delete: Arc<dyn DeletionTableProvider>,
         fed: Arc<dyn TableProvider>,
+        schema_metadata: HashMap<String, String>,
     ) -> Self {
-        PolyTableProvider { write, delete, fed }
+        PolyTableProvider {
+            write,
+            fed,
+            schema_metadata,
+        }
     }
 
     fn get_federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
@@ -70,16 +81,10 @@ impl PolyTableProvider {
     pub fn get_federated_table_provider(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.fed)
     }
-}
 
-#[async_trait]
-impl DeletionTableProvider for PolyTableProvider {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.delete.delete_from(state, filters).await
+    #[must_use]
+    pub fn writer(&self) -> Arc<dyn TableProvider> {
+        Arc::clone(&self.write)
     }
 }
 
@@ -93,8 +98,9 @@ impl FederationProvider for PolyTableProvider {
             .and_then(|f| f.compute_context())
     }
 
-    fn analyzer(&self) -> Option<Arc<datafusion::optimizer::Analyzer>> {
-        self.get_federation_provider().and_then(|f| f.analyzer())
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+        self.get_federation_provider()
+            .and_then(|f| f.analyzer(plan))
     }
 }
 
@@ -104,13 +110,19 @@ impl TableProvider for PolyTableProvider {
         self
     }
     fn schema(&self) -> SchemaRef {
-        self.write.schema()
+        let schema = self.write.schema().as_ref().clone();
+        let mut metadata = schema.metadata().clone();
+        metadata.extend(self.schema_metadata.clone());
+        Arc::new(schema.with_metadata(metadata))
     }
     fn constraints(&self) -> Option<&Constraints> {
         self.write.constraints()
     }
     fn table_type(&self) -> TableType {
         self.write.table_type()
+    }
+    fn statistics(&self) -> Option<Statistics> {
+        self.write.statistics()
     }
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.write.get_logical_plan()
@@ -143,5 +155,26 @@ impl TableProvider for PolyTableProvider {
         overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.write.insert_into(state, input, overwrite).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.update(state, assignments, filters).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.write.truncate(state).await
     }
 }

@@ -14,62 +14,48 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::compute::{SortOptions, filter_record_batch};
-use arrow::{
-    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
-    datatypes::DataType,
-};
-use arrow_schema::SchemaRef;
-use async_stream::stream;
-use datafusion::datasource::{DefaultTableSource, TableType};
-use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::dml::InsertOp;
-use datafusion::physical_planner::ExtensionPlanner;
-use datafusion_table_providers::util::retriable_error::{
-    check_and_mark_retriable_error, is_retriable_error,
-};
-use futures::{StreamExt, stream};
-use opentelemetry::KeyValue;
-use runtime_datafusion_index::analyzer::{
-    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
-};
-use snafu::{OptionExt, ResultExt};
-use tokio::time::Instant;
-use tracing::{Instrument, Span};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
-use util::{RetryError, retry};
-
+use super::metrics;
+use super::refresh::Refresh;
+use super::refresh::get_timestamp;
+use super::sink::AccelerationSink;
+use super::synchronized_table::SynchronizedTable;
+use crate::accelerated_table::caching::CacheRefreshHelper;
+use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
+use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
-use crate::datafusion::error::{SpiceExternalError, find_datafusion_root, get_spice_df_error};
-use crate::datafusion::extension::{SpiceExtensionPlanner, SpiceQueryPlanner};
+use crate::datafusion::error::{
+    SpiceExternalError, find_datafusion_root, format_datafusion_error, get_spice_df_error,
+};
+use crate::datafusion::filter_converter::create_timestamp_filter_convert;
 use crate::datafusion::is_spice_internal_dataset;
-use crate::datafusion::schema::BaseSchema;
+use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
+use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::timing::MultiTimeMeasurement;
+use crate::metrics::telemetry::track_bytes_processed;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
     datafusion::{filter_converter::TimestampFilterConvert, schema},
-    dataupdate::{DataUpdate, StreamingDataUpdate, UpdateType},
-    execution_plan::schema_cast::EnsureSchema,
+    dataupdate::{StreamingDataUpdate, UpdateType},
     status,
 };
-use runtime_object_store::registry::default_runtime_env;
-
-use super::refresh::get_timestamp;
-use super::sink::AccelerationSink;
-use super::synchronized_table::SynchronizedTable;
-use super::{UnableToCreateMemTableFromUpdateSnafu, metrics};
-
-use crate::component::dataset::TimeFormat;
-use std::time::{Duration, UNIX_EPOCH};
-use std::{cmp::Ordering, sync::Arc, time::SystemTime};
-use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
-
-use super::refresh::Refresh;
-use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
+use arrow::compute::{SortOptions, filter_record_batch};
+use arrow::{
+    array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    datatypes::DataType,
+};
+use arrow_schema::SchemaRef;
+use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use data_components::{
+    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
+};
+use datafusion::catalog::MemoryCatalogProvider;
+use datafusion::datasource::{DefaultTableSource, TableType};
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_planner::ExtensionPlanner;
 use datafusion::{
     dataframe::DataFrame,
     datasource::TableProvider,
@@ -80,18 +66,186 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
 use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
+use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
+use datafusion_table_providers::util::retriable_error::{
+    check_and_mark_retriable_error, is_retriable_error,
+};
+use futures::{StreamExt, stream};
+use opentelemetry::KeyValue;
+use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
+use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
+use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
+use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
+use runtime_datafusion_index::{
+    IndexedTableProvider,
+    analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
+};
+use runtime_object_store::registry::default_runtime_env;
+use runtime_request_context::{AsyncMarker, RequestContext};
+use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::time::{Duration, UNIX_EPOCH};
+use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use telemetry::timing::MultiTimeMeasurement;
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, RwLock, Semaphore, oneshot},
+    time::Instant,
+};
+use tracing::{Instrument, Span};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{RetryError, retry};
 
-mod changes;
-mod streaming_append;
+pub(crate) mod changes;
+mod deletion;
 
 const NANOS_TO_MILLIS: u128 = 1_000_000;
+
+// Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
+type StreamBatchProcessCallback =
+    Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+fn table_provider_with_existing_metadata(
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    let schema = provider.schema();
+    let table_metadata = schema.metadata().clone();
+    let field_metadata = schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let metadata = field.metadata().clone();
+            (!metadata.is_empty()).then(|| (field.name().clone(), metadata))
+        })
+        .collect::<FieldMetadata>();
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    metadata_enriched_table_provider_preserving_indexes(provider, table_metadata, field_metadata)
+}
+
+fn metadata_enriched_table_provider_preserving_indexes(
+    provider: Arc<dyn TableProvider>,
+    table_metadata: HashMap<String, String>,
+    field_metadata: FieldMetadata,
+) -> Arc<dyn TableProvider> {
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        let enriched_underlying = metadata_enriched_table_provider_preserving_indexes(
+            indexed.get_underlying(),
+            table_metadata,
+            field_metadata,
+        );
+
+        return Arc::new(IndexedTableProvider::with_indexes(
+            enriched_underlying,
+            indexed.get_all_indexes(),
+        ));
+    }
+
+    if let Some(metadata_enriched) = provider
+        .as_any()
+        .downcast_ref::<MetadataEnrichedTableProvider>()
+    {
+        return metadata_enriched_table_provider_preserving_indexes(
+            Arc::clone(metadata_enriched.get_inner_ref()),
+            table_metadata,
+            field_metadata,
+        );
+    }
+
+    if let Some(adaptor) = provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+    {
+        let Some(table_provider) = &adaptor.table_provider else {
+            return Arc::clone(&provider);
+        };
+
+        let enriched_provider = metadata_enriched_table_provider_preserving_indexes(
+            Arc::clone(table_provider),
+            table_metadata,
+            field_metadata,
+        );
+
+        return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+            Arc::clone(&adaptor.source),
+            enriched_provider,
+        ));
+    }
+
+    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
+}
 
 #[derive(Debug, Clone, Default)]
 struct RefreshStat {
     pub num_rows: usize,
     pub memory_size: usize,
+}
+
+/// Synchronous traversal: walks a provider chain and collects indexes from every
+/// [`IndexedTableProvider`] layer. Kept as a plain fn (not async) so that the
+/// `HashSet<*const ()>` used for dedup never appears inside an async fn and cannot
+/// make the enclosing future non-`Send`.
+fn collect_indexes_from_provider(
+    root: Arc<dyn datafusion::catalog::TableProvider>,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    use crate::embeddings::table::EmbeddingTable;
+    use runtime_datafusion_index::IndexedTableProvider;
+
+    let mut indexes: Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut current = Some(root);
+
+    while let Some(provider) = current.take() {
+        if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            for index in indexed.get_all_indexes() {
+                let ptr = Arc::as_ptr(&index).cast::<()>();
+                if seen.insert(ptr) {
+                    indexes.push(index);
+                }
+            }
+        }
+
+        current = if let Some(adaptor) = provider
+            .as_any()
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+        {
+            adaptor.table_provider.as_ref().map(Arc::clone)
+        } else if let Some(embedding_table) = provider.as_any().downcast_ref::<EmbeddingTable>() {
+            Some(Arc::clone(embedding_table.get_underlying_ref()))
+        } else if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+            Some(indexed.get_underlying())
+        } else {
+            None
+        };
+    }
+
+    indexes
+}
+
+/// Walks the federated provider chain and collects indexes from **every** [`IndexedTableProvider`]
+/// layer encountered. Known wrapper types (`FederatedTableProviderAdaptor`, `EmbeddingTable`) are
+/// unwrapped so that indexes nested inside them are not silently missed. These indexes receive
+/// write lifecycle hooks alongside accelerator refreshes.
+///
+/// Uses `try_table_provider_sync` to avoid blocking when the federated provider is deferred
+/// (e.g. during schema evolution). If the provider is not yet available, returns an empty list.
+fn indexes_from_federated(
+    federated: &FederatedTable,
+) -> Vec<Arc<dyn runtime_datafusion_index::Index + Send + Sync>> {
+    let Some(root) = federated.try_table_provider_sync() else {
+        return Vec::new();
+    };
+    collect_indexes_from_provider(root)
 }
 
 pub struct RefreshTaskBuilder {
@@ -100,11 +254,27 @@ pub struct RefreshTaskBuilder {
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
-    sink: Arc<RwLock<AccelerationSink>>,
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Shared flag that `AcceleratedTable::scan` checks to decide whether the
+    /// initial data load has completed. Set to `true` just before the status
+    /// transitions to `Ready` so there is no window where the runtime reports
+    /// ready but scans still see `initial_load_completed == false`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
+    /// State for `refresh_mode: snapshot`. Required when the refresh mode is
+    /// [`RefreshMode::Snapshot`]; ignored otherwise.
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
 }
 
 impl RefreshTaskBuilder {
@@ -115,18 +285,27 @@ impl RefreshTaskBuilder {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        metrics: Option<Metrics>,
+        io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             runtime_status,
             dataset_name,
             federated,
             federated_source,
-            accelerator: Arc::clone(&accelerator),
-            sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
+            accelerator,
             disable_federation: false,
             semaphore: None,
-            metrics,
+            metrics: None,
+            cpu_runtime: None,
+            io_runtime,
+            resource_monitor: None,
+            accelerator_write_mutex,
+            on_stream_batch_process_callback: None,
+            last_updated_at: Arc::new(AtomicI64::new(0)),
+            initial_load_completed: None,
+            is_s3_express_acceleration: false,
+            snapshot_refresh_state: None,
         }
     }
 
@@ -144,10 +323,95 @@ impl RefreshTaskBuilder {
     }
 
     #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<Metrics>) -> RefreshTaskBuilder {
+        self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cpu_runtime(mut self, runtime: Option<Handle>) -> RefreshTaskBuilder {
+        self.cpu_runtime = runtime;
+        self
+    }
+
+    #[must_use]
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::resource_monitor::ResourceMonitor,
+    ) -> RefreshTaskBuilder {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_on_stream_batch_process_callback(
+        mut self,
+        callback: Option<StreamBatchProcessCallback>,
+    ) -> RefreshTaskBuilder {
+        self.on_stream_batch_process_callback = callback;
+        self
+    }
+
+    #[must_use]
+    pub fn with_last_updated_at(mut self, last_updated_at: Arc<AtomicI64>) -> RefreshTaskBuilder {
+        self.last_updated_at = last_updated_at;
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_load_completed(
+        mut self,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> RefreshTaskBuilder {
+        self.initial_load_completed = Some(initial_load_completed);
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    #[must_use]
+    pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
+        self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Provide the snapshot-refresh state required for `RefreshMode::Snapshot`.
+    #[must_use]
+    pub fn with_snapshot_refresh_state(
+        mut self,
+        state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    ) -> RefreshTaskBuilder {
+        self.snapshot_refresh_state = state;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
             .semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)));
+
+        // Create the acceleration sink at build time rather than storing it in the builder.
+        //
+        // Design rationale: While this creates the sink even if the RefreshTask is never used,
+        // this approach is necessary because:
+        // 1. The sink requires the accelerator Arc, which the builder owns
+        // 2. Storing the sink in the builder would require the builder to be mutable or use
+        //    interior mutability (e.g., `Option<Arc<RwLock<AccelerationSink>>>`)
+        // 3. In practice, RefreshTask is always used immediately after building - it's not a
+        //    speculative construction pattern
+        // 4. The sink itself is lightweight (just wraps an Arc to the accelerator)
+        //
+        // Trade-off: This creates a small amount of overhead (one Arc + RwLock allocation) even
+        // if the task is never executed, but simplifies the builder API and ownership model.
+        // The alternative of lazy initialization would add complexity without meaningful benefit
+        // given the typical usage pattern.
+        // Extract indexes from the federated provider chain so they receive write
+        // lifecycle hooks without needing to be manually plumbed through as sink_indexes.
+        let federated_indexes = indexes_from_federated(&self.federated);
+        let sink = Arc::new(RwLock::new(
+            AccelerationSink::new(Arc::clone(&self.accelerator))
+                .with_sink_indexes(federated_indexes),
+        ));
 
         RefreshTask {
             runtime_status: self.runtime_status,
@@ -155,7 +419,7 @@ impl RefreshTaskBuilder {
             federated: self.federated,
             federated_source: self.federated_source,
             accelerator: self.accelerator,
-            sink: self.sink,
+            sink,
             disable_federation: self.disable_federation,
             semaphore,
             enabled_metrics: self
@@ -167,11 +431,20 @@ impl RefreshTaskBuilder {
                 .iter()
                 .cloned()
                 .collect(),
+            cpu_runtime: self.cpu_runtime,
+            io_runtime: self.io_runtime,
+            resource_monitor: self.resource_monitor,
+            accelerator_write_mutex: self.accelerator_write_mutex,
+            on_stream_batch_process_callback: self.on_stream_batch_process_callback,
+            last_updated_at: self.last_updated_at,
+            initial_load_completed: self.initial_load_completed,
+            is_s3_express_acceleration: self.is_s3_express_acceleration,
+            snapshot_refresh_state: self.snapshot_refresh_state,
+            cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-#[derive(Debug)]
 pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
@@ -183,6 +456,41 @@ pub struct RefreshTask {
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Arc<Semaphore>,
     enabled_metrics: HashSet<String>,
+    cpu_runtime: Option<Handle>,
+    io_runtime: Handle,
+    resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
+    accelerator_write_mutex: Arc<Mutex<()>>,
+    on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Shared flag set to `true` just before status transitions to `Ready`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
+    /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
+    /// other refresh modes.
+    snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
+    cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+}
+
+impl std::fmt::Debug for RefreshTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshTask")
+            .field("runtime_status", &self.runtime_status)
+            .field("dataset_name", &self.dataset_name)
+            .field("federated", &self.federated)
+            .field("federated_source", &self.federated_source)
+            .field("accelerator", &self.accelerator)
+            .field("sink", &self.sink)
+            .field("disable_federation", &self.disable_federation)
+            .field("semaphore", &self.semaphore)
+            .field("enabled_metrics", &self.enabled_metrics)
+            .field("cpu_runtime", &self.cpu_runtime)
+            .field("io_runtime", &self.io_runtime)
+            .field("resource_monitor", &self.resource_monitor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RefreshTask {
@@ -193,7 +501,8 @@ impl RefreshTask {
         federated: Arc<FederatedTable>,
         federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
-        metrics: Option<Metrics>,
+        io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> RefreshTaskBuilder {
         RefreshTaskBuilder::new(
             runtime_status,
@@ -201,7 +510,8 @@ impl RefreshTask {
             federated,
             federated_source,
             accelerator,
-            metrics,
+            io_runtime,
+            accelerator_write_mutex,
         )
     }
 
@@ -230,7 +540,7 @@ impl RefreshTask {
         let mut spans = vec![];
         let mut parent_span = Span::current();
         for dataset_name in self.get_dataset_names().await {
-            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "accelerated_refresh", input = %dataset_name);
+            let span = tracing::span!(target: "task_history", parent: &parent_span, tracing::Level::INFO, "acceleration_refresh", input = %dataset_name);
             spans.push(span.clone());
             parent_span = span;
         }
@@ -271,8 +581,11 @@ impl RefreshTask {
     }
 
     async fn run_once(&self, refresh: &Refresh) -> Result<(), RetryError<super::Error>> {
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let dataset_metrics_label_sets = self.get_dataset_label_sets(&refresh.mode).await;
 
@@ -297,13 +610,57 @@ impl RefreshTask {
             None
         };
 
+        // For table providers with refresh skip support, check if the refresh can be skipped to
+        // avoid unnecessary data fetching when the underlying data is unchanged.
+        if refresh.mode == RefreshMode::Full || refresh.mode == RefreshMode::Append {
+            let table_provider = self.federated.table_provider().await;
+
+            match data_components::refresh_skip::should_skip_refresh_for_table_provider(
+                table_provider.as_ref(),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    tracing::debug!(
+                        "Skipping refresh for {} - data unchanged",
+                        self.dataset_name
+                    );
+
+                    for label_set in &dataset_metrics_label_sets {
+                        metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                    }
+
+                    self.set_refresh_status(
+                        refresh.display_sql().as_deref(),
+                        status::ComponentStatus::Ready,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Data may have changed or provider does not support skipping; continue with refresh.
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to check if refresh should be skipped for {}, proceeding with refresh: {}",
+                        self.dataset_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Start timing the actual refresh operation (after early return checks)
         let _timer = MultiTimeMeasurement::new(
+            #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
             match refresh.mode {
                 RefreshMode::Disabled => {
                     unreachable!("Refresh cannot be called when acceleration is disabled")
                 }
                 RefreshMode::Full | RefreshMode::Append => &metrics::REFRESH_DURATION_MS,
                 RefreshMode::Changes => unreachable!("changes are handled upstream"),
+                RefreshMode::Caching => &metrics::REFRESH_DURATION_MS,
+                RefreshMode::Snapshot => &metrics::REFRESH_DURATION_MS,
             },
             &dataset_metrics_label_sets,
         );
@@ -320,13 +677,31 @@ impl RefreshTask {
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => {
+                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                return self.refresh_stale_cached_rows(refresh).await;
+            }
+            RefreshMode::Snapshot => {
+                // For snapshot mode, poll the snapshot store for a newer snapshot
+                // and reload the accelerator from it. The federated source is
+                // never queried for refreshes in this mode.
+                return self.refresh_from_snapshot(refresh).await;
+            }
         };
 
         let streaming_data_update = match get_data_update_result {
             Ok(data_update) => data_update,
             Err(e) => {
-                self.log_refresh_error(inner_err_from_retry_ref(&e), refresh.sql.as_deref())
-                    .await;
+                // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
+                // This is expected and should not be logged as an error.
+                if self.runtime_status.is_shutdown() {
+                    return Ok(());
+                }
+                self.log_refresh_error(
+                    inner_err_from_retry_ref(&e),
+                    refresh.display_sql().as_deref(),
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -353,27 +728,27 @@ impl RefreshTask {
                 (streaming_data_update, None)
             };
 
-        self.write_streaming_data_update(
-            Some(start_time),
-            streaming_data_update,
-            refresh.sql.as_deref(),
-        )
-        .await
-        .inspect_err(|e| {
+        if let Err(e) = self
+            .write_streaming_data_update(
+                Some(start_time),
+                streaming_data_update,
+                refresh.display_sql().as_deref(),
+            )
+            .await
+        {
             // During runtime shutdown, refresh tasks are canceled resulting in acceleration error.
             // This is expected and should not be logged as an error.
-            if !self.runtime_status.is_shutdown() {
-                tracing::warn!(
-                    "Failed to load data for {} {}: {}",
-                    self.component_type(),
-                    include_source_to_table_name(
-                        &self.dataset_name,
-                        self.federated_source.as_deref()
-                    ),
-                    inner_err_from_retry_ref(e)
-                );
+            if self.runtime_status.is_shutdown() {
+                return Ok(());
             }
-        })?;
+            tracing::warn!(
+                "Failed to load data for {} {}: {}",
+                self.component_type(),
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+                inner_err_from_retry_ref(&e)
+            );
+            return Err(e);
+        }
 
         // Only record metrics if a refresh was successful
         self.handle_metrics(
@@ -396,15 +771,17 @@ impl RefreshTask {
                 Ok(Some(time_nanos)) => i64::try_from(time_nanos / NANOS_TO_MILLIS).ok(),
                 Ok(None) => None,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
-                        self.component_type(),
-                        include_source_to_table_name(
-                            &self.dataset_name,
-                            self.federated_source.as_deref()
-                        ),
-                        e
-                    );
+                    if !self.runtime_status.is_shutdown() {
+                        tracing::warn!(
+                            "Failed to fetch max_timestamp_before_refresh for {} {}: {}",
+                            self.component_type(),
+                            include_source_to_table_name(
+                                &self.dataset_name,
+                                self.federated_source.as_deref()
+                            ),
+                            e
+                        );
+                    }
                     None
                 }
             }
@@ -427,7 +804,7 @@ impl RefreshTask {
             None => None,
         };
 
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let current_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -484,6 +861,7 @@ impl RefreshTask {
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
 
+        let resource_monitor = self.resource_monitor.clone();
         let observed_record_batch_stream = RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             stream::unfold(
@@ -493,6 +871,7 @@ impl RefreshTask {
                     dataset_name.to_string(),
                     notify_written_data_stat_available,
                     DataLoadTracing::new(&self.dataset_name),
+                    resource_monitor,
                 ),
                 move |(
                     mut stream,
@@ -500,6 +879,7 @@ impl RefreshTask {
                     ds_name,
                     notify_refresh_stat_available,
                     mut tracing,
+                    resource_monitor,
                 )| async move {
                     if let Some(batch) = stream.next().await {
                         match batch {
@@ -507,6 +887,18 @@ impl RefreshTask {
                                 tracing.on_new_batch_received(&batch);
                                 stat.num_rows += batch.num_rows();
                                 stat.memory_size += batch.get_array_memory_size();
+
+                                // Record incremental ingestion counters per batch.
+                                let labels = [KeyValue::new("dataset", ds_name.clone())];
+                                metrics::REFRESH_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
+                                metrics::REFRESH_BYTES_WRITTEN
+                                    .add(batch.get_array_memory_size() as u64, &labels);
+
+                                // Check memory usage after processing each batch
+                                if let Some(ref monitor) = resource_monitor {
+                                    monitor.check_memory_usage(&ds_name);
+                                }
+
                                 Some((
                                     Ok(batch),
                                     (
@@ -515,6 +907,7 @@ impl RefreshTask {
                                         ds_name,
                                         notify_refresh_stat_available,
                                         tracing,
+                                        resource_monitor,
                                     ),
                                 ))
                             }
@@ -526,6 +919,7 @@ impl RefreshTask {
                                     ds_name,
                                     notify_refresh_stat_available,
                                     tracing,
+                                    resource_monitor,
                                 ),
                             )),
                         }
@@ -545,21 +939,39 @@ impl RefreshTask {
         let sink_lock = self.sink.read().await;
         let sink = &*sink_lock;
 
+        let _lock_guard = self.accelerator_write_mutex.lock().await;
         if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
-            self.set_refresh_status(sql, status::ComponentStatus::Error)
-                .await;
+            let error_message = format_datafusion_error(&e);
+            self.set_refresh_status(
+                sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
             return Err(e);
         }
 
-        if let (Some(start_time), Ok(refresh_stat)) =
-            (start_time, on_written_data_stat_available.try_recv())
-        {
-            self.trace_load_completed(start_time, refresh_stat.num_rows, refresh_stat.memory_size)
+        let refresh_stat = on_written_data_stat_available.try_recv().ok();
+
+        if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
+            self.trace_load_completed(start_time, stat.num_rows, stat.memory_size)
                 .await;
+        }
+
+        if let Some(stat) = &refresh_stat {
+            for dataset_name in self.get_dataset_names().await {
+                let labels = [KeyValue::new("dataset", dataset_name.to_string())];
+                metrics::REFRESH_PROCESSED_ROWS.add(stat.num_rows as u64, &labels);
+                metrics::REFRESH_PROCESSED_BYTES.add(stat.memory_size as u64, &labels);
+            }
         }
 
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
+
+        self.maybe_update_last_updated_at(
+            &data_update.update_type,
+            refresh_stat.map_or(0, |s| s.num_rows),
+        );
 
         Ok(())
     }
@@ -578,8 +990,11 @@ impl RefreshTask {
             tracing::info!("Loading data for {} {dataset_name}", self.component_type());
         }
 
-        self.set_refresh_status(refresh.sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
+        self.set_refresh_status(
+            refresh.display_sql().as_deref(),
+            status::ComponentStatus::Refreshing,
+        )
+        .await;
 
         let refresh = refresh.clone();
         let mut filters = vec![];
@@ -594,37 +1009,6 @@ impl RefreshTask {
         }
 
         self.get_data_update(filters, &refresh).await
-    }
-
-    async fn write_data_update(
-        &self,
-        sql: Option<String>,
-        start_time: Option<SystemTime>,
-        data_update: DataUpdate,
-    ) -> super::Result<()> {
-        if data_update.data.is_empty()
-            || data_update
-                .data
-                .first()
-                .is_some_and(|x| x.columns().is_empty())
-        {
-            if let Some(start_time) = start_time {
-                self.trace_load_completed(start_time, 0, 0).await;
-            }
-
-            self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Ready)
-                .await;
-
-            return Ok(());
-        }
-
-        let streaming_update = StreamingDataUpdate::try_from(data_update)
-            .map_err(find_datafusion_root)
-            .context(UnableToCreateMemTableFromUpdateSnafu)?;
-
-        self.write_streaming_data_update(start_time, streaming_update, sql.as_deref())
-            .await
-            .map_err(inner_err_from_retry)
     }
 
     async fn get_incremental_append_update(
@@ -647,21 +1031,317 @@ impl RefreshTask {
             .await
             .map_err(RetryError::permanent)
         {
-            Ok(timestamp) => match self
-                .get_full_or_incremental_append_update(refresh, timestamp)
-                .await
-            {
-                Ok(data) => match self.except_existing_records_from(refresh, data).await {
-                    Ok(data) => Ok(data),
+            Ok(timestamp) => {
+                tracing::debug!(
+                    "Found max timestamp for {} {}: {:?}",
+                    self.component_type(),
+                    self.dataset_name,
+                    timestamp
+                );
+
+                match self
+                    .get_full_or_incremental_append_update(refresh, timestamp)
+                    .await
+                {
+                    Ok(data) => match self.except_existing_records_from(refresh, data).await {
+                        Ok(data) => Ok(data),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            },
+                }
+            }
             Err(e) => {
-                tracing::error!("No latest timestamp is found: {e}");
+                if !self.runtime_status.is_shutdown() {
+                    tracing::error!("No latest timestamp is found: {e}");
+                }
                 Err(e)
             }
         }
+    }
+
+    async fn refresh_stale_cached_rows(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<(), RetryError<super::Error>> {
+        // Get the caching TTL from refresh settings - default to 30 seconds if not specified
+        let ttl = refresh.caching_ttl.unwrap_or(Duration::from_secs(30));
+
+        tracing::info!(
+            "Starting stale row refresh for dataset {} with TTL {ttl:?}",
+            self.dataset_name,
+        );
+
+        // Use the CacheRefreshHelper to identify and refresh all stale rows
+        let federated_provider = self.federated.table_provider().await;
+        let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
+            federated_provider,
+            Arc::clone(&self.accelerator),
+            self.dataset_name.to_string().as_str(),
+            ttl,
+            Arc::clone(&self.accelerator_write_mutex),
+        )
+        .await
+        .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;
+
+        tracing::info!(
+            "Completed stale row refresh for dataset {} - refreshed {refreshed_count} rows",
+            self.dataset_name,
+        );
+
+        Ok(())
+    }
+
+    /// Drives `RefreshMode::Snapshot`: poll the snapshot store for a snapshot
+    /// strictly newer than what is currently loaded; if found, download it
+    /// (which writes to the accelerator's primary path) and call into the
+    /// accelerator's `reload_from_snapshot` to swap in a fresh `TableProvider`.
+    ///
+    /// The federated source is never queried by this code path. When no newer
+    /// snapshot is available the call is a no-op (Ready, no swap).
+    async fn refresh_from_snapshot(
+        &self,
+        refresh: &Refresh,
+    ) -> Result<(), RetryError<super::Error>> {
+        let _ = refresh; // refresh sql / window are intentionally unused for snapshot mode
+
+        let Some(state) = self.snapshot_refresh_state.clone() else {
+            // This is a configuration bug: the refresh mode is Snapshot but no
+            // SnapshotRefreshState was attached. Surface as a permanent error so
+            // the dataset is marked unhealthy rather than retried indefinitely.
+            tracing::error!(
+                dataset = %self.dataset_name,
+                "refresh_mode: snapshot is configured but no SnapshotRefreshState is available; \
+                 this indicates a runtime configuration bug."
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "snapshot refresh state missing".to_string(),
+                    ),
+                },
+            ));
+        };
+
+        self.set_refresh_status(None, status::ComponentStatus::Refreshing)
+            .await;
+
+        let start_time = SystemTime::now();
+        let current_local_id = state.current_loaded_id();
+
+        // Take the accelerator write mutex up front so the entire refresh
+        // (download + provider rebuild + swap) is serialized with other code
+        // paths that take this mutex. `AcceleratedTable::insert_into` rejects
+        // writes outright when `refresh_mode: snapshot` is enabled, so this
+        // mutex's only remaining job here is to serialize concurrent snapshot
+        // refreshes / cache writes against the swap. The atomic rename inside
+        // `download_if_newer` independently protects against partial-file
+        // reads from in-flight queries that hold their own connection refs to
+        // the prior file inode.
+        let _write_guard = Arc::clone(&self.accelerator_write_mutex).lock_owned().await;
+
+        // Hand the snapshot manager a schema validator that runs against
+        // the snapshot metadata's recorded schema **before** the file is
+        // downloaded or renamed. This guarantees a schema-incompatible
+        // snapshot can never overwrite the accelerator's primary file.
+        let live_schema = state.swappable_provider.schema();
+        let live_schema_for_validate = Arc::clone(&live_schema);
+        let validator: Box<dyn Fn(&arrow_schema::SchemaRef) -> bool + Send + Sync> =
+            Box::new(move |candidate: &arrow_schema::SchemaRef| {
+                schemas_compatible(candidate.as_ref(), live_schema_for_validate.as_ref())
+            });
+        let download_result = state
+            .manager
+            .download_if_newer(current_local_id, Some(validator.as_ref()))
+            .await;
+
+        let info = match download_result {
+            Ok(Some(info)) => info,
+            Ok(None) if current_local_id.is_none() => {
+                // No snapshot has ever been loaded and none is available at the configured location.
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    snapshot_location = %state.manager.snapshot_location(),
+                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "no snapshot available".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(
+                            "refresh_mode: snapshot - no snapshot found at the configured location"
+                                .to_string(),
+                        ),
+                    },
+                ));
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    dataset = %self.dataset_name,
+                    current_snapshot_id = ?current_local_id,
+                    "refresh_mode: snapshot - no newer snapshot available; skipping reload"
+                );
+                let dataset_metrics_label_sets =
+                    self.get_dataset_label_sets(&RefreshMode::Snapshot).await;
+                for label_set in &dataset_metrics_label_sets {
+                    metrics::REFRESH_DATA_FETCHES_SKIPPED.add(1, label_set);
+                }
+                self.set_refresh_status(None, status::ComponentStatus::Ready)
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    error = %e,
+                    "refresh_mode: snapshot - failed to check/download snapshot"
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "snapshot refresh failure".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::External(Box::new(e)),
+                    },
+                ));
+            }
+        };
+
+        // The snapshot manager already rejected schema-incompatible
+        // snapshots before download; this is a defense-in-depth check
+        // against the (rare) case where the metadata's recorded schema
+        // differed from the schema actually embedded in the downloaded
+        // file. The downloaded file may have replaced the primary path
+        // here, but `reload_from_snapshot` is gated below — and a
+        // schema-mismatch returned here is treated as permanent.
+        if !schemas_compatible(info.schema.as_ref(), live_schema.as_ref()) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                "refresh_mode: snapshot - downloaded snapshot schema does not match \
+                 accelerator schema; refusing to swap"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "snapshot schema mismatch".to_string(),
+                    ),
+                },
+            ));
+        }
+
+        // The accelerator write mutex was taken above, before the download,
+        // so the entire reload + swap remains serialized with concurrent
+        // accelerator writes.
+        let new_provider = match state
+            .accelerator
+            .reload_from_snapshot(
+                state.source.as_ref(),
+                state.swappable_provider.current(),
+                Arc::clone(&state.provider_factory),
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    dataset = %self.dataset_name,
+                    snapshot_id = info.snapshot_id,
+                    error = %e,
+                    "refresh_mode: snapshot - accelerator failed to reload from snapshot"
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "snapshot refresh failure".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(e.to_string()),
+                    },
+                ));
+            }
+        };
+
+        if !schemas_compatible(new_provider.schema().as_ref(), live_schema.as_ref()) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                "refresh_mode: snapshot - reloaded provider schema does not match accelerator \
+                 schema; refusing to swap"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(
+                        "reloaded snapshot provider schema mismatch".to_string(),
+                    ),
+                },
+            ));
+        }
+
+        if let Err(swap_err) = state.swappable_provider.swap(new_provider) {
+            tracing::error!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                error = %swap_err,
+                "refresh_mode: snapshot - swap rejected by SwappableTableProvider"
+            );
+            self.set_refresh_status(
+                None,
+                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+            )
+            .await;
+            return Err(RetryError::permanent(
+                super::Error::FailedToRefreshDataset {
+                    source: datafusion::error::DataFusionError::Internal(format!(
+                        "snapshot swap rejected: {swap_err}"
+                    )),
+                },
+            ));
+        }
+        state.set_current_loaded_id(info.snapshot_id);
+        if let Some(updated_at) = info.last_updated_at {
+            self.last_updated_at
+                .store(updated_at, std::sync::atomic::Ordering::Release);
+        }
+
+        if let Ok(elapsed) = util::humantime_elapsed(start_time) {
+            tracing::info!(
+                dataset = %self.dataset_name,
+                snapshot_id = info.snapshot_id,
+                bytes = info.bytes_downloaded,
+                "Loaded snapshot in {elapsed}"
+            );
+        }
+
+        self.set_refresh_status(None, status::ComponentStatus::Ready)
+            .await;
+        Ok(())
     }
 
     async fn trace_load_completed(
@@ -701,14 +1381,13 @@ impl RefreshTask {
 
     async fn get_data_update(
         &self,
-        filters: Vec<Expr>,
+        mut filters: Vec<Expr>,
         refresh: &Refresh,
     ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
         let federated_provider = self.federated.table_provider().await;
 
-        let mut ctx = self.refresh_df_context(Arc::clone(&federated_provider));
         let dataset_name = self.dataset_name.clone();
-
+        #[expect(clippy::match_same_arms)] // Caching will have different behavior in future
         let update_type = match refresh.mode {
             RefreshMode::Disabled => {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
@@ -716,14 +1395,116 @@ impl RefreshTask {
             RefreshMode::Full => UpdateType::Overwrite,
             RefreshMode::Append => UpdateType::Append,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
+            RefreshMode::Caching => UpdateType::Overwrite,
+            RefreshMode::Snapshot => {
+                unreachable!("snapshot mode is handled by refresh_from_snapshot")
+            }
         };
+
+        // If a refresh SQL is explicitly provided for this `RefreshTask` (instead of provided at startup within the
+        // spicepod), parse and use it. Transfer partition filters from the base refresh SQL.
+        let effective_sql = match refresh.override_sql_raw.as_ref().map(|s| {
+            refresh_sql::parse_refresh_sql(dataset_name.clone(), s, federated_provider.schema())
+        }) {
+            Some(Ok((mut parsed, _schema))) => {
+                if let Some(base) = &refresh.sql {
+                    parsed.set_partition_filters(base.partition_filters().to_vec());
+                }
+                Some(parsed)
+            }
+            Some(Err(e)) => {
+                tracing::error!("Failed to parse override refresh_sql for {dataset_name}: {e}");
+                return Err(RetryError::permanent(
+                    super::Error::FailedToRefreshDataset {
+                        source: DataFusionError::Plan(format!("Invalid override refresh_sql: {e}")),
+                    },
+                ));
+            }
+            None => refresh.sql.clone(),
+        };
+
+        // Extract SQL string and partition filters from RefreshSQL
+        let sql_string = effective_sql
+            .as_ref()
+            .map(super::refresh::RefreshSQL::to_sql);
+        if let Some(ref s) = effective_sql {
+            filters.extend(s.partition_filters().iter().cloned());
+        }
+
+        if let Some(cpu_runtime_handle) = self.cpu_runtime.clone() {
+            let dataset_name_for_runtime = dataset_name.clone();
+            let filters_for_runtime = filters.clone();
+            let update_type_for_runtime = update_type.clone();
+            let provider_for_runtime = Arc::clone(&federated_provider);
+            let sql_for_runtime = sql_string.clone();
+            let request_context = RequestContext::current(AsyncMarker::new().await);
+            let span = Span::current();
+
+            // Capture necessary state to create ctx inside the closure
+            let dataset_name_for_ctx = self.dataset_name.clone();
+            let accelerator_for_ctx = Arc::clone(&self.accelerator);
+            let disable_federation = self.disable_federation;
+            let io_runtime = self.io_runtime.clone();
+
+            let managed_stream: runtime_datafusion::managed_runtime::ManagedRecordBatchStream<
+                UpdateType,
+            > = managed_runtime::run_record_batch_stream_on_runtime(
+                cpu_runtime_handle,
+                request_context,
+                span,
+                async move {
+                    // Create ctx inside the managed runtime to avoid creating it twice
+                    let mut ctx = Self::create_refresh_df_context(
+                        Arc::clone(&provider_for_runtime),
+                        &dataset_name_for_ctx,
+                        &accelerator_for_ctx,
+                        disable_federation,
+                        io_runtime,
+                    )
+                    .await;
+
+                    let data = get_data(
+                        &mut ctx,
+                        dataset_name_for_runtime,
+                        provider_for_runtime,
+                        sql_for_runtime,
+                        filters_for_runtime,
+                    )
+                    .await
+                    .map_err(check_and_mark_retriable_error)?;
+                    Ok((update_type_for_runtime, data))
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                ManagedRuntimeError::Future(df_err) => retry_from_df_error(df_err),
+                ManagedRuntimeError::DriverTaskEnded => {
+                    retry_from_df_error(DataFusionError::Execution(
+                        "Refresh driver task ended unexpectedly".to_string(),
+                    ))
+                }
+            })?;
+
+            let (update_type, stream) = managed_stream.into_parts();
+            return Ok(StreamingDataUpdate::new(stream, update_type));
+        }
+
+        // Create ctx only in the fallback path (no managed runtime)
+        let mut ctx = Self::create_refresh_df_context(
+            Arc::clone(&federated_provider),
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
 
         let get_data_result = get_data(
             &mut ctx,
-            dataset_name.clone(),
+            dataset_name,
             federated_provider,
-            refresh.sql.clone(),
-            filters.clone(),
+            sql_string,
+            filters,
         )
         .await
         .map_err(check_and_mark_retriable_error);
@@ -736,6 +1517,21 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
+        Self::build_filter_converter(&schema, refresh)
+    }
+
+    fn get_accelerator_filter_converter(
+        &self,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let schema = self.accelerator.schema();
+        Self::build_filter_converter(&schema, refresh)
+    }
+
+    fn build_filter_converter(
+        schema: &SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
         let time_partition_column = refresh.time_partition_column.as_deref();
@@ -744,7 +1540,7 @@ impl RefreshTask {
             .map(|(_, f)| f)
             .cloned();
 
-        TimestampFilterConvert::create(
+        create_timestamp_filter_convert(
             field,
             refresh.time_column.clone(),
             refresh.time_format,
@@ -754,34 +1550,50 @@ impl RefreshTask {
         )
     }
 
-    fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
+    /// Static helper method to create a `DataFusion` context for refresh operations.
+    /// This is separated from `refresh_df_context` to allow it to be called from async closures
+    /// without requiring `self`, avoiding the need to create the context twice.
+    async fn create_refresh_df_context(
+        federated_provider: Arc<dyn TableProvider>,
+        dataset_name: &TableReference,
+        accelerator: &Arc<dyn TableProvider>,
+        disable_federation: bool,
+        io_runtime: Handle,
+    ) -> SessionContext {
         let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
-            .with_runtime_env(default_runtime_env())
+            .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
 
-        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
-            Arc::new(SpiceExtensionPlanner::new()),
-            Arc::new(IndexTableScanExtensionPlanner::new()),
-        ];
+        let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
+            vec![Arc::new(IndexTableScanExtensionPlanner::new())];
 
         let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
         // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
-        if self.disable_federation {
+        if disable_federation {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
         } else {
             analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 
-        let query_planner = SpiceQueryPlanner::new().with_extension_planners(extension_planners);
-
         let mut state = state_builder
-            .with_query_planner(Arc::new(query_planner))
+            .with_query_planner(Arc::new(
+                ExtensionPlanQueryPlanner::from_extension_planners(extension_planners),
+            ))
             .with_optimizer_rule(Arc::new(IndexTableScanOptimizerRule::new()))
+            .with_optimizer_rule(Arc::new(AvoidDerivedVectorColumnOnIndexRule {}))
+            .with_physical_optimizer_rule(Arc::new(HttpParamsPushdown))
+            .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
+                Box::new(track_bytes_processed),
+            ))))
             .with_analyzer_rules(analyzer_rules_builder.build())
             .build();
+
+        state
+            .config_mut()
+            .set_extension(RequestContext::current(AsyncMarker::new().await));
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             tracing::error!("Unable to register JSON functions: {e}");
@@ -790,38 +1602,56 @@ impl RefreshTask {
         let default_catalog = state.config_options().catalog.default_catalog.clone();
         let ctx = SessionContext::new_with_state(state);
 
-        match schema::ensure_schema_exists(&ctx, &default_catalog, &self.dataset_name) {
+        // Register core scalar UDFs (e.g. bucket())
+        crate::datafusion::udf::register_core_scalar_udfs(&ctx);
+
+        match schema::ensure_schema_exists(&ctx, &default_catalog, dataset_name) {
             Ok(()) => (),
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
         }
 
-        if let Err(e) = ctx.register_table(self.dataset_name.clone(), federated_provider) {
+        if let Some(catalog_name) = dataset_name.catalog()
+            && ctx.catalog(catalog_name).is_none()
+        {
+            ctx.register_catalog(catalog_name, Arc::new(MemoryCatalogProvider::new()));
+        }
+
+        let target_catalog = dataset_name.catalog().unwrap_or(&default_catalog);
+        if let Err(e) = schema::ensure_schema_exists(&ctx, target_catalog, dataset_name) {
+            tracing::error!(
+                "Unable to ensure schema exists for refresh context {}.{}: {e}",
+                target_catalog,
+                dataset_name.schema().unwrap_or_default()
+            );
+        }
+
+        let federated_provider = table_provider_with_existing_metadata(federated_provider);
+        if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
         let mut acc_dataset_name = String::with_capacity(
-            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
+            dataset_name.table().len() + dataset_name.schema().map_or(0, str::len),
         );
 
-        if let Some(schema) = self.dataset_name.schema() {
+        if let Some(schema) = dataset_name.schema() {
             acc_dataset_name.push_str(schema);
         }
 
         acc_dataset_name.push_str("accelerated_");
-        acc_dataset_name.push_str(self.dataset_name.table());
+        acc_dataset_name.push_str(dataset_name.table());
 
         if let Err(e) = ctx.register_table(
             TableReference::parse_str(&acc_dataset_name),
-            Arc::new(EnsureSchema::new(Arc::clone(&self.accelerator))),
+            Arc::new(EnsureSchema::new(Arc::clone(accelerator))),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
         }
         ctx
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     async fn except_existing_records_from(
         &self,
         refresh: &Refresh,
@@ -830,15 +1660,22 @@ impl RefreshTask {
         let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
             return Ok(update);
         };
-        let Some(filter_converter) = self.get_filter_converter(refresh) else {
+        let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
         };
 
         let federated_provider = self.federated.table_provider().await;
 
-        let existing_records = accelerator_df(
+        let mut existing_records = accelerator_df(
             &Arc::clone(&self.accelerator),
-            &self.refresh_df_context(Arc::clone(&federated_provider)),
+            &Self::create_refresh_df_context(
+                Arc::clone(&federated_provider),
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await,
         )
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?
@@ -850,7 +1687,72 @@ impl RefreshTask {
         .map_err(find_datafusion_root)
         .context(super::UnableToScanTableProviderSnafu)?;
 
-        let filter_schema = BaseSchema::get_schema(&federated_provider);
+        // ACID fix for append dedup with nullable time_column:
+        // The > max_time query intentionally excludes older rows (including all
+        // NULL-time rows, since NULL > X is never true). To prevent duplicate
+        // appends of rows that have NULL in the time_column (a real consistency
+        // bug on retry / repeated refresh / source re-emit), we additionally
+        // collect *all* rows where the time column IS NULL. These "timeless"
+        // rows are then available to the exact-row StructArray comparator in
+        // filter_records, which treats two nulls in the same position as Equal
+        // (via make_comparator + Ordering::Equal). Exact duplicate NULL-time
+        // rows are now correctly filtered.
+        //
+        // Devil's advocate / remaining edge case (being really sure):
+        // This loads the *entire historical set* of NULL-time rows on every
+        // append refresh when the column is nullable. For datasets with a very
+        // large number of distinct historical rows that happen to have NULL
+        // time (rare but possible with dirty sources or optional event times),
+        // this can consume significant memory during the dedup phase, potentially
+        // causing OOM in the refresh task. In such cases the >max optimization
+        // is defeated for the NULL subset.
+        //
+        // Mitigation in practice: most append workloads either have non-nullable
+        // time columns, or the number of NULL-time rows is small/bounded. For
+        // high-cardinality NULL time + append, users should prefer defining a
+        // primary key + on_conflict upsert semantics on the accelerator (which
+        // the engine will enforce at write time) or avoid append mode.
+        // We explicitly document the limitation here as part of rigorous
+        // correctness review for the recurring ACID task.
+        //
+        // This is the "comprehensive edge case" coverage for the recurring ACID
+        // task. We only pay the (hopefully small) cost of loading the NULL-time
+        // subset; the > max tail optimization is preserved for the non-null
+        // recent data. If the time_column is non-nullable, we skip this path.
+        if let Some(tc) = &refresh.time_column
+            && self
+                .accelerator
+                .schema()
+                .column_with_name(tc)
+                .is_some_and(|(_, f)| f.is_nullable())
+        {
+            let null_time_rows = accelerator_df(
+                &Arc::clone(&self.accelerator),
+                &Self::create_refresh_df_context(
+                    Arc::clone(&federated_provider),
+                    &self.dataset_name,
+                    &self.accelerator,
+                    self.disable_federation,
+                    self.io_runtime.clone(),
+                )
+                .await,
+            )
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .filter(ident(tc).is_null())
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?
+            .collect()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)?;
+            existing_records.extend(null_time_rows);
+        }
+
+        // Use the update stream's schema for dedup comparison, not the full federated
+        // provider schema.  When `refresh_sql` selects a column subset, the incoming
+        // batches and accelerated table only contain those columns.
+        let filter_schema = update.data.schema();
         let update_type = update.update_type.clone();
 
         let filtered_data = Box::pin(RecordBatchStreamAdapter::new(
@@ -868,13 +1770,20 @@ impl RefreshTask {
         Ok(StreamingDataUpdate::new(filtered_data, update_type))
     }
 
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_sign_loss)]
     async fn timestamp_nanos_for_append_query(
         &self,
         refresh: &Refresh,
     ) -> super::Result<Option<u128>> {
         let federated = self.federated.table_provider().await;
-        let ctx = self.refresh_df_context(federated);
+        let ctx = Self::create_refresh_df_context(
+            federated,
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
 
         refresh
             .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
@@ -901,18 +1810,11 @@ impl RefreshTask {
             return Ok(None);
         };
 
-        let array = result.column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-            })?;
-
-        if array.is_empty() {
+        if result.num_rows() == 0 {
             return Ok(None);
         }
 
-        let mut value = array.value(0) as u128;
+        let col_array = result.column(0);
 
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
@@ -922,15 +1824,123 @@ impl RefreshTask {
             });
         };
 
-        if let arrow::datatypes::DataType::Int8
-        | arrow::datatypes::DataType::Int16
-        | arrow::datatypes::DataType::Int32
-        | arrow::datatypes::DataType::Int64
-        | arrow::datatypes::DataType::UInt8
-        | arrow::datatypes::DataType::UInt16
-        | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
-        {
+        let is_integer_time_column = matches!(
+            accelerated_field.data_type(),
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        );
+
+        // Extract the max timestamp value based on the column's data type.
+        // - String columns (ISO8601): parse the ISO string back to nanos
+        // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
+        // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
+        // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
+        let iso_str_value = col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            });
+
+        let mut value: u128 = if let Some(iso_str) = iso_str_value {
+            util::timestamp_filter::parse_iso8601_to_nanos(&iso_str).context(
+                super::FailedToFindLatestTimestampSnafu {
+                    reason: format!(
+                        "Failed to parse ISO8601 timestamp '{iso_str}' from time column"
+                    ),
+                },
+            )?
+        } else if is_integer_time_column {
+            // Integer time columns are returned as-is (not cast to Timestamp)
+            // to avoid DuckDB cast errors. Extract the integer value directly.
+            if col_array.is_empty() {
+                return Ok(None);
+            }
+            match accelerated_field.data_type() {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::Int64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!("Failed to cast integer time column to Int64: {e}"),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason: "Failed to downcast integer time column to Int64Array."
+                                .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    let int_val = arr.value(0);
+                    u128::try_from(int_val).map_err(|_| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Integer time column value {int_val} is negative and cannot be used as a timestamp."
+                            ),
+                        }
+                    })?
+                }
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::UInt64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Failed to cast unsigned integer time column to UInt64: {e}"
+                            ),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason:
+                                "Failed to downcast unsigned integer time column to UInt64Array."
+                                    .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    u128::from(arr.value(0))
+                }
+                other => {
+                    return Err(super::Error::FailedToFindLatestTimestamp {
+                        reason: format!("Unexpected data type {other} for integer time column."),
+                    });
+                }
+            }
+        } else {
+            let array = col_array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context(super::FailedToFindLatestTimestampSnafu {
+                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
+                })?;
+
+            if array.is_empty() || array.is_null(0) {
+                return Ok(None);
+            }
+
+            array.value(0) as u128
+        };
+
+        if is_integer_time_column {
             match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
@@ -987,17 +1997,27 @@ impl RefreshTask {
     }
 
     async fn set_refresh_status(&self, sql: Option<&str>, status: status::ComponentStatus) {
+        let is_error = status.is_error();
+        let is_ready = status == status::ComponentStatus::Ready;
+
+        // Mark initial load complete BEFORE updating the runtime status to Ready.
+        // This closes the race window where `is_ready()` returns true but
+        // `AcceleratedTable::scan` still sees `initial_load_completed == false`.
+        if is_ready && let Some(flag) = &self.initial_load_completed {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+
         // runtime status update
         self.update_component_status(status).await;
 
         // telemetry update
         for dataset_name in self.get_dataset_names().await {
-            if status == status::ComponentStatus::Error {
+            if is_error {
                 let labels = [KeyValue::new("dataset", dataset_name.to_string())];
                 metrics::REFRESH_ERRORS.add(1, &labels);
             }
 
-            if status == status::ComponentStatus::Ready {
+            if is_ready {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default();
@@ -1023,16 +2043,17 @@ impl RefreshTask {
     async fn update_component_status(&self, status: status::ComponentStatus) {
         // main component status update
         if self.is_view_acceleration() {
-            self.runtime_status.update_view(&self.dataset_name, status);
+            self.runtime_status
+                .update_view(&self.dataset_name, status.clone());
         } else {
             self.runtime_status
-                .update_dataset(&self.dataset_name, status);
+                .update_dataset(&self.dataset_name, status.clone());
         }
 
         // synchronized tables can be datasets only
         for synchronized_table in self.sink.read().await.synchronized_tables() {
             self.runtime_status
-                .update_dataset(&synchronized_table.child_dataset_name(), status);
+                .update_dataset(&synchronized_table.child_dataset_name(), status.clone());
         }
     }
 
@@ -1057,6 +2078,25 @@ impl RefreshTask {
             return;
         }
 
+        // Check for S3 Express One Zone upload speed error and provide user-friendly message.
+        // ClientUploadSpeedTooSlow is specific to S3 Express One Zone (directory buckets).
+        if self.is_s3_express_acceleration && is_s3_express_upload_speed_error(&error.to_string()) {
+            let error_message = format_datafusion_error(error);
+            let table_name =
+                include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref());
+            tracing::warn!(
+                error = %error_message,
+                "Failed to load data for {} {table_name}: S3 upload speed too slow. This typically occurs when uploading to S3 Express One Zone from outside AWS or over a slow network connection. Consider: (1) Running Spice closer to your S3 bucket (same region/AZ), (2) Reducing dataset size or using incremental refresh, (3) Increasing 'cayenne_target_file_size_mb' to reduce the number of files uploaded.",
+                self.component_type(),
+            );
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return;
+        }
+
         // For all errors that result from calling DataFusion, check if they are due to the task being cancelled and ignore them
         match error {
             super::Error::UnableToGetDataFromConnector { source }
@@ -1078,14 +2118,61 @@ impl RefreshTask {
             _ => (),
         }
 
+        if let Some(message) = schema_evolution_mismatch_refresh_message(
+            self.component_type(),
+            &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error,
+        ) {
+            tracing::warn!("{message}");
+            self.set_refresh_status(
+                refresh_sql,
+                status::ComponentStatus::error_with_message(message),
+            )
+            .await;
+            return;
+        }
+
+        let error_message = format_datafusion_error(error);
         tracing::warn!(
-            "Failed to load data for {} {}: {error}",
+            "Failed to load data for {} {}: {}",
             self.component_type(),
             include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
+            error_message,
         );
-        self.set_refresh_status(refresh_sql, status::ComponentStatus::Error)
-            .await;
+        self.set_refresh_status(
+            refresh_sql,
+            status::ComponentStatus::error_with_message(error_message),
+        )
+        .await;
     }
+
+    /// Updates `last_updated_at` timestamp based on refresh type and row count.
+    ///
+    /// - For `Overwrite` and `Changes`: Always updates (data is replaced/modified)
+    /// - For `Append`: Only updates if rows were actually written (`num_rows > 0`)
+    fn maybe_update_last_updated_at(&self, update_type: &UpdateType, num_rows: usize) {
+        let should_update = match update_type {
+            UpdateType::Overwrite | UpdateType::Changes => true,
+            UpdateType::Append => num_rows > 0,
+        };
+
+        if should_update {
+            self.update_last_updated_at();
+        }
+    }
+
+    fn update_last_updated_at(&self) {
+        super::AcceleratedTable::set_timestamp_to_now(&self.last_updated_at);
+    }
+}
+
+/// Returns true when `candidate` is structurally compatible with `expected`
+/// for swapping a `TableProvider` under a `SwappableTableProvider`. See
+/// [`crate::dataaccelerator::swappable::schemas_compatible`] for the precise
+/// rules; this is a thin re-export so callers in this module can keep using
+/// the unqualified name.
+fn schemas_compatible(candidate: &arrow_schema::Schema, expected: &arrow_schema::Schema) -> bool {
+    crate::dataaccelerator::swappable::schemas_compatible(candidate, expected)
 }
 
 #[derive(Debug)]
@@ -1093,52 +2180,104 @@ impl RefreshTask {
 struct DataLoadTracing {
     dataset: TableReference,
     num_records_received: usize,
+    bytes_received: usize,
+    start_time: Instant,
     last_updated_time: Instant,
     log_interval: Duration,
 }
 
 impl DataLoadTracing {
     fn new(dataset: &TableReference) -> Self {
+        let now = Instant::now();
         Self {
             dataset: dataset.clone(),
             num_records_received: 0,
-            last_updated_time: Instant::now(),
+            bytes_received: 0,
+            start_time: now,
+            last_updated_time: now,
             log_interval: Duration::from_secs(10),
         }
     }
 
     fn on_new_batch_received(&mut self, batch: &RecordBatch) {
         let num_rows = batch.num_rows();
+        let batch_size = batch.get_array_memory_size();
+
         tracing::trace!("Dataset {} received {num_rows} records", self.dataset,);
         self.num_records_received += num_rows;
+        self.bytes_received += batch_size;
 
-        // trace num loaded records and reset every 10 seconds
+        // Log progress every 10 seconds showing cumulative stats
         if self.last_updated_time.elapsed() > self.log_interval {
             let pretty_records = util::pretty_print_number(self.num_records_received);
+            let elapsed = self.start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
 
-            if is_spice_internal_dataset(&self.dataset) {
-                tracing::debug!("Dataset {} received {pretty_records} records", self.dataset);
+            // Calculate throughput
+            #[expect(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_sign_loss)]
+            let throughput = if elapsed_secs > 0.0 {
+                let bytes_per_sec = (self.bytes_received as f64 / elapsed_secs) as usize;
+                format!("{}/s", util::human_readable_bytes(bytes_per_sec))
             } else {
-                tracing::info!("Dataset {} received {pretty_records} records", self.dataset);
+                "calculating...".to_string()
+            };
+
+            let size = util::human_readable_bytes(self.bytes_received);
+            let elapsed_str = format!("{}s", elapsed.as_secs());
+
+            // Note: size and throughput are based on uncompressed in-memory Arrow data size,
+            // not actual network transfer. Actual network bytes may be significantly smaller
+            // due to compression.
+            if is_spice_internal_dataset(&self.dataset) {
+                tracing::debug!(
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
+            } else {
+                tracing::info!(
+                    "Dataset {} received {pretty_records} records ({size} uncompressed) in {elapsed_str}, {throughput}",
+                    self.dataset
+                );
             }
 
-            self.num_records_received = 0;
             self.last_updated_time = Instant::now();
         }
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn max_timestamp_df(
     accelerator: &Arc<dyn TableProvider>,
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let expr = cast(
-        col(format!(r#""{column}""#)),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-    )
-    .alias("a");
+    let schema = accelerator.schema();
+    let needs_cast = schema.column_with_name(column).is_some_and(|(_, f)| {
+        // Only CAST for native date/time/timestamp types that need precision normalization.
+        // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
+        // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
+        // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
+        matches!(
+            f.data_type(),
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+        )
+    });
+
+    let expr = if needs_cast {
+        cast(
+            ident(column),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        )
+        .alias("a")
+    } else {
+        ident(column).alias("a")
+    };
 
     accelerator_df(accelerator, &ctx)?
         .select(vec![expr])?
@@ -1222,7 +2361,7 @@ fn filter_records(
                     .context(super::FailedToFilterUpdatesSnafu)?;
                 Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
             })
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Result<Vec<_>, super::Error>>()?,
     );
 
     for existing in existing_records {
@@ -1237,7 +2376,7 @@ fn filter_records(
                         .context(super::FailedToFilterUpdatesSnafu)?;
                     Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, super::Error>>()?,
         );
 
         comparators.push((
@@ -1277,7 +2416,7 @@ pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::E
     })
 }
 
-fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
+fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
     match error {
         RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
             inner_err
@@ -1285,10 +2424,875 @@ fn inner_err_from_retry(error: RetryError<super::Error>) -> super::Error {
     }
 }
 
-fn inner_err_from_retry_ref(error: &RetryError<super::Error>) -> &super::Error {
-    match error {
-        RetryError::Permanent(inner_err) | RetryError::Transient { err: inner_err, .. } => {
-            inner_err
+/// Check if an error message indicates an S3 Express One Zone upload speed error.
+///
+/// S3 Express One Zone (directory buckets) returns `ClientUploadSpeedTooSlow` when
+/// the client's upload speed is below the minimum threshold. This typically occurs
+/// when uploading from outside AWS or over slow network connections.
+///
+/// This function is extracted to enable unit testing of the detection logic.
+fn is_s3_express_upload_speed_error(error_message: &str) -> bool {
+    error_message.contains("ClientUploadSpeedTooSlow")
+}
+
+fn is_insert_schema_mismatch_error(error_message: &str) -> bool {
+    error_message.contains("Inserting query must have the same schema length as the table")
+        || error_message.contains("Inserting query must have same schema length as the table")
+}
+
+fn schema_evolution_mismatch_refresh_message(
+    component_type: &str,
+    table_name: &str,
+    error: &super::Error,
+) -> Option<String> {
+    let (super::Error::FailedToWriteData { source }
+    | super::Error::FailedToRefreshDataset { source }) = error
+    else {
+        return None;
+    };
+
+    if !is_insert_schema_mismatch_error(&source.to_string()) {
+        return None;
+    }
+
+    Some(format!(
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; fully featured schema evolution is on the roadmap, and acceleration does not apply this schema evolution automatically today; delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataupdate::{StreamingDataUpdate, UpdateType};
+    use crate::federated_table::FederatedTable;
+    use arrow::array::{
+        Float64Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+        TimestampNanosecondArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::TimeUnit;
+    use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::SendableRecordBatchStream;
+    use datafusion::physical_plan::collect;
+    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestRefreshIndex;
+
+    #[async_trait::async_trait]
+    impl runtime_datafusion_index::Index for TestRefreshIndex {
+        fn name(&self) -> &'static str {
+            "test_refresh_index"
         }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["id".to_string()]
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn table_provider_with_existing_metadata_preserves_indexed_provider() {
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false)
+                    .with_metadata([("field_meta".to_string(), "field_value".to_string())].into()),
+            ],
+            [("table_meta".to_string(), "table_value".to_string())].into(),
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("record batch should be created");
+        let mem_table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("mem table should be created"),
+        );
+        let index: Arc<dyn runtime_datafusion_index::Index + Send + Sync> =
+            Arc::new(TestRefreshIndex);
+        let indexed_provider: Arc<dyn TableProvider> = Arc::new(
+            IndexedTableProvider::with_indexes(mem_table, vec![Arc::clone(&index)]),
+        );
+
+        let wrapped = table_provider_with_existing_metadata(indexed_provider);
+        let indexed = wrapped
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+            .expect("indexed provider should remain the outer provider");
+        assert_eq!(indexed.get_all_indexes().len(), 1);
+        assert!(
+            indexed
+                .get_underlying()
+                .as_any()
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some()
+        );
+
+        let wrapped_schema = wrapped.schema();
+        assert_eq!(
+            wrapped_schema
+                .metadata()
+                .get("table_meta")
+                .map(String::as_str),
+            Some("table_value")
+        );
+        let id_field = wrapped_schema
+            .field_with_name("id")
+            .expect("id field should exist");
+        assert_eq!(
+            id_field.metadata().get("field_meta").map(String::as_str),
+            Some("field_value")
+        );
+    }
+
+    #[test]
+    fn test_data_load_tracing_tracks_bytes_and_rows() {
+        let dataset = TableReference::bare("test_dataset");
+        let mut tracing = DataLoadTracing::new(&dataset);
+
+        // Create a test batch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("Failed to create batch");
+
+        let batch_size = batch.get_array_memory_size();
+        let num_rows = batch.num_rows();
+
+        // Process the batch
+        tracing.on_new_batch_received(&batch);
+
+        // Verify state
+        assert_eq!(tracing.num_records_received, num_rows);
+        assert_eq!(tracing.bytes_received, batch_size);
+        assert!(tracing.bytes_received > 0);
+    }
+
+    #[test]
+    fn test_is_s3_express_upload_speed_error() {
+        // Should detect ClientUploadSpeedTooSlow error
+        assert!(is_s3_express_upload_speed_error(
+            "Error: ClientUploadSpeedTooSlow: Upload speed is below minimum threshold"
+        ));
+        // Should detect when error is part of a larger message
+        assert!(is_s3_express_upload_speed_error(
+            "Failed to upload: S3 returned ClientUploadSpeedTooSlow for bucket mybucket--usw2-az1--x-s3"
+        ));
+
+        // Should not match unrelated errors
+        assert!(!is_s3_express_upload_speed_error("Connection timeout"));
+        assert!(!is_s3_express_upload_speed_error("Access denied"));
+        assert!(!is_s3_express_upload_speed_error("NoSuchBucket"));
+
+        // Should not match partial error names
+        assert!(!is_s3_express_upload_speed_error("ClientUpload"));
+        assert!(!is_s3_express_upload_speed_error("SpeedTooSlow"));
+    }
+
+    #[test]
+    fn test_is_insert_schema_mismatch_error() {
+        assert!(is_insert_schema_mismatch_error(
+            "Error during planning: Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5"
+        ));
+        assert!(!is_insert_schema_mismatch_error(
+            "Error during planning: failed to parse expression"
+        ));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_for_write_error() {
+        let error = super::super::Error::FailedToWriteData {
+            source: DataFusionError::Execution(
+                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
+            ),
+        };
+
+        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
+            .expect("should detect schema mismatch");
+        assert!(message.contains("schema mismatch"));
+        assert!(message.contains("on the roadmap"));
+        assert!(message.contains("delete the existing acceleration data"));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_non_schema_error() {
+        let error = super::super::Error::FailedToRefreshDataset {
+            source: DataFusionError::Execution("other failure".to_string()),
+        };
+
+        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+    }
+
+    /// Tests that `max_timestamp_df` returns the maximum value for integer time columns
+    /// (e.g. `unix_seconds` / `unix_millis` time formats) without casting to a Timestamp type.
+    #[tokio::test]
+    async fn test_max_timestamp_df_integer_time_column() {
+        async fn run_test(data_type: DataType, array: Arc<dyn arrow::array::Array>) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch created");
+            let mem_table =
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table created"))
+                    as Arc<dyn TableProvider>;
+
+            let ctx = SessionContext::new();
+            let df = max_timestamp_df(&mem_table, ctx.clone(), "ts").expect("df created");
+            let results = collect(
+                df.create_physical_plan()
+                    .await
+                    .expect("physical plan created"),
+                ctx.task_ctx(),
+            )
+            .await
+            .expect("query succeeded");
+            results.into_iter().next().expect("at least one batch")
+        }
+
+        // Signed Int64: column is returned as Int64.
+        let signed_vals = Int64Array::from(vec![100_i64, 200, 50]);
+        let batch = run_test(DataType::Int64, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array")
+            .value(0);
+        assert_eq!(max_val, 200, "Int64: expected max value 200");
+
+        // Signed Int32: column is returned as Int32.
+        let signed_vals = Int32Array::from(vec![10_i32, 30, 20]);
+        let batch = run_test(DataType::Int32, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("Int32Array")
+            .value(0);
+        assert_eq!(max_val, 30, "Int32: expected max value 30");
+
+        // Unsigned UInt64: column is returned as UInt64.
+        let unsigned_vals = UInt64Array::from(vec![1_000_u64, 5_000, 3_000]);
+        let batch = run_test(DataType::UInt64, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("UInt64Array")
+            .value(0);
+        assert_eq!(max_val, 5_000, "UInt64: expected max value 5000");
+
+        // Unsigned UInt32: column is returned as UInt32.
+        let unsigned_vals = UInt32Array::from(vec![7_u32, 42, 3]);
+        let batch = run_test(DataType::UInt32, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("UInt32Array")
+            .value(0);
+        assert_eq!(max_val, 42, "UInt32: expected max value 42");
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_mixed_case_time_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "DateUpdated",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch should be created");
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx.clone(), "DateUpdated")
+            .expect("dataframe should be created");
+        let results = collect(
+            df.create_physical_plan()
+                .await
+                .expect("physical plan should be created"),
+            ctx.task_ctx(),
+        )
+        .await
+        .expect("query should succeed");
+
+        let batch = results.into_iter().next().expect("at least one batch");
+        let max_value = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("TimestampNanosecondArray")
+            .value(0);
+        assert_eq!(max_value, 3_000_000_000);
+    }
+
+    /// Verifies that `max_timestamp_df` uses sort+limit on raw string (no CAST)
+    /// for utf8 columns, which avoids the Vortex/Cayenne cast kernel issue.
+    #[tokio::test]
+    async fn test_max_timestamp_df_utf8_no_cast() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses sort+limit on raw string, not Cast or MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "utf8 column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "utf8 column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_uses_cast() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses Cast, not MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            plan_str.contains("Cast("),
+            "timestamp column should use Cast, got: {plan_str}"
+        );
+    }
+
+    /// Helper: run `max_timestamp_df` on an accelerator and extract the ISO string
+    /// from the result, using the same downcast chain as `timestamp_nanos_for_append_query`.
+    async fn collect_iso_string_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<String> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_large_utf8() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(LargeStringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8_view() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (`UnixSeconds`).
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_no_cast() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "integer column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "integer column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Helper: run `max_timestamp_df` on a numeric accelerator and extract the max
+    /// value using the same `arrow::compute::cast` to `Int64` path as
+    /// `timestamp_nanos_for_append_query`.
+    async fn collect_numeric_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<i64> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
+            .ok()
+            .and_then(|arr| {
+                let int_array = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+                if int_array.is_null(0) {
+                    return None;
+                }
+                Some(int_array.value(0))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint64_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![100u64, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int32_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint32_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt32Array::from(vec![100u32, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_float64_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![100.0, 300.0, 200.0]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_extraction() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            collect_numeric_from_max_df(&mem, "t").await,
+            Some(3_000_000_000)
+        );
+    }
+
+    /// When `refresh_sql` selects a column subset, `filter_records` must use the
+    /// update data's schema (not the full source schema) to compare incoming rows
+    /// against existing rows.
+    #[tokio::test]
+    async fn test_except_existing_records_column_subset() {
+        // Federated (source) schema is wider: ts + id + extra_col
+        let federated_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("extra_col", DataType::Int32, false),
+        ]));
+        let federated_batch = RecordBatch::try_new(
+            Arc::clone(&federated_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000, 3_000])),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .expect("federated batch");
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&federated_schema), vec![vec![federated_batch]])
+                .expect("federated MemTable"),
+        ) as Arc<dyn TableProvider>;
+
+        // Accelerator schema is the subset: ts + id (no extra_col)
+        let accel_schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        // Pre-populate the accelerator with one existing row (ts=1000, id=1)
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&accel_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&accel_schema), vec![vec![existing_batch]])
+                .expect("accelerator MemTable"),
+        ) as Arc<dyn TableProvider>;
+
+        // Build the RefreshTask with the wider federated schema
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_subset"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // The refresh must have a time_column so the dedup path is entered.
+        // append_overlap of 1s ensures the overlap window includes the existing
+        // row at ts=1000ns (query becomes ts > max_ts - 1s = ts > 0).
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
+
+        // Build the update stream with the SUBSET schema (only ts + id, no extra_col)
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&accel_schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_000, 2_000])),
+                Arc::new(Int32Array::from(vec![1, 4])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&accel_schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let result = task
+            .except_existing_records_from(&refresh, update)
+            .await
+            .expect("except_existing_records_from should succeed with column subset");
+
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collecting filtered data should succeed");
+
+        // Row (ts=1000, id=1) matches existing data and should be filtered out.
+        // Only row (ts=2000, id=4) should remain.
+        assert_eq!(collected.data.len(), 1, "should have one output batch");
+        assert_eq!(
+            collected.data[0].num_rows(),
+            1,
+            "should have one row after dedup"
+        );
+        let id_col = collected.data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32");
+        assert_eq!(id_col.value(0), 4, "remaining row should be id=4");
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_all_null_returns_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                None, None, None,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, None);
+    }
+
+    /// Regression test for append refresh dedup with nullable time columns.
+    ///
+    /// Mixed batches with both non-NULL and NULL timestamps must include existing
+    /// NULL-time rows in the anti-join comparison, otherwise a duplicate NULL-time
+    /// source row can be appended on repeated refresh or partial-failure recovery.
+    #[tokio::test]
+    async fn test_except_existing_records_from_nullable_time_column_with_nulls() {
+        // Schema with nullable timestamp (the append time_column) + id
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true, // nullable
+            ),
+            Field::new("id", DataType::Int32, false),
+        ]));
+
+        // Accelerator "existing" data: one row with concrete time, one with NULL time
+        let existing_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(1_000_000_000i64),
+                    None,
+                ])),
+                Arc::new(Int32Array::from(vec![1, 99])),
+            ],
+        )
+        .expect("existing batch");
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![existing_batch]])
+                .expect("accelerator mem table"),
+        ) as Arc<dyn TableProvider>;
+
+        // Mirror the construction from the "column subset" test in this module for compatibility.
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("federated mem table"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_table)));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("test_null_time"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        // The refresh must have a time_column so the dedup path is entered.
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
+
+        // Incoming update: (ts=NULL, id=99) is exact duplicate of existing NULL-time row;
+        // (ts=2s, id=2) is new.
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    None,
+                    Some(2_000_000_000i64),
+                ])),
+                Arc::new(Int32Array::from(vec![99, 2])),
+            ],
+        )
+        .expect("update batch");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let result = task
+            .except_existing_records_from(&refresh, update)
+            .await
+            .expect("except_existing_records_from should succeed with nullable time column");
+
+        let collected = result
+            .collect_data()
+            .await
+            .expect("collecting filtered data should succeed for NULL-time edge case test");
+
+        // After the ACID fix (collecting time IS NULL rows into existing_records for the
+        // StructArray comparator): the exact duplicate (ts=NULL, id=99) is now correctly
+        // filtered out because make_comparator returns Equal for two nulls in the time
+        // position + matching id. Only the genuinely new higher-time row remains.
+        // This is the comprehensive regression test for the nullable time_column edge
+        // case in append refresh dedup. Devil's advocate: we also need to consider
+        // whether large numbers of NULL-time rows could cause memory pressure — in
+        // practice the "timeless" set is expected to be small relative to the recent tail;
+        // if not, a follow-up can add a bounded collection or fall back to on-conflict upsert.
+        assert_eq!(
+            collected.data.len(),
+            1,
+            "one output batch after NULL-time dedup fix"
+        );
+        assert_eq!(
+            collected.data[0].num_rows(),
+            1,
+            "fixed append dedup with nullable time: NULL-time duplicate (id=99) is filtered; \
+             only the new higher-time row (id=2) remains. Comprehensive edge-case coverage for recurring ACID task."
+        );
+        let id_col = collected.data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column should be Int32 in NULL-time dedup test");
+        assert_eq!(
+            id_col.value(0),
+            2,
+            "remaining row after fix should be the new id=2 (NULL dup was filtered)"
+        );
     }
 }

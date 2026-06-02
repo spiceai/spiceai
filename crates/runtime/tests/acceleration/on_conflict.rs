@@ -17,12 +17,12 @@ limitations under the License.
 use crate::{
     configure_test_datafusion, init_tracing,
     postgres::common,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 
 use runtime::Runtime;
 use spicepod::{
@@ -34,10 +34,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::get_params;
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -219,25 +219,56 @@ WHERE event_name = 'File Download'
             // Wait for result to be refreshed
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
-            let pg_upsert_data =
-                get_query_result(&rt, "SELECT * FROM pg_on_conflict_upsert").await?;
-            let pg_drop_data = get_query_result(&rt, "SELECT * FROM pg_on_conflict_drop").await?;
-            let duckdb_mem_upsert_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_upsert").await?;
-            let duckdb_mem_drop_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_mem_on_conflict_drop").await?;
-            let duckdb_file_upsert_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_upsert").await?;
-            let duckdb_file_drop_data =
-                get_query_result(&rt, "SELECT * FROM duckdb_file_on_conflict_drop").await?;
-            let sqlite_mem_upsert_data =
-                get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_upsert").await?;
-            let sqlite_mem_drop_data =
-                get_query_result(&rt, "SELECT * FROM sql_mem_on_conflict_drop").await?;
-            let sqlite_file_upsert_data =
-                get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_upsert").await?;
-            let sqlite_file_drop_data =
-                get_query_result(&rt, "SELECT * FROM sql_file_on_conflict_drop").await?;
+            let pg_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM pg_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let pg_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM pg_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let duckdb_mem_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_mem_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let duckdb_mem_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_mem_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let duckdb_file_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_file_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let duckdb_file_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM duckdb_file_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let sqlite_mem_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_mem_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let sqlite_mem_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_mem_on_conflict_drop order by event_id asc",
+            )
+            .await?;
+            let sqlite_file_upsert_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_file_on_conflict_upsert order by event_id asc",
+            )
+            .await?;
+            let sqlite_file_drop_data = get_query_result(
+                &rt,
+                "SELECT * FROM sql_file_on_conflict_drop order by event_id asc",
+            )
+            .await?;
 
             let upsert_expected_result = &[
                 "+----------+-------------------+---------------------+",

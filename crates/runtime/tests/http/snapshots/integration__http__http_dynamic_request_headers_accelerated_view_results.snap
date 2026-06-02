@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/http/mod.rs
+description: Accelerated view with IN (SELECT ...) subquery over HTTP dataset
+---
++------------------------+---------------------------------------------------------+
+| request_headers        | content                                                 |
++------------------------+---------------------------------------------------------+
+| {"x-org-id":"org-001"} | {"x-org-id":"org-001","x-static-header":"static-value"} |
+| {"x-org-id":"org-002"} | {"x-org-id":"org-002","x-static-header":"static-value"} |
+| {"x-org-id":"org-003"} | {"x-org-id":"org-003","x-static-header":"static-value"} |
+| {"x-org-id":"org-004"} | {"x-org-id":"org-004","x-static-header":"static-value"} |
+| {"x-org-id":"org-005"} | {"x-org-id":"org-005","x-static-header":"static-value"} |
++------------------------+---------------------------------------------------------+

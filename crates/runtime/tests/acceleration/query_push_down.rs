@@ -22,10 +22,12 @@ use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 
-use crate::{init_tracing, utils::test_request_context};
+use crate::{
+    init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 
-#[cfg(feature = "postgres")]
-#[allow(clippy::too_many_lines)]
+#[cfg(feature = "postgres-accel")]
 #[tokio::test]
 async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error> {
     use crate::configure_test_datafusion;
@@ -36,6 +38,7 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
     use std::sync::Arc;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -185,14 +188,13 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
                 "| plan_type     | plan                                                                                                                                            |",
                 "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | BytesProcessedNode                                                                                                                              |",
-                "|               |   Federated                                                                                                                                     |",
+                "| logical_plan  | Federated                                                                                                                                       |",
                 "|               |  Projection: count(Int64(1))                                                                                                                    |",
                 "|               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                                                                                             |",
                 "|               |     TableScan: abc projection=[]                                                                                                                |",
-                "| physical_plan | BytesProcessedExec                                                                                                                              |",
-                "|               |   SchemaCastScanExec                                                                                                                            |",
-                "|               |     CooperativeExec                                                                                                                             |",
+                "| physical_plan | SchemaCastScanExec                                                                                                                              |",
+                "|               |   CooperativeExec                                                                                                                               |",
+                "|               |     BytesProcessedExec                                                                                                                          |",
                 "|               |       VirtualExecutionPlan name=postgres compute_context=host=Tcp(\"localhost\"),port=20962,user=postgres, initial_sql=SELECT count(1) FROM \"abc\" |",
                 "|               |                                                                                                                                                 |",
                 "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+",
@@ -224,22 +226,21 @@ async fn acceleration_with_and_without_federation() -> Result<(), anyhow::Error>
                 .expect("collect working");
 
             let expected_plan = [
-                "+---------------+--------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                           |",
-                "+---------------+--------------------------------------------------------------------------------+",
-                "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                              |",
-                "|               |   BytesProcessedNode                                                           |",
-                "|               |     TableScan: non_federated_abc projection=[]                                 |",
-                "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                      |",
-                "|               |   CoalescePartitionsExec                                                       |",
-                "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                |",
-                "|               |       BytesProcessedExec                                                       |",
-                "|               |         SchemaCastScanExec                                                     |",
-                "|               |           RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |",
-                "|               |             CooperativeExec                                                    |",
-                "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc     |",
-                "|               |                                                                                |",
-                "+---------------+--------------------------------------------------------------------------------+",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                         |",
+                "+---------------+------------------------------------------------------------------------------+",
+                "| logical_plan  | Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]                            |",
+                "|               |   TableScan: non_federated_abc projection=[]                                 |",
+                "| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]                    |",
+                "|               |   CoalescePartitionsExec                                                     |",
+                "|               |     AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]              |",
+                "|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1   |",
+                "|               |         SchemaCastScanExec                                                   |",
+                "|               |           CooperativeExec                                                    |",
+                "|               |             BytesProcessedExec                                               |",
+                "|               |               SqlExec sql=SELECT \"id\", \"created_at\" FROM non_federated_abc   |",
+                "|               |                                                                              |",
+                "+---------------+------------------------------------------------------------------------------+",
             ];
             assert_batches_eq!(expected_plan, &plan_results);
 

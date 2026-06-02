@@ -17,7 +17,7 @@ limitations under the License.
 #![allow(clippy::implicit_hasher)]
 use async_openai::{
     error::OpenAIError,
-    types::{
+    types::chat::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
         ChatCompletionResponseStream, ChatCompletionStreamOptions, CreateChatCompletionRequest,
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
@@ -37,7 +37,7 @@ use tera::Tera;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
-use crate::model::metrics::handle_metrics;
+use crate::model::metrics::{handle_metrics, handle_token_metrics};
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -67,9 +67,9 @@ pub(crate) static OPENAI_DEFAULT_PARAM_KEYS: LazyLock<HashSet<&'static str>> =
             "stream_options",
             "temperature",
             "top_p",
-            "tools",
             "tool_choice",
             "parallel_tool_calls",
+            "prompt_cache_key",
             "user",
         ])
     });
@@ -95,7 +95,7 @@ macro_rules! set_default_w_warning {
                 Ok(val) => Some(val),
                 Err(_) => {
                     tracing::warn!(
-                        "Failed to parse `openai_{}` override for model='{}'. Ensure {:?} is of the correct format.",
+                        "Failed to parse `{}` model parameter override for model='{}'. Ensure {:?} is of the correct format.",
                         stringify!($field),
                         $model,
                         $value
@@ -163,12 +163,14 @@ impl ChatWrapper {
         ) {
             // Template existing system prompt
             (Some(prompt), true) => {
-                let ctx = match req.metadata.as_ref() {
-                    Some(serde_json::Value::Object(m)) => {
-                        m.clone()
-                            .into_iter()
-                            .collect::<HashMap<String, serde_json::Value>>()
-                    }
+                let ctx = match req
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::to_value(m).ok())
+                {
+                    Some(serde_json::Value::Object(m)) => m
+                        .into_iter()
+                        .collect::<HashMap<String, serde_json::Value>>(),
                     Some(_) | None => HashMap::new(),
                 };
 
@@ -208,11 +210,12 @@ impl ChatWrapper {
         if req.stream.is_some_and(|s| s) {
             req.stream_options = match req.stream_options {
                 Some(mut opts) => {
-                    opts.include_usage = true;
+                    opts.include_usage = Some(true);
                     Some(opts)
                 }
                 None => Some(ChatCompletionStreamOptions {
-                    include_usage: true,
+                    include_obfuscation: None,
+                    include_usage: Some(true),
                 }),
             };
         }
@@ -220,6 +223,7 @@ impl ChatWrapper {
     }
 
     /// For [`None`] valued fields in a [`CreateChatCompletionRequest`], if the chat model has non-`None` defaults, use those instead.
+    #[expect(deprecated)] // seed and user fields are deprecated in async-openai
     fn with_model_defaults(
         &self,
         mut req: CreateChatCompletionRequest,
@@ -258,10 +262,12 @@ impl ChatWrapper {
                 }
                 "temperature" => set_default_w_warning!(req, temperature, value, self.public_name),
                 "top_p" => set_default_w_warning!(req, top_p, value, self.public_name),
-                "tools" => set_default_w_warning!(req, tools, value, self.public_name),
                 "tool_choice" => set_default_w_warning!(req, tool_choice, value, self.public_name),
                 "parallel_tool_calls" => {
                     set_default_w_warning!(req, parallel_tool_calls, value, self.public_name);
+                }
+                "prompt_cache_key" => {
+                    set_default_w_warning!(req, prompt_cache_key, value, self.public_name);
                 }
                 "user" => set_default_w_warning!(req, user, value, self.public_name),
                 _ => {
@@ -273,6 +279,7 @@ impl ChatWrapper {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl Chat for ChatWrapper {
     /// Expect `captured_output` to be instrumented by the underlying chat model (to not reopen/parse streams). i.e.
@@ -288,7 +295,7 @@ impl Chat for ChatWrapper {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "ai_completion", stream=true, model = %req.model, input = %serde_json::to_string(&req).unwrap_or_default());
 
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", metadata = %metadata);
+            tracing::info!(target: "task_history", metadata = ?metadata);
         }
 
         let labels = request_labels(&req);
@@ -332,13 +339,14 @@ impl Chat for ChatWrapper {
 
         let labels = request_labels(&req);
         if let Some(metadata) = &req.metadata {
-            tracing::info!(target: "task_history", parent: &span, metadata = %metadata, "labels");
+            tracing::info!(target: "task_history", parent: &span, metadata = ?metadata, "labels");
         }
 
         let result = match self.chat.chat_request(req).instrument(span.clone()).await {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, id=resp.id, "labels");
+                    handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &labels);
                 }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
@@ -432,6 +440,11 @@ where
 
                     // Usage should be on last message, so we can add latency metrics here.
                     handle_metrics(self.started.elapsed(), false, &self.labels);
+                    handle_token_metrics(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        &self.labels,
+                    );
                 }
                 Poll::Ready(Some(Ok(item)))
             }

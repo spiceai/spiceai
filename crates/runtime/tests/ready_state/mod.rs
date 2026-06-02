@@ -54,8 +54,8 @@ use runtime::{
     Runtime,
     component::dataset::Dataset,
     dataconnector::{
-        self, DataConnector, DataConnectorError, DataConnectorFactory, NewDataConnectorResult,
-        parameters::ConnectorParams,
+        self, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
+        NewDataConnectorResult, parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
 };
@@ -63,6 +63,7 @@ use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::{Dataset as SpicepodDataset, ReadyState},
+    component::runtime::{Runtime as SpicepodRuntime, RuntimeReadyState},
 };
 
 use crate::{configure_test_datafusion, init_tracing};
@@ -339,6 +340,7 @@ impl SQLExecutor for MockSQLExecutor {
         &self,
         _query: &str,
         schema: SchemaRef,
+        _filters: &[Arc<dyn datafusion::physical_plan::PhysicalExpr>],
     ) -> DataFusionResult<SendableRecordBatchStream> {
         // Create test data
         let data = RecordBatch::try_new(
@@ -445,6 +447,58 @@ impl DataConnectorFactory for SlowFederatedDataConnectorProvider {
     }
 }
 
+#[derive(Debug)]
+struct AuthErrorDataConnector;
+
+#[async_trait]
+impl DataConnector for AuthErrorDataConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        Err(
+            DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                dataconnector: "auth-error".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )
+    }
+}
+
+struct AuthErrorDataConnectorProvider;
+
+impl AuthErrorDataConnectorProvider {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+#[async_trait]
+impl DataConnectorFactory for AuthErrorDataConnectorProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create(
+        &self,
+        _params: ConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(AuthErrorDataConnector) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        "auth-error"
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &[]
+    }
+}
+
 // Register our data connector providers
 async fn register_slow_loading_providers() {
     dataconnector::register_connector_factory(
@@ -456,6 +510,14 @@ async fn register_slow_loading_providers() {
     dataconnector::register_connector_factory(
         "slow-loading-federated",
         SlowFederatedDataConnectorProvider::new_arc(),
+    )
+    .await;
+}
+
+async fn register_auth_error_provider() {
+    dataconnector::register_connector_factory(
+        "auth-error",
+        AuthErrorDataConnectorProvider::new_arc(),
     )
     .await;
 }
@@ -491,7 +553,6 @@ fn get_federated_dataset(
     dataset
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_ready_state_test(
     is_native: bool,
     ready_state: ReadyState,
@@ -509,10 +570,14 @@ async fn run_ready_state_test(
         (true, ReadyState::OnRegistration, Some(_)) => "native_on_registration_duckdb",
         (true, ReadyState::OnLoad, None) => "native_on_load_arrow",
         (true, ReadyState::OnLoad, Some(_)) => "native_on_load_duckdb",
+        (true, ReadyState::OnSchemaResolved, None) => "native_on_schema_resolved_arrow",
+        (true, ReadyState::OnSchemaResolved, Some(_)) => "native_on_schema_resolved_duckdb",
         (false, ReadyState::OnRegistration, None) => "federated_on_registration_arrow",
         (false, ReadyState::OnRegistration, Some(_)) => "federated_on_registration_duckdb",
         (false, ReadyState::OnLoad, None) => "federated_on_load_arrow",
         (false, ReadyState::OnLoad, Some(_)) => "federated_on_load_duckdb",
+        (false, ReadyState::OnSchemaResolved, None) => "federated_on_schema_resolved_arrow",
+        (false, ReadyState::OnSchemaResolved, Some(_)) => "federated_on_schema_resolved_duckdb",
     };
 
     tracing::info!("Using dataset: {}", dataset_name);
@@ -545,6 +610,73 @@ async fn run_ready_state_test(
                 return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
             }
             () = cloned_rt.load_components() => {}
+        }
+
+        // Assert dataset readiness state right after registration / load_components returns.
+        // This is the core behavior being tested: the reported readiness should reflect the
+        // configured `ReadyState` before the initial acceleration refresh completes.
+        let dataset_status_key = format!("dataset:{dataset_name}");
+        match ready_state {
+            ReadyState::OnRegistration => {
+                // `on_registration` marks the dataset ready immediately, regardless of the
+                // federated source. Poll briefly to account for scheduling races.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_registration should be Ready before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnSchemaResolved => {
+                // `on_schema_resolved` marks the dataset ready once the federated source's
+                // schema is resolved (access verified). For the slow-loading test sources used
+                // here, the federated provider is `Immediate` (schema is available
+                // synchronously before the builder runs), so readiness should transition to
+                // Ready before the initial refresh completes.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_schema_resolved should be Ready after schema resolution and before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnLoad => {
+                // `on_load` must NOT report the dataset as Ready before the initial refresh
+                // completes. The slow-loading source is wired to take ~5s.
+                let status = rt.status().get_component_status(&dataset_status_key);
+                assert!(
+                    !matches!(status, Some(runtime::status::ComponentStatus::Ready)),
+                    "Dataset {dataset_name} with ready_state=on_load should not be Ready before initial load completes, but status was {status:?}"
+                );
+            }
         }
 
         tracing::info!("Running initial query");
@@ -619,6 +751,17 @@ async fn run_ready_state_test(
         // Wait for acceleration to load
         tracing::info!("Waiting for acceleration to load");
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+        // After the initial refresh has completed, the dataset should be Ready for every
+        // configured `ReadyState` variant (including `on_load`).
+        assert!(
+            matches!(
+                rt.status().get_component_status(&dataset_status_key),
+                Some(runtime::status::ComponentStatus::Ready)
+            ),
+            "Dataset {dataset_name} should be Ready after initial load completes, but status was {:?}",
+            rt.status().get_component_status(&dataset_status_key)
+        );
 
         // Query again, now we should get results
         tracing::info!("Running query after loading");
@@ -715,6 +858,66 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
         Some("duckdb".to_string()),
         false,
         "test_ready_state_on_registration_federated_duckdb_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_native_arrow_acceleration() -> Result<(), anyhow::Error>
+{
+    // Native provider, OnSchemaResolved, Arrow engine: readiness triggers after the federated
+    // source is accessible (schema resolvable) and queries fall back to the source during initial load.
+    run_ready_state_test(
+        true,
+        ReadyState::OnSchemaResolved,
+        None,
+        false,
+        "test_ready_state_on_schema_resolved_native_arrow_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        true,
+        ReadyState::OnSchemaResolved,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_schema_resolved_native_duckdb_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_federated_arrow_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        false,
+        ReadyState::OnSchemaResolved,
+        None,
+        false,
+        "test_ready_state_on_schema_resolved_federated_arrow_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        false,
+        ReadyState::OnSchemaResolved,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_schema_resolved_federated_duckdb_acceleration",
     )
     .await
 }
@@ -1000,6 +1203,83 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             assert_eq!(results.len(), 1, "Query should return 1 record batch");
             assert_eq!(results[0].num_rows(), 5, "Should have 5 rows of data");
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_runtime_on_registration_ready_when_dataset_is_error() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    register_auth_error_provider().await;
+
+    let request_context = Arc::new(RequestContext::builder(Protocol::Http).build());
+    request_context
+        .scope(async {
+            let runtime = SpicepodRuntime {
+                ready_state: RuntimeReadyState::OnRegistration,
+                ..Default::default()
+            };
+
+            let app = AppBuilder::new("runtime_on_registration_dataset_error")
+                .with_runtime(runtime)
+                .with_dataset(SpicepodDataset::new(
+                    "auth-error://dummy",
+                    "bad_s3_credentials",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let rt_for_load = Arc::new(rt.clone());
+            let load_handle = tokio::spawn(async move {
+                rt_for_load.load_components().await;
+            });
+
+            let wait_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let statuses = rt.status().get_dataset_statuses();
+                    let dataset_status = statuses
+                        .iter()
+                        .find(|(name, _)| name.to_string() == "bad_s3_credentials")
+                        .map(|(_, status)| status.clone());
+
+                    if let Some(status) = dataset_status
+                        && matches!(status, runtime::status::ComponentStatus::Error(_))
+                        && rt.status().is_ready()
+                    {
+                        break;
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+
+            load_handle.abort();
+
+            assert!(
+                wait_result.is_ok(),
+                "Timed out waiting for runtime ready with dataset error in on_registration mode"
+            );
+
+            let statuses = rt.status().get_dataset_statuses();
+            let dataset_status = statuses
+                .iter()
+                .find(|(name, _)| name.to_string() == "bad_s3_credentials")
+                .map(|(_, status)| status.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Dataset status for bad_s3_credentials not found")
+                })?;
+
+            assert!(matches!(
+                dataset_status,
+                runtime::status::ComponentStatus::Error(_)
+            ));
+            assert!(rt.status().is_ready());
 
             Ok(())
         })

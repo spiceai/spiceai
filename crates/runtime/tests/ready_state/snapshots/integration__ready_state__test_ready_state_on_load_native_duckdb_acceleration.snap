@@ -5,7 +5,6 @@ expression: explain_str
 +---------------------+----------------------------------------------------------------------------------------+
 | plan_type           | plan                                                                                   |
 +---------------------+----------------------------------------------------------------------------------------+
-| logical_plan        | BytesProcessedNode                                                                     |
-|                     |   TableScan: native_on_load_duckdb projection=[id]                                     |
+| logical_plan        | TableScan: native_on_load_duckdb projection=[id]                                       |
 | physical_plan_error | External error: Acceleration not ready; loading initial data for native_on_load_duckdb |
 +---------------------+----------------------------------------------------------------------------------------+

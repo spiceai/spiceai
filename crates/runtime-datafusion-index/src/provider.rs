@@ -19,7 +19,7 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    catalog::{Session, TableProvider},
+    catalog::{ScanArgs, ScanResult, Session, TableProvider},
     common::{Constraints, Statistics},
     datasource::TableType,
     error::Result as DataFusionResult,
@@ -95,6 +95,7 @@ impl IndexedTableProvider {
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for IndexedTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -118,7 +119,9 @@ impl TableProvider for IndexedTableProvider {
     }
 
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.underlying.get_logical_plan()
+        // Cannot use underlying `get_logical_plan` as `IndexedTableProvider` will be replaced
+        // with the `LogicalPlan` during indexing.
+        None
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
@@ -155,5 +158,34 @@ impl TableProvider for IndexedTableProvider {
         insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.underlying.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.underlying.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.underlying.update(state, assignments, filters).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DataFusionResult<ScanResult> {
+        self.underlying.scan_with_args(state, args).await
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.underlying.truncate(state).await
     }
 }

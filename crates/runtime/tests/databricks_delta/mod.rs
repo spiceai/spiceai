@@ -20,8 +20,10 @@ use app::AppBuilder;
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::test_request_context,
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
+use datafusion::assert_batches_eq;
+use futures::TryStreamExt;
 
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
@@ -63,6 +65,7 @@ fn get_params() -> Params {
 async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -124,6 +127,120 @@ async fn databricks_delta_lake_integration_test() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn databricks_delta_lake_schema_inference_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_delta_lake_schema_test")
+                .with_dataset(make_dataset(
+                    "spiceai_sandbox.integration.delta_all_types_table",
+                    "datatypes",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify all 15 columns appear in information_schema
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT column_name, data_type FROM information_schema.columns \
+                     WHERE table_name = 'datatypes' ORDER BY ordinal_position",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let total_columns: usize = result
+                .iter()
+                .map(datafusion::arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(
+                total_columns, 15,
+                "Expected 15 columns in delta_all_types_table schema, got {total_columns}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn databricks_delta_lake_dataset_registration_test() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_delta_lake_registration_test")
+                .with_dataset(make_dataset(
+                    "spiceai_sandbox.integration.delta_all_types_table",
+                    "datatypes",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Verify the dataset appears in information_schema.tables
+            let result = rt
+                .datafusion()
+                .query_builder(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_name = 'datatypes'",
+                )
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .data
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let expected = [
+                "+------------+",
+                "| table_name |",
+                "+------------+",
+                "| datatypes  |",
+                "+------------+",
+            ];
+            assert_batches_eq!(expected, &result);
 
             Ok(())
         })

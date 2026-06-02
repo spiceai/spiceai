@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "package"
 repository.workspace = true
 rust-version.workspace = true
@@ -13,8 +13,8 @@ object_store.workspace = true
 tracing.workspace = true
 snafu.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../yaml" }
 spicepod = { path = "../spicepod" }
-zip = "3.0.0"
+zip = "7.2.0"
 bytes.workspace = true
 futures.workspace = true

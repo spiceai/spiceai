@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,20 +15,16 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, borrow::Cow, error::Error, sync::Arc};
+use std::{any::Any, error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Schema},
 };
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
-    common::Constraints,
-    datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
+    error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -36,19 +32,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-
-use crate::poly::PolyTableProvider;
-
-#[async_trait]
-pub trait DeletionTableProvider: TableProvider {
-    async fn delete_from(
-        &self,
-        _state: &dyn Session,
-        _filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan("Not implemented".to_string()))
-    }
-}
 
 #[async_trait]
 pub trait DeletionSink: Send + Sync {
@@ -61,9 +44,14 @@ pub struct DeletionExec {
 }
 
 impl DeletionExec {
-    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>) -> Self {
+        let count_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(schema)),
+            EquivalenceProperties::new(count_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -147,71 +135,5 @@ impl ExecutionPlan for DeletionExec {
                 }
             })
         })))
-    }
-}
-
-#[derive(Debug)]
-pub struct DeletionTableProviderAdapter {
-    source: Arc<dyn DeletionTableProvider>,
-}
-
-impl DeletionTableProviderAdapter {
-    pub fn new(source: Arc<dyn DeletionTableProvider>) -> Self {
-        Self { source }
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-pub fn get_deletion_provider(
-    from: Arc<dyn TableProvider>,
-) -> Option<Arc<dyn DeletionTableProvider>> {
-    if let Some(p) = from.as_any().downcast_ref::<PolyTableProvider>() {
-        return Some(Arc::new(p.clone()));
-    }
-    if let Some(p) = from.as_any().downcast_ref::<DeletionTableProviderAdapter>() {
-        return Some(Arc::clone(&p.source));
-    }
-
-    None
-}
-
-#[async_trait]
-impl TableProvider for DeletionTableProviderAdapter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn schema(&self) -> SchemaRef {
-        self.source.schema()
-    }
-    fn constraints(&self) -> Option<&Constraints> {
-        self.source.constraints()
-    }
-    fn table_type(&self) -> TableType {
-        self.source.table_type()
-    }
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.source.get_logical_plan()
-    }
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.source.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.source.scan(state, projection, filters, limit).await
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.source.insert_into(state, input, overwrite).await
     }
 }

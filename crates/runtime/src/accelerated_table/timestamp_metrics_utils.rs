@@ -18,9 +18,9 @@ use crate::component::dataset::TimeFormat;
 use crate::dataupdate::StreamingDataUpdate;
 use arrow::array::{
     Array, Date32Array, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::TimeUnit;
 use arrow_schema::{DataType, Field, SchemaRef};
@@ -155,6 +155,8 @@ fn find_max_timestamp_in_stream_inner(
                             max_ts = max_ts_macro!(StringArray, max_ts, array, |arr: &StringArray, i| string_to_ms(arr.value(i), time_format)),
                         DataType::LargeUtf8 =>
                             max_ts = max_ts_macro!(LargeStringArray, max_ts, array, |arr: &LargeStringArray, i| string_to_ms(arr.value(i), time_format)),
+                        DataType::Utf8View =>
+                            max_ts = max_ts_macro!(StringViewArray, max_ts, array, |arr: &StringViewArray, i| string_to_ms(arr.value(i), time_format)),
 
                         // Int
                         DataType::Int8 =>
@@ -250,7 +252,7 @@ fn uint64_to_ms(ts: u64, time_format: TimeFormat) -> Option<i64> {
         .flatten()
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn float_to_ms(ts: f64, time_format: TimeFormat) -> Option<i64> {
     match time_format {
         TimeFormat::UnixSeconds => Some((ts * 1000.0) as i64),
@@ -264,8 +266,14 @@ fn string_to_ms(s: &str, time_format: TimeFormat) -> Option<i64> {
         return None;
     }
 
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.timestamp_millis())
+    // Try RFC 3339 first (has timezone suffix like "Z" or "+00:00"), then fall
+    // back to naive ISO 8601 (no timezone) which is assumed to be UTC.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp_millis());
+    }
+
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .map(|ndt| ndt.and_utc().timestamp_millis())
         .ok()
 }
 
@@ -681,6 +689,47 @@ mod tests {
         };
 
         assert!(max_ts.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_utf8_iso8601_naive_no_tz() {
+        // Regression: naive ISO 8601 strings (no "Z" or offset) should be
+        // parsed as UTC instead of silently returning None.
+        let batch = record_batch!((
+            "ts",
+            Utf8,
+            [
+                Some("2010-01-01T00:00:00.000000000"),
+                None,
+                Some("2020-01-01T00:00:00.000000000")
+            ]
+        ))
+        .expect("created batch");
+
+        let max_ts = perform_test(batch, Some(TimeFormat::ISO8601)).await;
+
+        assert_eq!(max_ts, 1_577_836_800_000);
+    }
+
+    #[tokio::test]
+    async fn test_utf8view_iso8601() {
+        // Regression: Utf8View columns should be handled for ISO8601 metrics.
+        let array = StringViewArray::from(vec![
+            Some("2010-01-01T00:00:00Z"),
+            None,
+            Some("2020-01-01T00:00:00Z"),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Utf8View,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef]).expect("created batch");
+
+        let max_ts = perform_test(batch, Some(TimeFormat::ISO8601)).await;
+
+        assert_eq!(max_ts, 1_577_836_800_000);
     }
 
     #[tokio::test]

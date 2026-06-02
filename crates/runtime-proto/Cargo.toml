@@ -1,0 +1,22 @@
+[package]
+name = "runtime-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-proto = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

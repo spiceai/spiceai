@@ -8,10 +8,19 @@ All criteria must be met for the Catalog to be considered Beta, with exceptions 
 
 | Catalog       | Beta Quality | DRI Sign-off    |
 | ------------- | ------------ | --------------- |
-| Databricks    | ✅           | @Sevenannn      |
-| Iceberg       | ✅           | @phillipleblanc |
-| Spice.ai      | ✅           | @peasee         |
-| Unity Catalog | ✅           | @Sevenannn      |
+| ADBC          | ➖            |                 |
+| Cayenne       | ➖            |                 |
+| Databricks    | ✅            | @Sevenannn      |
+| DuckLake      | ✅            | @sgrebnov       |
+| Glue          | ➖            |                 |
+| Iceberg       | ✅            | @phillipleblanc |
+| MS SQL        | ➖            |                 |
+| MySQL         | ➖            |                 |
+| Oracle        | ➖            |                 |
+| PostgreSQL    | ➖            |                 |
+| Snowflake     | ➖            |                 |
+| Spice.ai      | ✅            | @peasee         |
+| Unity Catalog | ✅            | @Sevenannn      |
 
 ## Beta Release Criteria
 

@@ -34,10 +34,8 @@ use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
-    timing::TimedStream,
-};
+use crate::flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol};
+use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.
 pub(crate) async fn get_flight_info(
@@ -463,7 +461,7 @@ pub(crate) static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Ve
         convert
     });
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| {
     // The following are not defined in the [`SqlInfo`], but are
     // documented at
@@ -487,7 +485,7 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
     builder.append(SqlInfo::FlightSqlServerReadOnly, true);
     builder.append(SqlInfoFlightSqlServerSql, true);
-    builder.append(SqlInfoFlightSqlServerSubstrait, false);
+    builder.append(SqlInfoFlightSqlServerSubstrait, true);
     builder.append(
         SqlInfoFlightSqlServerTransaction,
         SqlSupportedTransactions::SqlTransactionUnspecified as i32,

@@ -1,0 +1,12 @@
+[package]
+name = "duration-parse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Human-readable duration parsing and formatting for Spice.ai"
+
+[dependencies]
+snafu.workspace = true
+
+[dev-dependencies]

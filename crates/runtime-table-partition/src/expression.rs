@@ -28,17 +28,18 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use snafu::prelude::*;
+use util::format_datafusion_error;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Failed to determine data type: {source}"))]
+    #[snafu(display("Failed to determine data type: {}", format_datafusion_error(source)))]
     DataTypeError { source: DataFusionError },
     #[snafu(display("Expression {expr} does not meet the criteria: {criterion} Expression Criteria: {}", PartitionCriteria.doc()))]
     CriterionFailed { expr: String, criterion: String },
     #[snafu(display("Invalid expression: {message}"))]
     InvalidExpression { message: String },
-    #[snafu(display("Parsing SQL expression failed: {source}"))]
+    #[snafu(display("Parsing SQL expression failed: {}", format_datafusion_error(source)))]
     ParsingExpression { source: DataFusionError },
     #[snafu(display(
         "Scalar value type {scalar_type} is incompatible with expression type {expr_type}"
@@ -85,6 +86,17 @@ pub fn partition_by_expressions(
     Ok(partitioned_by)
 }
 
+/// Validates that a single [`Expr`] meets the partition expression criteria.
+///
+/// This is useful for DDL paths where the expression is already parsed as a
+/// `DataFusion` `Expr` (e.g. from a `PARTITION BY` clause).
+///
+/// # Errors
+/// Returns an error if the expression does not meet the partition criteria.
+pub fn validate_partition_expression(expr: &Expr, schema: &DFSchema) -> ValidationResult {
+    PartitionCriteria.validate(expr, schema)
+}
+
 /// Validates whether a [`ScalarValue`] can be produced by the given [`Expr`].
 ///
 /// # Errors
@@ -94,7 +106,8 @@ pub fn validate_scalar_compatibility(
     scalar: &ScalarValue,
     schema: &DFSchema,
 ) -> ValidationResult {
-    let (expr_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+    let (_, expr_field) = expr.to_field(schema).context(DataTypeSnafu)?;
+    let expr_type = expr_field.data_type().clone();
     let scalar_type = scalar.data_type();
 
     ensure!(
@@ -157,12 +170,15 @@ impl Criterion for DataTypeCriterion {
     }
 
     fn validate(&self, expr: &Expr, schema: &DFSchema) -> ValidationResult {
-        let (data_type, _nullable) = expr.data_type_and_nullable(schema).context(DataTypeSnafu)?;
+        let (_, field) = expr.to_field(schema).context(DataTypeSnafu)?;
+        let data_type = field.data_type().clone();
 
         ensure!(
             matches!(
                 data_type,
                 DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
                     | DataType::Int8
                     | DataType::Int16
                     | DataType::Int32
@@ -297,23 +313,30 @@ mod tests {
             )
             .otherwise(lit("other"))
             .expect("expression created");
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Valid: date_trunc('month', date)
         let expr = Expr::ScalarFunction(ScalarFunction {
             func: date_trunc(),
             args: vec![lit("month"), col("date")],
         });
-        assert!(criterion.validate(&expr, &schema).is_ok());
+        criterion
+            .validate(&expr, &schema)
+            .expect("should create expression");
 
         // Invalid: Two columns (a + region)
         let expr = col("a") + col("region");
-        assert!(criterion.validate(&expr, &schema).is_err());
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Literal (no column)
         let expr = lit(42);
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         // Invalid: Alias
         let expr = Expr::Alias(Alias {
             expr: Box::new(col("region")),
@@ -321,15 +344,15 @@ mod tests {
             relation: None,
             metadata: None,
         });
-        assert!(
-            criterion.validate(&expr, &schema).is_err(),
-            "forbidden expression"
-        );
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
 
         // Invalid: Non-existent column
         let expr = col("missing");
-        assert!(criterion.validate(&expr, &schema).is_err());
-
+        criterion
+            .validate(&expr, &schema)
+            .expect_err("should be invalid expression");
         Ok(())
     }
 }

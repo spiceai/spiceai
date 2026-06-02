@@ -1,0 +1,1387 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! Spice.ai REPL utilities and Flight SQL REPL.
+//!
+//! This crate provides:
+//! - Shared REPL utilities (spinner, model selection, history management) via the `util` module
+//! - Flight SQL REPL implementation via the `run` function
+
+use std::borrow::Cow;
+use std::error::Error;
+use std::io::Write;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
+use arrow_flight::{
+    FlightDescriptor, decode::FlightRecordBatchStream, error::FlightError,
+    flight_service_client::FlightServiceClient,
+};
+
+use crate::completer::SchemaCache;
+use crate::pretty::{format_batches_expanded, format_batches_with_types};
+use ansi_colors::Color;
+use arrow::array::RecordBatch;
+use clap::Parser;
+use config::get_user_agent;
+use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE, TonicStatusError};
+use futures::{StreamExt, TryStreamExt};
+use prost::Message;
+use reqwest::Client;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::{
+    CompletionType, ConditionalEventHandler, Config, Helper, Hinter, KeyEvent, Validator,
+};
+use rustyline::{Editor, EventHandler};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::{RwLock, oneshot};
+use tokio::task::JoinHandle;
+use tonic::metadata::errors::InvalidMetadataValue;
+use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
+use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::{Code, IntoRequest, Status};
+
+pub mod cache_control;
+mod completer;
+mod config;
+pub mod pretty;
+pub mod util;
+
+#[derive(Parser, Debug)]
+#[clap(about = "Spice.ai SQL REPL")]
+pub struct ReplConfig {
+    #[arg(
+        long,
+        value_name = "FLIGHT_ENDPOINT",
+        default_value = "http://localhost:50051",
+        help_heading = "SQL REPL"
+    )]
+    pub repl_flight_endpoint: String,
+
+    #[arg(
+        long,
+        value_name = "HTTP_ENDPOINT",
+        default_value = "http://localhost:8090",
+        help_heading = "SQL REPL"
+    )]
+    pub http_endpoint: String,
+
+    /// The path to the root certificate file used to verify the Spice.ai runtime server certificate
+    #[arg(
+        long,
+        value_name = "TLS_ROOT_CERTIFICATE_FILE",
+        help_heading = "SQL REPL"
+    )]
+    pub tls_root_certificate_file: Option<String>,
+
+    /// The path to the client certificate file for mTLS authentication.
+    /// Required when connecting to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-key-file.
+    #[arg(
+        long,
+        requires = "client_tls_key_file",
+        value_name = "CLIENT_TLS_CERTIFICATE_FILE",
+        help_heading = "SQL REPL"
+    )]
+    pub client_tls_certificate_file: Option<String>,
+
+    /// The path to the client private key file for mTLS authentication.
+    /// Required when connecting to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-certificate-file.
+    #[arg(
+        long,
+        requires = "client_tls_certificate_file",
+        value_name = "CLIENT_TLS_KEY_FILE",
+        help_heading = "SQL REPL"
+    )]
+    pub client_tls_key_file: Option<String>,
+
+    /// The API key to use for authentication
+    #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
+    pub api_key: Option<String>,
+
+    #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
+    pub user_agent: Option<String>,
+
+    /// Control whether the results cache is used for queries.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = cache_control::CacheControl::Cache,
+        value_name = "CACHE_CONTROL",
+        help_heading = "SQL REPL"
+    )]
+    pub cache_control: cache_control::CacheControl,
+
+    /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
+    #[arg(long = "headers", value_name = "KEY:VALUE", help_heading = "SQL REPL")]
+    pub custom_headers: Vec<String>,
+
+    /// Start the REPL in expanded view mode, rendering each column on its own
+    /// line per record (useful for wide tables). Toggle at runtime with `.expanded`.
+    #[arg(long, short = 'x', help_heading = "SQL REPL")]
+    pub expanded: bool,
+}
+
+const NQL_LINE_PREFIX: &str = "nql ";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmRuntime {
+    Candle,
+    Mistral,
+    Openai,
+}
+
+async fn send_nsql_request(
+    client: &Client,
+    base_url: String,
+    query: String,
+    runtime: LlmRuntime,
+    user_agent: &str,
+) -> Result<String, reqwest::Error> {
+    client
+        .post(format!("{base_url}/v1/nsql"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", user_agent)
+        .json(&json!({
+            "query": query,
+            "model": runtime,
+        }))
+        .send()
+        .await?
+        .text()
+        .await
+}
+
+const SPECIAL_COMMANDS: [&str; 12] = [
+    ".exit",
+    "exit",
+    "quit",
+    "q",
+    ".error",
+    "help",
+    "?",
+    ".clear",
+    ".clear history",
+    ".expanded",
+    ".expanded on",
+    ".expanded off",
+];
+const PROMPT_COLOR: Color = Color::Fixed(8);
+
+/// Set secure permissions (0600) on a file to ensure only the user can read/write it
+#[cfg(unix)]
+fn set_secure_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_secure_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    // On Windows, file permissions work differently
+    // The file is created with user-only access by default
+    Ok(())
+}
+
+#[derive(Clone)]
+struct KeyEventHandler;
+
+impl ConditionalEventHandler for KeyEventHandler {
+    fn handle(
+        &self,
+        evt: &rustyline::Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        evt.get(0).and_then(|k| {
+            if *k == KeyEvent::ctrl('C') {
+                Some(if ctx.line().is_empty() {
+                    rustyline::Cmd::EndOfFile
+                } else {
+                    rustyline::Cmd::Interrupt
+                })
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[derive(Helper, Hinter, Validator)]
+struct EditorHelper {
+    schema_cache: Arc<RwLock<SchemaCache>>,
+    flight_client: Option<FlightServiceClient<Channel>>,
+    api_key: Option<String>,
+    user_agent: String,
+    refresh_task_handle: Option<JoinHandle<()>>,
+    shutdown_sender: Option<oneshot::Sender<()>>,
+}
+
+impl EditorHelper {
+    pub fn new(
+        flight_client: Option<FlightServiceClient<Channel>>,
+        api_key: Option<String>,
+        user_agent: String,
+    ) -> Self {
+        Self {
+            schema_cache: Arc::new(RwLock::new(SchemaCache::new())),
+            flight_client,
+            api_key,
+            user_agent,
+            refresh_task_handle: None,
+            shutdown_sender: None,
+        }
+    }
+}
+
+impl Drop for EditorHelper {
+    fn drop(&mut self) {
+        if let Some(sender) = self.shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+        if let Some(handle) = self.refresh_task_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Highlighter for EditorHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            PROMPT_COLOR.paint(prompt).to_string().into()
+        } else {
+            Cow::Borrowed(prompt)
+        }
+    }
+}
+
+#[expect(clippy::missing_errors_doc, clippy::too_many_lines)]
+pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Note: custom_headers are currently not applied to the gRPC Flight connection.
+    // Adding gRPC metadata headers requires interceptor changes.
+    // For now, this flag is accepted but not used.
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .completion_show_all_if_ambiguous(true)
+        .build();
+
+    let mut rl = Editor::with_config(config)?;
+
+    // Set up persistent history (with graceful fallback)
+    let history_path = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".spice")
+                .join("query_history.txt")
+        });
+
+    if let Some(ref path) = history_path {
+        // Create .spice directory if it doesn't exist
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "Warning: Failed to create history directory: {e}. History will not be persisted."
+            );
+        }
+
+        // Load existing history (ignore errors - just means no history file yet)
+        if let Err(e) = rl.load_history(path) {
+            // Most load failures are just "file not found" which is expected on first run
+            // Only show warnings for other error types
+            match e {
+                ReadlineError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+                    // File doesn't exist yet, that's fine
+                }
+                _ => {
+                    eprintln!("Warning: Could not load history file: {e}");
+                }
+            }
+        }
+    } else {
+        eprintln!("Warning: Could not determine home directory. History will not be persisted.");
+    }
+
+    rl.set_helper(Some(EditorHelper::new(
+        Some(client.clone()),
+        repl_config.api_key.clone(),
+        user_agent.clone(),
+    )));
+    if let Some(helper) = rl.helper_mut() {
+        // Perform initial refresh to populate autocomplete immediately with a 2-second timeout
+        let refresh_result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), helper.refresh_now()).await;
+        if refresh_result.is_err() {
+            tracing::debug!("Initial autocomplete metadata refresh timed out after 2 seconds");
+        }
+        // Start background refresh task for updates
+        helper.start_refreshing(300);
+    }
+
+    let key_handler = Box::new(KeyEventHandler {});
+    rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
+    rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
+
+    println!("Welcome to the Spice.ai SQL REPL! Type `help` or `?` for commands.\n");
+    println!("Examples:");
+    println!("  show tables;              -- list available tables");
+    println!("  describe <table_name>;    -- show column types");
+    println!("  nql <question>            -- natural language to SQL (requires a model)");
+    println!();
+
+    let mut last_error: Option<Status> = None;
+    let mut expanded = repl_config.expanded;
+
+    'outer: loop {
+        let mut first_line = true;
+        // When using the Editor, prompt coloring is applied automatically by the Highlighter. Manual colorizing for
+        // the prompt should not be used, as it does not work on Windows: https://github.com/kkawakam/rustyline/issues/836
+        let mut prompt = "sql> ".to_string();
+        let mut line = String::new();
+        loop {
+            let line_result = rl.readline(&prompt);
+            let newline = match line_result {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    // User canceled the current query
+                    continue 'outer;
+                }
+                Err(ReadlineError::Eof) => {
+                    if line.is_empty() {
+                        break 'outer;
+                    }
+
+                    continue 'outer;
+                }
+                Err(err) => {
+                    println!("{} Input read error: {err}", Color::Red.paint("Error:"));
+                    continue 'outer;
+                }
+            };
+
+            line.push_str(format!("{newline}\n").as_str());
+
+            if SPECIAL_COMMANDS.contains(&line.to_ascii_lowercase().trim())
+                || line.trim().ends_with(';')
+            {
+                line = line.trim().to_string();
+                break;
+            }
+
+            if first_line {
+                prompt = "  -> ".to_string();
+                first_line = false;
+            }
+        }
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Normalise once so every meta-command arm matches case-insensitively
+        // (the multi-line read loop already breaks out on lower-cased
+        // SPECIAL_COMMANDS, so the dispatch here should agree).  `lower` and
+        // `line` have identical byte lengths because `to_ascii_lowercase`
+        // only touches ASCII bytes, so we can safely index into `line` using
+        // offsets derived from `lower` where we need the original-case input
+        // (e.g., for `describe <Table>` identifiers or `nql <Question>`).
+        let lower = line.to_ascii_lowercase();
+        let line = match lower.as_str() {
+            ".exit" | "exit" | "quit" | "q" => break,
+            ".error" => {
+                match last_error {
+                    Some(ref err) => {
+                        let err = TonicStatusError::from(err.clone());
+                        println!("{err}");
+                    }
+                    None => println!("No previous error recorded."),
+                }
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".clear" => {
+                // Clear-screen only makes sense on a real terminal; gate on the TTY
+                // directly rather than on the colour heuristic (NO_COLOR should still
+                // let the escape codes through on a TTY, and FORCE_COLOR shouldn't
+                // push them into a pipe).
+                use std::io::IsTerminal;
+                if std::io::stdout().is_terminal() {
+                    print!("\x1B[H\x1B[2J");
+                    let _ = std::io::stdout().flush();
+                }
+                continue;
+            }
+            ".clear history" => {
+                // Clear the readline history
+                let _ = rl.clear_history();
+                // Save the empty history to file (if path is available)
+                if let Some(ref path) = history_path {
+                    if let Err(e) = rl.save_history(path) {
+                        eprintln!("Warning: Failed to save cleared history: {e}");
+                    } else if let Err(e) = set_secure_permissions(path) {
+                        eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+                    }
+                }
+                println!("Query history cleared.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded" => {
+                expanded = !expanded;
+                println!(
+                    "Expanded display is {}.",
+                    if expanded { "on" } else { "off" }
+                );
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded on" => {
+                expanded = true;
+                println!("Expanded display is on.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            ".expanded off" => {
+                expanded = false;
+                println!("Expanded display is off.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            "help" | "?" => {
+                println!("Meta-commands:\n");
+                println!(
+                    "  {} Exit the REPL",
+                    PROMPT_COLOR.paint(".exit, exit, quit, q")
+                );
+                println!(
+                    "  {} Show details of the last error",
+                    PROMPT_COLOR.paint(".error                ")
+                );
+                println!(
+                    "  {} Clear the screen",
+                    PROMPT_COLOR.paint(".clear                ")
+                );
+                println!(
+                    "  {} Clear persisted query history",
+                    PROMPT_COLOR.paint(".clear history        ")
+                );
+                println!(
+                    "  {} Toggle expanded (column-per-line) display; pass `on`/`off` to set",
+                    PROMPT_COLOR.paint(".expanded [on|off]    ")
+                );
+                println!(
+                    "  {} Show this help message",
+                    PROMPT_COLOR.paint("help, ?               ")
+                );
+                println!();
+                println!("SQL shortcuts (queries end with `;`, multi-line supported):");
+                println!(
+                    "  {} list all tables visible to the runtime",
+                    PROMPT_COLOR.paint("show tables;          ")
+                );
+                println!(
+                    "  {} list schemas (databases)",
+                    PROMPT_COLOR.paint("show schemas;         ")
+                );
+                println!(
+                    "  {} show a table's column names and types",
+                    PROMPT_COLOR.paint("describe <table>;     ")
+                );
+                println!();
+                println!("Natural language:");
+                println!(
+                    "  {} translate a question to SQL and run it",
+                    PROMPT_COLOR.paint("nql <question>        ")
+                );
+                println!();
+                println!("Any other line is run as SQL.");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
+            "show tables" | "show tables;" => {
+                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema';"
+            }
+            "show schemas" | "show schemas;" | "show databases" | "show databases;" => {
+                "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
+            }
+            _ if {
+                // `describe`/`desc` is matched case-insensitively via `lower`;
+                // the identifier token is read from the outer `line` so quoted
+                // or mixed-case table names are preserved.
+                let without_semi = lower.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let first = parts.next().unwrap_or_default();
+                let rest = parts.next().unwrap_or_default().trim();
+                let kw = first == "describe" || first == "desc";
+                kw && !rest.is_empty() && !rest.contains(char::is_whitespace)
+            } =>
+            {
+                // Rewrite `describe <table>` into an information_schema.columns lookup.
+                // Schema-qualified names (`schema.table`) are split; bare names match any schema.
+                // Identifiers keep their original case so quoted/mixed-case tables work.
+                // Single quotes are escaped (SQL standard `''`) before they're interpolated
+                // into the string literals to avoid query injection/syntax errors.
+                fn unquote(s: &str) -> &str {
+                    s.trim_matches('"').trim_matches('\'')
+                }
+                fn esc(s: &str) -> String {
+                    s.replace('\'', "''")
+                }
+                let without_semi = line.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let _kw = parts.next();
+                let raw_ident = parts.next().unwrap_or_default().trim();
+                // Quotes need stripping per identifier segment, not just the whole token:
+                // `describe schema."MyTable"` should split into (`schema`, `MyTable`), not
+                // (`schema`, `"MyTable"`). Unquote each side after the split.
+                let rewritten = if let Some((schema, name)) = raw_ident.split_once('.') {
+                    let schema = unquote(schema);
+                    let name = unquote(name);
+                    format!(
+                        "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{}' and table_name = '{}' order by ordinal_position;",
+                        esc(schema),
+                        esc(name)
+                    )
+                } else {
+                    let ident = unquote(raw_ident);
+                    format!(
+                        "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{}' order by table_schema, ordinal_position;",
+                        esc(ident)
+                    )
+                };
+                let _ = rl.add_history_entry(line);
+                let start_time = Instant::now();
+                match get_records(
+                    client.clone(),
+                    &rewritten,
+                    repl_config.api_key.as_ref(),
+                    &user_agent,
+                    repl_config.cache_control,
+                )
+                .await
+                {
+                    Ok((records, total_rows, from_cache)) => {
+                        display_records(&records, start_time, total_rows, from_cache, expanded)?;
+                    }
+                    Err(FlightError::Tonic(status)) => {
+                        display_grpc_error(&status);
+                        last_error = Some(*status);
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Unexpected Flight error: {e}.",
+                            Color::Red.paint("Error:")
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                continue;
+            }
+            _ if lower.starts_with(NQL_LINE_PREFIX) => {
+                let _ = rl.add_history_entry(line);
+                // `lower` and `line` have the same byte length, so slicing
+                // off the prefix on the original line yields the user's
+                // original-case question.
+                let question = line[NQL_LINE_PREFIX.len()..].to_string();
+                if let Err(e) = get_and_display_nql_records(
+                    repl_config.http_endpoint.clone(),
+                    question,
+                    &user_agent,
+                    expanded,
+                )
+                .await
+                {
+                    println!(
+                        "{} NQL processing failed: {e}. Use '.error' if applicable.",
+                        Color::Red.paint("Error:")
+                    );
+                }
+                continue;
+            }
+            _ => line,
+        };
+
+        let _ = rl.add_history_entry(line);
+
+        let start_time = Instant::now();
+        match get_records(
+            client.clone(),
+            line,
+            repl_config.api_key.as_ref(),
+            &user_agent,
+            repl_config.cache_control,
+        )
+        .await
+        {
+            Ok((records, total_rows, from_cache)) => {
+                display_records(&records, start_time, total_rows, from_cache, expanded)?;
+            }
+            Err(FlightError::Tonic(status)) => {
+                display_grpc_error(&status);
+                last_error = Some(*status);
+            }
+            Err(e) => {
+                println!(
+                    "{} Unexpected Flight error: {e}. Check connection or query syntax.",
+                    Color::Red.paint("Error:")
+                );
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+
+    // Save history before exiting (if path is available)
+    if let Some(ref path) = history_path {
+        if let Err(e) = rl.save_history(path) {
+            eprintln!("Warning: Failed to save history on exit: {e}");
+        } else if let Err(e) = set_secure_permissions(path) {
+            eprintln!("Warning: Failed to set secure permissions on history file: {e}");
+        }
+    }
+
+    if let Some(helper) = rl.helper_mut() {
+        helper.stop_refreshing();
+    }
+
+    Ok(())
+}
+
+/// Run one SQL query through the Flight SQL client and print the formatted result.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection or query execution fails.
+pub async fn run_query(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+    let start_time = Instant::now();
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, total_rows, from_cache)) => {
+            display_records(
+                &records,
+                start_time,
+                total_rows,
+                from_cache,
+                repl_config.expanded,
+            )?;
+            Ok(())
+        }
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+/// Run one SQL query through the Flight SQL client and print the result as JSON.
+///
+/// # Errors
+///
+/// Returns an error if the Flight connection, query execution, or JSON serialization fails.
+pub async fn run_query_json(
+    repl_config: ReplConfig,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    warn_if_custom_headers_are_unsupported(&repl_config);
+    let user_agent = build_user_agent(repl_config.user_agent.as_deref());
+    let client = connect_flight_client(&repl_config, &user_agent).await?;
+
+    match get_records(
+        client,
+        sql,
+        repl_config.api_key.as_ref(),
+        &user_agent,
+        repl_config.cache_control,
+    )
+    .await
+    {
+        Ok((records, _total_rows, _from_cache)) => write_records_json(&records),
+        Err(FlightError::Tonic(status)) => {
+            Err(Box::<dyn Error>::from(format_flight_sql_status(&status)))
+        }
+        Err(error) => Err(Box::<dyn Error>::from(format!(
+            "Unexpected Flight error: {error}. Check connection or query syntax."
+        ))),
+    }
+}
+
+fn write_records_json(records: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        writer.write_batches(&records.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+    }
+    let json = String::from_utf8(buf)?;
+    println!("{json}");
+    Ok(())
+}
+
+fn warn_if_custom_headers_are_unsupported(repl_config: &ReplConfig) {
+    if !repl_config.custom_headers.is_empty() {
+        tracing::warn!(
+            "Custom headers are not currently supported for the SQL REPL's Flight gRPC connection"
+        );
+    }
+}
+
+fn build_user_agent(user_agent_override: Option<&str>) -> String {
+    let user_agent = get_user_agent();
+    match user_agent_override {
+        Some(override_value) => format!("{override_value} {user_agent}"),
+        None => user_agent,
+    }
+}
+
+fn format_flight_sql_status(status: &Status) -> String {
+    format!(
+        "Flight SQL query failed ({:?}): {}",
+        status.code(),
+        status.message()
+    )
+}
+
+async fn connect_flight_client(
+    repl_config: &ReplConfig,
+    user_agent: &str,
+) -> Result<FlightServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let mut repl_flight_endpoint = repl_config.repl_flight_endpoint.clone();
+    let client_identity = if let (Some(cert_path), Some(key_path)) = (
+        &repl_config.client_tls_certificate_file,
+        &repl_config.client_tls_key_file,
+    ) {
+        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
+            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
+        })?;
+        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
+            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
+        })?;
+        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+    } else {
+        None
+    };
+
+    let mut client_tls_config = if let Some(tls_root_certificate_file) =
+        &repl_config.tls_root_certificate_file
+    {
+        let tls_root_certificate = tokio::fs::read(tls_root_certificate_file)
+            .await
+            .map_err(|e| {
+                format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
+            })?;
+        let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
+        Some(ClientTlsConfig::new().ca_certificate(tls_root_certificate))
+    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
+        Some(ClientTlsConfig::new().with_native_roots())
+    } else {
+        None
+    };
+
+    if let Some(identity) = client_identity {
+        let tls_config =
+            client_tls_config.unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
+        client_tls_config = Some(tls_config.identity(identity));
+    }
+
+    if client_tls_config.is_some() && repl_flight_endpoint.starts_with("http://") {
+        repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
+    }
+
+    let channel = connect_channel(repl_flight_endpoint.clone(), user_agent, client_tls_config)
+        .await
+        .map_err(|e| {
+        Box::<dyn Error>::from(format!(
+            "Connection failed to spiced at '{repl_flight_endpoint}': {e}. Check if the Spice runtime is running, endpoint including port is correct, and TLS config (if used) is valid."
+        ))
+    })?;
+
+    Ok(FlightServiceClient::new(channel)
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE))
+}
+
+async fn connect_channel(
+    endpoint: String,
+    user_agent: &str,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<Channel, Box<dyn std::error::Error>> {
+    let mut endpoint = Channel::from_shared(endpoint)?.user_agent(user_agent.to_string())?;
+    if let Some(tls_config) = tls_config {
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    Ok(endpoint.connect().await?)
+}
+
+/// Send a SQL query to the Flight service and return the resulting record batches.
+///
+/// # Errors
+///
+/// Returns an error if the Flight service returns an error.
+pub async fn get_records(
+    mut client: FlightServiceClient<Channel>,
+    line: &str,
+    api_key: Option<&String>,
+    user_agent: &str,
+    cache_control: cache_control::CacheControl,
+) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
+    let sql_command = CommandStatementQuery {
+        query: line.to_string(),
+        transaction_id: None,
+    };
+    let sql_command_bytes = sql_command.as_any().encode_to_vec();
+
+    let request = FlightDescriptor::new_cmd(sql_command_bytes).into_request();
+    let request = add_api_key(request, api_key)?;
+
+    let mut flight_info = client.get_flight_info(request).await?.into_inner();
+    let Some(endpoint) = flight_info.endpoint.pop() else {
+        return Err(FlightError::Tonic(Box::new(Status::internal(
+            "No endpoint returned from server. Verify server configuration.",
+        ))));
+    };
+    let Some(ticket) = endpoint.ticket else {
+        return Err(FlightError::Tonic(Box::new(Status::internal(
+            "No ticket in endpoint. Server may be misconfigured.",
+        ))));
+    };
+    let mut request = ticket.into_request();
+    request = add_api_key(request, api_key)?;
+
+    if cache_control == cache_control::CacheControl::NoCache {
+        request
+            .metadata_mut()
+            .insert("cache-control", MetadataValue::from_static("no-cache"));
+    }
+
+    let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
+        .map_err(|e| FlightError::ExternalError(e.into()))?;
+    let user_agent_value = user_agent
+        .parse()
+        .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(e.into()))?;
+
+    request
+        .metadata_mut()
+        .insert(user_agent_key, user_agent_value);
+
+    let response = client.do_get(request).await?;
+    let from_cache = response
+        .metadata()
+        .get("results-cache-status")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|s| {
+            s.to_lowercase().starts_with("hit") || s.to_lowercase().starts_with("stale")
+        });
+
+    let stream = response.into_inner();
+
+    let mut stream = FlightRecordBatchStream::new_from_flight_data(
+        stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+    );
+    let mut records = vec![];
+    let mut total_rows = 0_usize;
+    while let Some(data) = stream.next().await {
+        match data {
+            Ok(data) => {
+                total_rows += data.num_rows();
+                records.push(data);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok((records, total_rows, from_cache))
+}
+
+fn add_api_key<T>(
+    mut request: tonic::Request<T>,
+    api_key: Option<&String>,
+) -> Result<tonic::Request<T>, FlightError> {
+    if let Some(api_key) = api_key {
+        let val: MetadataValue<Ascii> = format!("Bearer {api_key}")
+            .parse()
+            .map_err(|e: InvalidMetadataValue| FlightError::ExternalError(Box::new(e)))?;
+        request.metadata_mut().insert("authorization", val);
+    }
+    Ok(request)
+}
+
+/// Display a set of record batches to the user. This function will display the first 500 rows.
+///
+/// When `expanded` is true, each row is rendered as a vertical block of
+/// `column | value` lines instead of a table, similar to `PostgreSQL`'s `\x`.
+///
+/// # Errors
+///
+/// Returns an error if the record batches cannot be formatted.
+fn display_records(
+    records: &[RecordBatch],
+    start_time: Instant,
+    total_rows: usize,
+    from_cache: bool,
+    expanded: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut limited_records = Vec::new();
+    let mut rows_collected = 0;
+
+    let elapsed = start_time.elapsed();
+
+    for batch in records {
+        if rows_collected >= 500 {
+            break;
+        }
+
+        let rows_to_take = (500 - rows_collected).min(batch.num_rows());
+        if rows_to_take > 0 {
+            limited_records.push(batch.slice(0, rows_to_take));
+            rows_collected += rows_to_take;
+        }
+    }
+
+    let format_result = if expanded {
+        format_batches_expanded(&limited_records)
+    } else {
+        format_batches_with_types(&limited_records)
+    };
+    let pretty_batches = match format_result {
+        Ok(pretty) => pretty,
+        Err(e) => {
+            println!(
+                "{} Failed to format results: {e}",
+                Color::Red.paint("Display Error:")
+            );
+            return Err(Box::new(e));
+        }
+    };
+
+    if total_rows > 0 {
+        println!("{pretty_batches}");
+    } else {
+        println!("No results.");
+    }
+
+    if rows_collected == total_rows {
+        if total_rows == 0 {
+            println!(
+                "\nTime: {} seconds{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        } else {
+            println!(
+                "\nTime: {} seconds. {rows_collected} rows{}.",
+                elapsed.as_secs_f64(),
+                if from_cache { " (cached)" } else { "" }
+            );
+        }
+    } else {
+        println!(
+            "\nTime: {} seconds. {rows_collected}/{total_rows} rows displayed{}.",
+            elapsed.as_secs_f64(),
+            if from_cache { " (cached)" } else { "" }
+        );
+    }
+    let _ = std::io::stdout().flush();
+    Ok(pretty_batches)
+}
+
+/// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
+async fn get_and_display_nql_records(
+    endpoint: String,
+    query: String,
+    user_agent: &str,
+    expanded: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+
+    let resp = send_nsql_request(
+        &Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?,
+        endpoint,
+        query,
+        LlmRuntime::Openai,
+        user_agent,
+    )
+    .await
+    .map_err(|e| {
+        format!("Network error during NQL request: {e}. Check HTTP endpoint and network.")
+    })?;
+
+    let jsonl_resp = json_array_to_jsonl(&resp).map_err(|e| {
+        format!("Failed to convert NQL response to JSONL: {e}. Response may be malformed.")
+    })?;
+
+    let (schema, _) =
+        arrow_json::reader::infer_json_schema(jsonl_resp.as_bytes(), None).map_err(|e| {
+            format!("Schema inference failed for NQL results: {e}. Ensure response is valid JSON.")
+        })?;
+
+    let records: Vec<RecordBatch> = arrow_json::ReaderBuilder::new(Arc::new(schema))
+        .build(jsonl_resp.as_bytes())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read NQL records into Arrow format: {e}."))?;
+
+    let total_rows = records
+        .iter()
+        .map(RecordBatch::num_rows)
+        .reduce(|x, y| x + y)
+        .unwrap_or(0) as usize;
+
+    display_records(&records, start_time, total_rows, false, expanded)?;
+
+    Ok(())
+}
+
+/// Convert a JSON array string to a JSONL string.
+fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let json_array: Vec<serde_json::Value> = serde_json::from_str(json_array_str)
+        .map_err(|e| format!("Invalid JSON array in response: {e}"))?;
+
+    let jsonl_strings: Vec<String> = json_array
+        .into_iter()
+        .map(|item| serde_json::to_string(&item))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to serialize JSON item: {e}"))?;
+
+    let jsonl_str = jsonl_strings.join("\n");
+
+    Ok(jsonl_str)
+}
+
+/// Returns a boolean indicating if a message needs truncation, from a given input of lines.
+/// 280 is 2x 140,the X post length limit.
+fn lines_need_truncation(lines: &[&str]) -> bool {
+    lines.iter().any(|line| line.len() > 280)
+}
+
+fn display_grpc_error(err: &Status) {
+    let (error_type, user_err_msg) = match err.code() {
+        Code::Ok => return,
+        Code::Internal => (
+            "Internal Error",
+            "Unexpected internal error. Use '.error' for details.".to_string(),
+        ),
+        Code::Unknown | Code::DataLoss | Code::FailedPrecondition => (
+            "Error",
+            "Unexpected error. Use '.error' for details.".to_string(),
+        ),
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound | Code::Unavailable => {
+            let message = err.message();
+            let lines = message.split('\n').collect::<Vec<_>>();
+            let truncate = lines_need_truncation(&lines);
+
+            let first_line = lines.first().unwrap_or(&message);
+            let user_err_msg = match (truncate, lines.len() > 1) {
+                // truncating due to length, and multiple error lines
+                (true, true) => format!(
+                    "{first_line}\nMessage truncated due to length. Run '.error' for full details."
+                ),
+                // truncating due to length, but only one line
+                (true, false) => {
+                    "Query failed. Message truncated; run '.error' for full details.".to_string()
+                }
+                _ => message.to_string(),
+            };
+            ("Query Error", user_err_msg)
+        }
+        Code::Cancelled => (
+            "Operation Cancelled",
+            "Request cancelled. Retry if needed.".to_string(),
+        ),
+        Code::Aborted => (
+            "Operation Aborted",
+            "Request aborted before completion. Check logs or retry.".to_string(),
+        ),
+        Code::DeadlineExceeded => (
+            "Timeout",
+            "Query exceeded time limit. Optimize query or increase timeout if configurable."
+                .to_string(),
+        ),
+        Code::Unauthenticated => (
+            "Authentication Failed",
+            "Invalid credentials. Verify credentials and try again.".to_string(),
+        ),
+        Code::PermissionDenied => (
+            "Permission Denied",
+            "Insufficient permissions. Check authorization scopes or account access.".to_string(),
+        ),
+        Code::ResourceExhausted => (
+            "Resource Exhausted",
+            "Server resources exhausted. Reduce query complexity or try later.".to_string(),
+        ),
+        Code::Unimplemented => (
+            "Unsupported Operation",
+            "Feature not implemented. Check documentation for alternatives.".to_string(),
+        ),
+        Code::OutOfRange => (
+            "Result Limit Exceeded",
+            "Results too large. Consider adding a LIMIT clause to the query.".to_string(),
+        ),
+    };
+
+    println!(
+        "{} {user_err_msg}",
+        Color::Red.paint(format!("{error_type}:"))
+    );
+    let _ = std::io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn create_test_batch(num_rows: usize, batch_id: i32) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let id_array = Int32Array::from(
+            (0..num_rows)
+                .map(|i| {
+                    batch_id * 1000 + i32::try_from(i).expect("Failed to convert usize to i32")
+                })
+                .collect::<Vec<_>>(),
+        );
+        let name_array = StringArray::from(
+            (0..num_rows)
+                .map(|i| {
+                    format!(
+                        "name_{}",
+                        batch_id * 1000 + i32::try_from(i).expect("Failed to convert usize to i32")
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)])
+            .expect("Failed to create RecordBatch")
+    }
+
+    #[test]
+    fn flight_sql_status_error_includes_grpc_code() {
+        let message = format_flight_sql_status(&Status::permission_denied("missing token"));
+
+        assert!(message.contains("PermissionDenied"));
+        assert!(message.contains("missing token"));
+    }
+
+    #[test]
+    fn test_display_records() {
+        let test_cases = vec![
+            (
+                vec![
+                    create_test_batch(100, 1),
+                    create_test_batch(100, 2),
+                    create_test_batch(100, 3),
+                ],
+                300,
+                "multiple_batches_under_500_rows",
+            ),
+            (
+                vec![
+                    create_test_batch(200, 1),
+                    create_test_batch(200, 2),
+                    create_test_batch(200, 3),
+                ],
+                600,
+                "multiple_batches_over_500_rows",
+            ),
+            (
+                vec![create_test_batch(250, 1), create_test_batch(250, 2)],
+                500,
+                "multiple_batches_exactly_500_rows",
+            ),
+            (
+                vec![create_test_batch(700, 1)],
+                700,
+                "single_batch_over_500_rows",
+            ),
+            (vec![], 0, "single_empty_batch"),
+        ];
+
+        for (records, total_rows, test_name) in test_cases {
+            run_single_test_display_records(&records, total_rows, test_name);
+        }
+    }
+
+    fn run_single_test_display_records(
+        records: &[RecordBatch],
+        total_rows: usize,
+        test_name: &str,
+    ) {
+        let start_time = Instant::now();
+        let from_cache = false;
+
+        let result = display_records(records, start_time, total_rows, from_cache, false)
+            .expect("Failed to display records");
+
+        insta::assert_snapshot!(test_name, result);
+    }
+
+    #[test]
+    fn test_display_records_expanded() {
+        let records = vec![create_test_batch(3, 1)];
+        let total_rows = 3;
+        let start_time = Instant::now();
+        let from_cache = false;
+
+        let result = display_records(&records, start_time, total_rows, from_cache, true)
+            .expect("Failed to display records in expanded view");
+
+        insta::assert_snapshot!("display_records_expanded", result);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_basic() {
+        let input = r#"[{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse valid JSON array");
+
+        // Each line should be a valid JSON object
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Verify each line is valid JSON
+        for line in &lines {
+            let _: serde_json::Value =
+                serde_json::from_str(line).expect("each line should be valid JSON");
+        }
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_empty_array() {
+        let input = "[]";
+        let result = json_array_to_jsonl(input).expect("should parse empty array");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_single_item() {
+        let input = r#"[{"key": "value"}]"#;
+        let result = json_array_to_jsonl(input).expect("should parse single item array");
+        assert_eq!(result.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_invalid_json() {
+        let input = "not valid json";
+        let result = json_array_to_jsonl(input);
+        let err = result.expect_err("invalid JSON should fail");
+        assert!(err.to_string().contains("Invalid JSON array"));
+    }
+
+    #[test]
+    fn test_json_array_to_jsonl_not_an_array() {
+        let input = r#"{"key": "value"}"#;
+        let result = json_array_to_jsonl(input);
+        let _ = result.expect_err("non-array JSON should fail");
+    }
+
+    #[test]
+    fn test_lines_need_truncation_short_lines() {
+        let lines = vec!["short line", "another short line", "abc"];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_exactly_280() {
+        let line_280 = "a".repeat(280);
+        let lines = vec![line_280.as_str()];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_over_280() {
+        let line_281 = "a".repeat(281);
+        let lines = vec![line_281.as_str()];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_mixed() {
+        let long_line = "a".repeat(300);
+        let lines = vec!["short", long_line.as_str(), "also short"];
+        assert!(lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_lines_need_truncation_empty() {
+        let lines: Vec<&str> = vec![];
+        assert!(!lines_need_truncation(&lines));
+    }
+
+    #[test]
+    fn test_cache_control_default() {
+        let default = cache_control::CacheControl::default();
+        assert_eq!(default, cache_control::CacheControl::Cache);
+    }
+
+    #[test]
+    fn test_cache_control_equality() {
+        assert_eq!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::Cache
+        );
+        assert_eq!(
+            cache_control::CacheControl::NoCache,
+            cache_control::CacheControl::NoCache
+        );
+        assert_ne!(
+            cache_control::CacheControl::Cache,
+            cache_control::CacheControl::NoCache
+        );
+    }
+}

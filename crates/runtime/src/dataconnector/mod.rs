@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{self, AcceleratedTable};
 use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
@@ -43,7 +43,8 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
-use parameters::ConnectorParams;
+use linkme::distributed_slice;
+pub use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -51,67 +52,131 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+use tracing::Level;
 
 use std::future::Future;
+use std::time::Duration;
 
+pub mod http_rate_control;
 pub mod listing;
 
+/// Creates a default reqwest client with standard Spice settings.
+///
+/// # Errors
+///
+/// Returns an error if the client cannot be built.
+pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwest::Client> {
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
+
+    reqwest::Client::builder()
+        .user_agent(util::spiceai_user_agent())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+}
+
+#[derive(Clone, Copy)]
+pub struct DataConnectorRegistration {
+    pub name: &'static str,
+    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
+}
+
+impl DataConnectorRegistration {
+    pub const fn new(
+        name: &'static str,
+        constructor: fn() -> Arc<dyn DataConnectorFactory>,
+    ) -> Self {
+        Self { name, constructor }
+    }
+}
+
+/// Distributed slice that automatically collects all data connector registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
+#[distributed_slice]
+pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
+
+/// Registers a data connector factory by name.
+///
+/// This macro creates a constructor function for the specified connector factory type and
+/// registers it in the global distributed slice of data connectors. This allows
+/// the runtime to discover and instantiate connectors without updating a central registry.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_connector!("file", FileFactory);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_connector!(
+///     register_file_connector,
+///     FILE_CONNECTOR_REGISTRATION,
+///     "file",
+///     FileFactory
+/// );
+/// ```
+///
+/// Using this macro automatically adds the connector to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_connector {
+    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
+            <$factory>::new_arc()
+        }
+
+        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
+            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
+    };
+
+    ($name:expr, $factory:ident) => {
+        ::paste::paste! {
+            $crate::register_data_connector!(
+                [<__register_data_connector_fn_ $factory:snake>],
+                [<__REGISTER_DATA_CONNECTOR_ $factory:upper>],
+                $name,
+                $factory
+            );
+        }
+    };
+}
+
 pub mod abfs;
-#[cfg(feature = "clickhouse")]
-pub mod clickhouse;
-#[cfg(feature = "databricks")]
-pub mod databricks;
+#[cfg(feature = "adbc")]
+pub mod adbc;
+#[cfg(feature = "cosmosdb")]
+pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
-#[cfg(feature = "delta_lake")]
-pub mod delta_lake;
-#[cfg(feature = "dremio")]
-pub mod dremio;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
-#[cfg(feature = "flightsql")]
-pub mod flightsql;
-#[cfg(feature = "ftp")]
-pub mod ftp;
+
+pub mod git;
 pub mod github;
-pub mod graphql;
 pub mod https;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod localpod;
 pub mod memory;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
-#[cfg(feature = "mssql")]
-pub mod mssql;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "odbc")]
-pub mod odbc;
-#[cfg(feature = "oracle")]
-pub mod oracle;
+
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
+#[cfg(feature = "duckdb")]
+pub mod ducklake;
+pub mod gcs;
 pub mod glue;
 pub mod iceberg;
-#[cfg(feature = "imap")]
-pub mod imap;
 pub mod parameters;
-#[cfg(feature = "postgres")]
-pub mod postgres;
 pub mod s3;
-#[cfg(feature = "ftp")]
-pub mod sftp;
-#[cfg(feature = "sharepoint")]
-pub mod sharepoint;
 pub mod sink;
-#[cfg(feature = "snowflake")]
-pub mod snowflake;
-#[cfg(feature = "spark")]
-pub mod spark;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -311,6 +376,41 @@ pub enum DataConnectorError {
         dataconnector: String,
         keyword: String,
     },
+
+    #[snafu(display(
+        "Insufficient permissions to access the {connector_component} ({dataconnector}). {source}"
+    ))]
+    InsufficientPermissions {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl DataConnectorError {
+    /// Returns `true` if this error is transient and the operation may succeed
+    /// on retry. Configuration errors, unsupported type/table errors, and
+    /// permission errors are permanent and should not be retried.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidConfiguration { .. }
+                | Self::InvalidConfigurationSourceOnly { .. }
+                | Self::InvalidConfigurationNoSource { .. }
+                | Self::InvalidConnectorType { .. }
+                | Self::InvalidGlobPattern { .. }
+                | Self::InvalidTableName { .. }
+                | Self::InsufficientPermissions { .. }
+                | Self::UnableToConnectInvalidHostOrPort { .. }
+                | Self::UnableToConnectInvalidUsernameOrPassword { .. }
+                | Self::UnableToConnectTlsError { .. }
+                | Self::UnsupportedTypeAction { .. }
+                | Self::UnsupportedDataType { .. }
+                | Self::OdbcNotInstalled { .. }
+                | Self::UseOfProtectedKeyword { .. }
+        )
+    }
 }
 
 pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;
@@ -332,6 +432,12 @@ pub async fn register_connector_factory(
     registry.insert(name.to_string(), connector_factory);
 }
 
+/// Look up a registered connector factory by name.
+pub async fn get_connector_factory(name: &str) -> Option<Arc<dyn DataConnectorFactory>> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    guard.get(name).map(Arc::clone)
+}
+
 /// Create a new `DataConnector` by name.
 ///
 /// # Returns
@@ -341,11 +447,10 @@ pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
-    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-
-    let connector_factory = guard.get(name);
-
-    let factory = connector_factory?;
+    let factory = {
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        Arc::clone(guard.get(name)?)
+    };
 
     let ConnectorComponent::Dataset(ds) = &params.component else {
         unreachable!("Component is always a dataset at this point")
@@ -375,61 +480,48 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
-    #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
-    #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
-    register_connector_factory("file", file::FileFactory::new_arc()).await;
-    #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
-    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
-    #[cfg(feature = "imap")]
-    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
-    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("github", github::GithubFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
-    register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
-    register_connector_factory("memory", memory::MemoryConnectorFactory::new_arc()).await;
-    #[cfg(feature = "mongodb")]
-    register_connector_factory("mongodb", mongodb::MongoDBFactory::new_arc()).await;
-    #[cfg(feature = "mssql")]
-    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
-    #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
-    #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
-    #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
-    #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
-    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
-    #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
-    #[cfg(feature = "oracle")]
-    register_connector_factory("oracle", oracle::OracleFactory::new_arc()).await;
-    #[cfg(feature = "sharepoint")]
-    register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
-    #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
-    #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
-    #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    #[cfg(feature = "kafka")]
-    register_connector_factory("kafka", kafka::KafkaFactory::new_arc()).await;
-    register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
-    #[cfg(feature = "dynamodb")]
-    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
-    register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
-    register_connector_factory("glue", glue::GlueDataConnectorFactory::new_arc()).await;
+    for registration in DATA_CONNECTOR_REGISTRATIONS {
+        register_connector_factory(registration.name, (registration.constructor)()).await;
+    }
+}
+
+/// Names of every registered data connector. Useful for generating helpful
+/// "did you mean?" suggestions when a user references an unknown connector.
+pub async fn registered_connector_names() -> Vec<String> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    let mut names: Vec<String> = guard.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Returns the registered connector name whose Levenshtein distance to `name`
+/// is lowest (bounded so short typos only match very close names).
+pub async fn suggest_connector(name: &str) -> Option<String> {
+    closest_name(name, &registered_connector_names().await)
+}
+
+/// Pure helper used by [`suggest_connector`]. Kept separate from the registry
+/// lookup so its scoring + threshold can be unit-tested without spinning up
+/// the async registry.
+pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> {
+    let input = typo.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for candidate in candidates {
+        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+            best = Some((candidate.clone(), d));
+        }
+    }
+    let (candidate, distance) = best?;
+    // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
+    // wildly different name ("kafka" vs. "postgres") from being suggested while
+    // still catching connector-name typos like "postgress" → "postgres" (d=1).
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 pub async fn unregister_all() {
@@ -472,6 +564,35 @@ pub trait DataConnectorFactory: Send + Sync {
     fn reserved_keywords(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// Returns a static schema for the given dataset if this connector
+    /// **intrinsically** knows the schema from configuration alone
+    /// — i.e. without contacting the source and without relying on a
+    /// user-declared `columns:` block. (User-declared columns are
+    /// handled separately by the runtime's deferral dispatch as a
+    /// fallback when this method returns `None`.)
+    ///
+    /// Called during dataset registration **before** the connector itself
+    /// is built (no `create` call is required first). Implementations may
+    /// consult `params` (e.g. a configured file format) and `dataset`
+    /// (e.g. declared content type, JSON column decomposition) but must
+    /// not perform any I/O.
+    ///
+    /// When `Some(schema)` is returned, the runtime is allowed to register
+    /// the dataset using that schema and defer building the connector and
+    /// calling [`DataConnector::read_provider`] until the dataset is
+    /// actually referenced. The connector is still expected to return a
+    /// `TableProvider` whose schema matches on the first `read_provider`
+    /// call; mismatches surface at first scan as a hard error rather than
+    /// being silently retried (the static schema is configuration, not
+    /// source state).
+    ///
+    /// Default: `None`. Most connectors do not have an intrinsic
+    /// configuration-only schema and instead rely on either source
+    /// inference or the user-declared `columns:` fallback.
+    fn static_schema(&self, _params: &ConnectorParams, _dataset: &Dataset) -> Option<SchemaRef> {
+        None
+    }
 }
 
 /// A `DataConnector` knows how to retrieve and optionally write or stream data.
@@ -500,7 +621,14 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<Mutex<()>>,
+        _cpu_runtime: Option<tokio::runtime::Handle>,
+    ) -> Option<ChangesStream> {
         None
     }
 
@@ -517,6 +645,44 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
+    }
+
+    /// Pre-register any object stores this connector needs in order to execute
+    /// scans for `dataset` against the supplied `runtime_env`.
+    ///
+    /// Called on cluster executor startup so that physical plans decoded from
+    /// the scheduler can resolve their object stores via
+    /// `runtime_env().object_store(url)` even when the per-scan
+    /// `parquet_file_reader_factory` (or equivalent) is dropped during proto
+    /// round-trip.
+    ///
+    /// The default implementation is a no-op. Connectors backed by per-table
+    /// object stores (object-store-style connectors, Delta on S3/Azure/GCS,
+    /// Iceberg, etc.) should override this to register the appropriate stores
+    /// using the dataset's already secret-expanded params.
+    async fn register_object_stores(
+        &self,
+        _dataset: &Dataset,
+        _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
+    /// A hook called **before** the accelerated table is built, giving the
+    /// connector a chance to wrap or replace the accelerator provider on the
+    /// [`Builder`](crate::accelerated_table::Builder).
+    ///
+    /// Any provider set here will be shared with the [`Refresher`] that is
+    /// created during [`Builder::build`]. Use this hook instead of
+    /// [`on_accelerated_table_registration`](Self::on_accelerated_table_registration)
+    /// when the wrapped provider must be visible to the refresh pipeline
+    /// (e.g. to recreate indexes after a data refresh).
+    async fn on_accelerator_setup(
+        &self,
+        _dataset: &Dataset,
+        _builder: &mut accelerated_table::Builder,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 
     /// A hook that is called when an accelerated table is registered to the
@@ -542,7 +708,16 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
+    }
+
+    /// Returns whether the data connector should be initialized on startup or on trigger,
+    /// with dataset-specific logic.
+    ///
+    /// This method allows connectors to make initialization decisions based on the specific
+    /// dataset configuration. The default implementation delegates to `initialization()`.
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+        self.initialization()
     }
 }
 
@@ -595,6 +770,13 @@ pub async fn get_data(
 
     for filter in filters {
         df = df.filter(filter).map_err(find_datafusion_root)?;
+    }
+
+    if tracing::enabled!(Level::TRACE)
+        && let Ok(explained) = df.clone().explain(false, false)
+        && let Ok(explained) = explained.to_string().await
+    {
+        tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
     let sql = Unparser::default()
@@ -662,7 +844,7 @@ fn include_computed_columns(
                                 {
                                     proj.expr.push(Expr::Column(Column::new(
                                         proj.schema.qualified_field(idx).0.cloned(),
-                                        computed_column.name().to_string(),
+                                        computed_column.name().clone(),
                                     )));
                                 }
                             }
@@ -682,13 +864,134 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
-    use tokio::sync::RwLock;
+    use tokio::runtime::Handle;
+    use tokio::sync::{Barrier, RwLock};
+    use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn closest_name_matches_one_char_typo() {
+        let candidates = names(&["postgres", "mysql", "snowflake", "kafka"]);
+        assert_eq!(
+            closest_name("postgress", &candidates),
+            Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_matches_case_insensitive() {
+        let candidates = names(&["postgres", "mysql"]);
+        assert_eq!(
+            closest_name("MYSQL", &candidates),
+            Some("mysql".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_distant_returns_none() {
+        let candidates = names(&["postgres", "mysql", "kafka"]);
+        // "xyz" has no close match.
+        assert_eq!(closest_name("xyz", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_empty_candidates_returns_none() {
+        let candidates: Vec<String> = Vec::new();
+        assert_eq!(closest_name("postgres", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_short_typo_short_threshold() {
+        // Short names get a max_allowed floor of 1 — a single-char off name matches,
+        // but two chars off does not (protects against wildly different suggestions).
+        let candidates = names(&["pg", "my"]);
+        // "po" vs "pg": distance 1, allowed. vs "my": distance 2, not allowed.
+        assert_eq!(closest_name("po", &candidates), Some("pg".to_string()));
+        // "zz" vs both is distance 2 — no match.
+        assert_eq!(closest_name("zz", &candidates), None);
+    }
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;
     use crate::secrets::Secrets;
+
+    async fn build_test_connector_params(
+        connector_name: &str,
+        dataset_name: &str,
+        app: Arc<app::App>,
+        runtime: Arc<crate::Runtime>,
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> ConnectorParams {
+        let dataset =
+            DatasetBuilder::try_new(format!("{connector_name}:{dataset_name}"), dataset_name)
+                .expect("Failed to create builder")
+                .with_app(app)
+                .with_runtime(runtime)
+                .build()
+                .expect("Failed to build dataset");
+
+        ConnectorParamsBuilder::new(
+            connector_name.into(),
+            ConnectorComponent::Dataset(Arc::new(dataset)),
+        )
+        .build(secrets, Handle::current())
+        .await
+        .expect("failed to build connector params")
+    }
+
+    #[tokio::test]
+    async fn test_static_schema_default_returns_none() {
+        // Any factory that doesn't override `static_schema` should return
+        // None. This is the contract relied on by the deferred-dataset
+        // path: a None return falls back to the eager source-contact
+        // registration flow.
+        struct DefaultFactory;
+        impl DataConnectorFactory for DefaultFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                unimplemented!("static_schema must not require create()")
+            }
+            fn prefix(&self) -> &'static str {
+                "default_factory"
+            }
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+        }
+
+        register_connector_factory("default_factory", Arc::new(DefaultFactory)).await;
+
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let dataset = DatasetBuilder::try_new("default_factory:tbl".to_string(), "tbl")
+            .expect("Failed to create builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("Failed to build dataset");
+
+        let params = ConnectorParamsBuilder::new(
+            "default_factory".into(),
+            ConnectorComponent::Dataset(Arc::new(dataset.clone())),
+        )
+        .build(secrets, Handle::current())
+        .await
+        .expect("failed to build connector params");
+
+        let factory = DefaultFactory;
+        assert!(factory.static_schema(&params, &dataset).is_none());
+    }
 
     #[tokio::test]
     async fn test_connector_params_builder_unsupported_type_action() {
@@ -703,7 +1006,10 @@ mod tests {
                 &self,
                 _params: ConnectorParams,
             ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
-                Box::pin(async { Ok(Arc::new(TestConnector) as Arc<dyn DataConnector>) })
+                Box::pin(async {
+                    let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+                    Ok(connector)
+                })
             }
 
             fn prefix(&self) -> &'static str {
@@ -756,7 +1062,7 @@ mod tests {
             ConnectorComponent::Dataset(Arc::new(dataset)),
         );
 
-        let result = builder.build(secrets).await;
+        let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
 
         let params = result.expect("failed to build connector params");
@@ -764,6 +1070,101 @@ mod tests {
             params.unsupported_type_action,
             Some(UnsupportedTypeAction::Ignore),
             "Unsupported type action should be properly set in connector params"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_new_connector_allows_concurrent_factory_initialization() {
+        struct ConcurrentConnectorFactory {
+            barrier: Arc<Barrier>,
+        }
+
+        impl DataConnectorFactory for ConcurrentConnectorFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                let barrier = Arc::clone(&self.barrier);
+
+                Box::pin(async move {
+                    barrier.wait().await;
+
+                    let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+                    Ok(connector)
+                })
+            }
+
+            fn prefix(&self) -> &'static str {
+                "test_concurrent"
+            }
+
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestConnector;
+
+        #[async_trait]
+        impl DataConnector for TestConnector {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            async fn read_provider(
+                &self,
+                _dataset: &Dataset,
+            ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+                unimplemented!()
+            }
+        }
+
+        register_connector_factory(
+            "test_concurrent",
+            Arc::new(ConcurrentConnectorFactory {
+                barrier: Arc::new(Barrier::new(2)),
+            }),
+        )
+        .await;
+
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+
+        let params_one = build_test_connector_params(
+            "test_concurrent",
+            "first",
+            Arc::clone(&app),
+            Arc::clone(&runtime),
+            Arc::clone(&secrets),
+        )
+        .await;
+        let params_two =
+            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
+
+        let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
+            tokio::join!(
+                create_new_connector("test_concurrent", params_one),
+                create_new_connector("test_concurrent", params_two),
+            )
+        })
+        .await
+        .expect("create_new_connector should not serialize concurrent factory initialization");
+
+        assert!(result_one.is_some(), "first factory should be registered");
+        assert!(result_two.is_some(), "second factory should be registered");
+        assert!(
+            result_one.expect("first factory should exist").is_ok(),
+            "first connector should initialize successfully"
+        );
+        assert!(
+            result_two.expect("second factory should exist").is_ok(),
+            "second connector should initialize successfully"
         );
     }
 }

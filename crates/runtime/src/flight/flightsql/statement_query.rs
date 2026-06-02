@@ -30,9 +30,9 @@ use crate::{
         to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for executing a SQL query.
 pub(crate) async fn get_flight_info(
@@ -76,13 +76,20 @@ pub(crate) async fn do_get(
     let context = RequestContext::current(AsyncMarker::new().await);
     let datafusion = get_current_datafusion(&context);
 
-    tracing::trace!("do_get_statement: {cmd:?}");
-    let (output, from_cache) =
-        Box::pin(Service::sql_to_flight_stream(datafusion, &cmd.query, None)).await?;
+    tracing::trace!("do_get_statement: {:?}", cmd.query);
+    let pre_parsed_plan =
+        super::super::check_read_only_sql(&context, &datafusion, &cmd.query, None).await?;
+    let (output, from_cache) = Box::pin(Service::sql_to_flight_stream(
+        datafusion,
+        &cmd.query,
+        None,
+        pre_parsed_plan,
+    ))
+    .await?;
     let timed_output = TimedStream::new(output, move || start);
 
     let mut response =
         Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
-    attach_cache_metadata(&mut response, from_cache);
+    attach_cache_metadata(&mut response, from_cache, &context);
     Ok(response)
 }

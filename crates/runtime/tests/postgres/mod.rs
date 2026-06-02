@@ -28,7 +28,15 @@ use datafusion_table_providers::{
 
 use crate::{init_tracing, utils::test_request_context};
 
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
+pub mod comments;
 pub mod common;
+#[cfg(feature = "postgres")]
+pub mod dml;
+#[cfg(feature = "postgres")]
+pub mod replication;
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
+pub mod replication_tpch;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {

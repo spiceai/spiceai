@@ -1,0 +1,109 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-turso[file]
+datasets:
+  - from: s3:catalog_sales.parquet
+    name: catalog_sales
+    params: &s3_params
+      s3_endpoint: http://minio:9000
+      s3_region: us-east-1
+      s3_bucket: tpcds-sf1
+      s3_key: data
+      s3_access_key_id: ${secrets:AWS_ACCESS_KEY_ID}
+      s3_secret_access_key: ${secrets:AWS_SECRET_ACCESS_KEY}
+    acceleration: &acceleration
+      engine: turso
+      mode: file
+      enabled: true
+  - from: s3:catalog_returns.parquet
+    name: catalog_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:inventory.parquet
+    name: inventory
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:store_sales.parquet
+    name: store_sales
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:store_returns.parquet
+    name: store_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:web_sales.parquet
+    name: web_sales
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:web_returns.parquet
+    name: web_returns
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:customer.parquet
+    name: customer
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:customer_address.parquet
+    name: customer_address
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:customer_demographics.parquet
+    name: customer_demographics
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:date_dim.parquet
+    name: date_dim
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:household_demographics.parquet
+    name: household_demographics
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:item.parquet
+    name: item
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:promotion.parquet
+    name: promotion
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:ship_mode.parquet
+    name: ship_mode
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:store.parquet
+    name: store
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:time_dim.parquet
+    name: time_dim
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:warehouse.parquet
+    name: warehouse
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:web_site.parquet
+    name: web_site
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:web_page.parquet
+    name: web_page
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:income_band.parquet
+    name: income_band
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:reason.parquet
+    name: reason
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:call_center.parquet
+    name: call_center
+    params: *s3_params
+    acceleration: *acceleration
+  - from: s3:catalog_page.parquet
+    name: catalog_page
+    params: *s3_params
+    acceleration: *acceleration

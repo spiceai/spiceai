@@ -1,0 +1,9 @@
+---
+source: crates/vortex/src/convert/exprs.rs
+expression: result.display_tree().to_string()
+---
+vortex.zip()
+├── if_true: vortex.literal("yes")
+├── if_false: vortex.literal("no")
+└── mask: vortex.get_item(active)
+    └── input: vortex.root()

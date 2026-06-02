@@ -1,0 +1,24 @@
+version: v1
+kind: Spicepod
+name: v1_full_featured
+runtime:
+  results_cache:
+    enabled: true
+    item_ttl: 5s
+    cache_max_size: 128MiB
+  memory_limit: 512MiB
+  temp_directory: /tmp/spice_v1
+  params:
+    key1: value1
+  flight:
+    max_message_size: 16MiB
+datasets:
+  - name: my_dataset
+    from: s3://bucket/data.parquet
+    access: read_write
+    time_column: created_at
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: 10s

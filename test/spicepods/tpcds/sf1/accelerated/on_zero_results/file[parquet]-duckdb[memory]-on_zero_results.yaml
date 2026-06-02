@@ -10,6 +10,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/catalog_returns.parquet
     name: catalog_returns
     acceleration:
@@ -18,6 +20,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/inventory.parquet
     name: inventory
     acceleration:
@@ -26,6 +30,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM inventory LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/store_sales.parquet
     name: store_sales
     acceleration:
@@ -34,6 +40,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/store_returns.parquet
     name: store_returns
     acceleration:
@@ -42,6 +50,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/web_sales.parquet
     name: web_sales
     acceleration:
@@ -50,6 +60,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_sales LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/web_returns.parquet
     name: web_returns
     acceleration:
@@ -58,6 +70,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_returns LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/customer.parquet
     name: customer
     acceleration:
@@ -66,6 +80,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/customer_address.parquet
     name: customer_address
     acceleration:
@@ -74,6 +90,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer_address LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/customer_demographics.parquet
     name: customer_demographics
     acceleration:
@@ -82,6 +100,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM customer_demographics LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/date_dim.parquet
     name: date_dim
     acceleration:
@@ -90,6 +110,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM date_dim LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/household_demographics.parquet
     name: household_demographics
     acceleration:
@@ -98,6 +120,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM household_demographics LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/item.parquet
     name: item
     acceleration:
@@ -106,6 +130,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM item LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/promotion.parquet
     name: promotion
     acceleration:
@@ -114,6 +140,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM promotion LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/ship_mode.parquet
     name: ship_mode
     acceleration:
@@ -122,6 +150,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM ship_mode LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/store.parquet
     name: store
     acceleration:
@@ -130,6 +160,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM store LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/time_dim.parquet
     name: time_dim
     acceleration:
@@ -138,6 +170,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM time_dim LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/warehouse.parquet
     name: warehouse
     acceleration:
@@ -146,6 +180,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM warehouse LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/web_page.parquet
     name: web_page
     acceleration:
@@ -154,6 +190,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_page LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/web_site.parquet
     name: web_site
     acceleration:
@@ -162,6 +200,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM web_site LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/reason.parquet
     name: reason
     acceleration:
@@ -170,6 +210,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM reason LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/call_center.parquet
     name: call_center
     acceleration:
@@ -178,6 +220,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM call_center LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/income_band.parquet
     name: income_band
     acceleration:
@@ -186,6 +230,8 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM income_band LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25
   - from: file:data/catalog_page.parquet
     name: catalog_page
     acceleration:
@@ -194,3 +240,5 @@ datasets:
       enabled: true
       refresh_sql: 'SELECT * FROM catalog_page LIMIT 0'
       on_zero_results: use_source
+      params:
+        connection_pool_size: 25

@@ -14,36 +14,61 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{AccelerationSource, BootstrapStatus, DataAccelerator};
 use crate::{
     App, Runtime,
     component::{
         dataset::{
             Dataset,
-            acceleration::{Engine, Mode},
+            acceleration::{Acceleration, Engine, Mode, RefreshMode},
         },
         view::View,
     },
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
-    datafusion::dialect::new_duckdb_dialect,
+    dataaccelerator::{
+        FilePathError,
+        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+        storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
+    },
+    datafusion::{
+        dialect::new_duckdb_dialect,
+        sort_columns::{SortColumn, parse_sort_columns},
+        udf::deny_spice_functions_for_duckdb,
+    },
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path,
+    register_data_accelerator, spice_data_base_path,
 };
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
-    catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
+    catalog::TableProviderFactory,
+    datasource::TableProvider,
+    execution::context::SessionContext,
     logical_expr::CreateExternalTable,
+    sql::sqlparser::ast::{
+        Delete, FromTable, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement,
+        TableFactor,
+    },
 };
 use datafusion_table_providers::{
-    duckdb::{DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter},
-    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    duckdb::{
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        write::{DuckDBTableWriter, WriteCompletionHandler},
+    },
+    sql::db_connection_pool::{
+        self as db_connection_pool,
+        duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    },
 };
 use duckdb::AccessMode;
 use itertools::Itertools;
+use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{
     any::Any,
     cmp::max,
@@ -53,11 +78,31 @@ use std::{
     sync::{Arc, Once},
 };
 
-use super::{AccelerationSource, DataAccelerator};
-
 pub(crate) mod settings;
 
-const DEFAULT_MIN_IDLE_CONNECTIONS: u32 = 10;
+/// Creates a [`DuckDBTableProviderFactory`] with standard Spice settings (dialect, timezone,
+/// index scan tuning, function deny-list). All `DuckDB` accelerator consumers should use this
+/// to avoid divergent configurations.
+pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
+    DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+        .with_dialect(new_duckdb_dialect())
+        .with_settings_registry(
+            DuckDBSettingsRegistry::new()
+                .with_setting(Box::new(OrderByNonIntegerLiteral))
+                .with_setting(Box::new(settings::IndexScanPercentage))
+                .with_setting(Box::new(settings::IndexScanMaxCount))
+                .with_setting(Box::new(settings::TimeZone)),
+        )
+        .with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+}
+
+pub(crate) const DEFAULT_CONNECTION_POOL_SIZE: u32 = 10;
+pub(crate) const DEFAULT_EBS_CONNECTION_POOL_SIZE: u32 = 4;
+pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
+    "spice.optimizer.duckdb_aggregate_pushdown";
+
+use super::upsert_dedup;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -102,53 +147,13 @@ impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
-                .with_dialect(new_duckdb_dialect())
-                .with_settings_registry(
-                    DuckDBSettingsRegistry::new()
-                        .with_setting(Box::new(OrderByNonIntegerLiteral))
-                        .with_setting(Box::new(settings::IndexScanPercentage))
-                        .with_setting(Box::new(settings::IndexScanMaxCount)),
-                ),
+            duckdb_factory: create_factory(),
         }
     }
 
     /// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` accelerator from this dataset
     pub fn duckdb_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
-        if !source.is_file_accelerated() {
-            Err(Error::InvalidConfiguration {
-                detail: Arc::from("Dataset is not file accelerated"),
-            })
-        } else if let Some(acceleration) = source.acceleration().as_ref() {
-            let mut params = acceleration.params.clone();
-            let mut using_duckdb_data_dir = true;
-            let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
-                using_duckdb_data_dir = false;
-                spice_data_base_path()
-            });
-            params.insert("data_directory".to_string(), data_directory);
-
-            if let Some(duckdb_file) = params.remove("duckdb_file") {
-                if using_duckdb_data_dir {
-                    static WARN_ONCE: Once = Once::new();
-                    WARN_ONCE.call_once(|| {
-                        tracing::warn!(
-                            "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
-                        );
-                    });
-                }
-                params.insert("duckdb_open".to_string(), duckdb_file.to_string());
-            }
-
-            self.duckdb_factory
-                .duckdb_file_path("accelerated_duckdb", &mut params)
-                .map_err(|err| Error::InvalidConfiguration {
-                    detail: Arc::from(err.to_string()),
-                })
-        } else {
-            unreachable!("Expected dataset to have acceleration parameters, but none were found")
-        }
+        duckdb_file_path(&self.duckdb_factory, source, "accelerated_duckdb")
     }
 
     /// Returns an existing `DuckDB` connection pool for the given dataset, or creates a new one if it doesn't exist.
@@ -163,17 +168,30 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
                     source.runtime(),
                 );
-                let max_size = Self::get_max_size(num_accelerating_datasets);
-                let pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
+                let storage =
+                    resolve_acceleration_storage_async(acceleration.storage_profile, &duckdb_file)
+                        .await;
+                tracing::debug!(
+                    dataset = %source.name(),
+                    storage = %storage,
+                    "Resolved DuckDB acceleration storage profile"
+                );
+                let max_size =
+                    Self::get_pool_max_size(num_accelerating_datasets, acceleration, storage);
+                let min_idle = Self::get_pool_min_idle(storage, max_size);
+                let mut pool_builder = DuckDbConnectionPoolBuilder::file(&duckdb_file)
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_min_idle(Some(min_idle))
                     .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
+                for pragma in Self::storage_setup_queries(storage) {
+                    pool_builder = pool_builder.with_connection_setup_query(*pragma);
+                }
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
                     .await
@@ -183,10 +201,16 @@ impl DuckDBAccelerator {
             (_, Mode::Memory) => {
                 let num_accelerating_datasets =
                     self.get_num_accelerating_datasets(None, &source.app(), source.runtime());
-                let max_size = Self::get_max_size(num_accelerating_datasets);
+                let max_size = Self::get_pool_max_size(
+                    num_accelerating_datasets,
+                    acceleration,
+                    ResolvedAccelerationStorage::Unknown,
+                );
+                let min_idle =
+                    Self::get_pool_min_idle(ResolvedAccelerationStorage::Unknown, max_size);
                 let pool_builder = DuckDbConnectionPoolBuilder::memory()
                     .with_max_size(Some(max_size))
-                    .with_min_idle(Some(DEFAULT_MIN_IDLE_CONNECTIONS))
+                    .with_min_idle(Some(min_idle))
                     .with_connection_setup_query("PRAGMA enable_checkpoint_on_shutdown");
                 self.duckdb_factory
                     .get_or_init_instance_with_builder(pool_builder)
@@ -194,7 +218,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File) => {
+            (Err(e), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
@@ -221,8 +245,10 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if acceleration.mode == Mode::File
-                        && let Ok(file_path) = self.file_path(ds.as_ref())
+                    if matches!(
+                        acceleration.mode,
+                        Mode::File | Mode::FileCreate | Mode::FileUpdate
+                    ) && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
                         instance_usage += 1;
@@ -239,8 +265,105 @@ impl DuckDBAccelerator {
         instance_usage
     }
 
-    fn get_max_size(num_accelerating_datasets: u32) -> u32 {
-        max(DEFAULT_MIN_IDLE_CONNECTIONS, num_accelerating_datasets)
+    pub(crate) fn default_connection_pool_size(storage: ResolvedAccelerationStorage) -> u32 {
+        match storage {
+            ResolvedAccelerationStorage::Ebs => DEFAULT_EBS_CONNECTION_POOL_SIZE,
+            ResolvedAccelerationStorage::LocalSsd
+            | ResolvedAccelerationStorage::Tmpfs
+            | ResolvedAccelerationStorage::Unknown => DEFAULT_CONNECTION_POOL_SIZE,
+        }
+    }
+
+    pub(crate) fn get_pool_min_idle(storage: ResolvedAccelerationStorage, max_size: u32) -> u32 {
+        Self::default_connection_pool_size(storage).min(max_size)
+    }
+
+    /// Storage-profile-specific `DuckDB` pragmas applied to every connection in
+    /// the pool. These tune `DuckDB`'s I/O behavior to match the underlying
+    /// medium's latency and durability profile.
+    pub(crate) fn storage_setup_queries(
+        storage: ResolvedAccelerationStorage,
+    ) -> &'static [&'static str] {
+        match storage {
+            // Network-attached block storage (e.g. EBS, Azure Managed Disks)
+            // pays per-IO latency on every flush. Raise the checkpoint
+            // threshold so WAL flushes are larger and less frequent, which
+            // reduces write amplification on the slow link.
+            ResolvedAccelerationStorage::Ebs => &["PRAGMA checkpoint_threshold='256MiB'"],
+            // tmpfs/ramfs is volatile and effectively free to write, but
+            // checkpointing still copies pages around. Push the threshold up
+            // so steady-state workloads don't pay checkpoint cost on tiny
+            // amounts of dirty data.
+            ResolvedAccelerationStorage::Tmpfs => &["PRAGMA checkpoint_threshold='1GiB'"],
+            // Local SSD/NVMe handles small frequent flushes well; keep
+            // DuckDB defaults.
+            ResolvedAccelerationStorage::LocalSsd | ResolvedAccelerationStorage::Unknown => &[],
+        }
+    }
+
+    fn get_pool_max_size(
+        num_accelerating_datasets: u32,
+        acceleration: &Acceleration,
+        storage: ResolvedAccelerationStorage,
+    ) -> u32 {
+        let pool_size_param = acceleration
+            .params
+            .get("connection_pool_size")
+            .and_then(|size_str| size_str.parse::<u32>().ok());
+
+        pool_size_param.unwrap_or_else(|| {
+            max(
+                Self::default_connection_pool_size(storage),
+                num_accelerating_datasets,
+            )
+        })
+    }
+}
+
+/// Returns the `DuckDB` file path that would be used for a file-based `DuckDB` acceleration for this acceleration source
+///
+/// # Parameters
+///
+/// * `duckdb_factory` - The `DuckDB` table provider factory used to generate the file path
+/// * `source` - The acceleration source (dataset or view) containing acceleration configuration
+/// * `default_db_name` - Default database file name to use if the `duckdb_file` parameter is not specified
+pub fn duckdb_file_path(
+    duckdb_factory: &DuckDBTableProviderFactory,
+    source: &dyn AccelerationSource,
+    default_db_name: &str,
+) -> Result<String> {
+    if !source.is_file_accelerated() {
+        Err(Error::InvalidConfiguration {
+            detail: Arc::from("Dataset is not file accelerated"),
+        })
+    } else if let Some(acceleration) = source.acceleration().as_ref() {
+        let mut params = acceleration.params.clone();
+        let mut using_duckdb_data_dir = true;
+        let data_directory = params.remove("duckdb_data_dir").unwrap_or_else(|| {
+            using_duckdb_data_dir = false;
+            spice_data_base_path()
+        });
+        params.insert("data_directory".to_string(), data_directory);
+
+        if let Some(duckdb_file) = params.remove("duckdb_file") {
+            if using_duckdb_data_dir {
+                static WARN_ONCE: Once = Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        "'duckdb_data_dir' and 'duckdb_file' were both specified but 'duckdb_file' ({duckdb_file}) will be used."
+                    );
+                });
+            }
+            params.insert("duckdb_open".to_string(), duckdb_file);
+        }
+
+        duckdb_factory
+            .duckdb_file_path(default_db_name, &mut params)
+            .map_err(|err| Error::InvalidConfiguration {
+                detail: Arc::from(err.to_string()),
+            })
+    } else {
+        unreachable!("Expected dataset to have acceleration parameters, but none were found")
     }
 }
 
@@ -251,13 +374,28 @@ impl Default for DuckDBAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("file"),
     ParameterSpec::component("data_dir"),
-    ParameterSpec::runtime("file_watcher"),
     ParameterSpec::component("memory_limit"),
     ParameterSpec::component("preserve_insertion_order"),
     ParameterSpec::component("index_scan_percentage"),
     ParameterSpec::component("index_scan_max_count"),
+    ParameterSpec::runtime("partition_mode"),
+    ParameterSpec::component("partitioned_write_flush_threshold_rows"),
+    ParameterSpec::runtime("connection_pool_size").description(
+        "The maximum number of client connections created in the duckdb connection pool.",
+    ),
+    ParameterSpec::runtime("on_refresh_recompute_statistics"),
+    ParameterSpec::runtime("on_refresh_sort_columns"),
+    ParameterSpec::runtime("partitioned_write_buffer"),
+    ParameterSpec::runtime("optimizer_duckdb_aggregate_pushdown"),
+];
+
+static DUCKDB_TYPE_REWRITE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteRule] = &[
+    &arrow_tools::type_rewrite::DictionaryUnwrap,
+    &arrow_tools::type_rewrite::IntervalToMonthDayNano,
+    &arrow_tools::type_rewrite::NullToInt32,
 ];
 
 #[async_trait]
@@ -294,9 +432,9 @@ impl DataAccelerator for DuckDBAccelerator {
     async fn init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            return Ok(());
+            return Ok(BootstrapStatus::none());
         }
 
         let path = self.file_path(source)?;
@@ -323,12 +461,47 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            download_snapshot_if_needed(acceleration, source, PathBuf::from(path)).await;
+            // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
+            if acceleration.mode == Mode::FileCreate {
+                let file_path = std::path::Path::new(&path);
+                if file_path.exists() {
+                    snapshot_before_recreate(
+                        acceleration,
+                        &source.name().to_string(),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
+                            &path,
+                        )),
+                        AccelerationEngine::DuckDB,
+                        Arc::new(arrow_schema::Schema::empty()),
+                        None,
+                    )
+                    .await;
+
+                    tracing::warn!(
+                        "DuckDB acceleration mode is 'file_create', removing existing file: {}",
+                        path
+                    );
+                    std::fs::remove_file(file_path).map_err(|err| {
+                        Error::AccelerationInitializationFailed { source: err.into() }
+                    })?;
+                }
+            }
+
+            let bootstrap_status = download_snapshot_if_needed(
+                acceleration,
+                source,
+                runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(path)),
+                AccelerationEngine::DuckDB,
+                None,
+            )
+            .await;
 
             self.get_shared_pool(source).await?;
+
+            return Ok(bootstrap_status);
         }
 
-        Ok(())
+        Ok(BootstrapStatus::none())
     }
 
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
@@ -337,11 +510,30 @@ impl DataAccelerator for DuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         _partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        normalize_schema_for_duckdb(&mut cmd)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
         if let Some(duckdb_file) = cmd.options.remove("file") {
-            cmd.options
-                .insert("open".to_string(), duckdb_file.to_string());
+            cmd.options.insert("open".to_string(), duckdb_file);
         }
+
+        if let Some(recompute_statistics_on_write) =
+            cmd.options.remove("on_refresh_recompute_statistics")
+        {
+            // Translate Spice parameter to DuckDB write setting
+            cmd.options.insert(
+                "recompute_statistics_on_write".to_string(),
+                recompute_statistics_on_write,
+            );
+        }
+
+        let is_changes_refresh = source
+            .and_then(|src| src.acceleration())
+            .and_then(|acceleration| acceleration.refresh_mode)
+            .is_some_and(|refresh_mode| refresh_mode == RefreshMode::Changes);
+        apply_changes_refresh_write_defaults(&mut cmd, is_changes_refresh);
 
         // Modify the `cmd` by adding options to attach other databases
         if let Some(source) = source {
@@ -352,10 +544,9 @@ impl DataAccelerator for DuckDBAccelerator {
                 .clone()
                 .unwrap_or_default()
                 .temp_directory
-                .clone()
             {
                 cmd.options
-                    .insert("temp_directory".to_string(), temp_directory.to_string());
+                    .insert("temp_directory".to_string(), temp_directory);
             }
 
             if source.is_file_accelerated() {
@@ -384,10 +575,13 @@ impl DataAccelerator for DuckDBAccelerator {
                             .map(|view| view as Arc<dyn AccelerationSource>),
                     )
                     .filter_map(|other_source| {
-                        if other_source
-                            .acceleration()
-                            .is_some_and(|a| a.engine == Engine::DuckDB && a.mode == Mode::File)
-                        {
+                        if other_source.acceleration().is_some_and(|a| {
+                            a.engine == Engine::DuckDB
+                                && matches!(
+                                    a.mode,
+                                    Mode::File | Mode::FileCreate | Mode::FileUpdate
+                                )
+                        }) {
                             if other_source.name() == source.name() {
                                 None
                             } else {
@@ -409,7 +603,64 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
+        let write_completion_handler = source.and_then(|src| {
+            let acceleration = src.acceleration()?;
+            let dataset_name = src.name().to_string();
+            let schema = Arc::new(cmd.schema.as_arrow().clone());
+
+            let mut config = OnRefreshConfig::empty();
+
+            // Parse retention SQL if configured
+            if let Some(retention_sql) = acceleration
+                .retention_sql
+                .as_deref()
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+            {
+                match crate::datafusion::retention_sql::parse_retention_sql(
+                    src.name(),
+                    retention_sql,
+                    Arc::clone(&schema),
+                ) {
+                    Ok(parsed_sql) => {
+                        config = config.with_retention(parsed_sql.delete_statement);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse retention_sql for dataset {dataset_name}: {e}. Retention SQL will not be applied.");
+                    }
+                }
+            }
+
+            // Parse on_refresh_sort_columns if configured
+            if let Some(sort_columns_str) = acceleration
+                .params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                match parse_sort_columns(sort_columns_str, &schema) {
+                    Ok(sort_columns) => {
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            sort_columns = ?sort_columns,
+                            "Parsed on_refresh_sort_columns"
+                        );
+                        config = config.with_sort(sort_columns);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse on_refresh_sort_columns for dataset {dataset_name}: {e}. Sorting will not be applied."
+                        );
+                    }
+                }
+            }
+
+            Some(make_on_refresh_write_handler(dataset_name, config))
+        });
+
+        Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -419,13 +670,110 @@ impl DataAccelerator for DuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    fn supports_snapshot_reload(&self) -> bool {
+        true
+    }
+
+    /// Reloads the `DuckDB`-backed table provider from the snapshot file
+    /// that was just written to the primary path.
+    ///
+    /// Drops the previous provider, evicts the cached connection pool from
+    /// the upstream `DuckDBTableProviderFactory` registry, and then re-runs
+    /// the registry factory to build a fresh provider over the on-disk file.
+    /// The pool eviction is required because the registry caches pool
+    /// instances by file path; without it, the freshly built provider would
+    /// reuse the prior pool's open connections — which keep observing the
+    /// previous file inode — and queries would continue to return stale data
+    /// even after the file has been atomically replaced on disk.
+    async fn reload_from_snapshot(
+        &self,
+        source: &dyn AccelerationSource,
+        previous_provider: Arc<dyn TableProvider>,
+        provider_factory: super::ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // Drop the caller's clone first so the only remaining strong refs to
+        // the prior pool are the registry entry (which we are about to evict)
+        // and any in-flight queries (which will drain naturally).
+        drop(previous_provider);
+
+        // Evict the cached pool. For file mode this matches the path the
+        // factory keyed on at construction time; for memory mode this falls
+        // back to the in-memory key. Snapshot reload is only meaningful for
+        // file mode in practice (memory accelerators cannot be snapshotted),
+        // but the memory branch is kept for completeness.
+        let acceleration =
+            source
+                .acceleration()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "acceleration not configured for snapshot reload".into()
+                })?;
+        match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+                let path = self.duckdb_file_path(source).boxed()?;
+                self.duckdb_factory.invalidate_file_instance(path).await;
+            }
+            Mode::Memory => {
+                self.duckdb_factory
+                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
+                    .await;
+            }
+        }
+
+        provider_factory().await
+    }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(self.get_shared_pool(source).await?);
+        let table_name = table_name.to_owned();
+
+        tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let escaped = table_name.replace('"', "\"\"");
+                let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
+                duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&drop_sql, [])
+                    .boxed()?;
+                // Also drop any internal DuckDB tables associated with this table
+                let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
+                let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
+                let _ = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&internal_drop, []);
+                tracing::info!(
+                    "Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+}
+
+fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_changes_refresh: bool) {
+    if is_changes_refresh && !cmd.options.contains_key("recompute_statistics_on_write") {
+        cmd.options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "false".to_string(),
+        );
+    }
 }
 
 pub(crate) async fn create_table_provider(
     duckdb_factory: &DuckDBTableProviderFactory,
     cmd: &CreateExternalTable,
+    on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
+
     let table_provider = duckdb_factory
         .create(&ctx.state(), cmd)
         .await
@@ -437,16 +785,224 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer = Arc::new(duckdb_writer.clone());
-    let cloned_writer = Arc::clone(&duckdb_writer);
+    let duckdb_writer: Arc<DuckDBTableWriter> = match on_data_written {
+        Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
+        None => Arc::new(duckdb_writer.clone()),
+    };
 
-    let table_provider = Arc::new(PolyTableProvider::new(
-        cloned_writer,
+    // Wrap with upsert deduplication if needed
+    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
         duckdb_writer,
+        &cmd.options,
+        cmd.constraints.clone(),
+    );
+
+    let mut schema_metadata = HashMap::new();
+    schema_metadata.insert(
+        SPICE_ACCELERATOR_METADATA_KEY.to_string(),
+        "duckdb".to_string(),
+    );
+
+    let agg_pushdown_optimization = cmd
+        .options
+        .get("optimizer_duckdb_aggregate_pushdown")
+        .map_or("disabled", |v| v.as_str())
+        .to_lowercase();
+
+    schema_metadata.insert(
+        SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY.to_string(),
+        agg_pushdown_optimization,
+    );
+
+    let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
+        write_provider,
         read_provider,
+        schema_metadata,
     ));
 
     Ok(table_provider)
+}
+
+/// Reconstruct the DELETE statement with the internal `DuckDB` table name.
+fn reconstruct_retention_sql_with_table_name(
+    delete: &Delete,
+    internal_table_name: &str,
+) -> Result<String, String> {
+    // Clone the delete statement and modify the table name
+    let mut modified_delete = delete.clone();
+
+    // Replace the table name with the internal table name
+    // DuckDB internal table names should be used as-is without schema qualification
+    let FromTable::WithFromKeyword(from_tables) = &mut modified_delete.from else {
+        return Err("DELETE statement must use FROM keyword".to_string());
+    };
+
+    // Replace the first table's name, keeping all other properties
+    let Some(table_relation) = from_tables.first_mut() else {
+        return Err("No table specified in DELETE statement".to_string());
+    };
+
+    if let TableFactor::Table { name, .. } = &mut table_relation.relation {
+        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            internal_table_name,
+        ))]);
+    } else {
+        return Err("DELETE statement must reference a simple table".to_string());
+    }
+
+    // Simply convert the AST to string using Display trait
+    let statement = SQLStatement::Delete(modified_delete);
+    Ok(statement.to_string())
+}
+
+/// Configuration for on-refresh operations that run after data is written but before commit.
+#[derive(Clone, Default)]
+struct OnRefreshConfig {
+    /// Parsed DELETE statement for retention SQL
+    retention_delete: Option<Delete>,
+    /// Sort columns configuration
+    sort_columns: Vec<SortColumn>,
+}
+
+impl OnRefreshConfig {
+    /// Creates an empty config.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Sets retention SQL configuration.
+    #[must_use]
+    fn with_retention(mut self, delete: Delete) -> Self {
+        self.retention_delete = Some(delete);
+        self
+    }
+
+    /// Sets sort columns configuration.
+    #[must_use]
+    fn with_sort(mut self, columns: Vec<SortColumn>) -> Self {
+        self.sort_columns = columns;
+        self
+    }
+}
+
+fn make_on_refresh_write_handler(
+    dataset_name: String,
+    config: OnRefreshConfig,
+) -> WriteCompletionHandler {
+    Arc::new(move |tx, table_manager, _schema, inserted_rows| {
+        let internal_table_name = table_manager.table_name().to_string();
+
+        // Apply retention SQL if configured
+        if let Some(ref parsed_delete) = config.retention_delete {
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                "Applying retention SQL before commit"
+            );
+
+            let reconstructed_sql = match reconstruct_retention_sql_with_table_name(
+                parsed_delete,
+                &internal_table_name,
+            ) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to reconstruct retention SQL for dataset {dataset_name}: {e}"
+                    )));
+                }
+            };
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                sql = %reconstructed_sql,
+                "Reconstructed retention SQL with internal table name"
+            );
+
+            match tx.execute(reconstructed_sql.as_str(), []) {
+                Ok(affected_rows) => {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        table = %internal_table_name,
+                        affected_rows,
+                        "Retention SQL applied before commit"
+                    );
+                }
+                Err(err) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to apply retention SQL for dataset {dataset_name} (table {internal_table_name}): {err}"
+                    )));
+                }
+            }
+        }
+
+        // Current sorting implementation is experimental. CREATE OR REPLACE TABLE recreates
+        // the table from scratch, which means:
+        // - Primary keys and unique constraints (table-level definitions) are NOT preserved
+        // - Indexes (separate DB objects) are dropped when the original table is replaced
+        // - Foreign key constraints are NOT preserved
+        if !config.sort_columns.is_empty() {
+            let order_by_clause: String = config
+                .sort_columns
+                .iter()
+                .map(|sc| format!("\"{}\" {}", sc.column, sc.direction))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                order_by = %order_by_clause,
+                "Applying on-refresh sort before commit"
+            );
+
+            let sort_sql = format!(
+                "CREATE OR REPLACE TABLE \"{internal_table_name}\" AS SELECT * FROM \"{internal_table_name}\" ORDER BY {order_by_clause}"
+            );
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                sql = %sort_sql,
+                "Executing on-refresh sort SQL"
+            );
+
+            if let Err(err) = tx.execute(sort_sql.as_str(), []) {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to apply on-refresh sort for dataset {dataset_name} (table {internal_table_name}): {err}"
+                )));
+            }
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                "On-refresh sort applied before commit"
+            );
+        }
+
+        table_manager.create_indexes(tx).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "Failed to create DuckDB indexes for dataset {dataset_name} (table {internal_table_name}) before refresh commit: {err}"
+            ))
+        })?;
+
+        Ok(())
+    })
+}
+
+register_data_accelerator!(Engine::DuckDB, DuckDBAccelerator);
+
+fn normalize_schema_for_duckdb(cmd: &mut CreateExternalTable) -> datafusion::common::Result<()> {
+    use datafusion::common::ToDFSchema;
+    let arrow_schema = cmd.schema.as_arrow();
+    let normalized =
+        arrow_tools::type_rewrite::apply_rules(arrow_schema, DUCKDB_TYPE_REWRITE_RULES);
+    if normalized != *arrow_schema {
+        cmd.schema = ToDFSchema::to_dfschema_ref(Arc::new(normalized))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -456,9 +1012,8 @@ mod tests {
     use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
-        datatypes::{DataType, Schema},
+        datatypes::{DataType, Field, Schema},
     };
-    use data_components::delete::get_deletion_provider;
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -472,9 +1027,441 @@ mod tests {
     use crate::component::dataset::acceleration::{Engine, Mode};
     use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
 
+    fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(schema)
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("write_settings_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        }
+    }
+
+    #[test]
+    fn duckdb_write_settings_changes_refresh_disables_recompute_statistics_by_default() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"false".to_string())
+        );
+    }
+
+    #[test]
+    fn duckdb_write_settings_changes_refresh_preserves_explicit_recompute_statistics_setting() {
+        let mut options = HashMap::new();
+        options.insert(
+            "recompute_statistics_on_write".to_string(),
+            "true".to_string(),
+        );
+        let mut external_table = external_table_with_options(options);
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, true);
+
+        assert_eq!(
+            external_table.options.get("recompute_statistics_on_write"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn duckdb_write_settings_non_changes_refresh_keeps_recompute_statistics_unset() {
+        let mut external_table = external_table_with_options(HashMap::new());
+
+        super::apply_changes_refresh_write_defaults(&mut external_table, false);
+
+        assert!(
+            !external_table
+                .options
+                .contains_key("recompute_statistics_on_write")
+        );
+    }
+
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::unreadable_literal)]
+    async fn retention_sql_applies_before_commit() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("retention_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let retention_sql = "DELETE FROM retention_table WHERE value < 5";
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("retention_table"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
+        let handler = super::make_on_refresh_write_handler(
+            "retention_dataset".to_string(),
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 3, 5, 7]))],
+        )
+        .expect("to create RecordBatch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input)], schema));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("to create insert plan");
+
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("to execute insert");
+
+        let read_ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan");
+
+        let batches = collect(scan_plan, read_ctx.task_ctx())
+            .await
+            .expect("to execute scan");
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("to downcast column to Int64Array");
+            values.extend((0..column.len()).map(|idx| column.value(idx)));
+        }
+
+        assert_eq!(values, vec![5, 7]);
+    }
+
+    #[tokio::test]
+    async fn overwrite_index_failure_keeps_previous_duckdb_view() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        let mut options = HashMap::new();
+        options.insert("indexes".to_string(), "value:unique".to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("indexed_overwrite_table"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let handler = super::make_on_refresh_write_handler(
+            "indexed_overwrite_dataset".to_string(),
+            super::OnRefreshConfig::empty(),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        let write_ctx = SessionContext::new();
+        let initial_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .expect("to create initial RecordBatch");
+        let initial_exec = Arc::new(MockExec::new(vec![Ok(initial_input)], Arc::clone(&schema)));
+        let initial_insert = table
+            .insert_into(&write_ctx.state(), initial_exec, InsertOp::Overwrite)
+            .await
+            .expect("to create initial insert plan");
+        collect(initial_insert, write_ctx.task_ctx())
+            .await
+            .expect("initial overwrite should succeed");
+
+        let duplicate_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![3, 3]))],
+        )
+        .expect("to create duplicate RecordBatch");
+        let duplicate_exec = Arc::new(MockExec::new(
+            vec![Ok(duplicate_input)],
+            Arc::clone(&schema),
+        ));
+        let duplicate_insert = table
+            .insert_into(&write_ctx.state(), duplicate_exec, InsertOp::Overwrite)
+            .await
+            .expect("to create duplicate insert plan");
+        let duplicate_result = collect(duplicate_insert, write_ctx.task_ctx()).await;
+        assert!(
+            duplicate_result.is_err(),
+            "duplicate unique-index overwrite should fail"
+        );
+
+        let read_ctx = SessionContext::new();
+        let scan_plan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan");
+        let batches = collect(scan_plan, read_ctx.task_ctx())
+            .await
+            .expect("to execute scan");
+
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("to downcast column to Int64Array");
+            values.extend((0..column.len()).map(|idx| column.value(idx)));
+        }
+        values.sort_unstable();
+
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn retention_sql_fails_with_internal_tables() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+        use tempfile::TempDir;
+
+        // This test reproduces the bug where retention SQL fails with internal tables.
+        //
+        // When DuckDB uses internal tables (for indexes/constraints via preserve_insertion_order),
+        // the write completion handler receives the internal table name (like __data_table_123)
+        // from table_manager.table_name(), but the retention SQL references the logical table name.
+        //
+        // DuckDB's error: "Can only delete from base table!" occurs because DELETE statements
+        // must target the base/view table name, not the internal table directly.
+
+        let temp_dir = TempDir::new().expect("to create temp directory");
+        let db_path = temp_dir.path().join("test_retention.db");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        let mut options = HashMap::new();
+        // Use file mode to enable full DuckDB features
+        options.insert(
+            "open".to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
+        );
+        // Enable preserve_insertion_order which triggers internal table creation
+        options.insert("preserve_insertion_order".to_string(), "true".to_string());
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("taxi_trips"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+
+        // The retention SQL references the logical table name "taxi_trips"
+        let retention_sql = "DELETE FROM taxi_trips WHERE value < 5";
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("taxi_trips"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
+        let handler = super::make_on_refresh_write_handler(
+            "taxi_trips".to_string(),
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        );
+
+        let table = super::create_table_provider(
+            &duckdb_accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        // Insert initial data
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![1, 3, 5, 7])),
+            ],
+        )
+        .expect("to create RecordBatch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("to create insert plan");
+
+        // First insert should succeed
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("first insert should succeed");
+
+        // Verify internal tables were created by checking DuckDB directly
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_file(
+                db_path.to_str().expect("to convert path to string"),
+                &duckdb::AccessMode::ReadWrite,
+            )
+            .expect("to create DuckDB connection pool"),
+        );
+
+        let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+
+        // Check for internal tables (they follow the pattern __data_*)
+        let internal_tables: Vec<String> = duckdb_conn
+            .get_underlying_conn_mut()
+            .prepare(
+                "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '__data_%'",
+            )
+            .expect("to prepare SQL statement")
+            .query_map([], |row| row.get(0))
+            .expect("to execute query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("to collect query results");
+
+        if internal_tables.is_empty() {
+            eprintln!(
+                "WARNING: No internal tables found. Test may not be validating the bug correctly."
+            );
+            eprintln!(
+                "This could mean preserve_insertion_order didn't trigger internal table creation."
+            );
+            return;
+        }
+
+        eprintln!("Found internal tables: {internal_tables:?}");
+
+        // Now try to insert more data - this should trigger the retention SQL
+        // and fail because it tries to DELETE from the internal table name
+        let exec2 = Arc::new(MockExec::new(vec![Ok(input)], schema));
+
+        let insert_plan2 = table
+            .insert_into(&write_ctx.state(), exec2, InsertOp::Append)
+            .await
+            .expect("to create second insert plan");
+
+        let result = collect(insert_plan2, write_ctx.task_ctx()).await;
+
+        // This should fail with "Can only delete from base table!"
+        assert!(
+            result.is_err(),
+            "Expected an error due to retention SQL targeting internal table, but insert succeeded"
+        );
+
+        let error_msg = result.expect_err("Expected error").to_string();
+        assert!(
+            error_msg.contains("Can only delete from base table")
+                || error_msg.contains("Binder Error")
+                || error_msg.contains("to apply retention SQL"),
+            "Expected error about deleting from base table, got: {error_msg}"
+        );
+
+        eprintln!("✓ Test correctly reproduced the error: {error_msg}");
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unreadable_literal)]
     async fn test_round_trip_duckdb() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
@@ -493,7 +1480,8 @@ mod tests {
                 false,
             ),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
@@ -501,6 +1489,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -512,7 +1501,7 @@ mod tests {
         let duckdb_accelerator = DuckDBAccelerator::new();
         let ctx = SessionContext::new();
         let table = duckdb_accelerator
-            .create_external_table(external_table, None, vec![])
+            .create_external_table(external_table, None, vec![], None)
             .await
             .expect("table should be created");
 
@@ -557,9 +1546,6 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -568,8 +1554,8 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -587,8 +1573,8 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -618,15 +1604,12 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -652,15 +1635,12 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletion provider");
-
         let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan = delete_table
-            .delete_from(&ctx.state(), &[filter])
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
 
@@ -687,11 +1667,11 @@ mod tests {
             "duckdb_file_accelerator_init".to_string(),
             "duckdb_file_accelerator_init",
         )
-        .expect("Failed to create builder")
+        .expect("to create builder")
         .with_app(Arc::new(app))
         .with_runtime(Arc::new(rt))
         .build()
-        .expect("Failed to build dataset");
+        .expect("to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
@@ -708,12 +1688,621 @@ mod tests {
             .expect("initialization should be successful");
 
         assert!(accelerator.is_initialized(&dataset));
-        assert!(accelerator.file_path(&dataset).is_ok());
 
         let path = accelerator.file_path(&dataset).expect("path should exist");
         assert!(std::path::Path::new(&path).exists());
 
         // cleanup
         std::fs::remove_file(&path).expect("file should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_retention_sql_with_duckdb_accelerator() {
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the DuckDB file
+        let temp_dir = TempDir::new().expect("to create temp dir");
+        let db_path = temp_dir.path().join("test_retention.db");
+
+        // Create schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        // Prepare the external table command with file path
+        let mut external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("retention_test_dataset"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        external_table.options.insert(
+            "open".to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
+        );
+
+        // Parse retention SQL and create handler
+        let retention_sql = "DELETE FROM retention_test_dataset WHERE value < 5";
+        let parsed_delete = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("retention_test_dataset"),
+            retention_sql,
+            Arc::clone(&schema),
+        )
+        .expect("should parse retention SQL")
+        .delete_statement;
+        let handler = super::make_on_refresh_write_handler(
+            "retention_test_dataset".to_string(),
+            super::OnRefreshConfig::empty().with_retention(parsed_delete),
+        );
+
+        // Create the accelerator and table
+        let accelerator = DuckDBAccelerator::new();
+        let table = super::create_table_provider(
+            &accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        // Insert initial data with values both above and below the retention threshold
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(Int64Array::from(vec![2, 3, 4, 6, 7, 8])), // values: 2, 3, 4 should be deleted (< 5)
+            ],
+        )
+        .expect("to create RecordBatch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("to create insert plan");
+
+        // Execute the insert - this should trigger the retention SQL
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        // Query the table to verify retention SQL was applied
+        let read_ctx = SessionContext::new();
+        let scan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let results = collect(scan, read_ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        // Verify that only rows with value >= 5 remain
+        let mut total_rows = 0;
+        let mut values = Vec::new();
+        for batch in &results {
+            total_rows += batch.num_rows();
+            let value_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column should be Int64Array");
+
+            // Collect all values
+            for i in 0..value_array.len() {
+                values.push(value_array.value(i));
+            }
+        }
+
+        // All values should be >= 5
+        for value in &values {
+            assert!(
+                *value >= 5,
+                "Found value {value} which should have been deleted by retention SQL"
+            );
+        }
+
+        // We should have 3 rows remaining (values 6, 7, 8)
+        assert_eq!(
+            total_rows, 3,
+            "Expected 3 rows after retention (values >= 5), found {total_rows}. Values: {values:?}"
+        );
+
+        // cleanup
+        drop(table);
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_retention_sql() {
+        let sql = "DELETE FROM taxi_trips WHERE status = 'expired'";
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "status",
+            DataType::Utf8,
+            true,
+        )]));
+        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("taxi_trips"),
+            sql,
+            schema,
+        )
+        .expect("should parse");
+
+        let internal_name = "__data_taxi_trips_1234567890";
+        let result = super::reconstruct_retention_sql_with_table_name(
+            &parsed.delete_statement,
+            internal_name,
+        );
+
+        assert!(result.is_ok(), "Should reconstruct SQL successfully");
+        let reconstructed = result.expect("reconstructed");
+
+        // Verify the internal table name is used
+        assert!(
+            reconstructed.contains(internal_name),
+            "Should contain internal table name"
+        );
+
+        // Verify the WHERE clause is preserved
+        assert!(
+            reconstructed.contains("status = 'expired'")
+                || reconstructed.contains("status = \"expired\""),
+            "Should preserve WHERE clause"
+        );
+
+        // Verify it's still a DELETE statement
+        assert!(
+            reconstructed.to_lowercase().starts_with("delete from"),
+            "Should start with DELETE FROM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconstruct_retention_sql_complex_where() {
+        let sql = "DELETE FROM orders WHERE created_at < NOW() - INTERVAL '30 days' AND status IN ('cancelled', 'expired')";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("created_at", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let parsed = crate::datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("orders"),
+            sql,
+            schema,
+        )
+        .expect("should parse");
+
+        let internal_name = "__data_orders_9876543210";
+        let result = super::reconstruct_retention_sql_with_table_name(
+            &parsed.delete_statement,
+            internal_name,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should reconstruct complex SQL successfully"
+        );
+        let reconstructed = result.expect("reconstructed");
+
+        // Verify the internal table name is used
+        assert!(
+            reconstructed.contains(internal_name),
+            "Should contain internal table name"
+        );
+
+        // Basic sanity check - make sure it's still a valid DELETE statement structure
+        assert!(
+            reconstructed.to_lowercase().starts_with("delete from"),
+            "Should start with DELETE FROM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sort_columns_with_duckdb_accelerator() {
+        use crate::datafusion::sort_columns::SortColumn;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for the DuckDB file
+        let temp_dir = TempDir::new().expect("to create temp dir");
+        let db_path = temp_dir.path().join("test_sort.db");
+
+        // Create schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
+            .expect("to convert Arrow schema to DataFusion schema");
+
+        // Prepare the external table command with file path
+        let mut external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("sort_test_dataset"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        external_table.options.insert(
+            "open".to_string(),
+            db_path
+                .to_str()
+                .expect("to convert path to string")
+                .to_string(),
+        );
+
+        // Create sort columns configuration - sort by value DESC
+        let sort_columns = vec![SortColumn::desc("value")];
+        let handler = super::make_on_refresh_write_handler(
+            "sort_test_dataset".to_string(),
+            super::OnRefreshConfig::empty().with_sort(sort_columns),
+        );
+
+        // Create the accelerator and table
+        let accelerator = DuckDBAccelerator::new();
+        let table = super::create_table_provider(
+            &accelerator.duckdb_factory,
+            &external_table,
+            Some(handler),
+        )
+        .await
+        .expect("table should be created");
+
+        // Insert data in unsorted order
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int64Array::from(vec![30, 10, 50, 20, 40])), // unsorted values
+            ],
+        )
+        .expect("to create RecordBatch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input.clone())], Arc::clone(&schema)));
+
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("to create insert plan");
+
+        // Execute the insert - this should trigger the sort
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        // Query the table to verify sorting was applied
+        let read_ctx = SessionContext::new();
+        let scan = table
+            .scan(&read_ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let results = collect(scan, read_ctx.task_ctx())
+            .await
+            .expect("collect should succeed");
+
+        // Collect all values in order
+        let mut values = Vec::new();
+        for batch in &results {
+            let value_array = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column should be Int64Array");
+
+            for i in 0..value_array.len() {
+                values.push(value_array.value(i));
+            }
+        }
+
+        // Verify data is sorted in descending order
+        assert_eq!(
+            values,
+            vec![50, 40, 30, 20, 10],
+            "Data should be sorted by value DESC"
+        );
+
+        // cleanup
+        drop(table);
+        drop(temp_dir);
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
+    ///
+    /// Arrow Dictionary-encoded columns (enums) must be transparently unpacked
+    /// to their value types before reaching the `DuckDB` accelerator.
+    #[tokio::test]
+    async fn test_duckdb_dictionary_type_round_trip() {
+        use arrow::array::StringDictionaryBuilder;
+        use arrow::datatypes::Int32Type;
+
+        // Build a schema containing a Dictionary(Int32, Utf8) column.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        // Normalize the schema (Dictionary -> Utf8).
+        let accel_schema = Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
+            &source_schema,
+        ));
+        assert_eq!(accel_schema.field(1).data_type(), &DataType::Utf8);
+
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&accel_schema)).expect("df schema");
+
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("dict_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let table = duckdb_accelerator
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("DuckDB table with normalized Dictionary types should be created");
+
+        // Build a record batch with Dictionary-encoded data.
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let mut status_builder = StringDictionaryBuilder::<Int32Type>::new();
+        status_builder.append_value("active");
+        status_builder.append_value("inactive");
+        status_builder.append_value("active");
+        let statuses = status_builder.finish();
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(ids), Arc::new(statuses)],
+        )
+        .expect("record batch");
+
+        // Cast from Dictionary to the normalized schema before inserting.
+        let casted = arrow_tools::record_batch::try_cast_to(data, Arc::clone(&accel_schema))
+            .expect("cast Dictionary to Utf8");
+
+        let exec = MockExec::new(vec![Ok(casted)], accel_schema);
+        let ctx = SessionContext::new();
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion of Dictionary data into DuckDB should succeed");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert should succeed");
+
+        assert!(!result.is_empty());
+
+        // Verify the data can be read back.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back data");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3, "should have 3 rows");
+    }
+
+    /// Tests that the DROP TABLE SQL used by `drop_table` correctly removes a table.
+    #[tokio::test]
+    async fn test_drop_table_sql_removes_table() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+
+        let pool =
+            Arc::new(DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"));
+        let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+
+        let table_name = "drop_test_table";
+        let underlying = duckdb_conn.get_underlying_conn_mut();
+
+        // Create a table
+        underlying
+            .execute(
+                &format!("CREATE TABLE \"{table_name}\" (id INTEGER, name VARCHAR)"),
+                [],
+            )
+            .expect("create table should succeed");
+
+        // Insert data
+        underlying
+            .execute(
+                &format!("INSERT INTO \"{table_name}\" VALUES (1, 'alice')"),
+                [],
+            )
+            .expect("insert should succeed");
+
+        // Verify table exists
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 1, "table should exist before drop");
+
+        // Execute the same DROP TABLE SQL that drop_table() uses
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop should succeed");
+
+        // Verify the table is gone
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 0, "table should not exist after drop");
+
+        // Verify DROP IF EXISTS on non-existent table doesn't error
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop of non-existent table should succeed");
+    }
+
+    #[test]
+    fn storage_profile_drives_setup_pragmas() {
+        use crate::dataaccelerator::storage::ResolvedAccelerationStorage;
+
+        // EBS bumps the checkpoint threshold to amortize remote-disk writes.
+        let ebs = DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Ebs);
+        assert!(
+            ebs.iter().any(|q| q.contains("checkpoint_threshold")),
+            "EBS profile should tune checkpoint_threshold, got {ebs:?}"
+        );
+
+        // Tmpfs also raises checkpoint threshold (volatile, RAM-backed).
+        let tmpfs = DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Tmpfs);
+        assert!(
+            tmpfs.iter().any(|q| q.contains("checkpoint_threshold")),
+            "Tmpfs profile should tune checkpoint_threshold, got {tmpfs:?}"
+        );
+
+        // Local SSD and Unknown keep DuckDB defaults.
+        assert!(
+            DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::LocalSsd)
+                .is_empty()
+        );
+        assert!(
+            DuckDBAccelerator::storage_setup_queries(ResolvedAccelerationStorage::Unknown)
+                .is_empty()
+        );
+    }
+
+    fn cmd_with_schema(schema: Arc<Schema>) -> CreateExternalTable {
+        let df_schema = ToDFSchema::to_dfschema_ref(schema).expect("valid schema");
+        CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("t"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::default(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        }
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_null_to_int32() {
+        let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("untyped", DataType::Null, true),
+            Field::new("name", DataType::Utf8, true),
+        ])));
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        let arrow = cmd.schema.as_arrow();
+        assert_eq!(
+            arrow.field_with_name("id").expect("id field").data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            arrow
+                .field_with_name("untyped")
+                .expect("untyped field")
+                .data_type(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            arrow
+                .field_with_name("name")
+                .expect("name field")
+                .data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_interval_to_month_day_nano() {
+        use datafusion::arrow::datatypes::IntervalUnit;
+        let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("dur", DataType::Interval(IntervalUnit::YearMonth), true),
+        ])));
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        let arrow = cmd.schema.as_arrow();
+        assert_eq!(
+            arrow.field_with_name("dur").expect("dur field").data_type(),
+            &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_is_noop_when_no_rules_match() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut cmd = cmd_with_schema(Arc::clone(&schema));
+        let schema_before = Arc::clone(&cmd.schema);
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        assert!(
+            Arc::ptr_eq(&schema_before, &cmd.schema),
+            "schema Arc should be unchanged when no rules match"
+        );
     }
 }

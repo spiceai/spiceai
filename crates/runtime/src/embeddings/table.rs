@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::{any::Any, sync::Arc};
 
@@ -30,7 +31,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::{
     datasource::{TableProvider, TableType},
-    logical_expr::Expr,
+    logical_expr::{Expr, LogicalPlan},
 };
 use itertools::Itertools;
 use snafu::prelude::*;
@@ -40,7 +41,10 @@ use crate::embeddings::construct_chunker;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
-use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use spicepod::component::embeddings::{
+    ColumnEmbeddingConfig, EmbeddingAggregation, MULTI_VECTOR_MAX_ELEMENTS_DEFAULT,
+    MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP,
+};
 use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
@@ -48,9 +52,47 @@ use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed. For details, visit: https://spiceai.org/docs/components/embeddings",
+        "Column '{column}' has an unsupported data type for embedding. Supported types are string (`Utf8`, `Utf8View`, `LargeUtf8`) and list-of-string (`List<Utf8>`, `LargeList<Utf8>`). For details, visit: https://spiceai.org/docs/components/embeddings",
     ))]
     InvalidColumnType { column: String, data_type: DataType },
+
+    #[snafu(display(
+        "Column '{column}' is configured for multi-vector embedding (list-typed) but also has chunking enabled. Chunking only applies to scalar string columns. Remove the chunking configuration for multi-vector columns."
+    ))]
+    MultiVectorChunkingNotSupported { column: String },
+
+    #[snafu(display(
+        "Column '{column}' was configured with `aggregation` or `max_elements_per_row`, but its type '{data_type}' is not a list-typed column. These options only apply to multi-vector (list-typed) columns."
+    ))]
+    MultiVectorOptionsOnScalar { column: String, data_type: DataType },
+
+    #[snafu(display(
+        "Column '{column}': `max_elements_per_row` must be between 1 and {cap}, got {value}."
+    ))]
+    MaxElementsPerRowOutOfRange {
+        column: String,
+        value: usize,
+        cap: usize,
+    },
+
+    #[snafu(display(
+        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    EmbeddingModelNotFound { column: String, model: String },
+
+    #[snafu(display(
+        "Embedding row_id column '{row_id_column}' for column '{column}' was not found in the dataset schema. Valid columns: {valid_columns}. Verify the row_id configuration and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    RowIdColumnNotFound {
+        column: String,
+        row_id_column: String,
+        valid_columns: String,
+    },
+
+    #[snafu(display(
+        "The dataset is configured with an embedding for column '{column}', but '{column}' is not present in the dataset schema. Verify the column configuration and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    EmbeddingColumnNotInSchema { column: String },
 }
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
@@ -72,6 +114,63 @@ impl std::fmt::Debug for EmbeddingTable {
     }
 }
 
+/// Internal classifier for the source column's Arrow type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SourceShape {
+    /// `Utf8` / `Utf8View` / `LargeUtf8` — carries the concrete type for error messages.
+    Scalar(DataType),
+    /// `List<Utf8>` / `LargeList<Utf8>` (and `Utf8View`/`LargeUtf8` element variants).
+    ListOfString,
+}
+
+/// Compatibility matrix for the multi-vector output type
+/// (`List<FixedSizeList<F32, D>>`) across the accelerator engines Spice
+/// supports. This shape is identical to what the chunked-scalar path has
+/// produced since its introduction; multi-vector columns inherit that
+/// behavior.
+///
+/// | Accelerator | Storage                                     | Notes                        |
+/// |-------------|---------------------------------------------|------------------------------|
+/// | Arrow       | Native Arrow in-memory                      | Transparent.                 |
+/// | Cayenne     | Native Arrow persistence                    | Transparent.                 |
+/// | `DuckDB`      | Native `FLOAT[D][]`                         | Transparent.                 |
+/// | `SQLite`      | JSON-serialized `TEXT` (via table-providers)| Functional; JSON overhead.   |
+/// | Turso       | JSON-serialized `TEXT`                      | See `turso.rs:581-583`.      |
+/// | `PostgreSQL`  | Not yet supported                           | Out of scope this milestone. |
+///
+/// `SQLite` / Turso JSON serialization is lossy in type fidelity (everything
+/// round-trips as TEXT) but functionally correct. A proper side-table
+/// strategy (`<base>__<col>_mv(pk, elem_idx, vector)`) is a future
+/// optimization for those accelerators; the current behavior is the same
+/// the chunked-scalar path has shipped with.
+///
+/// Shape of the source column being embedded.
+///
+/// `Scalar` — the source column is a single string per row (`Utf8` /
+/// `Utf8View` / `LargeUtf8`). One embedding vector is produced per row,
+/// optionally doubly-nested if chunking is enabled.
+///
+/// `ListMulti` — the source column is a list of strings per row
+/// (`List<Utf8>` / `LargeList<Utf8>` and their `Utf8View` / `LargeUtf8`
+/// variants). One embedding vector is produced per list element; at
+/// query time per-element similarities are aggregated into a single
+/// per-row score via `aggregation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingInputMode {
+    Scalar,
+    ListMulti {
+        aggregation: EmbeddingAggregation,
+        max_elements_per_row: usize,
+    },
+}
+
+impl EmbeddingInputMode {
+    #[must_use]
+    pub fn is_list_multi(&self) -> bool {
+        matches!(self, Self::ListMulti { .. })
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbeddingColumnConfig {
     /// The name of the embedding model to use for this column.
@@ -86,6 +185,10 @@ pub struct EmbeddingColumnConfig {
 
     // If None, either no chunking is needed, or [`in_base_table`] is true.
     pub chunker: Option<Arc<dyn Chunker>>,
+
+    /// Shape of the source column. Determines the output Arrow type and
+    /// whether the search path uses MaxSim-over-elements.
+    pub input_mode: EmbeddingInputMode,
 }
 
 impl std::fmt::Debug for EmbeddingColumnConfig {
@@ -94,11 +197,89 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
             .field("model_name", &self.model_name)
             .field("vector_size", &self.vector_size)
             .field("in_base_table", &self.in_base_table)
+            .field("input_mode", &self.input_mode)
             .finish_non_exhaustive()
     }
 }
 
 impl EmbeddingTable {
+    pub async fn from_spicepod_columns(
+        base_table: Arc<dyn TableProvider>,
+        embeddings: Vec<ColumnEmbeddingConfig>,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+        file_format: Option<&str>,
+    ) -> Result<Arc<dyn TableProvider>, Error> {
+        if embeddings.is_empty() {
+            return Ok(base_table);
+        }
+
+        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
+            .iter()
+            .map(|e| (e.column.clone(), e.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Validate that all row_id columns exist in the dataset schema.
+        let base_schema = base_table.schema();
+        for (column, config) in &embed_columns {
+            if let Some(primary_keys) = &config.primary_keys {
+                for pk in primary_keys {
+                    if base_schema.column_with_name(pk).is_none() {
+                        let valid_columns: String = base_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::RowIdColumnNotFound {
+                            column: column.clone(),
+                            row_id_column: pk.clone(),
+                            valid_columns,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Early check if embedding models are available.
+        for (column, config) in &embed_columns {
+            let model = &config.model;
+            if !embedding_models.read().await.contains_key(model) {
+                return Err(Error::EmbeddingModelNotFound {
+                    column: column.clone(),
+                    model: model.clone(),
+                });
+            }
+        }
+
+        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
+            .iter()
+            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
+            .filter_map(|e| {
+                e.chunking.as_ref().map(|chunk_cfg| {
+                    (
+                        e.column.clone(),
+                        ChunkingConfig {
+                            target_chunk_size: chunk_cfg.target_chunk_size,
+                            overlap_size: chunk_cfg.overlap_size,
+                            trim_whitespace: chunk_cfg.trim_whitespace,
+                            file_format,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let embedding_table = EmbeddingTable::try_new(
+            base_table,
+            embed_columns,
+            Arc::clone(embedding_models),
+            embed_chunker_config,
+        )
+        .await?;
+
+        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
+    }
+
     /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
     pub async fn try_new(
@@ -111,8 +292,10 @@ impl EmbeddingTable {
         let mut embedded_columns: HashMap<String, EmbeddingColumnConfig> = HashMap::new();
 
         for (column, config) in embed_columns {
-            let model = config.model;
+            let model = config.model.clone();
             let chunking_config_opt = embed_chunker_config.get(&column);
+
+            let source_shape = Self::detect_source_shape(&column, &base_schema)?;
 
             if Self::base_table_has_embedding_column(&base_schema, &column) {
                 tracing::debug!(
@@ -136,6 +319,15 @@ impl EmbeddingTable {
                     continue;
                 };
 
+                // For precomputed embeddings, resolve the mode based on
+                // the source column's shape. If the source column isn't
+                // present (unusual — we got here via the embedding
+                // column existing), default to Scalar.
+                let input_mode = match source_shape {
+                    Some(shape) => Self::resolve_input_mode(&column, shape, &config)?,
+                    None => EmbeddingInputMode::Scalar,
+                };
+
                 embedded_columns.insert(
                     column,
                     EmbeddingColumnConfig {
@@ -143,6 +335,7 @@ impl EmbeddingTable {
                         vector_size: vector_length,
                         in_base_table: true,
                         chunker: None, // Don't need chunking since it is done in base table.
+                        input_mode,
                     },
                 );
             } else {
@@ -150,7 +343,12 @@ impl EmbeddingTable {
                     "Column '{column}' does not have needed embeddings in base table. Will augment with model {model}."
                 );
 
-                Self::verify_column_type_supported(&column, &base_schema)?;
+                // Source shape is required when we're computing
+                // embeddings — we can't embed a column we can't read.
+                let Some(shape) = source_shape else {
+                    return EmbeddingColumnNotInSchemaSnafu { column }.fail();
+                };
+                let input_mode = Self::resolve_input_mode(&column, shape, &config)?;
 
                 let Some(vector_length) =
                     Self::embedding_size_from_models(&model, &embedding_models).await
@@ -180,6 +378,7 @@ impl EmbeddingTable {
                         vector_size: vector_length,
                         in_base_table: false,
                         chunker,
+                        input_mode,
                     },
                 );
             }
@@ -196,15 +395,18 @@ impl EmbeddingTable {
     /// For a base table with column, c, we expect:
     ///  - `c` to be in the base schema.
     ///  - `c_embedding` to be in the base schema. It needs to have a type compatible with [`Self::embedding_fields`].
-    ///  - If `c_embedding` has a doubly-nested list type, `c_offsets` should also be in the base schema. It should be a `List[FixedSizeList[Int32, 2]]`.
+    ///  - If `c_embedding` has a doubly-nested list type AND the source column `c` is scalar-typed
+    ///    (a chunked scalar embedding), `c_offsets` must also be in the base schema as
+    ///    `List[FixedSizeList[Int32, 2]]`. For multi-vector embeddings (`c` is list-typed), no
+    ///    offsets column is required — element index is the implicit offset.
     fn base_table_has_embedding_column(base_schema: &SchemaRef, column: &str) -> bool {
         // Check if the base column exists
-        if base_schema.column_with_name(column).is_none() {
+        let Some((_, source_field)) = base_schema.column_with_name(column) else {
             tracing::warn!(
-                "Column '{column}' does not exist in the base table. Cannot use it create an embeddings"
+                "Column '{column}' does not exist in the base table. Cannot use it to create embeddings"
             );
             return false;
-        }
+        };
 
         // Check if the embedding column exists and has a valid data type
         let Some((_, embedding_field)) =
@@ -217,12 +419,40 @@ impl EmbeddingTable {
             return false;
         }
 
-        // If embedding is doubly nested, also check for the offsets column
-        if let DataType::List(inner)
-        | DataType::LargeList(inner)
-        | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
-            && let DataType::FixedSizeList(_, _) = inner.data_type()
-        {
+        // If the source column is list-of-string, this is multi-vector
+        // mode: no sibling offsets column is required.
+        let source_is_list_of_string = matches!(
+            source_field.data_type(),
+            DataType::List(inner) | DataType::LargeList(inner)
+                if matches!(
+                    inner.data_type(),
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                )
+        );
+
+        // Multi-vector mode must have a doubly-nested embedding column
+        // (`List<FixedSizeList<...>>` or similar). Otherwise treating a
+        // scalar embedding as precomputed leads to UNNEST planning errors
+        // downstream.
+        let embedding_is_doubly_nested = matches!(
+            embedding_field.data_type(),
+            DataType::List(inner)
+            | DataType::LargeList(inner)
+            | DataType::FixedSizeList(inner, _)
+                if matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        );
+
+        if source_is_list_of_string && !embedding_is_doubly_nested {
+            tracing::warn!(
+                "Column '{column}' is list-typed (multi-vector) but the precomputed embedding column '{}' is not doubly-nested (`List<FixedSizeList<...>>`). Will recompute embeddings.",
+                embedding_col!(column).as_str()
+            );
+            return false;
+        }
+
+        // Otherwise, if the embedding is doubly nested (chunked scalar),
+        // require the offsets column too.
+        if !source_is_list_of_string && embedding_is_doubly_nested {
             let Some((_, offsets_field)) =
                 base_schema.column_with_name(offset_col!(column).as_str())
             else {
@@ -311,6 +541,40 @@ impl EmbeddingTable {
         })
     }
 
+    /// Returns true if the column's embedding is produced in multi-vector
+    /// mode (source column is list-typed, one embedding per list
+    /// element). Multi-vector and chunked outputs share the same
+    /// doubly-nested Arrow shape, but the search path aggregates them
+    /// differently (multi-vector: max over list elements; chunked: max
+    /// over chunks of one scalar string).
+    #[must_use]
+    pub fn is_multi_vector(&self, column: &str) -> bool {
+        self.embedded_columns
+            .get(column)
+            .is_some_and(|cfg| cfg.input_mode.is_list_multi())
+    }
+
+    /// Returns the aggregation strategy configured for a multi-vector
+    /// column, or `None` if the column is scalar.
+    #[must_use]
+    pub fn multi_vector_aggregation(&self, column: &str) -> Option<EmbeddingAggregation> {
+        self.embedded_columns
+            .get(column)
+            .and_then(|cfg| match cfg.input_mode {
+                EmbeddingInputMode::ListMulti { aggregation, .. } => Some(aggregation),
+                EmbeddingInputMode::Scalar => None,
+            })
+    }
+
+    /// Returns true when the column's output Arrow type is
+    /// doubly-nested (`List<FixedSizeList<...>>`): either because the
+    /// scalar source is chunked, or because the source is list-typed
+    /// (multi-vector). Both use the same UNNEST-based search path.
+    #[must_use]
+    pub fn has_nested_embedding_output(&self, column: &str) -> bool {
+        self.is_chunked(column) || self.is_multi_vector(column)
+    }
+
     /// Get the names of the columns that are augmented with embeddings.
     #[must_use]
     pub fn get_embedding_columns(&self) -> Vec<String> {
@@ -333,21 +597,84 @@ impl EmbeddingTable {
         vector_length(embedding_field.data_type())
     }
 
-    fn verify_column_type_supported(column: &str, base_schema: &SchemaRef) -> Result<(), Error> {
-        if let Some((_, field)) = base_schema.column_with_name(column) {
-            let data_type = field.data_type();
-            if !matches!(
-                data_type,
-                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
-            ) {
-                return InvalidColumnTypeSnafu {
-                    column: column.to_string(),
-                    data_type: data_type.clone(),
+    /// Shape of the source column, if it exists and has a supported
+    /// type. Returns `None` when the column isn't in the base schema
+    /// (caller handles that case); errors when the column exists but has
+    /// an unsupported type.
+    fn detect_source_shape(
+        column: &str,
+        base_schema: &SchemaRef,
+    ) -> Result<Option<SourceShape>, Error> {
+        let Some((_, field)) = base_schema.column_with_name(column) else {
+            return Ok(None);
+        };
+        let data_type = field.data_type();
+        match data_type {
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
+                Ok(Some(SourceShape::Scalar(data_type.clone())))
+            }
+            DataType::List(inner) | DataType::LargeList(inner)
+                if matches!(
+                    inner.data_type(),
+                    DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+                ) =>
+            {
+                Ok(Some(SourceShape::ListOfString))
+            }
+            _ => InvalidColumnTypeSnafu {
+                column: column.to_string(),
+                data_type: data_type.clone(),
+            }
+            .fail(),
+        }
+    }
+
+    /// Resolve the effective [`EmbeddingInputMode`] for a column given
+    /// its detected source shape and the user-provided configuration.
+    /// Enforces validation rules: list-typed multi-vector options only
+    /// apply to list columns; chunking is incompatible with multi-vector;
+    /// `max_elements_per_row` is bounds-checked.
+    fn resolve_input_mode(
+        column: &str,
+        shape: SourceShape,
+        config: &ColumnEmbeddingConfig,
+    ) -> Result<EmbeddingInputMode, Error> {
+        match shape {
+            SourceShape::Scalar(data_type) => {
+                if config.aggregation.is_some() || config.max_elements_per_row.is_some() {
+                    return MultiVectorOptionsOnScalarSnafu {
+                        column: column.to_string(),
+                        data_type,
+                    }
+                    .fail();
                 }
-                .fail();
+                Ok(EmbeddingInputMode::Scalar)
+            }
+            SourceShape::ListOfString => {
+                if config.chunking.as_ref().is_some_and(|c| c.enabled) {
+                    return MultiVectorChunkingNotSupportedSnafu {
+                        column: column.to_string(),
+                    }
+                    .fail();
+                }
+                let aggregation = config.aggregation.unwrap_or_default();
+                let cap = config
+                    .max_elements_per_row
+                    .unwrap_or(MULTI_VECTOR_MAX_ELEMENTS_DEFAULT);
+                if cap == 0 || cap > MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP {
+                    return MaxElementsPerRowOutOfRangeSnafu {
+                        column: column.to_string(),
+                        value: cap,
+                        cap: MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP,
+                    }
+                    .fail();
+                }
+                Ok(EmbeddingInputMode::ListMulti {
+                    aggregation,
+                    max_elements_per_row: cap,
+                })
             }
         }
-        Ok(())
     }
 
     async fn embedding_size_from_models(
@@ -417,8 +744,10 @@ impl EmbeddingTable {
             return vec![];
         }
 
-        if cfg.chunker.is_some() {
-            vec![
+        match (cfg.input_mode, cfg.chunker.is_some()) {
+            // Scalar + chunked: doubly nested embedding + offsets
+            // (character offsets of each chunk into the source string).
+            (EmbeddingInputMode::Scalar, true) => vec![
                 Arc::new(Field::new_list(
                     embedding_col!(field.name()),
                     Field::new_fixed_size_list(
@@ -439,18 +768,38 @@ impl EmbeddingTable {
                     ),
                     false,
                 )),
-            ]
-        } else {
-            vec![Arc::new(Field::new_fixed_size_list(
+            ],
+            // Scalar + unchunked: one vector per row.
+            (EmbeddingInputMode::Scalar, false) => vec![Arc::new(Field::new_fixed_size_list(
                 embedding_col!(field.name()),
                 Field::new("item", DataType::Float32, true),
                 cfg.vector_size,
                 true,
-            ))]
+            ))],
+            // Multi-vector: one vector per list element. No offsets —
+            // element index serves as the implicit offset into the
+            // source list at query time.
+            //
+            // The inner FixedSizeList is nullable so that null strings
+            // inside the source list produce null vectors in the output,
+            // preserving index correspondence with the source column.
+            // The outer list is non-null: a null source row maps to an
+            // empty output list.
+            (EmbeddingInputMode::ListMulti { .. }, _) => vec![Arc::new(Field::new_list(
+                embedding_col!(field.name()),
+                Field::new_fixed_size_list(
+                    "item",
+                    Field::new("item", DataType::Float32, false),
+                    cfg.vector_size,
+                    true,
+                ),
+                false,
+            ))],
         }
     }
 }
 
+#[deny(clippy::missing_trait_methods)]
 #[async_trait]
 impl TableProvider for EmbeddingTable {
     fn as_any(&self) -> &dyn Any {
@@ -467,6 +816,19 @@ impl TableProvider for EmbeddingTable {
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.base_table.get_column_default(column)
+    }
+
+    fn get_table_definition(&self) -> Option<&str> {
+        self.base_table.get_table_definition()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        // EmbeddingTable augments the base table's schema with computed
+        // embedding columns. The base table's logical plan does not represent
+        // those columns, so forwarding it would cause `LogicalPlanBuilder::scan`
+        // to inline a plan whose schema is missing the embedding columns —
+        // any subsequent projection of those columns then fails.
+        None
     }
 
     fn schema(&self) -> SchemaRef {
@@ -488,10 +850,7 @@ impl TableProvider for EmbeddingTable {
                         let embedding_fields = self.embedding_fields(field);
                         computed_columns_meta.insert(
                             base_column_name.clone(),
-                            embedding_fields
-                                .iter()
-                                .map(|f| f.name().to_string())
-                                .collect(),
+                            embedding_fields.iter().map(|f| f.name().clone()).collect(),
                         );
                         embedding_fields
                     })
@@ -499,6 +858,12 @@ impl TableProvider for EmbeddingTable {
             .flatten()
             .collect();
 
+        // Deduplicate: if the base table already stores the embedding column (e.g. after a
+        // refresh writes it to DuckDB while in_base_table was set to false at startup), skip
+        // re-appending it to avoid a duplicate field that corrupts column-index resolution.
+        let base_field_names: std::collections::HashSet<_> =
+            base_fields.iter().map(|f| f.name().clone()).collect();
+        embedding_fields.retain(|f| !base_field_names.contains(f.name()));
         base_fields.append(&mut embedding_fields);
 
         let mut schema = Schema::new(base_fields);
@@ -602,7 +967,7 @@ impl TableProvider for EmbeddingTable {
             .schema()
             .fields
             .iter()
-            .map(|f| f.name().to_string())
+            .map(|f| f.name().clone())
             .collect();
 
         let push_downs = filters
@@ -641,6 +1006,43 @@ impl TableProvider for EmbeddingTable {
         overwrite: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         self.base_table.insert_into(state, input, overwrite).await
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.delete_from(state, filters).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.update(state, assignments, filters).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: datafusion::catalog::ScanArgs<'a>,
+    ) -> DataFusionResult<datafusion::catalog::ScanResult> {
+        let plan = self
+            .scan(
+                state,
+                args.projection().map(<[usize]>::to_vec).as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+            )
+            .await?;
+        Ok(plan.into())
+    }
+
+    async fn truncate(&self, state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.base_table.truncate(state).await
     }
 }
 
@@ -760,5 +1162,569 @@ mod tests {
             ])),
             "c"
         ));
+    }
+
+    #[test]
+    fn test_list_source_with_scalar_embedding_rejected() {
+        // Multi-vector source (`List<Utf8>`) paired with a singly-nested
+        // (scalar) embedding column is a shape mismatch: the runtime
+        // cannot UNNEST stored vectors per-element from a
+        // `FixedSizeList<Float32>` alone.
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            &Arc::new(Schema::new(vec![
+                field("c", DataType::List(field("item", DataType::Utf8))),
+                field(
+                    "c_embedding",
+                    DataType::FixedSizeList(field("item", DataType::Float32), 4),
+                ),
+            ])),
+            "c"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_row_id_column_rejected() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+            field("r_comment", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["n_regionkey".to_string()]),
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected row_id validation error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("n_regionkey"),
+            "Error should mention the invalid column name, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("r_name"),
+            "Error should mention the embedding column, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_row_id_column_accepted() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        // Valid row_id but model doesn't exist — should fail on model check, NOT row_id check
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["id".to_string()]),
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected model-not-found error");
+        // Should fail on model not found, not row_id validation
+        assert!(
+            matches!(err, Error::EmbeddingModelNotFound { .. }),
+            "Expected EmbeddingModelNotFound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_row_id_columns_accepted() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        // No primary_keys specified — should pass row_id validation and fail on model check
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected model-not-found error");
+        assert!(
+            matches!(err, Error::EmbeddingModelNotFound { .. }),
+            "Expected EmbeddingModelNotFound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_row_id_columns_one_invalid() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["id".to_string(), "nonexistent".to_string()]),
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected row_id validation error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("nonexistent"),
+            "Error should mention the invalid column, got: {err_msg}"
+        );
+    }
+
+    // ===== M1: multi-vector configuration =====
+
+    fn list_of_utf8(name: &str) -> FieldRef {
+        Arc::new(Field::new_list(
+            name,
+            Field::new("item", DataType::Utf8, true),
+            true,
+        ))
+    }
+
+    #[test]
+    fn test_detect_source_shape_scalar_utf8() {
+        let schema = Arc::new(Schema::new(vec![field("c", DataType::Utf8)]));
+        let shape = EmbeddingTable::detect_source_shape("c", &schema).expect("ok");
+        assert_eq!(shape, Some(SourceShape::Scalar(DataType::Utf8)));
+    }
+
+    #[test]
+    fn test_detect_source_shape_list_of_utf8() {
+        let schema = Arc::new(Schema::new(vec![list_of_utf8("tags")]));
+        let shape = EmbeddingTable::detect_source_shape("tags", &schema).expect("ok");
+        assert_eq!(shape, Some(SourceShape::ListOfString));
+    }
+
+    #[test]
+    fn test_detect_source_shape_unsupported() {
+        let schema = Arc::new(Schema::new(vec![field("c", DataType::Int32)]));
+        let err = EmbeddingTable::detect_source_shape("c", &schema)
+            .expect_err("expected unsupported type");
+        assert!(matches!(err, Error::InvalidColumnType { .. }));
+    }
+
+    #[test]
+    fn test_detect_source_shape_missing_column() {
+        let schema = Arc::new(Schema::new(vec![field("other", DataType::Utf8)]));
+        let shape = EmbeddingTable::detect_source_shape("c", &schema).expect("ok");
+        assert_eq!(shape, None);
+    }
+
+    #[test]
+    fn test_resolve_input_mode_scalar_default() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "c".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        };
+        let mode =
+            EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar(DataType::Utf8), &cfg)
+                .expect("ok");
+        assert_eq!(mode, EmbeddingInputMode::Scalar);
+    }
+
+    #[test]
+    fn test_resolve_input_mode_scalar_rejects_multi_vector_options() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "c".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: Some(EmbeddingAggregation::Max),
+            max_elements_per_row: None,
+        };
+        let err =
+            EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar(DataType::Utf8), &cfg)
+                .expect_err("expected rejection");
+        assert!(matches!(err, Error::MultiVectorOptionsOnScalar { .. }));
+    }
+
+    #[test]
+    fn test_resolve_input_mode_list_defaults_max_and_cap_32() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "tags".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        };
+        let mode = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect("ok");
+        match mode {
+            EmbeddingInputMode::ListMulti {
+                aggregation,
+                max_elements_per_row,
+            } => {
+                assert_eq!(aggregation, EmbeddingAggregation::Max);
+                assert_eq!(max_elements_per_row, MULTI_VECTOR_MAX_ELEMENTS_DEFAULT);
+            }
+            EmbeddingInputMode::Scalar => panic!("expected ListMulti"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_input_mode_list_honors_aggregation_override() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "tags".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: Some(EmbeddingAggregation::Mean),
+            max_elements_per_row: Some(64),
+        };
+        let mode = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect("ok");
+        assert_eq!(
+            mode,
+            EmbeddingInputMode::ListMulti {
+                aggregation: EmbeddingAggregation::Mean,
+                max_elements_per_row: 64,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_input_mode_list_rejects_chunking() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "tags".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: Some(spicepod::component::embeddings::EmbeddingChunkConfig {
+                enabled: true,
+                target_chunk_size: 256,
+                overlap_size: 0,
+                trim_whitespace: false,
+            }),
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
+        };
+        let err = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect_err("expected chunking rejection");
+        assert!(matches!(err, Error::MultiVectorChunkingNotSupported { .. }));
+    }
+
+    #[test]
+    fn test_resolve_input_mode_list_rejects_zero_cap() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "tags".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: Some(0),
+        };
+        let err = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect_err("expected cap rejection");
+        assert!(matches!(err, Error::MaxElementsPerRowOutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_resolve_input_mode_list_rejects_cap_above_hard_cap() {
+        let cfg = ColumnEmbeddingConfig {
+            column: "tags".to_string(),
+            model: "m".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+            aggregation: None,
+            max_elements_per_row: Some(MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP + 1),
+        };
+        let err = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect_err("expected cap rejection");
+        assert!(matches!(err, Error::MaxElementsPerRowOutOfRange { .. }));
+    }
+
+    // ===== M4: accelerator schema compatibility =====
+    //
+    // Multi-vector output is `List<FixedSizeList<F32, D>>` — the
+    // identical Arrow shape the chunked-scalar path has always emitted
+    // (just without the sibling `_offset` column). Arrow, Cayenne, and
+    // DuckDB accelerators already round-trip this shape via the chunked
+    // code path, so multi-vector inherits that compatibility with no
+    // additional accelerator changes. SQLite / Turso nested-
+    // FixedSizeList support remains fragile and is addressed by the
+    // M7 side-table strategy.
+
+    #[test]
+    fn test_embedding_fields_multi_vector_schema_matches_chunked_minus_offset() {
+        // A multi-vector column should produce exactly one output field:
+        // `<col>_embedding: List<FixedSizeList<F32, D>>`. The chunked path
+        // adds an `<col>_offset` sibling; multi-vector does not.
+        let tags_field = Arc::new(Field::new_list(
+            "tags",
+            Field::new("item", DataType::Utf8, true),
+            true,
+        ));
+        let base_schema = Arc::new(Schema::new(vec![Arc::clone(&tags_field)]));
+
+        let embedded_columns = HashMap::from([(
+            "tags".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::ListMulti {
+                    aggregation: EmbeddingAggregation::Max,
+                    max_elements_per_row: 32,
+                },
+            },
+        )]);
+
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let fields = table.embedding_fields(&tags_field);
+        assert_eq!(fields.len(), 1, "multi-vector produces no offset column");
+        let emb = &fields[0];
+        assert_eq!(emb.name(), "tags_embedding");
+        // Expect List<FixedSizeList<Float32, 4>>
+        let DataType::List(inner) = emb.data_type() else {
+            panic!("expected List, got {:?}", emb.data_type());
+        };
+        let DataType::FixedSizeList(leaf, size) = inner.data_type() else {
+            panic!("expected inner FixedSizeList, got {:?}", inner.data_type());
+        };
+        assert_eq!(*size, 4);
+        assert_eq!(leaf.data_type(), &DataType::Float32);
+    }
+
+    #[test]
+    fn test_has_nested_embedding_output_list_multi() {
+        let tags_field = Arc::new(Field::new_list(
+            "tags",
+            Field::new("item", DataType::Utf8, true),
+            true,
+        ));
+        let base_schema = Arc::new(Schema::new(vec![tags_field]));
+        let embedded_columns = HashMap::from([(
+            "tags".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::ListMulti {
+                    aggregation: EmbeddingAggregation::Max,
+                    max_elements_per_row: 32,
+                },
+            },
+        )]);
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        assert!(table.is_multi_vector("tags"));
+        assert!(!table.is_chunked("tags"));
+        // has_nested_embedding_output covers either mode — this is what
+        // the search dispatcher keys off of to pick the UNNEST path.
+        assert!(table.has_nested_embedding_output("tags"));
+        assert_eq!(
+            table.multi_vector_aggregation("tags"),
+            Some(EmbeddingAggregation::Max)
+        );
+    }
+
+    #[test]
+    fn test_base_table_has_embedding_list_multi_no_offset_required() {
+        // Source is List<Utf8>; no offsets column should be required.
+        let schema = Arc::new(Schema::new(vec![
+            list_of_utf8("tags"),
+            Arc::new(Field::new_list(
+                "tags_embedding",
+                Field::new_fixed_size_list(
+                    "item",
+                    Field::new("item", DataType::Float32, false),
+                    4,
+                    false,
+                ),
+                false,
+            )),
+        ]));
+        assert!(EmbeddingTable::base_table_has_embedding_column(
+            &schema, "tags"
+        ));
+    }
+
+    // ===== schema() dedup =====
+
+    #[test]
+    fn test_schema_no_duplicate_when_base_already_has_embedding_column() {
+        // Simulate the state after a DuckDB refresh writes the embedding column back to the
+        // accelerated base table while `in_base_table` was set to `false` at startup.
+        // `schema()` must not append the embedding field a second time.
+        let body_field = Arc::new(Field::new("body", DataType::Utf8, true));
+        let embedding_field = Arc::new(Field::new_fixed_size_list(
+            "body_embedding",
+            Field::new("item", DataType::Float32, false),
+            4,
+            true,
+        ));
+        // Base table already contains the embedding column.
+        let base_schema = Arc::new(Schema::new(vec![
+            Arc::clone(&body_field),
+            Arc::clone(&embedding_field),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let embedded_columns = HashMap::from([(
+            "body".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                // in_base_table was false at startup — the refresh later wrote it to DuckDB.
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        )]);
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let schema = table.schema();
+        let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // body_embedding must appear exactly once.
+        assert_eq!(
+            field_names
+                .iter()
+                .filter(|&&n| n == "body_embedding")
+                .count(),
+            1,
+            "body_embedding appeared more than once in schema: {field_names:?}"
+        );
+        assert_eq!(
+            field_names,
+            vec!["body", "body_embedding"],
+            "unexpected field order: {field_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_appends_embedding_column_when_not_in_base() {
+        // When the base table does not yet have the embedding column, `schema()` must append it.
+        let body_field = Arc::new(Field::new("body", DataType::Utf8, true));
+        let base_schema = Arc::new(Schema::new(vec![Arc::clone(&body_field)]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let embedded_columns = HashMap::from([(
+            "body".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        )]);
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let schema = table.schema();
+        let field_names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert!(
+            field_names.contains(&"body_embedding"),
+            "body_embedding missing from schema: {field_names:?}"
+        );
+        assert_eq!(
+            field_names
+                .iter()
+                .filter(|&&n| n == "body_embedding")
+                .count(),
+            1,
+            "body_embedding appeared more than once: {field_names:?}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 description = "Spice OSS"
 edition.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,32 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
+connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
+connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
+connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
+connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch", optional = true }
+connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
+connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
+connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
+connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
+connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optional = true }
+connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
+connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
+connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
+# connector-nfs requires system libnfs library - build separately with `nfs` feature
+connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
+connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
+connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
+connector-postgres = { path = "../../crates/data-connectors/connector-postgres", optional = true }
+connector-scylladb = { path = "../../crates/data-connectors/connector-scylladb", optional = true }
+connector-sharepoint = { path = "../../crates/data-connectors/connector-sharepoint", optional = true }
+connector-smb = { path = "../../crates/data-connectors/connector-smb", optional = true }
+connector-snowflake = { path = "../../crates/data-connectors/connector-snowflake", optional = true }
+connector-spark = { path = "../../crates/data-connectors/connector-spark", optional = true }
 event_stream = { path = "../../crates/event_stream" }
-flightrepl = { path = "../../crates/flightrepl" }
+repl = { path = "../../crates/repl" }
 futures.workspace = true
 mimalloc = { version = "0.1.48", optional = true }
 opentelemetry.workspace = true
@@ -25,10 +49,10 @@ prometheus.workspace = true
 reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
+runtime-async = { path = "../../crates/runtime-async" }
+runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 rustls.workspace = true
-rustls-pemfile.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
 snmalloc-rs = { version = "0.3.6" }
 spice-cloud = { path = "../../crates/spice_cloud" }
@@ -40,22 +64,26 @@ tracing.workspace = true
 tracing-log = "0.2.0"
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-util = { path = "../../crates/util" }
-vortex = "0.52.1"
+util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
+adbc = ["runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
-clickhouse = ["runtime/clickhouse"]
+azure-keyvault = ["runtime/azure-keyvault"]
+hashicorp_vault = ["runtime/hashicorp_vault"]
+clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
+cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
-databricks = ["runtime/databricks"]
+databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
 default = [
+    "adbc",
     "duckdb",
     "postgres",
     "sqlite",
@@ -65,11 +93,12 @@ default = [
     "databricks",
     "dremio",
     "clickhouse",
+    "cosmosdb",
     "sharepoint",
-    "snapshots",
     "snowflake",
     "spark",
     "ftp",
+    "sftp",
     "debezium",
     "kafka",
     "anonymous_telemetry",
@@ -81,36 +110,56 @@ default = [
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "vortex"
-
+    "turso",
+    "smb",
+    "pingora",
+    "scylladb",
+    "models",
+    "aws-secrets-manager",
+    "azure-keyvault",
+    "keyring-secret-store",
 ]
-delta_lake = ["runtime/delta_lake"]
+delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
-dremio = ["runtime/dremio"]
-duckdb = ["runtime/duckdb"]
+dremio = ["connector-dremio", "runtime/dremio"]
+elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
+duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
-flightsql = ["runtime/flightsql"]
-ftp = ["runtime/ftp"]
+flightsql = ["connector-flightsql", "runtime/flightsql"]
+ftp = ["connector-ftp", "runtime/ftp"]
+geo = ["runtime/geo"]
+http-functions = ["runtime/http-functions"]
+rate-control = ["runtime/rate-control"]
+wasm-functions = ["runtime/wasm-functions"]
+wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
-imap = ["runtime/imap"]
+imap = ["connector-imap", "runtime/imap"]
 kafka = ["runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]
 models = ["runtime/models"]
-mongodb = ["runtime/mongodb"]
-mssql = ["runtime/mssql"]
-mysql = ["runtime/mysql"]
-odbc = ["runtime/odbc"]
-oracle = ["runtime/oracle"]
-postgres = ["runtime/postgres"]
-postgres-write = ["runtime/postgres-write"]
+mongodb = ["connector-mongodb", "runtime/mongodb"]
+mssql = ["connector-mssql", "runtime/mssql"]
+mysql = ["connector-mysql", "runtime/mysql"]
+# nfs feature requires system libnfs library and connector-nfs crate
+nfs = ["connector-nfs", "runtime/nfs"]
+odbc = ["connector-odbc"]
+oracle = ["connector-oracle", "runtime/oracle"]
+pingora = ["runtime/pingora"]
+postgres = ["connector-postgres", "runtime/postgres"]
+postgres-accel = ["runtime/postgres-accel"]
+
 release = []
-sharepoint = ["runtime/sharepoint"]
-snowflake = ["runtime/snowflake"]
+scylladb = ["connector-scylladb", "runtime/scylladb"]
+sftp = ["connector-sftp", "runtime/sftp"]
+sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
+smb = ["connector-smb"]
 snapshots = ["runtime/snapshots"]
-spark = ["runtime/spark"]
+client_tls = ["runtime/client_tls"]
+snowflake = ["connector-snowflake", "runtime/snowflake"]
+spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
+turso = ["runtime/turso"]
 vortex = ["runtime/vortex"]
-xxhash = ["runtime/xxhash"]

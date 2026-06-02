@@ -135,3 +135,24 @@ impl DuckDBSetting for IndexScanMaxCount {
         Ok(())
     }
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TimeZone;
+
+impl DuckDBSetting for TimeZone {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn setting_name(&self) -> &'static str {
+        "TimeZone"
+    }
+
+    fn get_value(&self, _options: &std::collections::HashMap<String, String>) -> Option<String> {
+        Some(String::from("UTC"))
+    }
+
+    fn scope(&self) -> DuckDBSettingScope {
+        DuckDBSettingScope::Local
+    }
+}

@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: ghcr.io/spiceai/spiceai-nightly
-  tag: latest-models # 1.9.0-unstable
+  tag: latest-models # 1.11.0-unstable
 replicaCount: 1
 
 service:
@@ -24,6 +24,11 @@ serviceAccount:
   # The name of the ServiceAccount to use.
   # If not set and create is true, a name is generated using the fullname template
   name:
+  # Annotations to add to the ServiceAccount (e.g. for AWS IRSA, GKE Workload Identity)
+  annotations: {}
+  # Examples:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/my-spice-role
+  #   iam.gke.io/gcp-service-account: my-sa@my-project.iam.gserviceaccount.com
 
 # Resource requests and limits
 # resources:
@@ -33,6 +38,44 @@ serviceAccount:
 #   requests:
 #     cpu: 500m
 #     memory: 1Gi
+
+# Override the default command for spiced
+# command:
+#   - /usr/local/bin/spiced
+#   - --http
+#   - 0.0.0.0:8090
+#   - --metrics
+#   - 0.0.0.0:9090
+#   - --flight
+#   - 0.0.0.0:50051
+
+# Configure Kubernetes probes for the Spice.ai runtime container.
+# Omitted probe fields keep these defaults, so overrides can be partial.
+# If a probe value is omitted entirely, the template renders these defaults.
+# If exec, tcpSocket, or grpc is configured, the template omits the default httpGet handler.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /v1/ready
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8090
+  timeoutSeconds: 1
+  periodSeconds: 10
+  failureThreshold: 3
 
 # Additional environment variables
 # additionalEnv:

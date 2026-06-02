@@ -21,6 +21,22 @@ pub enum AccessMode {
     #[default]
     Read,
     ReadWrite,
+    /// Full read-write access including DDL operations (CREATE TABLE, DROP TABLE, etc.)
+    ReadWriteCreate,
+}
+
+impl AccessMode {
+    /// Returns true if this access mode allows write operations (INSERT, UPDATE, DELETE).
+    #[must_use]
+    pub fn allows_write(&self) -> bool {
+        matches!(self, AccessMode::ReadWrite | AccessMode::ReadWriteCreate)
+    }
+
+    /// Returns true if this access mode allows DDL operations (CREATE TABLE, DROP TABLE, etc.).
+    #[must_use]
+    pub fn allows_ddl(&self) -> bool {
+        matches!(self, AccessMode::ReadWriteCreate)
+    }
 }
 
 impl From<SpicepodAccessMode> for AccessMode {
@@ -28,6 +44,7 @@ impl From<SpicepodAccessMode> for AccessMode {
         match mode {
             SpicepodAccessMode::Read => AccessMode::Read,
             SpicepodAccessMode::ReadWrite => AccessMode::ReadWrite,
+            SpicepodAccessMode::ReadWriteCreate => AccessMode::ReadWriteCreate,
         }
     }
 }

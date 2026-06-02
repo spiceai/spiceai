@@ -36,6 +36,8 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 use util::RetryError;
 
+use runtime_datafusion_index::Index;
+
 use crate::{
     accelerated_table::{refresh_task::retry_from_df_error, synchronized_table::SynchronizedTable},
     datafusion::error::find_datafusion_root,
@@ -46,6 +48,7 @@ use crate::{
 pub(crate) struct MultiSink {
     original_table_provider: Arc<dyn TableProvider>,
     synchronized_tables: Vec<SynchronizedTable>,
+    sink_indexes: Vec<Arc<dyn Index + Send + Sync>>,
 }
 
 impl MultiSink {
@@ -56,7 +59,13 @@ impl MultiSink {
         Self {
             original_table_provider,
             synchronized_tables,
+            sink_indexes: vec![],
         }
+    }
+
+    pub fn with_sink_indexes(mut self, indexes: Vec<Arc<dyn Index + Send + Sync>>) -> Self {
+        self.sink_indexes = indexes;
+        self
     }
 
     pub fn add_synchronized_table(&mut self, synchronized_table: SynchronizedTable) {
@@ -139,6 +148,20 @@ impl MultiSink {
         let (parent_complete_tx, parent_complete_rx) = watch::channel(false);
         let child_barrier = Arc::new(Barrier::new(self.synchronized_tables.len()));
 
+        // Run on_write_start for all sink_indexes before any write begins.
+        for index in &self.sink_indexes {
+            tracing::debug!(
+                "MultiSink: running on_write_start for index '{}'",
+                index.name()
+            );
+            if let Err(e) = index.on_write_start().await {
+                tracing::warn!(
+                    "MultiSink: on_write_start failed for index '{}': {e}. Continuing with write.",
+                    index.name()
+                );
+            }
+        }
+
         // Spawn primary task
         let primary_provider = Arc::clone(&self.original_table_provider);
         join_set.spawn(Self::spawn_parent_task(
@@ -192,7 +215,30 @@ impl MultiSink {
         }
 
         if let Some(first_error) = errors.into_iter().next() {
+            // Run on_write_failed for all sink_indexes.
+            for index in &self.sink_indexes {
+                if let Err(e) = index.on_write_failed().await {
+                    tracing::warn!(
+                        "MultiSink: on_write_failed failed for index '{}': {e}. Index write state may need manual cleanup.",
+                        index.name()
+                    );
+                }
+            }
             return Err(first_error);
+        }
+
+        // Run on_write_complete for all sink_indexes.
+        for index in &self.sink_indexes {
+            tracing::debug!(
+                "MultiSink: running on_write_complete for index '{}'",
+                index.name()
+            );
+            if let Err(e) = index.on_write_complete().await {
+                tracing::warn!(
+                    "MultiSink: on_write_complete failed for index '{}': {e}. Index may be stale until next refresh.",
+                    index.name()
+                );
+            }
         }
 
         Ok(())
@@ -383,8 +429,8 @@ mod tests {
         assert_eq!(received_values, vec![1, 2, 3, 4, 5, 6]);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::cast_possible_wrap)]
+    #[expect(clippy::similar_names)]
     #[tokio::test]
     async fn test_barrier_synchronization() {
         let barrier = Arc::new(Barrier::new(2));
@@ -478,11 +524,8 @@ mod tests {
         }
 
         // Verify we get an error when reading from a lagged stream
-        if let Some(result) = stream.next().await {
-            assert!(result.is_err());
-        } else {
-            panic!("expected error");
-        }
+        let result = stream.next().await.expect("should have an item");
+        result.expect_err("expected lagging error");
     }
 
     #[tokio::test]

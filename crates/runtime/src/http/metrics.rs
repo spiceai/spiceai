@@ -21,6 +21,8 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
+use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
+
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("http"));
 
 /// Deprecated, to be removed in the future
@@ -42,5 +44,6 @@ pub(crate) static REQUESTS_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new
     METER
         .f64_histogram("http_requests_duration_ms")
         .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });

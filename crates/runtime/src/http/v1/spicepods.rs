@@ -39,7 +39,7 @@ pub struct SpicepodQueryParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct SpicepodCsvRow {
+pub struct SpicepodSummary {
     /// The name of the spicepod
     pub name: String,
 
@@ -59,9 +59,22 @@ pub struct SpicepodCsvRow {
     pub dependencies_count: usize,
 }
 
+fn to_spicepod_summaries(spicepods: &[Spicepod]) -> Vec<SpicepodSummary> {
+    spicepods
+        .iter()
+        .map(|spod| SpicepodSummary {
+            version: spod.version.to_string(),
+            name: spod.name.clone(),
+            models_count: spod.models.len(),
+            datasets_count: spod.datasets.len(),
+            dependencies_count: spod.dependencies.len(),
+        })
+        .collect_vec()
+}
+
 /// List Spicepods
 ///
-/// Get a list of spicepods and their details. In CSV format, it will return a summarised form.
+/// Get a list of spicepods and their summary details.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/spicepods",
@@ -70,8 +83,7 @@ pub struct SpicepodCsvRow {
     params(SpicepodQueryParams),
     responses(
         (status = 200, description = "List of spicepods", content((
-            // Don't use Vec<Spicepod> here, to avoid propagating the utoipa::ToSchema trait
-            Vec<serde_json::Value> = "application/json",
+            Vec<SpicepodSummary> = "application/json",
             example = json!([
                 {
                     "name": "spicepod1",
@@ -104,34 +116,21 @@ pub(crate) async fn get(
     let Some(readable_app) = &*app.read().await else {
         return (
             status::StatusCode::INTERNAL_SERVER_ERROR,
-            Json::<Vec<Spicepod>>(vec![]),
+            Json::<Vec<SpicepodSummary>>(vec![]),
         )
             .into_response();
     };
 
+    let summaries = to_spicepod_summaries(&readable_app.spicepods);
+
     match params.format {
-        Format::Json => {
-            (status::StatusCode::OK, Json(readable_app.spicepods.clone())).into_response()
-        }
-        Format::Csv => {
-            let resp: Vec<SpicepodCsvRow> = readable_app
-                .spicepods
-                .iter()
-                .map(|spod| SpicepodCsvRow {
-                    version: spod.version.to_string(),
-                    name: spod.name.clone(),
-                    models_count: spod.models.len(),
-                    datasets_count: spod.datasets.len(),
-                    dependencies_count: spod.dependencies.len(),
-                })
-                .collect_vec();
-            match convert_entry_to_csv(&resp) {
-                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
-                Err(e) => {
-                    tracing::error!("Error converting to CSV: {e}");
-                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
+        Format::Json => (status::StatusCode::OK, Json(summaries)).into_response(),
+        Format::Csv => match convert_entry_to_csv(&summaries) {
+            Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+            Err(e) => {
+                tracing::error!("Error converting to CSV: {e}");
+                (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
-        }
+        },
     }
 }

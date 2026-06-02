@@ -18,14 +18,16 @@ pub mod catalogs;
 pub mod chat;
 pub mod datasets;
 pub mod embeddings;
-pub mod eval;
+pub mod functions;
 pub mod iceberg;
 pub mod inference;
 pub mod responses;
+pub mod snapshots;
 
 pub mod models;
 pub mod nsql;
 pub mod packages;
+pub mod queries;
 pub mod query;
 pub mod ready;
 pub mod search;
@@ -38,7 +40,13 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{DataFusion, query::QueryBuilder},
+    datafusion::{
+        DataFusion,
+        query::{
+            Error as QueryError, QueryBuilder, is_cancellation_error, write_to_json_string,
+            write_to_json_value,
+        },
+    },
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
@@ -51,14 +59,20 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::{HeaderValue, header::CONTENT_TYPE};
+use http::{
+    HeaderValue,
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use runtime_request_context::{AsyncMarker, RequestContext};
+use runtime_auth::AuthPrincipalRef;
+use runtime_request_context::{AsyncMarker, CacheNamespace, RequestContext};
+
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -80,6 +94,41 @@ pub enum Format {
     Csv,
 }
 
+pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
+    principal
+        .groups()
+        .iter()
+        .any(|group| *group == "write" || *group == "read_write")
+}
+
+pub(crate) async fn current_principal_requires_read_only() -> bool {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
+        .is_some_and(|principal| !principal_has_write_access(principal))
+}
+
+pub(crate) async fn require_write_access() -> Option<Response> {
+    if current_principal_requires_read_only().await {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({ "message": "API key does not allow write access" })),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
+}
+
+fn status_for_sql_error(message: &str) -> StatusCode {
+    if message.contains("read-only SQL context") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
 #[cfg(feature = "openapi")]
 impl utoipa::IntoParams for Format {
     fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
@@ -95,7 +144,7 @@ impl utoipa::IntoParams for Format {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
 pub enum ResponseMimeType {
@@ -115,10 +164,12 @@ pub struct ResponseMetadata {
 
 impl ResponseMetadata {
     /// Creates an empty `ResponseMetadata`
+    #[must_use]
     pub fn empty() -> Self {
         Self { sql: None }
     }
 
+    #[must_use]
     pub fn with_sql(mut self, sql: impl Into<String>) -> Self {
         self.sql = Some(sql.into());
         self
@@ -131,17 +182,19 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
-    pub fn to_accept_header(&self) -> Option<http::HeaderValue> {
+    #[must_use]
+    pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
-            ResponseMimeType::Json => "application/json",
-            ResponseMimeType::Csv => "text/csv",
-            ResponseMimeType::Plain => "text/plain",
-            ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
-            ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
+            Self::Json => "application/json",
+            Self::Csv => "text/csv",
+            Self::Plain => "text/plain",
+            Self::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
+            Self::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
         };
         HeaderValue::from_str(media_type).ok()
     }
 
+    #[must_use]
     pub fn from_accept_header(accept: Option<&TypedHeader<Accept>>) -> ResponseMimeType {
         accept.map_or(ResponseMimeType::default(), |header| {
             accept_header_types(header)
@@ -169,10 +222,18 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
-    if df.table_exists(ds.name.clone()) {
+    // First check the runtime status which tracks the actual component state
+    // (Initializing, Refreshing, Ready, Error, etc.)
+    let dataset_statuses = df.runtime_status().get_dataset_statuses();
+    if let Some(status) = dataset_statuses.get(&ds.name) {
+        return status.clone();
+    }
+
+    // Fallback: if not in runtime status, check if table exists
+    if df.table_exists(&ds.name) {
         ComponentStatus::Ready
     } else {
-        ComponentStatus::Error
+        ComponentStatus::error()
     }
 }
 
@@ -182,14 +243,29 @@ pub async fn sql_to_http_response(
     sql: &str,
     parameters: Option<ParamValues>,
     format: ResponseMimeType,
+    read_only: bool,
 ) -> Response {
-    let (data, results_cache_status) = match run_sql(df, sql, parameters).await {
-        Ok((data, results_cache_status)) => (data, results_cache_status),
-        Err(e) => {
-            tracing::debug!("Error executing query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
+    let (data, results_cache_status) =
+        match run_sql_with_read_only(df, sql, parameters, read_only).await {
+            Ok((data, results_cache_status)) => (data, results_cache_status),
+            Err(e) => {
+                let message = e.to_string();
+                tracing::debug!("Error executing query: {message}");
+                let status = if e
+                    .downcast_ref::<datafusion::error::DataFusionError>()
+                    .is_some_and(is_cancellation_error)
+                    || e.downcast_ref::<QueryError>()
+                        .is_some_and(|err| matches!(err, QueryError::QueryCancelled { .. }))
+                {
+                    // 499 Client Closed Request: used for cancelled queries so
+                    // clients can distinguish cancellation from a bad request.
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+                } else {
+                    status_for_sql_error(&message)
+                };
+                return (status, message).into_response();
+            }
+        };
 
     to_http_response(
         data,
@@ -198,6 +274,7 @@ pub async fn sql_to_http_response(
         ResponseMetadata::empty(),
     )
     .await
+    .into_response()
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -206,8 +283,19 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
+    run_sql_with_read_only(df, sql, parameters, false).await
+}
+
+// Runs query and returns the results as a vector of `RecordBatch`, enforcing read-only mode when requested.
+pub async fn run_sql_with_read_only(
+    df: Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<ParamValues>,
+    read_only: bool,
+) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
     let query_res = QueryBuilder::new(sql, df)
         .parameters(parameters)
+        .read_only(read_only)
         .build()
         .run()
         .await?;
@@ -224,7 +312,9 @@ pub async fn to_http_response(
     cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
-) -> Response {
+) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+
     let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
@@ -237,12 +327,11 @@ pub async fn to_http_response(
     let body = match res {
         Ok(body) => body,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 
     let request_context = RequestContext::current(AsyncMarker::new().await);
-    let mut headers = HeaderMap::new();
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
@@ -252,15 +341,17 @@ pub async fn to_http_response(
         &mut headers,
         cache_status,
         request_context.client_supplied_cache_key().is_some(),
+        &request_context,
     );
 
-    (StatusCode::OK, headers, body).into_response()
+    (StatusCode::OK, headers, body)
 }
 
 fn attach_cache_headers(
     headers: &mut HeaderMap,
     results_cache_status: CacheStatus,
     user_key_specified: bool,
+    request_context: &RequestContext,
 ) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
@@ -273,16 +364,91 @@ fn attach_cache_headers(
         headers.insert("Results-Cache-Status", val);
     }
 
+    // Surface the cache scope so callers can tell whether a MISS came
+    // from per-user isolation (a coworker's cached entry is not visible)
+    // versus a true cold cache.
+    let cache_namespace = request_context.cache_namespace();
+    headers.insert(
+        "Results-Cache-Scope",
+        HeaderValue::from_static(cache_namespace.as_header_value()),
+    );
+
     // Tell CDN entry is unique per user cache key
     if user_key_specified {
-        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+        append_vary(headers, "Spice-Cache-Key");
     }
+
+    // For per-user scope, additionally vary on every header that can
+    // identify a principal so an HTTP cache between Spice and the client
+    // never collapses entries belonging to different principals.
+    // - `Authorization` covers Bearer / Basic / future U2M flows.
+    // - `X-API-Key` is the header used by the API-key auth flow today;
+    //   without it shared proxies/CDNs would happily reuse Alice's
+    //   response for Bob.
+    // - `Cookie` covers any future session-cookie based auth.
+    if matches!(cache_namespace, CacheNamespace::Principal(_)) {
+        append_vary(headers, "Authorization");
+        append_vary(headers, "X-API-Key");
+        append_vary(headers, "Cookie");
+    }
+
+    // Add Cache-Control response header with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The Results-Cache-Status header will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
+            }
+        }
+    }
+}
+
+/// Append `field` to the `Vary` response header, preserving any prior
+/// value(s). RFC 7231 §7.1.4 allows comma-separated field lists.
+pub(super) fn append_vary(headers: &mut HeaderMap, field: &'static str) {
+    use http::header::VARY;
+    if let Some(existing) = headers.get(VARY)
+        && let Ok(existing_str) = existing.to_str()
+    {
+        // Skip if already present.
+        if existing_str
+            .split(',')
+            .any(|f| f.trim().eq_ignore_ascii_case(field))
+        {
+            return;
+        }
+        let combined = format!("{existing_str}, {field}");
+        if let Ok(v) = HeaderValue::from_str(&combined) {
+            headers.insert(VARY, v);
+        }
+        return;
+    }
+    headers.insert(VARY, HeaderValue::from_static(field));
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
@@ -290,15 +456,7 @@ fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderVa
 
 /// Converts a vector of `RecordBatch` to a JSON string.
 fn arrow_to_json(data: &[RecordBatch]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
-
-    writer
-        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        .boxed()?;
-    writer.finish().boxed()?;
-
-    String::from_utf8(writer.into_inner()).boxed()
+    write_to_json_string(data)
 }
 
 /// Converts a vector of `RecordBatch` to a CSV string.
@@ -326,16 +484,6 @@ fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
     meta: ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
-
-    // Convert manually instead of reusing arrow_to_json
-    // to avoid an extra serialization-deserialization cycle
-    writer
-        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        .boxed()?;
-    writer.finish().boxed()?;
-
     // Calculate total row count across all batches
     let row_count = data.iter().map(RecordBatch::num_rows).sum::<usize>();
 
@@ -349,7 +497,7 @@ fn arrow_to_vnd_sql_json_v1(
     let mut result = json!({
         "row_count": row_count,
         "schema": schema_json,
-        "data": serde_json::from_slice::<serde_json::Value>(&writer.into_inner()).boxed()?,
+        "data": write_to_json_value(data)?,
     });
 
     if let Some(sql) = meta.sql {

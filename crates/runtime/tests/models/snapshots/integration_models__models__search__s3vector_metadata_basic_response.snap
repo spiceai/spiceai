@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: normalize_search_response(resp, round_scores)
 snapshot_kind: text
 ---
 {
@@ -9,42 +9,50 @@ snapshot_kind: text
     {
       "dataset": "qs",
       "matches": {
-        "answer": "Choices create costs and benefits."
+        "answer": [
+          "Choices create costs and benefits."
+        ]
       },
       "primary_key": {
         "id": 863
       },
-      "score": 0.89
+      "_score": "0.89"
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{2a + 4b}\\)"
+        "answer": [
+          "\\(\\boxed{2a + 4b}\\)"
+        ]
       },
       "primary_key": {
         "id": 1316
       },
-      "score": 0.84
+      "_score": "0.84"
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "\\(\\boxed{x = A + E}\\)"
+        "answer": [
+          "\\(\\boxed{x = A + E}\\)"
+        ]
       },
       "primary_key": {
         "id": 590
       },
-      "score": 0.83
+      "_score": "0.83"
     },
     {
       "dataset": "qs",
       "matches": {
-        "answer": "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        "answer": [
+          "<refined solution>  \n\n*(Repeated for each question-answer pair above.)"
+        ]
       },
       "primary_key": {
         "id": 6
       },
-      "score": 0.83
+      "_score": "0.83"
     }
   ]
 }

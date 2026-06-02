@@ -8,6 +8,8 @@ datasets:
       engine: duckdb
       mode: memory
       enabled: true
+      params:
+        connection_pool_size: 25
   - from: file:data/catalog_returns.parquet
     name: catalog_returns
     acceleration: *acceleration

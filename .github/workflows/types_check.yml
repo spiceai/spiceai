@@ -7,11 +7,6 @@ jobs:
   build:
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
-    env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch_go }}
-
     strategy:
       matrix:
         include:
@@ -19,22 +14,16 @@ jobs:
             runner: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
-            target_arch_go: 'amd64'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GOVER }}
+      - run: rustup toolchain install 1.94.1 --profile minimal
 
-      - run: rustup toolchain install stable --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
@@ -45,57 +34,36 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/install-protoc
 
-      - name: Build spiced
-        run: make -C bin/spiced
+      - name: Build spiced and spice CLI
+        id: build-spiced
+        uses: ./.github/actions/build-spiced
+        with:
+          build_cli: 'true'
+          upload_artifact: 'true'
+          artifact_name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
 
       - name: Update build cache (macOS)
         if: matrix.target_os == 'darwin'
         run: |
           if [ -d /Users/spiceai/build/target ]; then
-            rsync -av target/ /Users/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /Users/spiceai/build/target/
           fi
 
       - name: Update build cache (Linux)
         if: matrix.target_os == 'linux'
         run: |
           if [ -d /home/spiceai/build/target ]; then
-            rsync -av target/ /home/spiceai/build/target/
+            rsync -av "${{ steps.build-spiced.outputs.target_dir_relative }}/" /home/spiceai/build/target/
           fi
 
       - name: Update build cache (Windows)
         if: matrix.target_os == 'windows'
         run: |
           if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+            Copy-Item -Recurse -Force "${{ steps.build-spiced.outputs.target_dir_relative }}/*" C:/spiceai/build/target
           }
-
-      - name: Build spice
-        run: make -C bin/spice
-
-      - name: make spiced executable
-        if: matrix.target_os != 'windows'
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: make spice executable
-        if: matrix.target_os != 'windows'
-        run: |
-          mv target/release/spice spice
-          chmod +x spice
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@v4
-        if: matrix.target_os != 'windows'
-        with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: |
-            spice
-            spiced
 
   test_acceleration:
     name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
@@ -115,15 +83,14 @@ jobs:
           ]
         target:
           - name: 'Linux x64'
-            runner: 'ubuntu-latest'
+            runner: 'ubuntu-24.04'
             target_os: 'linux'
             target_arch: 'x86_64'
-            target_arch_go: 'amd64'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: 3.x
 
@@ -134,7 +101,7 @@ jobs:
           ls -l test/arrow-types/
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -153,7 +120,6 @@ jobs:
         uses: ./.github/actions/install-postgres
         if: matrix.acceleration.engine == 'postgres'
         with:
-          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Test boolean

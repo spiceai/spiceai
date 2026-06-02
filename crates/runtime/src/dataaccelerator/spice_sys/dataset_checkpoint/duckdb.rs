@@ -67,12 +67,12 @@ impl DatasetCheckpoint {
             .get_underlying_conn_mut();
 
         let query = format!(
-            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+            "SELECT epoch_us(timezone('UTC', updated_at::TIMESTAMPTZ)) FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
         let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        let checkpoint_time_micros: Option<u64> = rows
+        let checkpoint_time_micros: Option<i64> = rows
             .next()
             .map_err(Error::external)?
             .map(|row| row.get(0))
@@ -80,7 +80,8 @@ impl DatasetCheckpoint {
             .map_err(Error::external)?;
 
         if let Some(checkpoint_time_micros) = checkpoint_time_micros {
-            let duration = Duration::from_micros(checkpoint_time_micros);
+            let micros = u64::try_from(checkpoint_time_micros).map_err(Error::external)?;
+            let duration = Duration::from_micros(micros);
             Ok(Some(UNIX_EPOCH + duration))
         } else {
             Ok(None)
@@ -91,6 +92,7 @@ impl DatasetCheckpoint {
         &self,
         pool: &Arc<DuckDbConnectionPool>,
         schema: &SchemaRef,
+        refresh_sql: Option<&str>,
     ) -> Result<()> {
         let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
         let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
@@ -99,13 +101,16 @@ impl DatasetCheckpoint {
 
         let schema_json = Self::serialize_schema(schema)?;
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at, schema_json)
-             VALUES (?, now(), now(), ?)
-             ON CONFLICT (dataset_name) DO UPDATE 
-             SET updated_at = now(), schema_json = excluded.schema_json"
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, created_at, updated_at, schema_json, refresh_sql)
+             VALUES (?, now(), now(), ?, ?)
+             ON CONFLICT (dataset_name) DO UPDATE
+             SET updated_at = now(), schema_json = excluded.schema_json, refresh_sql = excluded.refresh_sql"
         );
         duckdb_conn
-            .execute(&upsert, [&self.dataset_name, &schema_json])
+            .execute(
+                &upsert,
+                duckdb::params![&self.dataset_name, &schema_json, refresh_sql],
+            )
             .map_err(Error::external)?;
 
         if self.snapshot_behavior.create_enabled() {
@@ -126,6 +131,10 @@ impl DatasetCheckpoint {
 
         duckdb_conn
             .execute(SCHEMA_MIGRATION_01_STMT, [])
+            .map_err(Error::external)?;
+
+        duckdb_conn
+            .execute(super::REFRESH_SQL_MIGRATION_STMT, [])
             .map_err(Error::external)?;
 
         Ok(())
@@ -155,6 +164,43 @@ impl DatasetCheckpoint {
         } else {
             Ok(None)
         }
+    }
+
+    pub(super) fn get_refresh_sql_duckdb(
+        &self,
+        pool: &Arc<DuckDbConnectionPool>,
+    ) -> Result<Option<String>> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(Error::external)?
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+        );
+        let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
+        let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
+
+        if let Some(row) = rows.next().map_err(Error::external)? {
+            let refresh_sql: Option<String> = row.get(0).map_err(Error::external)?;
+            Ok(refresh_sql)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(Error::external)?
+            .get_underlying_conn_mut();
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        duckdb_conn
+            .execute(&delete, [&self.dataset_name])
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 }
 
@@ -228,7 +274,7 @@ mod tests {
 
         // Save the schema
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to save schema");
 
@@ -266,7 +312,7 @@ mod tests {
         let schema_ref = std::sync::Arc::new(schema.clone());
 
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to save schema after migration");
 
@@ -298,7 +344,7 @@ mod tests {
 
         // Create the checkpoint with schema
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -324,7 +370,7 @@ mod tests {
 
         // Create the initial checkpoint
         checkpoint
-            .checkpoint(&schema_ref1)
+            .checkpoint(&schema_ref1, None)
             .await
             .expect("Failed to create initial checkpoint");
 
@@ -340,7 +386,7 @@ mod tests {
 
         // Update the checkpoint with new schema
         checkpoint
-            .checkpoint(&schema_ref2)
+            .checkpoint(&schema_ref2, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -353,45 +399,97 @@ mod tests {
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
         // Verify that the updated_at timestamp has changed
-        if let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection {
-            let mut db_conn = Arc::clone(pool)
-                .connect_sync()
-                .expect("Failed to connect to DuckDB");
-            let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
-                .expect("Failed to get DuckDB connection")
-                .get_underlying_conn_mut();
-
-            let query = format!(
-                "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
-            );
-            let mut stmt = duckdb_conn
-                .prepare(&query)
-                .expect("Failed to prepare SQL statement");
-            let mut rows = stmt
-                .query([&checkpoint.dataset_name])
-                .expect("Failed to execute query");
-
-            if let Some(row) = rows.next().expect("Failed to fetch row") {
-                let created_at: duckdb::types::Value =
-                    row.get(0).expect("Failed to get created_at");
-                let duckdb::types::Value::Timestamp(_, created_at) = created_at else {
-                    panic!("created_at is not a timestamp");
-                };
-                let updated_at: duckdb::types::Value =
-                    row.get(1).expect("Failed to get updated_at");
-                let duckdb::types::Value::Timestamp(_, updated_at) = updated_at else {
-                    panic!("updated_at is not a timestamp");
-                };
-                assert_ne!(
-                    created_at, updated_at,
-                    "created_at and updated_at should be different"
-                );
-            } else {
-                panic!("No checkpoint found");
-            }
-        } else {
+        #[cfg(any(feature = "postgres-accel", feature = "sqlite", feature = "turso"))]
+        let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection else {
             panic!("Unexpected acceleration connection type");
+        };
+        #[cfg(not(any(feature = "postgres-accel", feature = "sqlite", feature = "turso")))]
+        let AccelerationConnection::DuckDB(pool) = &checkpoint.acceleration_connection;
+        let mut db_conn = Arc::clone(pool)
+            .connect_sync()
+            .expect("Failed to connect to DuckDB");
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .expect("Failed to get DuckDB connection")
+            .get_underlying_conn_mut();
+
+        let query = format!(
+            "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+        );
+        let mut stmt = duckdb_conn
+            .prepare(&query)
+            .expect("Failed to prepare SQL statement");
+        let mut rows = stmt
+            .query([&checkpoint.dataset_name])
+            .expect("Failed to execute query");
+
+        if let Some(row) = rows.next().expect("Failed to fetch row") {
+            let created_at: duckdb::types::Value = row.get(0).expect("Failed to get created_at");
+            let duckdb::types::Value::Timestamp(_, created_at) = created_at else {
+                panic!("created_at is not a timestamp");
+            };
+            let updated_at: duckdb::types::Value = row.get(1).expect("Failed to get updated_at");
+            let duckdb::types::Value::Timestamp(_, updated_at) = updated_at else {
+                panic!("updated_at is not a timestamp");
+            };
+            assert_ne!(
+                created_at, updated_at,
+                "created_at and updated_at should be different"
+            );
+        } else {
+            panic!("No checkpoint found");
         }
+    }
+
+    #[tokio::test]
+    async fn test_duckdb_refresh_sql_roundtrip() {
+        let (checkpoint, _) = create_in_memory_duckdb_checkpoint();
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Store a refresh_sql
+        checkpoint
+            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"))
+            .await
+            .expect("Failed to store checkpoint with refresh_sql");
+
+        let stored = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get refresh_sql")
+            .expect("refresh_sql should be Some");
+        assert_eq!(stored, "SELECT * FROM source_table");
+
+        // Update to a different refresh_sql
+        checkpoint
+            .checkpoint(
+                &schema_ref,
+                Some("SELECT id FROM source_table WHERE id > 10"),
+            )
+            .await
+            .expect("Failed to update refresh_sql");
+
+        let updated = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get updated refresh_sql")
+            .expect("refresh_sql should still be Some");
+        assert_eq!(updated, "SELECT id FROM source_table WHERE id > 10");
+
+        // Clear refresh_sql by passing None — should overwrite (no COALESCE)
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to clear refresh_sql");
+
+        let cleared = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get cleared refresh_sql");
+        assert!(
+            cleared.is_none(),
+            "refresh_sql should be None after passing None (no COALESCE)"
+        );
     }
 
     #[tokio::test]
@@ -416,7 +514,7 @@ mod tests {
 
         // Create the checkpoint
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -439,7 +537,7 @@ mod tests {
 
         // Update the checkpoint
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to update checkpoint");
 

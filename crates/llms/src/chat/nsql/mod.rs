@@ -13,7 +13,7 @@ limitations under the License.
 
 use async_openai::{
     error::OpenAIError,
-    types::{CreateChatCompletionRequest, CreateChatCompletionResponse},
+    types::chat::{CreateChatCompletionRequest, CreateChatCompletionResponse},
 };
 
 use std::fmt::Write;

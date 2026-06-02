@@ -1,16 +1,20 @@
 #!/bin/bash
 
+set -euo pipefail
+
 OUTPUT_FILE=".spice/service_data.parquet"
+TEMP_OUTPUT_FILE="${OUTPUT_FILE}.tmp"
 DB_FILE=".spice/service_data.db"
 UPDATE_INTERVAL_SEC=3
 
-rm -f $DB_FILE
+rm -f "$DB_FILE" "$TEMP_OUTPUT_FILE"
+trap 'rm -f "$TEMP_OUTPUT_FILE"' EXIT
 
 # Create the directory if it does not exist
 mkdir -p .spice
 
 # Initialize the DuckDB database and create test table
-duckdb $DB_FILE <<SQL
+duckdb "$DB_FILE" <<SQL
 CREATE TABLE IF NOT EXISTS service_data (
   Id INTEGER,
   Data VARCHAR(4000) NOT NULL,
@@ -31,22 +35,24 @@ generate_row() {
 # Simulate updates every N seconds
 while true; do
   # Truncate the table before inserting new data
-  duckdb $DB_FILE <<SQL
+  duckdb "$DB_FILE" <<SQL
 TRUNCATE TABLE service_data;
 SQL
 
   # Generate 100 rows of data
   for i in $(seq 1 100); do
-    DATA=$(generate_row $i)
-    duckdb $DB_FILE <<SQL
+    DATA=$(generate_row "$i")
+    duckdb "$DB_FILE" <<SQL
 INSERT INTO service_data (Id, Data, DateCreated, DateUpdated) VALUES ($DATA);
 SQL
   done
 
-  # Overwrite the Parquet file with the updated data
-  duckdb $DB_FILE <<SQL
-COPY (SELECT * FROM service_data) TO '$OUTPUT_FILE' (FORMAT PARQUET);
+  # Publish each Parquet snapshot atomically so readers never see a partial file.
+  rm -f "$TEMP_OUTPUT_FILE"
+  duckdb "$DB_FILE" <<SQL
+COPY (SELECT * FROM service_data) TO '$TEMP_OUTPUT_FILE' (FORMAT PARQUET);
 SQL
+  mv -f "$TEMP_OUTPUT_FILE" "$OUTPUT_FILE"
 
   echo "File '$OUTPUT_FILE' updated at $(date)"
 

@@ -19,14 +19,14 @@ limitations under the License.
 pub(crate) mod caching;
 pub(crate) mod catalog;
 pub(crate) mod dataset;
+pub(crate) mod dataset_initialization;
 pub(crate) mod embedding;
-#[cfg(feature = "models")]
-pub(crate) mod eval;
 pub(crate) mod extension;
 pub(crate) mod llm;
 pub(crate) mod metrics;
 pub(crate) mod model;
 pub(crate) mod pods_watcher;
+pub(crate) mod rerank;
 pub(crate) mod scheduler;
 pub(crate) mod task_history;
 pub(crate) mod tool;

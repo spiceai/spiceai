@@ -14,16 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use rand::Rng;
 use regex::Regex;
 use std::{
+    fs,
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+
+use arrow::array::{AsArray, LargeStringArray, RecordBatch, StringArray};
+use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 
 use crate::process::{MemoryReading, MemoryReadingsHandle};
 
@@ -45,26 +49,90 @@ where
     false
 }
 
-pub(crate) fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    if vec.is_empty() {
-        None
-    } else {
-        let mut rng = rand::rng();
-        let index = rng.random_range(0..vec.len());
-        Some(&vec[index])
-    }
-}
-
 pub fn hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
 }
 
+/// Apply regex filters to all string columns in a list of `RecordBatch`es.
+///
+/// Filters use the same `(pattern, replacement)` tuple format as insta snapshot
+/// filters. Each cell value in every `Utf8` column is run through the filters
+/// in order. This should be applied **before** `pretty_format_batches` so that
+/// table column widths are computed from the normalized (deterministic) values.
+///
+/// # Errors
+///
+/// Returns an error if a filter pattern is not a valid regex or if rebuilding
+/// a `RecordBatch` fails.
+pub fn sanitize_record_batches<P: AsRef<str>, R: AsRef<str>>(
+    batches: &[RecordBatch],
+    filters: &[(P, R)],
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let compiled: Vec<(Regex, &str)> = filters
+        .iter()
+        .map(|(pattern, replacement)| {
+            let pattern = pattern.as_ref();
+            let regex = Regex::new(pattern)?;
+            Ok((regex, replacement.as_ref()))
+        })
+        .collect::<Result<Vec<_>, regex::Error>>()?;
+    batches
+        .iter()
+        .map(|batch| sanitize_batch(batch, &compiled).map_err(Into::into))
+        .collect()
+}
+
+fn sanitize_batch(
+    batch: &RecordBatch,
+    filters: &[(Regex, &str)],
+) -> Result<RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let new_columns: Vec<Arc<dyn arrow::array::Array>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let col = batch.column(i);
+            match field.data_type() {
+                DataType::Utf8 => {
+                    let str_array = col.as_string::<i32>();
+                    let sanitized: StringArray = str_array
+                        .iter()
+                        .map(|opt| opt.map(|v| apply_filters(v, filters)))
+                        .collect();
+                    Arc::new(sanitized) as Arc<dyn arrow::array::Array>
+                }
+                DataType::LargeUtf8 => {
+                    let str_array = col.as_string::<i64>();
+                    let sanitized: LargeStringArray = str_array
+                        .iter()
+                        .map(|opt| opt.map(|v| apply_filters(v, filters)))
+                        .collect();
+                    Arc::new(sanitized) as Arc<dyn arrow::array::Array>
+                }
+                _ => Arc::clone(col),
+            }
+        })
+        .collect();
+
+    RecordBatch::try_new(Arc::clone(&schema), new_columns)
+}
+
+/// Apply a list of regex filters to a string, returning the result.
+fn apply_filters(value: &str, filters: &[(Regex, &str)]) -> String {
+    let mut result = value.to_string();
+    for (regex, replacement) in filters {
+        result = regex.replace_all(&result, *replacement).into_owned();
+    }
+    result
+}
+
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
 static INSTA_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)] // the regex is valid
+    #[expect(clippy::expect_used)] // the regex is valid
     Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build")
 });
 
@@ -144,4 +212,162 @@ pub async fn observe_memory(
     println!("Max memory usage: {max_memory:.2} GB");
     println!("Median memory usage: {median_memory:.2} GB");
     Ok((max_memory, median_memory))
+}
+
+pub fn recursively_get_dir_size(dir: &PathBuf) -> anyhow::Result<usize> {
+    let mut total_size = 0;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                total_size += usize::try_from(entry.metadata()?.len())?;
+            } else if entry.file_type()?.is_dir() {
+                total_size += recursively_get_dir_size(&entry.path())?;
+            }
+        }
+    }
+    Ok(total_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn make_batch(plan_types: &[&str], plans: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("plan_type", DataType::Utf8, false),
+            Field::new("plan", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    plan_types
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    plans.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("failed to create test batch")
+    }
+
+    #[test]
+    fn test_sanitize_no_filters() {
+        let batch = make_batch(&["logical_plan"], &["Scan /tmp/abc/data"]);
+        let result = sanitize_record_batches(std::slice::from_ref(&batch), &[] as &[(&str, &str)])
+            .expect("to sanitize");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].column(1).as_string::<i32>().value(0),
+            "Scan /tmp/abc/data"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_single_filter() {
+        let batch = make_batch(
+            &["physical_plan"],
+            &["Scan /tmp/sess123/.spice/data/table.parquet"],
+        );
+        let filters = vec![(r"/tmp/[^/]+/\.spice/data", "<DATA>")];
+        let result = sanitize_record_batches(&[batch], &filters).expect("to sanitize");
+        assert_eq!(
+            result[0].column(1).as_string::<i32>().value(0),
+            "Scan <DATA>/table.parquet"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_multiple_filters_applied_in_order() {
+        let batch = make_batch(
+            &["physical_plan"],
+            &["file.vortex:100..200 required_guarantees=[a, b]"],
+        );
+        let filters = vec![
+            (r"(\.vortex):\d+\.\.\d+", "$1:<RANGE>"),
+            (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
+        ];
+        let result = sanitize_record_batches(&[batch], &filters).expect("to sanitize");
+        assert_eq!(
+            result[0].column(1).as_string::<i32>().value(0),
+            "file.vortex:<RANGE> required_guarantees=[N]"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_preserves_non_string_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["abc123", "def456"])),
+            ],
+        )
+        .expect("failed to create test batch");
+
+        let filters: Vec<(&str, &str)> = vec![(r"\d+", "N")];
+        let result = sanitize_record_batches(&[batch], &filters).expect("to sanitize");
+
+        // Int column untouched
+        let int_col = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int col");
+        assert_eq!(int_col.value(0), 1);
+        assert_eq!(int_col.value(1), 2);
+
+        // String column filtered
+        let str_col = result[0].column(1).as_string::<i32>();
+        assert_eq!(str_col.value(0), "abcN");
+        assert_eq!(str_col.value(1), "defN");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new("plan", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                Some("hello123"),
+                None,
+                Some("world456"),
+            ]))],
+        )
+        .expect("failed to create test batch");
+
+        let filters: Vec<(&str, &str)> = vec![(r"\d+", "N")];
+        let result = sanitize_record_batches(&[batch], &filters).expect("to sanitize");
+        let col = result[0].column(0).as_string::<i32>();
+        assert_eq!(col.value(0), "helloN");
+        assert!(col.is_null(1));
+        assert_eq!(col.value(2), "worldN");
+    }
+
+    #[test]
+    fn test_sanitize_multiple_batches() {
+        let b1 = make_batch(&["logical_plan"], &["path /tmp/a/data"]);
+        let b2 = make_batch(&["physical_plan"], &["path /tmp/b/data"]);
+        let filters = vec![(r"/tmp/[a-z]/data", "<DIR>")];
+        let result = sanitize_record_batches(&[b1, b2], &filters).expect("to sanitize");
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].column(1).as_string::<i32>().value(0),
+            "path <DIR>"
+        );
+        assert_eq!(
+            result[1].column(1).as_string::<i32>().value(0),
+            "path <DIR>"
+        );
+    }
 }

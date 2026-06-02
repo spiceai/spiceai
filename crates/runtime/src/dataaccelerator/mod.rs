@@ -22,16 +22,18 @@ use crate::{Runtime, spice_data_base_path};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::{Constraint, DFSchema};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 use datafusion::{
     common::{Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
-use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
+    column_reference::ColumnReference, constraints::UpsertOptions, on_conflict::OnConflict,
 };
+use linkme::distributed_slice;
+use runtime_acceleration::snapshot::{AccelerationLayout, SnapshotDownloadInfo};
 use runtime_table_partition::expression::{PartitionedBy, partition_by_expressions};
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -39,42 +41,107 @@ use std::path::PathBuf;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-use self::arrow::ArrowAccelerator;
-
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBAccelerator;
-#[cfg(feature = "duckdb")]
-use self::partitioned_duckdb::PartitionedDuckDBAccelerator;
-#[cfg(feature = "postgres")]
-use self::postgres::PostgresAccelerator;
-#[cfg(feature = "sqlite")]
-use self::sqlite::SqliteAccelerator;
-#[cfg(feature = "vortex")]
-use self::vortex::VortexAccelerator;
-
 pub mod arrow;
+#[cfg(not(windows))]
+pub mod cayenne;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod partitioned_arrow;
 #[cfg(feature = "duckdb")]
 pub mod partitioned_duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
-#[cfg(feature = "vortex")]
-pub mod vortex;
+#[cfg(feature = "turso")]
+pub mod turso;
 
-mod snapshots;
+pub(crate) mod snapshots;
 pub mod spice_sys;
+pub(crate) mod storage;
+pub mod swappable;
+pub mod upsert_dedup;
 
 pub(crate) use snapshots::validate_snapshot_paths;
+pub use snapshots::{CayenneSnapshotValidationError, validate_cayenne_snapshot_consistency};
+
+#[derive(Clone, Copy)]
+pub struct AcceleratorRegistration {
+    pub engine: Engine,
+    pub constructor: fn() -> Arc<dyn DataAccelerator>,
+}
+
+impl AcceleratorRegistration {
+    pub const fn new(engine: Engine, constructor: fn() -> Arc<dyn DataAccelerator>) -> Self {
+        Self {
+            engine,
+            constructor,
+        }
+    }
+}
+
+/// Distributed slice that automatically collects all data accelerator registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_accelerator!`] macro.
+#[distributed_slice]
+pub static DATA_ACCELERATOR_REGISTRATIONS: [AcceleratorRegistration] = [..];
+
+/// Registers a data accelerator for a given engine.
+///
+/// This macro creates a constructor function for the specified accelerator type and
+/// registers it in the global distributed slice of data accelerators. This allows
+/// the runtime to discover and instantiate accelerators for supported engines.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_accelerator!(Engine::Foo, FooAccelerator);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_accelerator!(
+///     my_accel_fn,
+///     MY_ACCEL_STATIC,
+///     Engine::Bar,
+///     BarAccelerator
+/// );
+/// ```
+///
+/// Using this macro automatically adds the accelerator to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_accelerator {
+    ($fn_name:ident, $static_name:ident, $engine:expr, $accelerator:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataaccelerator::DataAccelerator> {
+            ::std::sync::Arc::new(<$accelerator>::new())
+        }
+
+        #[linkme::distributed_slice($crate::dataaccelerator::DATA_ACCELERATOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataaccelerator::AcceleratorRegistration =
+            $crate::dataaccelerator::AcceleratorRegistration::new($engine, $fn_name);
+    };
+
+    ($engine:expr, $accelerator:ident) => {
+        ::paste::paste! {
+            $crate::register_data_accelerator!(
+                [<__register_data_accelerator_fn_ $accelerator:snake>],
+                [<__REGISTER_DATA_ACCELERATOR_ $accelerator:upper>],
+                $engine,
+                $accelerator
+            );
+        }
+    };
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
-    #[snafu(display("Unknown engine: {engine}"))]
+    #[snafu(display(
+        "Unknown acceleration engine '{engine}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres, cayenne. Docs: https://spiceai.org/docs/components/data-accelerators"
+    ))]
     UnknownEngine { engine: Arc<str> },
 
     #[snafu(display("Acceleration creation failed: {source}"))]
@@ -125,44 +192,41 @@ impl AcceleratorEngineRegistry {
         }
     }
 
-    async fn register_accelerator_engine(
+    pub(crate) async fn register_accelerator_engine(
         &self,
         engine: Engine,
         accelerator_engine: Arc<dyn DataAccelerator>,
     ) {
-        let mut registry = self.accelerator_engine_registry.write().await;
-        registry.insert(engine, accelerator_engine);
+        let replaced_engine = {
+            let mut registry = self.accelerator_engine_registry.write().await;
+            registry.insert(engine, accelerator_engine)
+        };
+
+        if let Some(replaced_engine) = replaced_engine
+            && let Err(e) = replaced_engine.shutdown().await
+        {
+            tracing::error!("Failed to shutdown replaced accelerator engine {engine}: {e}");
+        }
     }
 
     pub(crate) async fn register_all(&self) {
-        self.register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new()))
-            .await;
-        #[cfg(feature = "duckdb")]
-        self.register_accelerator_engine(
-            Engine::PartitionedDuckDB,
-            Arc::new(PartitionedDuckDBAccelerator::new()),
-        )
-        .await;
-        #[cfg(feature = "postgres")]
-        self.register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new()))
-            .await;
-        #[cfg(feature = "sqlite")]
-        self.register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new()))
-            .await;
-        #[cfg(feature = "vortex")]
-        self.register_accelerator_engine(Engine::Vortex, Arc::new(VortexAccelerator::new()))
-            .await;
+        for registration in DATA_ACCELERATOR_REGISTRATIONS {
+            self.register_accelerator_engine(registration.engine, (registration.constructor)())
+                .await;
+        }
     }
 
     pub async fn unregister_all(&self) {
         let mut registry = self.accelerator_engine_registry.write().await;
-        registry.clear();
+        // Shutdown each accelerator before clearing the registry
+        for (engine, accelerator) in registry.drain() {
+            if let Err(e) = accelerator.shutdown().await {
+                tracing::error!("Failed to shutdown accelerator engine {engine}: {e}");
+            }
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn create_accelerator_table(
         &self,
         table_name: TableReference,
@@ -174,6 +238,29 @@ impl AcceleratorEngineRegistry {
         ctx: Arc<SessionContext>,
     ) -> Result<Arc<dyn TableProvider>> {
         let engine = acceleration_settings.engine;
+
+        // Normalize Dictionary-encoded types to their value types only for
+        // accelerator engines that do not natively support Arrow Dictionary
+        // encoding (DuckDB, SQLite, Turso).  Other engines (Arrow, Cayenne,
+        // PostgreSQL) handle Dictionary types natively and benefit from the
+        // compact encoding.
+        let needs_dictionary_normalization = matches!(
+            engine.to_unpartitioned(),
+            acceleration::Engine::DuckDB
+                | acceleration::Engine::Sqlite
+                | acceleration::Engine::Turso
+        );
+        let schema = if needs_dictionary_normalization
+            && arrow_tools::schema::has_dictionary_types(&schema)
+        {
+            let normalized = arrow_tools::type_rewrite::normalize_dictionary_types(&schema);
+            tracing::debug!(
+                "Normalized Arrow Dictionary types in schema for {engine} acceleration"
+            );
+            Arc::new(normalized)
+        } else {
+            schema
+        };
 
         let accelerator = self
             .get_accelerator_engine(acceleration_settings.engine)
@@ -229,18 +316,20 @@ impl AcceleratorEngineRegistry {
         .mode(acceleration_settings.mode)
         .options(params)
         .indexes(acceleration_settings.indexes.clone());
+        let suppress_auto_on_conflict = cayenne_pk_conflict_detection_none(acceleration_settings);
 
         // If there are constraints from the federated table, then add them to the accelerated table
-        // and automatically configure upsert behavior for them. This can be overridden by the user.
+        // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
         if let Some(constraints) = constraints
             && !constraints.is_empty()
         {
             external_table_builder = external_table_builder.constraints(constraints.clone());
-            let primary_keys: Vec<String> = get_primary_keys_from_constraints(constraints, &schema);
-            external_table_builder = external_table_builder.on_conflict(OnConflict::Upsert(
-                ColumnReference::new(primary_keys),
-                UpsertOptions::default(),
-            ));
+            if !suppress_auto_on_conflict {
+                let primary_keys: Vec<String> =
+                    get_primary_keys_from_constraints(constraints, &schema);
+                external_table_builder = external_table_builder
+                    .on_conflict(OnConflict::Upsert(ColumnReference::new(primary_keys)));
+            }
         }
 
         if let Some(on_conflict) =
@@ -253,10 +342,26 @@ impl AcceleratorEngineRegistry {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
+        // Pass UpsertOptions for constraint validation behavior
+        external_table_builder =
+            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
                 if !constraints.is_empty() {
-                    external_table_builder = external_table_builder.constraints(constraints);
+                    external_table_builder =
+                        external_table_builder.constraints(constraints.clone());
+                    // Update on_conflict to match the new constraints' primary key
+                    // if user hasn't explicitly configured on_conflict
+                    if acceleration_settings.on_conflict.is_empty() && !suppress_auto_on_conflict {
+                        let primary_keys: Vec<String> =
+                            get_primary_keys_from_constraints(&constraints, &schema);
+                        if !primary_keys.is_empty() {
+                            external_table_builder = external_table_builder.on_conflict(
+                                OnConflict::Upsert(ColumnReference::new(primary_keys)),
+                            );
+                        }
+                    }
                 }
             }
             Ok(None) => {}
@@ -281,7 +386,12 @@ impl AcceleratorEngineRegistry {
         };
 
         let table_provider = accelerator
-            .create_external_table(external_table, source, partition_by)
+            .create_external_table(
+                external_table,
+                source,
+                partition_by,
+                Some(ctx.runtime_env()),
+            )
             .await
             .context(AccelerationCreationFailedSnafu)?;
 
@@ -302,6 +412,7 @@ pub trait DataAccelerator: Send + Sync {
         cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// The name of the accelerator
@@ -313,9 +424,42 @@ pub trait DataAccelerator: Send + Sync {
     /// The parameters of the accelerator
     fn parameters(&self) -> &'static [ParameterSpec];
 
+    /// Returns the storage layout configuration for this accelerator.
+    ///
+    /// Returns the appropriate `AccelerationLayout` for this engine type:
+    /// - File-based accelerators (`DuckDB`, `SQLite`) return `AccelerationLayout::file`
+    /// - Directory-based accelerators (Cayenne) return `AccelerationLayout::cayenne`
+    ///
+    /// This is used for snapshots and size metrics.
+    fn acceleration_layout(&self, source: &dyn AccelerationSource) -> AccelerationLayout {
+        // Default: use file-based layout if file_path is available
+        if let Ok(path) = self.file_path(source) {
+            AccelerationLayout::file(PathBuf::from(path))
+        } else {
+            AccelerationLayout::default()
+        }
+    }
+
     /// Initialize the accelerator for a component
+    /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
+    /// `WasBootstrapped::no()` otherwise.
     async fn init(
         &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(BootstrapStatus::none())
+    }
+
+    /// Drops an existing table from the acceleration engine.
+    ///
+    /// Used by `file_update` mode to remove a table whose schema is incompatible with
+    /// the current source, so it can be recreated with the correct schema.
+    ///
+    /// The default implementation is a no-op; engines that support file-based acceleration
+    /// should override this.
+    async fn drop_table(
+        &self,
+        _table_name: &str,
         _source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
@@ -360,6 +504,97 @@ pub trait DataAccelerator: Send + Sync {
             false
         }
     }
+
+    /// Shutdown the accelerator, performing any necessary cleanup
+    /// Default implementation does nothing
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    /// Whether this accelerator supports reloading its data from a freshly
+    /// downloaded snapshot file after [`DataAccelerator::init`] has already
+    /// produced a [`TableProvider`].
+    ///
+    /// Returning `true` indicates that [`DataAccelerator::reload_from_snapshot`]
+    /// is implemented; in-memory accelerators (e.g. Arrow) and accelerators
+    /// without a stable on-disk snapshot format must return `false`.
+    fn supports_snapshot_reload(&self) -> bool {
+        false
+    }
+
+    /// Reload the accelerator from a snapshot file that has already been
+    /// downloaded and written to the accelerator's primary path on disk
+    /// (i.e. `acceleration_layout(source).primary_path()`).
+    ///
+    /// The runtime guarantees the per-dataset accelerator write mutex is held
+    /// for the duration of this call. Implementations must:
+    ///   1. Drop or clear any cached engine state (open connections, pool
+    ///      entries, file handles, cached schema views, etc.) holding the
+    ///      previous file open.
+    ///   2. Invoke `provider_factory` to construct a fresh [`TableProvider`]
+    ///      backed by the now-replaced file at the primary path.
+    ///
+    /// `provider_factory` re-runs the same `create_accelerator_table` flow
+    /// used at startup, so the returned provider has the same logical schema,
+    /// constraints, and indexes as `previous_provider`.
+    ///
+    /// The default implementation rejects the call. File-based accelerators
+    /// that participate in `refresh_mode: snapshot` must override this.
+    async fn reload_from_snapshot(
+        &self,
+        _source: &dyn AccelerationSource,
+        _previous_provider: Arc<dyn TableProvider>,
+        _provider_factory: ReloadProviderFactory,
+    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(SnapshotReloadUnsupported {
+            engine: self.name(),
+        }))
+    }
+
+    /// Optional engine-specific [`SnapshotEngine`] used for snapshot create/extract.
+    ///
+    /// Engines that need to customise the on-disk archive contents (e.g.
+    /// Cayenne, which ships a per-dataset metastore-slice JSON instead of
+    /// the raw `cayenne.db` file) override this to return their engine.
+    /// File-based accelerators (`DuckDB` / `SQLite` / `Turso`) return `None` and
+    /// the default `SnapshotManager` engine selection applies.
+    async fn snapshot_engine_for_source(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Option<Arc<dyn runtime_acceleration::snapshot::engine::SnapshotEngine>> {
+        None
+    }
+}
+
+/// Factory that re-runs the `create_accelerator_table` registry flow to
+/// produce a fresh [`TableProvider`] for an already-initialized dataset.
+///
+/// Used by [`DataAccelerator::reload_from_snapshot`] so engines don't need
+/// to re-derive table options, attach databases, write handlers, etc.
+pub type ReloadProviderFactory = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Arc<dyn TableProvider>,
+                            Box<dyn std::error::Error + Send + Sync>,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Error returned by the default [`DataAccelerator::reload_from_snapshot`]
+/// implementation when an engine does not support snapshot-based reloads.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Acceleration engine '{engine}' does not support reloading from a snapshot. \
+     `refresh_mode: snapshot` requires a snapshot-capable file-based engine \
+     (DuckDB, SQLite, Cayenne, or Turso)."
+))]
+pub struct SnapshotReloadUnsupported {
+    pub engine: &'static str,
 }
 
 pub struct AcceleratorExternalTableBuilder {
@@ -371,6 +606,7 @@ pub struct AcceleratorExternalTableBuilder {
     indexes: HashMap<ColumnReference, IndexType>,
     constraints: Option<Constraints>,
     on_conflict: Option<OnConflict>,
+    upsert_options: UpsertOptions,
 }
 
 impl AcceleratorExternalTableBuilder {
@@ -385,6 +621,7 @@ impl AcceleratorExternalTableBuilder {
             indexes: HashMap::new(),
             constraints: None,
             on_conflict: None,
+            upsert_options: UpsertOptions::default(),
         }
     }
 
@@ -418,8 +655,14 @@ impl AcceleratorExternalTableBuilder {
         self
     }
 
+    #[must_use]
+    pub fn upsert_options(mut self, upsert_options: UpsertOptions) -> Self {
+        self.upsert_options = upsert_options;
+        self
+    }
+
     fn validate_arrow(&self) -> Result<(), Error> {
-        if Mode::File == self.mode {
+        if matches!(self.mode, Mode::File | Mode::FileUpdate) {
             InvalidConfigurationSnafu {
                 msg: "File mode not supported for Arrow engine".to_string(),
             }
@@ -461,7 +704,21 @@ impl AcceleratorExternalTableBuilder {
         }
 
         if let Some(on_conflict) = self.on_conflict {
-            options.insert("on_conflict".to_string(), on_conflict.to_string());
+            let on_conflict_str = on_conflict.to_string();
+            tracing::debug!("Adding on_conflict to options: {}", on_conflict_str);
+            options.insert("on_conflict".to_string(), on_conflict_str);
+        }
+
+        // Pass upsert_options as JSON serialized string
+        if self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins {
+            options.insert(
+                "upsert_remove_duplicates".to_string(),
+                self.upsert_options.remove_duplicates.to_string(),
+            );
+            options.insert(
+                "upsert_last_write_wins".to_string(),
+                self.upsert_options.last_write_wins.to_string(),
+            );
         }
 
         let constraints = match self.constraints {
@@ -481,6 +738,7 @@ impl AcceleratorExternalTableBuilder {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -514,6 +772,13 @@ pub trait AccelerationSource: Send + Sync {
 
     /// Returns the name of this source
     fn name(&self) -> &TableReference;
+
+    /// Returns the time column name if configured, None otherwise
+    /// Views always return None as they don't support time-based append mode
+    fn time_column(&self) -> Option<&str>;
+
+    /// Returns a reference to `Any` for downcasting
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub async fn acceleration_file_path(
@@ -532,7 +797,33 @@ pub async fn acceleration_file_path(
     Ok(PathBuf::from(file))
 }
 
-fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaRef) -> Vec<String> {
+/// Gets the storage layout for the given acceleration source.
+///
+/// This function retrieves the registered accelerator for the source's engine
+/// and returns the engine-specific layout. Different engines use
+/// different layout types:
+/// - File-based engines (`DuckDB`, `SQLite`): `AccelerationLayout::file`
+/// - Directory-based engines (Cayenne): `AccelerationLayout::cayenne`
+///
+/// This is used for snapshots and size metrics.
+pub async fn get_acceleration_layout(
+    source: &dyn AccelerationSource,
+) -> Result<AccelerationLayout, FilePathError> {
+    let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
+
+    let accelerator = get_registered_accelerator(source, acceleration_settings.engine)
+        .await
+        .context(AcceleratorEngineUnavailableSnafu {
+            engine: acceleration_settings.engine,
+        })?;
+
+    Ok(accelerator.acceleration_layout(source))
+}
+
+pub(crate) fn get_primary_keys_from_constraints(
+    constraints: &Constraints,
+    schema: &SchemaRef,
+) -> Vec<String> {
     constraints
         .iter()
         .filter_map(|constraint| {
@@ -540,7 +831,7 @@ fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaR
                 Some(
                     col_indexes
                         .iter()
-                        .map(|&col_index| schema.field(col_index).name().to_string()),
+                        .map(|&col_index| schema.field(col_index).name().clone()),
                 )
             } else {
                 None
@@ -548,6 +839,14 @@ fn get_primary_keys_from_constraints(constraints: &Constraints, schema: &SchemaR
         })
         .flatten()
         .collect()
+}
+
+fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> bool {
+    matches!(acceleration_settings.engine, Engine::Cayenne)
+        && ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+            .iter()
+            .filter_map(|key| acceleration_settings.params.get(*key))
+            .any(|value| value.eq_ignore_ascii_case("none"))
 }
 
 async fn get_registered_accelerator(
@@ -561,11 +860,82 @@ async fn get_registered_accelerator(
         .await
 }
 
+/// Indicates whether a data accelerator was bootstrapped (initialized from existing data)
+/// during initialization, and carries any metadata from the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapStatus {
+    Bootstrapped(SnapshotDownloadInfo),
+    None,
+}
+
+impl BootstrapStatus {
+    #[must_use]
+    pub const fn bootstrapped(info: SnapshotDownloadInfo) -> Self {
+        Self::Bootstrapped(info)
+    }
+
+    #[must_use]
+    pub const fn none() -> Self {
+        Self::None
+    }
+
+    #[must_use]
+    pub fn is_bootstrapped(&self) -> bool {
+        matches!(self, Self::Bootstrapped { .. })
+    }
+
+    #[must_use]
+    pub const fn last_updated_at(&self) -> Option<i64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => info.last_updated_at,
+        }
+    }
+
+    /// The `snapshot_id` of the snapshot that was loaded at bootstrap, if any.
+    /// `None` when no bootstrap occurred (no snapshot, or snapshots disabled).
+    #[must_use]
+    pub const fn loaded_snapshot_id(&self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Bootstrapped(info) => Some(info.snapshot_id),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use ::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn test_cayenne_pk_conflict_detection_none_suppresses_auto_on_conflict() {
+        let acceleration_settings = Acceleration {
+            engine: Engine::Cayenne,
+            params: HashMap::from([(
+                "cayenne_pk_conflict_detection".to_string(),
+                "none".to_string(),
+            )]),
+            ..Acceleration::default()
+        };
+
+        assert!(cayenne_pk_conflict_detection_none(&acceleration_settings));
+    }
+
+    #[test]
+    fn test_cayenne_pk_conflict_detection_auto_keeps_auto_on_conflict() {
+        let acceleration_settings = Acceleration {
+            engine: Engine::Cayenne,
+            params: HashMap::from([(
+                "cayenne_pk_conflict_detection".to_string(),
+                "auto".to_string(),
+            )]),
+            ..Acceleration::default()
+        };
+
+        assert!(!cayenne_pk_conflict_detection_none(&acceleration_settings));
+    }
 
     #[tokio::test]
     #[cfg(feature = "duckdb")]
@@ -681,10 +1051,174 @@ mod test {
         assert!(path.is_file());
         fs::remove_file(path).expect("file removed");
     }
+
+    #[tokio::test]
+    async fn test_arrow_primary_key_enables_hash_index_and_upsert() {
+        use crate::builder::RuntimeBuilder;
+        use ::arrow::array::{Int64Array, RecordBatch, StringArray};
+        use data_components::{
+            arrow::IndexedMemTable, index_maintenance::perform_index_maintenance,
+        };
+        use datafusion::{assert_batches_eq, logical_expr::dml::InsertOp, physical_plan::collect};
+        use datafusion_table_providers::util::{column_reference::ColumnReference, test::MockExec};
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let acceleration_settings = Acceleration {
+            enabled: true,
+            mode: Mode::Memory,
+            engine: Engine::Arrow,
+            primary_key: Some(ColumnReference::new(vec!["id".to_string()])),
+            ..Acceleration::default()
+        };
+
+        let table = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "arrow_pk_upsert".into(),
+                Arc::clone(&schema),
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+                Arc::clone(&ctx),
+            )
+            .await
+            .expect("accelerator table should be created");
+
+        let indexed = table
+            .as_any()
+            .downcast_ref::<IndexedMemTable>()
+            .expect("primary key should create an IndexedMemTable");
+        assert!(indexed.has_index());
+        assert_eq!(indexed.primary_key_columns(), &["id".to_string()]);
+
+        let initial = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec!["old"])),
+            ],
+        )
+        .expect("initial batch should be created");
+        let initial_insert = table
+            .insert_into(
+                &ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(initial)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("initial insert plan should be created");
+        collect(initial_insert, ctx.task_ctx())
+            .await
+            .expect("initial insert should succeed");
+
+        let update = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(StringArray::from(vec!["new", "second"])),
+            ],
+        )
+        .expect("update batch should be created");
+        let upsert = table
+            .insert_into(
+                &ctx.state(),
+                Arc::new(MockExec::new(vec![Ok(update)], Arc::clone(&schema))),
+                InsertOp::Append,
+            )
+            .await
+            .expect("upsert plan should be created");
+        collect(upsert, ctx.task_ctx())
+            .await
+            .expect("upsert should succeed");
+        perform_index_maintenance(table.as_ref())
+            .await
+            .expect("index maintenance should succeed");
+
+        ctx.register_table("arrow_pk_upsert", Arc::clone(&table))
+            .expect("table should be registered");
+        let result = ctx
+            .sql("SELECT id, name FROM arrow_pk_upsert ORDER BY id")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should succeed");
+
+        let expected = [
+            "+----+--------+",
+            "| id | name   |",
+            "+----+--------+",
+            "| 1  | new    |",
+            "| 2  | second |",
+            "+----+--------+",
+        ];
+        assert_batches_eq!(&expected, &result);
+
+        let result = ctx
+            .sql("SELECT name FROM arrow_pk_upsert WHERE id = 1")
+            .await
+            .expect("point lookup should plan")
+            .collect()
+            .await
+            .expect("point lookup should succeed");
+        let expected = ["+------+", "| name |", "+------+", "| new  |", "+------+"];
+        assert_batches_eq!(&expected, &result);
+    }
+
+    #[tokio::test]
+    async fn test_arrow_indexes_enable_hash_index() {
+        use crate::builder::RuntimeBuilder;
+        use data_components::arrow::IndexedMemTable;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let runtime = Arc::new(RuntimeBuilder::new().build().await);
+        let ctx = Arc::clone(&runtime.df.ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let acceleration_settings = Acceleration {
+            enabled: true,
+            mode: Mode::Memory,
+            engine: Engine::Arrow,
+            indexes: HashMap::from([(
+                ColumnReference::new(vec!["name".to_string()]),
+                IndexType::Unique,
+            )]),
+            ..Acceleration::default()
+        };
+
+        let table = runtime
+            .accelerator_engine_registry
+            .create_accelerator_table(
+                "arrow_secondary_index".into(),
+                schema,
+                None,
+                &acceleration_settings,
+                Arc::new(RwLock::new(Secrets::new())),
+                None,
+                ctx,
+            )
+            .await
+            .expect("accelerator table should be created");
+
+        let indexed = table
+            .as_any()
+            .downcast_ref::<IndexedMemTable>()
+            .expect("indexes should create an IndexedMemTable");
+        assert!(!indexed.has_index());
+        assert!(indexed.has_secondary_indexes());
+    }
 }
 
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::redundant_closure_for_method_calls,
     clippy::uninlined_format_args,
     clippy::bool_assert_comparison,
@@ -704,63 +1238,147 @@ mod accelerator_compat_tests {
     use crate::dataaccelerator::DataAccelerator;
     use ::arrow::{
         array::{
-            Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+            Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
             DurationMillisecondArray, Float32Array, Float64Array, Int8Array, Int16Array,
             Int32Array, Int32Builder, Int64Array, IntervalYearMonthArray, LargeBinaryArray,
-            LargeStringArray, RecordBatch, StringArray, Time32MillisecondArray,
+            LargeStringArray, RecordBatch, StringArray, StringBuilder, Time32MillisecondArray,
             Time64MicrosecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
             UInt32Array, UInt64Array,
         },
-        datatypes::{DataType, Field, Schema, TimeUnit},
+        datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
     };
-    use data_components::delete::get_deletion_provider;
     use datafusion::{
-        common::{Constraints, TableReference, ToDFSchema},
+        common::{Constraint, Constraints, TableReference, ToDFSchema},
         datasource::TableProvider,
         execution::context::SessionContext,
         logical_expr::{CreateExternalTable, col, dml::InsertOp, lit},
         physical_plan::collect,
     };
     use datafusion_table_providers::util::test::MockExec;
+    use datafusion_table_providers::util::{
+        column_reference::ColumnReference, on_conflict::OnConflict,
+    };
     use std::{collections::HashMap, sync::Arc};
+    use tempfile::TempDir;
 
-    /// Mock acceleration source for testing
+    /// Helper struct to manage temporary test environment
+    /// Ensures unique data directories per test and proper cleanup
+    struct TestEnvironment {
+        _temp_dir: TempDir,
+        data_path: String,
+    }
+
+    impl TestEnvironment {
+        fn new() -> Self {
+            let temp_dir = TempDir::new().expect("Failed to create temp directory");
+            let data_path = temp_dir.path().to_string_lossy().to_string();
+
+            Self {
+                _temp_dir: temp_dir,
+                data_path,
+            }
+        }
+
+        fn metadata_dir(&self) -> String {
+            format!("{}/metadata", self.data_path)
+        }
+    }
+
+    fn clean_cayenne_metadata(metadata_dir: &str) {
+        let metadata_path = std::path::Path::new(metadata_dir);
+        if !metadata_path.exists() {
+            let _ = std::fs::create_dir_all(metadata_path);
+            return;
+        }
+
+        if let Ok(entries) = std::fs::read_dir(metadata_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("cayenne.db"))
+                {
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper function to construct mode label with optional timestamp format
+    fn make_mode_label(
+        mode: &str,
+        timestamp_format: Option<&str>,
+        metastore_type: Option<&str>,
+    ) -> String {
+        let mut labels = vec![mode.to_string()];
+        if let Some(ts_fmt) = timestamp_format {
+            labels.push(format!("timestamp_format={ts_fmt}"));
+        }
+        if let Some(metastore) = metastore_type {
+            labels.push(format!("metastore={metastore}"));
+        }
+        labels.join(", ")
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct CompatTableOptions {
+        primary_key: bool,
+    }
+
     /// Test helper that runs the same test logic against all enabled accelerators
     async fn run_compat_test<F, Fut>(test_fn: F)
     where
-        F: Fn(Engine, Arc<dyn TableProvider>, String) -> Fut,
+        F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        run_compat_test_with_table_options(test_fn, CompatTableOptions::default()).await;
+    }
+
+    async fn run_compat_test_with_table_options<F, Fut>(
+        test_fn: F,
+        table_options: CompatTableOptions,
+    ) where
+        F: Fn(Engine, Arc<dyn TableProvider>, String, &TestEnvironment) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
         // Test both memory and file modes for databases
-        // For Turso, also test both timestamp formats
+        // For Turso accelerator, test both timestamp formats
+        // For Cayenne, test both SQLite and Turso metastore backends
+        // Format: (engine, mode, timestamp_format, metastore_type)
         let test_configs = vec![
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "memory", None),
+            (Engine::Sqlite, "memory", None, None),
             #[cfg(feature = "sqlite")]
-            (Engine::Sqlite, "file", None),
+            (Engine::Sqlite, "file", None, None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("rfc3339")),
+            (Engine::Turso, "memory", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("rfc3339")),
+            (Engine::Turso, "file", Some("rfc3339"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "memory", Some("integer_millis")),
+            (Engine::Turso, "memory", Some("integer_millis"), None),
             #[cfg(feature = "turso")]
-            (Engine::Turso, "file", Some("integer_millis")),
+            (Engine::Turso, "file", Some("integer_millis"), None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "memory", None),
+            (Engine::DuckDB, "memory", None, None),
             #[cfg(feature = "duckdb")]
-            (Engine::DuckDB, "file", None),
-            (Engine::Arrow, "memory", None),
-            #[cfg(feature = "vortex")]
-            (Engine::Vortex, "file", None), // Vortex only supports file mode
+            (Engine::DuckDB, "file", None, None),
+            (Engine::Arrow, "memory", None, None),
+            #[cfg(not(windows))]
+            (Engine::Cayenne, "file", None, Some("sqlite")), // Cayenne with SQLite metastore
+            #[cfg(all(not(windows), feature = "turso"))]
+            (Engine::Cayenne, "file", None, Some("turso")), // Cayenne with Turso metastore
         ];
 
-        for (engine, mode, timestamp_format) in test_configs {
-            let mode_label = if let Some(ts_fmt) = timestamp_format {
-                format!("{}, timestamp_format={}", mode, ts_fmt)
-            } else {
-                mode.to_string()
-            };
+        for (engine, mode, timestamp_format, metastore_type) in test_configs {
+            // Create a unique test environment for this test run
+            let test_env = TestEnvironment::new();
+
+            let mode_label = make_mode_label(mode, timestamp_format, metastore_type);
 
             println!("Testing with engine: {:?} ({})", engine, mode_label);
 
@@ -770,10 +1388,16 @@ mod accelerator_compat_tests {
             // Create appropriate location based on mode with a unique identifier per test run
             // This ensures tests don't interfere with each other by reusing the same file/directory
             let location = if mode == "file" {
+                let variant = match (timestamp_format, metastore_type) {
+                    (Some(ts_fmt), Some(metastore)) => format!("{ts_fmt}_{metastore}"),
+                    (Some(ts_fmt), None) => ts_fmt.to_string(),
+                    (None, Some(metastore)) => metastore.to_string(),
+                    (None, None) => "default".to_string(),
+                };
                 format!(
                     "/tmp/spice_benchmark_{:?}_{}_{}_{}.db",
                     engine,
-                    timestamp_format.unwrap_or("default"),
+                    variant,
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -797,6 +1421,16 @@ mod accelerator_compat_tests {
                 options.insert("internal_timestamp_format".to_string(), ts_fmt.to_string());
             }
 
+            let constraints = if table_options.primary_key {
+                options.insert(
+                    "on_conflict".to_string(),
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])).to_string(),
+                );
+                Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])])
+            } else {
+                Constraints::new_unverified(vec![])
+            };
+
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare(format!("test_table_{:?}_{}", engine, mode)),
@@ -804,11 +1438,12 @@ mod accelerator_compat_tests {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
                 options,
-                constraints: Constraints::new_unverified(vec![]),
+                constraints,
                 column_defaults: HashMap::default(),
                 temporary: false,
             };
@@ -818,7 +1453,7 @@ mod accelerator_compat_tests {
                 Engine::Sqlite => {
                     use crate::dataaccelerator::sqlite::SqliteAccelerator;
                     match SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -832,7 +1467,7 @@ mod accelerator_compat_tests {
                 Engine::Turso => {
                     use crate::dataaccelerator::turso::TursoAccelerator;
                     match TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -846,7 +1481,7 @@ mod accelerator_compat_tests {
                 Engine::DuckDB => {
                     use crate::dataaccelerator::duckdb::DuckDBAccelerator;
                     match DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -859,7 +1494,7 @@ mod accelerator_compat_tests {
                 Engine::Arrow => {
                     use crate::dataaccelerator::arrow::ArrowAccelerator;
                     match ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
+                        .create_external_table(external_table, None, Vec::new(), None)
                         .await
                     {
                         Ok(table) => table,
@@ -869,21 +1504,22 @@ mod accelerator_compat_tests {
                         }
                     }
                 }
-                #[cfg(feature = "vortex")]
-                Engine::Vortex => {
+                #[cfg(not(windows))]
+                Engine::Cayenne => {
                     use crate::component::dataset::builder::DatasetBuilder;
-                    use crate::dataaccelerator::vortex::VortexAccelerator;
+                    use crate::dataaccelerator::cayenne::CayenneAccelerator;
 
-                    // Clean up any existing .vortex files in the test directory
-                    // Vortex only supports appends, so we need a clean state for each test
+                    // Clean up any existing .cayenne files and Cayenne metadata
+                    // Cayenne only supports appends, so we need a clean state for each test
                     if mode == "file" && !location.is_empty() {
                         let test_dir = std::path::Path::new(&location);
                         if test_dir.exists() {
                             if let Ok(entries) = std::fs::read_dir(test_dir) {
                                 for entry in entries.flatten() {
                                     let path = entry.path();
-                                    // Safety: only delete .vortex files
-                                    if path.extension().and_then(|s| s.to_str()) == Some("vortex") {
+                                    // Safety: only delete .cayenne files
+                                    if path.extension().and_then(|s| s.to_str()) == Some("cayenne")
+                                    {
                                         let _ = std::fs::remove_file(&path);
                                     }
                                 }
@@ -892,6 +1528,8 @@ mod accelerator_compat_tests {
                             // Create the directory if it doesn't exist
                             let _ = std::fs::create_dir_all(test_dir);
                         }
+
+                        clean_cayenne_metadata(&test_env.metadata_dir());
                     }
 
                     // Create a proper Dataset that implements AccelerationSource
@@ -923,7 +1561,16 @@ mod accelerator_compat_tests {
                     let mut params = HashMap::new();
                     if mode == "file" {
                         // Set file_path to use our unique temporary location with timestamp
-                        params.insert("vortex_file_path".to_string(), location.clone());
+                        params.insert("cayenne_file_path".to_string(), location.clone());
+                    }
+                    // Use test environment's metadata directory for Cayenne
+                    params.insert("cayenne_metadata_dir".to_string(), test_env.metadata_dir());
+                    // Use 'error' mode for tests to fail on unsupported types
+                    // This matches the new default production behavior
+                    params.insert("unsupported_type_action".to_string(), "error".to_string());
+                    // Set metastore type if specified (for Cayenne variants)
+                    if let Some(metastore) = metastore_type {
+                        params.insert("cayenne_metastore".to_string(), metastore.to_string());
                     }
 
                     dataset.acceleration = Some(Acceleration {
@@ -933,7 +1580,7 @@ mod accelerator_compat_tests {
                         } else {
                             Mode::Memory
                         },
-                        engine: Engine::Vortex,
+                        engine: Engine::Cayenne,
                         params,
                         ..Acceleration::default()
                     });
@@ -943,11 +1590,13 @@ mod accelerator_compat_tests {
                     use futures::FutureExt;
                     use std::panic::AssertUnwindSafe;
 
-                    let accelerator = VortexAccelerator::new();
+                    let accelerator = CayenneAccelerator::new();
+                    let runtime_env = SessionContext::new().runtime_env();
                     let create_future = AssertUnwindSafe(accelerator.create_external_table(
                         external_table,
                         Some(&dataset),
                         Vec::new(),
+                        Some(runtime_env),
                     ))
                     .catch_unwind();
 
@@ -977,7 +1626,7 @@ mod accelerator_compat_tests {
                 _ => panic!("Unsupported engine for this test"),
             };
 
-            test_fn(engine, table, mode_label.clone()).await;
+            test_fn(engine, table, mode_label.clone(), &test_env).await;
 
             // Cleanup file if in file mode
             if mode == "file" && !location.is_empty() {
@@ -988,7 +1637,7 @@ mod accelerator_compat_tests {
 
     /// Helper function to get the comprehensive test schema covering all major Arrow data types
     /// Note: Some exotic types (`Time64`, `LargeBinary`, `LargeUtf8`) may not be supported by all engines
-    /// For Vortex, Duration types are excluded as they are not yet supported
+    /// For Vortex, Time32, Time64, Duration, Interval, and Map types are excluded as they are not yet supported
     fn test_schema(engine: Option<Engine>) -> Arc<Schema> {
         let mut fields = vec![
             // Original columns (for backwards compatibility with existing tests)
@@ -1017,23 +1666,8 @@ mod accelerator_compat_tests {
             Field::new("date64_col", DataType::Date64, true),
         ];
 
-        // Time32 and Time64 types - Vortex doesn't support these
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
-            fields.push(Field::new(
-                "time32_ms_col",
-                DataType::Time32(TimeUnit::Millisecond),
-                true,
-            ));
-            fields.push(Field::new(
-                "time64_us_col",
-                DataType::Time64(TimeUnit::Microsecond),
-                true,
-            ));
-        }
-
-        #[cfg(not(feature = "vortex"))]
-        {
+        // Skip Time32 and Time64 for Vortex as they're not yet supported
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "time32_ms_col",
                 DataType::Time32(TimeUnit::Millisecond),
@@ -1052,28 +1686,17 @@ mod accelerator_compat_tests {
             true,
         ));
 
-        // Duration and Interval types - Vortex doesn't support Duration yet
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
+        // Skip Duration for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "duration_ms_col",
                 DataType::Duration(TimeUnit::Millisecond),
-                true,
-            ));
-            fields.push(Field::new(
-                "interval_ym_col",
-                DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
                 true,
             ));
         }
 
-        #[cfg(not(feature = "vortex"))]
-        {
-            fields.push(Field::new(
-                "duration_ms_col",
-                DataType::Duration(TimeUnit::Millisecond),
-                true,
-            ));
+        // Skip Interval for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "interval_ym_col",
                 DataType::Interval(datafusion::arrow::datatypes::IntervalUnit::YearMonth),
@@ -1087,31 +1710,8 @@ mod accelerator_compat_tests {
             true,
         ));
 
-        // Map type (map of Utf8 keys to Int32 values) - Vortex doesn't support Map yet
-        #[cfg(feature = "vortex")]
-        if !matches!(engine, Some(Engine::Vortex)) {
-            fields.push(Field::new(
-                "map_col",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(
-                            vec![
-                                Field::new("key", DataType::Utf8, false),
-                                Field::new("value", DataType::Int32, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false, // keys are not sorted
-                ),
-                true,
-            ));
-        }
-
-        #[cfg(not(feature = "vortex"))]
-        {
+        // Skip Map type for Vortex as it's not yet supported
+        if !matches!(engine, Some(Engine::Cayenne)) {
             fields.push(Field::new(
                 "map_col",
                 DataType::Map(
@@ -1533,14 +2133,155 @@ mod accelerator_compat_tests {
         RecordBatch::try_new(schema, columns).expect("data should be created")
     }
 
+    /// Transform `RecordBatch` to match a target schema by converting unsupported types to strings
+    /// This is needed for engines like Vortex that convert unsupported types to Utf8
+    fn transform_batch_to_schema(
+        batch: &RecordBatch,
+        target_schema: SchemaRef,
+    ) -> Result<RecordBatch, arrow::error::ArrowError> {
+        let source_schema = batch.schema();
+        let mut new_columns: Vec<ArrayRef> = Vec::new();
+
+        for target_field in target_schema.fields() {
+            // Find the corresponding source field by name
+            let source_field_idx = source_schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == target_field.name())
+                .ok_or_else(|| {
+                    arrow::error::ArrowError::SchemaError(format!(
+                        "Field '{}' not found in source schema",
+                        target_field.name()
+                    ))
+                })?;
+
+            let source_array = batch.column(source_field_idx);
+            let source_type = source_schema.field(source_field_idx).data_type();
+
+            // If types match, use the column as-is
+            if source_type == target_field.data_type() {
+                new_columns.push(Arc::clone(source_array));
+                continue;
+            }
+
+            // If target is Utf8 and source is not, convert to string
+            if matches!(target_field.data_type(), DataType::Utf8)
+                && !matches!(source_type, DataType::Utf8 | DataType::LargeUtf8)
+            {
+                let mut builder = StringBuilder::new();
+
+                for row_idx in 0..source_array.len() {
+                    if source_array.is_null(row_idx) {
+                        builder.append_null();
+                    } else {
+                        // Convert the value to string representation
+                        let string_value = match source_type {
+                            DataType::Time32(TimeUnit::Millisecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<Time32MillisecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time32MillisecondArray".to_string(),
+                                    ));
+                                };
+                                format!("{}", arr.value(row_idx))
+                            }
+                            DataType::Time64(TimeUnit::Microsecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<Time64MicrosecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to Time64MicrosecondArray".to_string(),
+                                    ));
+                                };
+                                format!("{}", arr.value(row_idx))
+                            }
+                            DataType::Duration(TimeUnit::Millisecond) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<DurationMillisecondArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to DurationMillisecondArray"
+                                            .to_string(),
+                                    ));
+                                };
+                                format!("{}ms", arr.value(row_idx))
+                            }
+                            DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth) => {
+                                let Some(arr) = source_array
+                                    .as_any()
+                                    .downcast_ref::<IntervalYearMonthArray>()
+                                else {
+                                    return Err(arrow::error::ArrowError::ComputeError(
+                                        "Failed to downcast to IntervalYearMonthArray".to_string(),
+                                    ));
+                                };
+                                format!("{} months", arr.value(row_idx))
+                            }
+                            DataType::Map(_, _) => {
+                                // For Map types, use Arrow's display format
+                                format!(
+                                    "{:?}",
+                                    arrow::util::display::array_value_to_string(
+                                        source_array,
+                                        row_idx
+                                    )
+                                    .unwrap_or_else(|_| "null".to_string())
+                                )
+                            }
+                            _ => {
+                                // Generic conversion using Arrow's display utilities
+                                arrow::util::display::array_value_to_string(source_array, row_idx)
+                                    .unwrap_or_else(|_| "null".to_string())
+                            }
+                        };
+                        builder.append_value(string_value);
+                    }
+                }
+
+                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
+            } else {
+                // For other type mismatches, use Arrow's cast kernel to handle compatible conversions
+                // (e.g., Float16->Float32, Int32->Int64, etc.)
+                let casted =
+                    arrow::compute::cast(source_array, target_field.data_type()).map_err(|e| {
+                        arrow::error::ArrowError::ComputeError(format!(
+                            "Failed to cast field '{}' from {:?} to {:?}: {}",
+                            target_field.name(),
+                            source_type,
+                            target_field.data_type(),
+                            e
+                        ))
+                    })?;
+                new_columns.push(casted);
+            }
+        }
+
+        RecordBatch::try_new(target_schema, new_columns)
+    }
+
     /// Helper function to insert test data into a table
     async fn insert_test_data(
         table: &Arc<dyn TableProvider>,
         ctx: &SessionContext,
         data: RecordBatch,
     ) {
-        let schema = data.schema();
-        let exec = MockExec::new(vec![Ok(data)], schema);
+        let table_schema = table.schema();
+
+        // Transform the data to match the table schema if needed
+        // (e.g., for Vortex which converts unsupported types to strings)
+        let transformed_data = if data.schema() == table_schema {
+            data
+        } else {
+            transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                .expect("data transformation should succeed")
+        };
+
+        let schema = transformed_data.schema();
+        let exec = MockExec::new(vec![Ok(transformed_data)], schema);
         let insertion = table
             .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
             .await
@@ -1552,9 +2293,135 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
+    async fn test_schema_preservation() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            let original_schema = test_schema(Some(engine));
+            let table_schema = table.schema();
+
+            // Verify that the table schema has all fields (count should match)
+            assert_eq!(
+                table_schema.fields().len(),
+                original_schema.fields().len(),
+                "{:?}: Schema field count mismatch. Expected {}, got {}. \
+                 This indicates that the catalog is not preserving all fields correctly.",
+                engine,
+                original_schema.fields().len(),
+                table_schema.fields().len()
+            );
+
+            // Define types that Vortex converts to Utf8 with unsupported_type_action: string
+            let vortex_unsupported_types = [
+                DataType::Time32(TimeUnit::Millisecond),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Duration(TimeUnit::Millisecond),
+                DataType::Interval(arrow::datatypes::IntervalUnit::YearMonth),
+            ];
+
+            // Verify each field matches (or is appropriately converted)
+            for (i, (original_field, table_field)) in original_schema
+                .fields()
+                .iter()
+                .zip(table_schema.fields().iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    original_field.name(),
+                    table_field.name(),
+                    "{:?}: Field {} name mismatch",
+                    engine,
+                    i
+                );
+
+                let original_type = original_field.data_type();
+                let table_type = table_field.data_type();
+
+                // For Vortex, check if unsupported types are converted to Utf8
+                if matches!(engine, Engine::Cayenne) {
+                    if vortex_unsupported_types.contains(original_type) {
+                        assert_eq!(
+                            table_type,
+                            &DataType::Utf8,
+                            "{:?}: Field {} ({}) with unsupported type {:?} should be converted to Utf8, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            original_type,
+                            table_type
+                        );
+                    } else if matches!(original_type, DataType::Map(_, _)) {
+                        // Map types are also converted to Utf8
+                        assert_eq!(
+                            table_type,
+                            &DataType::Utf8,
+                            "{:?}: Field {} ({}) with Map type should be converted to Utf8, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            table_type
+                        );
+                    } else {
+                        // Other types should match exactly (or be compatible conversions like timestamps)
+                        assert_eq!(
+                            original_type,
+                            table_type,
+                            "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                            engine,
+                            i,
+                            original_field.name(),
+                            original_type,
+                            table_type
+                        );
+                    }
+                } else if matches!(engine, Engine::DuckDB) {
+                    // DuckDB normalises YearMonth/DayTime intervals to MonthDayNano
+                    // because its native INTERVAL type maps to the MonthDayNano layout.
+                    let expected_type = match original_type {
+                        DataType::Interval(
+                            arrow::datatypes::IntervalUnit::YearMonth
+                            | arrow::datatypes::IntervalUnit::DayTime,
+                        ) => &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+                        other => other,
+                    };
+                    assert_eq!(
+                        expected_type,
+                        table_type,
+                        "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        expected_type,
+                        table_type
+                    );
+                } else {
+                    // For all other engines, types should match exactly
+                    assert_eq!(
+                        original_type,
+                        table_type,
+                        "{:?}: Field {} ({}) data type mismatch. Expected {:?}, got {:?}",
+                        engine,
+                        i,
+                        original_field.name(),
+                        original_type,
+                        table_type
+                    );
+                }
+
+                assert_eq!(
+                    original_field.is_nullable(),
+                    table_field.is_nullable(),
+                    "{:?}: Field {} ({}) nullable mismatch",
+                    engine,
+                    i,
+                    original_field.name()
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_basic_insert_and_query() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -1574,7 +2441,10 @@ mod accelerator_compat_tests {
             assert_eq!(total_rows, 100, "{:?}: should have {} rows", engine, 100);
 
             // Test 2: Filter with WHERE clause (id > 50)
-            // Note: Arrow and Vortex engines don't support filter pushdown, so they return all rows
+            // Note: Arrow and Vortex engines don't support filter pushdown at the TableProvider
+            // level (via scan() method). Vortex supports filter pushdown at the physical plan
+            // level via DataFusion's FilterPushdown optimizer rule, but that only applies when
+            // running SQL queries, not when calling scan() directly.
             let filter = col("id").gt(lit(50_i64));
             let scan = table
                 .scan(&ctx.state(), None, &[filter], None)
@@ -1584,7 +2454,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("filtered scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 50,
                     "{:?}: filtered should have <= 50 rows, got {}",
@@ -1608,7 +2478,8 @@ mod accelerator_compat_tests {
             );
 
             // Test 4: LIMIT clause
-            // Note: Arrow and Vortex engines don't support limit pushdown
+            // Note: Arrow doesn't support limit pushdown. Vortex supports limit pushdown via
+            // FileScanConfig.limit at the TableProvider level when scan() is called with a limit.
             let limit = Some(10);
             let scan = table
                 .scan(&ctx.state(), None, &[], limit)
@@ -1618,7 +2489,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("limit scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 10,
                     "{:?}: limit should have <= 10 rows, got {}",
@@ -1628,7 +2499,9 @@ mod accelerator_compat_tests {
             }
 
             // Test 5: Combined filter + projection + limit
-            // Note: Arrow and Vortex engines don't support filter/limit pushdown
+            // Note: Arrow doesn't support filter/limit pushdown at the TableProvider level.
+            // Vortex supports limit pushdown via FileScanConfig.limit but filter pushdown
+            // only works via DataFusion's physical optimizer (when running SQL queries).
             let filter = col("id").lt(lit(30_i64));
             let projection = Some(vec![1_usize]); // name only
             let limit = Some(5);
@@ -1640,7 +2513,7 @@ mod accelerator_compat_tests {
                 .await
                 .expect("combined scan successful");
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            if engine != Engine::Arrow && engine != Engine::Vortex {
+            if engine != Engine::Arrow && engine != Engine::Cayenne {
                 assert!(
                     total_rows <= 5,
                     "{:?}: combined should have <= 5 rows, got {}",
@@ -1658,8 +2531,8 @@ mod accelerator_compat_tests {
                 .await
                 .expect("scan successful");
 
-            // Vortex may not preserve nulls properly yet, so skip this check for Vortex
-            if engine != Engine::Vortex {
+            // Cayenne may not preserve nulls properly yet, so skip this check for Cayenne
+            if engine != Engine::Cayenne {
                 for batch in &results {
                     let value_col = batch
                         .column(2)
@@ -1676,11 +2549,10 @@ mod accelerator_compat_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::unreadable_literal)]
     async fn test_delete_operations() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             // Skip engines that don't support deletion
-            if engine == Engine::Arrow || engine == Engine::Vortex {
+            if engine == Engine::Arrow || engine == Engine::Cayenne {
                 return;
             }
 
@@ -1691,13 +2563,10 @@ mod accelerator_compat_tests {
             let data = generate_test_data(Arc::clone(&schema), 50, 0);
             insert_test_data(&table, &ctx, data).await;
 
-            // Get deletion provider
-            let table = get_deletion_provider(table).expect("should support deletion");
-
             // Delete rows where id > 3 (should delete ids 4-49, which is 46 rows)
             let filter = col("id").gt(lit(3_i64));
             let plan = table
-                .delete_from(&ctx.state(), &[filter])
+                .delete_from(&ctx.state(), vec![filter])
                 .await
                 .expect("deletion should be successful");
 
@@ -1725,14 +2594,23 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_null_handling() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
             // Insert 3 records with nulls in the value column
             let data = generate_test_data(Arc::clone(&schema), 3, 0);
 
-            let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
+            // Transform data to match table schema if needed (e.g., for Vortex type conversions)
+            let table_schema = table.schema();
+            let transformed_data = if data.schema() == table_schema {
+                data
+            } else {
+                transform_batch_to_schema(&data, Arc::clone(&table_schema))
+                    .expect("data transformation should succeed")
+            };
+
+            let exec = MockExec::new(vec![Ok(transformed_data)], Arc::clone(&table_schema));
 
             let insertion = table
                 .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
@@ -1788,139 +2666,252 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_boolean_values() {
-        run_compat_test(|engine, _table, _mode| async move {
-            let ctx = SessionContext::new();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("active", DataType::Boolean, false),
-            ]));
+        run_compat_test(|engine, _table, _mode, test_env| {
+            let metadata_dir = test_env.metadata_dir();
+            async move {
+                let ctx = SessionContext::new();
+                let mode = if _mode.starts_with("file") {
+                    "file"
+                } else {
+                    "memory"
+                };
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("name", DataType::Utf8, false),
+                    Field::new("active", DataType::Boolean, false),
+                ]));
 
-            let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
-            let external_table = CreateExternalTable {
-                schema: df_schema,
-                name: TableReference::bare(format!("test_bool_{:?}", engine)),
-                location: String::new(),
-                file_type: String::new(),
-                table_partition_cols: vec![],
-                if_not_exists: true,
-                definition: None,
-                order_exprs: vec![],
-                unbounded: false,
-                options: HashMap::new(),
-                constraints: Constraints::new_unverified(vec![]),
-                column_defaults: HashMap::default(),
-                temporary: false,
-            };
+                let df_schema =
+                    ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
-            let bool_table: Arc<dyn TableProvider> = match engine {
-                #[cfg(feature = "sqlite")]
-                Engine::Sqlite => {
-                    use crate::dataaccelerator::sqlite::SqliteAccelerator;
-                    SqliteAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("SQLite table should be created")
+                // Create location for file-based engines
+                let location = if mode == "file" {
+                    format!(
+                        "/tmp/spice_benchmark_{:?}_boolean_{}_{}.db",
+                        engine,
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("Time went backwards")
+                            .as_nanos()
+                    )
+                } else {
+                    String::new()
+                };
+
+                let mut options = HashMap::new();
+                if mode == "file" {
+                    options.insert("file".to_string(), location.clone());
                 }
-                #[cfg(feature = "turso")]
-                Engine::Turso => {
-                    use crate::dataaccelerator::turso::TursoAccelerator;
-                    TursoAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("Turso table should be created")
+                options.insert("mode".to_string(), mode.to_string());
+
+                let external_table = CreateExternalTable {
+                    schema: df_schema,
+                    name: TableReference::bare(format!("test_bool_{:?}", engine)),
+                    location: location.clone(),
+                    file_type: String::new(),
+                    table_partition_cols: vec![],
+                    if_not_exists: true,
+                    or_replace: false,
+                    definition: None,
+                    order_exprs: vec![],
+                    unbounded: false,
+                    options,
+                    constraints: Constraints::new_unverified(vec![]),
+                    column_defaults: HashMap::default(),
+                    temporary: false,
+                };
+
+                let bool_table: Arc<dyn TableProvider> = match engine {
+                    #[cfg(feature = "sqlite")]
+                    Engine::Sqlite => {
+                        use crate::dataaccelerator::sqlite::SqliteAccelerator;
+                        SqliteAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new(), None)
+                            .await
+                            .expect("SQLite table should be created")
+                    }
+                    #[cfg(feature = "turso")]
+                    Engine::Turso => {
+                        use crate::dataaccelerator::turso::TursoAccelerator;
+                        TursoAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new(), None)
+                            .await
+                            .expect("Turso table should be created")
+                    }
+                    #[cfg(feature = "duckdb")]
+                    Engine::DuckDB => {
+                        use crate::dataaccelerator::duckdb::DuckDBAccelerator;
+                        DuckDBAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new(), None)
+                            .await
+                            .expect("DuckDB table should be created")
+                    }
+                    Engine::Arrow => {
+                        use crate::dataaccelerator::arrow::ArrowAccelerator;
+                        ArrowAccelerator::new()
+                            .create_external_table(external_table, None, Vec::new(), None)
+                            .await
+                            .expect("Arrow table should be created")
+                    }
+                    #[cfg(not(windows))]
+                    Engine::Cayenne => {
+                        use crate::component::dataset::builder::DatasetBuilder;
+                        use crate::dataaccelerator::cayenne::CayenneAccelerator; // Clean up any existing files and metadata
+                        if mode == "file" && !location.is_empty() {
+                            let test_dir = std::path::Path::new(&location);
+                            if test_dir.exists() {
+                                if let Ok(entries) = std::fs::read_dir(test_dir) {
+                                    for entry in entries.flatten() {
+                                        let path = entry.path();
+                                        if path.extension().and_then(|s| s.to_str())
+                                            == Some("cayenne")
+                                        {
+                                            let _ = std::fs::remove_file(&path);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let _ = std::fs::create_dir_all(test_dir);
+                            }
+
+                            clean_cayenne_metadata(&metadata_dir);
+                        }
+
+                        let test_app_obj = app::AppBuilder::new("test").build();
+                        let test_app = Arc::new(test_app_obj.clone());
+                        let test_runtime = Arc::new(
+                            crate::Runtime::builder()
+                                .with_app(test_app_obj)
+                                .build()
+                                .await,
+                        );
+
+                        let dataset_name = format!("test_bool_{:?}", engine);
+                        let mut dataset =
+                            match DatasetBuilder::try_new(dataset_name.clone(), &dataset_name)
+                                .expect("Failed to create dataset builder")
+                                .with_app(Arc::clone(&test_app))
+                                .with_runtime(Arc::clone(&test_runtime))
+                                .build()
+                            {
+                                Ok(ds) => ds,
+                                Err(e) => {
+                                    panic!("Failed to create dataset: {}", e);
+                                }
+                            };
+
+                        let mut params = HashMap::new();
+                        if mode == "file" {
+                            params.insert("cayenne_file_path".to_string(), location.clone());
+                        }
+                        // Use test environment's metadata directory for Cayenne
+                        params.insert("cayenne_metadata_dir".to_string(), metadata_dir.clone());
+                        params.insert("unsupported_type_action".to_string(), "error".to_string());
+                        if _mode.contains("metastore=turso") {
+                            params.insert("cayenne_metastore".to_string(), "turso".to_string());
+                        }
+
+                        dataset.acceleration = Some(Acceleration {
+                            enabled: true,
+                            mode: if mode == "file" {
+                                Mode::File
+                            } else {
+                                Mode::Memory
+                            },
+                            engine: Engine::Cayenne,
+                            params,
+                            ..Acceleration::default()
+                        });
+
+                        let runtime_env = SessionContext::new().runtime_env();
+                        CayenneAccelerator::new()
+                            .create_external_table(
+                                external_table,
+                                Some(&dataset),
+                                Vec::new(),
+                                Some(runtime_env),
+                            )
+                            .await
+                            .expect("Vortex table should be created")
+                    }
+                    _ => panic!("Unsupported engine: {:?}", engine),
+                };
+
+                // Insert boolean data
+                let id_array = Int64Array::from(vec![1, 2, 3]);
+                let name_array = StringArray::from(vec!["A", "B", "C"]);
+                let bool_array = BooleanArray::from(vec![true, false, true]);
+
+                let data = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(id_array),
+                        Arc::new(name_array),
+                        Arc::new(bool_array),
+                    ],
+                )
+                .expect("data should be created");
+
+                let exec = MockExec::new(vec![Ok(data)], schema);
+
+                let insertion = bool_table
+                    .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+                    .await
+                    .expect("insertion should be successful");
+
+                collect(insertion, ctx.task_ctx())
+                    .await
+                    .expect("insert successful");
+
+                // Query and verify boolean values
+                let scan = bool_table
+                    .scan(&ctx.state(), None, &[], None)
+                    .await
+                    .expect("scan should be successful");
+
+                let results = collect(scan, ctx.task_ctx())
+                    .await
+                    .expect("scan successful");
+
+                let batch = &results[0];
+                let bool_col = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("active should be BooleanArray");
+
+                assert_eq!(
+                    bool_col.value(0),
+                    true,
+                    "{:?}: row 0 should be true",
+                    engine
+                );
+                assert_eq!(
+                    bool_col.value(1),
+                    false,
+                    "{:?}: row 1 should be false",
+                    engine
+                );
+                assert_eq!(
+                    bool_col.value(2),
+                    true,
+                    "{:?}: row 2 should be true",
+                    engine
+                );
+
+                // Cleanup
+                if mode == "file" && !location.is_empty() {
+                    let _ = std::fs::remove_file(&location);
                 }
-                #[cfg(feature = "duckdb")]
-                Engine::DuckDB => {
-                    use crate::dataaccelerator::duckdb::DuckDBAccelerator;
-                    DuckDBAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("DuckDB table should be created")
-                }
-                Engine::Arrow => {
-                    use crate::dataaccelerator::arrow::ArrowAccelerator;
-                    ArrowAccelerator::new()
-                        .create_external_table(external_table, None, Vec::new())
-                        .await
-                        .expect("Arrow table should be created")
-                }
-                #[cfg(feature = "vortex")]
-                Engine::Vortex => {
-                    // Vortex doesn't work well with this simple test, skip it
-                    return;
-                }
-                _ => panic!("Unsupported engine: {:?}", engine),
-            };
-
-            // Insert boolean data
-            let id_array = Int64Array::from(vec![1, 2, 3]);
-            let name_array = StringArray::from(vec!["A", "B", "C"]);
-            let bool_array = BooleanArray::from(vec![true, false, true]);
-
-            let data = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(id_array),
-                    Arc::new(name_array),
-                    Arc::new(bool_array),
-                ],
-            )
-            .expect("data should be created");
-
-            let exec = MockExec::new(vec![Ok(data)], schema);
-
-            let insertion = bool_table
-                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                .await
-                .expect("insertion should be successful");
-
-            collect(insertion, ctx.task_ctx())
-                .await
-                .expect("insert successful");
-
-            // Query and verify boolean values
-            let scan = bool_table
-                .scan(&ctx.state(), None, &[], None)
-                .await
-                .expect("scan should be successful");
-
-            let results = collect(scan, ctx.task_ctx())
-                .await
-                .expect("scan successful");
-
-            let batch = &results[0];
-            let bool_col = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("active should be BooleanArray");
-
-            assert_eq!(
-                bool_col.value(0),
-                true,
-                "{:?}: row 0 should be true",
-                engine
-            );
-            assert_eq!(
-                bool_col.value(1),
-                false,
-                "{:?}: row 1 should be false",
-                engine
-            );
-            assert_eq!(
-                bool_col.value(2),
-                true,
-                "{:?}: row 2 should be true",
-                engine
-            );
+            }
         })
         .await;
     }
 
     #[tokio::test]
     async fn test_empty_result_set() {
-        run_compat_test(|engine, _table, _mode| async move {
+        run_compat_test(|engine, _table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
 
             // Query empty table
@@ -1944,7 +2935,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_filter_predicates() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -1964,9 +2955,11 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            // (when calling scan() directly). Filter pushdown for Vortex only works via
+            // DataFusion's physical optimizer when running SQL queries.
             // IDs are 0-9, so id > 5 gives IDs 6,7,8,9 = 4 rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 4
@@ -1990,8 +2983,8 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 3
@@ -2014,8 +3007,8 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 1
@@ -2040,8 +3033,8 @@ mod accelerator_compat_tests {
                 .expect("scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow and Vortex don't support filter pushdown, so they return all rows
-            let expected_rows = if engine == Engine::Arrow || engine == Engine::Vortex {
+            // Arrow and Vortex don't support filter pushdown at the TableProvider level
+            let expected_rows = if engine == Engine::Arrow || engine == Engine::Cayenne {
                 10
             } else {
                 3
@@ -2057,7 +3050,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_projection_pushdown() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2116,7 +3109,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_limit_pushdown() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2150,7 +3143,7 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_combined_filter_projection_limit() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
 
@@ -2166,7 +3159,7 @@ mod accelerator_compat_tests {
             let scan = table
                 .scan(&ctx.state(), projection.as_ref(), &[filter], limit)
                 .await
-                .expect("scan should be successful");
+                .expect("combined scan should be successful");
 
             // Verify projected schema
             let projected_schema = scan.schema();
@@ -2185,12 +3178,13 @@ mod accelerator_compat_tests {
 
             let results = collect(scan, ctx.task_ctx())
                 .await
-                .expect("scan successful");
+                .expect("combined scan successful");
 
             let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-            // Arrow doesn't support filter or limit pushdown, so it returns all rows
-            // Vortex doesn't support filter pushdown but does support limit pushdown
-            // DuckDB supports both filter and limit pushdown
+            // Arrow doesn't support filter or limit pushdown at the TableProvider level
+            // Vortex doesn't support filter pushdown at TableProvider level (only via physical
+            // optimizer when running SQL), but does support limit pushdown via FileScanConfig.limit
+            // DuckDB supports both filter and limit pushdown at TableProvider level
             if engine == Engine::Arrow {
                 // No pushdown - returns all 10 rows
                 assert_eq!(
@@ -2198,7 +3192,7 @@ mod accelerator_compat_tests {
                     "{:?}: should have 10 rows (no pushdown)",
                     engine
                 );
-            } else if engine == Engine::Vortex {
+            } else if engine == Engine::Cayenne {
                 // Limit pushdown only - id > 3 gives 6 rows, limit 2 gives 2 rows
                 assert_eq!(
                     total_rows, 2,
@@ -2230,24 +3224,39 @@ mod accelerator_compat_tests {
 
     #[tokio::test]
     async fn test_complex_types_list_and_map() {
-        run_compat_test(|engine, table, _mode| async move {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
             let ctx = SessionContext::new();
             let schema = test_schema(Some(engine));
+            let table_schema = table.schema();
 
-            // Check if List and Map columns exist in the schema
+            // Turso has known issues with List/Map serialization/deserialization
+            // Skip this test for Turso until those are resolved
+            #[cfg(feature = "turso")]
+            if engine == Engine::Turso {
+                println!("  Skipping Turso - List/Map types have known serialization issues");
+                return;
+            }
+
+            // Check if List and Map columns exist in the schemas
             let has_list = schema.column_with_name("list_col").is_some();
             let has_map = schema.column_with_name("map_col").is_some();
+            let table_has_map = table_schema.column_with_name("map_col").is_some();
 
-            // Vortex supports List but not Map yet
-            if engine == Engine::Vortex {
+            // Vortex supports List natively, but Map is excluded from schema
+            if engine == Engine::Cayenne {
                 assert!(
                     has_list,
-                    "{:?}: should have list_col (now supported)",
+                    "{:?}: should have list_col (natively supported)",
                     engine
                 );
                 assert!(
                     !has_map,
-                    "{:?}: should not have map_col (not yet supported)",
+                    "{:?}: should not have map_col in source schema (not yet supported)",
+                    engine
+                );
+                assert!(
+                    !table_has_map,
+                    "{:?}: should not have map_col in table schema (not yet supported)",
                     engine
                 );
             } else {
@@ -2297,9 +3306,12 @@ mod accelerator_compat_tests {
                     );
                 }
 
-                // Verify Map column exists and has correct type
-                if let Ok(map_col_idx) = batch.schema().index_of("map_col") {
+                // Verify Map column exists and has correct type (only for non-Vortex engines)
+                if engine != Engine::Cayenne
+                    && let Ok(map_col_idx) = batch.schema().index_of("map_col")
+                {
                     let map_col = batch.column(map_col_idx);
+
                     assert!(
                         matches!(map_col.data_type(), DataType::Map(_, _)),
                         "{:?}: map_col should be Map type, got {:?}",
@@ -2322,13 +3334,120 @@ mod accelerator_compat_tests {
                 }
             }
 
-            if engine == Engine::Vortex {
+            if engine == Engine::Cayenne {
                 println!(
                     "✓ {:?}: List type works correctly (Map not yet supported)",
                     engine
                 );
             } else {
                 println!("✓ {:?}: List and Map types work correctly", engine);
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_operations() {
+        run_compat_test(|engine, table, _mode, _test_env| async move {
+            let ctx = SessionContext::new();
+            let schema = test_schema(Some(engine));
+
+            // Insert initial data - 50 records
+            let initial_data = generate_test_data(Arc::clone(&schema), 50, 0);
+            insert_test_data(&table, &ctx, initial_data).await;
+
+            // Verify initial data is there
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 50,
+                "{:?}: should have 50 rows after initial insert",
+                engine
+            );
+
+            // Now INSERT OVERWRITE with different data - 30 records with offset 100
+            let overwrite_data = generate_test_data(Arc::clone(&schema), 30, 100);
+            let table_schema = table.schema();
+            let transformed_data = if overwrite_data.schema() == table_schema {
+                overwrite_data
+            } else {
+                transform_batch_to_schema(&overwrite_data, Arc::clone(&table_schema))
+                    .expect("data transformation should succeed")
+            };
+
+            let exec_schema = transformed_data.schema();
+            let exec = MockExec::new(vec![Ok(transformed_data)], exec_schema);
+            let insertion = table
+                .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Overwrite)
+                .await
+                .expect("overwrite insertion should be successful");
+
+            collect(insertion, ctx.task_ctx())
+                .await
+                .expect("overwrite insert successful");
+
+            // Verify that old data is gone and new data is present
+            let scan = table
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("scan should be successful");
+            let results = collect(scan, ctx.task_ctx())
+                .await
+                .expect("scan successful");
+            let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                total_rows, 30,
+                "{:?}: should have 30 rows after overwrite (not 50 or 80)",
+                engine
+            );
+
+            // Verify that the new data IDs are from the overwrite batch (offset 100)
+            // IDs should be 100, 101, ..., 129
+            for batch in &results {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id should be Int64Array");
+
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id_value = id_col.value(i);
+                        assert!(
+                            (100..130).contains(&id_value),
+                            "{:?}: ID should be in range [100, 130), got {}",
+                            engine,
+                            id_value
+                        );
+                    }
+                }
+            }
+
+            // Verify old data (IDs 0-49) is not present
+            for batch in &results {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id should be Int64Array");
+
+                for i in 0..id_col.len() {
+                    if !id_col.is_null(i) {
+                        let id_value = id_col.value(i);
+                        assert!(
+                            !(0..50).contains(&id_value),
+                            "{:?}: Old ID {} should not be present after overwrite",
+                            engine,
+                            id_value
+                        );
+                    }
+                }
             }
         })
         .await;
@@ -2355,6 +3474,25 @@ mod accelerator_compat_tests {
         type MetricFormatter = fn(&BenchmarkResults) -> String;
         type Metric<'a> = (&'a str, MetricFormatter);
 
+        fn format_change_duration(
+            result: &BenchmarkResults,
+            duration: std::time::Duration,
+        ) -> String {
+            if result.benchmarked_changes {
+                format_duration_compact(duration)
+            } else {
+                "n/a".to_string()
+            }
+        }
+
+        fn format_change_rate(result: &BenchmarkResults, rate: f64) -> String {
+            if result.benchmarked_changes {
+                format!("{rate:.0}")
+            } else {
+                "n/a".to_string()
+            }
+        }
+
         println!("\n");
         println!(
             "╔════════════════════════════════════════════════════════════════════════════════════════════╗"
@@ -2379,9 +3517,20 @@ mod accelerator_compat_tests {
             );
 
             // Print header with engine names
+            // For Cayenne, include metastore type in the label
             print!("║ {:20}", "Metric");
             for result in &mode_results {
-                print!(" │ {:>15}", format!("{:?}", result.engine));
+                let engine_label = if matches!(result.engine, Engine::Cayenne) {
+                    // Extract metastore type from mode string (e.g., "file, metastore=turso")
+                    if let Some(metastore) = result.mode.split("metastore=").nth(1) {
+                        format!("Cayenne({})", metastore)
+                    } else {
+                        format!("{:?}", result.engine)
+                    }
+                } else {
+                    format!("{:?}", result.engine)
+                };
+                print!(" │ {:>15}", engine_label);
             }
             println!(" ║");
             println!(
@@ -2398,6 +3547,28 @@ mod accelerator_compat_tests {
             print!("║ {:20}", "Iterations");
             for result in &mode_results {
                 print!(" │ {:>15}", format!("{}", result.num_iterations));
+            }
+            println!(" ║");
+
+            print!("║ {:20}", "Change rows/iter");
+            for result in &mode_results {
+                let value = if result.benchmarked_changes {
+                    result.num_change_records.to_string()
+                } else {
+                    "n/a".to_string()
+                };
+                print!(" │ {:>15}", value);
+            }
+            println!(" ║");
+
+            print!("║ {:20}", "Delete rows/iter");
+            for result in &mode_results {
+                let value = if result.benchmarked_changes {
+                    result.num_delete_records.to_string()
+                } else {
+                    "n/a".to_string()
+                };
+                print!(" │ {:>15}", value);
             }
             println!(" ║");
             println!(
@@ -2521,7 +3692,121 @@ mod accelerator_compat_tests {
             );
             println!(
                 "║ {:20}                                                                        ║",
-                "ROUNDTRIP (INSERT+QUERY)"
+                "CHANGE PERFORMANCE"
+            );
+            println!(
+                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
+            );
+
+            let change_metrics: [Metric<'static>; 7] = [
+                (
+                    "Min",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.min_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "P90",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p90_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p95_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99.9",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_9_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "Max",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.max_change))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95 rec/sec",
+                    (|r: &BenchmarkResults| format_change_rate(r, r.p95_change_rec_per_sec))
+                        as MetricFormatter,
+                ),
+            ];
+
+            for (label, formatter) in change_metrics {
+                print!("║ {:20}", label);
+                for result in &mode_results {
+                    print!(" │ {:>15}", formatter(result));
+                }
+                println!(" ║");
+            }
+
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+            println!(
+                "║ {:20}                                                                        ║",
+                "DELETE PERFORMANCE"
+            );
+            println!(
+                "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
+            );
+
+            let delete_metrics: [Metric<'static>; 7] = [
+                (
+                    "Min",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.min_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "P90",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p90_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p95_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "P99.9",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.p99_9_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "Max",
+                    (|r: &BenchmarkResults| format_change_duration(r, r.max_delete))
+                        as MetricFormatter,
+                ),
+                (
+                    "P95 rec/sec",
+                    (|r: &BenchmarkResults| format_change_rate(r, r.p95_delete_rec_per_sec))
+                        as MetricFormatter,
+                ),
+            ];
+
+            for (label, formatter) in delete_metrics {
+                print!("║ {:20}", label);
+                for result in &mode_results {
+                    print!(" │ {:>15}", formatter(result));
+                }
+                println!(" ║");
+            }
+
+            println!(
+                "╠════════════════════════════════════════════════════════════════════════════════════════════╣"
+            );
+            println!(
+                "║ {:20}                                                                        ║",
+                "ROUNDTRIP (ALL OPS+QUERY)"
             );
             println!(
                 "╟────────────────────────────────────────────────────────────────────────────────────────────╢"
@@ -2582,6 +3867,8 @@ mod accelerator_compat_tests {
         mode: String,
         num_records: usize,
         num_iterations: usize,
+        num_change_records: usize,
+        num_delete_records: usize,
         // Insert metrics
         min_insert: std::time::Duration,
         p90_insert: std::time::Duration,
@@ -2598,6 +3885,23 @@ mod accelerator_compat_tests {
         p99_9_query: std::time::Duration,
         max_query: std::time::Duration,
         p95_query_rec_per_sec: f64,
+        // Change metrics
+        benchmarked_changes: bool,
+        min_change: std::time::Duration,
+        p90_change: std::time::Duration,
+        p95_change: std::time::Duration,
+        p99_change: std::time::Duration,
+        p99_9_change: std::time::Duration,
+        max_change: std::time::Duration,
+        p95_change_rec_per_sec: f64,
+        // Delete metrics
+        min_delete: std::time::Duration,
+        p90_delete: std::time::Duration,
+        p95_delete: std::time::Duration,
+        p99_delete: std::time::Duration,
+        p99_9_delete: std::time::Duration,
+        max_delete: std::time::Duration,
+        p95_delete_rec_per_sec: f64,
         // Roundtrip metrics
         min_roundtrip: std::time::Duration,
         p90_roundtrip: std::time::Duration,
@@ -2607,8 +3911,131 @@ mod accelerator_compat_tests {
         max_roundtrip: std::time::Duration,
     }
 
+    fn benchmark_env_usize(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    }
+
+    fn benchmark_sizing(engine: Engine, is_memory: bool, is_file: bool) -> (usize, usize) {
+        let defaults = match (engine, is_memory, is_file) {
+            #[cfg(feature = "turso")]
+            (Engine::Turso, true, _) => (100, 3),
+            #[cfg(feature = "turso")]
+            (Engine::Turso, _, true) => (1_000, 10),
+            (_, true, _) => (100_000, 10),
+            (_, _, true) => (1_000_000, 10),
+            _ => (10_000, 10),
+        };
+
+        let num_records = benchmark_env_usize("SPICE_ACCEL_BENCH_RECORDS")
+            .unwrap_or(defaults.0)
+            .max(2);
+        let num_iterations = benchmark_env_usize("SPICE_ACCEL_BENCH_ITERATIONS")
+            .unwrap_or(defaults.1)
+            .max(1);
+
+        (num_records, num_iterations)
+    }
+
+    fn supports_change_delete_roundtrip(engine: Engine) -> bool {
+        !matches!(engine, Engine::Arrow | Engine::Turso)
+    }
+
+    fn generate_changed_test_data(
+        schema: Arc<Schema>,
+        num_records: usize,
+        offset: i64,
+    ) -> RecordBatch {
+        let base = generate_test_data(Arc::clone(&schema), num_records, offset);
+        let columns = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| match field.name().as_str() {
+                "name" => Arc::new(StringArray::from(
+                    (0..num_records)
+                        .map(|row| format!("changed_{}", offset + row as i64))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "value" => Arc::new(Float64Array::from(
+                    (0..num_records)
+                        .map(|row| Some(10_000.0 + row as f64))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                _ => Arc::clone(base.column(idx)),
+            })
+            .collect::<Vec<_>>();
+
+        RecordBatch::try_new(schema, columns).expect("changed data should be created")
+    }
+
+    async fn delete_id_range(
+        table: &Arc<dyn TableProvider>,
+        ctx: &SessionContext,
+        start_id: i64,
+        row_count: usize,
+    ) -> u64 {
+        if row_count == 0 {
+            return 0;
+        }
+
+        let end_id = start_id + row_count as i64;
+        let filter = col("id")
+            .gt_eq(lit(start_id))
+            .and(col("id").lt(lit(end_id)));
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("delete should be successful");
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("delete successful");
+
+        result
+            .first()
+            .expect("delete result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("delete result should be UInt64Array")
+            .value(0)
+    }
+
+    fn assert_changed_name_visible(engine: Engine, batches: &[RecordBatch], changed_id: i64) {
+        let expected_name = format!("changed_{changed_id}");
+        for batch in batches {
+            let id_idx = batch.schema().index_of("id").expect("id column exists");
+            let name_idx = batch.schema().index_of("name").expect("name column exists");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id should be Int64Array");
+            let names = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name should be StringArray");
+
+            for row in 0..batch.num_rows() {
+                if ids.value(row) == changed_id {
+                    assert_eq!(
+                        names.value(row),
+                        expected_name,
+                        "{engine:?}: changed row should round-trip with updated name",
+                    );
+                    return;
+                }
+            }
+        }
+
+        panic!("{engine:?}: changed row id {changed_id} was not found after mutation round-trip");
+    }
+
     #[tokio::test]
-    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,vortex -- --ignored --nocapture benchmark_roundtrip"]
+    #[ignore = "Run with --ignored flag: cargo test --features sqlite,turso,duckdb,cayenne -- --ignored --nocapture benchmark_roundtrip"]
     async fn benchmark_roundtrip() {
         use std::sync::Mutex;
         use std::time::Instant;
@@ -2616,7 +4043,8 @@ mod accelerator_compat_tests {
         // Collect all results for comparison
         let all_results = Arc::new(Mutex::new(Vec::new()));
 
-        run_compat_test(|engine, table, mode| {
+        run_compat_test_with_table_options(
+            |engine, table, mode, _test_env| {
             let all_results = Arc::clone(&all_results);
             async move {
                 let ctx = SessionContext::new();
@@ -2628,21 +4056,34 @@ mod accelerator_compat_tests {
                 let is_memory = mode.starts_with("memory");
                 let is_file = mode.starts_with("file");
 
-                let (num_records, num_iterations) = match (engine, is_memory, is_file) {
-                    #[cfg(feature = "turso")]
-                    (Engine::Turso, true, _) => (100, 3), // 300 total records (very limited due to page cache)
-                    #[cfg(feature = "turso")]
-                    (Engine::Turso, _, true) => (1_000, 10), // 10K total records (reduced due to complex schema)
-                    (_, true, _) => (100_000, 10), // 1M total records
-                    (_, _, true) => (1_000_000, 10), // 10M total records
-                    _ => (10_000, 10),             // Fallback
+                let (num_records, num_iterations) = benchmark_sizing(engine, is_memory, is_file);
+                let benchmarked_changes = supports_change_delete_roundtrip(engine);
+                let num_change_records = if benchmarked_changes {
+                    (num_records / 10).max(1).min(num_records - 1)
+                } else {
+                    0
+                };
+                let num_delete_records = if benchmarked_changes {
+                    (num_records / 10)
+                        .max(1)
+                        .min(num_records - num_change_records)
+                } else {
+                    0
                 };
 
                 let mut insert_times = Vec::new();
+                let mut change_times = Vec::new();
+                let mut delete_times = Vec::new();
                 let mut query_times = Vec::new();
 
                 println!("\n=== Benchmarking {:?} ({}) ===", engine, mode);
                 println!("Records per iteration: {}", num_records);
+                if benchmarked_changes {
+                    println!("Change rows per iteration: {}", num_change_records);
+                    println!("Delete rows per iteration: {}", num_delete_records);
+                } else {
+                    println!("Change/delete benchmark: not supported by this accelerator");
+                }
                 println!("Number of iterations: {}", num_iterations);
 
                 for iteration in 0..num_iterations {
@@ -2652,17 +4093,37 @@ mod accelerator_compat_tests {
 
                     // Benchmark insert
                     let insert_start = Instant::now();
-                    let exec = MockExec::new(vec![Ok(data)], Arc::clone(&schema));
-                    let insertion = table
-                        .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
-                        .await
-                        .expect("insertion should be successful");
-
-                    collect(insertion, ctx.task_ctx())
-                        .await
-                        .expect("insert successful");
+                    insert_test_data(&table, &ctx, data).await;
                     let insert_duration = insert_start.elapsed();
                     insert_times.push(insert_duration);
+
+                    let mut change_duration = std::time::Duration::ZERO;
+                    let mut delete_duration = std::time::Duration::ZERO;
+                    if benchmarked_changes {
+                        let changed_data = generate_changed_test_data(
+                            Arc::clone(&schema),
+                            num_change_records,
+                            id_offset,
+                        );
+
+                        let change_start = Instant::now();
+                        insert_test_data(&table, &ctx, changed_data).await;
+                        change_duration = change_start.elapsed();
+                        change_times.push(change_duration);
+
+                        let delete_start_id = id_offset + num_change_records as i64;
+                        let delete_start = Instant::now();
+                        let deleted_rows =
+                            delete_id_range(&table, &ctx, delete_start_id, num_delete_records)
+                                .await;
+                        delete_duration = delete_start.elapsed();
+                        delete_times.push(delete_duration);
+                        assert_eq!(
+                            deleted_rows,
+                            num_delete_records as u64,
+                            "{engine:?}: iteration {iteration}: should delete {num_delete_records} rows",
+                        );
+                    }
 
                     // Benchmark query (scan all data)
                     let query_start = Instant::now();
@@ -2679,17 +4140,29 @@ mod accelerator_compat_tests {
 
                     // Verify data integrity
                     let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-                    let expected_rows = num_records * (iteration + 1);
+                    let expected_rows = if benchmarked_changes {
+                        (num_records - num_delete_records) * (iteration + 1)
+                    } else {
+                        num_records * (iteration + 1)
+                    };
                     assert_eq!(
                         total_rows, expected_rows,
                         "{:?}: iteration {}: should have {} total rows",
                         engine, iteration, expected_rows
                     );
 
+                    if benchmarked_changes {
+                        assert_changed_name_visible(engine, &results, id_offset);
+                    }
+
                     if iteration % 3 == 0 {
                         println!(
-                            "  Iteration {}: Insert: {:?}, Query: {:?}",
-                            iteration, insert_duration, query_duration
+                            "  Iteration {}: Insert: {:?}, Change: {:?}, Delete: {:?}, Query: {:?}",
+                            iteration,
+                            insert_duration,
+                            change_duration,
+                            delete_duration,
+                            query_duration
                         );
                     }
                 }
@@ -2700,32 +4173,74 @@ mod accelerator_compat_tests {
                     sorted_times[idx]
                 }
 
-                // Sort times for percentile calculations
-                let mut sorted_insert = insert_times.clone();
-                sorted_insert.sort();
-                let mut sorted_query = query_times.clone();
-                sorted_query.sort();
+                fn duration_stats(
+                    times: &[std::time::Duration],
+                ) -> (
+                    std::time::Duration,
+                    std::time::Duration,
+                    std::time::Duration,
+                    std::time::Duration,
+                    std::time::Duration,
+                    std::time::Duration,
+                ) {
+                    let mut sorted = times.to_vec();
+                    sorted.sort();
+                    (
+                        sorted[0],
+                        percentile(&sorted, 0.90),
+                        percentile(&sorted, 0.95),
+                        percentile(&sorted, 0.99),
+                        percentile(&sorted, 0.999),
+                        sorted[sorted.len() - 1],
+                    )
+                }
+
+                fn records_per_second(records: usize, duration: std::time::Duration) -> f64 {
+                    records as f64 / duration.as_secs_f64().max(f64::EPSILON)
+                }
 
                 // Calculate percentiles
-                let min_insert = sorted_insert[0];
-                let p90_insert = percentile(&sorted_insert, 0.90);
-                let p95_insert = percentile(&sorted_insert, 0.95);
-                let p99_insert = percentile(&sorted_insert, 0.99);
-                let p99_9_insert = percentile(&sorted_insert, 0.999);
-                let max_insert = sorted_insert[sorted_insert.len() - 1];
-
-                let min_query = sorted_query[0];
-                let p90_query = percentile(&sorted_query, 0.90);
-                let p95_query = percentile(&sorted_query, 0.95);
-                let p99_query = percentile(&sorted_query, 0.99);
-                let p99_9_query = percentile(&sorted_query, 0.999);
-                let max_query = sorted_query[sorted_query.len() - 1];
+                let (min_insert, p90_insert, p95_insert, p99_insert, p99_9_insert, max_insert) =
+                    duration_stats(&insert_times);
+                let (min_query, p90_query, p95_query, p99_query, p99_9_query, max_query) =
+                    duration_stats(&query_times);
+                let (min_change, p90_change, p95_change, p99_change, p99_9_change, max_change) =
+                    if benchmarked_changes {
+                        duration_stats(&change_times)
+                    } else {
+                        (
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                        )
+                    };
+                let (min_delete, p90_delete, p95_delete, p99_delete, p99_9_delete, max_delete) =
+                    if benchmarked_changes {
+                        duration_stats(&delete_times)
+                    } else {
+                        (
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                        )
+                    };
 
                 // Calculate round-trip percentiles
                 let mut roundtrip_times: Vec<std::time::Duration> = insert_times
                     .iter()
+                    .enumerate()
                     .zip(query_times.iter())
-                    .map(|(i, q)| *i + *q)
+                    .map(|((idx, insert), query)| {
+                        let change = change_times.get(idx).copied().unwrap_or_default();
+                        let delete = delete_times.get(idx).copied().unwrap_or_default();
+                        *insert + change + delete + *query
+                    })
                     .collect();
                 roundtrip_times.sort();
                 let min_roundtrip = roundtrip_times[0];
@@ -2735,10 +4250,23 @@ mod accelerator_compat_tests {
                 let p99_9_roundtrip = percentile(&roundtrip_times, 0.999);
                 let max_roundtrip = roundtrip_times[roundtrip_times.len() - 1];
 
-                let p95_insert_rec_per_sec =
-                    num_records as f64 / percentile(&sorted_insert, 0.95).as_secs_f64();
-                let p95_query_rec_per_sec = (num_records * num_iterations) as f64
-                    / percentile(&sorted_query, 0.95).as_secs_f64();
+                let final_expected_rows = if benchmarked_changes {
+                    (num_records - num_delete_records) * num_iterations
+                } else {
+                    num_records * num_iterations
+                };
+                let p95_insert_rec_per_sec = records_per_second(num_records, p95_insert);
+                let p95_query_rec_per_sec = records_per_second(final_expected_rows, p95_query);
+                let p95_change_rec_per_sec = if benchmarked_changes {
+                    records_per_second(num_change_records, p95_change)
+                } else {
+                    0.0
+                };
+                let p95_delete_rec_per_sec = if benchmarked_changes {
+                    records_per_second(num_delete_records, p95_delete)
+                } else {
+                    0.0
+                };
 
                 // Store results for comparison
                 let results = BenchmarkResults {
@@ -2746,6 +4274,8 @@ mod accelerator_compat_tests {
                     mode: mode.clone(),
                     num_records,
                     num_iterations,
+                    num_change_records,
+                    num_delete_records,
                     min_insert,
                     p90_insert,
                     p95_insert,
@@ -2760,6 +4290,21 @@ mod accelerator_compat_tests {
                     p99_9_query,
                     max_query,
                     p95_query_rec_per_sec,
+                    benchmarked_changes,
+                    min_change,
+                    p90_change,
+                    p95_change,
+                    p99_change,
+                    p99_9_change,
+                    max_change,
+                    p95_change_rec_per_sec,
+                    min_delete,
+                    p90_delete,
+                    p95_delete,
+                    p99_delete,
+                    p99_9_delete,
+                    max_delete,
+                    p95_delete_rec_per_sec,
                     min_roundtrip,
                     p90_roundtrip,
                     p95_roundtrip,
@@ -2773,7 +4318,9 @@ mod accelerator_compat_tests {
                     Err(poisoned) => panic!("Failed to lock benchmark results: {poisoned}"),
                 }
             }
-        })
+        },
+            CompatTableOptions { primary_key: true },
+        )
         .await;
 
         // Print comparison table

@@ -25,10 +25,10 @@ use arrow_flight::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol},
-    timing::TimedStream,
+use crate::flight::{
+    Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol,
 };
+use telemetry::timing::TimedStream;
 
 pub(crate) async fn get_flight_info(
     query: &sql::CommandGetPrimaryKeys,
@@ -56,7 +56,6 @@ pub(crate) async fn get_flight_info(
 ///   `column_name`: utf8 not null,
 ///   `key_name`: utf8,
 ///   `key_sequence`: int32 not null
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) async fn do_get(
     query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {

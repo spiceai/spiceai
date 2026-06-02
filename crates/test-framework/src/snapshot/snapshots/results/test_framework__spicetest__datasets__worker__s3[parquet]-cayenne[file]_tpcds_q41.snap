@@ -1,0 +1,6 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q41"
+---
+++
+++

@@ -23,16 +23,43 @@ use crate::param::Params;
 
 /// The secrets configuration for a Spicepod.
 ///
+/// Each entry selects a secret store via `from: <provider>[:<selector>]` and
+/// may pass provider-specific configuration through `params:`.
+///
+/// `params:` values may reference environment variables using the same
+/// `${ env:KEY }` / `${ secrets:KEY }` syntax used elsewhere in the
+/// spicepod. At this bootstrap point only the env store is loaded, so
+/// `secrets:KEY` resolves against env as well; references to other stores
+/// are rejected.
+///
 /// Example:
 /// ```yaml
 /// secrets:
 ///   - from: env
 ///     name: env
+///     params:
+///       file_path: .env.local
 ///   - from: kubernetes:my_secret_name
 ///     name: k8s
+///     params:
+///       namespace: spice
+///   - from: aws_secrets_manager:my-secret
+///     name: aws
+///     params:
+///       region: ${ env:AWS_REGION }
+///       key: ${ env:AWS_ACCESS_KEY_ID }
+///       secret: ${ env:AWS_SECRET_ACCESS_KEY }
+///   - from: azure_keyvault:my-vault
+///     name: azure
+///     params:
+///       auth_method: service_principal
+///       tenant_id: ${ env:AZURE_TENANT_ID }
+///       client_id: ${ env:AZURE_CLIENT_ID }
+///       client_secret: ${ env:AZURE_CLIENT_SECRET }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Secret {
     pub from: String,
 

@@ -16,11 +16,42 @@ limitations under the License.
 
 use std::{panic, sync::Arc};
 
-use crate::{flight::query_to_batches, queries::Query};
+use crate::{flight::query_to_batches, queries::Query, utils::sanitize_record_batches};
 use spiceai::Client as SpiceClient;
+
+pub const CAYENNE_PATH_FILTER_PATTERN: &str =
+    r"(/data/[A-Za-z0-9_\-\[\]=]+)(?:/[A-Za-z0-9_\-\.\[\]=]+)+\.vortex";
+pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
+const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
+const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
+}
+
+/// Build the list of regex filters for normalizing explain plan output.
+fn build_explain_filters(temp_dir: &std::path::Path) -> Vec<(String, &'static str)> {
+    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
+    let temp_dir_clean = temp_dir_str.trim_end_matches('/').trim_start_matches('/');
+    let temp_dir_pattern = regex::escape(temp_dir_clean);
+    let path_filter_pattern = make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
+
+    vec![
+        (path_filter_pattern, "/data"),
+        (CAYENNE_PATH_FILTER_PATTERN.to_string(), CAYENNE_PATH_FILTER_REPLACEMENT),
+        (VORTEX_RANGE_FILTER_PATTERN.to_string(), VORTEX_RANGE_FILTER_REPLACEMENT),
+        (r"required_guarantees=\[[^\]]*\]".to_string(), "required_guarantees=[N]"),
+        (r"partition_sizes=\[[^\]]*\]".to_string(), "partition_sizes=[<redacted>]"),
+        (r"file_groups=\{(\d+ groups?): [^}]+\}".to_string(), "file_groups={$1: [<redacted>]}"),
+        (
+            r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#.to_string(),
+            "<GROUPING_PAIR>",
+        ),
+        (
+            r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#.to_string(),
+            "<GROUPING_PAIR>",
+        ),
+    ]
 }
 
 pub async fn record_explain_plan(
@@ -37,30 +68,23 @@ pub async fn record_explain_plan(
         .await
         .map_err(|e| anyhow::anyhow!("query `{query_name}` to plan: {e}"))?;
 
-    let explain_plan = arrow::util::pretty::pretty_format_batches(&plan_results)?;
+    // Apply filters to raw RecordBatch values before formatting so that
+    // pretty_format_batches computes column widths from normalized values,
+    // eliminating non-deterministic padding diffs.
+    let filters = build_explain_filters(&std::env::temp_dir());
+    let sanitized = sanitize_record_batches(&plan_results, &filters)?;
+
+    let explain_plan_raw = arrow::util::pretty::pretty_format_batches(&sanitized)?;
+
+    // Sort PartitionedUnionExec children for deterministic snapshot comparison
+    let explain_plan = sort_partitioned_union_children(&explain_plan_raw.to_string());
 
     let mut assertion_err: Option<String> = None;
-
-    let temp_dir = std::env::temp_dir();
-    let temp_dir_str = temp_dir.to_str().unwrap_or_default();
-    let temp_dir_clean = temp_dir_str.trim_end_matches('/').trim_start_matches('/');
-    let temp_dir_pattern = regex::escape(temp_dir_clean);
-
-    // Create two patterns:
-    // 1. Exact match starting with the temp_dir: {temp_dir}/some_dir/data
-    // 2. Match with "private" prefix: private{temp_dir}/some_dir/data
-    let path_filter_pattern = make_tmpdir_regex_pattern(temp_dir_pattern.as_str());
 
     insta::with_settings!({
         description => format!("Query: {query_name}"),
         omit_expression => true,
         snapshot_path => "snapshots/explain",
-        filters => vec![
-            (path_filter_pattern.as_str(), "/data"),
-            (r"required_guarantees=\[[^\]]*\]", "required_guarantees=[N]"),
-            (r#"grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\),\s*grouping\((?:item|"item")\.(?:i_category|i_class|"i_category"|"i_class")\)"#, "<GROUPING_PAIR>"),
-            (r#"grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\),\s*grouping\((?:store|"store")\.(?:s_state|s_county|"s_state"|"s_county")\)"#, "<GROUPING_PAIR>")
-        ],
     }, {
         let snapshot_name = if (scale_factor - 1.0).abs() < f64::EPSILON {
             format!("{name}_{query_name}_explain")
@@ -81,6 +105,108 @@ pub async fn record_explain_plan(
     }
 
     Ok(())
+}
+
+/// Sorts children of `PartitionedUnionExec` nodes in the explain plan output
+/// to ensure deterministic snapshot comparison.
+///
+/// The approach: when we find `PartitionedUnionExec`, we identify child subtrees
+/// by their indentation level. Lines at the first child's indent level start new
+/// subtrees. We sort all subtrees alphabetically.
+fn sort_partitioned_union_children(explain_plan: &str) -> String {
+    // if no PartitionedUnionExec, return unchanged
+    if !explain_plan.contains("PartitionedUnionExec") {
+        return explain_plan.to_string();
+    }
+
+    let lines: Vec<&str> = explain_plan.lines().collect();
+    let mut result: Vec<String> = Vec::with_capacity(lines.len());
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        result.push(line.to_string());
+
+        // Check if this line contains PartitionedUnionExec
+        if line.contains("PartitionedUnionExec") && i + 1 < lines.len() {
+            let parent_indent = get_indent_level(line);
+            let first_child_indent = get_indent_level(lines[i + 1]);
+
+            // The first child should have greater indentation
+            if first_child_indent <= parent_indent {
+                i += 1;
+                continue;
+            }
+
+            // Collect all lines that belong to PartitionedUnionExec children
+            // Stop at empty-content lines (table separators) or lower indent
+            let children_start = i + 1;
+            let mut children_end = children_start;
+            while children_end < lines.len() {
+                let child_line = lines[children_end];
+                // Stop at empty-content lines (table row separators)
+                if is_empty_content_line(child_line) {
+                    break;
+                }
+                let child_indent = get_indent_level(child_line);
+                if child_indent <= parent_indent {
+                    break;
+                }
+                children_end += 1;
+            }
+
+            // Split children into subtrees based on indent level
+            let mut subtrees: Vec<Vec<&str>> = Vec::new();
+            let mut current_subtree: Vec<&str> = Vec::new();
+
+            for current_line in lines.iter().take(children_end).skip(children_start) {
+                // A line at the first child's indent level starts a new subtree
+                if get_indent_level(current_line) == first_child_indent
+                    && !current_subtree.is_empty()
+                {
+                    subtrees.push(current_subtree);
+                    current_subtree = Vec::new();
+                }
+                current_subtree.push(current_line);
+            }
+            if !current_subtree.is_empty() {
+                subtrees.push(current_subtree);
+            }
+
+            // Sort all subtrees by their string representation
+            subtrees.sort_by(|a, b| {
+                let a_str = a.join("\n");
+                let b_str = b.join("\n");
+                a_str.cmp(&b_str)
+            });
+
+            // Add sorted subtrees to result
+            for subtree in &subtrees {
+                for subtree_line in subtree {
+                    result.push((*subtree_line).to_string());
+                }
+            }
+
+            i = children_end;
+            continue;
+        }
+        i += 1;
+    }
+
+    result.join("\n")
+}
+
+/// Checks if a line contains only whitespace and `|` characters (empty table cell).
+fn is_empty_content_line(line: &str) -> bool {
+    line.chars().all(|c| c.is_whitespace() || c == '|')
+}
+
+/// Gets the indentation level of a line in the explain plan.
+/// Counts leading whitespace and `|` characters before the first content.
+fn get_indent_level(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace() || *c == '|')
+        .count()
 }
 
 #[cfg(test)]
@@ -122,6 +248,214 @@ mod tests {
             let result = regex.replace(input, "/data");
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cayenne_file_filters() -> Result<(), String> {
+        let test_cases = [
+            (
+                "/data/customer/5/019a22d7-f162-7be0-975f-417b334a95c6/tD0GMdUfbVhRvA6E_0.vortex:0..368070",
+                "/data/customer/<CAYENNE_PATH>.vortex:<RANGE>",
+            ),
+            (
+                "/data/customer/expression=22/5/019a4a83-a9a5-76b2-8cb4-3efdd70ce29b/7h45OnUbTA5PyuSE_0.vortex:",
+                "/data/customer/<CAYENNE_PATH>.vortex:",
+            ),
+        ];
+
+        let path_regex =
+            regex::Regex::new(super::CAYENNE_PATH_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+        let range_regex =
+            regex::Regex::new(super::VORTEX_RANGE_FILTER_PATTERN).map_err(|e| format!("{e}"))?;
+
+        for (input, expected) in test_cases {
+            let path_redacted =
+                path_regex.replace_all(input, super::CAYENNE_PATH_FILTER_REPLACEMENT);
+            let fully_redacted = range_regex
+                .replace_all(
+                    path_redacted.as_ref(),
+                    super::VORTEX_RANGE_FILTER_REPLACEMENT,
+                )
+                .into_owned();
+
+            assert_eq!(fully_redacted, expected, "Failed for input: {input}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children() {
+        // Simplified explain plan with out-of-order PartitionedUnionExec children
+        let input = r#"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=3/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=1/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=2/orders"     |
+|               |                         AggregateExec: mode=Final                                                  |"#;
+
+        // All children sorted alphabetically (1, 2, 3)
+        let expected = r#"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=1/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=2/orders"     |
+|               |                                         CooperativeExec                                           |
+|               |                                           BytesProcessedExec                                       |
+|               |                                             DuckSqlExec sql= SELECT FROM "expression=3/orders"     |
+|               |                         AggregateExec: mode=Final                                                  |"#;
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_plain_format() {
+        // Plain format (non-table) with out-of-order children
+        let input = r"SchemaCastScanExec
+  PartitionedUnionExec
+    CayenneAccelerationExec partition=3
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=1
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=2
+      BytesProcessedExec
+        DataSourceExec
+  SomeOtherExec";
+
+        // All children sorted alphabetically (1, 2, 3)
+        let expected = r"SchemaCastScanExec
+  PartitionedUnionExec
+    CayenneAccelerationExec partition=1
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=2
+      BytesProcessedExec
+        DataSourceExec
+    CayenneAccelerationExec partition=3
+      BytesProcessedExec
+        DataSourceExec
+  SomeOtherExec";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_no_union() {
+        // Plan without PartitionedUnionExec should be unchanged
+        let input = r"|               |   ProjectionExec                    |
+|               |     SortExec                        |
+|               |       AggregateExec                 |";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_get_indent_level() {
+        // Table format: counts whitespace and | before first content
+        assert_eq!(
+            super::get_indent_level("|               |   PartitionedUnionExec   |"),
+            20 // |, 15 spaces, |, 3 spaces
+        );
+        assert_eq!(
+            super::get_indent_level("|               |     CooperativeExec      |"),
+            22 // |, 15 spaces, |, 5 spaces
+        );
+        assert_eq!(
+            super::get_indent_level("|               | PartitionedUnionExec     |"),
+            18 // |, 15 spaces, |, 1 space
+        );
+        // Plain format: counts leading spaces
+        assert_eq!(super::get_indent_level("  PartitionedUnionExec"), 2);
+        assert_eq!(super::get_indent_level("    CayenneAccelerationExec"), 4);
+        assert_eq!(super::get_indent_level("SchemaCastScanExec"), 0);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_empty() {
+        // PartitionedUnionExec with no children (sibling follows at same indent)
+        let input = r"|               |                                       PartitionedUnionExec                                   |
+|               |                         AggregateExec: mode=Final                                                  |
+|               |                           ProjectionExec                                                           |";
+
+        // Should remain unchanged - no children to sort
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_sort_partitioned_union_children_trailing_empty_line() {
+        // Table format with trailing empty line in last child - should be preserved at end
+        let input = r"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec partition=2                                |
+|               |                                         CooperativeExec partition=1                                |
+|               |                                                                                                    |";
+
+        // Children sorted (1, 2), trailing empty line stays at end
+        let expected = r"|               |                                       PartitionedUnionExec                                   |
+|               |                                         CooperativeExec partition=1                                |
+|               |                                         CooperativeExec partition=2                                |
+|               |                                                                                                    |";
+
+        let result = super::sort_partitioned_union_children(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_file_groups_filter() -> Result<(), String> {
+        let regex = regex::Regex::new(r"file_groups=\{(\d+ groups?): [^}]+\}")
+            .map_err(|e| format!("{e}"))?;
+        let replacement = "file_groups={$1: [<redacted>]}";
+
+        // Multiple groups with vortex ranges and trailing `...`
+        let input = "DataSourceExec: file_groups={16 groups: [[/data/orders/<CAYENNE_PATH>.vortex:<RANGE>, /data/orders/<CAYENNE_PATH>.vortex:<RANGE>], [/data/orders/<CAYENNE_PATH>.vortex:<RANGE>], ...]}, projection=[o_orderkey]";
+        let expected =
+            "DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey]";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group (singular "group") with single vortex file
+        let input = "DataSourceExec: file_groups={1 group: [[/data/nation/<CAYENNE_PATH>.vortex]]}, projection=[n_nationkey]";
+        let expected =
+            "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[n_nationkey]";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group with parquet file
+        let input = "DataSourceExec: file_groups={1 group: [[tpcds_sf1/item.parquet]]}, projection=[i_manufact], file_type=parquet";
+        let expected = "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[i_manufact], file_type=parquet";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Multiple groups with parquet byte ranges and trailing `...`
+        let input = "ParquetExec: file_groups={24 groups: [[/data/orders.parquet:0..2311466], [/data/orders.parquet:2311466..4622932], [/data/orders.parquet:4622932..6934398], ...]}, projection=[o_orderkey], limit=10";
+        let expected =
+            "ParquetExec: file_groups={24 groups: [<redacted>]}, projection=[o_orderkey], limit=10";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Single group with temp path
+        let input = "DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name], file_type=vortex";
+        let expected = "DataSourceExec: file_groups={1 group: [<redacted>]}, projection=[id, name], file_type=vortex";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // Multiple file_groups on one line (two DataSourceExec nodes in plan output)
+        let input = "DataSourceExec: file_groups={4 groups: [[a], [b], [c], [d]]}, x=1 ... DataSourceExec: file_groups={2 groups: [[e], [f]]}, y=2";
+        let expected = "DataSourceExec: file_groups={4 groups: [<redacted>]}, x=1 ... DataSourceExec: file_groups={2 groups: [<redacted>]}, y=2";
+        assert_eq!(regex.replace_all(input, replacement), expected);
+
+        // No file_groups — input unchanged
+        let input = "SortExec: expr=[revenue@1 DESC]";
+        assert_eq!(regex.replace_all(input, replacement), input);
 
         Ok(())
     }

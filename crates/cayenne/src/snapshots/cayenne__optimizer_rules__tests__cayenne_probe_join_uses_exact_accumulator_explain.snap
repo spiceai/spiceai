@@ -1,0 +1,8 @@
+---
+source: crates/cayenne/src/optimizer_rules.rs
+expression: plan_snapshot(&optimized)
+---
+HashJoinExec: mode=Partitioned, join_type=Inner, accumulator=ExactLeftAccumulator, on=[(order_id@0, order_id@0)]
+  DataSourceExec: file_groups={1 group: [[left.vortex]]}, projection=[order_id, warehouse_id, line_number], file_type=test
+  CayenneAccelerationExec
+    DataSourceExec: file_groups={1 group: [[right.vortex]]}, projection=[order_id, warehouse_id, line_number], file_type=test

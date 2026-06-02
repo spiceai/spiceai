@@ -37,7 +37,6 @@ on:
         options:
           - 'all'
           - 'Linux x64'
-          - 'Windows x64'
         default: 'all'
       compute_cap:
         description: 'Which CUDA compute capability to build for? (Default is ALL)'
@@ -63,75 +62,48 @@ on:
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "80",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "86",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "87",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "89",
-                runner: "windows-latest-8core",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "90",
-                runner: "windows-latest-8core",
-                target_os: "windows",
                 target_arch: "x86_64"
               }
             ];
@@ -144,8 +116,7 @@ jobs:
 
               // Filter by platform if specified
               if (platform_option !== 'all') {
-                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
-                filtered = filtered.filter(m => m.target_os === target_os);
+                filtered = filtered.filter(m => m.target_os === 'linux');
               }
 
               // Filter by compute capability if specified
@@ -178,19 +149,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      - name: Install Visual Studio Build Tools
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-vs-buildtools
-
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-        with:
-          os: ${{ matrix.target.target_os }}
 
       - name: Set up wget
         if: matrix.target.target_os == 'linux'
@@ -206,10 +171,13 @@ jobs:
         if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/setup-cc
 
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: '12.4.1'
+          cuda-version: '12.6.0'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           target_os: ${{ matrix.target.target_os }}
@@ -228,17 +196,17 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
-          pattern: spiced_models_cuda_*_linux_x86_64
+          pattern: spiced_cuda_*_linux_x86_64
           path: ${{ env.ARTIFACT_DIR }}
           merge-multiple: true
 
@@ -251,7 +219,7 @@ jobs:
           mc alias set spice-minio ${{ env.MINIO_ENDPOINT }} ${{ env.MINIO_ACCESS_KEY }} ${{ env.MINIO_SECRET_KEY }}
 
           # Upload any CUDA artifacts that were successfully built
-          for file in ${{ env.ARTIFACT_DIR }}/spiced_models_cuda_*_linux_x86_64.tar.gz; do
+          for file in ${{ env.ARTIFACT_DIR }}/spiced_cuda_*_linux_x86_64.tar.gz; do
             if [ -f "$file" ]; then
               echo "Uploading $file to Minio..."
               mc cp "$file" spice-minio/artifacts/spiced/linux-x86_64/${{ env.COMMIT_SHA }}/
@@ -266,9 +234,9 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -278,7 +246,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}

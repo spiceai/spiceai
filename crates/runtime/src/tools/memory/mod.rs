@@ -73,8 +73,7 @@ pub fn try_from(data: &[MemoryTableElement]) -> Result<RecordBatch, ArrowError> 
 async fn memory_table_name(
     rt: &Arc<Runtime>,
 ) -> Result<TableReference, Box<dyn std::error::Error + Send + Sync>> {
-    let app_lock = rt.app.read().await;
-    let Some(app) = app_lock.as_deref() else {
+    let Some(app) = rt.read_app().await else {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "App not initialized",
         ));

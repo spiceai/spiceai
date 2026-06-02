@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{AuthVerdict, HttpAuth};
+use crate::{AuthRequestContext, AuthVerdict, HttpAuth};
 use axum::{
     body::Body,
     http::StatusCode,
@@ -73,8 +73,34 @@ where
         Box::pin(async move {
             let (parts, body) = req.into_parts();
 
+            // Short-circuit when an upstream layer (e.g. the mTLS
+            // layer in mTLS-as-identity mode) has already established
+            // the auth principal. Without this check the API-key /
+            // bearer-token verifier would still run and a request
+            // with a verified client cert but no API key would be
+            // rejected.
+            if let Some(ctx) = parts
+                .extensions
+                .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                && ctx.auth_principal().is_some()
+            {
+                let req = Request::from_parts(parts, body);
+                return inner.call(req).await;
+            }
+
             match auth_verifier.http_verify(&parts) {
-                Ok(AuthVerdict::Allow(_)) => inner.call(Request::from_parts(parts, body)).await,
+                Ok(AuthVerdict::Allow(principal)) => {
+                    let mut request = Request::from_parts(parts, body);
+                    if let Some(context) = request
+                        .extensions()
+                        .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                        && let Err(err) = context.set_auth_principal(Arc::clone(&principal))
+                    {
+                        tracing::warn!(%err, "Failed to set auth principal on request context");
+                    }
+                    request.extensions_mut().insert(principal);
+                    inner.call(request).await
+                }
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {
                     tracing::error!("{e}");

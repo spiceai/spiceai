@@ -13,6 +13,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use ::util::format_datafusion_error;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -26,26 +27,38 @@ pub mod util;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("Error occured during search: {source}"))]
+    #[snafu(display("An internal error occurred during search: {source}"))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("A query engine error occured during search: {source}"))]
+    #[snafu(display("Failed to execute search query: {}", format_datafusion_error(source)))]
     QueryError { source: DataFusionError },
 
     #[cfg(feature = "text_search")]
-    #[snafu(display("Error occured performing full text search: {source}"))]
+    #[snafu(display("Failed to perform full text search: {source}"))]
     TextSearchError { source: text_search::Error },
 }
 
 impl Error {
+    /// Returns true if this error was caused by a user error (e.g., invalid query syntax).
+    ///
+    /// This method is feature-gated because [`Error::TextSearchError`] only exists when
+    /// the `text_search` feature is enabled. Without the feature gate, the match would
+    /// fail to compile when `text_search` is disabled.
     #[must_use]
     pub fn is_user_error(&self) -> bool {
-        matches!(
-            self,
-            Error::TextSearchError { source } if source.is_user_error()
-        )
+        #[cfg(feature = "text_search")]
+        {
+            matches!(
+                self,
+                Error::TextSearchError { source } if source.is_user_error()
+            )
+        }
+        #[cfg(not(feature = "text_search"))]
+        {
+            false
+        }
     }
 
     #[must_use]

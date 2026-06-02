@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,19 +32,43 @@ use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::caching::HashingAlgorithm;
 
+pub mod backend;
 pub mod lru_cache;
-mod metrics;
+pub mod metrics;
 mod simple_cache;
-mod utils;
+pub mod utils;
 
+pub mod encoding;
 pub mod key;
 pub mod result;
 
+pub use backend::CacheBackend;
+pub use backend::CacheBackendBuilder;
+pub use backend::MokaBackend;
+
+#[cfg(feature = "pingora")]
+pub use backend::PingoraBackend;
+
 pub use lru_cache::LruCache;
+pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
+pub use utils::RESPONSE_STATUS_COLUMN;
+pub use utils::batches_to_cache;
+pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
+
+/// Stable [`datafusion::logical_expr::UserDefinedLogicalNodeCore::name`] values for
+/// every Spice logical-plan extension node that performs (or dispatches) a write,
+/// a schema mutation, or any other side-effect that must not be reachable via a
+/// read-only SQL path and must not be served from or populated into the SQL
+/// results cache.
+///
+/// Keep this list in sync with:
+/// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
+/// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
+pub const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &["DdlExtension", "DmlExtension"];
 
 use crate::result::embeddings::CachedEmbeddingResult;
 
@@ -53,8 +77,8 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_ttl value: {source}"))]
-    FailedToParseItemTtl { source: ParseError },
+    #[snafu(display("Failed to parse {field} value: {source}"))]
+    FailedToParseDuration { source: ParseError, field: String },
 
     #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
     FailedToInvalidateCache {
@@ -106,9 +130,9 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
 {
     async fn get_raw_key(&self, key: &u64) -> Option<V>;
     async fn put_raw_key(&self, key: &u64, value: V);
-    fn invalidate_all(&self);
-    fn size_bytes(&self) -> u64;
-    fn item_count(&self) -> u64;
+    async fn invalidate_all(&self);
+    async fn size_bytes(&self) -> u64;
+    async fn item_count(&self) -> u64;
     fn max_size(&self) -> usize;
     async fn checkpoint(&self);
 }
@@ -129,30 +153,24 @@ pub trait TabledCacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
 pub enum HashBuilder {
     Ahash(ahash::RandomState),
     Siphash(std::hash::RandomState),
-    #[cfg(feature = "xxhash")]
+    Blake3,
     XxHash3(std::hash::BuildHasherDefault<twox_hash::XxHash3_64>),
-    #[cfg(feature = "xxhash")]
     XxHash32(std::hash::BuildHasherDefault<twox_hash::XxHash32>),
-    #[cfg(feature = "xxhash")]
     XxHash64(std::hash::BuildHasherDefault<twox_hash::XxHash64>),
-    #[cfg(feature = "xxhash")]
     XxHash128,
 }
 
 impl std::hash::BuildHasher for HashBuilder {
-    type Hasher = Box<dyn Hasher>;
+    type Hasher = Box<dyn Hasher + Send + Sync + 'static>;
 
     fn build_hasher(&self) -> Self::Hasher {
         match self {
             HashBuilder::Ahash(builder) => Box::new(builder.build_hasher()),
             HashBuilder::Siphash(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
+            HashBuilder::Blake3 => Box::new(blake3_compat::Blake3Wrapper::new()),
             HashBuilder::XxHash3(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash32(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash64(builder) => Box::new(builder.build_hasher()),
-            #[cfg(feature = "xxhash")]
             HashBuilder::XxHash128 => Box::new(xxhash_compat::XxHash3_128Wrapper::new()),
         }
     }
@@ -166,26 +184,52 @@ pub fn get_hash_builder(hashing_algorithm: HashingAlgorithm) -> Result<HashBuild
     match hashing_algorithm {
         HashingAlgorithm::Siphash => Ok(HashBuilder::Siphash(std::hash::RandomState::default())),
         HashingAlgorithm::Ahash => Ok(HashBuilder::Ahash(ahash::RandomState::default())),
-        #[cfg(feature = "xxhash")]
+        HashingAlgorithm::Blake3 => Ok(HashBuilder::Blake3),
         HashingAlgorithm::XXH3 => Ok(HashBuilder::XxHash3(std::hash::BuildHasherDefault::<
             twox_hash::XxHash3_64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH32 => Ok(HashBuilder::XxHash32(std::hash::BuildHasherDefault::<
             twox_hash::XxHash32,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH64 => Ok(HashBuilder::XxHash64(std::hash::BuildHasherDefault::<
             twox_hash::XxHash64,
         >::default())),
-        #[cfg(feature = "xxhash")]
         HashingAlgorithm::XXH128 => Ok(HashBuilder::XxHash128),
-        #[allow(unreachable_patterns)]
-        _ => Err(Error::InvalidHashingAlgorithm),
     }
 }
 
-#[cfg(feature = "xxhash")]
+mod blake3_compat {
+    use std::hash::Hasher;
+
+    pub struct Blake3Wrapper {
+        hasher: blake3::Hasher,
+    }
+
+    impl Blake3Wrapper {
+        pub fn new() -> Self {
+            Self {
+                hasher: blake3::Hasher::new(),
+            }
+        }
+    }
+
+    impl Hasher for Blake3Wrapper {
+        fn finish(&self) -> u64 {
+            // blake3::Hasher::finalize_xof() doesn't consume self, so we must clone
+            // to get the hash value while preserving the hasher state for potential reuse.
+            // This is the intended design of blake3's incremental API.
+            let mut xof = self.hasher.finalize_xof();
+            let mut bytes = [0u8; 8];
+            xof.fill(&mut bytes);
+            u64::from_le_bytes(bytes)
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.hasher.update(bytes);
+        }
+    }
+}
+
 mod xxhash_compat {
     use std::hash::Hasher;
 
@@ -202,7 +246,7 @@ mod xxhash_compat {
     }
 
     impl Hasher for XxHash3_128Wrapper {
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         fn finish(&self) -> u64 {
             let hasher_copy = self.hasher.clone();
             let hash128 = hasher_copy.finish_128();
@@ -295,6 +339,25 @@ impl Caching {
         }
         Ok(())
     }
+
+    /// Drives moka housekeeping on every configured cache. `moka::future::Cache`
+    /// has no background maintenance thread, so invalidation predicates and
+    /// expired entries on a cache with no `get`/`insert` traffic are only
+    /// reclaimed when this runs.
+    pub async fn run_pending_maintenance(&self) {
+        if let Some(results) = &self.results {
+            results.run_pending_tasks().await;
+        }
+        if let Some(plans) = &self.plans {
+            plans.checkpoint().await;
+        }
+        if let Some(search) = &self.search {
+            search.checkpoint().await;
+        }
+        if let Some(embeddings) = &self.embeddings {
+            embeddings.checkpoint().await;
+        }
+    }
 }
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
@@ -302,8 +365,12 @@ pub struct QueryResultsCacheProvider {
     cache: Arc<dyn TabledCacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
+    stale_while_revalidate_ttl: Option<std::time::Duration>,
 
     ignore_schemas: Box<[Box<str>]>,
+    encoder: Option<Arc<dyn encoding::Encoder>>,
+    encoding: spicepod::component::caching::Encoding,
+    hashing_algorithm: spicepod::component::caching::HashingAlgorithm,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -311,6 +378,10 @@ impl std::fmt::Debug for QueryResultsCacheProvider {
         f.debug_struct("QueryResultsCacheProvider")
             .field("cache_max_size", &self.cache_max_size)
             .field("ttl", &self.ttl)
+            .field(
+                "stale_while_revalidate_ttl",
+                &self.stale_while_revalidate_ttl,
+            )
             .field("ignore_schemas", &self.ignore_schemas)
             .finish_non_exhaustive()
     }
@@ -332,18 +403,46 @@ impl QueryResultsCacheProvider {
         };
 
         let ttl = match &config.item_ttl {
-            Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
+            Some(item_ttl) => {
+                fundu::parse_duration(item_ttl).context(FailedToParseDurationSnafu {
+                    field: "item_ttl".to_string(),
+                })?
+            }
             None => std::time::Duration::from_secs(1),
         };
 
+        let stale_while_revalidate_ttl = match &config.stale_while_revalidate_ttl {
+            Some(stale_ttl_str) => Some(fundu::parse_duration(stale_ttl_str).context(
+                FailedToParseDurationSnafu {
+                    field: "stale_while_revalidate_ttl".to_string(),
+                },
+            )?),
+            None => None,
+        };
+
         let hash_builder = get_hash_builder(config.hashing_algorithm)?;
-        let cache = Arc::new(LruCache::new(cache_max_size, ttl, hash_builder));
+        // Cache TTL should be the base TTL plus the stale-while-revalidate window
+        // so entries aren't evicted before they can be served as stale
+        let cache_ttl = ttl + stale_while_revalidate_ttl.unwrap_or_default();
+        let cache = Arc::new(LruCache::new(
+            cache_max_size,
+            cache_ttl,
+            hash_builder,
+            config.caching_policy,
+            config.engine,
+        ));
+
+        let encoder = encoding::get_encoder(config.encoding);
 
         let cache_provider = QueryResultsCacheProvider {
             cache,
             cache_max_size,
             ttl,
+            stale_while_revalidate_ttl,
             ignore_schemas,
+            encoder,
+            encoding: config.encoding,
+            hashing_algorithm: config.hashing_algorithm,
         };
 
         Ok(cache_provider)
@@ -405,13 +504,57 @@ impl QueryResultsCacheProvider {
     }
 
     #[must_use]
-    pub fn size(&self) -> u64 {
-        self.cache.size_bytes()
+    pub async fn size(&self) -> u64 {
+        self.cache.size_bytes().await
     }
 
     #[must_use]
-    pub fn item_count(&self) -> u64 {
-        self.cache.item_count()
+    pub async fn item_count(&self) -> u64 {
+        self.cache.item_count().await
+    }
+
+    /// Returns the base TTL for cache entries (used for staleness checks).
+    #[must_use]
+    pub fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    /// Returns the maximum stale-while-revalidate duration.
+    #[must_use]
+    pub fn max_stale_while_revalidate(&self) -> std::time::Duration {
+        self.stale_while_revalidate_ttl.unwrap_or_default()
+    }
+
+    /// Returns the actual cache TTL (base TTL + stale-while-revalidate period).
+    /// This is the duration after which entries are evicted from the cache.
+    #[must_use]
+    pub fn cache_ttl(&self) -> std::time::Duration {
+        self.ttl + self.stale_while_revalidate_ttl.unwrap_or_default()
+    }
+
+    /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).
+    /// This is useful in tests to ensure eviction happens immediately.
+    pub async fn run_pending_tasks(&self) {
+        self.cache.checkpoint().await;
+    }
+
+    #[must_use]
+    pub fn stale_while_revalidate_ttl(&self) -> Option<std::time::Duration> {
+        self.stale_while_revalidate_ttl
+    }
+
+    #[must_use]
+    pub fn encoder(&self) -> Option<Arc<dyn encoding::Encoder>> {
+        self.encoder.as_ref().map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        use spicepod::component::caching::Encoding;
+        match self.encoding {
+            Encoding::None => "none",
+            Encoding::Zstd => "zstd",
+        }
     }
 
     #[must_use]
@@ -438,6 +581,11 @@ impl QueryResultsCacheProvider {
                 | LogicalPlan::Dml(..)
                 | LogicalPlan::Copy { .. }
                 | LogicalPlan::Statement(..) => return false,
+                LogicalPlan::Extension(ext)
+                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) =>
+                {
+                    return false;
+                }
                 _ => {}
             }
 
@@ -452,9 +600,11 @@ impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item ttl: {:?}",
+            "max size: {:.2}, item ttl: {:?}, hashing algorithm: {:?}, encoding: {}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
-            self.ttl
+            self.ttl,
+            self.hashing_algorithm,
+            self.encoding_name(),
         )
     }
 }
@@ -487,7 +637,9 @@ mod tests {
         )
         .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for SHOW TABLES");
     }
 
     #[tokio::test]
@@ -499,7 +651,10 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        cache_provider
+            .cache_is_enabled_for_plan(&logical_plan)
+            .then_some(())
+            .expect("cache should be enabled for simple SELECT");
     }
 
     #[tokio::test]
@@ -511,7 +666,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for INSERT INTO");
     }
 
     #[tokio::test]
@@ -523,7 +680,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for UPDATE");
     }
 
     #[tokio::test]
@@ -535,7 +694,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for DELETE");
     }
 
     #[tokio::test]
@@ -547,7 +708,85 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for CREATE TABLE");
+    }
+
+    #[test]
+    fn test_display_includes_encoding() {
+        let config_none = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::None,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_none = QueryResultsCacheProvider::try_new(&config_none, Box::new([]))
+            .expect("valid cache provider");
+        let display_none = format!("{cache_none}");
+        assert!(
+            display_none.contains("encoding: none"),
+            "Display should include encoding: none, got: {display_none}"
+        );
+
+        let config_zstd = SQLResultsCacheConfig {
+            encoding: spicepod::component::caching::Encoding::Zstd,
+            ..SQLResultsCacheConfig::default()
+        };
+        let cache_zstd = QueryResultsCacheProvider::try_new(&config_zstd, Box::new([]))
+            .expect("valid cache provider");
+        let display_zstd = format!("{cache_zstd}");
+        assert!(
+            display_zstd.contains("encoding: zstd"),
+            "Display should include encoding: zstd, got: {display_zstd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_pending_maintenance_handles_untouched_caches() {
+        use crate::result::search::CachedSearchResult;
+        use spicepod::component::caching::CacheConfig;
+
+        // A search cache that never receives get/insert traffic, plus a results
+        // cache.
+        let results = Arc::new(
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid results cache"),
+        );
+        let search = lru_cache::build_from_config::<CachedSearchResult>(&CacheConfig::default())
+            .expect("valid search cache")
+            .as_tabled_provider();
+
+        let caching = Caching::new()
+            .with_results_cache(results)
+            .with_search_cache(search);
+
+        let table = TableReference::bare("never_read");
+
+        // Each call registers a moka invalidation predicate.
+        for _ in 0..1_000 {
+            caching
+                .invalidate_for_table(table.clone())
+                .expect("invalidation should succeed");
+        }
+
+        // Maintenance drains the predicates; the caches stay empty and functional.
+        caching.run_pending_maintenance().await;
+
+        let results = caching.results.as_ref().expect("results configured");
+        assert_eq!(results.item_count().await, 0);
+        let search = caching.search.as_ref().expect("search configured");
+        assert_eq!(search.item_count().await, 0);
+
+        // Another invalidate + maintenance cycle still works.
+        caching
+            .invalidate_for_table(table)
+            .expect("invalidation should succeed");
+        caching.run_pending_maintenance().await;
+    }
+
+    #[tokio::test]
+    async fn test_run_pending_maintenance_on_empty_caching_is_noop() {
+        // No configured caches: maintenance must be a harmless no-op.
+        Caching::new().run_pending_maintenance().await;
     }
 
     #[tokio::test]
@@ -559,6 +798,8 @@ mod tests {
             QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
-        assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
+        (!cache_provider.cache_is_enabled_for_plan(&logical_plan))
+            .then_some(())
+            .expect("cache should be disabled for COPY");
     }
 }

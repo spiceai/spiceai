@@ -9,9 +9,43 @@ on:
       rel_version:
         description: 'The version to build CLI / download released CLI'
         required: false
-        default: '1.0.2'
+        default: '2.0.0'
+      upgrade_from_version:
+        description: 'Released version of spiced to test upgrading from (empty = latest release)'
+        required: false
+        default: ''
 
 jobs:
+  resolve-upgrade-version:
+    name: Resolve upgrade-from version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT="${{ github.event.inputs.upgrade_from_version }}"
+          BUILD_CLI="${{ github.event.inputs.build_cli }}"
+
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+            echo "Using provided version: $VERSION"
+          elif [ "$BUILD_CLI" = "false" ]; then
+            # When testing a released CLI, upgrade from the previous release
+            VERSION=$(gh release list --repo ${{ github.repository }} --exclude-pre-releases --limit 20 --json tagName -q '.[].tagName' \
+              | grep -v '-' | sed 's/^v//' | sed -n '2p')
+            echo "Auto-detected N-1 release: $VERSION"
+          else
+            # When building from source, upgrade from the latest release
+            VERSION=$(gh release list --repo ${{ github.repository }} --exclude-pre-releases --limit 20 --json tagName -q '.[].tagName' \
+              | grep -v '-' | sed 's/^v//' | head -1)
+            echo "Auto-detected latest release: $VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   setup-matrix:
     name: Setup strategy matrix
     runs-on: spiceai-dev-runners
@@ -20,7 +54,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
@@ -30,19 +64,16 @@ jobs:
                 runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
+                runner: "macos-15",
                 target_os: "darwin",
                 target_arch: "aarch64",
-                target_arch_go: "arm64",
               }, {
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
-                target_arch_go: "amd64",
               }
             ];
             return matrix;
@@ -52,31 +83,32 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      GOVER: 1.25.3
-      GOOS: ${{ matrix.target.target_os }}
-      GOARCH: ${{ matrix.target.target_arch_go }}
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: github.event.inputs.build_cli == 'true'
-
-      - name: Set up Go
-        if: github.event.inputs.build_cli == 'true'
-        uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GOVER }}
+          persist-credentials: false
+
+      - name: Set up Rust
+        if: github.event.inputs.build_cli == 'true'
+        uses: ./.github/actions/setup-rust
 
       - name: Set up make
         if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
         uses: ./.github/actions/setup-make
 
+      - name: Set up cc
+        if: matrix.target.target_os == 'linux' && github.event.inputs.build_cli == 'true'
+        uses: ./.github/actions/setup-cc
+
       - name: Build spice
         if: github.event.inputs.build_cli == 'true'
-        run: make -C bin/spice
+        run: cargo build --release -p spice
 
       - name: Make spice executable & Move spice (Unix)
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
@@ -92,7 +124,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os != 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -100,7 +132,7 @@ jobs:
 
       - name: Save spice artifact
         if: matrix.target.target_os == 'windows' && github.event.inputs.build_cli == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
@@ -111,11 +143,13 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
+      UPGRADE_FROM_VERSION: ${{ needs.resolve-upgrade-version.outputs.version }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
       - setup-matrix
+      - resolve-upgrade-version
     timeout-minutes: 5
 
     strategy:
@@ -123,11 +157,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -137,7 +173,7 @@ jobs:
         run: |
           mkdir -p ./build
           cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
           output="spice.tar.gz"
           curl -L -o "$output" "$url"
           tar -xzf "$output"
@@ -149,7 +185,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path "./build" > $null
           Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spice.exe_windows_x86_64.tar.gz"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spice.exe_windows_x86_64.tar.gz"
           $output = "spice.exe_windows_x86_64.tar.gz"
           Invoke-WebRequest -Uri $url -OutFile $output
           tar -xzf $output
@@ -160,7 +196,7 @@ jobs:
         if: matrix.target.target_os == 'windows'
         run: |
           Set-Location "./build"
-          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
+          $url = "https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced.exe_windows_x86_64.tar.gz"
           $output = "spiced.exe_windows_x86_64.tar.gz"
           Invoke-WebRequest -Uri $url -OutFile $output
           tar -xzf $output
@@ -170,7 +206,7 @@ jobs:
         if: matrix.target.target_os != 'windows'
         run: |
           cd ./build
-          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.REL_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
+          url="https://github.com/spiceai/spiceai/releases/download/v${{ env.UPGRADE_FROM_VERSION }}/spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz"
           output="spiced.tar.gz"
           curl -L -o "$output" "$url"
           tar -xzf "$output"
@@ -182,9 +218,42 @@ jobs:
         with:
           build-path: ./build
 
-      - name: Run spice upgrade
+      - name: Check pre-upgrade version
+        shell: bash
         run: |
-          spice upgrade
+          spice version
+          RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
+          EXPECTED="v${{ env.UPGRADE_FROM_VERSION }}"
+          echo "Pre-upgrade Runtime version: $RUNTIME_VERSION (expected: $EXPECTED)"
+          # v1.11.x on Windows doesn't detect spiced.exe (looks for 'spiced' without extension)
+          if [[ "$RUNTIME_VERSION" == "not" ]]; then
+            echo "::warning::Runtime reported as 'not installed' (known v1.11.x Windows issue)"
+          elif [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
+            echo "::error::Expected pre-upgrade Runtime version starting with $EXPECTED, got $RUNTIME_VERSION"
+            exit 1
+          fi
+
+      - name: Run spice upgrade
+        shell: bash
+        run: |
+          spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
+
+      - name: Verify no models variant attempted for v2+
+        shell: bash
+        run: |
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/upgrade_output.log; then
+              echo "::error::v2+ upgrade should not attempt to download models variant"
+              cat /tmp/upgrade_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
 
       - name: Check the temp directory (Windows)
         if: matrix.target.target_os == 'windows'
@@ -209,12 +278,35 @@ jobs:
               Select-Object FullName, Length, LastWriteTime |
               Format-Table -AutoSize
 
+      - name: Run spice version
+        shell: bash
+        run: |
+          spice version
+          CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
+          RUNTIME_VERSION=$(spice version 2>&1 | grep 'Runtime version:' | awk '{print $3}')
+          EXPECTED="v${{ env.REL_VERSION }}"
+          # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
+          if [[ "$CLI_VERSION" != v1.11.* ]]; then
+            if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
+              echo "::error::Expected CLI version starting with $EXPECTED, got $CLI_VERSION"
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
+          fi
+          if [[ "$RUNTIME_VERSION" == "not" ]]; then
+            echo "::warning::Runtime reported as 'not installed' (known v1.11.x Windows issue)"
+          elif [[ "$RUNTIME_VERSION" != "$EXPECTED"* ]]; then
+            echo "::error::Expected Runtime version starting with $EXPECTED, got $RUNTIME_VERSION"
+            exit 1
+          fi
+
   test_spice_upgrade_without_runtime:
     name: 'Test spice upgrade without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -226,11 +318,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -264,8 +358,26 @@ jobs:
           build-path: ./build
 
       - name: Run spice upgrade
+        shell: bash
         run: |
-          spice upgrade
+          spice -v upgrade 2>&1 | tee /tmp/upgrade_output.log
+
+      - name: Verify no models variant attempted for v2+
+        shell: bash
+        run: |
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/upgrade_output.log; then
+              echo "::error::v2+ upgrade should not attempt to download models variant"
+              cat /tmp/upgrade_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
 
       - name: Check the temp directory (Windows)
         if: matrix.target.target_os == 'windows'
@@ -290,12 +402,28 @@ jobs:
               Select-Object FullName, Length, LastWriteTime |
               Format-Table -AutoSize
 
+      - name: Run spice version
+        shell: bash
+        run: |
+          spice version
+          CLI_VERSION=$(spice version 2>&1 | grep 'CLI version:' | awk '{print $3}')
+          EXPECTED="v${{ env.REL_VERSION }}"
+          # v1.11.x CLI doesn't self-upgrade (fix landed in v2.0.0)
+          if [[ "$CLI_VERSION" != v1.11.* ]]; then
+            if [[ "$CLI_VERSION" != "$EXPECTED"* ]]; then
+              echo "::error::Expected CLI version starting with $EXPECTED, got $CLI_VERSION"
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
+          fi
+
   test_spice_install_without_runtime:
     name: 'Test spice install without runtime (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -307,11 +435,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -345,8 +475,44 @@ jobs:
           build-path: ./build
 
       - name: Run spice install
+        if: matrix.target.target_os != 'windows'
+        shell: bash
         run: |
-          spice install
+          spice -v install 2>&1 | tee /tmp/install_output.log
+
+      - name: Verify no models variant attempted for v2+
+        if: matrix.target.target_os != 'windows'
+        shell: bash
+        run: |
+          VERSION="${{ env.REL_VERSION }}"
+          VERSION="${VERSION#v}"
+          MAJOR="${VERSION%%.*}"
+          if [[ -n "$MAJOR" && "$MAJOR" -ge 2 ]]; then
+            if grep -q '_models_' /tmp/install_output.log; then
+              echo "::error::v2+ install should not attempt to download models variant"
+              cat /tmp/install_output.log
+              exit 1
+            fi
+            echo "Confirmed: no models variant attempted for v${{ env.REL_VERSION }}"
+          else
+            echo "Skipping models variant check for v1.x"
+          fi
+
+      - name: Validate native Windows spice install guidance
+        if: matrix.target.target_os == 'windows'
+        shell: pwsh
+        run: |
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $installOutput = (& spice install 2>&1 | Out-String)
+          Write-Host $installOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice install unexpectedly succeeded on native Windows"
+          }
+          if (-not $installOutput.Contains($expected)) {
+            throw "spice install did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Run spice version
         run: |
@@ -357,7 +523,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -369,11 +535,13 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -413,25 +581,27 @@ jobs:
           # time to download runtime
           sleep 60
 
-      - name: Start spice runtime
+      - name: Validate native Windows spice run guidance
         if: matrix.target.target_os == 'windows'
+        shell: pwsh
         run: |
-          Start-Process spice -ArgumentList "run" -NoNewWindow -RedirectStandardOutput "spice.stdout.log" -RedirectStandardError "spice.stderr.log"
-          # time to download runtime
-          Start-Sleep -Seconds 60
+          $expected = "Open WSL and run the Linux Spice CLI there instead."
+          $runOutput = (& spice run 2>&1 | Out-String)
+          Write-Host $runOutput
+          if ($LASTEXITCODE -eq 0) {
+            throw "spice run unexpectedly succeeded on native Windows"
+          }
+          if (-not $runOutput.Contains($expected)) {
+            throw "spice run did not print the expected WSL guidance"
+          }
+
+          exit 0
 
       - name: Stop spice and check logs
         if: always() && matrix.target.target_os != 'windows'
         run: |
           killall spice || true
           cat spice.log
-
-      - name: Stop spice and check logs
-        if: always() && matrix.target.target_os == 'windows'
-        shell: pwsh
-        run: |
-          Get-Process -Name spice -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Get-Content spice.stdout.log, spice.stderr.log
 
       - name: Run spice version
         run: |
@@ -443,7 +613,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -453,17 +623,18 @@ jobs:
       matrix:
         target:
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'macos-14'
+            runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -491,7 +662,7 @@ jobs:
     continue-on-error: true
     runs-on: ${{ matrix.target.runner }}
     env:
-      REL_VERSION: ${{ github.event.inputs.rel_version || '1.0.2' }}
+      REL_VERSION: ${{ github.event.inputs.rel_version || '2.0.0' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     needs:
       - build
@@ -501,17 +672,18 @@ jobs:
       matrix:
         target:
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'macos-14'
+            runner: 'macos-15'
             target_os: 'darwin'
             target_arch: 'aarch64'
-            target_arch_go: 'arm64'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: github.event.inputs.build_cli != 'false'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
@@ -541,7 +713,11 @@ jobs:
       - name: Install expect (macOS)
         if: matrix.target.target_os == 'darwin'
         run: |
-          brew install expect
+          if command -v expect >/dev/null 2>&1; then
+            expect -v
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install expect
+          fi
 
       - name: Make expect scripts executable
         run: |

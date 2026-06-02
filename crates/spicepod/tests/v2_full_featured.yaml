@@ -1,0 +1,40 @@
+version: v2
+kind: Spicepod
+name: v2_full_featured
+runtime:
+  caching:
+    sql_results:
+      enabled: true
+      item_ttl: 10s
+      max_size: 256MiB
+      stale_while_revalidate_ttl: 30s
+      encoding: zstd
+    search_results:
+      enabled: true
+      item_ttl: 5s
+    embeddings:
+      enabled: false
+  ready_state: on_registration
+  flight:
+    max_message_size: 32MiB
+    do_put_rate_limit_enabled: false
+  query:
+    memory_limit: 1GiB
+    temp_directory: /tmp/spice_v2
+    spill_compression: lz4_frame
+  params:
+    key1: value1
+datasets:
+  - name: my_dataset
+    from: s3://bucket/data.parquet
+    access: read_write
+    time_column: created_at
+    acceleration:
+      enabled: true
+      engine: duckdb
+      mode: file
+      refresh_check_interval: 10s
+catalogs:
+  - name: my_catalog
+    from: spice.ai
+    access: read_write_create

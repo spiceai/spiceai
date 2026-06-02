@@ -1,0 +1,30 @@
+version: v1
+kind: Spicepod
+name: s3-public[parquet]-federated
+datasets:
+  - from: s3://spiceai-public-datasets/tpch/customer/customer.parquet
+    name: customer
+    params: &s3_params
+      file_format: parquet
+      s3_auth: public
+  - from: s3://spiceai-public-datasets/tpch/lineitem/lineitem.parquet
+    name: lineitem
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/nation/nation.parquet
+    name: nation
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/orders/orders.parquet
+    name: orders
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/part/part.parquet
+    name: part
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/partsupp/partsupp.parquet
+    name: partsupp
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/region/region.parquet
+    name: region
+    params: *s3_params
+  - from: s3://spiceai-public-datasets/tpch/supplier/supplier.parquet
+    name: supplier
+    params: *s3_params

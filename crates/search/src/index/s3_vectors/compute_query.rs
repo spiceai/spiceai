@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::s3_vectors::query_provider::ComputeQueryVector;
+use data_components::s3_vectors::compute_query::ComputeQueryVector;
 use llms::embeddings::Embed;
 use snafu::ResultExt;
 use std::sync::Arc;

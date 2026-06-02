@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError, logical_expr::TableProviderFilterPushDown, prelude::Expr,
-    scalar::ScalarValue,
+    common::Constraints, error::DataFusionError, logical_expr::TableProviderFilterPushDown,
+    prelude::Expr, scalar::ScalarValue,
 };
 use snafu::prelude::*;
 
@@ -28,6 +28,16 @@ use crate::Partition;
 pub mod filename;
 
 type StdError = Box<dyn std::error::Error + Send + Sync>;
+
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -43,12 +53,19 @@ pub enum Error {
 }
 
 #[async_trait]
-pub trait PartitionCreator: Debug + Send + Sync {
-    /// Create a new [`Partition`] using the `partition_value`.
+pub trait PartitionCreator: AsAny + Debug + Send + Sync {
+    /// Create a new [`Partition`] using the given partition values.
+    ///
+    /// For single-column partitions, pass a single-element vector.
+    /// For composite partitions (e.g., `partition_by: [year, month]`), pass
+    /// multiple values in the same order as the partition expressions.
     ///
     /// # Errors
     /// Returns an error when creating a [`Partition`] is unsuccessful.
-    async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
+    async fn create_partition(
+        &self,
+        partition_values: Vec<ScalarValue>,
+    ) -> Result<Partition, Error>;
 
     /// Find and load previously created [`Partition`]s
     ///
@@ -64,4 +81,9 @@ pub trait PartitionCreator: Debug + Send + Sync {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError>;
+
+    /// Returns the constraints (primary key, unique, etc.) for partitions.
+    fn constraints(&self) -> Option<&Constraints> {
+        None
+    }
 }

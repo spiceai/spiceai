@@ -16,9 +16,8 @@ limitations under the License.
 
 use std::time::Duration;
 
-use opentelemetry::{KeyValue, metrics::Histogram};
-
-use super::{Counter, LazyLock, Meter, global};
+use super::{Counter, Histogram, LazyLock, Meter, UpDownCounter, global};
+use opentelemetry::KeyValue;
 
 pub(crate) static TELEMETRY_METER: LazyLock<Meter> = LazyLock::new(|| global::meter("telemetry"));
 
@@ -33,6 +32,26 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub fn track_query_count(dimensions: &[KeyValue]) {
     telemetry::track_query_count(dimensions);
     QUERY_COUNT.add(1, dimensions);
+}
+
+static QUERY_ACTIVE_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    TELEMETRY_METER
+        .i64_up_down_counter("query_active_count")
+        .with_description(
+            "Number of concurrent top-level queries actively being processed in the runtime.",
+        )
+        .with_unit("queries")
+        .build()
+});
+
+pub fn inc_query_active_count(dimensions: &[KeyValue]) {
+    telemetry::inc_query_active_count(dimensions);
+    QUERY_ACTIVE_COUNT.add(1, dimensions);
+}
+
+pub fn dec_query_active_count(dimensions: &[KeyValue]) {
+    telemetry::dec_query_active_count(dimensions);
+    QUERY_ACTIVE_COUNT.add(-1, dimensions);
 }
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -82,11 +101,12 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
             "The total amount of time spent planning and executing queries in milliseconds.",
         )
         .with_unit("ms")
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
 pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_duration(duration, dimensions);
+    telemetry::track_query_duration(duration, &without_anonymous_excluded(dimensions));
     QUERY_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
@@ -97,12 +117,31 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
             "The total amount of time spent only executing queries. This is 0 for cached queries.",
         )
         .with_unit("ms")
+        .with_boundaries(telemetry::DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_execution_duration(duration, dimensions);
+    telemetry::track_query_execution_duration(duration, &without_anonymous_excluded(dimensions));
     QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+/// Attribute keys that must never be exported via the spice.ai anonymous
+/// telemetry pipeline. They are kept on the runtime's own meter (so users
+/// who connect their own OTel/Prometheus stack still see them) but are
+/// stripped before forwarding to the anonymous exporter.
+///
+/// `datasets` is a comma-joined list of dataset names referenced by a
+/// query and is not needed for the aggregate latency shape that anonymous
+/// telemetry tracks.
+const ANONYMOUS_TELEMETRY_EXCLUDED_KEYS: &[&str] = &["datasets"];
+
+fn without_anonymous_excluded(dimensions: &[KeyValue]) -> Vec<KeyValue> {
+    dimensions
+        .iter()
+        .filter(|kv| !ANONYMOUS_TELEMETRY_EXCLUDED_KEYS.contains(&kv.key.as_str()))
+        .cloned()
+        .collect()
 }
 
 static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {

@@ -16,9 +16,17 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
+use crate::{
+    accelerated_table::{DataRetentionFilter, Retention, refresh},
+    component::dataset::TimeFormat,
+    datafusion::{
+        builder::get_df_default_config,
+        filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert},
+        is_spice_internal_dataset,
+    },
+};
 use arrow::array::UInt64Array;
 use cache::Caching;
-use data_components::delete::get_deletion_provider;
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -26,136 +34,162 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
-
-use crate::{
-    accelerated_table::{DataRetentionFilter, Retention, refresh},
-    component::dataset::TimeFormat,
-    datafusion::{
-        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
-        is_spice_internal_dataset,
-    },
-};
 use runtime_object_store::registry::default_runtime_env;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
 impl super::AcceleratedTable {
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
         caching: Option<Arc<Caching>>,
+        io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
+        let mut nullable_time_column_warning_emitted = false;
 
         loop {
             interval_timer.tick().await;
 
-            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
-                let mut exprs = Vec::new();
+            // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
+            let _lock_guard = accelerator_write_mutex.lock().await;
 
-                // convert retention filters into data eviction expressions
-                for filter in &retention.filters {
-                    match filter {
-                        DataRetentionFilter::Expression { delete_expr } => {
-                            log_retention_action(&dataset_name, "using SQL expression");
-                            exprs.push(delete_expr.clone());
-                        }
-                        DataRetentionFilter::Time {
-                            period,
+            let mut exprs = Vec::new();
+
+            // convert retention filters into data eviction expressions
+            for filter in &retention.filters {
+                match filter {
+                    DataRetentionFilter::Expression { delete_expr } => {
+                        log_retention_action(&dataset_name, "using SQL expression");
+                        exprs.push(delete_expr.clone());
+                    }
+                    DataRetentionFilter::Time {
+                        period,
+                        time_column,
+                        time_format,
+                        time_partition_column,
+                        time_partition_format,
+                    } => {
+                        let Some(converter) = create_timestamp_filter_converter(
+                            &accelerator,
                             time_column,
-                            time_format,
-                            time_partition_column,
-                            time_partition_format,
-                        } => {
-                            let Some(converter) = create_timestamp_filter_converter(
-                                &accelerator,
-                                time_column,
-                                *time_format,
-                                time_partition_column.as_ref(),
-                                *time_partition_format,
-                            ) else {
-                                tracing::error!(
-                                    "[retention] Failed to create timestamp filter converter for retention for dataset {dataset_name}",
-                                );
-                                continue;
-                            };
-
-                            let start = SystemTime::now() - *period;
-                            let timestamp = refresh::get_timestamp(start);
-                            let expr = converter.convert(timestamp, Operator::Lt);
-
-                            let timestamp = if let Some(value) = chrono::DateTime::from_timestamp(
-                                (timestamp / 1_000_000_000) as i64,
-                                0,
-                            ) {
-                                value.to_rfc3339()
-                            } else {
-                                tracing::warn!("[retention] Unable to convert timestamp");
-                                continue;
-                            };
-
-                            log_retention_action(
-                                &dataset_name,
-                                &format!("where {time_column} < {timestamp}"),
+                            *time_format,
+                            time_partition_column.as_ref(),
+                            *time_partition_format,
+                        ) else {
+                            tracing::error!(
+                                "[retention] Failed to create timestamp filter converter for retention for dataset {dataset_name}",
                             );
-                            exprs.push(Box::new(expr));
+                            continue;
+                        };
+
+                        // ACID / correctness warning for nullable time columns.
+                        // `timestamp < cutoff` (and any <, >, = comparison) evaluates to NULL (false)
+                        // when the timestamp is NULL. Therefore, rows with NULL in the retention
+                        // time_column are *never* deleted by a time-based policy. This can lead to
+                        // unbounded table growth if the source produces NULL-timestamp data that
+                        // the user expects to be eventually cleaned up.
+                        // We surface this explicitly so operators are not surprised by "leaky"
+                        // retention. For full control, users can use an Expression filter with
+                        // explicit NULL handling (e.g. `time < cutoff OR time IS NULL`).
+                        if !nullable_time_column_warning_emitted
+                            && accelerator
+                                .schema()
+                                .column_with_name(time_column)
+                                .is_some_and(|(_, f)| f.is_nullable())
+                        {
+                            tracing::warn!(
+                                "[retention] time_column '{time_column}' for dataset {dataset_name} is nullable. \
+                                 Rows with NULL in this column will never satisfy `time < cutoff` and will not be deleted by retention. \
+                                 This can cause the accelerated table to grow without bound if the source emits NULL timestamps. \
+                                 Consider making the time column non-nullable or using a custom Expression retention filter."
+                            );
+                            nullable_time_column_warning_emitted = true;
                         }
+
+                        let start = SystemTime::now() - *period;
+                        let timestamp = refresh::get_timestamp(start);
+                        let expr = converter.convert(timestamp, Operator::Lt);
+
+                        let timestamp = if let Some(value) =
+                            chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
+                        {
+                            value.to_rfc3339()
+                        } else {
+                            tracing::warn!("[retention] Unable to convert timestamp");
+                            continue;
+                        };
+
+                        log_retention_action(
+                            &dataset_name,
+                            &format!("where {time_column} < {timestamp}"),
+                        );
+                        exprs.push(Box::new(expr));
                     }
                 }
+            }
 
-                // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
-                let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
-                    tracing::warn!(
-                        "[retention] No valid retention filters found for dataset {dataset_name}"
+            // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
+            let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
+                tracing::warn!(
+                    "[retention] No valid retention filters found for dataset {dataset_name}"
+                );
+                continue;
+            };
+
+            tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+            let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
+                Ok(simplified) => simplified,
+                Err(e) => {
+                    tracing::error!(
+                        "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
                     );
                     continue;
-                };
+                }
+            };
 
-                tracing::trace!("[retention] Expr {expr:?}");
+            tracing::debug!("[retention] Expr: {expr:?}");
 
-                let ctx = SessionContext::new_with_config_rt(
-                    get_df_default_config(),
-                    default_runtime_env(),
-                );
+            let ctx = SessionContext::new_with_config_rt(
+                get_df_default_config(),
+                default_runtime_env(io_runtime.clone()),
+            );
 
-                let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &[expr])
-                    .await;
-                match plan {
-                    Ok(plan) => match collect(plan, ctx.task_ctx()).await {
-                        Err(e) => {
-                            tracing::error!("[retention] Error running retention check: {e}");
-                        }
-                        Ok(deleted) => {
-                            let num_records = deleted.first().map_or(0, |f| {
-                                f.column(0)
-                                    .as_any()
-                                    .downcast_ref::<UInt64Array>()
-                                    .map_or(0, |v| v.values().first().map_or(0, |f| *f))
-                            });
-
-                            log_retention_result(&dataset_name, num_records);
-
-                            if num_records > 0
-                                && let Some(cache_provider) = caching.as_ref()
-                                && let Err(e) =
-                                    cache_provider.invalidate_for_table(dataset_name.clone())
-                            {
-                                tracing::error!(
-                                    "Failed to invalidate cached results for dataset {}: {e}",
-                                    &dataset_name
-                                );
-                            }
-                        }
-                    },
+            let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
+            match plan {
+                Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                     Err(e) => {
                         tracing::error!("[retention] Error running retention check: {e}");
                     }
+                    Ok(deleted) => {
+                        let num_records = deleted.first().map_or(0, |f| {
+                            f.column(0)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .map_or(0, |v| v.values().first().map_or(0, |f| *f))
+                        });
+
+                        log_retention_result(&dataset_name, num_records);
+
+                        if num_records > 0
+                            && let Some(cache_provider) = caching.as_ref()
+                            && let Err(e) =
+                                cache_provider.invalidate_for_table(dataset_name.clone())
+                        {
+                            tracing::error!(
+                                "Failed to invalidate cached results for dataset {}: {e}",
+                                &dataset_name
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    tracing::error!("[retention] Error running retention check: {e}");
                 }
-            } else {
-                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
@@ -178,7 +212,7 @@ fn create_timestamp_filter_converter(
                 .map(|(_, f)| f)
         });
 
-    TimestampFilterConvert::create(
+    create_timestamp_filter_convert(
         field.cloned(),
         Some(time_column.to_string()),
         time_format,
@@ -216,8 +250,8 @@ mod tests {
         array::{BooleanArray, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::{arrow::write::MemTable, delete::DeletionTableProviderAdapter};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use data_components::arrow::write::MemTable;
+    use datafusion::{catalog::TableProvider, physical_plan::collect, prelude::SessionContext};
     use tokio::time::{Duration, sleep};
 
     fn create_test_schema() -> Arc<Schema> {
@@ -233,7 +267,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Create test data with different timestamps (some old, some recent)
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("to get current time")
@@ -291,8 +325,7 @@ mod tests {
         let mem_table =
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
-        let accelerator = Arc::new(DeletionTableProviderAdapter::new(Arc::new(mem_table)))
-            as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {
@@ -302,6 +335,7 @@ mod tests {
                 accelerator.schema(),
             )
             .expect("Failed to parse retention SQL")
+            .delete_expr
         });
 
         let retention = Retention::builder()
@@ -323,6 +357,8 @@ mod tests {
             Arc::clone(&accelerator),
             retention,
             caching,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
         ));
 
         // Wait for retention to run
