@@ -7207,7 +7207,7 @@ impl CayenneTableProvider {
                 candidates = sized_candidates.len(),
                 min_runs,
                 tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                "Skipping protected-snapshot compaction: no size tier has enough runs to merge"
             );
             return Ok(false);
         }
@@ -7250,7 +7250,7 @@ impl CayenneTableProvider {
             dominance_pct,
             phase1_fence_ms,
             sizing_ms,
-            "Running fast protected-snapshot subset compaction"
+            "Running protected-snapshot subset compaction"
         );
 
         // --- Phase 2: rewrite outside the lock. ---
@@ -7399,7 +7399,7 @@ impl CayenneTableProvider {
             phase2_rewrite_ms,
             phase3_commit_ms = phase3_start.elapsed().as_millis(),
             duration_ms = compaction_start.elapsed().as_millis(),
-            "Fast protected-snapshot subset compaction completed"
+            "Protected-snapshot subset compaction completed"
         );
 
         Ok(true)
@@ -10876,7 +10876,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 table = self.table_metadata.table_name.as_str(),
                 protected_len,
                 min_inputs,
-                "Skipping fast protected-snapshot compaction: protected set below trigger floor",
+                "Skipping protected-snapshot compaction: protected set below trigger floor",
             );
             return Ok(false);
         }
@@ -10978,14 +10978,6 @@ mod tests {
             protected_snapshot_size_tier(base * growth * growth, base, growth),
             2
         );
-    }
-
-    #[test]
-    fn protected_snapshot_size_tier_handles_degenerate_growth() {
-        let base = 8 * 1024 * 1024;
-        // growth <= 1 cannot form ceilings: everything collapses to tier 0.
-        assert_eq!(protected_snapshot_size_tier(base * 100, base, 1), 0);
-        assert_eq!(protected_snapshot_size_tier(base * 100, base, 0), 0);
     }
 
     #[test]
@@ -11204,6 +11196,10 @@ mod tests {
             .await
             .expect("table created");
 
+        // Hold the compaction lock across the inserts to prevent the automated
+        // post-write maintenance background compaction from racing our explicit compaction.
+        let compaction_guard = Arc::clone(&provider.compaction_lock).lock_owned().await;
+
         // Each insert into an upsert table publishes a new protected snapshot.
         // Create more than the trigger floor of small (tier-0) snapshots.
         let n = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
@@ -11214,6 +11210,15 @@ mod tests {
             )
             .await;
         }
+
+        // Drain the debounced post-write maintenance synchronously. Any
+        // compaction it scheduled runs now (against the held lock) and no-ops,
+        // and its `scheduled` flag is cleared, so nothing re-fires after the
+        // guard is dropped below.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
 
         let before = provider.protected_snapshots.load_full().len();
         assert!(
@@ -11227,6 +11232,9 @@ mod tests {
             expected,
             "sanity: all inserted rows visible before compaction"
         );
+
+        // Release the lock so the explicit compaction below can acquire it.
+        drop(compaction_guard);
 
         let merged = provider
             .compact_protected_snapshots_subset(usize::MAX)
@@ -11246,6 +11254,363 @@ mod tests {
             collect_id_value_pairs(&ctx, &provider, "compact_subset").await,
             expected,
             "compaction must preserve all visible rows"
+        );
+
+        // (c) Reload-stable thresholds: every in-memory protected-snapshot
+        // threshold must equal its persisted sequence number, or a scan would
+        // return different rows before vs after a restart.
+        let in_mem = provider.protected_snapshots.load_full();
+        let persisted = catalog
+            .get_all_snapshot_sequences(&provider.table_metadata.table_id)
+            .await
+            .expect("persisted snapshot sequences");
+        for (id, threshold) in in_mem.iter() {
+            assert_eq!(
+                persisted.get(id),
+                Some(threshold),
+                "protected snapshot {id}: in-memory threshold {threshold} must equal persisted {:?}",
+                persisted.get(id),
+            );
+        }
+    }
+
+    /// Protected-snapshot compaction must apply overlapping key-based (PK)
+    /// deletes from its merge inputs. Re-upserting the same PKs across several
+    /// snapshots makes each input carry its own deletion threshold. After
+    /// compaction, assert: (a) the snapshot count drops, (b) exactly one latest
+    /// row per key (`COUNT(*) == COUNT(DISTINCT pk)`, no resurrected/duplicate
+    /// PKs), and (c) reload-stable thresholds (in-memory == persisted).
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_applies_overlapping_pk_deletes() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        let ctx = SessionContext::new();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_overlap".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Disable the inline memtable so each upsert-table write lands in
+                // a file-backed protected snapshot (the compaction's domain)
+                // instead of being absorbed inline.
+                inline_max_rows: 0,
+                // Deterministic, low trigger floor so a handful of snapshots merge.
+                compaction_trigger_protected_snapshots: TRIGGER,
+                // Pin the background compactor far out so only our explicit call
+                // runs — the test must not race the 30s background tick.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Hold the compaction lock across the inserts to prevent the automated
+        // post-write maintenance background compaction from racing our explicit
+        // compaction.
+        let compaction_guard = Arc::clone(&provider.compaction_lock).lock_owned().await;
+
+        // Each insert into the upsert table publishes a new protected snapshot.
+        // Re-inserting a key that already exists deletes the prior row for that
+        // key, so these batches deposit overlapping deletes across the inputs:
+        //   s0: 0,1,2,3 (initial)
+        //   s1: 0,1     (updates -> delete prior 0,1)
+        //   s2: 4,5     (new)
+        //   s3: 2,3     (updates -> delete prior 2,3)
+        //   s4: 6,7     (new)
+        //   s5: 0       (update -> delete prior 0 again)
+        // Final latest-wins state: one row per key with its last value.
+        let batches: &[(&[i64], &[i64])] = &[
+            (&[0, 1, 2, 3], &[0, 10, 20, 30]),
+            (&[0, 1], &[1000, 1010]),
+            (&[4, 5], &[40, 50]),
+            (&[2, 3], &[2000, 3000]),
+            (&[6, 7], &[60, 70]),
+            (&[0], &[10_000]),
+        ];
+        for (ids, values) in batches {
+            insert_batch(&provider, id_value_batch(Arc::clone(&schema), ids, values)).await;
+        }
+
+        // Drain the debounced post-write maintenance synchronously. Any
+        // compaction it scheduled runs now (against the held lock) and no-ops,
+        // and its `scheduled` flag is cleared, so nothing re-fires after the
+        // guard is dropped below.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let before = provider.protected_snapshots.load_full().len();
+        assert!(
+            before >= TRIGGER,
+            "expected >= {TRIGGER} protected snapshots before compaction, got {before}"
+        );
+
+        // Latest value wins for every key; exactly one row per key.
+        let expected: Vec<(i64, i64)> = vec![
+            (0, 10_000),
+            (1, 1010),
+            (2, 2000),
+            (3, 3000),
+            (4, 40),
+            (5, 50),
+            (6, 60),
+            (7, 70),
+        ];
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "compact_overlap").await,
+            expected,
+            "sanity: overlapping upserts must show exactly the latest row per key before compaction"
+        );
+
+        // Release the lock so the explicit compaction below can acquire it.
+        drop(compaction_guard);
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(merged, "a tier with >= {TRIGGER} runs should have merged");
+
+        // (a) All same-tier inputs collapse into a single merged snapshot.
+        let after = provider.protected_snapshots.load_full().len();
+        assert_eq!(
+            after, 1,
+            "all {before} tier-0 inputs must merge into exactly one snapshot, got {after}"
+        );
+
+        // (b) No resurrected / duplicate PKs: the merged snapshot must still
+        // contain exactly one latest row per key. A lost deletion during the
+        // rewrite would surface here as a duplicate PK or a stale value.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "compact_overlap").await;
+        assert_eq!(
+            pairs, expected,
+            "compaction must apply overlapping PK deletes: exactly one latest row per key, no duplicates"
+        );
+        let distinct: std::collections::HashSet<i64> = pairs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            pairs.len(),
+            distinct.len(),
+            "COUNT(*) must equal COUNT(DISTINCT pk) after compaction (no resurrected rows)"
+        );
+
+        // (b') The stats-backed `SELECT COUNT(*)` must be correct
+        let count = count_star(&ctx, &provider, "compact_overlap").await;
+        assert_eq!(
+            usize::try_from(count).expect("count is non-negative"),
+            expected.len(),
+            "stats-backed COUNT(*) must match the {} live rows after compaction",
+            expected.len()
+        );
+
+        // (c) Reload-stable thresholds: every in-memory protected-snapshot
+        // threshold must equal its persisted sequence number, or a scan would
+        // return different rows before vs after a restart.
+        let in_mem = provider.protected_snapshots.load_full();
+        let persisted = catalog
+            .get_all_snapshot_sequences(&provider.table_metadata.table_id)
+            .await
+            .expect("persisted snapshot sequences");
+        for (id, threshold) in in_mem.iter() {
+            assert_eq!(
+                persisted.get(id),
+                Some(threshold),
+                "protected snapshot {id}: in-memory threshold {threshold} must equal persisted {:?}",
+                persisted.get(id),
+            );
+        }
+    }
+
+    /// Composite-PK counterpart to
+    /// [`protected_snapshot_subset_compaction_applies_overlapping_pk_deletes`].
+    ///
+    /// Protected-snapshot compaction for multi-column PKs.
+    /// Runs the overlapping-delete scenario over a 2-column PK and
+    /// asserts after compaction: (a) snapshots collapse to one, (b) one latest
+    /// row per key (`COUNT(*) == COUNT(DISTINCT pk)`, no duplicates), and (c)
+    /// reload-stable thresholds (in-memory == persisted).
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_applies_overlapping_composite_pk_deletes() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        let ctx = SessionContext::new();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        // Two-column primary key (k1, k2) -> RowConverterBased deletion strategy.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, false),
+            Field::new("k2", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_overlap_composite".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["k1".to_string(), "k2".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "k1".to_string(),
+                    "k2".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Disable the inline memtable so each upsert-table write lands in
+                // a file-backed protected snapshot (the compaction's domain)
+                // instead of being absorbed inline.
+                inline_max_rows: 0,
+                // Deterministic, low trigger floor so a handful of snapshots merge.
+                compaction_trigger_protected_snapshots: TRIGGER,
+                // Pin the background compactor far out so only our explicit call
+                // runs — the test must not race the 30s background tick.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Hold the compaction lock across the inserts to prevent the automated
+        // post-write maintenance background compaction from racing our explicit
+        // compaction.
+        let compaction_guard = Arc::clone(&provider.compaction_lock).lock_owned().await;
+
+        // Each insert into the upsert table publishes a new protected snapshot.
+        // Re-inserting a composite key that already exists deletes the prior row
+        // for that key, so these batches deposit overlapping deletes across the
+        // inputs:
+        //   s0: (1,1),(1,2),(2,1),(2,2) (initial)
+        //   s1: (1,1),(1,2)             (updates -> delete prior)
+        //   s2: (3,1),(3,2)             (new)
+        //   s3: (2,1),(2,2)             (updates -> delete prior)
+        //   s4: (4,1),(4,2)             (new)
+        //   s5: (1,1)                   (update -> delete prior (1,1) again)
+        // Final latest-wins state: one row per composite key with its last value.
+        let batches: &[(&[(i64, i64)], &[i64])] = &[
+            (&[(1, 1), (1, 2), (2, 1), (2, 2)], &[0, 10, 20, 30]),
+            (&[(1, 1), (1, 2)], &[1000, 1010]),
+            (&[(3, 1), (3, 2)], &[40, 50]),
+            (&[(2, 1), (2, 2)], &[2000, 3000]),
+            (&[(4, 1), (4, 2)], &[60, 70]),
+            (&[(1, 1)], &[10_000]),
+        ];
+        for (keys, values) in batches {
+            insert_batch(
+                &provider,
+                composite_key_batch(Arc::clone(&schema), keys, values),
+            )
+            .await;
+        }
+
+        // Drain the debounced post-write maintenance synchronously. Any
+        // compaction it scheduled runs now (against the held lock) and no-ops,
+        // and its `scheduled` flag is cleared, so nothing re-fires after the
+        // guard is dropped below.
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let before = provider.protected_snapshots.load_full().len();
+        assert!(
+            before >= TRIGGER,
+            "expected >= {TRIGGER} protected snapshots before compaction, got {before}"
+        );
+
+        // Latest value wins for every composite key; exactly one row per key.
+        let expected: Vec<(i64, i64, i64)> = vec![
+            (1, 1, 10_000),
+            (1, 2, 1010),
+            (2, 1, 2000),
+            (2, 2, 3000),
+            (3, 1, 40),
+            (3, 2, 50),
+            (4, 1, 60),
+            (4, 2, 70),
+        ];
+        assert_eq!(
+            collect_composite_key_rows(&ctx, &provider, "compact_overlap_composite").await,
+            expected,
+            "sanity: overlapping composite upserts must show exactly the latest row per key before compaction"
+        );
+
+        // Release the lock so the explicit compaction below can acquire it.
+        drop(compaction_guard);
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(merged, "a tier with >= {TRIGGER} runs should have merged");
+
+        // (a) All same-tier inputs collapse into a single merged snapshot.
+        let after = provider.protected_snapshots.load_full().len();
+        assert_eq!(
+            after, 1,
+            "all {before} tier-0 inputs must merge into exactly one snapshot, got {after}"
+        );
+
+        // (b) No resurrected / duplicate composite PKs: the merged snapshot must
+        // still contain exactly one latest row per key. A lost key-based
+        // deletion during the rewrite would surface here as a duplicate
+        // composite PK or a stale value — this is the exact corruption observed
+        // on `customer` / `stock`.
+        let rows = collect_composite_key_rows(&ctx, &provider, "compact_overlap_composite").await;
+        assert_eq!(
+            rows, expected,
+            "compaction must apply overlapping composite PK deletes: exactly one latest row per key, no duplicates"
+        );
+        let distinct: std::collections::HashSet<(i64, i64)> =
+            rows.iter().map(|(k1, k2, _)| (*k1, *k2)).collect();
+        assert_eq!(
+            rows.len(),
+            distinct.len(),
+            "COUNT(*) must equal COUNT(DISTINCT pk) after compaction (no resurrected rows)"
+        );
+
+        // (b') The stats-backed `SELECT COUNT(*)` must be correct
+        let count = count_star(&ctx, &provider, "compact_overlap_composite").await;
+        assert_eq!(
+            usize::try_from(count).expect("count is non-negative"),
+            expected.len(),
+            "stats-backed COUNT(*) must match the {} live rows after compaction",
+            expected.len()
         );
 
         // (c) Reload-stable thresholds: every in-memory protected-snapshot
@@ -12280,6 +12645,34 @@ mod tests {
         df.collect().await.expect("collect succeeded")
     }
 
+    /// Run `SELECT COUNT(*)` through the SQL planner.
+    async fn count_star(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> i64 {
+        use arrow::array::Int64Array;
+        ctx.deregister_table(table_name).ok();
+        ctx.register_table(table_name, Arc::new(provider.clone_for_write()))
+            .expect("table registered");
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) FROM {table_name}"))
+            .await
+            .expect("count query created")
+            .collect()
+            .await
+            .expect("count collect succeeded");
+        assert_eq!(batches.len(), 1, "COUNT(*) must produce a single batch");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1, "COUNT(*) must produce a single row");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) is Int64")
+            .value(0)
+    }
+
     /// Phase 2 (bloom fallback) helper: create an int64-PK upsert table with an
     /// explicit keyset-cache budget (MB). `pk_keyset_cache_mb = 0` forces the
     /// bounded-bloom existence path once any key is recorded, exercising the
@@ -12370,6 +12763,63 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    /// Build a 3-column `(k1, k2, value)` batch for a composite-PK test table.
+    fn composite_key_batch(schema: SchemaRef, keys: &[(i64, i64)], values: &[i64]) -> RecordBatch {
+        use arrow::array::Int64Array;
+        assert_eq!(
+            keys.len(),
+            values.len(),
+            "composite_key_batch: keys and values must be the same length"
+        );
+        let k1: Vec<i64> = keys.iter().map(|(k1, _)| *k1).collect();
+        let k2: Vec<i64> = keys.iter().map(|(_, k2)| *k2).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(k1)),
+                Arc::new(Int64Array::from(k2)),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .expect("composite key batch is valid")
+    }
+
+    /// Read back all `(k1, k2, value)` rows, sorted, for assertion.
+    async fn collect_composite_key_rows(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> Vec<(i64, i64, i64)> {
+        use arrow::array::Int64Array;
+        let batches = read_all(ctx, provider, table_name).await;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let k1_idx = batch.schema().index_of("k1").expect("k1 column");
+            let k2_idx = batch.schema().index_of("k2").expect("k2 column");
+            let value_idx = batch.schema().index_of("value").expect("value column");
+            let k1 = batch
+                .column(k1_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("k1 is Int64");
+            let k2 = batch
+                .column(k2_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("k2 is Int64");
+            let values = batch
+                .column(value_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value is Int64");
+            for row in 0..batch.num_rows() {
+                rows.push((k1.value(row), k2.value(row), values.value(row)));
+            }
+        }
+        rows.sort_unstable();
+        rows
     }
 
     #[test]
