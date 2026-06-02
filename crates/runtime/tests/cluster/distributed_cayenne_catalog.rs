@@ -167,7 +167,10 @@ where
 /// 6. DROP TABLE and verify it is inaccessible, then re-create
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -555,7 +558,10 @@ async fn ddl_lifecycle_drop(harness: &ClusterHarness) -> Result<(), anyhow::Erro
 /// - Aggregations over `JOINed` data are correct
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -717,7 +723,10 @@ async fn multi_table_join_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 /// Also tests same-named tables in different schemas to verify namespace correctness.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -875,7 +884,10 @@ async fn schema_isolation_verify(harness: &ClusterHarness) -> Result<(), anyhow:
 /// - DELETE on PK tables works correctly
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1077,7 +1089,10 @@ async fn pk_upsert_delete(harness: &ClusterHarness) -> Result<(), anyhow::Error>
 /// - WHERE IS NULL / IS NOT NULL filtering
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1132,7 +1147,10 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
 // `cayenne_catalog_ddl/mod.rs`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1267,7 +1285,10 @@ async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
 // must preserve unmatched rows the same way.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1400,7 +1421,10 @@ async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Resu
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1513,7 +1537,10 @@ async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error
 // `cayenne_catalog_merge_duplicate_source_keys_rejected` test.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Result<(), anyhow::Error>
 {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -1623,7 +1650,10 @@ async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Resu
 // =============================================================================
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1750,7 +1780,10 @@ async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::E
 // yet support no-predicate delete-all on PK-less Cayenne tables.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -1843,7 +1876,10 @@ async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
 // scheduler to forward the predicate to every partition/executor.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_dml_non_partition_filter() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -2071,7 +2107,10 @@ async fn null_agg_filters(harness: &ClusterHarness) -> Result<(), anyhow::Error>
 /// 4. Verify the 2nd executor registered and the cluster can still query the table
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
-#[ignore = "Cayenne catalog connector removed from registry"]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "requires the spicebench feature"
+)]
 async fn test_distributed_cayenne_late_join_ddl_replay() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 

@@ -385,18 +385,23 @@ impl<'a> AppendMutationWriter<'a> {
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
 
-        let (total_rows, write_stats_acc, validated_keys) = if needs_new_snapshot {
+        // `superseded` = existing rows replaced by this upsert (deleted as part
+        // of the conflict resolution). The live-row delta is `inserted -
+        // superseded`, which keeps the metastore `num_rows` tracking COUNT(*)
+        // under CDC upsert instead of summing every insert.
+        let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
             let new_snapshot_start = Instant::now();
-            let (rows, stats_acc, validated_keys) = self
+            let (rows, stats_acc, validated_keys, superseded) = self
                 .write_new_snapshot_after_validation(prepared_stream, &post_validation)
                 .await?;
             tracing::debug!(
                 table = self.table.table_name(),
                 rows,
+                superseded,
                 duration_ms = new_snapshot_start.elapsed().as_millis(),
                 "New snapshot write and publish completed"
             );
-            (rows, stats_acc, validated_keys)
+            (rows, stats_acc, validated_keys, superseded)
         } else {
             let target_size_bytes = self.context.target_file_size_bytes();
             let write_start = Instant::now();
@@ -417,19 +422,24 @@ impl<'a> AppendMutationWriter<'a> {
                 validated_keys,
             } = take_post_validation(&post_validation);
 
+            let superseded = on_conflict_deletions.total_superseded();
             self.table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
 
-            (rows, stats_acc, validated_keys)
+            (rows, stats_acc, validated_keys, superseded)
         };
 
         let retention_requested = self.table.has_retention_delete_filters();
 
+        let live_rows_delta = i64::try_from(total_rows)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
         self.table.schedule_post_write_maintenance(
             Some(write_stats_acc),
             needs_new_snapshot,
             retention_requested,
+            live_rows_delta,
         );
 
         if retention_requested {
@@ -454,6 +464,7 @@ impl<'a> AppendMutationWriter<'a> {
         u64,
         Arc<ColumnStatsAccumulator>,
         std::collections::HashSet<arrow_row::OwnedRow>,
+        usize,
     )> {
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let target_size_bytes = self.context.target_file_size_bytes();
@@ -482,6 +493,7 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
         } = take_post_validation(post_validation);
 
+        let superseded = on_conflict_deletions.total_superseded();
         let deletion_start = Instant::now();
         self.table
             .apply_on_conflict_deletions(on_conflict_deletions)
@@ -504,7 +516,7 @@ impl<'a> AppendMutationWriter<'a> {
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
-        Ok((rows, stats_acc, validated_keys))
+        Ok((rows, stats_acc, validated_keys, superseded))
     }
 
     async fn try_inline_or_restream(
@@ -552,8 +564,18 @@ impl<'a> AppendMutationWriter<'a> {
                     stats_acc.update(batch);
                 }
 
-                self.table
-                    .schedule_post_write_maintenance(Some(Arc::new(stats_acc)), false, false);
+                // Net live-row delta: inlined inserts minus rows superseded by
+                // this inline upsert (across inlined + file-backed deletes).
+                let superseded = state.on_conflict_deletions.total_superseded();
+                let live_rows_delta = i64::try_from(buffer.total_rows())
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+                self.table.schedule_post_write_maintenance(
+                    Some(Arc::new(stats_acc)),
+                    false,
+                    false,
+                    live_rows_delta,
+                );
 
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();

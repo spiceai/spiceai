@@ -90,10 +90,9 @@ impl SpiceModelTool for McpToolWrapper {
             .into());
         }
 
+        let task_name = format!("tool_use::{}/{}", self.server_name, self.spec.name);
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = self.name().to_string(), input = arg);
-        span.in_scope(
-            || tracing::info!(target: "task_history", task_override = %format!("tool_use::{}/{}", self.server_name, self.spec.name), "labels"),
-        );
+        tracing::info!(target: "task_history", parent: &span, task_override = %task_name, mcp_server = %self.server_name, "labels");
 
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let client = self.client.read().await;

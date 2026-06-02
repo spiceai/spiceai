@@ -38,7 +38,7 @@ const HTTP_RESULT_COLUMNS: [&str; 7] = [
     "content",
     RESPONSE_STATUS_COLUMN,
     "response_headers",
-    "fetched_at",
+    "_fetched_at",
 ];
 
 /// Filter out transient HTTP error responses (5xx server errors and 429 Too Many Requests)
