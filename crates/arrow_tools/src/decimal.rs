@@ -60,14 +60,14 @@ pub fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128
         Less => {
             let diff = dst_scale - src_scale;
             let mul = 10_i128
-                .checked_pow(u32::from(diff as u8))
+                .checked_pow(u32::from(diff.cast_unsigned()))
                 .context(OverflowSnafu)?;
             unscaled.checked_mul(mul).context(OverflowSnafu)
         }
         Greater => {
             let diff = src_scale - dst_scale;
             let div = 10_i128
-                .checked_pow(u32::from(diff as u8))
+                .checked_pow(u32::from(diff.cast_unsigned()))
                 .context(OverflowSnafu)?;
             Ok(unscaled / div)
         }
@@ -104,7 +104,7 @@ pub fn parse_number_to_decimal(n: &serde_json::Number, target_scale: i8) -> Resu
             reason: format!("cannot parse '{s}' as decimal"),
         })?;
         let scale_factor = 10_i128
-            .checked_pow(u32::from(target_scale as u8))
+            .checked_pow(u32::from(target_scale.cast_unsigned()))
             .context(OverflowSnafu)?;
         #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
         return Ok((f * scale_factor as f64).round() as i128);
