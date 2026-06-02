@@ -2496,7 +2496,9 @@ mod tests {
         assert_eq!(schema.fields().len(), 4);
         // User-declared columns default to Utf8.
         for name in &["id", "name", "data"] {
-            let f = schema.field_with_name(name).unwrap();
+            let f = schema
+                .field_with_name(name)
+                .expect("declared json_nest test column should exist in schema");
             assert_eq!(
                 f.data_type(),
                 &arrow_schema::DataType::Utf8,
@@ -2505,7 +2507,9 @@ mod tests {
             assert!(f.is_nullable());
         }
         // Auto-injected _fetched_at gets its type from base_table_schema.
-        let fetched_at = schema.field_with_name("_fetched_at").unwrap();
+        let fetched_at = schema
+            .field_with_name("_fetched_at")
+            .expect("_fetched_at should be present in dynamic json_nest schema");
         assert_eq!(
             fetched_at.data_type(),
             &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
@@ -2585,7 +2589,13 @@ mod tests {
             "_fetched_at must not be a static body field"
         );
         // Auto-injected at the end, after user-declared columns.
-        assert_eq!(nesting.column_order.last().unwrap(), "_fetched_at");
+        assert_eq!(
+            nesting
+                .column_order
+                .last()
+                .expect("column_order should include auto-injected _fetched_at"),
+            "_fetched_at"
+        );
     }
 
     #[tokio::test]
