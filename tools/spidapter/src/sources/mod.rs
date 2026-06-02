@@ -15,7 +15,7 @@
 pub(super) mod cayenne;
 pub(super) mod dynamodb;
 pub(super) mod mongodb;
-pub(super) mod postgres_cdc;
+pub(super) mod postgres_wal;
 pub(super) mod postgres_debezium;
 
 /// Format a list of column names as a `ColumnReference` string accepted by spicepod:

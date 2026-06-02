@@ -25,7 +25,7 @@ use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::DatasetConfig;
 use uuid::Uuid;
 
-use super::postgres_cdc::{PgConfig, pg_create_table_ddl, pg_error_message};
+use super::postgres_wal::{PgConfig, pg_create_table_ddl, pg_error_message};
 use super::{arrow_type_to_spicepod_str, composite_key_str};
 
 /// Set up `PostgreSQL` for Debezium CDC: verify `wal_level`, create schema, drop+create tables.

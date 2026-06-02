@@ -53,7 +53,7 @@ use sources::dynamodb::{
     generate_dynamodb_spicepod,
 };
 use sources::mongodb::generate_mongodb_spicepod;
-use sources::postgres_cdc::{
+use sources::postgres_wal::{
     PgConfig, generate_postgres_wal_spicepod, pg_create_table_ddl, pg_error_message,
     setup_postgres_for_wal, teardown_postgres, tpch_schema_name,
 };
