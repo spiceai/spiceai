@@ -436,6 +436,7 @@ impl DataConnector for Debezium {
                     &self.kafka_config,
                     debezium_kafka_sys.as_deref(),
                     declared_schema.as_ref(),
+                    self.schema_evolution,
                 )
                 .await?
             }
@@ -562,6 +563,7 @@ async fn get_metadata_from_kafka(
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&DebeziumKafkaSys>,
     declared_schema: Option<&SchemaRef>,
+    schema_evolution: bool,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -583,44 +585,81 @@ async fn get_metadata_from_kafka(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
-        topic,
-        kafka_config,
-        Duration::from_secs(30),
-    )
-    .await;
+    // Obtain a schema sample and ensure the real consumer has a partition assignment
+    // before `restart_topic` rewinds it.
+    let (key, value) = if schema_evolution {
+        // Poll the real consumer once for partition assignment, and peek the latest
+        // message via a temp consumer for the schema sample.
+        let (_, event) = tokio::try_join!(
+            fetch_first_event(dataset, topic, &kafka_consumer),
+            fetch_latest_change_event(dataset, topic, kafka_config),
+        )?;
+        event
+    } else {
+        // Use a short-timeout peek via a temp consumer.  If no message is available
+        // and the user declared column types, use those as the schema so the dataset
+        // can register without waiting for data.
+        let peek_timeout = if declared_schema.is_some() {
+            Duration::from_secs(5)
+        } else {
+            SCHEMA_INFERENCE_TIMEOUT
+        };
+        let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+            topic,
+            kafka_config,
+            peek_timeout,
+        )
+        .await;
 
-    let (key, value) = match fetch_result {
-        Ok(Some((key, value))) => (key, value),
-        Ok(None) | Err(data_components::kafka::Error::MetadataTopicNotFound { .. }) => {
-            if let Some(declared) = declared_schema {
-                tracing::debug!(
-                    dataset = %dataset_name,
-                    "No Kafka message received; using declared schema for Debezium dataset"
-                );
-                let metadata = DebeziumKafkaMetadata {
-                    consumer_group_id: kafka_consumer.group_id().to_string(),
-                    topic: topic.to_string(),
-                    primary_keys: primary_keys_from_acceleration(dataset),
-                    schema_fields: vec![],
-                    offsets: Vec::new(),
-                };
-                if let Some(sys) = debezium_kafka_sys {
-                    let _ = set_metadata_to_accelerator(sys, &metadata).await;
+        match fetch_result {
+            Ok(Some(pair)) => pair,
+            Ok(None) | Err(data_components::kafka::Error::MetadataTopicNotFound { .. }) => {
+                if let Some(declared) = declared_schema {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        "No Kafka message received; using declared schema for Debezium dataset"
+                    );
+                    let metadata = DebeziumKafkaMetadata {
+                        consumer_group_id: kafka_consumer.group_id().to_string(),
+                        topic: topic.to_string(),
+                        primary_keys: primary_keys_from_acceleration(dataset),
+                        schema_fields: vec![],
+                        offsets: Vec::new(),
+                    };
+                    if let Some(sys) = debezium_kafka_sys {
+                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
+                    }
+                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
                 }
-                return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "debezium".to_string(),
+                    source: format!("No message received from Kafka topic '{topic}'. Create the topic with data or declare `columns` with types to initialize without it.").into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                });
             }
-            return Err(super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "debezium".to_string(),
-                source: format!("No message received from Kafka topic '{topic}'. Create the topic with data or declare `columns` with types to initialize without it.").into(),
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        }
-        Err(e) => {
-            return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            });
+            Err(e) => {
+                if let Some(declared) = declared_schema {
+                    tracing::warn!(
+                        dataset = %dataset_name,
+                        "Failed to peek at Kafka topic for schema ({e}); using declared schema"
+                    );
+                    let metadata = DebeziumKafkaMetadata {
+                        consumer_group_id: kafka_consumer.group_id().to_string(),
+                        topic: topic.to_string(),
+                        primary_keys: primary_keys_from_acceleration(dataset),
+                        schema_fields: vec![],
+                        offsets: Vec::new(),
+                    };
+                    if let Some(sys) = debezium_kafka_sys {
+                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
+                    }
+                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                }
+                return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                });
+            }
         }
     };
 
