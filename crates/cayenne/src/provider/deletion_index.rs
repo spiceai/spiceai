@@ -204,17 +204,23 @@ impl DeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, seq) in additions {
-            let stored_sequence = if let Some(existing) = entries.get(&pk).copied() {
-                if seq > existing {
-                    entries.insert(pk, seq);
-                    seq
-                } else {
-                    existing
+            // Use explicit `Entry::Occupied` / `Entry::Vacant` matching so the bloom-update path only sees newly-inserted keys; the Occupied
+            // branch must not push to `new_keys`, otherwise repeat updates of existing keys would re-insert their hashes and bloat the bloom.
+            let stored_sequence = match entries.entry(pk) {
+                im::hashmap::Entry::Occupied(mut occ) => {
+                    let existing = *occ.get();
+                    if seq > existing {
+                        occ.insert(seq);
+                        seq
+                    } else {
+                        existing
+                    }
                 }
-            } else {
-                entries.insert(pk, seq);
-                new_keys.push(pk);
-                seq
+                im::hashmap::Entry::Vacant(vac) => {
+                    vac.insert(seq);
+                    new_keys.push(pk);
+                    seq
+                }
             };
             if max_sequence_number.is_none_or(|max| stored_sequence > max) {
                 max_sequence_number = Some(stored_sequence);
