@@ -482,6 +482,7 @@ impl RefreshTask {
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        let recv_wait_labels = [KeyValue::new("dataset", dataset_name.clone())];
 
         loop {
             // Time how long the apply loop blocks waiting for the next batch
@@ -495,10 +496,7 @@ impl RefreshTask {
                 Some(item) => Some(item),
                 None => rx.recv().await,
             };
-            metrics::CDC_SOURCE_RECV_WAIT_MS.record(
-                elapsed_ms(recv_start),
-                &[KeyValue::new("dataset", dataset_name.to_string())],
-            );
+            metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), &recv_wait_labels);
             let Some(first) = next_item else {
                 break;
             };
