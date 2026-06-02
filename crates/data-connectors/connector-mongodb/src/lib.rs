@@ -344,7 +344,7 @@ impl DataConnector for MongoDB {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(self
             .mongodb_factory
-            .table_provider_with_schema(dataset.path().into(), dataset.schema.clone())
+            .table_provider(dataset.path().into(), dataset.schema.clone())
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",
