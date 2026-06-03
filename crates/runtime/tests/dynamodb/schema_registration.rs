@@ -41,8 +41,7 @@ use crate::utils::{runtime_ready_check, test_request_context};
 
 use super::streams::{
     create_table, ensure_dataset_rows, get_client, insert_rows, make_dynamodb_dataset,
-    run_and_snapshot_query, start_dynamodb_docker_container,
-    wait_for_dynamodb_source_rows,
+    run_and_snapshot_query, start_dynamodb_docker_container, wait_for_dynamodb_source_rows,
 };
 
 // Ports 8020-8030 reserved for this module; 8001-8014 are used by streams.rs / dml.rs.
