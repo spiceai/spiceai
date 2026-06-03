@@ -7333,7 +7333,7 @@ impl CayenneTableProvider {
         let pass_start = Instant::now();
         let result = self.rewrite_current_snapshot_for_compaction().await;
 
-        let table = self.table_metadata.table_name.to_string();
+        let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
             "completed"
         } else {
@@ -7346,16 +7346,16 @@ impl CayenneTableProvider {
                 telemetry::KeyValue::new("result", result_label),
             ],
         );
-        if let Err(e) = &result {
-            if matches!(
+        if let Err(e) = &result
+            && matches!(
                 e,
                 Error::DataFusion { source }
                     if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
-            ) {
-                telemetry::track_cayenne_compaction_memory_exhausted(&[telemetry::KeyValue::new(
-                    "table", table,
-                )]);
-            }
+            )
+        {
+            telemetry::track_cayenne_compaction_memory_exhausted(&[telemetry::KeyValue::new(
+                "table", table,
+            )]);
         }
         result
     }
