@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::cluster::partition::service::PartitionService;
 use crate::cluster::ClusterStateStore;
 use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
-use crate::cluster::partition::service::PartitionService;
 #[cfg(not(windows))]
 use crate::component::dataset::acceleration::Engine;
 use crate::config::ClusterRole;
@@ -31,7 +31,7 @@ use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
-    Runtime, catalogconnector,
+    catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
     dataconnector,
     datafusion::DataFusion,
@@ -40,7 +40,7 @@ use crate::{
     flight::RateLimits,
     metrics, podswatcher,
     secrets::{self, Secrets},
-    status, tracers,
+    status, tracers, Runtime,
 };
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
@@ -63,6 +63,16 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
+/// Runtime param: fraction of `runtime.query.memory_limit` carved into a
+/// dedicated Cayenne compaction memory pool when Cayenne acceleration is
+/// configured on a dataset and dedicated thread pools are enabled.
+const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memory_fraction";
+/// Default carve fraction when the param is unset: 20% of the query budget to
+/// compaction, 80% retained for queries.
+const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
+const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
+const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
+
 /// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
@@ -70,6 +80,7 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
     CAYENNE_FILTER_PROPAGATION_PARAM,
     CAYENNE_OPTIMIZER_RULES_PARAM,
+    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -329,6 +340,40 @@ impl RuntimeBuilder {
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
+        // Carve a dedicated compaction memory pool only when Cayenne acceleration
+        // is configured (and enabled) on a dataset AND dedicated thread pools are
+        // enabled. This keeps non-Cayenne deployments at full query budget and
+        // matches the dedicated compaction runtime's "create only if Cayenne is
+        // enabled" lifecycle — the carved env is the signal spiced uses to bring
+        // up the compaction worker threads.
+        let cayenne_configured = self.app.as_ref().is_some_and(|app| {
+            app.datasets.iter().any(|dataset| {
+                dataset.acceleration.as_ref().is_some_and(|accel| {
+                    accel.enabled
+                        && accel
+                            .engine
+                            .as_deref()
+                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+                })
+            })
+        });
+        let dedicated_thread_pools_enabled = !matches!(
+            spicepod_rt
+                .params
+                .get("dedicated_thread_pool")
+                .map(String::as_str),
+            Some("disabled")
+        );
+        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+            .then(|| {
+                let requested = parse_f64_runtime_param(
+                    &spicepod_rt.params,
+                    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+                )
+                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
+                clamp_cayenne_compaction_memory_fraction(requested)
+            });
+
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
             self.accelerator_engine_registry
@@ -503,6 +548,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
+        .compaction_memory_fraction(compaction_memory_fraction)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -821,6 +867,19 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
+    let clamped = value.clamp(
+        MIN_COMPACTION_MEMORY_FRACTION,
+        MAX_COMPACTION_MEMORY_FRACTION,
+    );
+    if !(MIN_COMPACTION_MEMORY_FRACTION..=MAX_COMPACTION_MEMORY_FRACTION).contains(&value) {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM}={value} is outside supported range [{MIN_COMPACTION_MEMORY_FRACTION}, {MAX_COMPACTION_MEMORY_FRACTION}]; using {clamped}"
+        );
+    }
+    clamped
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
     Disabled,
@@ -1069,6 +1128,17 @@ mod test {
             util::levenshtein::closest_match("totally_unrelated_key", &known),
             None,
         );
+    }
+
+    #[test]
+    fn test_clamp_cayenne_compaction_memory_fraction() {
+        for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
+            let actual = clamp_cayenne_compaction_memory_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]
