@@ -203,7 +203,7 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         primary_key: Some("id".to_string()),
         retention_sql: Some("DELETE FROM oom_events WHERE id >= 0".to_string()),
         retention_check_enabled: true,
-        retention_check_interval: Some("60s".to_string()),
+        retention_check_interval: Some("5m".to_string()),
         params: Some(Params::from_string_map(params)),
         ..Acceleration::default()
     });
