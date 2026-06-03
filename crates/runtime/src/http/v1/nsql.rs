@@ -68,7 +68,6 @@ enum NsqlContextResponseFormat {
     PlainText,
     Json,
 }
-
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
         Some(rest) => rest.to_string(),
@@ -108,7 +107,7 @@ fn validate_context_limit(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct Request {
