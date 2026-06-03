@@ -205,6 +205,32 @@ const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
+const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
+
+#[cfg(any(test, not(windows)))]
+#[derive(Debug, Default)]
+struct BoundedWarningKeys {
+    seen: std::collections::HashSet<String>,
+    insertion_order: std::collections::VecDeque<String>,
+}
+
+#[cfg(any(test, not(windows)))]
+impl BoundedWarningKeys {
+    fn insert_new(&mut self, key: String, limit: usize) -> bool {
+        if limit == 0 || self.seen.contains(&key) {
+            return false;
+        }
+
+        if self.seen.len() >= limit
+            && let Some(oldest_key) = self.insertion_order.pop_front()
+        {
+            self.seen.remove(&oldest_key);
+        }
+
+        self.insertion_order.push_back(key.clone());
+        self.seen.insert(key)
+    }
+}
 
 impl Default for CdcConfig {
     fn default() -> Self {
@@ -224,6 +250,11 @@ impl Default for CdcConfig {
 /// ignored with a warning because active CDC streams may already be using the
 /// first config.
 static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
+
+#[cfg(not(windows))]
+static CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS: std::sync::LazyLock<
+    parking_lot::Mutex<BoundedWarningKeys>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
 
 /// Install the CDC configuration resolved from spicepod
 /// `runtime.params.cdc_*`. Should be called exactly once during runtime
@@ -1136,9 +1167,6 @@ impl RefreshTask {
         // privately in each accelerator module); the accelerator's schema
         // metadata carries the engine name.
         const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
-        static WARNED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-            std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
-
         let is_cayenne = self
             .accelerator
             .schema()
@@ -1149,7 +1177,12 @@ impl RefreshTask {
         if !is_cayenne {
             return;
         }
-        let first_for_table = WARNED.lock().insert(self.dataset_name.to_string());
+        let first_for_table = CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS
+            .lock()
+            .insert_new(
+                self.dataset_name.to_string(),
+                CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT,
+            );
         if first_for_table {
             tracing::warn!(
                 dataset = %self.dataset_name,
@@ -2047,6 +2080,20 @@ mod tests {
         )]));
 
         assert_eq!(config.max_coalesce_age_ms, 90_000);
+    }
+
+    #[test]
+    fn bounded_warning_keys_eviction_allows_rewarning_old_keys() {
+        let mut warning_keys = BoundedWarningKeys::default();
+
+        assert!(warning_keys.insert_new("dataset_a".to_string(), 2));
+        assert!(!warning_keys.insert_new("dataset_a".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_b".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_c".to_string(), 2));
+
+        assert_eq!(warning_keys.seen.len(), 2);
+        assert!(!warning_keys.insert_new("dataset_c".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_a".to_string(), 2));
     }
 
     fn create_test_data_schema() -> Schema {
