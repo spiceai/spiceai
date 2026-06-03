@@ -169,7 +169,17 @@ pub fn build_authenticate_message(
     let user_offset = domain_offset + u32::try_from(domain_bytes.len()).unwrap_or(u32::MAX);
     let ws_offset = user_offset + u32::try_from(user_bytes.len()).unwrap_or(u32::MAX);
 
-    let flags = challenge.negotiate_flags | NTLMSSP_NEGOTIATE_VERSION;
+    // Only retain flags the client actually advertised in the Negotiate message.
+    // Echoing all challenge flags verbatim would include KEY_EXCH (0x4000_0000)
+    // without a valid EncryptedRandomSessionKey. Servers interpret that as
+    // ExportedSessionKey = all-zeros while the client uses SessionBaseKey —
+    // a mismatch that produces different signing keys on each side.
+    const SUPPORTED: u32 = NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_VERSION;
+    let flags = challenge.negotiate_flags & SUPPORTED;
 
     let mut buf = BytesMut::with_capacity(ws_offset as usize + ws_bytes.len());
     buf.put_slice(NTLMSSP_SIGNATURE);
@@ -229,12 +239,17 @@ pub fn build_authenticate_message(
 /// Derive the SMB 3.1.1 signing key using SP800-108 Counter Mode KDF.
 #[must_use]
 pub fn derive_signing_key(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u8; 16] {
+    // SP800-108 CTR-mode KDF: counter || label || 0x00 || context || L
+    // Per [MS-SMB2] §3.1.4.5.1 and the smb-rs reference implementation,
+    // the label is "SMBSigningKey\0" (14 bytes, null included), and the
+    // kbkdf library adds one more 0x00 as the SP800-108 separator.
+    // Total KDF input: 4 + 14 + 1 + 64 + 4 = 87 bytes.
     let label = b"SMBSigningKey\0";
 
     let mut input = Vec::with_capacity(4 + label.len() + 1 + 64 + 4);
     input.extend_from_slice(&1u32.to_be_bytes());
     input.extend_from_slice(label);
-    input.push(0x00);
+    input.push(0x00); // SP800-108 separator
     input.extend_from_slice(preauth_hash);
     input.extend_from_slice(&128u32.to_be_bytes());
 
@@ -435,6 +450,28 @@ mod tests {
         wrong_type[..8].copy_from_slice(NTLMSSP_SIGNATURE);
         wrong_type[8..12].copy_from_slice(&NTLMSSP_NEGOTIATE.to_le_bytes());
         assert!(parse_challenge_message(&wrong_type).is_none());
+    }
+
+    #[test]
+    fn test_derive_signing_key_smb_rs_vector() {
+        // Known vector from smb-rs crates/smb/src/session/state.rs test_key_deriver.
+        // This is an externally validated vector that the reference implementation passes.
+        let session_key = [
+            0xDA_u8, 0x90, 0xB1, 0xDF, 0x80, 0x5C, 0x34, 0x9F, 0x88, 0x86, 0xBA, 0x02, 0x9E, 0xA4,
+            0x5C, 0xB6,
+        ];
+        let preauth_hash: [u8; 64] = [
+            0x47, 0x95, 0x78, 0xb1, 0x87, 0x23, 0x05, 0x6a, 0x4c, 0x3e, 0x6f, 0x73, 0x2f, 0x36,
+            0xf1, 0x9c, 0xcc, 0xdd, 0x51, 0x6f, 0x49, 0x56, 0x6b, 0xa0, 0x43, 0xce, 0x59, 0x6a,
+            0x13, 0x42, 0x27, 0xd9, 0x64, 0xef, 0x0a, 0xa6, 0xa6, 0x27, 0x1a, 0xfe, 0x4f, 0xe6,
+            0x4b, 0x4d, 0x8c, 0xb2, 0xe6, 0xa1, 0x95, 0x11, 0xed, 0xbb, 0xf6, 0xd7, 0x7d, 0xce,
+            0xf0, 0x33, 0xda, 0xed, 0x8c, 0x71, 0x81, 0xb2,
+        ];
+        let derived = derive_signing_key(&session_key, &preauth_hash);
+        assert_eq!(
+            crypto::hex_encode(&derived),
+            "6dacced e5b4e3608ad6ea54733ca3163".replace(' ', "")
+        );
     }
 
     #[test]

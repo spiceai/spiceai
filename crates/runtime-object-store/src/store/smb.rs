@@ -302,14 +302,18 @@ impl SMBObjectStore {
         let share = self.get_share().await?;
         let config = self.config();
         let prefix_str = prefix.unwrap_or_default();
-        let normalized = config.normalize_subpath(&prefix_str).to_string();
 
         let mut results = Vec::new();
-        let mut queue = vec![normalized];
+        // Queue holds display paths (caller's perspective, e.g. "data/subdir").
+        // Each iteration normalizes to the server-side path via normalize_subpath
+        // so SMB operations strip the share prefix while returned ObjectMeta
+        // paths keep it — matching what the caller (DataFusion) expects.
+        let mut queue = vec![prefix_str];
 
-        while let Some(dir_path) = queue.pop() {
-            let entries = Self::list_dir_entries(&share, config, &dir_path).await?;
-            let (files, dirs) = process_directory_entries(&dir_path, entries);
+        while let Some(display_path) = queue.pop() {
+            let server_path = config.normalize_subpath(&display_path).to_string();
+            let entries = Self::list_dir_entries(&share, config, &server_path).await?;
+            let (files, dirs) = process_directory_entries(&display_path, entries);
             results.extend(files);
             queue.extend(dirs);
         }
@@ -323,10 +327,12 @@ impl SMBObjectStore {
     ) -> object_store::Result<ListResult> {
         let share = self.get_share().await?;
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
-        let normalized = self.config().normalize_subpath(&prefix_str).to_string();
+        let server_path = self.config().normalize_subpath(&prefix_str).to_string();
 
-        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await?;
-        Ok(process_directory_entries_shallow(&normalized, entries))
+        let entries = Self::list_dir_entries(&share, self.config(), &server_path).await?;
+        // Use prefix_str (not server_path) so returned paths include the share
+        // name prefix and match what the caller (DataFusion) expects.
+        Ok(process_directory_entries_shallow(&prefix_str, entries))
     }
 
     /// Put the payload to the SMB share without a concat-copy.

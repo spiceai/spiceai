@@ -131,6 +131,7 @@ pub struct ContainerRunnerBuilder<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     command: Option<Vec<String>>,
+    binds: Vec<String>,
 }
 
 impl<'a> ContainerRunnerBuilder<'a> {
@@ -142,6 +143,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: Vec::new(),
             healthcheck: None,
             command: None,
+            binds: Vec::new(),
         }
     }
 
@@ -174,6 +176,12 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
+    /// Add a bind mount in `host_path:container_path` format.
+    pub fn add_bind_mount(mut self, host_path: &str, container_path: &str) -> Self {
+        self.binds.push(format!("{host_path}:{container_path}"));
+        self
+    }
+
     pub fn build(self) -> Result<ContainerRunner<'a>, anyhow::Error> {
         let image = self
             .image
@@ -186,6 +194,7 @@ impl<'a> ContainerRunnerBuilder<'a> {
             env_vars: self.env_vars,
             healthcheck: self.healthcheck,
             command: self.command,
+            binds: self.binds,
         })
     }
 }
@@ -198,6 +207,7 @@ pub struct ContainerRunner<'a> {
     env_vars: Vec<(String, String)>,
     healthcheck: Option<HealthConfig>,
     command: Option<Vec<String>>,
+    binds: Vec<String>,
 }
 
 impl<'a> ContainerRunner<'a> {
@@ -249,8 +259,15 @@ impl<'a> ContainerRunner<'a> {
             (Some(exposed_ports), Some(port_bindings_map))
         };
 
+        let binds = if self.binds.is_empty() {
+            None
+        } else {
+            Some(self.binds.clone())
+        };
+
         let host_config = Some(HostConfig {
             port_bindings,
+            binds,
             ..Default::default()
         });
 

@@ -127,6 +127,8 @@ mod s3_location_pruning;
 mod schema_evolution;
 #[cfg(feature = "sharepoint")]
 mod sharepoint;
+#[cfg(feature = "smb")]
+mod smb;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]
