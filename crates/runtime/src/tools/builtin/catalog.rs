@@ -18,12 +18,13 @@ use async_trait::async_trait;
 
 use runtime_query_engine::allowlist::ResolvedTableAwareAllowlist;
 use runtime_query_engine::query_engine::QueryEngine;
+use runtime_tools::factory::IndividualToolFactory;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::{ResultExt, Snafu};
 use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{status, tools::factory::IndividualToolFactory};
+use crate::status;
 use app::App;
 use cache::TabledCacheProvider;
 use cache::result::search::CachedSearchResult;

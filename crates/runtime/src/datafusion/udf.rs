@@ -128,7 +128,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::downgrade(&runtime.df) as _;
     ctx.register_udf(
         RerankTableFunc::new(
-            weak_df.clone(),
+            std::sync::Weak::clone(&weak_df),
             runtime.rerankers(),
             runtime.completion_llms(),
         )

@@ -1780,7 +1780,7 @@ impl Runtime {
     ///
     /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
     fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
-        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let default_catalogs = default_available_catalogs(self);
         let stream_self = Arc::clone(self);
         stream! {
             let tool_lock = stream_self.tools.read().await;

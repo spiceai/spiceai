@@ -534,12 +534,34 @@ impl<E: TableProviderExplorer + 'static> ScalarUDFImpl for TextSearchTableFunc<E
 #[cfg(test)]
 mod tests {
     use super::{TextSearchTableFunc, TextSearchTableFuncArgs, suggest_column};
+    use crate::table_provider_explorer::TableProviderExplorer;
     use datafusion::common::Column;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use datafusion::sql::TableReference;
+    use runtime_datafusion_index::Index;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct NoopExplorer;
+
+    impl TableProviderExplorer for NoopExplorer {
+        fn find_concrete<'a, T: datafusion::datasource::TableProvider + 'static>(
+            &self,
+            _tbl: &'a Arc<dyn datafusion::datasource::TableProvider>,
+        ) -> Option<&'a T> {
+            None
+        }
+
+        fn find_index<'a, T: Index + 'static>(
+            &self,
+            _tbl: &'a Arc<dyn datafusion::datasource::TableProvider>,
+        ) -> Option<(Vec<&'a T>, Arc<dyn datafusion::datasource::TableProvider>)> {
+            None
+        }
+    }
 
     fn fields(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
@@ -660,7 +682,7 @@ mod tests {
             Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
             passthrough_lit("rank_weight"),
         ];
-        let parsed = TextSearchTableFunc::parse_args(&exprs)
+        let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
             .expect("Passthrough named arg should be ignored");
         assert_eq!(parsed.query, "hello");
         assert_eq!(parsed.column, None);
@@ -677,7 +699,7 @@ mod tests {
             passthrough_lit("rank_weight"),
             Expr::Column(Column::new_unqualified("body")),
         ];
-        let parsed = TextSearchTableFunc::parse_args(&exprs)
+        let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
             .expect("Passthrough named arg should be ignored");
         assert_eq!(parsed.column.as_deref(), Some("body"));
     }
@@ -701,8 +723,8 @@ mod tests {
             Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
             named_arg("include_score", ScalarValue::Boolean(Some(false))),
         ];
-        let parsed =
-            TextSearchTableFunc::parse_args(&exprs).expect("Named include_score should parse");
+        let parsed = TextSearchTableFunc::<NoopExplorer>::parse_args(&exprs)
+            .expect("Named include_score should parse");
         assert_eq!(parsed.include_score, Some(false));
     }
 }

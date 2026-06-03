@@ -45,7 +45,7 @@ impl Runtime {
         // This will enable loading each tool in the catalog, and the catalog as a whole. E.g:
         //   `tools: models, builtin`
         //   `tools: sql, load_memory`
-        for ctlg in default_available_catalogs(Arc::clone(&self)) {
+        for ctlg in default_available_catalogs(&self) {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
                 let cloned_self = Arc::clone(&cloned_self);
@@ -69,7 +69,7 @@ impl Runtime {
                 tools: Arc::clone(t),
                 default_catalog_names: crate::tools::factory::default_catalog_names()
                     .iter()
-                    .map(|s| s.to_string())
+                    .map(ToString::to_string)
                     .collect(),
             },
         );

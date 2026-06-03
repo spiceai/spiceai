@@ -214,12 +214,13 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow_schema::{Field, Schema};
-    use datafusion::datasource::MemTable;
+    use datafusion::{datasource::MemTable, execution::context::SessionContext};
+    use runtime_query_engine::session::QuerySession;
 
     #[tokio::test]
     async fn samples_reserved_keyword_column_names() {
-        let runtime = crate::Runtime::builder().build().await;
-        let df = runtime.datafusion();
+        let ctx = Arc::new(SessionContext::new());
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("interval", DataType::Int64, false),
             Field::new("group", DataType::Utf8, false),
@@ -232,23 +233,24 @@ mod tests {
             ],
         )
         .expect("test batch should be valid");
-        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-            .expect("mem table should be valid");
-        df.ctx
-            .register_table("audiences", Arc::new(table))
-            .expect("test table should register");
+        ctx.register_table(
+            "audiences",
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be valid"),
+            ),
+        )
+        .expect("test table should register");
 
-        let params = DistinctColumnsParams {
+        let df = Arc::new(QuerySession::new(Arc::clone(&ctx))) as Arc<dyn QueryEngine>;
+        let sample = DistinctColumnsParams {
             tbl: "audiences".to_string(),
             limit: 3,
             cols: None,
-        };
-
-        let df = Arc::clone(&df) as Arc<dyn QueryEngine>;
-        let sample = params
-            .sample(Arc::clone(&df))
-            .await
-            .expect("sampling keyword columns should succeed");
+        }
+        .sample(Arc::clone(&df))
+        .await
+        .expect("sampling keyword columns should succeed");
 
         assert_eq!(sample.num_columns(), 2);
         assert_eq!(sample.num_rows(), 3);

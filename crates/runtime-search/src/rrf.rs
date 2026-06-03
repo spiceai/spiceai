@@ -1332,8 +1332,6 @@ mod tests {
     use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
     #[cfg(feature = "models")]
     use arrow::array::as_string_array;
-    #[cfg(feature = "models")]
-    use arrow::record_batch::RecordBatch;
     use datafusion::arrow::datatypes::DataType;
     use datafusion::catalog::TableProvider;
     #[cfg(feature = "models")]
@@ -1353,8 +1351,6 @@ mod tests {
     use datafusion_expr::ExprFunctionExt;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::lit;
-    #[cfg(feature = "models")]
-    use futures::TryStreamExt;
     #[cfg(feature = "models")]
     use llms::model2vec::Model2Vec;
     #[cfg(feature = "models")]

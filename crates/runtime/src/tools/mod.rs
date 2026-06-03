@@ -27,6 +27,7 @@ mod tests {
 
     use super::*;
     use async_trait::async_trait;
+    use runtime_tools::catalog::SpiceToolCatalog;
     use serde_json::Value;
     use std::borrow::Cow;
     use std::sync::Arc;
@@ -111,12 +112,9 @@ mod tests {
     async fn test_default_catalog() {
         let t = Tooling::Catalog {
             tools: Arc::new(MockCatalog {
-                name: default_catalog_names()[0].to_string(),
+                name: "memory".to_string(),
             }),
-            default_catalog_names: default_catalog_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            default_catalog_names: vec!["memory".to_string(), "auto".to_string()],
         };
         assert_eq!(
             t.tools()

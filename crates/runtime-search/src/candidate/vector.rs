@@ -746,7 +746,9 @@ impl ChunkedNonIndexVectorGeneration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{embedding_col, offset_col};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::utils::quote_identifier;
     use datafusion::sql::TableReference;
     use datafusion_expr::expr::WindowFunctionDefinition;
     use spicepod::component::embeddings::EmbeddingAggregation;
@@ -822,6 +824,52 @@ mod tests {
         assert!(
             matches!(unwrap_alias(&expr), LogicalExpr::WindowFunction(_)),
             "expected WindowFunction, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_quoting_embedding_columns() {
+        // lowercase
+        assert_eq!(offset_col!("embedding"), "embedding_offset");
+        assert_eq!(embedding_col!("embedding"), "embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            quote_identifier(&embedding_col!("embedding")),
+            "embedding_embedding"
+        );
+        assert_eq!(
+            offset_col!(quote_identifier("embedding")),
+            "embedding_offset"
+        );
+        assert_eq!(
+            embedding_col!(quote_identifier("embedding")),
+            "embedding_embedding"
+        );
+
+        // mixed case
+        assert_eq!(offset_col!("Embedding"), "Embedding_offset");
+        assert_eq!(embedding_col!("Embedding"), "Embedding_embedding");
+        assert_eq!(
+            quote_identifier(&offset_col!("Embedding")),
+            "\"Embedding_offset\""
+        );
+
+        assert_eq!(
+            quote_identifier(&embedding_col!("Embedding")),
+            "\"Embedding_embedding\""
+        );
+
+        assert_eq!(
+            offset_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_offset"
+        );
+
+        assert_eq!(
+            embedding_col!(quote_identifier("Embedding")),
+            "\"Embedding\"_embedding"
         );
     }
 }

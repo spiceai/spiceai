@@ -19,12 +19,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::Runtime;
 
+use runtime_query_engine::query_engine::QueryEngine;
 #[cfg(feature = "mcp")]
 use runtime_tools::mcp::factory::McpCatalogFactory;
 
-use runtime_tools::catalog::SpiceToolCatalog;
-
-use runtime_tools::memory::catalog::MemoryToolCatalog;
+use runtime_tools::{
+    catalog::SpiceToolCatalog,
+    factory::{IndividualToolFactory, ToolCatalogFactory},
+    memory::catalog::MemoryToolCatalog,
+};
 
 use super::{Tooling, builtin::catalog::BuiltinToolCatalog};
 
@@ -47,7 +50,7 @@ impl ToolFactory {
                     tools: catalog,
                     default_catalog_names: default_catalog_names()
                         .iter()
-                        .map(|s| s.to_string())
+                        .map(ToString::to_string)
                         .collect(),
                 })
             }
@@ -73,15 +76,13 @@ impl From<Arc<dyn IndividualToolFactory>> for ToolFactory {
     }
 }
 
-pub use runtime_tools::factory::{IndividualToolFactory, ToolCatalogFactory};
-
 pub async fn register_all_factories(rt: Arc<Runtime>) {
     let tool_factories = rt.tool_factories();
     let mut registry = tool_factories.lock().await;
     registry.insert(
         "builtin".to_string(),
         ToolFactory::Tool(Arc::new(BuiltinToolCatalog::new(
-            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            rt.datafusion() as Arc<dyn QueryEngine>,
             Arc::clone(&rt.app),
             rt.status(),
             rt.datafusion().search_cache_provider(),
@@ -90,7 +91,7 @@ pub async fn register_all_factories(rt: Arc<Runtime>) {
     registry.insert(
         "memory".to_string(),
         ToolFactory::Tool(Arc::new(MemoryToolCatalog::new(
-            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            rt.datafusion() as Arc<dyn QueryEngine>,
             Arc::clone(&rt.app),
         ))),
     );
@@ -112,16 +113,16 @@ pub async fn unregister_all_factories(rt: &Runtime) {
 
 /// Get all catalogs available by default in the spice runtime.
 #[must_use]
-pub fn default_available_catalogs(rt: Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
+pub fn default_available_catalogs(rt: &Arc<Runtime>) -> Vec<Arc<dyn SpiceToolCatalog>> {
     vec![
         Arc::new(BuiltinToolCatalog::new(
-            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            rt.datafusion() as Arc<dyn QueryEngine>,
             Arc::clone(&rt.app),
             rt.status(),
             rt.datafusion().search_cache_provider(),
         )),
         Arc::new(MemoryToolCatalog::new(
-            rt.datafusion() as Arc<dyn runtime_query_engine::query_engine::QueryEngine>,
+            rt.datafusion() as Arc<dyn QueryEngine>,
             Arc::clone(&rt.app),
         )),
     ]

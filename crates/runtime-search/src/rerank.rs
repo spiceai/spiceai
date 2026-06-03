@@ -1191,7 +1191,8 @@ mod tests {
     use async_trait::async_trait;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{Volatility, create_udf};
-    use futures::TryStreamExt;
+    use datafusion::prelude::SessionContext;
+    use runtime_query_engine::{query_engine::QueryEngine, session::QuerySession};
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
 
@@ -1574,12 +1575,9 @@ mod tests {
         let chat_models: Arc<RwLock<ChatModelStore>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Register rerank UDTF
-        let weak_ctx: std::sync::Weak<dyn runtime_query_engine::query_engine::QueryEngine> =
-            Arc::downgrade(
-                &(Arc::new(runtime_query_engine::session::QuerySession::new(
-                    Arc::clone(&ctx),
-                )) as Arc<dyn runtime_query_engine::query_engine::QueryEngine>),
-            );
+        let weak_ctx: std::sync::Weak<dyn QueryEngine> = Arc::downgrade(
+            &(Arc::new(QuerySession::new(Arc::clone(&ctx))) as Arc<dyn QueryEngine>),
+        );
         ctx.register_udf(
             RerankTableFunc::new(
                 weak_ctx.clone(),
