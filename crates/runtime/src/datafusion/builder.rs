@@ -58,6 +58,7 @@ use datafusion::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
         memory_pool::{GreedyMemoryPool, TrackConsumersPool},
+        object_store::ObjectStoreRegistry,
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -557,30 +558,45 @@ impl DataFusionBuilder {
     pub fn build(self) -> DataFusion {
         let mut config = self.config;
         let effective_memory_limit = effective_query_memory_limit(self.memory_limit);
-        // Carve a dedicated compaction memory budget out of the query limit when
-        // a fraction is configured (Cayenne acceleration + dedicated thread
-        // pools). The query pool shrinks by the carved amount so the two budgets
-        // together never exceed the operator's configured memory limit; the
-        // query-side sizing below (hash join, optimizer) then uses the reduced
-        // query budget, and `compaction_memory_bytes` sizes the separate pool.
+        // Request a dedicated compaction memory budget when a fraction is
+        // configured (Cayenne acceleration + dedicated thread pools). The query
+        // pool is only shrunk after the dedicated compaction RuntimeEnv builds
+        // successfully; otherwise queries keep the full configured budget.
         let compaction_memory_fraction = self
             .compaction_memory_fraction
             .and_then(validate_compaction_memory_fraction);
-        let (effective_memory_limit, compaction_memory_bytes) = match compaction_memory_fraction {
-            Some(fraction) => {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss
-                )]
-                let compaction_bytes = (effective_memory_limit as f64 * fraction) as u64;
-                (
-                    effective_memory_limit.saturating_sub(compaction_bytes),
-                    Some(compaction_bytes),
-                )
-            }
-            None => (effective_memory_limit, None),
-        };
+        let compaction_memory_bytes = compaction_memory_fraction.map(|fraction| {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss
+            )]
+            let compaction_bytes = (effective_memory_limit as f64 * fraction) as u64;
+            compaction_bytes
+        });
+
+        let object_store_registry: Arc<dyn ObjectStoreRegistry> =
+            Arc::new(SpiceObjectStoreRegistry::new(self.io_runtime.clone()));
+        // Build the dedicated compaction environment from the requested carved
+        // budget, sharing the query environment's object-store registry so
+        // compaction reads/writes the same stores while accounting memory
+        // against its own bounded pool.
+        let (effective_memory_limit, compaction_runtime_env, compaction_memory_bytes) =
+            match compaction_memory_bytes {
+                Some(bytes) => match build_compaction_runtime_env(
+                    bytes,
+                    Arc::clone(&object_store_registry),
+                    self.temp_directory.clone(),
+                ) {
+                    Some(runtime_env) => (
+                        effective_memory_limit.saturating_sub(bytes),
+                        Some(runtime_env),
+                        Some(bytes),
+                    ),
+                    None => (effective_memory_limit, None, None),
+                },
+                None => (effective_memory_limit, None, None),
+            };
 
         if let Some(spill_compression) = self.spill_compression {
             config = config.with_spill_compression(spill_compression);
@@ -617,28 +633,13 @@ impl DataFusionBuilder {
 
         let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
 
-        let query_runtime_env = runtime_env_with_effective_memory_limit(
+        let query_runtime_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             effective_memory_limit,
             self.temp_directory.clone(),
-            self.io_runtime.clone(),
+            object_store_registry,
             self.cayenne_footer_cache_mb
                 .map(|size_mb| size_mb.saturating_mul(1024 * 1024)),
         );
-        // Build the dedicated compaction environment from the carved budget,
-        // sharing the query environment's object-store registry so compaction
-        // reads/writes the same stores while accounting memory against its own
-        // bounded pool.
-        let (compaction_runtime_env, compaction_memory_bytes) = match compaction_memory_bytes {
-            Some(bytes) => match build_compaction_runtime_env(
-                bytes,
-                &query_runtime_env,
-                self.temp_directory.clone(),
-            ) {
-                Some(runtime_env) => (Some(runtime_env), Some(bytes)),
-                None => (None, None),
-            },
-            None => (None, None),
-        };
 
         let mut state = SessionStateBuilder::new()
             .with_config(config)
@@ -1216,10 +1217,10 @@ fn configure_hash_join_memory_limits(
     exact_join_filter_memory_limit
 }
 
-fn runtime_env_with_effective_memory_limit(
+fn runtime_env_with_effective_memory_limit_and_object_store_registry(
     effective_memory_limit: u64,
     temp_directory: Option<String>,
-    io_runtime: Handle,
+    object_store_registry: Arc<dyn ObjectStoreRegistry>,
     metadata_cache_limit_bytes: Option<usize>,
 ) -> Arc<RuntimeEnv> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
@@ -1245,7 +1246,7 @@ fn runtime_env_with_effective_memory_limit(
     ));
 
     let mut runtime_env_builder = RuntimeEnvBuilder::default()
-        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
+        .with_object_store_registry(object_store_registry)
         .with_memory_pool(memory_pool)
         .with_disk_manager_builder(disk_manager_builder);
 
@@ -1281,7 +1282,7 @@ fn validate_compaction_memory_fraction(fraction: f64) -> Option<f64> {
 /// together never exceed the operator's configured memory limit.
 fn build_compaction_runtime_env(
     compaction_memory_bytes: u64,
-    query_runtime_env: &Arc<RuntimeEnv>,
+    object_store_registry: Arc<dyn ObjectStoreRegistry>,
     temp_directory: Option<String>,
 ) -> Option<Arc<RuntimeEnv>> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
@@ -1308,7 +1309,7 @@ fn build_compaction_runtime_env(
     let runtime_env_builder = RuntimeEnvBuilder::default()
         // Share the query environment's object-store registry so the stores
         // Cayenne registered there are visible to compaction.
-        .with_object_store_registry(Arc::clone(&query_runtime_env.object_store_registry))
+        .with_object_store_registry(object_store_registry)
         .with_memory_pool(memory_pool)
         .with_disk_manager_builder(disk_manager_builder);
 
@@ -1425,10 +1426,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_env_applies_metadata_cache_limit() {
-        let runtime_env = runtime_env_with_effective_memory_limit(
+        let object_store_registry: Arc<dyn ObjectStoreRegistry> = Arc::new(
+            SpiceObjectStoreRegistry::new(tokio::runtime::Handle::current()),
+        );
+        let runtime_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             1024 * 1024,
             None,
-            tokio::runtime::Handle::current(),
+            object_store_registry,
             Some(8 * 1024 * 1024),
         );
 
@@ -1440,14 +1444,21 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_runtime_env_separate_pool_shared_object_store() {
-        let query_env = runtime_env_with_effective_memory_limit(
+        let object_store_registry: Arc<dyn ObjectStoreRegistry> = Arc::new(
+            SpiceObjectStoreRegistry::new(tokio::runtime::Handle::current()),
+        );
+        let query_env = runtime_env_with_effective_memory_limit_and_object_store_registry(
             1024 * 1024 * 1024,
             None,
-            tokio::runtime::Handle::current(),
+            object_store_registry,
             None,
         );
-        let compaction_env = build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None)
-            .expect("compaction RuntimeEnv should build");
+        let compaction_env = build_compaction_runtime_env(
+            256 * 1024 * 1024,
+            Arc::clone(&query_env.object_store_registry),
+            None,
+        )
+        .expect("compaction RuntimeEnv should build");
 
         // The carved compaction pool is a DISTINCT pool, so compaction memory is
         // accounted and bounded separately and cannot starve queries.
