@@ -435,7 +435,15 @@ pub fn encode_create_request(
     buf.put_u16_le(name_len); // NameLength
     buf.put_u32_le(0); // CreateContextsOffset
     buf.put_u32_le(0); // CreateContextsLength
-    buf.put_slice(&name_bytes);
+    // StructureSize is 57 = 56-byte fixed part + 1 mandatory buffer byte.
+    // The variable-length buffer must always be present, so when opening the
+    // share root (empty name) we still emit a single padding byte. Omitting
+    // it yields a 56-byte body that servers reject with STATUS_INVALID_PARAMETER.
+    if name_bytes.is_empty() {
+        buf.put_u8(0);
+    } else {
+        buf.put_slice(&name_bytes);
+    }
 }
 
 #[derive(Debug, Clone)]

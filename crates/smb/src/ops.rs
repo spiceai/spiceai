@@ -539,7 +539,7 @@ impl ShareSession {
                 &smb_path,
                 DesiredAccess::GenericWrite as u32,
                 ShareAccess::Read as u32,
-                disposition,
+                CreateDisposition::OverwriteIf as u32,
                 CreateOptions::NonDirectoryFile as u32,
             )
             .await?;
