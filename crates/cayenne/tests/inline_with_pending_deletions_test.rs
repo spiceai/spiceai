@@ -968,7 +968,7 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
     // Writers: each upserts one hot key per commit, cycling through its own
     // stripe of the keyset, to maximise the rate of concurrent new-snapshot
     // publishes (and protected-snapshot churn) while scanners are mid-plan.
-    let mut writers = Vec::with_capacity(NUM_WRITERS as usize);
+    let mut writers = Vec::new();
     for writer_id in 0..NUM_WRITERS {
         let table = Arc::clone(&table);
         let schema = Arc::clone(&schema);
