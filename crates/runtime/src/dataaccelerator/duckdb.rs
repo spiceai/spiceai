@@ -396,6 +396,7 @@ static DUCKDB_TYPE_REWRITE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteR
     &arrow_tools::type_rewrite::DictionaryUnwrap,
     &arrow_tools::type_rewrite::IntervalToMonthDayNano,
     &arrow_tools::type_rewrite::NullToInt32,
+    &arrow_tools::type_rewrite::TimestampToMicrosecond,
 ];
 
 #[async_trait]
@@ -1188,6 +1189,109 @@ mod tests {
         }
 
         assert_eq!(values, vec![5, 7]);
+    }
+
+    #[tokio::test]
+    async fn duckdb_timestamptz_roundtrip_sorts_without_rowconverter_panic() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        // Register the column as Timestamp(Nanosecond, "UTC") — the type Spice
+        // assigns to a Postgres `timestamptz` source (see declared_type.rs).
+        // DuckDB physically stores and returns microsecond precision, so without
+        // schema normalization an ORDER BY on this column panics with a
+        // RowConverter "expected Timestamp(ns) got Timestamp(µs)" mismatch (#10627).
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+
+        let cmd = cmd_with_schema(Arc::clone(&source_schema));
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        let table = duckdb_accelerator
+            .create_external_table(cmd, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // The accelerator must register the column at microsecond precision so the
+        // registered schema matches what DuckDB returns.
+        let microsecond_tz = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(
+            table
+                .schema()
+                .field_with_name("created_at")
+                .expect("created_at field")
+                .data_type(),
+            &microsecond_tz,
+            "DuckDB-accelerated timestamptz column must be registered as microsecond",
+        );
+
+        // Insert rows out of timestamp order. Values are microsecond-precision to
+        // match the normalized table schema (the refresh path casts source batches
+        // to this schema via arrow_tools::record_batch::try_cast_to before writing).
+        let insert_schema = table.schema();
+        let input = RecordBatch::try_new(
+            Arc::clone(&insert_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        1_730_194_427_511_278, // latest
+                        1_730_108_530_123_456,
+                        1_730_022_333_789_012, // earliest
+                    ])
+                    .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .expect("to create RecordBatch");
+
+        let exec = Arc::new(MockExec::new(vec![Ok(input)], insert_schema));
+        let write_ctx = SessionContext::new();
+        let insert_plan = table
+            .insert_into(
+                &write_ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("to create insert plan");
+        collect(insert_plan, write_ctx.task_ctx())
+            .await
+            .expect("to execute insert");
+
+        // ORDER BY on the timestamptz column exercises DataFusion's RowConverter,
+        // which is where the schema mismatch previously panicked.
+        let read_ctx = SessionContext::new();
+        read_ctx
+            .register_table(TableReference::bare("events"), Arc::clone(&table))
+            .expect("to register table");
+        let batches = read_ctx
+            .sql("SELECT id FROM events ORDER BY created_at DESC")
+            .await
+            .expect("to plan query")
+            .collect()
+            .await
+            .expect("ORDER BY on timestamptz column must not panic in RowConverter");
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            ids.extend((0..col.len()).map(|i| col.value(i)));
+        }
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "rows must be ordered by descending timestamp"
+        );
     }
 
     #[tokio::test]
@@ -2288,6 +2392,42 @@ mod tests {
         assert_eq!(
             arrow.field_with_name("dur").expect("dur field").data_type(),
             &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+    }
+
+    #[test]
+    fn normalize_schema_for_duckdb_timestamp_to_microsecond() {
+        use arrow::datatypes::TimeUnit;
+        let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "local_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ])));
+        super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
+        let arrow = cmd.schema.as_arrow();
+        // DuckDB stores all TIMESTAMP/TIMESTAMPTZ at microsecond precision; the
+        // registered schema must match to avoid a RowConverter mismatch (#10627).
+        assert_eq!(
+            arrow
+                .field_with_name("created_at")
+                .expect("created_at field")
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        );
+        assert_eq!(
+            arrow
+                .field_with_name("local_at")
+                .expect("local_at field")
+                .data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
         );
     }
 
