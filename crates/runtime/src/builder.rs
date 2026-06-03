@@ -764,7 +764,7 @@ fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
         MIN_COMPACTION_MEMORY_FRACTION,
         MAX_COMPACTION_MEMORY_FRACTION,
     );
-    if value < MIN_COMPACTION_MEMORY_FRACTION || value > MAX_COMPACTION_MEMORY_FRACTION {
+    if !(MIN_COMPACTION_MEMORY_FRACTION..=MAX_COMPACTION_MEMORY_FRACTION).contains(&value) {
         tracing::warn!(
             "runtime.params.{CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM}={value} is outside supported range [{MIN_COMPACTION_MEMORY_FRACTION}, {MAX_COMPACTION_MEMORY_FRACTION}]; using {clamped}"
         );
