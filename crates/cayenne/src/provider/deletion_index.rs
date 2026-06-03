@@ -17,8 +17,8 @@ limitations under the License.
 //! Immutable deletion index with bloom-filter prefilter.
 //!
 //! [`DeletionIndex`] (Int64 PK) and [`KeyDeletionIndex`] (composite-key PK) are the
-//! frozen, share-by-`Arc` snapshots that scans probe at query time. They hold a plain
-//! [`HashMap`] plus a [`BloomFilter`] sized for the deletion set, and expose only
+//! frozen snapshots that scans probe at query time. They hold a persistent
+//! [`im::HashMap`] plus a [`BloomFilter`] sized for the deletion set, and expose only
 //! read-only methods: a probe goes through the bloom filter first, and falls through to
 //! the hash map only on a possible hit.
 //!
@@ -32,7 +32,9 @@ limitations under the License.
 //! `Arc<DeletionIndex>` back into the swap cell. Readers always see a fully-built
 //! snapshot and never block.
 
+use bytes::Bytes;
 use hash_index::{BloomFilter, hash_key};
+use im::HashMap as PersistentHashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -51,7 +53,7 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 /// [`extend_max`](Self::extend_max) for the full argument.
 #[derive(Debug, Clone)]
 pub struct DeletionIndex {
-    entries: Arc<HashMap<i64, i64>>,
+    entries: PersistentHashMap<i64, i64>,
     bloom: BloomFilter,
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
@@ -78,7 +80,7 @@ impl DeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            entries: Arc::new(HashMap::new()),
+            entries: PersistentHashMap::new(),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
@@ -106,7 +108,7 @@ impl DeletionIndex {
         }
         let max_sequence_number = entries.values().copied().max();
         Self {
-            entries: Arc::new(entries),
+            entries: entries.into_iter().collect(),
             bloom,
             max_sequence_number,
             bloom_capacity: capacity,
@@ -132,10 +134,12 @@ impl DeletionIndex {
     }
 
     /// Approximate resident bytes for memory accounting: each `i64 -> i64` entry
-    /// is 16 bytes of key+value plus hash-table control/load-factor overhead.
+    /// includes the key/value payload plus HAMT node/bitmap/Arc overhead. Shared
+    /// nodes retained by older reader-pinned generations are intentionally not
+    /// charged to the latest snapshot again.
     #[must_use]
     pub fn approx_bytes(&self) -> usize {
-        const APPROX_I64_ENTRY_BYTES: usize = 48;
+        const APPROX_I64_ENTRY_BYTES: usize = 72;
         self.entries.len().saturating_mul(APPROX_I64_ENTRY_BYTES)
     }
 
@@ -167,7 +171,7 @@ impl DeletionIndex {
     /// Direct read-only access to the underlying entries (for callers that need to
     /// rebuild a filtered index, e.g. partial-deletion filters).
     #[must_use]
-    pub fn entries(&self) -> &HashMap<i64, i64> {
+    pub fn entries(&self) -> &PersistentHashMap<i64, i64> {
         &self.entries
     }
 
@@ -176,28 +180,24 @@ impl DeletionIndex {
     ///
     /// # Performance
     ///
-    /// With `Arc<HashMap>` + `Arc::make_mut`, the map is mutated in place on the
-    /// common single-writer path where no reader pins the latest generation; when
-    /// readers do pin it, `Arc::make_mut` performs an O(N) clone. The bloom filter
-    /// is updated incrementally (O(K) inserts
-    /// for K new keys) instead of being rebuilt from scratch every call. A full
-    /// O(N) rebuild only happens when the entry count crosses `2 * bloom_capacity`,
+    /// `entries` is a persistent HAMT, so cloning the current map for a write
+    /// shares unchanged nodes with any reader-pinned generation. Inserts update
+    /// only the path to the touched key (O(log N)) instead of cloning every
+    /// entry. The bloom filter is updated incrementally (O(K) inserts for K new
+    /// keys) instead of being rebuilt from scratch every call. A full O(N)
+    /// rebuild only happens when the entry count crosses `2 * bloom_capacity`,
     /// giving amortized O(K) bloom cost per call.
     ///
     /// **Why this matters**: a previous revision rebuilt the bloom from scratch on
     /// every `extend_max` call, which is the dominant cost (10K entries ≈ 10K hash
-    /// ops ≈ ~1 ms per call versus ~2 µs for the `HashMap` clone of the same size).
+    /// ops ≈ ~1 ms per call before any map update work is counted).
     /// On high-rate upsert/delete workloads (each producing a small `additions`
     /// batch but operating on a deletion cache that grows over time), the wasted
     /// bloom rebuild work compounds — and is the root cause of the ingestion
     /// regression that prompted this fix.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
-        // Arc::make_mut mutates in place on the common single-writer path where
-        // the latest DeletionIndex Arc is not held by any concurrent reader. Only
-        // when readers pin the current generation do we pay the O(N) map clone.
-        let mut entries_arc = Arc::clone(&self.entries);
-        let entries = Arc::make_mut(&mut entries_arc);
+        let mut entries = self.entries.clone();
         let mut max_sequence_number = self.max_sequence_number;
         let additions = additions.into_iter();
         // Track newly-inserted keys so the bloom can be updated incrementally
@@ -205,18 +205,20 @@ impl DeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, seq) in additions {
+            // Use explicit `Entry::Occupied` / `Entry::Vacant` matching so the bloom-update path only sees newly-inserted keys; the Occupied
+            // branch must not push to `new_keys`, otherwise repeat updates of existing keys would re-insert their hashes and bloat the bloom.
             let stored_sequence = match entries.entry(pk) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let existing = *e.get();
+                im::hashmap::Entry::Occupied(mut occ) => {
+                    let existing = *occ.get();
                     if seq > existing {
-                        *e.get_mut() = seq;
+                        occ.insert(seq);
                         seq
                     } else {
                         existing
                     }
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(seq);
+                im::hashmap::Entry::Vacant(vac) => {
+                    vac.insert(seq);
                     new_keys.push(pk);
                     seq
                 }
@@ -246,7 +248,7 @@ impl DeletionIndex {
                 bloom.insert(hash_key(&pk));
             }
             return Self {
-                entries: entries_arc,
+                entries,
                 bloom,
                 max_sequence_number,
                 bloom_capacity: new_capacity,
@@ -260,7 +262,7 @@ impl DeletionIndex {
             bloom.insert(hash_key(pk));
         }
         Self {
-            entries: entries_arc,
+            entries,
             bloom,
             max_sequence_number,
             bloom_capacity: self.bloom_capacity,
@@ -275,7 +277,7 @@ impl DeletionIndex {
 /// `KeyDeletionIndex` applies the same strategy to byte-keyed entries.
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
-    entries: Arc<HashMap<Box<[u8]>, i64>>,
+    entries: PersistentHashMap<Bytes, i64>,
     bloom: BloomFilter,
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
@@ -300,7 +302,7 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            entries: Arc::new(HashMap::new()),
+            entries: PersistentHashMap::new(),
             bloom: BloomFilter::new(MIN_BLOOM_CAPACITY),
             max_sequence_number: None,
             bloom_capacity: MIN_BLOOM_CAPACITY,
@@ -326,7 +328,10 @@ impl KeyDeletionIndex {
         }
         let max_sequence_number = entries.values().copied().max();
         Self {
-            entries: Arc::new(entries),
+            entries: entries
+                .into_iter()
+                .map(|(key, sequence)| (Bytes::from(key), sequence))
+                .collect(),
             bloom,
             max_sequence_number,
             bloom_capacity: capacity,
@@ -347,11 +352,13 @@ impl KeyDeletionIndex {
 
     /// Approximate resident bytes for memory accounting. Uses a per-entry
     /// estimate (a typical row-encoded composite key plus the `Box`, value, and
-    /// hash-table control overhead) rather than summing every key length, so the
-    /// call stays O(1) on the hot CDC path instead of O(total deletions).
+    /// HAMT node overhead) rather than summing every key length, so the call stays
+    /// O(1) on the hot CDC path instead of O(total deletions). Shared nodes
+    /// retained by older reader-pinned generations are intentionally not charged
+    /// to the latest snapshot again.
     #[must_use]
     pub fn approx_bytes(&self) -> usize {
-        const APPROX_KEY_ENTRY_BYTES: usize = 80;
+        const APPROX_KEY_ENTRY_BYTES: usize = 112;
         self.entries.len().saturating_mul(APPROX_KEY_ENTRY_BYTES)
     }
 
@@ -387,7 +394,7 @@ impl KeyDeletionIndex {
 
     /// Direct read-only access to the underlying entries.
     #[must_use]
-    pub fn entries(&self) -> &HashMap<Box<[u8]>, i64> {
+    pub fn entries(&self) -> &PersistentHashMap<Bytes, i64> {
         &self.entries
     }
 
@@ -399,33 +406,30 @@ impl KeyDeletionIndex {
     /// the new keys are inserted into a clone of the existing bloom.
     #[must_use]
     pub fn extend_max(&self, additions: impl IntoIterator<Item = (Box<[u8]>, i64)>) -> Self {
-        // Arc::make_mut mutates in place on the common single-writer path where
-        // the latest KeyDeletionIndex Arc is not held by any concurrent reader.
-        // Only when readers pin the current generation (or for composite PKs with
-        // heavier Box<[u8]> keys) do we pay the O(N) map + key clone.
-        let mut entries_arc = Arc::clone(&self.entries);
-        let entries = Arc::make_mut(&mut entries_arc);
+        let mut entries = self.entries.clone();
         let mut max_sequence_number = self.max_sequence_number;
         let additions = additions.into_iter();
         // Hash newly-inserted keys inline so the bloom can be updated
-        // incrementally without paying for a `Box<[u8]>` clone per key (the
-        // bloom only needs the hash, not the byte slice). Pre-size from the
+        // incrementally without cloning key bytes (the bloom only needs the
+        // hash, not the byte slice). Pre-size from the
         // iterator's hint to skip Vec growth reallocations.
         let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
+            let key = Bytes::from(key);
+            let key_hash = hash_key(&key.as_ref());
             let stored_sequence = match entries.entry(key) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let existing = *e.get();
+                im::hashmap::Entry::Occupied(mut occ) => {
+                    let existing = *occ.get();
                     if seq > existing {
-                        *e.get_mut() = seq;
+                        occ.insert(seq);
                         seq
                     } else {
                         existing
                     }
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    new_hashes.push(hash_key(&e.key().as_ref()));
-                    e.insert(seq);
+                im::hashmap::Entry::Vacant(vac) => {
+                    vac.insert(seq);
+                    new_hashes.push(key_hash);
                     seq
                 }
             };
@@ -444,7 +448,7 @@ impl KeyDeletionIndex {
                 bloom.insert(hash_key(&key.as_ref()));
             }
             return Self {
-                entries: entries_arc,
+                entries,
                 bloom,
                 max_sequence_number,
                 bloom_capacity: new_capacity,
@@ -456,7 +460,7 @@ impl KeyDeletionIndex {
             bloom.insert(h);
         }
         Self {
-            entries: entries_arc,
+            entries,
             bloom,
             max_sequence_number,
             bloom_capacity: self.bloom_capacity,
@@ -558,6 +562,66 @@ mod tests {
         let after = next.extend_max([(key1.clone(), 10)]);
         assert_eq!(after.max_sequence_number(), Some(10));
         assert_eq!(after.get(&key1), Some(10));
+    }
+
+    #[test]
+    fn key_index_extend_max_keeps_existing_key_allocations_shared() {
+        let mut map: HashMap<Box<[u8]>, i64> = HashMap::new();
+        for value in 0_u16..512 {
+            map.insert(
+                value.to_be_bytes().to_vec().into_boxed_slice(),
+                i64::from(value),
+            );
+        }
+        let idx = KeyDeletionIndex::from_map(map);
+        let original_ptrs: HashMap<Vec<u8>, *const u8> = idx
+            .entries
+            .keys()
+            .map(|key| (key.as_ref().to_vec(), key.as_ptr()))
+            .collect();
+
+        let pinned_reader_generation = idx.clone();
+        let next = idx.extend_max([(999_u16.to_be_bytes().to_vec().into_boxed_slice(), 999)]);
+        let shared_existing_keys = next
+            .entries
+            .keys()
+            .filter(|key| {
+                original_ptrs
+                    .get(key.as_ref())
+                    .is_some_and(|original_ptr| *original_ptr == key.as_ptr())
+            })
+            .count();
+
+        assert!(
+            shared_existing_keys > 400,
+            "expected the HAMT update to share most existing key allocations, shared {shared_existing_keys} of {}",
+            original_ptrs.len(),
+        );
+        assert_eq!(pinned_reader_generation.get(&0_u16.to_be_bytes()), Some(0));
+        assert_eq!(next.get(&0_u16.to_be_bytes()), Some(0));
+    }
+
+    #[test]
+    fn key_index_extend_max_preserves_updated_key_allocation() {
+        let key: Box<[u8]> = vec![9, 9].into_boxed_slice();
+        let original_ptr = key.as_ptr();
+        let mut map: HashMap<Box<[u8]>, i64> = HashMap::new();
+        map.insert(key, 1);
+        let idx = KeyDeletionIndex::from_map(map);
+
+        let replacement_key: Box<[u8]> = vec![9, 9].into_boxed_slice();
+        assert_ne!(replacement_key.as_ptr(), original_ptr);
+        let next = idx.extend_max([(replacement_key, 5)]);
+
+        let stored_ptr = next
+            .entries
+            .keys()
+            .find(|stored_key| stored_key.as_ref() == [9, 9])
+            .expect("updated key should still exist")
+            .as_ptr();
+        assert_eq!(stored_ptr, original_ptr);
+        assert_eq!(idx.get(&[9, 9]), Some(1));
+        assert_eq!(next.get(&[9, 9]), Some(5));
     }
 
     // -------------------------------------------------------------------------

@@ -109,7 +109,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@d6961a12666c2704619accbb5c9ffb8cc33d4425 # v0.5.5
+        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -144,12 +144,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
-
-      - name: Cancel workflow on failure
-        if: failure()
-        run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
@@ -204,7 +198,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@d6961a12666c2704619accbb5c9ffb8cc33d4425 # v0.5.5
+        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -247,12 +241,6 @@ jobs:
           AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
-
-      - name: Cancel workflow on failure
-        if: failure()
-        run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -315,7 +303,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@d6961a12666c2704619accbb5c9ffb8cc33d4425 # v0.5.5
+        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -368,12 +356,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: make install-spiced
-
-      - name: Cancel workflow on failure
-        if: failure()
-        run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}

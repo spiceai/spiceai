@@ -204,6 +204,15 @@ pub enum CatalogError {
 /// Result type for catalog operations.
 pub type CatalogResult<T> = std::result::Result<T, CatalogError>;
 
+/// Snapshot sequence metadata to commit atomically with a related catalog mutation.
+#[derive(Debug, Clone)]
+pub struct SnapshotSequenceCommit {
+    /// Snapshot id whose sequence should be recorded.
+    pub snapshot_id: String,
+    /// Sequence number assigned to the snapshot.
+    pub sequence_number: i64,
+}
+
 // Transaction support is currently not exposed at the catalog level.
 // Each catalog implementation can use backend-specific transactions internally
 // to ensure atomicity of operations.
@@ -344,6 +353,7 @@ pub trait MetadataCatalog: Send + Sync {
         table_id: &str,
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()>;
 
     /// Get all insert records for a table.
@@ -395,6 +405,30 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Atomically update snapshot and clear delete files in a single transaction.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+
+    /// Atomically swap a subset of protected snapshots for a single merged
+    /// snapshot (fast protected-snapshot compaction, "Step 1").
+    ///
+    /// Runs in one transaction:
+    /// 1. CAS guard: verifies every `old_snapshot_id` still has a sequence row.
+    /// 2. Deletes those sequence rows.
+    /// 3. Inserts the new merged snapshot's sequence row.
+    ///
+    /// Unlike [`commit_compaction`], this does NOT touch `current_snapshot_id`,
+    /// delete files, or insert records — the current snapshot is unchanged, so
+    /// its deletion vectors must remain intact (the merged inputs only had
+    /// deletions with `seq > max_delete_seq_at_creation` applied during the
+    /// rewrite, while `current` still relies on the full delete-file set).
+    ///
+    /// Returns `Ok(false)` if any input snapshot is no longer active (the
+    /// caller should discard the rewritten output and retry on a later trigger).
+    async fn swap_protected_snapshots(
+        &self,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool>;
 
     /// Atomically commit an overwrite: update the snapshot pointer, clear all
     /// per-snapshot delete tracking, AND drop inlined data, inlined deletes,
