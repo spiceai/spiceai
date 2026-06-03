@@ -141,11 +141,11 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 static VECTOR_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Runs vector search over a configured embedding/vector index.".to_string(),
-    syntax_example: "vector_search(dataset, 'query text'[, column])".to_string(),
+    syntax_example: "vector_search(tbl, 'query text'[, column])".to_string(),
     sql_example: None,
     arguments: Some(vec![
         (
-            "dataset".to_string(),
+            "tbl".to_string(),
             "Dataset or table reference with an embedding/vector index.".to_string(),
         ),
         ("query".to_string(), "Search query text.".to_string()),

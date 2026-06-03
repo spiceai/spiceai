@@ -89,11 +89,11 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 static TEXT_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
     doc_section: DocSection::default(),
     description: "Runs full-text search over a configured searchable dataset.".to_string(),
-    syntax_example: "text_search(dataset, 'query text'[, column])".to_string(),
+    syntax_example: "text_search(tbl, 'query text'[, column])".to_string(),
     sql_example: None,
     arguments: Some(vec![
         (
-            "dataset".to_string(),
+            "tbl".to_string(),
             "Dataset or table reference with a full-text search index.".to_string(),
         ),
         ("query".to_string(), "Search query text.".to_string()),

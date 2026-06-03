@@ -1626,7 +1626,7 @@ fn is_search_context_function_visible(
         return search_functions.vector_search;
     }
     if name == RRF_UDF_NAME || name == RERANK_UDTF_NAME {
-        return search_functions.text_search && search_functions.vector_search;
+        return search_functions.text_search || search_functions.vector_search;
     }
     false
 }
@@ -3142,7 +3142,7 @@ mod tests {
     }
 
     #[test]
-    fn function_context_requires_text_and_vector_search_for_fusion_and_rerank() {
+    fn function_context_includes_fusion_and_rerank_with_text_or_vector_search() {
         let app = app::AppBuilder::new("test").build();
         let available_names = HashSet::from([
             TEXT_SEARCH_UDTF_NAME.to_string(),
@@ -3155,15 +3155,15 @@ mod tests {
         let text_only_names = entry_names(&text_only.search);
         assert!(text_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(!text_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
-        assert!(!text_only_names.contains(RRF_UDF_NAME));
-        assert!(!text_only_names.contains(RERANK_UDTF_NAME));
+        assert!(text_only_names.contains(RRF_UDF_NAME));
+        assert!(text_only_names.contains(RERANK_UDTF_NAME));
 
         let vector_only = nsql_function_context_for_test(&app, &available_names, true, false);
         let vector_only_names = entry_names(&vector_only.search);
         assert!(!vector_only_names.contains(TEXT_SEARCH_UDTF_NAME));
         assert!(vector_only_names.contains(VECTOR_SEARCH_UDTF_NAME));
-        assert!(!vector_only_names.contains(RRF_UDF_NAME));
-        assert!(!vector_only_names.contains(RERANK_UDTF_NAME));
+        assert!(vector_only_names.contains(RRF_UDF_NAME));
+        assert!(vector_only_names.contains(RERANK_UDTF_NAME));
 
         let hybrid = nsql_function_context_for_test(&app, &available_names, true, true);
         let hybrid_names = entry_names(&hybrid.search);
