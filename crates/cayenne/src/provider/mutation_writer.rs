@@ -34,16 +34,19 @@ limitations under the License.
 //! ## Pipelined vs. synchronous routing
 //!
 //! `write_cdc_pipelined` short-circuits to the synchronous `write_prepared_stream`
-//! path when any of these hold:
+//! path when the table has pending PK deletions or is partitioned — those need
+//! state held until the visibility flip is durable and can't be deferred to
+//! Stage B.
 //!
-//! - the table has pending PK deletions
-//! - the burst produced file-level on-conflict deletions
-//! - the table has any on-conflict deletions
-//! - the table has `sort_columns` configured
-//! - the table is partitioned
-//!
-//! Those paths can't be safely deferred to Stage B because they require holding
-//! state (deletion vectors, sort order) until the visibility flip is durable.
+//! On-conflict (upsert) tables DO pipeline: the burst stages into a new
+//! protected snapshot and the on-conflict deletions are resolved and published
+//! by the backgrounded `finish()`. The one exception is a batch that replaces
+//! *inlined* rows — the staged on-conflict commit can't represent an inline
+//! rewrite, and that is only known after validation. Such a batch stages
+//! optimistically and then falls back to a synchronous publish that reuses the
+//! staged files (tracked by the `cdc_path_inline_fallback` write-phase metric),
+//! rather than excluding every inline-bearing upsert table from the pipeline up
+//! front.
 //!
 //! ## Inline-memtable admission
 //!
@@ -76,7 +79,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use super::Result;
 use super::context::CayenneContext;
-use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
+use super::staging_wal::{CayenneStagedAppend, PreparedStagedAppend, StagingWalTargetKind};
 use super::table::{
     CayenneCdcWrite, CayenneTableProvider, ColumnStatsAccumulator, PostValidationState,
     record_cayenne_write_phase,
@@ -231,9 +234,17 @@ impl<'a> AppendMutationWriter<'a> {
         // `PostWriteMaintenance`, the pipelined path can run for retention-
         // configured tables — the bg scheduler picks up the retention request
         // after publish (see `CayenneCdcWrite::finish`).
-        let can_stage_for_pipeline = !pending_pk_deletions
-            && !may_have_on_conflict_deletions
-            && self.table.metadata().partition_column.is_none();
+        // On-conflict upserts can stage even when the table holds inlined data.
+        // Whether a given batch actually replaces inlined rows is only known
+        // after validation (it populates `on_conflict_deletions`), so rather
+        // than excluding every inline-bearing upsert table from the pipeline up
+        // front, we stage optimistically and fall back to the synchronous
+        // publish *after* staging if the batch turns out to touch inlined rows
+        // (the staged on-conflict commit can't represent an inline rewrite).
+        // This lets inline-bearing upsert tables pipeline every batch that does
+        // not conflict with inlined rows.
+        let can_stage_for_pipeline =
+            !pending_pk_deletions && self.table.metadata().partition_column.is_none();
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
@@ -251,6 +262,17 @@ impl<'a> AppendMutationWriter<'a> {
                 duration_ms = write_start.elapsed().as_millis(),
                 inlined = false,
                 "CDC pipelined append completed on synchronous path"
+            );
+            // End-to-end Cayenne-write wall-clock for the synchronous (non-pipelined)
+            // path, labeled by path. For this path publish runs inline, so this IS
+            // the full slot-apply→publish-complete latency. The gap between this
+            // `total` and the sum of the named sub-phases (apply_on_conflict_deletions
+            // + vortex_write + publish) is the currently-unmeasured prepare/validation
+            // + lock-wait + fsync cost.
+            record_cayenne_write_phase(
+                self.table.table_name(),
+                "cdc_path_synchronous",
+                write_start,
             );
             return Ok(CayenneCdcWrite::completed(
                 self.table.clone_for_write_operations(),
@@ -274,6 +296,11 @@ impl<'a> AppendMutationWriter<'a> {
                     inlined = true,
                     "CDC pipelined append completed as inlined write"
                 );
+                record_cayenne_write_phase(
+                    self.table.table_name(),
+                    "cdc_path_inlined",
+                    write_start,
+                );
                 Ok(CayenneCdcWrite::completed(
                     self.table.clone_for_write_operations(),
                     rows,
@@ -281,19 +308,166 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback(re_stream) => {
                 prepared_stream = re_stream;
-                let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
+                let stage_on_conflict = may_have_on_conflict_deletions;
+                let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
+                    let (staging_snapshot_id, target_snapshot_id) =
+                        CayenneTableProvider::new_staging_snapshot_id_pair();
+                    (
+                        staging_snapshot_id,
+                        target_snapshot_id,
+                        StagingWalTargetKind::ProtectedSnapshot,
+                    )
+                } else {
+                    (
+                        CayenneTableProvider::new_staging_snapshot_id(),
+                        self.table.get_current_snapshot_id(),
+                        StagingWalTargetKind::CurrentSnapshot,
+                    )
+                };
                 let target_size_bytes = self.context.target_file_size_bytes();
                 self.table
                     .clear_staging_snapshot_dir(&staging_snapshot_id)
                     .await?;
+
+                let (write_guard_for_prepare, held_write_guard) = if stage_on_conflict {
+                    (None, Some(write_guard))
+                } else {
+                    (Some(write_guard), None)
+                };
+
                 let (rows, writer_ops, stats_acc, prepared_append) = self
                     .write_staged_append_prepared(
                         prepared_stream,
                         target_size_bytes,
-                        Some(write_guard),
+                        write_guard_for_prepare,
                         staging_snapshot_id,
+                        target_snapshot_id.clone(),
+                        target_kind,
                     )
                     .await?;
+
+                let PostValidationState {
+                    on_conflict_deletions,
+                    validated_keys,
+                } = take_post_validation(&post_validation);
+
+                // Inline-conflict fallback. The staged on-conflict commit cannot
+                // represent an inline rewrite, and whether a batch replaces inlined
+                // rows is only known now (after validation). Rather than erroring,
+                // publish synchronously here, reusing the already-staged Vortex files.
+                //
+                // Order and primitives mirror the non-pipelined
+                // `write_new_snapshot_after_validation`: move the staged files into
+                // the (protected) target snapshot, apply the conflict resolution
+                // (inline rewrite + file/position tombstones + re-insert records),
+                // then make the snapshot visible. The new snapshot's deletion
+                // threshold is its own sequence, allocated *after* the conflict
+                // deletes, so those deletes never hide the replacement rows.
+                //
+                // This inherits the synchronous on-conflict path's publish window
+                // (a concurrent scan may briefly observe the conflict delete before
+                // the replacement snapshot is visible) — i.e. it is no worse than
+                // the path these inline-bearing upsert tables took before the gate
+                // was relaxed. Hardening both publish paths to be fully atomic
+                // without a long listing-fence hold is a separate item.
+                if stage_on_conflict && on_conflict_deletions.has_inlined_deletions() {
+                    let superseded = on_conflict_deletions.total_superseded();
+
+                    // ProtectedSnapshot targets do not take `write_lock`, so this
+                    // composes with the held write guard. Files land in the target
+                    // dir but stay invisible until the snapshot is published below.
+                    prepared_append.apply_under_barrier().await?;
+
+                    // Runs while the write guard is held, as the deletion sink
+                    // expects. Rewrites inlined rows and tombstones file rows.
+                    let update = self
+                        .table
+                        .apply_on_conflict_deletions(on_conflict_deletions)
+                        .await?;
+
+                    let snapshot_sequence = self
+                        .table
+                        .catalog()
+                        .increment_sequence_number(self.table.table_id())
+                        .await?;
+                    self.table
+                        .record_written_snapshot_sequence(&target_snapshot_id, snapshot_sequence)
+                        .await?;
+                    self.table
+                        .commit_on_conflict_publish(
+                            update,
+                            Some((&target_snapshot_id, snapshot_sequence)),
+                        )
+                        .await;
+                    prepared_append.finish().await?;
+                    drop(held_write_guard);
+
+                    let retention_requested = self.table.has_retention_delete_filters();
+                    if retention_requested {
+                        self.table.clear_cached_pk_keyset();
+                    } else {
+                        self.table.record_file_pk_keys(&validated_keys);
+                    }
+                    let live_rows_delta = i64::try_from(rows)
+                        .unwrap_or(i64::MAX)
+                        .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
+                    self.table.schedule_post_write_maintenance(
+                        Some(stats_acc),
+                        false,
+                        retention_requested,
+                        live_rows_delta,
+                    );
+
+                    tracing::debug!(
+                        table = self.table.table_name(),
+                        rows,
+                        writer_ops,
+                        superseded,
+                        duration_ms = write_start.elapsed().as_millis(),
+                        "CDC pipelined append fell back to synchronous publish (batch replaces inlined rows)"
+                    );
+                    // Distinct label so the inline-fallback frequency is measurable:
+                    // it shows whether relaxing the gate for inline-bearing upsert
+                    // tables mostly pipelines (rare fallback) or mostly thrashes.
+                    record_cayenne_write_phase(
+                        self.table.table_name(),
+                        "cdc_path_inline_fallback",
+                        write_start,
+                    );
+                    return Ok(CayenneCdcWrite::completed(
+                        self.table.clone_for_write_operations(),
+                        rows,
+                    ));
+                }
+
+                let prepared_on_conflict = if stage_on_conflict {
+                    match self
+                        .table
+                        .prepare_on_conflict_deletions_for_staged_snapshot(
+                            on_conflict_deletions,
+                            target_snapshot_id,
+                        )
+                        .await
+                    {
+                        Ok(prepared_on_conflict) => Some(prepared_on_conflict),
+                        Err(err) => {
+                            if let Err(cleanup_err) = prepared_append.rollback().await {
+                                tracing::warn!(
+                                    "Failed to rollback staged append after on-conflict metadata error for table {}: {cleanup_err}",
+                                    self.table.table_name(),
+                                );
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if stage_on_conflict {
+                    self.table.record_file_pk_keys(&validated_keys);
+                }
+                drop(held_write_guard);
 
                 tracing::debug!(
                     table = self.table.table_name(),
@@ -303,14 +477,30 @@ impl<'a> AppendMutationWriter<'a> {
                     inlined = false,
                     "CDC pipelined append staged; WAL is durable, publish/finalize is pending"
                 );
+                // Time to durable WAL + return on the staged (pipelined) path.
+                // NOTE: publish/finalize is backgrounded here, so unlike
+                // `cdc_path_synchronous` this does NOT include publish — it is
+                // the staged-prepare latency, not full end-to-end.
+                record_cayenne_write_phase(self.table.table_name(), "cdc_path_staged", write_start);
 
-                Ok(CayenneCdcWrite::prepared_append(
-                    self.table.clone_for_write_operations(),
-                    rows,
-                    prepared_append,
-                    stats_acc,
-                    take_post_validation(&post_validation).validated_keys,
-                ))
+                if let Some(prepared_on_conflict) = prepared_on_conflict {
+                    Ok(CayenneCdcWrite::prepared_upsert_append(
+                        self.table.clone_for_write_operations(),
+                        rows,
+                        prepared_append,
+                        prepared_on_conflict,
+                        stats_acc,
+                        validated_keys,
+                    ))
+                } else {
+                    Ok(CayenneCdcWrite::prepared_append(
+                        self.table.clone_for_write_operations(),
+                        rows,
+                        prepared_append,
+                        stats_acc,
+                        validated_keys,
+                    ))
+                }
             }
         }
     }
@@ -522,7 +712,7 @@ impl<'a> AppendMutationWriter<'a> {
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
         self.table
-            .commit_on_conflict_publish(update, Some(&new_snapshot_id))
+            .commit_on_conflict_publish(update, Some((&new_snapshot_id, new_sequence)))
             .await;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
@@ -668,6 +858,8 @@ impl<'a> AppendMutationWriter<'a> {
         target_size_bytes: usize,
         write_guard: Option<OwnedMutexGuard<()>>,
         staging_snapshot_id: String,
+        target_snapshot_id: String,
+        target_kind: StagingWalTargetKind,
     ) -> Result<(
         u64,
         usize,
@@ -706,10 +898,12 @@ impl<'a> AppendMutationWriter<'a> {
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
 
-        let staged_append = CayenneStagedAppend::from_staged_append_in(
+        let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
             write_guard,
             staging_snapshot_id.clone(),
+            target_snapshot_id,
+            target_kind,
             rows,
         );
         let prepare_start = Instant::now();
