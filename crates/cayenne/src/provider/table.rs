@@ -108,6 +108,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
+use vortex_datafusion::WriteShardConfig;
 
 use super::context::CayenneContext;
 use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
@@ -3980,11 +3981,19 @@ impl CayenneTableProvider {
             snapshot_id,
         );
 
+        // Build the write-path Vortex format for this snapshot. Unsorted writes
+        // are sharded across `target_partitions` concurrent encoders (PK-hashed
+        // for keyed tables, round-robin otherwise) so the encode saturates all
+        // cores; sorted rewrites and single-writer configs fall back to one
+        // serial writer. Scans are unaffected — they never read the write-shard
+        // config (only `create_writer_physical_plan` does).
+        let write_format = self.write_shard_format(target_partitions);
+
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
             Arc::clone(&self.table_metadata.schema),
-            self.context.file_format(),
+            &write_format,
             &self.pk_deletion_strategy,
         )?;
 
@@ -4056,13 +4065,12 @@ impl CayenneTableProvider {
 
         let tracked_stream =
             RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
-        let stream_exec: Arc<dyn ExecutionPlan> =
+        // The Vortex sink performs intra-write sharding internally (see
+        // `write_shard_format` / `ShardSpec`), so the writer input is a single
+        // coordinated stream — no upstream round-robin repartition, which would
+        // only be coalesced back to one stream before the `DataSinkExec` anyway.
+        let writer_input_plan: Arc<dyn ExecutionPlan> =
             Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
-        let writer_input_plan = self.create_writer_input_plan(stream_exec, target_partitions)?;
-        let writer_partitions = writer_input_plan
-            .properties()
-            .output_partitioning()
-            .partition_count();
 
         let insert_plan = snapshot_listing_table
             .insert_into(session_state.as_ref(), writer_input_plan, InsertOp::Append)
@@ -4071,7 +4079,15 @@ impl CayenneTableProvider {
         collect(insert_plan, session_state.task_ctx()).await?;
 
         let total_rows = total_rows_written.load(Ordering::Relaxed);
-        let writer_ops = if total_rows > 0 { writer_partitions } else { 0 };
+        // Files added ≈ number of concurrent shard writers (each writes ≥1 file
+        // when it receives rows). Drives only the compaction-trigger heuristic;
+        // for the common (unsorted) case this equals the prior input-partition
+        // count, so the heuristic is unchanged.
+        let writer_ops = if total_rows > 0 {
+            self.snapshot_shard_count(target_partitions)
+        } else {
+            0
+        };
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
@@ -4107,24 +4123,47 @@ impl CayenneTableProvider {
         Ok((total_rows, writer_ops, stats_accumulator))
     }
 
-    fn create_writer_input_plan(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        session_target_partitions: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target_partitions = self.snapshot_write_concurrency(session_target_partitions);
-        if let Some(repartitioned) =
-            round_robin_repartition_if_needed(Arc::clone(&plan), target_partitions)?
-        {
-            tracing::debug!(
-                table = self.table_metadata.table_name.as_str(),
-                target_partitions,
-                "Repartitioning Cayenne snapshot write input for parallel Vortex writers"
-            );
-            Ok(repartitioned)
-        } else {
-            Ok(plan)
+    /// Effective number of concurrent shard writers the Vortex sink will use for
+    /// a snapshot write — `1` for sorted rewrites (sharding a globally-sorted
+    /// stream would scatter its order across files), otherwise the
+    /// configured/derived write concurrency. Also drives the compaction-trigger
+    /// file-add heuristic.
+    fn snapshot_shard_count(&self, session_target_partitions: usize) -> usize {
+        if self.context.has_sort_columns() {
+            return 1;
         }
+        self.snapshot_write_concurrency(session_target_partitions)
+    }
+
+    /// Build the write-path Vortex format, enabling intra-write sharding
+    /// (parallel encode) for this snapshot write. Sorted rewrites and
+    /// single-writer configs return the base (scan) format unchanged
+    /// (`ShardSpec::Single`). Keyed/upsert tables hash rows by primary key so
+    /// each output file is PK-clustered; other tables shard round-robin.
+    ///
+    /// Returned formats are write-only: the scan path keeps using
+    /// `context.file_format()` and never observes the write-shard config.
+    fn write_shard_format(&self, session_target_partitions: usize) -> Arc<VortexFormat> {
+        let base = self.context.file_format();
+        let shard_count = self.snapshot_shard_count(session_target_partitions);
+        if shard_count <= 1 {
+            return Arc::clone(base);
+        }
+        let shard_key_columns = self
+            .pk_column_indices
+            .iter()
+            .filter_map(|&i| {
+                self.table_metadata
+                    .schema
+                    .fields()
+                    .get(i)
+                    .map(|f| f.name().clone())
+            })
+            .collect::<Vec<_>>();
+        Arc::new(base.with_write_shard(WriteShardConfig {
+            write_concurrency: shard_count,
+            shard_key_columns,
+        }))
     }
 
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
@@ -12347,6 +12386,17 @@ mod tests {
         sort_columns: Vec<String>,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, tempfile::TempDir) {
+        create_cayenne_table_for_sharding(table_name, schema, sort_columns, vec![], runtime_env)
+            .await
+    }
+
+    async fn create_cayenne_table_for_sharding(
+        table_name: &str,
+        schema: SchemaRef,
+        sort_columns: Vec<String>,
+        primary_key: Vec<String>,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let metadata_dir = format!(
             "{}/metadata",
@@ -12369,7 +12419,7 @@ mod tests {
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
             schema,
-            primary_key: vec![],
+            primary_key,
             on_conflict: None,
             base_path: data_dir,
             partition_column: None,
@@ -12384,16 +12434,8 @@ mod tests {
         (provider, temp_dir)
     }
 
-    fn empty_write_stream_plan(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            futures::stream::empty::<datafusion_common::Result<RecordBatch>>(),
-        );
-        Arc::new(StreamingExec::new(schema, Box::pin(stream)))
-    }
-
     #[tokio::test]
-    async fn test_writer_input_plan_repartitions_unsorted_writes() {
+    async fn test_write_shard_format_unsorted_round_robin() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -12404,28 +12446,49 @@ mod tests {
         )
         .await;
 
-        let write_plan = provider
-            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
-            .expect("writer input plan should be created");
-
+        // Unsorted, no primary key: the sink shards round-robin across the
+        // requested writer count for parallel encode (no key clustering).
+        assert_eq!(provider.snapshot_shard_count(4), 4);
+        let format = provider.write_shard_format(4);
+        let write_shard = format
+            .write_shard()
+            .expect("unsorted multi-writer config should enable write sharding");
+        assert_eq!(write_shard.write_concurrency, 4);
         assert!(
-            write_plan
-                .as_any()
-                .downcast_ref::<datafusion_physical_plan::repartition::RepartitionExec>()
-                .is_some(),
-            "unsorted writes should be repartitioned for parallel writers"
-        );
-        assert_eq!(
-            write_plan
-                .properties()
-                .output_partitioning()
-                .partition_count(),
-            4
+            write_shard.shard_key_columns.is_empty(),
+            "PK-less tables shard round-robin, with no key columns"
         );
     }
 
     #[tokio::test]
-    async fn test_writer_input_plan_uses_configured_write_concurrency_override() {
+    async fn test_write_shard_format_keyed_hashes_by_primary_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _temp_dir) = create_cayenne_table_for_sharding(
+            "parallel_keyed_write",
+            Arc::clone(&schema),
+            vec![],
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Keyed/upsert table: the sink hashes rows by the primary key so each
+        // output file is PK-clustered (tight per-file zone maps).
+        assert_eq!(provider.snapshot_shard_count(4), 4);
+        let format = provider.write_shard_format(4);
+        let write_shard = format
+            .write_shard()
+            .expect("keyed multi-writer config should enable write sharding");
+        assert_eq!(write_shard.write_concurrency, 4);
+        assert_eq!(write_shard.shard_key_columns, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_write_shard_format_uses_configured_write_concurrency_override() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (mut provider, _temp_dir) = create_sorted_cayenne_table(
@@ -12444,21 +12507,21 @@ mod tests {
             ctx.runtime_env(),
         );
 
-        let write_plan = provider
-            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
-            .expect("writer input plan should be created");
-
+        // The explicit `write_concurrency` override wins over the session's
+        // target-partition count.
+        assert_eq!(provider.snapshot_shard_count(4), 2);
         assert_eq!(
-            write_plan
-                .properties()
-                .output_partitioning()
-                .partition_count(),
+            provider
+                .write_shard_format(4)
+                .write_shard()
+                .expect("override should enable write sharding")
+                .write_concurrency,
             2
         );
     }
 
     #[tokio::test]
-    async fn test_writer_input_plan_repartitions_sorted_writes() {
+    async fn test_write_shard_format_sorted_single_writer() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -12469,23 +12532,12 @@ mod tests {
         )
         .await;
 
-        let write_plan = provider
-            .create_writer_input_plan(empty_write_stream_plan(schema), 4)
-            .expect("writer input plan should be created");
-
+        // Sorted rewrites must stay on a single writer: sharding a globally
+        // sorted stream would scatter its order across files.
+        assert_eq!(provider.snapshot_shard_count(4), 1);
         assert!(
-            write_plan
-                .as_any()
-                .downcast_ref::<datafusion_physical_plan::repartition::RepartitionExec>()
-                .is_some(),
-            "sorted table writes should use the same parallel writer fanout as unsorted writes"
-        );
-        assert_eq!(
-            write_plan
-                .properties()
-                .output_partitioning()
-                .partition_count(),
-            4
+            provider.write_shard_format(4).write_shard().is_none(),
+            "sorted writes fall back to the unsharded base format"
         );
     }
 
