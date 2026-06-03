@@ -411,17 +411,22 @@ impl KeyDeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
-            let stored_sequence = if let Some(existing) = entries.get(key.as_ref()).copied() {
-                if seq > existing {
-                    entries.insert(key, seq);
-                    seq
-                } else {
-                    existing
+            let key_hash = hash_key(&key.as_ref());
+            let stored_sequence = match entries.entry(key) {
+                im::hashmap::Entry::Occupied(mut occ) => {
+                    let existing = *occ.get();
+                    if seq > existing {
+                        occ.insert(seq);
+                        seq
+                    } else {
+                        existing
+                    }
                 }
-            } else {
-                new_hashes.push(hash_key(&key.as_ref()));
-                entries.insert(key, seq);
-                seq
+                im::hashmap::Entry::Vacant(vac) => {
+                    vac.insert(seq);
+                    new_hashes.push(key_hash);
+                    seq
+                }
             };
             if max_sequence_number.is_none_or(|max| stored_sequence > max) {
                 max_sequence_number = Some(stored_sequence);
@@ -589,6 +594,29 @@ mod tests {
         );
         assert_eq!(pinned_reader_generation.get(&0_u16.to_be_bytes()), Some(0));
         assert_eq!(next.get(&0_u16.to_be_bytes()), Some(0));
+    }
+
+    #[test]
+    fn key_index_extend_max_preserves_updated_key_allocation() {
+        let key: Box<[u8]> = vec![9, 9].into_boxed_slice();
+        let original_ptr = key.as_ptr();
+        let mut map: HashMap<Box<[u8]>, i64> = HashMap::new();
+        map.insert(key, 1);
+        let idx = KeyDeletionIndex::from_map(map);
+
+        let replacement_key: Box<[u8]> = vec![9, 9].into_boxed_slice();
+        assert_ne!(replacement_key.as_ptr(), original_ptr);
+        let next = idx.extend_max([(replacement_key, 5)]);
+
+        let stored_ptr = next
+            .entries
+            .keys()
+            .find(|stored_key| stored_key.as_ref() == [9, 9])
+            .expect("updated key should still exist")
+            .as_ptr();
+        assert_eq!(stored_ptr, original_ptr);
+        assert_eq!(idx.get(&[9, 9]), Some(1));
+        assert_eq!(next.get(&[9, 9]), Some(5));
     }
 
     // -------------------------------------------------------------------------

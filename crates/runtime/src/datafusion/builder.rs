@@ -628,9 +628,17 @@ impl DataFusionBuilder {
         // sharing the query environment's object-store registry so compaction
         // reads/writes the same stores while accounting memory against its own
         // bounded pool.
-        let compaction_runtime_env = compaction_memory_bytes.map(|bytes| {
-            build_compaction_runtime_env(bytes, &query_runtime_env, self.temp_directory.clone())
-        });
+        let (compaction_runtime_env, compaction_memory_bytes) = match compaction_memory_bytes {
+            Some(bytes) => match build_compaction_runtime_env(
+                bytes,
+                &query_runtime_env,
+                self.temp_directory.clone(),
+            ) {
+                Some(runtime_env) => (Some(runtime_env), Some(bytes)),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
 
         let mut state = SessionStateBuilder::new()
             .with_config(config)
@@ -1275,7 +1283,7 @@ fn build_compaction_runtime_env(
     compaction_memory_bytes: u64,
     query_runtime_env: &Arc<RuntimeEnv>,
     temp_directory: Option<String>,
-) -> Arc<RuntimeEnv> {
+) -> Option<Arc<RuntimeEnv>> {
     let disk_manager_builder = if let Some(directory) = temp_directory {
         let mode = DiskManagerMode::Directories(vec![directory.into()]);
         DiskManager::builder().with_mode(mode)
@@ -1305,12 +1313,12 @@ fn build_compaction_runtime_env(
         .with_disk_manager_builder(disk_manager_builder);
 
     match runtime_env_builder.build_arc() {
-        Ok(runtime_env) => runtime_env,
+        Ok(runtime_env) => Some(runtime_env),
         Err(e) => {
             tracing::warn!(
-                "Failed to build dedicated Cayenne compaction RuntimeEnv: {e}; falling back to the query RuntimeEnv"
+                "Failed to build dedicated Cayenne compaction RuntimeEnv: {e}; disabling dedicated compaction runtime"
             );
-            Arc::clone(query_runtime_env)
+            None
         }
     }
 }
@@ -1438,7 +1446,8 @@ mod tests {
             tokio::runtime::Handle::current(),
             None,
         );
-        let compaction_env = build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None);
+        let compaction_env = build_compaction_runtime_env(256 * 1024 * 1024, &query_env, None)
+            .expect("compaction RuntimeEnv should build");
 
         // The carved compaction pool is a DISTINCT pool, so compaction memory is
         // accounted and bounded separately and cannot starve queries.
