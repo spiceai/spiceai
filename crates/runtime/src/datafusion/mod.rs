@@ -2706,20 +2706,36 @@ impl DataFusion {
             );
             return;
         };
-        let Some(parent_table_federation_adaptor) = parent_table
+
+        // The parent's registered provider takes one of two shapes depending on its
+        // acceleration engine:
+        // - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a
+        //   federated source, so `AcceleratedTable::table_provider()` wraps the table in a
+        //   `FederatedTableProviderAdaptor`.
+        // - The in-memory Arrow accelerator has no federated source, so
+        //   `create_federated_table_source()` returns `None` and `table_provider()` hands back the
+        //   bare `AcceleratedTable`.
+        // Unwrap the adaptor when present so we can find the parent `AcceleratedTable` in either
+        // case; otherwise a child of an Arrow-accelerated parent would never synchronize. The
+        // downcast borrows `parent_table`, so clone out the inner provider first to release the
+        // borrow before falling back to `parent_table` itself.
+        let adaptor_inner = parent_table
             .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>(
-        ) else {
-            tracing::debug!(
-                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table."
-            );
-            return;
-        };
-        let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
-            tracing::debug!(
-                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider."
-            );
-            return;
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .map(|adaptor| adaptor.table_provider.clone());
+        let parent_table = match adaptor_inner {
+            // FederatedTableProviderAdaptor wrapping an inner provider.
+            Some(Some(inner)) => inner,
+            // FederatedTableProviderAdaptor with no inner provider — nothing to synchronize with.
+            Some(None) => {
+                tracing::debug!(
+                    "Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider."
+                );
+                return;
+            }
+            // Not a FederatedTableProviderAdaptor (e.g. a bare AcceleratedTable from the in-memory
+            // Arrow accelerator).
+            None => parent_table,
         };
         let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
             tracing::debug!(

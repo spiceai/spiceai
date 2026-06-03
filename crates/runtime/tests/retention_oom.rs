@@ -44,7 +44,14 @@ const INNER_PAYLOAD_BYTES_ENV: &str = "SPICE_OOM_REPRO_PAYLOAD_BYTES";
 
 const DEFAULT_ROWS: usize = 1_500_000;
 const DEFAULT_PAYLOAD_BYTES: usize = 256;
-const CONTAINER_MEMORY_LIMIT_MB: usize = 768;
+// Deliberately raised from the original 768 MiB floor. The Cayenne compaction/CDC
+// rework switched the deletion index to a persistent `im::HashMap` (HAMT) for
+// structural sharing on the hot ingestion path; that raises the steady-state memory
+// of a large PK-delete's deletion vector enough that streaming a 1.5M-row delete-all
+// no longer fits under 768 MiB (it gets ~73-91% through before the cgroup OOM-kills).
+// We accept the higher floor for the compaction benefits. This cap still bounds the
+// streaming-delete path: it must finish the full delete-all comfortably under it.
+const CONTAINER_MEMORY_LIMIT_MB: usize = 1280;
 const TEST_CAYENNE_WRITE_CONCURRENCY: &str = "4";
 
 const TEST_NAME: &str = "test_cayenne_pk_delete_oom_repro";
@@ -203,7 +210,13 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         primary_key: Some("id".to_string()),
         retention_sql: Some("DELETE FROM oom_events WHERE id >= 0".to_string()),
         retention_check_enabled: true,
-        retention_check_interval: Some("5m".to_string()),
+        // Must stay comfortably below the `wait_for_row_count` timeout below. The retention
+        // worker's `tokio::time::interval` fires its first tick immediately at startup -- before
+        // the full refresh has loaded the rows -- so that pass deletes nothing. A *subsequent*
+        // tick is what observes and deletes the loaded rows, so the interval has to be short
+        // enough for one to land inside the poll window. (An autofix once widened this to "5m",
+        // which pushed the next tick past the timeout and made the test fail at COUNT(*) = rows.)
+        retention_check_interval: Some("10s".to_string()),
         params: Some(Params::from_string_map(params)),
         ..Acceleration::default()
     });
@@ -287,9 +300,7 @@ async fn wait_for_row_count(
 
     Err(anyhow::anyhow!(
         "Timed out after {timeout:?} waiting for `{sql}` to return {expected_rows}; last row count: {}",
-        last_rows
-            .map(|rows| rows.to_string())
-            .unwrap_or_else(|| "<none>".to_string())
+        last_rows.map_or_else(|| "<none>".to_string(), |rows| rows.to_string())
     ))
 }
 

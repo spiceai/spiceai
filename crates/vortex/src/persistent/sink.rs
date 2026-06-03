@@ -630,7 +630,9 @@ async fn send_batch_to_active_writer(
     let path = writer.path.clone();
     Err(match finish_file_writer(writer).await {
         Ok(_) => {
-            exec_datafusion_err!("Vortex writer task for '{path}' exited before consuming all input")
+            exec_datafusion_err!(
+                "Vortex writer task for '{path}' exited before consuming all input"
+            )
         }
         Err(real) => real,
     })
@@ -2085,7 +2087,10 @@ mod tests {
 
     const SHARD_WRITE_ID: &str = "testwriteid";
 
-    fn batches_to_stream(schema: SchemaRef, batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+    fn batches_to_stream(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
         let stream = futures::stream::iter(
             batches
                 .into_iter()
@@ -2252,8 +2257,10 @@ mod tests {
         assert_eq!(results.len(), 4, "expected one file per shard");
 
         // One write_id, four distinct shard segments.
-        let segments: HashSet<String> =
-            results.iter().filter_map(|(p, _)| shard_segment(p)).collect();
+        let segments: HashSet<String> = results
+            .iter()
+            .filter_map(|(p, _)| shard_segment(p))
+            .collect();
         assert_eq!(
             segments.len(),
             4,
@@ -2503,7 +2510,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_shard_writer_surfaces_real_error_not_receiver_gone() -> anyhow::Result<()> {
+    async fn test_failed_shard_writer_surfaces_real_error_not_receiver_gone() -> anyhow::Result<()>
+    {
         let schema = one_col_schema();
         // Writes to shard 2's file (`..._p002_...`) fail; every other shard
         // succeeds. The failing shard drops its receiver, which would make the
@@ -2555,8 +2563,9 @@ mod tests {
         let keys: Vec<Option<i64>> = (0i64..40)
             .map(|i| if i % 3 == 0 { None } else { Some(i) })
             .collect();
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(keys))])
-            .expect("nullable key batch");
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(keys))])
+                .expect("nullable key batch");
 
         let exprs: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("key", 0))];
         let results = run_sharded_write(
@@ -2597,7 +2606,10 @@ mod tests {
         let ds: Vec<i64> = (0i64..36).map(|i| i % 6).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(ws)), Arc::new(Int64Array::from(ds))],
+            vec![
+                Arc::new(Int64Array::from(ws)),
+                Arc::new(Int64Array::from(ds)),
+            ],
         )
         .expect("composite key batch");
 

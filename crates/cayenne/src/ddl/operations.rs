@@ -520,7 +520,11 @@ mod tests {
 
         let schema = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
             Field::new("payload", DataType::Utf8, false),
         ]);
         let vortex_schema = Arc::new(
@@ -531,7 +535,10 @@ mod tests {
         let metadata_catalog: Arc<dyn MetadataCatalog> = Arc::new(
             CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog opens"),
         );
-        metadata_catalog.init().await.expect("catalog schema initializes");
+        metadata_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
 
         let metadata_table_name = "test/buckets".to_string();
         let create_options = CreateTableOptions {
@@ -549,7 +556,11 @@ mod tests {
             .expect("catalog create_table");
 
         let ctx = SessionContext::new();
-        let df_schema = vortex_schema.as_ref().clone().to_dfschema().expect("df schema");
+        let df_schema = vortex_schema
+            .as_ref()
+            .clone()
+            .to_dfschema()
+            .expect("df schema");
         let expr_sql = "date_trunc('day', ts)".to_string();
         let parsed_expr = ctx
             .parse_sql_expr(&expr_sql, &df_schema)
@@ -600,8 +611,14 @@ mod tests {
             .collect()
             .await
             .expect("select executes");
-        let total: usize = results.iter().map(arrow::array::RecordBatch::num_rows).sum();
-        assert_eq!(total, 4, "all 4 rows must round-trip across the day buckets");
+        let total: usize = results
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            total, 4,
+            "all 4 rows must round-trip across the day buckets"
+        );
 
         // Exactly 3 `ts_day_bucket=<micros>/` partition dirs, all FS-safe.
         let mut bucket_dirs = 0usize;
@@ -618,6 +635,9 @@ mod tests {
                 );
             }
         }
-        assert_eq!(bucket_dirs, 3, "expected exactly 3 day-bucket partition dirs");
+        assert_eq!(
+            bucket_dirs, 3,
+            "expected exactly 3 day-bucket partition dirs"
+        );
     }
 }

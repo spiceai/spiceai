@@ -32,6 +32,7 @@ limitations under the License.
 //! `Arc<DeletionIndex>` back into the swap cell. Readers always see a fully-built
 //! snapshot and never block.
 
+use bytes::Bytes;
 use hash_index::{BloomFilter, hash_key};
 use im::HashMap as PersistentHashMap;
 use std::collections::HashMap;
@@ -276,7 +277,7 @@ impl DeletionIndex {
 /// `KeyDeletionIndex` applies the same strategy to byte-keyed entries.
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
-    entries: PersistentHashMap<Box<[u8]>, i64>,
+    entries: PersistentHashMap<Bytes, i64>,
     bloom: BloomFilter,
     /// Monotonic upper bound for the current immutable entries. This stays
     /// exact because indexes are build-once / extend-only; any future removal
@@ -327,7 +328,10 @@ impl KeyDeletionIndex {
         }
         let max_sequence_number = entries.values().copied().max();
         Self {
-            entries: entries.into_iter().collect(),
+            entries: entries
+                .into_iter()
+                .map(|(key, sequence)| (Bytes::from(key), sequence))
+                .collect(),
             bloom,
             max_sequence_number,
             bloom_capacity: capacity,
@@ -390,7 +394,7 @@ impl KeyDeletionIndex {
 
     /// Direct read-only access to the underlying entries.
     #[must_use]
-    pub fn entries(&self) -> &PersistentHashMap<Box<[u8]>, i64> {
+    pub fn entries(&self) -> &PersistentHashMap<Bytes, i64> {
         &self.entries
     }
 
@@ -406,8 +410,8 @@ impl KeyDeletionIndex {
         let mut max_sequence_number = self.max_sequence_number;
         let additions = additions.into_iter();
         // Hash newly-inserted keys inline so the bloom can be updated
-        // incrementally without paying for a `Box<[u8]>` clone per key (the
-        // bloom only needs the hash, not the byte slice). Pre-size from the
+        // incrementally without cloning key bytes (the bloom only needs the
+        // hash, not the byte slice). Pre-size from the
         // iterator's hint to skip Vec growth reallocations.
         let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
@@ -420,7 +424,7 @@ impl KeyDeletionIndex {
                 }
             } else {
                 let key_hash = hash_key(&key.as_ref());
-                entries.insert(key, seq);
+                entries.insert(Bytes::from(key), seq);
                 new_hashes.push(key_hash);
                 seq
             };
