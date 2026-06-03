@@ -234,7 +234,7 @@ impl Dialect for SpiceCloudPlatformDialect {
         PostgreSqlDialect {}.identifier_quote_style(identifier)
     }
 
-    /// Spice Cloud re-plans the SQL we push down with DataFusion's analyzer,
+    /// Spice Cloud re-plans the SQL we push down with `DataFusion`'s analyzer,
     /// which rejects a correlated scalar subquery whose parent plan node is a
     /// `Join` (only `Projection`/`Filter`/`Aggregate` are permitted). The
     /// unparser only emits subqueries inside `JOIN ... ON` predicates when this
