@@ -503,16 +503,15 @@ mod tests {
     use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
 
-    /// End-to-end on local FS: a Cayenne table partitioned by a `date_trunc`
-    /// EXPRESSION over a Timestamp column — the exact shape Part C
-    /// (`cayenne_time_partition`) and explicit `PARTITION BY date_trunc(...)`
-    /// derive — must route each row to its `ts_day_bucket=<micros>/` partition
-    /// and read every row back. This is the path the prior cayenne partition
-    /// tests don't cover (they use string/Int column partitions, not an
-    /// expression over timestamps); it directly exercises per-partition
-    /// staging-write → move → scan for timestamp buckets on local FS, so no row
-    /// is stranded in `_staging/` or lost, and bucket dir names stay
-    /// filesystem-safe.
+    /// End-to-end on local FS: a Cayenne table partitioned by a user-supplied
+    /// `date_trunc` EXPRESSION over a Timestamp column (explicit `partition_by`
+    /// with the user's own `date_trunc` — the supported time-bucketing path)
+    /// must route each row to its `ts_day_bucket=<micros>/` partition and read
+    /// every row back. This is the path the prior cayenne partition tests don't
+    /// cover (they use string/Int column partitions, not an expression over
+    /// timestamps); it directly exercises per-partition staging-write → move →
+    /// scan for timestamp buckets on local FS, so no row is stranded in
+    /// `_staging/` or lost, and bucket dir names stay filesystem-safe.
     #[tokio::test]
     async fn test_date_trunc_expression_partition_round_trips_on_local_fs() {
         let tmp = TempDir::new().expect("tempdir");
