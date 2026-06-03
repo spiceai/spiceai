@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::cluster::partition::service::PartitionService;
 use crate::cluster::ClusterStateStore;
 use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::SchedulerHeartbeatStore;
+use crate::cluster::partition::service::PartitionService;
 #[cfg(not(windows))]
 use crate::component::dataset::acceleration::Engine;
 use crate::config::ClusterRole;
@@ -31,7 +31,7 @@ use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
-    catalogconnector,
+    Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
     dataconnector,
     datafusion::DataFusion,
@@ -40,7 +40,7 @@ use crate::{
     flight::RateLimits,
     metrics, podswatcher,
     secrets::{self, Secrets},
-    status, tracers, Runtime,
+    status, tracers,
 };
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
