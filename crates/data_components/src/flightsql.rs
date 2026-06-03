@@ -789,10 +789,6 @@ impl ExecutionPlan for FlightSqlExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(self.statistics.clone())
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
         // Single output partition (`UnknownPartitioning(1)`), so per-partition
         // statistics for partition 0 are the whole scan's statistics.
