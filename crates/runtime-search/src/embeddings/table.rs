@@ -43,6 +43,7 @@ use super::common::base_col;
 use super::construct_chunker;
 use super::execution_plan::EmbeddingTableExec;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
+use crate::{embedding_col, offset_col};
 
 use spicepod::component::embeddings::{
     ColumnEmbeddingConfig, EmbeddingAggregation, MULTI_VECTOR_MAX_ELEMENTS_DEFAULT,

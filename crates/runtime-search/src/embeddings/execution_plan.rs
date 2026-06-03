@@ -46,6 +46,7 @@ use std::{any::Any, sync::Arc, thread};
 
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
+use crate::{embedding_col, offset_col};
 
 use rayon::ThreadPool;
 use std::fmt;
