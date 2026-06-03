@@ -74,7 +74,10 @@ jobs:
             # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
             # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
             # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            cat ./install/install.sh | /bin/bash
+            # Pipe through tr to strip CR (Windows git checkout + autocrlf can leave CRLF in the working tree for .sh files;
+            # the WSL mount then exposes CRLF to the Ubuntu shell, which can break script parsing for piped execution.
+            # The remote curl case gets clean LF from raw.githubusercontent.com.
+            cat ./install/install.sh | tr -d '\r' | /bin/bash
           fi
 
       - name: add Spice bin to PATH
@@ -288,7 +291,10 @@ jobs:
             # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
             # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
             # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            cat ./install/install.sh | /bin/bash
+            # Pipe through tr to strip CR (Windows git checkout + autocrlf can leave CRLF in the working tree for .sh files;
+            # the WSL mount then exposes CRLF to the Ubuntu shell, which can break script parsing for piped execution.
+            # The remote curl case gets clean LF from raw.githubusercontent.com.
+            cat ./install/install.sh | tr -d '\r' | /bin/bash
           fi
 
       - name: check installation
