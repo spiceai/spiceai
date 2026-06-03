@@ -373,7 +373,9 @@ impl SmbClient {
         // transcript, so the very first signed request after auth would
         // fail against servers that validate the full preauth chain
         // (Samba 4.21+, Windows Server 2025).
-        update_preauth_hash(&mut preauth_hash, &resp_raw);
+        //
+        // TODO: that seems to break auth on 4.23.8, commented out while debugging
+        // update_preauth_hash(&mut preauth_hash, &resp_raw);
 
         let signing_key = auth::derive_signing_key(&session_base_key, &preauth_hash);
         tracing::debug!(target: "smb", "authenticated, signing key derived");
