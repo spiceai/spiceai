@@ -98,8 +98,8 @@ pub struct StdioArgs {
     #[arg(long, env = "SPICEAI_API_KEY")]
     pub api_key: Option<String>,
 
-    /// Compute mode for provisioning: `cloud` (Spice Cloud Platform, default) or `local`.
-    #[arg(long, env = "SPIDAPTER_COMPUTE", default_value = "cloud")]
+    /// Compute mode for provisioning: `scp` (Spice Cloud Platform, default) or `local`.
+    #[arg(long, env = "SPIDAPTER_COMPUTE", default_value = "scp")]
     pub compute: SpiceCompute,
 
     /// Override the Flight SQL endpoint URL instead of deriving it from the deployment cname.
