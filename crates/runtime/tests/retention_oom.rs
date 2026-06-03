@@ -44,7 +44,14 @@ const INNER_PAYLOAD_BYTES_ENV: &str = "SPICE_OOM_REPRO_PAYLOAD_BYTES";
 
 const DEFAULT_ROWS: usize = 1_500_000;
 const DEFAULT_PAYLOAD_BYTES: usize = 256;
-const CONTAINER_MEMORY_LIMIT_MB: usize = 768;
+// Deliberately raised from the original 768 MiB floor. The Cayenne compaction/CDC
+// rework switched the deletion index to a persistent `im::HashMap` (HAMT) for
+// structural sharing on the hot ingestion path; that raises the steady-state memory
+// of a large PK-delete's deletion vector enough that streaming a 1.5M-row delete-all
+// no longer fits under 768 MiB (it gets ~73-91% through before the cgroup OOM-kills).
+// We accept the higher floor for the compaction benefits. This cap still bounds the
+// streaming-delete path: it must finish the full delete-all comfortably under it.
+const CONTAINER_MEMORY_LIMIT_MB: usize = 1280;
 const TEST_CAYENNE_WRITE_CONCURRENCY: &str = "4";
 
 const TEST_NAME: &str = "test_cayenne_pk_delete_oom_repro";
