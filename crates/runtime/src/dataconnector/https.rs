@@ -1746,6 +1746,7 @@ mod tests {
     use secrecy::SecretString;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
+    use tempfile::TempDir;
 
     async fn test_connector(file_format: Option<&str>) -> Https {
         let extra: Vec<(&str, &str)> = match file_format {
@@ -2531,6 +2532,28 @@ mod tests {
             .build_http_client(&dataset)
             .await
             .expect("valid inline mTLS identity should build an HTTP client");
+    }
+
+    #[tokio::test]
+    async fn build_http_client_accepts_valid_file_identity() {
+        let (cert_pem, key_pem) = test_client_identity_pems();
+        let dir = TempDir::new().expect("create temp dir for mTLS test certs");
+        let cert_path = dir.path().join("client.pem");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, &cert_pem).expect("write test client cert pem");
+        std::fs::write(&key_path, &key_pem).expect("write test client key pem");
+
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", cert_path.to_str().unwrap()),
+            ("http_tls_client_key_file", key_path.to_str().unwrap()),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        connector
+            .build_http_client(&dataset)
+            .await
+            .expect("valid file-based mTLS identity should build an HTTP client");
     }
 
     #[tokio::test]
