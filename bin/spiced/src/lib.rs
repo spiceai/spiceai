@@ -659,22 +659,21 @@ pub async fn run(args: Args) -> Result<()> {
 
             rt.datafusion().set_refresh_runtime(refresh_runtime);
 
-            // Bring up the dedicated compaction runtime only when the DataFusion
-            // builder carved a compaction memory environment — i.e. Cayenne
-            // acceleration is configured on a dataset (and we're in this arm, so
-            // dedicated thread pools are enabled). `set_compaction_runtime`
-            // injects both the runtime handle and the carved memory environment
-            // into the Cayenne crate, isolating compaction on CPU and memory.
-            if rt.datafusion().compaction_runtime_env().is_some() {
-                let compaction_runtime = ManagedTokioRuntime::builder()
-                    .with_low_priority()
-                    .with_thread_name("compaction-worker")
-                    .build()
-                    .boxed()
-                    .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+            // Bring up the dedicated compaction runtime whenever dedicated
+            // thread pools are enabled. Cayenne can be activated lazily after
+            // startup (for example via Iceberg DDL acceleration defaults), so
+            // install the runtime handle even when the DataFusion builder did
+            // not carve a compaction memory environment from the initial
+            // spicepod. `set_compaction_runtime` injects the carved memory
+            // environment only when one is available.
+            let compaction_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
+                .with_thread_name("compaction-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
-                rt.datafusion().set_compaction_runtime(compaction_runtime);
-            }
+            rt.datafusion().set_compaction_runtime(compaction_runtime);
         }
         Some("disabled") => {
             tracing::info!(
