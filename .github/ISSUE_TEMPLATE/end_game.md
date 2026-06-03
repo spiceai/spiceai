@@ -98,6 +98,16 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Spice.ai Cloud Platform](https://github.com/spiceai/cookbook/blob/trunk/spiceai/README.md)
      - [ ] [Debezium CDC (plain & SASL/SCRAM)](https://github.com/spiceai/cookbook/blob/trunk/cdc-debezium/README.md)
      - [ ] [IMAP](https://github.com/spiceai/cookbook/blob/trunk/imap/README.md)
+     - [ ] [Elasticsearch](https://github.com/spiceai/cookbook/blob/trunk/elasticsearch/connector/README.md)
+     - [ ] [Kafka](https://github.com/spiceai/cookbook/blob/trunk/kafka/README.md)
+     - [ ] [MongoDB](https://github.com/spiceai/cookbook/blob/trunk/mongodb/connector/README.md)
+     - [ ] [ODBC](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
+     - [ ] [Oracle](https://github.com/spiceai/cookbook/blob/trunk/oracle/README.md)
+     - [ ] [PlanetScale (MySQL)](https://github.com/spiceai/cookbook/blob/trunk/mysql/planetscale/README.md)
+     - [ ] [Redshift](https://github.com/spiceai/cookbook/blob/trunk/redshift/README.md)
+     - [ ] [ScyllaDB](https://github.com/spiceai/cookbook/blob/trunk/scylladb/README.md)
+     - [ ] [SMB](https://github.com/spiceai/cookbook/blob/trunk/smb/README.md)
+     - [ ] [Snowflake DML](https://github.com/spiceai/cookbook/blob/trunk/snowflake/dml/README.md)
      - [ ] Update connector status per [Connector RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/connectors/rc.md).
 
    - **Data Accelerators**
@@ -115,6 +125,10 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Glue Catalog](https://github.com/spiceai/cookbook/tree/trunk/catalogs/glue/README.md)
      - [ ] [Iceberg Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/iceberg/README.md)
        - [ ] [Hadoop Catalog](https://github.com/spiceai/cookbook/tree/trunk/catalogs/iceberg-hadoop/README.md)
+     - [ ] [DuckLake Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/ducklake/README.md)
+     - [ ] [MSSQL Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/mssql/README.md)
+     - [ ] [MySQL Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/mysql/README.md)
+     - [ ] [PostgreSQL Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/postgres/README.md)
 
    - **AI/ML Models**
      - [ ] [Searching GitHub files with Spice](https://github.com/spiceai/cookbook/tree/trunk/search_github_files)
@@ -126,6 +140,18 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
      - [ ] [AI SQL Function](https://github.com/spiceai/cookbook/blob/trunk/ai/README.md)
      - [ ] [Hybrid Search & Real Time Indexing](https://github.com/spiceai/cookbook/blob/trunk/search/README.md)
+     - [ ] [DeepSeek](https://github.com/spiceai/cookbook/blob/trunk/deepseek/README.md)
+     - [ ] [Llama](https://github.com/spiceai/cookbook/blob/trunk/llama/README.md)
+     - [ ] [OpenAI Model](https://github.com/spiceai/cookbook/blob/trunk/models/openai/README.md)
+     - [ ] [xAI Model](https://github.com/spiceai/cookbook/blob/trunk/models/xai/README.md)
+     - [ ] [Filesystem Model](https://github.com/spiceai/cookbook/blob/trunk/models/filesystem/README.md)
+     - [ ] [OpenAI Responses API](https://github.com/spiceai/cookbook/blob/trunk/openai-responses-api/README.md)
+     - [ ] [MCP Server](https://github.com/spiceai/cookbook/blob/trunk/mcp-server/README.md)
+     - [ ] [LLM Judge](https://github.com/spiceai/cookbook/blob/trunk/llm-judge/README.md)
+     - [ ] [Evals](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
+     - [ ] [Generative Visualisations](https://github.com/spiceai/cookbook/blob/trunk/generative-visualisations/README.md)
+     - [ ] [Web Search](https://github.com/spiceai/cookbook/blob/trunk/websearch/README.md)
+     - [ ] [Elasticsearch Search](https://github.com/spiceai/cookbook/blob/trunk/search/elasticsearch/README.md)
 
    - **SDK Samples**
      - [ ] [Spice with gospice SDK](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
@@ -154,6 +180,17 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Python ADBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/adbc/README.md)
      - [ ] [Java JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/java/README.md)
      - [ ] [Scala JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/scala/README.md)
+     - [ ] [Distributed Query](https://github.com/spiceai/cookbook/blob/trunk/distributed/README.md)
+     - [ ] [mTLS](https://github.com/spiceai/cookbook/blob/trunk/mtls/README.md)
+     - [ ] [Async Queries](https://github.com/spiceai/cookbook/blob/trunk/async-queries/README.md)
+     - [ ] [Full-Text Search](https://github.com/spiceai/cookbook/blob/trunk/full-text-search/README.md)
+     - [ ] [Vectors on S3](https://github.com/spiceai/cookbook/blob/trunk/vectors/s3/README.md)
+     - [ ] [CQRS](https://github.com/spiceai/cookbook/blob/trunk/cqrs/README.md)
+     - [ ] [JSON Strings](https://github.com/spiceai/cookbook/blob/trunk/json_strings/README.md)
+     - [ ] [Hashed Partitioning](https://github.com/spiceai/cookbook/blob/trunk/hashed_partitioning/README.md)
+     - [ ] [Dual Dataset Registration](https://github.com/spiceai/cookbook/blob/trunk/acceleration/dual-dataset-registration/README.md)
+     - [ ] [Docker Deployment](https://github.com/spiceai/cookbook/blob/trunk/docker/README.md)
+     - [ ] [Localpod](https://github.com/spiceai/cookbook/blob/trunk/localpod/README.md)
 
 ## Focus Areas
 
