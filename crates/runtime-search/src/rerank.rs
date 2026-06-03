@@ -1553,7 +1553,7 @@ mod tests {
         }
     }
 
-    async fn make_rerank_session() -> DataFusionResult<(
+    fn make_rerank_session() -> DataFusionResult<(
         Arc<SessionContext>,
         Arc<RwLock<llms::rerank::RerankerModelStore>>,
         Arc<RwLock<ChatModelStore>>,
@@ -1580,7 +1580,7 @@ mod tests {
         );
         ctx.register_udf(
             RerankTableFunc::new(
-                weak_ctx.clone(),
+                std::sync::Weak::clone(&weak_ctx),
                 Arc::clone(&rerankers),
                 Arc::clone(&chat_models),
             )
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_bare_table_ordering_and_limit() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models) = make_rerank_session().await?;
+        let (ctx, rerankers, _chat_models) = make_rerank_session()?;
         setup_test_table(&ctx, &rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
 
         let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker', limit => 3)";
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_filter_pushdown_reduces_candidates() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models) = make_rerank_session().await?;
+        let (ctx, rerankers, _chat_models) = make_rerank_session()?;
         // 5 scores but only 2 rows match category='electronics' (ids 1,2).
         // MockRerank returns scores in positional order of the filtered input.
         setup_test_table(&ctx, &rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
