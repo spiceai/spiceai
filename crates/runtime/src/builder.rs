@@ -975,9 +975,13 @@ mod test {
 
     #[test]
     fn test_clamp_cayenne_compaction_memory_fraction() {
-        assert_eq!(clamp_cayenne_compaction_memory_fraction(0.0), 0.05);
-        assert_eq!(clamp_cayenne_compaction_memory_fraction(0.2), 0.2);
-        assert_eq!(clamp_cayenne_compaction_memory_fraction(1.0), 0.9);
+        for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
+            let actual = clamp_cayenne_compaction_memory_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]
