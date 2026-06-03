@@ -395,7 +395,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # branch: spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "119fc5df0568fa165154697eb9c6a302938fe848" } # branch: spiceai-58
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "db9fa021eb070b6a02abd2d0cb875468b81dc3ee" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
