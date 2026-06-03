@@ -1358,6 +1358,7 @@ mod tests {
     use datafusion::common::stats::Precision;
     #[cfg(not(windows))]
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::execution::object_store::ObjectStoreRegistry;
     #[cfg(not(windows))]
     use datafusion::logical_expr::Operator;
     use datafusion::optimizer::Analyzer;
@@ -1369,13 +1370,15 @@ mod tests {
     use super::{
         CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
         configure_hash_join_memory_limits, exact_join_filter_memory_limit,
-        runtime_env_with_effective_memory_limit, validate_compaction_memory_fraction,
+        runtime_env_with_effective_memory_limit_and_object_store_registry,
+        validate_compaction_memory_fraction,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
     use runtime_datafusion::join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES;
+    use runtime_object_store::registry::SpiceObjectStoreRegistry;
     #[cfg(not(windows))]
     use std::collections::HashMap;
     use std::sync::Arc;
