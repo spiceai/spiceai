@@ -396,7 +396,7 @@ static DUCKDB_TYPE_REWRITE_RULES: &[&dyn arrow_tools::type_rewrite::TypeRewriteR
     &arrow_tools::type_rewrite::DictionaryUnwrap,
     &arrow_tools::type_rewrite::IntervalToMonthDayNano,
     &arrow_tools::type_rewrite::NullToInt32,
-    &arrow_tools::type_rewrite::TimestampToMicrosecond,
+    &arrow_tools::type_rewrite::TimestampTzToMicrosecond,
 ];
 
 #[async_trait]
@@ -2396,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_schema_for_duckdb_timestamp_to_microsecond() {
+    fn normalize_schema_for_duckdb_timestamptz_to_microsecond() {
         use arrow::datatypes::TimeUnit;
         let mut cmd = cmd_with_schema(Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -2413,8 +2413,8 @@ mod tests {
         ])));
         super::normalize_schema_for_duckdb(&mut cmd).expect("normalize succeeds");
         let arrow = cmd.schema.as_arrow();
-        // DuckDB stores all TIMESTAMP/TIMESTAMPTZ at microsecond precision; the
-        // registered schema must match to avoid a RowConverter mismatch (#10627).
+        // DuckDB's TIMESTAMPTZ is always microsecond; the registered schema for a
+        // timezone-aware column must match to avoid a RowConverter mismatch (#10627).
         assert_eq!(
             arrow
                 .field_with_name("created_at")
@@ -2422,12 +2422,14 @@ mod tests {
                 .data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         );
+        // Timezone-naive timestamps keep nanosecond precision — DuckDB has a
+        // native TIMESTAMP_NS type and the runtime's _fetched_at column relies on it.
         assert_eq!(
             arrow
                 .field_with_name("local_at")
                 .expect("local_at field")
                 .data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
         );
     }
 
