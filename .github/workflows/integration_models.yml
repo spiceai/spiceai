@@ -274,6 +274,7 @@ jobs:
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
 
+      # NOTE: Step conditionals for secret-requiring AI tests (e.g. this one, OpenAI, workers, search, xAI UDFs, etc.) were added so the job completes cleanly with "skipped" steps on PRs (secrets are intentionally not available for security on external/fork PRs). The original fast-fail (`if [ -z ]; exit 1`) logic is preserved inside the `run:` when secrets *are* present in the environment. This is intentional and confirmed for schedule + workflow_dispatch (including `run_all_tests`). See Copilot review thread on merge commit for context; prevents spurious job failures unrelated to code changes.
       - name: Run AI UDF LEFT truncate test
         if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' && secrets.SPICE_SECRET_XAI_API_KEY != '' }}
         env:
