@@ -379,7 +379,17 @@ impl AcceleratorEngineRegistry {
             .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?;
 
         let partition_by = if acceleration_settings.partition_by.is_empty() {
-            vec![]
+            // Cayenne time-series tables (a `time_column` plus a
+            // `cayenne_time_partition: <granularity>` param) get an implicit
+            // `date_trunc` bucket partition so rows route to one contiguous
+            // file-set per time bucket — enabling time-range pruning and
+            // whole-bucket retention drops — reusing the standard partition
+            // machinery and its expression validation.
+            match derive_time_partition_by(accelerator.name(), acceleration_settings, source) {
+                Some(derived) => partition_by_expressions(&derived, &ctx, &df_schema)
+                    .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?,
+                None => vec![],
+            }
         } else {
             partition_by_expressions(&acceleration_settings.partition_by, &ctx, &df_schema)
                 .map_err(|e| Error::AccelerationCreationFailed { source: e.into() })?
@@ -397,6 +407,79 @@ impl AcceleratorEngineRegistry {
 
         Ok(table_provider)
     }
+}
+
+/// `date_trunc` units exposed for Cayenne time-series bucketing.
+const CAYENNE_TIME_PARTITION_GRANULARITIES: &[&str] =
+    &["minute", "hour", "day", "week", "month", "quarter", "year"];
+
+/// Derive an implicit `partition_by` for time-series Cayenne tables.
+///
+/// Opt-in via the `cayenne_time_partition: <granularity>` acceleration param.
+/// When set on a Cayenne dataset that has a `time_column` (and no explicit
+/// `partition_by`), rows route through the standard partition machinery bucketed
+/// by `date_trunc('<granularity>', <time_column>)`: one contiguous file-set per
+/// time bucket, which gives time-range pruning and whole-bucket retention drops.
+///
+/// Returns `None` (no implicit partitioning) for any non-Cayenne accelerator, an
+/// unset/blank/invalid granularity, or a dataset without a `time_column`.
+fn derive_time_partition_by(
+    accelerator_name: &str,
+    acceleration_settings: &acceleration::Acceleration,
+    source: Option<&dyn AccelerationSource>,
+) -> Option<Vec<spicepod::partitioning::PartitionedBy>> {
+    time_partition_spec(
+        accelerator_name,
+        acceleration_settings
+            .params
+            .get("cayenne_time_partition")
+            .map(String::as_str),
+        source.and_then(|s| s.time_column()),
+    )
+}
+
+/// Pure core of [`derive_time_partition_by`] — see that function's docs. Split
+/// out so the gate/granularity/`time_column` logic is unit-testable without
+/// constructing an [`AccelerationSource`].
+fn time_partition_spec(
+    accelerator_name: &str,
+    granularity_param: Option<&str>,
+    time_column: Option<&str>,
+) -> Option<Vec<spicepod::partitioning::PartitionedBy>> {
+    if accelerator_name != "cayenne" {
+        return None;
+    }
+
+    let granularity = granularity_param
+        .map(|g| g.trim().to_ascii_lowercase())
+        .filter(|g| !g.is_empty())?;
+
+    if !CAYENNE_TIME_PARTITION_GRANULARITIES.contains(&granularity.as_str()) {
+        tracing::warn!(
+            "Ignoring cayenne_time_partition='{granularity}': expected one of \
+             {CAYENNE_TIME_PARTITION_GRANULARITIES:?}; no implicit time partitioning applied"
+        );
+        return None;
+    }
+
+    let Some(time_column) = time_column else {
+        tracing::warn!(
+            "cayenne_time_partition='{granularity}' is set but the dataset has no time_column; \
+             skipping implicit time partitioning"
+        );
+        return None;
+    };
+
+    // Double-quote the identifier so column names with special characters parse;
+    // the value is a config-declared column name, evaluated against the schema.
+    let expression = format!("date_trunc('{granularity}', \"{time_column}\")");
+    tracing::info!(
+        "Cayenne time partitioning enabled: bucketing '{time_column}' by {granularity} ({expression})"
+    );
+    Some(vec![spicepod::partitioning::PartitionedBy {
+        name: format!("{time_column}_{granularity}_bucket"),
+        expression,
+    }])
 }
 
 /// A `DataAccelerator` knows how to read, write and create new tables.
@@ -935,6 +1018,85 @@ mod test {
         };
 
         assert!(!cayenne_pk_conflict_detection_none(&acceleration_settings));
+    }
+
+    #[test]
+    fn test_time_partition_spec_derives_date_trunc_bucket() {
+        let spec = time_partition_spec("cayenne", Some("day"), Some("event_time"))
+            .expect("a granularity + time_column should derive a partition");
+        assert_eq!(spec.len(), 1);
+        assert_eq!(spec[0].name, "event_time_day_bucket");
+        assert_eq!(spec[0].expression, "date_trunc('day', \"event_time\")");
+    }
+
+    #[test]
+    fn test_time_partition_spec_normalizes_granularity_case_and_whitespace() {
+        let spec = time_partition_spec("cayenne", Some("  HOUR "), Some("ts"))
+            .expect("granularity should normalize");
+        assert_eq!(spec[0].name, "ts_hour_bucket");
+        assert_eq!(spec[0].expression, "date_trunc('hour', \"ts\")");
+    }
+
+    #[test]
+    fn test_time_partition_spec_requires_cayenne_engine() {
+        assert!(time_partition_spec("duckdb", Some("day"), Some("ts")).is_none());
+    }
+
+    #[test]
+    fn test_time_partition_spec_requires_granularity_and_time_column() {
+        // No granularity param configured.
+        assert!(time_partition_spec("cayenne", None, Some("ts")).is_none());
+        // Blank granularity.
+        assert!(time_partition_spec("cayenne", Some("   "), Some("ts")).is_none());
+        // Granularity set, but the dataset has no time_column.
+        assert!(time_partition_spec("cayenne", Some("day"), None).is_none());
+    }
+
+    #[test]
+    fn test_time_partition_spec_rejects_unknown_granularity() {
+        assert!(time_partition_spec("cayenne", Some("fortnight"), Some("ts")).is_none());
+    }
+
+    #[test]
+    fn test_derive_time_partition_by_reads_param_and_requires_time_column() {
+        let acceleration_settings = Acceleration {
+            engine: Engine::Cayenne,
+            params: HashMap::from([(
+                "cayenne_time_partition".to_string(),
+                "day".to_string(),
+            )]),
+            ..Acceleration::default()
+        };
+        // No source → no time_column → no implicit partitioning even though the
+        // param is set.
+        assert!(derive_time_partition_by("cayenne", &acceleration_settings, None).is_none());
+    }
+
+    #[test]
+    fn test_time_partition_derived_expression_parses_and_validates() {
+        // The specs above assert the derived *string*; this asserts that string
+        // actually parses and passes partition validation against a real
+        // timestamp schema — the seam between Part C and the partition machinery
+        // (if `date_trunc` were rejected by the criteria, Part C would be broken
+        // in prod yet green in the string-only tests).
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(::arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]);
+        let df_schema = DFSchema::try_from(schema).expect("schema converts to DFSchema");
+        let ctx = SessionContext::new();
+
+        let derived = time_partition_spec("cayenne", Some("day"), Some("ts"))
+            .expect("cayenne + day + ts must derive a spec");
+        let exprs = partition_by_expressions(&derived, &ctx, &df_schema)
+            .expect("derived date_trunc('day', \"ts\") must parse and validate");
+
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(exprs[0].name, "ts_day_bucket");
     }
 
     #[tokio::test]
