@@ -1828,15 +1828,60 @@ mod tests {
     }
 
     fn test_client_identity_pems() -> (String, String) {
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "http-connector-client");
-        let mut params = rcgen::CertificateParams::default();
-        params.distinguished_name = dn;
-        let key_pair = rcgen::KeyPair::generate().expect("client key should be generated");
-        let cert = params
-            .self_signed(&key_pair)
-            .expect("client certificate should be generated");
-        (cert.pem(), key_pair.serialize_pem())
+        // Hardcoded RSA 2048 self-signed test client identity PEMs (generated with openssl).
+        // Using RSA (instead of rcgen default EC) ensures reqwest::Identity::from_pem succeeds
+        // reliably on all CI runners (linux + macOS native-tls/rustls backends) for the
+        // file-based and inline mTLS client identity coverage tests.
+        const CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIDIzCCAgugAwIBAgIUSb5DSV5Kh+Rx2CH3fTGYEPXpgNAwDQYJKoZIhvcNAQEL
+BQAwITEfMB0GA1UEAwwWc3BpY2UtaHR0cC10ZXN0LWNsaWVudDAeFw0yNjA2MDMw
+MzI3NTZaFw0yNjA2MDUwMzI3NTZaMCExHzAdBgNVBAMMFnNwaWNlLWh0dHAtdGVz
+dC1jbGllbnQwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDSPWF1GXtp
+etJ82kiVbJioCQw5AbFgVkn7KV6kQo+rrple26ZzVRy3gXPJlVF0735qT/YCGpGU
+VO6IscOtnWHOwy+3pEAZio51W7SnTa6uzJVjForrqmjhvwuO5BZH3vEBp1ZC+VQ2
+Udyp7yA8ikYfpV7odxP4kzwt4HTYFbnVJJBLZ5ndWDPu1dfs11s8aqHniafFqk5O
+v2R2JZmepWKv+ku1zFi0OD3C4JgDd+nLFHEao552IoRvhm18HBYaI2OYCvIrgPWl
+KcSwizlkGtlPSGhJZA24gwthi7EM3u022ilZuo/SMuFlNse/UO6zCNo++sj7I1HP
+XwiMjfRGJlDrAgMBAAGjUzBRMB0GA1UdDgQWBBQsxny7qIXIe1+xSAYZfqgh/GuF
+nzAfBgNVHSMEGDAWgBQsxny7qIXIe1+xSAYZfqgh/GuFnzAPBgNVHRMBAf8EBTAD
+AQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCw95aWRvo/Nx088wguPn87svdNjgm2DQ7g
++1LBNS3Xsjv+hLjLPf5J2R3b09+faqUIEVIAiulq5BlhDNMisq6tTo/SnAHz85Tu
+98/p56pnkS8LP63nr2HY0T59NZFu2+t8rlYgNriXPIW1I8ac9VmYsphQHcIKe+jf
+CmOcr/NE5DhpJMfg5oTRXQO1qOWobqhoB/6z26LpT6LOkkbU7NYTqgeHC+wQU5Ve
+y9JLAntUo6x4XB+dL/Ec6DCWZn0B+LB8MJkM/Sy2rj1KAb6rJoZpFAwHllGepqbI
+azFN2bb89uBcm6Xy+Xg2TX/bH6XEdHLx2AFlaaFMxYO+siI2IvNz
+-----END CERTIFICATE-----
+"#;
+        const KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDSPWF1GXtpetJ8
+2kiVbJioCQw5AbFgVkn7KV6kQo+rrple26ZzVRy3gXPJlVF0735qT/YCGpGUVO6I
+scOtnWHOwy+3pEAZio51W7SnTa6uzJVjForrqmjhvwuO5BZH3vEBp1ZC+VQ2Udyp
+7yA8ikYfpV7odxP4kzwt4HTYFbnVJJBLZ5ndWDPu1dfs11s8aqHniafFqk5Ov2R2
+JZmepWKv+ku1zFi0OD3C4JgDd+nLFHEao552IoRvhm18HBYaI2OYCvIrgPWlKcSw
+izlkGtlPSGhJZA24gwthi7EM3u022ilZuo/SMuFlNse/UO6zCNo++sj7I1HPXwiM
+jfRGJlDrAgMBAAECggEAAtb1Zzsa4aFyqmENNFRGxsfbtGfQP4VEc1hrTaJG7Bvs
+BZrHgSzkugEAavg4JQr/FOyGxB+1WHpbmaXdByezCua0BEthpxBDo4fDkhoiG+Md
+H9a0HA7HL+Izg8PGhHeZOPTlQ2GFJt6s/labUHYFqg1ckZzaIwD9TrLtB3/AbNKO
+8DwkdwsnPFKRT7bCZQLaN5bXVkLR7yADItg/LJawflk9QHsJmFK7zQglixK4Unzn
+RKneEFHMHytSeEZhaakwLB5T/S4zcBzBDLcdmi/k9cNChX1bqJyVO6Tyl8UlEX7q
+E69wnwTk0/OtCdyKrcXdtFWYacGK8YLkOZY9C/AhgQKBgQDuOrQ4PI/RUCm/HlmE
+wnczySouIjaLMcgk1Glv90BH+MKUm2HTIIj4gKmJ3RlVQaxVzcjQmNjKtTsYFqoR
+OpD/yifxmV1o6JiMFBOSn52BRJC7G0nLS28H+PJQWkrCMD2ZOz0w9YNIjRhqdma1
+JJux+K+DoQKfs/xkZ6uMVzv7SwKBgQDh7C4lmBn5gKb/RowI+rBxdhlzxGAn4ujx
+wzq2FEoRvU9t9W4zoQItYXa+jmfHM8vHGD0nOyULAKxDHqJ2sMdraIWeCbJ3l5wb
+JoqllL5fFPMNyZyHuiq7RjCeYPwJo/EEb31lySka+Jg8cyTVhI08dezkIxOnKNoZ
+a8cnVS7c4QKBgGvxP32Hu2aNGw1U9BzafGaDjNAwgmRZnyVI9alc78xso8XwDcg7
+IrTun2MvQm5F/o82Wfpid0CKE4ebpV1/Gvo7oBOxeQiy84PtCN1T42sSJT4SZEJw
+IJQNMcZE00Df2NlYZSaM5/p0rA55LZqARufCFczfpK+2PvNDohBJ6oy3AoGBAM0v
+9pGKXTzwDbwX1KNrG8lQ27j7B+HyAmNhTveD4enOqE9T8yzM9O9Gb9SN/c88Sb2f
+VBtHalNd3xZuwltOHzB8E67/W6mmds9p586PE3/DxSQmkhXrjVfdXdbaes4+qW2/
+3IIPe1fVpF5yrWeHJcddyzNAcF8HiV5BNvWQNinBAoGBAJRFBeOe15libL/IFI1W
+LimqRMVJsrPIIYJGEZjCVUCExqxKvhBt1ueVxomk+n6J+U8DYwMH4m4GF6YjTW6F
+BK4GgbAupmwJeJht3XVuLKbxPOj3F/Ubz/vBFScFa7o/mgLpfFOFY5509vOoEcki
+uGgYIHbi/F+GaiUPzDyqe5p9
+-----END PRIVATE KEY-----
+"#;
+        (CERT_PEM.to_string(), KEY_PEM.to_string())
     }
 
     fn assert_invalid_url_error(error: DataConnectorError) {
