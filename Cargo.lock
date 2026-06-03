@@ -16289,6 +16289,7 @@ dependencies = [
  "datafusion-federation",
  "datafusion-functions-json",
  "futures",
+ "insta",
  "itertools 0.14.0",
  "llms",
  "moka",

@@ -54,3 +54,6 @@ elasticsearch = ["search/elasticsearch"]
 models = []
 openapi = ["dep:utoipa"]
 s3_vectors = ["search/s3_vectors"]
+
+[dev-dependencies]
+insta.workspace = true

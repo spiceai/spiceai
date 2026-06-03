@@ -1550,15 +1550,12 @@ mod tests {
         let fruit_embedding_table =
             df_as_embedding_table(Arc::clone(&embedding_models), fruit_df.clone());
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         // decay_constant is made more aggressive in this query to further deprioritize
         // old results. The test will/should fail if you use the default of 0.01.
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'red crispy'), vector_search(foo, 'fruit'), time_column => 'picked_at', decay_constant => 0.1)"
         );
 
@@ -1601,7 +1598,7 @@ mod tests {
         );
         // right_fruit: id (1) with timestamp 1970-01-01
         let right_fruit = df_as_embedding_table(
-            &runtime,
+            Arc::clone(&embedding_models),
             fruit_df.clone().limit(0, Some(1))?.with_column(
                 "picked_at",
                 fruit_df.parse_sql_expr("to_timestamp(cast(0 as timestamp))")?,
@@ -1614,7 +1611,7 @@ mod tests {
 
         // Baseline: query against self to obtain fused score with recency decay
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(left_fruit, 'red crispy'), vector_search(right_fruit, 'red crispy'), k => 0, time_column => 'picked_at', decay_constant => 0.25)"
         );
 
@@ -1651,13 +1648,10 @@ mod tests {
         let fruit_df = make_fruit_dataframe(&ctx).await?;
         let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'yellow', rank_weight => 100), vector_search(foo, 'red', rank_weight => 10))"
         );
 
@@ -1677,13 +1671,10 @@ mod tests {
         let fruit_df = make_fruit_dataframe(&ctx).await?;
         let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
         );
 
@@ -1706,13 +1697,10 @@ mod tests {
             .with_column("meta_b.special", named_struct(vec![lit("k2"), lit(133.7)]))?;
         let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), k => 600.0)"
         );
 
@@ -1738,13 +1726,10 @@ mod tests {
 
         let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'Id', k => 600.0, time_column => 'pIckEd_AT')"
         );
 
@@ -1765,13 +1750,10 @@ mod tests {
         let fruit_df = fruit_df.clone().union(fruit_df)?;
         let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
 
-        runtime
-            .df
-            .ctx
-            .register_table("foo", fruit_embedding_table)?;
+        ctx.register_table("foo", fruit_embedding_table)?;
 
         let results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'crispy'), vector_search(foo, 'red'), join_key => 'id', k => 600.0)"
         );
 
@@ -1801,7 +1783,7 @@ mod tests {
         ctx.register_table("bar", no_fruit_table)?;
 
         let query_empty_red_results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by _fused_score desc"
         );
         let query_empty_red_content = extract_column!(
@@ -1812,7 +1794,7 @@ mod tests {
         let query_empty_red_score = query_empty_red_content.value(0);
 
         let query_red_empty_results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))"
         );
         let query_red_empty_content = extract_column!(
@@ -1828,7 +1810,7 @@ mod tests {
 
         // If timestamp column is missing due to FULL OUTER JOIN, ensure a score is still output
         let query_empty_red_recency_results = test_query!(
-            runtime,
+            ctx,
             "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red'), time_column => 'timestamp')"
         );
         let query_empty_red_recency_scores = extract_column!(
