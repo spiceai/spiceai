@@ -147,8 +147,8 @@ fn resolve_client_identity_params(
             set_field,
             missing_field,
         } => Error::IncompleteClientIdentity {
-            set_field: format!("spiceai_{}", set_field),
-            missing_field: format!("spiceai_{}", missing_field),
+            set_field: format!("spiceai_{set_field}"),
+            missing_field: format!("spiceai_{missing_field}"),
         },
         ClientIdentityConfigError::Ambiguous => Error::AmbiguousClientIdentity,
     })

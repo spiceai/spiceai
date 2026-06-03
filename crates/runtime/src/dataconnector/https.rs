@@ -602,7 +602,7 @@ impl Https {
     fn map_client_identity_config_error(
         &self,
         dataset: &Dataset,
-        error: ClientIdentityConfigError,
+        error: &ClientIdentityConfigError,
     ) -> DataConnectorError {
         match error {
             ClientIdentityConfigError::Incomplete {
@@ -692,7 +692,7 @@ impl Https {
             client_certificate_inline,
             client_key_inline,
         )
-        .map_err(|error| self.map_client_identity_config_error(dataset, error))
+        .map_err(|error| self.map_client_identity_config_error(dataset, &error))
     }
 
     async fn resolve_client_identity(
