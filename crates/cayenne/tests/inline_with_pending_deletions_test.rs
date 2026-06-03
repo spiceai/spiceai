@@ -31,10 +31,13 @@ use common::TestFixture;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::{col, lit};
+use datafusion_common::Result as DFResult;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -70,6 +73,23 @@ async fn setup_table(
     schema: Arc<Schema>,
     primary_key: Vec<String>,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
+    setup_table_with_config(
+        fixture,
+        table_name,
+        schema,
+        primary_key,
+        cayenne::metadata::VortexConfig::default(),
+    )
+    .await
+}
+
+async fn setup_table_with_config(
+    fixture: &TestFixture,
+    table_name: &str,
+    schema: Arc<Schema>,
+    primary_key: Vec<String>,
+    vortex_config: cayenne::metadata::VortexConfig,
+) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let table_options = CreateTableOptions {
         table_name: table_name.to_string(),
         schema: Arc::clone(&schema),
@@ -77,7 +97,7 @@ async fn setup_table(
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(primary_key))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: cayenne::metadata::VortexConfig::default(),
+        vortex_config,
     };
 
     let catalog: Arc<dyn MetadataCatalog> =
@@ -878,3 +898,167 @@ async fn test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl(
 }
 
 test_with_backends!(test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl);
+
+// =============================================================================
+// Concurrent upsert/scan stress test
+// =============================================================================
+
+/// Helper to run the duplicate-PK detection query once. Returns a pretty-printed sample
+/// of any duplicate composite keys, or `None` when every PK is unique.
+async fn scan_for_duplicate_pks(
+    ctx: &SessionContext,
+    table_name: &str,
+) -> DFResult<Option<String>> {
+    let sql = format!(
+        "SELECT k1, k2, COUNT(*) AS dup_count FROM {table_name} \
+         GROUP BY k1, k2 HAVING COUNT(*) > 1 ORDER BY dup_count DESC LIMIT 10"
+    );
+    let batches = ctx.sql(&sql).await?.collect().await?;
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if rows == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+    ))
+}
+
+/// Spawns several writers that continuously upsert a small hot keyset and several
+/// scanners that poll for duplicate PKs. Fails on the first duplicate observed.
+async fn assert_no_duplicate_pk_under_concurrent_upserts(
+    fixture: TestFixture,
+    inline_max_rows: usize,
+    table_name: &str,
+) -> TestResult<()> {
+    const NUM_KEYS: i64 = 512;
+    const NUM_WRITERS: i64 = 1;
+    const NUM_SCANNERS: usize = 8;
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    let schema = composite_pk_schema();
+    let vortex_config = cayenne::metadata::VortexConfig {
+        inline_max_rows,
+        ..cayenne::metadata::VortexConfig::default()
+    };
+    let (table, ctx) = setup_table_with_config(
+        &fixture,
+        table_name,
+        Arc::clone(&schema),
+        vec!["k1".into(), "k2".into()],
+        vortex_config,
+    )
+    .await?;
+
+    // Seed every key once so the keyset is fully live before concurrency starts.
+    for key in 0..NUM_KEYS {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![key])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )?;
+        insert_batch(&table, batch).await?;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let duplicate_sample = Arc::new(std::sync::Mutex::new(None::<String>));
+
+    // Writers: each upserts one hot key per commit, cycling through its own
+    // stripe of the keyset, to maximise the rate of concurrent new-snapshot
+    // publishes (and protected-snapshot churn) while scanners are mid-plan.
+    let mut writers = Vec::with_capacity(NUM_WRITERS as usize);
+    for writer_id in 0..NUM_WRITERS {
+        let table = Arc::clone(&table);
+        let schema = Arc::clone(&schema);
+        let stop = Arc::clone(&stop);
+        writers.push(tokio::spawn(async move {
+            let start = Instant::now();
+            let mut round: i64 = 1;
+            while !stop.load(Ordering::Relaxed) && start.elapsed() < DEADLINE {
+                let key = (writer_id + round * NUM_WRITERS) % NUM_KEYS;
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![key])),
+                        Arc::new(Int64Array::from(vec![0])),
+                        Arc::new(Int64Array::from(vec![round])),
+                    ],
+                )
+                .expect("build upsert batch");
+                common::insert_batch(&table, batch)
+                    .await
+                    .expect("upsert hot key");
+                round += 1;
+            }
+            // Signal scanners to wind down once the writers are finished.
+            stop.store(true, Ordering::Relaxed);
+        }));
+    }
+
+    // Scanners: poll for duplicate PKs; record the first hit and stop everyone.
+    let mut scanners = Vec::with_capacity(NUM_SCANNERS);
+    for _ in 0..NUM_SCANNERS {
+        let ctx = ctx.clone();
+        let stop = Arc::clone(&stop);
+        let duplicate_sample = Arc::clone(&duplicate_sample);
+        let table_name = table_name.to_string();
+        scanners.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(sample) = scan_for_duplicate_pks(&ctx, &table_name)
+                    .await
+                    .expect("duplicate-detection scan")
+                {
+                    *duplicate_sample.lock().expect("lock duplicate sample") = Some(sample);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    for writer in writers {
+        writer.await.expect("writer task");
+    }
+    for scanner in scanners {
+        scanner.await.expect("scanner task");
+    }
+
+    let detected = duplicate_sample
+        .lock()
+        .expect("lock duplicate sample")
+        .take();
+    assert!(
+        detected.is_none(),
+        "concurrent upsert/scan produced a duplicate primary key with inline_max_rows={inline_max_rows}; offending keys:\n{}",
+        detected.unwrap_or_default()
+    );
+
+    Ok(())
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
+async fn test_concurrent_upsert_scan_no_duplicate_pk_no_inline() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+        assert_no_duplicate_pk_under_concurrent_upserts(
+            fixture,
+            0,
+            "concurrent_upsert_scan_no_inline",
+        )
+    })
+    .await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
+async fn test_concurrent_upsert_scan_no_duplicate_pk_inline() -> TestResult<()> {
+    common::run_with_backend(common::BackendType::Sqlite, |fixture| {
+        assert_no_duplicate_pk_under_concurrent_upserts(
+            fixture,
+            DEFAULT_INLINE_MAX_ROWS,
+            "concurrent_upsert_scan_inline",
+        )
+    })
+    .await
+}
