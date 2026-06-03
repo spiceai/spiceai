@@ -203,7 +203,13 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
         primary_key: Some("id".to_string()),
         retention_sql: Some("DELETE FROM oom_events WHERE id >= 0".to_string()),
         retention_check_enabled: true,
-        retention_check_interval: Some("5m".to_string()),
+        // Must stay comfortably below the `wait_for_row_count` timeout below. The retention
+        // worker's `tokio::time::interval` fires its first tick immediately at startup -- before
+        // the full refresh has loaded the rows -- so that pass deletes nothing. A *subsequent*
+        // tick is what observes and deletes the loaded rows, so the interval has to be short
+        // enough for one to land inside the poll window. (An autofix once widened this to "5m",
+        // which pushed the next tick past the timeout and made the test fail at COUNT(*) = rows.)
+        retention_check_interval: Some("10s".to_string()),
         params: Some(Params::from_string_map(params)),
         ..Acceleration::default()
     });
