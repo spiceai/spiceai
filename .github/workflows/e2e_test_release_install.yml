@@ -70,11 +70,11 @@ jobs:
           if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
           else
-            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script.
-            # This correctly tests the proposed changes even for PRs from forks (where head_ref would not exist on upstream),
-            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation.
+            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script (via pipe, to match the curl | bash invocation style used for remote "from branch").
+            # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
+            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
             # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            bash -c "$(cat ./install/install.sh)"
+            cat ./install/install.sh | /bin/bash
           fi
 
       - name: add Spice bin to PATH
@@ -284,11 +284,11 @@ jobs:
           if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
           else
-            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script.
-            # This correctly tests the proposed changes even for PRs from forks (where head_ref would not exist on upstream),
-            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation.
+            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script (via pipe, to match the curl | bash invocation style used for remote "from branch").
+            # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
+            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
             # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            bash -c "$(cat ./install/install.sh)"
+            cat ./install/install.sh | /bin/bash
           fi
 
       - name: check installation
