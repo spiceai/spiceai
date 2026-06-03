@@ -923,7 +923,7 @@ async fn scan_for_duplicate_pks(
     ))
 }
 
-/// Spawns several writers that continuously upsert a small hot keyset and several
+/// Spawns a writer that continuously upserts a small hot keyset and several
 /// scanners that poll for duplicate PKs. Fails on the first duplicate observed.
 async fn assert_no_duplicate_pk_under_concurrent_upserts(
     fixture: TestFixture,
@@ -965,9 +965,9 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
     let stop = Arc::new(AtomicBool::new(false));
     let duplicate_sample = Arc::new(std::sync::Mutex::new(None::<String>));
 
-    // Writers: each upserts one hot key per commit, cycling through its own
-    // stripe of the keyset, to maximise the rate of concurrent new-snapshot
-    // publishes (and protected-snapshot churn) while scanners are mid-plan.
+    // The writer upserts one hot key per commit, cycling through the keyset to
+    // maximise the rate of new-snapshot publishes (and protected-snapshot churn)
+    // while scanners are mid-plan.
     let mut writers = Vec::new();
     for writer_id in 0..NUM_WRITERS {
         let table = Arc::clone(&table);

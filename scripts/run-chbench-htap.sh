@@ -125,7 +125,8 @@ SPICED_LOG="$SPICED_LOG" "$TESTOP" run htap \
   ${TERMINALS:+--terminals "$TERMINALS"} \
   ${CONCURRENCY:+--concurrency "$CONCURRENCY"} \
   --disable-progress-bars --scrape-spiced-metrics > "$LOG" 2>&1
-echo "TESTOP_EXIT=$?"
+testop_exit=$?
+echo "TESTOP_EXIT=$testop_exit"
 kill "$CPU_PID" "$QLAT_PID" ${OLTP_PID:+$OLTP_PID} 2>/dev/null
 
 strip() { sed -E 's/\x1b\[[0-9;]*m//g'; }
@@ -134,10 +135,11 @@ awk -F, 'NR>1{if($2>mc)mc=$2; if($3>mr)mr=$3; n++} END{printf "samples=%d peak_c
 echo "===== OLAP query latency over time (interval avg ms = d(sum)/d(count)) ====="
 awk -F, 'NR>1{ if(pc>0 && $2>pc){dq=$2-pc; ds=$3-ps; printf "t=%s done=%d avg=%.0fms\n",$1,dq,(dq>0?ds/dq:0)} pc=$2; ps=$3 }' "$QLAT" | tail -30
 echo "===== OLTP throughput over time (tx/sec), peak intervals ====="
-sort -t, -k3 -n "$OLTP" 2>/dev/null | tail -8
+awk -F, 'NR>1' "$OLTP" 2>/dev/null | sort -t, -k3 -n | tail -8
 awk -F, 'NR>1&&$3>m{m=$3}END{printf "peak_tx_per_sec=%.0f\n",m}' "$OLTP" 2>/dev/null
 echo "===== break signals ====="
 echo "panic=$(grep -ciE 'panic' "$LOG") oom=$(grep -ciE 'out of memory|cannot allocate|Killed' "$LOG") exhausted=$(grep -ci 'ResourcesExhausted' "$LOG")"
 echo "===== validation + OLTP report ====="
 strip < "$LOG" | grep -iE "verdict|all 7 tables|converged in|tpmc|throughput|transactions|OLTP workload error|match$" | tail -20
 echo "DONE -> $OUTDIR"
+exit "$testop_exit"

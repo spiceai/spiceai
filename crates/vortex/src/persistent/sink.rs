@@ -480,10 +480,21 @@ async fn run_shard_writer(
 
             let batch_bytes = batch_uncompressed_bytes(&batch)?;
             send_batch_to_active_writer(&mut active_writer, batch).await?;
+            let active_path = active_writer
+                .as_ref()
+                .ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Missing active file writer while updating sink byte counter"
+                    )
+                })?
+                .path
+                .as_ref();
             uncompressed_bytes_in_file = uncompressed_bytes_in_file
                 .checked_add(batch_bytes)
                 .ok_or_else(|| {
-                    exec_datafusion_err!("Uncompressed byte counter overflow for sink output file")
+                    exec_datafusion_err!(
+                        "Uncompressed byte counter overflow for sink output file {active_path}"
+                    )
                 })?;
 
             if let Some(target) = target {
