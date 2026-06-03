@@ -29,6 +29,8 @@ impl Read for MongoDBTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        self.table_provider(table_reference).await
+        // table-providers MongoDBTableFactory::table_provider now takes an optional declared
+        // schema (schema-merging support, #657); none is declared at this layer, so pass None.
+        self.table_provider(table_reference, None).await
     }
 }
