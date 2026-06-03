@@ -66,18 +66,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
+          # For the PR/push "from branch" case (no explicit input), fetch using the PR head's repo (to support forks)
+          # + sha (immutable, safe characters, no risk of shell injection via branch name in the URL).
+          # This ensures we test the *exact commit's* version of install.sh, gets clean LF endings from raw.githubusercontent,
+          # and works even if the branch doesn't exist on the upstream repo.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
           else
-            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script (via pipe, to match the curl | bash invocation style used for remote "from branch").
-            # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
-            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
-            # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            # Pipe through tr to strip CR (Windows git checkout + autocrlf can leave CRLF in the working tree for .sh files;
-            # the WSL mount then exposes CRLF to the Ubuntu shell, which can break script parsing for piped execution.
-            # The remote curl case gets clean LF from raw.githubusercontent.com.
-            cat ./install/install.sh | tr -d '\r' | /bin/bash
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
           fi
 
       - name: add Spice bin to PATH
@@ -283,18 +282,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
+          # For the PR/push "from branch" case (no explicit input), fetch using the PR head's repo (to support forks)
+          # + sha (immutable, safe characters, no risk of shell injection via branch name in the URL).
+          # This ensures we test the *exact commit's* version of install.sh, gets clean LF endings from raw.githubusercontent,
+          # and works even if the branch doesn't exist on the upstream repo. (Also avoids any CRLF issues from Windows checkout in the WSL mount.)
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
           else
-            # For pull_request / push events (triggered by changes to install scripts): execute the checked-out version of the script (via pipe, to match the curl | bash invocation style used for remote "from branch").
-            # This correctly tests the proposed changes even for PRs from forks (where a branch ref would not exist on upstream),
-            # and avoids using untrusted data (github.head_ref / github.ref_name from fork PRs) directly in shell script interpolation for URLs/commands.
-            # See: https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-            # Pipe through tr to strip CR (Windows git checkout + autocrlf can leave CRLF in the working tree for .sh files;
-            # the WSL mount then exposes CRLF to the Ubuntu shell, which can break script parsing for piped execution.
-            # The remote curl case gets clean LF from raw.githubusercontent.com.
-            cat ./install/install.sh | tr -d '\r' | /bin/bash
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
           fi
 
       - name: check installation
