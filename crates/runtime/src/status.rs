@@ -41,18 +41,27 @@ pub enum RuntimeReadyState {
     OnRegistration,
 }
 
+/// Per-component state stored in the `statuses` map.
+///
+/// The `notifier` is created lazily the first time a caller subscribes via
+/// `get_or_create_notifier`; components that are never waited on carry no
+/// watch-channel overhead.
+#[derive(Debug)]
+struct ComponentState {
+    status: ComponentStatus,
+    notifier: Option<watch::Sender<ComponentStatus>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeStatus {
-    /// Stores the current status of all components.
-    statuses: Arc<RwLock<HashMap<String, ComponentStatus>>>,
+    /// Stores the current status of all components with optional notifiers.
+    statuses: Arc<RwLock<HashMap<String, ComponentState>>>,
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
     /// Controls how runtime readiness is computed.
     ready_state: Arc<RwLock<RuntimeReadyState>>,
-    /// Per-component notifiers for status change subscriptions.
-    notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
     /// Cancellation token that is cancelled when the runtime is shutting down.
     /// Used to make background retry loops promptly exit on shutdown.
     shutdown_token: CancellationToken,
@@ -65,7 +74,6 @@ impl Default for RuntimeStatus {
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
-            notifiers: Arc::new(RwLock::new(HashMap::new())),
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -79,7 +87,6 @@ impl RuntimeStatus {
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
-            notifiers: Arc::new(RwLock::new(HashMap::new())),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -98,28 +105,37 @@ impl RuntimeStatus {
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
+    #[expect(clippy::needless_pass_by_value)]
     pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
-        let mut statuses = match self.statuses.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        statuses.insert(component_name.to_string(), status.clone());
+        let mut statuses = self
+            .statuses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if status == ComponentStatus::Ready {
-            let mut ever_ready = match self.ever_ready_components.write() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            ever_ready.insert(component_name.to_string());
+        match statuses.entry(component_name.to_string()) {
+            Entry::Occupied(mut e) => {
+                let state = e.get_mut();
+                state.status = status.clone();
+                if let Some(tx) = &state.notifier {
+                    // send_replace stores the new value even when no receivers exist.
+                    tx.send_replace(status.clone());
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(ComponentState {
+                    status: status.clone(),
+                    notifier: None,
+                });
+            }
         }
 
-        // Notify subscribers of the status change
-        let notifiers = self
-            .notifiers
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(sender) = notifiers.get(component_name) {
-            let _ = sender.send(status); // Ignore error if no receivers
+        drop(statuses);
+
+        if status == ComponentStatus::Ready {
+            self.ever_ready_components
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(component_name.to_string());
         }
     }
 
@@ -213,12 +229,8 @@ impl RuntimeStatus {
     /// Get the status of a worker
     #[must_use]
     pub fn worker_status(&self, name: &str) -> Option<ComponentStatus> {
-        let components = match self.statuses.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let full_name = format!("worker:{name}");
-        components.get(&full_name).cloned()
+        self.get_component_status(&full_name)
     }
 
     /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
@@ -273,7 +285,7 @@ impl RuntimeStatus {
             // Only components in ShuttingDown state block overall readiness.
             RuntimeReadyState::OnRegistration => statuses
                 .values()
-                .all(|status| !matches!(status, ComponentStatus::ShuttingDown)),
+                .all(|state| !matches!(state.status, ComponentStatus::ShuttingDown)),
         }
     }
 
@@ -284,7 +296,10 @@ impl RuntimeStatus {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        statuses.clone()
+        statuses
+            .iter()
+            .map(|(k, state)| (k.clone(), state.status.clone()))
+            .collect()
     }
 
     /// Returns the status of all registered models.
@@ -331,7 +346,10 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), v.clone())))
+            .filter_map(|(k, state)| {
+                k.strip_prefix(prefix)
+                    .map(|name| (name.into(), state.status.clone()))
+            })
             .collect()
     }
 
@@ -362,31 +380,35 @@ impl RuntimeStatus {
             .statuses
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        statuses.get(component_name).cloned()
+        statuses
+            .get(component_name)
+            .map(|state| state.status.clone())
     }
 
     /// Gets or creates a notifier for a component, returning a receiver to watch for status changes.
     fn get_or_create_notifier(&self, component_name: &str) -> watch::Receiver<ComponentStatus> {
-        // Read the current status BEFORE acquiring `notifiers.write()` so this
-        // path locks `statuses` then `notifiers` — the SAME order as
-        // `update_component_status`. Fetching the status while already holding
-        // the `notifiers` write lock is an ABBA lock-order inversion that
-        // deadlocks under concurrent dataset startup (observed wedging the
-        // runtime at scale when many datasets register + wait-for-ready at once).
-        let current = self
-            .get_component_status(component_name)
-            .unwrap_or(ComponentStatus::Initializing);
-
-        let mut notifiers = self
-            .notifiers
+        let mut statuses = self
+            .statuses
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        match notifiers.entry(component_name.to_string()) {
-            Entry::Occupied(e) => e.get().subscribe(),
+        match statuses.entry(component_name.to_string()) {
+            Entry::Occupied(mut e) => {
+                let state = e.get_mut();
+                if let Some(tx) = &state.notifier {
+                    tx.subscribe()
+                } else {
+                    let (tx, rx) = watch::channel(state.status.clone());
+                    state.notifier = Some(tx);
+                    rx
+                }
+            }
             Entry::Vacant(e) => {
-                let (tx, rx) = watch::channel(current);
-                e.insert(tx);
+                let (tx, rx) = watch::channel(ComponentStatus::Initializing);
+                e.insert(ComponentState {
+                    status: ComponentStatus::Initializing,
+                    notifier: Some(tx),
+                });
                 rx
             }
         }
