@@ -423,9 +423,12 @@ impl<'a> AppendMutationWriter<'a> {
             } = take_post_validation(&post_validation);
 
             let superseded = on_conflict_deletions.total_superseded();
-            self.table
+            let update = self
+                .table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
+            // Publish any deletion-cache update under the consistency lock. This path writes no protected snapshot
+            self.table.commit_on_conflict_publish(update, None).await;
 
             (rows, stats_acc, validated_keys, superseded)
         };
@@ -495,7 +498,8 @@ impl<'a> AppendMutationWriter<'a> {
 
         let superseded = on_conflict_deletions.total_superseded();
         let deletion_start = Instant::now();
-        self.table
+        let update = self
+            .table
             .apply_on_conflict_deletions(on_conflict_deletions)
             .await?;
         record_cayenne_write_phase(
@@ -511,9 +515,15 @@ impl<'a> AppendMutationWriter<'a> {
             .increment_sequence_number(self.table.table_id())
             .await?;
 
+        // Durably record the new snapshot's sequence before making it visible.
         self.table
-            .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
+            .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
             .await?;
+        // Atomically publish the deletion-cache update and the protected snapshot
+        // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
+        self.table
+            .commit_on_conflict_publish(update, Some(&new_snapshot_id))
+            .await;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok((rows, stats_acc, validated_keys, superseded))

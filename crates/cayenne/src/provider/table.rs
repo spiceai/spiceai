@@ -183,7 +183,7 @@ fn protected_snapshot_age(
     now: SystemTime,
 ) -> Option<Duration> {
     // Protected snapshot ids are generated as UUIDv7 values by
-    // `publish_written_snapshot_with_sequence`; imported or future ids that
+    // `commit_on_conflict_publish`; imported or future ids that
     // do not preserve that invariant are ignored for age-triggered maintenance
     // and still participate in count-triggered maintenance.
     let Ok(snapshot_uuid) = uuid::Uuid::parse_str(snapshot_id) else {
@@ -352,6 +352,21 @@ struct InlinedCache {
     /// Per-entry view used by the upsert-rewrite path to avoid a second
     /// metastore round-trip and re-decode.
     view: Arc<Vec<InlinedViewEntry>>,
+}
+
+/// Outcome of a durable inlined-data commit that has not yet been published to the in-memory caches.
+///
+/// Returned by [`CayenneTableProvider::commit_inlined_data_durable`] and
+/// consumed by [`CayenneTableProvider::publish_inlined_mutation`] under
+/// `scan_state_lock.write()`.
+struct InlinedDurableCommit {
+    /// Number of rows removed by the rewrite (superseded inlined copies).
+    removed_rows: i64,
+    /// Sequence assigned to newly appended inlined rows, or `None` when the
+    /// commit only rewrote/removed existing entries. When `Some`, publishing
+    /// advances `published_inlined_seq` to this value to make the appended rows
+    /// visible.
+    published_seq: Option<i64>,
 }
 
 /// Result of a Cayenne CDC append write.
@@ -1278,6 +1293,14 @@ pub struct CayenneTableProvider {
     /// after Stage A, then Stage B takes this lock for move + listing cache
     /// invalidation so readers still observe one ordered visibility boundary.
     visibility_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Makes the deletion-view, protected-snapshots, and inlined-data
+    /// visibility appear to change atomically to scans.
+    ///
+    /// Scans take **read** while capturing the `(deletion_snapshot,
+    /// protected_snapshots, inlined_batches)` tuple (a few `ArcSwap`/atomic
+    /// loads plus a cache-hit inlined read); writers take **write** around the
+    /// matching publish.
+    scan_state_lock: Arc<tokio::sync::RwLock<()>>,
     /// Optional object store configuration for remote storage (e.g., S3 Express One Zone).
     /// When set, this object store is registered with `SessionContext` for data file operations.
     object_store_config: Option<crate::metadata::ObjectStoreConfig>,
@@ -1333,6 +1356,15 @@ pub struct CayenneTableProvider {
     /// `clear_inlined_metadata_after_checkpoint`. [`Self::inlined_cache`] is
     /// valid only when its stored generation matches this counter.
     inlined_generation: Arc<AtomicU64>,
+    /// Published inline-visibility watermark: the highest inlined-entry
+    /// `sequence_number` whose in-memory visibility has been published.
+    ///
+    /// A freshly committed inlined entry is durably written to the catalog with
+    /// a sequence strictly greater than this watermark, but stays *invisible* to
+    /// scans until the writer advances the watermark to that sequence under
+    /// `scan_state_lock.write()` — atomically with the paired file
+    /// deletion-cache update.
+    published_inlined_seq: Arc<AtomicI64>,
     /// Cached deserialized inline-memtable batches.
     ///
     /// A generation-matched hit in [`Self::read_inlined_batches`] avoids the
@@ -1972,6 +2004,21 @@ impl OnConflictDeletions {
             + self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len()
     }
+}
+
+/// `apply_on_conflict_deletions` performs all durable deletion-vector I/O but
+/// returns the computed in-memory deletion-cache update instead of storing it,
+/// so the store can be committed synchronously — together with the protected
+/// snapshot publish — under a single `scan_state_lock.write()`. This keeps
+/// the scan-excluding guard held for microseconds rather than across the
+/// deletion-vector writes.
+pub(crate) enum OnConflictUpdate {
+    /// No key-based deletion-cache change (pure position deletes or no deletes).
+    None,
+    /// New `Int64Pk` deletion snapshot to publish.
+    Int64Pk(Arc<Int64PkDeletionSnapshot>),
+    /// New `RowConverterBased` deletion snapshot to publish.
+    RowConverter(Arc<RowConverterDeletionSnapshot>),
 }
 
 #[derive(Clone)]
@@ -3487,6 +3534,13 @@ impl CayenneTableProvider {
                 .await?;
         let inlined_row_count = catalog.get_inlined_data_count(&table_id).await?;
 
+        // Every inlined entry persisted at open time is already published, and
+        // all have `sequence_number <= current_sequence_number`. Seed the
+        // visibility watermark there so existing inlined data is visible while
+        // future inline writes (which commit at a strictly higher sequence) stay
+        // gated until published.
+        let initial_inlined_seq = table_metadata.current_sequence_number;
+
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
 
         // Register the S3 object store in the shared RuntimeEnv once during
@@ -3531,6 +3585,7 @@ impl CayenneTableProvider {
             pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             visibility_lock: Arc::new(tokio::sync::Mutex::new(())),
+            scan_state_lock: Arc::new(tokio::sync::RwLock::new(())),
             object_store_config,
             object_store_registered_runtime_envs: Arc::new(ParkingMutex::new(
                 object_store_registered_runtime_envs,
@@ -3544,6 +3599,7 @@ impl CayenneTableProvider {
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
+            published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             inlined_cache: Arc::new(ArcSwap::new(Arc::new(InlinedCache {
                 // Sentinel: first `read_inlined_batches` / `cached_inlined_view` call always misses.
                 generation: u64::MAX,
@@ -3684,18 +3740,14 @@ impl CayenneTableProvider {
             )
             .await?;
 
-        // Get the maximum delete sequence from current deletions.
-        // This snapshot is protected from deletions with seq <= max_delete_seq.
-        let max_delete_seq = self.get_max_delete_sequence();
-
-        // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
-        // We do NOT clear old protected snapshots because they may contain data that's still valid.
-        // Each protected snapshot applies its own partial deletion filter based on when it was created.
-        self.protected_snapshots.rcu(|current| {
-            let mut new_map = (**current).clone();
-            new_map.insert(new_snapshot_id.clone(), max_delete_seq);
-            Arc::new(new_map)
-        });
+        // Publish the protected snapshot under `scan_state_lock` so scans that
+        // capture the (deletion view, protected map) pair under `.read()` observe a
+        // consistent view.
+        {
+            let _view_guard = self.scan_state_lock.write().await;
+            let max_delete_seq = self.get_max_delete_sequence();
+            self.commit_protected_snapshot(&new_snapshot_id, max_delete_seq);
+        }
 
         // The listing table stays as-is. Protected snapshots are handled at scan time.
         // See the doc comment above for why we do NOT update current_snapshot.
@@ -3703,7 +3755,14 @@ impl CayenneTableProvider {
         Ok((total_rows, stats_acc))
     }
 
-    pub(crate) async fn publish_written_snapshot_with_sequence(
+    /// Durably record a newly written snapshot's sequence number in the catalog
+    /// (syncing the snapshot directory first on local filesystems).
+    ///
+    /// This does NOT publish the in-memory protected-snapshot entry — that is
+    /// committed by the caller via [`Self::commit_on_conflict_publish`] so the
+    /// deletion-view store and the protected insert flip atomically under
+    /// `scan_state_lock`.
+    pub(crate) async fn record_written_snapshot_sequence(
         &self,
         snapshot_id: &str,
         sequence_number: i64,
@@ -3717,13 +3776,6 @@ impl CayenneTableProvider {
         self.catalog
             .set_snapshot_sequence(&self.table_metadata.table_id, snapshot_id, sequence_number)
             .await?;
-
-        let max_delete_seq = self.get_max_delete_sequence();
-        self.protected_snapshots.rcu(|current| {
-            let mut new_map = (**current).clone();
-            new_map.insert(snapshot_id.to_string(), max_delete_seq);
-            Arc::new(new_map)
-        });
 
         Ok(())
     }
@@ -3983,6 +4035,7 @@ impl CayenneTableProvider {
             pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             visibility_lock: Arc::clone(&self.visibility_lock),
+            scan_state_lock: Arc::clone(&self.scan_state_lock),
             object_store_config: self.object_store_config.clone(),
             object_store_registered_runtime_envs: Arc::clone(
                 &self.object_store_registered_runtime_envs,
@@ -3997,6 +4050,7 @@ impl CayenneTableProvider {
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             inlined_generation: Arc::clone(&self.inlined_generation),
+            published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             inlined_cache: Arc::clone(&self.inlined_cache),
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
@@ -5642,12 +5696,28 @@ impl CayenneTableProvider {
         data: Vec<InlinedData>,
         appended_rows: usize,
     ) -> CatalogResult<()> {
-        if rewrite.is_empty() && data.is_empty() {
+        let Some(commit) = self.commit_inlined_data_durable(rewrite, data).await? else {
             return Ok(());
+        };
+        self.publish_inlined_mutation(appended_rows, commit.removed_rows, commit.published_seq);
+        Ok(())
+    }
+
+    /// Durably commit an inlined-data mutation to the catalog WITHOUT publishing
+    /// the in-memory visibility change. Returns `Some(InlinedDurableCommit)`
+    /// when a commit occurred, or `None` when there was nothing to commit.
+    async fn commit_inlined_data_durable(
+        &self,
+        rewrite: InlinedDataRewrite,
+        data: Vec<InlinedData>,
+    ) -> CatalogResult<Option<InlinedDurableCommit>> {
+        if rewrite.is_empty() && data.is_empty() {
+            return Ok(None);
         }
 
         let removed_rows = rewrite.removed_rows;
-        self.catalog
+        let published_seq = self
+            .catalog
             .commit_inlined_mutation(
                 &self.table_metadata.table_id,
                 rewrite.updated_data,
@@ -5656,16 +5726,32 @@ impl CayenneTableProvider {
             )
             .await?;
 
+        Ok(Some(InlinedDurableCommit {
+            removed_rows: i64::try_from(removed_rows).unwrap_or(i64::MAX),
+            published_seq,
+        }))
+    }
+
+    /// Publish a previously-durable inlined mutation into the in-memory caches:
+    /// adjust the cached live-row count and bump `inlined_generation` so the
+    /// next scan rebuilds the inlined view.
+    fn publish_inlined_mutation(
+        &self,
+        appended_rows: usize,
+        removed_rows: i64,
+        published_seq: Option<i64>,
+    ) {
         let appended_rows = i64::try_from(appended_rows).unwrap_or(i64::MAX);
-        let removed_rows = i64::try_from(removed_rows).unwrap_or(i64::MAX);
         self.adjust_cached_inlined_row_count(appended_rows.saturating_sub(removed_rows));
-
-        // Invalidate the inlined-batch cache. The Release ordering guarantees
-        // that any concurrent `read_inlined_batches` Acquire-loading the new
-        // generation will observe all catalog changes committed above.
+        // Advance the visibility watermark BEFORE bumping the generation: the
+        // generation bump's `Release` store (paired with the Acquire load in
+        // `read_inlined_batches`) publishes the watermark store, so a scan that
+        // observes the new generation also observes the advanced watermark and
+        // includes the freshly appended entry.
+        if let Some(seq) = published_seq {
+            self.published_inlined_seq.fetch_max(seq, Ordering::Release);
+        }
         self.inlined_generation.fetch_add(1, Ordering::Release);
-
-        Ok(())
     }
 
     /// Convert typed PK values into raw key bytes for deletion vector writing.
@@ -5755,7 +5841,7 @@ impl CayenneTableProvider {
     pub(crate) async fn apply_on_conflict_deletions(
         &self,
         on_conflict_deletions: OnConflictDeletions,
-    ) -> CatalogResult<()> {
+    ) -> CatalogResult<OnConflictUpdate> {
         let OnConflictDeletions {
             delete_specs,
             deleted_pk_i64,
@@ -5770,7 +5856,7 @@ impl CayenneTableProvider {
             !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
 
         if !has_file_deletions && !has_inlined_deletions {
-            return Ok(());
+            return Ok(OnConflictUpdate::None);
         }
 
         let inlined_rewrite = if has_inlined_deletions {
@@ -5842,7 +5928,7 @@ impl CayenneTableProvider {
         // position-delete batch has no key lists, so skip the entire
         // sequence-reservation + key-vector path.
         if deleted_pk_i64.is_empty() && deleted_row_keys.is_empty() {
-            return Ok(());
+            return Ok(OnConflictUpdate::None);
         }
 
         // Reserve two consecutive sequence numbers in one metastore round-trip.
@@ -5877,13 +5963,15 @@ impl CayenneTableProvider {
             )
             .await?
         else {
-            return Ok(());
+            return Ok(OnConflictUpdate::None);
         };
 
-        // Update the appropriate cache based on deletion strategy.
+        // Build the appropriate deletion-cache update based on deletion strategy.
         // This follows Iceberg's pattern where deletes are tracked by PK + sequence number.
         // For upserts, we also update insert records so the new row isn't filtered out.
-        match &self.pk_deletion_strategy {
+        // The update is returned (not stored) so it can be committed atomically
+        // with the protected-snapshot publish under `scan_state_lock`.
+        let update = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
             } => {
@@ -5900,20 +5988,19 @@ impl CayenneTableProvider {
                     .insert_records
                     .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
                 let insert_count = updated_inserts.len();
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_indices(
-                    updated_deleted,
-                    updated_inserts,
-                )));
-                self.refresh_deletion_memory_accounting();
-
                 tracing::debug!(
-                    "Updated Int64 PK deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
+                    "Prepared Int64 PK deletion cache update with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
                     deleted_count,
                     delete_sequence,
                     insert_count,
                     insert_sequence,
                     self.table_metadata.table_name
                 );
+
+                OnConflictUpdate::Int64Pk(Arc::new(Int64PkDeletionSnapshot::from_indices(
+                    updated_deleted,
+                    updated_inserts,
+                )))
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
@@ -5942,20 +6029,18 @@ impl CayenneTableProvider {
                     .insert_records
                     .extend_max(written_keys.into_iter().map(|key| (key, insert_sequence)));
                 let insert_count = updated_inserts.len();
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
-                    updated_deleted,
-                    updated_inserts,
-                )));
-                self.refresh_deletion_memory_accounting();
-
                 tracing::debug!(
-                    "Updated RowConverter deletion cache with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
+                    "Prepared RowConverter deletion cache update with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
                     deleted_count,
                     delete_sequence,
                     insert_count,
                     insert_sequence,
                     self.table_metadata.table_name
                 );
+
+                OnConflictUpdate::RowConverter(Arc::new(
+                    RowConverterDeletionSnapshot::from_indices(updated_deleted, updated_inserts),
+                ))
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
                 // This branch should never be reached - position-based tables don't have PKs
@@ -5965,18 +6050,87 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 );
             }
-        }
+        };
 
-        Ok(())
+        Ok(update)
+    }
+
+    /// Synchronously store a deferred on-conflict deletion-cache update into the
+    /// live deletion cache. MUST be called while holding
+    /// `scan_state_lock.write()` when paired with a protected-snapshot publish
+    /// so concurrent scans observe both changes atomically.
+    fn commit_on_conflict_update(&self, update: OnConflictUpdate) {
+        match update {
+            OnConflictUpdate::None => {}
+            OnConflictUpdate::Int64Pk(snapshot) => {
+                if let PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                } = &self.pk_deletion_strategy
+                {
+                    deletion_snapshot.store(snapshot);
+                }
+                self.refresh_deletion_memory_accounting();
+            }
+            OnConflictUpdate::RowConverter(snapshot) => {
+                if let PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                } = &self.pk_deletion_strategy
+                {
+                    deletion_snapshot.store(snapshot);
+                }
+                self.refresh_deletion_memory_accounting();
+            }
+        }
+    }
+
+    /// Synchronously insert a protected-snapshot entry. Callers that pair this
+    /// with a deletion-view change MUST hold `scan_state_lock.write()` so
+    /// scans never observe the new protected snapshot with a stale deletion view.
+    fn commit_protected_snapshot(&self, snapshot_id: &str, threshold: i64) {
+        self.protected_snapshots.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(snapshot_id.to_string(), threshold);
+            Arc::new(new_map)
+        });
+    }
+
+    /// Atomically publish an on-conflict deletion update and, when
+    /// `protected_snapshot_id` is set, the protected-snapshot entry for a newly
+    /// written snapshot — both under a single `scan_state_lock.write()` guard.
+    ///
+    /// Only the synchronous in-memory commits run under the guard; all durable
+    /// I/O (deletion vectors, sequence records) is performed by the caller
+    /// beforehand, so the write lock is held for microseconds. When there is no
+    /// protected snapshot to publish and the deletion view is unchanged (the hot
+    /// pure-append case) the guard is skipped entirely.
+    pub(crate) async fn commit_on_conflict_publish(
+        &self,
+        update: OnConflictUpdate,
+        protected_snapshot_id: Option<&str>,
+    ) {
+        if protected_snapshot_id.is_none() && matches!(update, OnConflictUpdate::None) {
+            return;
+        }
+        let _view_guard = self.scan_state_lock.write().await;
+        self.commit_on_conflict_update(update);
+        if let Some(snapshot_id) = protected_snapshot_id {
+            // Compute the protection threshold AFTER the deletion view includes the
+            // just-applied on-conflict delete, so the new snapshot is protected from
+            // that delete (and all earlier ones) and the replacement row stays visible.
+            let max_delete_seq = self.get_max_delete_sequence();
+            self.commit_protected_snapshot(snapshot_id, max_delete_seq);
+        }
     }
 
     /// Persist file-backed PK deletion vectors to disk for durability.
     ///
-    /// Called after replacement data has been inlined and the in-memory deletion
-    /// cache has already been updated (by [`Self::update_file_deletion_cache`]
+    /// Called during an inline upsert after the replacement data has been
+    /// durably committed but BEFORE the in-memory deletion cache is published
+    /// (by [`Self::update_file_deletion_cache`] under `scan_state_lock`
     /// inside [`Self::try_inline_batches_with_inlined_deletions`]). This method
     /// writes the durable deletion vectors and commits them to the catalog so
-    /// that the deletions survive a restart.
+    /// that the deletions survive a restart; it does not touch the in-memory
+    /// cache, so its ordering relative to the cache publish is irrelevant.
     pub(crate) async fn persist_file_deletions_after_inlined_insert(
         &self,
         deleted_pk_i64: &[i64],
@@ -5993,7 +6147,8 @@ impl CayenneTableProvider {
 
         // Commit delete files only — no insert records (inline data bypasses
         // the deletion filter, so no protected insert sequence is needed).
-        // The in-memory deletion cache was already updated by the caller.
+        // The in-memory deletion cache is published separately by the caller
+        // under `scan_state_lock.write()`.
         self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0)
             .await?;
 
@@ -7761,23 +7916,26 @@ impl CayenneTableProvider {
             .await?;
         let removed_rows = rewrite.removed_rows;
 
-        self.commit_inlined_data_mutation(
-            rewrite,
-            vec![InlinedData::pending_catalog_insert(
-                self.table_metadata.table_id.clone(),
-                None,
-                ipc_bytes,
-                i64::try_from(total_rows).unwrap_or(i64::MAX),
-            )],
-            total_rows,
-        )
-        .await?;
+        // Durably commit the inlined data WITHOUT publishing visibility yet, so
+        // making the new inlined row visible and hiding the file-backed row it
+        // supersedes can be published together under one
+        // `scan_state_lock.write()`.
+        let inlined_commit = self
+            .commit_inlined_data_durable(
+                rewrite,
+                vec![InlinedData::pending_catalog_insert(
+                    self.table_metadata.table_id.clone(),
+                    None,
+                    ipc_bytes,
+                    i64::try_from(total_rows).unwrap_or(i64::MAX),
+                )],
+            )
+            .await?;
 
-        // Update in-memory deletion cache and persist deletion vectors for
-        // file-backed PKs replaced by the inlined data.
+        // Persist file-backed deletion vectors durably BEFORE the in-memory
+        // publish, so all durable I/O is complete by the time the write guard is
+        // taken and the guard is held only for the synchronous cache flips.
         if let Some(delete_seq) = delete_seq {
-            self.update_file_deletion_cache(file_deleted_pk_i64, file_deleted_row_keys, delete_seq);
-
             self.persist_file_deletions_after_inlined_insert(
                 file_deleted_pk_i64,
                 file_deleted_row_keys,
@@ -7785,6 +7943,28 @@ impl CayenneTableProvider {
             )
             .await
             .map_err(|err| Error::Catalog { source: err })?;
+        }
+
+        // Atomically publish both in-memory visibility changes: make the new inlined row visible (generation bump) and hide the superseded
+        // file-backed row (deletion cache). Scans capture the (inlined view, deletion view) pair under `scan_state_lock.read()`,
+        // so committing both halves here under one `.write()` closes the duplicate-PK window.
+        // Only synchronous in-memory work runs under the guard; all durable I/O above is already complete.
+        {
+            let _view_guard = self.scan_state_lock.write().await;
+            if let Some(commit) = inlined_commit {
+                self.publish_inlined_mutation(
+                    total_rows,
+                    commit.removed_rows,
+                    commit.published_seq,
+                );
+            }
+            if let Some(delete_seq) = delete_seq {
+                self.update_file_deletion_cache(
+                    file_deleted_pk_i64,
+                    file_deleted_row_keys,
+                    delete_seq,
+                );
+            }
         }
 
         tracing::debug!(
@@ -7883,9 +8063,18 @@ impl CayenneTableProvider {
         let view: Vec<InlinedViewEntry> = if inlined.is_empty() {
             Vec::new()
         } else {
+            // Visibility watermark: entries durably committed but not yet
+            // published (sequence strictly greater than the watermark) are
+            // skipped so an in-flight inline write's freshly committed row stays
+            // hidden until its writer publishes the paired file deletion-cache
+            // update under `scan_state_lock`.
+            let watermark = self.published_inlined_seq.load(Ordering::Acquire);
             let inlined_deletions = self.load_inlined_deletion_maps().await?;
             let mut view = Vec::with_capacity(inlined.len());
             for entry in inlined {
+                if entry.sequence_number > watermark {
+                    continue;
+                }
                 let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
                     .map_err(|e| super::Error::Arrow { source: e })?;
                 let mut filtered_batches = Vec::with_capacity(entry_batches.len());
@@ -8873,12 +9062,10 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         pk_indices_in_projection: &[usize],
+        protected_snapshots: Arc<HashMap<String, i64>>,
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
-        // Wait-free Arc::clone — the inner HashMap is shared, not cloned,
-        // so the scan does not pay an O(N) String + i64 clone per call.
-        let protected_snapshots = self.protected_snapshots.load_full();
-
+        // `protected_snapshots` is captured by the caller together with the deletion snapshot
         if protected_snapshots.is_empty() {
             return Ok(Vec::new());
         }
@@ -9664,11 +9851,39 @@ impl TableProvider for CayenneTableProvider {
             self.register_object_store_for_runtime(state.runtime_env(), config);
         }
 
-        // Capture one immutable deletion snapshot for this scan and use it for
-        // both projection planning and filter construction. This avoids racing a
-        // later cache publish between the decision to include PK columns and the
-        // decision to wrap the plan with a PK deletion filter.
-        let deletion_snapshot = self.pk_deletion_snapshot();
+        // Warm the inlined cache before taking `scan_state_lock` so the read under the lock is a cheap cache hit
+        if self.cached_inlined_row_count() > 0 {
+            self.read_inlined_batches().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to warm inlined data cache for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
+        }
+
+        // Capture the (deletion view, protected snapshot map, inlined data)
+        // triple atomically under `scan_state_lock.read()`
+        let (deletion_snapshot, protected_map, inlined_batches) = {
+            let _view_guard = self.scan_state_lock.read().await;
+            // Read any inlined data while the guard is held so it is consistent
+            // with the captured deletion view. The warm-up above makes this a
+            // cache hit in the common case.
+            let inlined_batches = if self.cached_inlined_row_count() > 0 {
+                self.read_inlined_batches().await.map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to read inlined data for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?
+            } else {
+                Vec::new()
+            };
+            (
+                self.pk_deletion_snapshot(),
+                self.protected_snapshots.load_full(),
+                inlined_batches,
+            )
+        };
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
@@ -9814,23 +10029,14 @@ impl TableProvider for CayenneTableProvider {
                 scan_filters,
                 limit,
                 &pk_indices_in_projection,
+                protected_map,
                 &deletion_snapshot,
             )
             .await?;
 
-        // Read any inlined data and create a MemoryExec plan for it. The cached
-        // row count is maintained on writes/checkpoints, so the common fully
-        // materialized path avoids a metastore read on every scan.
-        let inlined_batches = if self.cached_inlined_row_count() > 0 {
-            self.read_inlined_batches().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to read inlined data for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?
-        } else {
-            Vec::new()
-        };
+        // Build a MemoryExec plan for the inlined data captured under the
+        // read guard above (consistent with the deletion view used for the
+        // file-backed deletion filter).
         let inlined_plan: Option<Arc<dyn ExecutionPlan>> = if inlined_batches.is_empty() {
             None
         } else {

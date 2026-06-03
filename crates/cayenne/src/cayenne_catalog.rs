@@ -2076,9 +2076,9 @@ impl MetadataCatalog for CayenneCatalog {
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
-    ) -> CatalogResult<()> {
+    ) -> CatalogResult<Option<i64>> {
         if updated_data.is_empty() && deleted_inlined_ids.is_empty() && data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         for updated in &updated_data {
@@ -2123,19 +2123,38 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
+            // Sequence assigned to the appended `data` rows (all share one
+            // sequence per call).
+            let mut assigned_sequence: Option<i64> = None;
+
             if sequence_increment > 0 {
-                tx.execute(ExecuteParams {
-                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2",
-                    params: vec![
-                        MetastoreValue::Integer(sequence_increment),
-                        MetastoreValue::Text(table_id.to_string()),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
+                let row_values = tx
+                    .query_row_values(QueryRowParams {
+                        sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2 RETURNING current_sequence_number",
+                        params: vec![
+                            MetastoreValue::Integer(sequence_increment),
+                            MetastoreValue::Text(table_id.to_string()),
+                        ],
+                    })
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to execute inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    })?;
+                let value =
+                    row_values
+                        .first()
+                        .ok_or_else(|| CatalogError::InvalidOperationNoSource {
+                            message: "Inline mutation sequence update returned no columns"
+                                .to_string(),
+                        })?;
+                assigned_sequence =
+                    Some(
+                        i64::from_value(value).map_err(|e| CatalogError::InvalidOperation {
+                            message: "Failed to parse inline mutation sequence number".to_string(),
+                            source: Box::new(e),
+                        })?,
+                    );
             }
 
             for updated in &updated_data {
@@ -2202,7 +2221,7 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             match tx.commit().await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(assigned_sequence),
                 Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
                     let delay = retry_backoff_delay(attempt);
                     tracing::debug!(
