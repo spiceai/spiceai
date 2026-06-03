@@ -14,20 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-/// Column name for the embedding of a given source column.
-macro_rules! embedding_col {
-    ($col:expr) => {
-        format!("{}_embedding", $col)
-    };
-}
-
-/// Column name for the offset of a given source column.
-macro_rules! offset_col {
-    ($col:expr) => {
-        format!("{}_offset", $col)
-    };
-}
-
 use datafusion::catalog::TableProvider;
 use datafusion::common::{Column, UnnestOptions};
 use datafusion::datasource::{DefaultTableSource, ViewTable};
@@ -47,6 +33,8 @@ use search::generation::CandidateGeneration;
 use search::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME};
 use spicepod::component::embeddings::EmbeddingAggregation;
 use std::sync::Arc;
+
+use crate::{embedding_col, offset_col};
 
 // Distance column name for the vector search query.
 // static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";

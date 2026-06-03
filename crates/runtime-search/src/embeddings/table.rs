@@ -44,17 +44,6 @@ use super::construct_chunker;
 use super::execution_plan::EmbeddingTableExec;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
 
-macro_rules! embedding_col {
-    ($col:expr) => {
-        format!("{}_embedding", $col)
-    };
-}
-
-macro_rules! offset_col {
-    ($col:expr) => {
-        format!("{}_offset", $col)
-    };
-}
 use spicepod::component::embeddings::{
     ColumnEmbeddingConfig, EmbeddingAggregation, MULTI_VECTOR_MAX_ELEMENTS_DEFAULT,
     MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP,

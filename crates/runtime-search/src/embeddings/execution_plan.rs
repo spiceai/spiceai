@@ -47,17 +47,6 @@ use std::{any::Any, sync::Arc, thread};
 use super::EmbeddingModelStore;
 use crate::udtf::{EmbeddingColumnConfig, EmbeddingInputMode};
 
-macro_rules! embedding_col {
-    ($col:expr) => {
-        format!("{}_embedding", $col)
-    };
-}
-
-macro_rules! offset_col {
-    ($col:expr) => {
-        format!("{}_offset", $col)
-    };
-}
 use rayon::ThreadPool;
 use std::fmt;
 use tokio::sync::RwLock;

@@ -46,6 +46,7 @@ mod tests {
     use spicepod::component::runtime::ApiKey;
     use std::sync::Arc;
     use tokio::runtime::Handle;
+    use tools::SpiceModelTool;
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
