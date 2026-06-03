@@ -1745,8 +1745,8 @@ mod tests {
     use app::AppBuilder;
     use secrecy::SecretString;
     use std::collections::HashMap;
-    use tokio::sync::RwLock;
     use tempfile::TempDir;
+    use tokio::sync::RwLock;
 
     async fn test_connector(file_format: Option<&str>) -> Https {
         let extra: Vec<(&str, &str)> = match file_format {
@@ -2544,7 +2544,10 @@ mod tests {
         std::fs::write(&key_path, &key_pem).expect("write test client key pem");
 
         let connector = test_connector_with(&[
-            ("http_tls_client_certificate_file", cert_path.to_str().unwrap()),
+            (
+                "http_tls_client_certificate_file",
+                cert_path.to_str().unwrap(),
+            ),
             ("http_tls_client_key_file", key_path.to_str().unwrap()),
         ])
         .await;
