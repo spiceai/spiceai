@@ -14,19 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for MongoDB connector registration behavior across the
+//! Integration tests for `MongoDB` connector registration behavior across the
 //! combinations of: acceleration mode (federated / CDC change streams) ×
 //! initial collection state (not found / empty / has documents).
 //!
-//! Key MongoDB behavior (after the datafusion-table-providers fix):
+//! Key `MongoDB` behavior (after the datafusion-table-providers fix):
 //!
 //! * `read_provider` returns a **retriable** `EmptyCollection` error when the
 //!   collection is empty or does not exist.  `load_dataset` retries with
 //!   Fibonacci back-off until the collection has at least one document.
 //!
-//! * This mirrors DynamoDB's `EmptyTable` error — both databases require at
+//! * This mirrors `DynamoDB`'s `EmptyTable` error — both databases require at
 //!   least one document/item at startup so the connector can infer the schema.
-//!   Unlike DynamoDB, MongoDB does not yet support `dataset.columns` declared
+//!   Unlike `DynamoDB`, `MongoDB` does not yet support `dataset.columns` declared
 //!   schema as a fallback (no declared-schema → registers-immediately path).
 
 #![allow(clippy::expect_used)]

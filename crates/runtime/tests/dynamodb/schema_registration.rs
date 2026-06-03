@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for DynamoDB connector registration behavior across all
+//! Integration tests for `DynamoDB` connector registration behavior across all
 //! combinations of: acceleration mode (federated / CDC streams) × schema source
 //! (inferred / declared) × initial table state (missing / empty / has rows /
 //! streams disabled).
@@ -41,7 +41,7 @@ use crate::utils::{runtime_ready_check, test_request_context};
 
 use super::streams::{
     create_table, ensure_dataset_rows, get_client, insert_rows, make_dynamodb_dataset,
-    run_and_snapshot_query, start_dynamodb_docker_container, wait_for_dataset_rows,
+    run_and_snapshot_query, start_dynamodb_docker_container,
     wait_for_dynamodb_source_rows,
 };
 
@@ -65,8 +65,8 @@ const SECRET_KEY: &str = "bar";
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Creates a DynamoDB table with a single string hash key named `id`, but
-/// **without** enabling DynamoDB Streams.  Used to test the retry path when
+/// Creates a `DynamoDB` table with a single string hash key named `id`, but
+/// **without** enabling `DynamoDB` Streams.  Used to test the retry path when
 /// streams are required but not yet enabled.
 async fn create_table_without_streams(client: &Client, table_name: &str) {
     client
@@ -92,7 +92,7 @@ async fn create_table_without_streams(client: &Client, table_name: &str) {
         .expect("table created without streams");
 }
 
-/// Enables DynamoDB Streams (`NewAndOldImages`) on an existing table.
+/// Enables `DynamoDB` Streams (`NewAndOldImages`) on an existing table.
 async fn enable_streams(client: &Client, table_name: &str) {
     client
         .update_table()
