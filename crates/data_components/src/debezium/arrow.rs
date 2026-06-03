@@ -673,10 +673,20 @@ mod tests {
 
     #[test]
     fn test_wrong_json_type() {
-        let n: i128 = 12345;
-        let input = json!(n); // Not a string or object
-        let result = convert_json_to_decimal(&input, 2);
-        result.expect_err("Should fail for wrong JSON type");
+        // Bool and Array are genuinely unsupported types.
+        let result = convert_json_to_decimal(&json!(true), 2);
+        result.expect_err("Should fail for boolean JSON type");
+
+        let result = convert_json_to_decimal(&json!([1, 2, 3]), 2);
+        result.expect_err("Should fail for array JSON type");
+    }
+
+    #[test]
+    fn test_plain_number_is_supported() {
+        // A plain JSON number is valid: treat it as the unscaled value and
+        // rescale to the target scale.  12345 at scale=2 → 1234500.
+        let result = convert_json_to_decimal(&json!(12345_i64), 2);
+        assert_eq!(result.expect("number should be valid"), Some(1_234_500));
     }
 
     #[test]
