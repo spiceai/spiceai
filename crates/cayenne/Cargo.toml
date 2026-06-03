@@ -35,6 +35,7 @@ datafusion-physical-plan = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
+im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
