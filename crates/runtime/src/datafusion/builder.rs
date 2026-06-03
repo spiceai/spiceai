@@ -1368,7 +1368,7 @@ mod tests {
     use super::{
         CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
         configure_hash_join_memory_limits, exact_join_filter_memory_limit,
-        runtime_env_with_effective_memory_limit,
+        runtime_env_with_effective_memory_limit, validate_compaction_memory_fraction,
     };
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::status;
