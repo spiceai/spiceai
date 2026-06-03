@@ -1014,7 +1014,7 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }));
     }

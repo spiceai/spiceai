@@ -64,7 +64,14 @@ echo "epoch,pct_cpu,rss_mb" > "$CPU"
 echo "epoch,q_count,q_sum_ms,qx_count,qx_sum_ms" > "$QLAT"
 echo "epoch,xact_commit,tx_per_sec" > "$OLTP"
 
-wait_for_spiced() { for _ in $(seq 1 6000); do pgrep -x spiced >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+wait_for_spiced() {
+  local deadline=$((SECONDS + READY))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    pgrep -x spiced >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
 
 # --- spiced CPU% / RSS (5s) ---
 ( wait_for_spiced || exit 0

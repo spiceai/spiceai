@@ -622,10 +622,12 @@ mod tests {
 
         // Exactly 3 `ts_day_bucket=<micros>/` partition dirs, all FS-safe.
         let mut bucket_dirs = 0usize;
-        for entry in std::fs::read_dir(&table_data_path).expect("read table dir") {
-            let entry = entry.expect("dir entry");
+        let mut entries = tokio::fs::read_dir(&table_data_path)
+            .await
+            .expect("read table dir");
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
             let name = entry.file_name().to_string_lossy().to_string();
-            if entry.file_type().expect("file type").is_dir()
+            if entry.file_type().await.expect("file type").is_dir()
                 && let Some(value) = name.strip_prefix("ts_day_bucket=")
             {
                 bucket_dirs += 1;

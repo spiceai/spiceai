@@ -25,8 +25,10 @@ use datafusion_physical_plan::metrics::Time;
 use datafusion_physical_plan::repartition::BatchPartitioner;
 use futures::SinkExt;
 use futures::StreamExt;
+use object_store::Error as ObjectStoreError;
 use object_store::ObjectStore;
 use object_store::path::Path;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vortex::array::ArrayRef;
@@ -313,6 +315,7 @@ async fn write_record_batch_stream_to_files(
     // exerts backpressure on the demux loop (peak buffer ~= 2 * N batches).
     let mut senders = Vec::with_capacity(num_shards);
     let mut handles = Vec::with_capacity(num_shards);
+    let started_paths = Arc::new(Mutex::new(HashSet::new()));
     for shard_id in 0..num_shards {
         let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
         senders.push(tx);
@@ -328,6 +331,7 @@ async fn write_record_batch_stream_to_files(
             single_file_output,
             shard_id,
             num_shards,
+            Arc::clone(&started_paths),
         )));
     }
 
@@ -417,12 +421,11 @@ async fn write_record_batch_stream_to_files(
     }
 
     if let Some(err) = first_err {
-        cleanup_failed_write(
-            object_store,
-            Vec::new(),
-            results.iter().map(|(path, _)| path.clone()).collect(),
-        )
-        .await;
+        let cleanup_paths = {
+            let started_paths = started_paths.lock().await;
+            started_paths.iter().cloned().collect()
+        };
+        cleanup_failed_write(object_store, Vec::new(), cleanup_paths).await;
         return Err(err);
     }
 
@@ -446,6 +449,7 @@ async fn run_shard_writer(
     single_file_output: bool,
     shard_id: usize,
     num_shards: usize,
+    started_paths: Arc<Mutex<HashSet<Path>>>,
 ) -> DFResult<Vec<(Path, WriteSummary)>> {
     let mut results: Vec<(Path, WriteSummary)> = Vec::new();
     let mut active_writer: Option<ActiveFileWriter> = None;
@@ -465,6 +469,7 @@ async fn run_shard_writer(
                     shard_id,
                     num_shards,
                 );
+                started_paths.lock().await.insert(file_path.clone());
                 active_writer = Some(start_file_writer(
                     &session,
                     Arc::clone(&object_store),
@@ -602,8 +607,11 @@ async fn cleanup_failed_write(
     }
 
     for path in cleanup_paths {
-        if let Err(e) = object_store.delete(&path).await {
-            tracing::warn!(path = %path, error = %e, "Failed to delete sink output during error cleanup");
+        match object_store.delete(&path).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "Failed to delete sink output during error cleanup");
+            }
         }
     }
 }
