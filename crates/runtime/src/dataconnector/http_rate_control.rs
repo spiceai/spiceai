@@ -41,6 +41,17 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+
+/// Every `http_*` rate-control key this module reads from `runtime.params`.
+/// Exposed as the authoritative list so the startup unknown-param check can
+/// scope its "did you mean" suggestions to the HTTP rate-control family.
+pub(crate) const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
+    RUNTIME_MAX_CONCURRENT_REQUESTS,
+    RUNTIME_REQUESTS_PER_SECOND_LIMIT,
+    RUNTIME_REQUESTS_PER_MINUTE_LIMIT,
+    RUNTIME_RATE_CONTROL_JITTER_MIN,
+    RUNTIME_RATE_CONTROL_JITTER_MAX,
+];
 #[cfg(feature = "rate-control")]
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 

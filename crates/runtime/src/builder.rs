@@ -63,11 +63,7 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
-/// All `runtime.params` keys with a `cayenne_` prefix that the runtime
-/// recognizes. Used to surface typos: any `cayenne_*` key not in this list
-/// gets a startup warning with a "did you mean" suggestion so operators
-/// don't silently run on defaults when they thought they had tuned the
-/// runtime.
+/// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
 const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FOOTER_CACHE_MB_PARAM,
     CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
@@ -75,6 +71,42 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_FILTER_PROPAGATION_PARAM,
     CAYENNE_OPTIMIZER_RULES_PARAM,
 ];
+
+/// Recognized `runtime.params` keys that don't belong to a larger prefix
+/// family (the family lists live next to the code that consumes them:
+/// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+const MISC_RUNTIME_PARAMS: &[&str] = &[
+    "url_tables",
+    "geo",
+    "parquet_page_index",
+    "dedicated_thread_pool",
+    "shuffle_location",
+    "shuffle_format",
+    "github_max_concurrent_connections",
+];
+
+/// The complete set of `runtime.params` keys the runtime recognizes, gathered
+/// from every consuming subsystem's authoritative list. Used to validate the
+/// `runtime.params` section at startup: any key not in this set is a typo or
+/// unsupported option and gets a "did you mean" warning scoped to this
+/// section's vocabulary. See spiceai/spiceai#10970.
+///
+/// When adding a new `runtime.params` key, extend the owning family's list
+/// (or `MISC_RUNTIME_PARAMS`) so it is recognized here.
+fn known_runtime_params() -> Vec<&'static str> {
+    let mut known = Vec::with_capacity(
+        KNOWN_CAYENNE_RUNTIME_PARAMS.len()
+            + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
+            + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + MISC_RUNTIME_PARAMS.len(),
+    );
+    known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
+    known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(MISC_RUNTIME_PARAMS);
+    known
+}
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -261,12 +293,7 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
-        warn_on_unknown_runtime_params(
-            &spicepod_rt.params,
-            "cayenne_",
-            KNOWN_CAYENNE_RUNTIME_PARAMS,
-            "Cayenne",
-        );
+        warn_on_unknown_runtime_params(&spicepod_rt.params);
         let cayenne_sort_merge_min_rows =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SORT_MERGE_MIN_ROWS_PARAM);
         log_applied_cayenne_param(
@@ -735,29 +762,25 @@ fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) 
     }
 }
 
-/// Warn (with a "did you mean" suggestion when close) on any key in
-/// `runtime.params` that begins with `prefix` but is not in `known`, so typos
-/// like `cayenne_footer_cach_mb` don't silently leave the runtime on
-/// defaults. `family_label` names the family for the warning text (e.g.
-/// "Cayenne"). See spiceai/spiceai#10970.
-fn warn_on_unknown_runtime_params(
-    params: &HashMap<String, String>,
-    prefix: &str,
-    known: &[&str],
-    family_label: &str,
-) {
+/// Warn (with a "did you mean" suggestion when close) on any key in the
+/// `runtime.params` section the runtime doesn't recognize, so typos like
+/// `cayenne_footer_cach_mb` or `shuffle_locatin` don't silently leave the
+/// runtime on defaults. Candidates are scoped to the `runtime.params`
+/// section's full vocabulary ([`known_runtime_params`]) so suggestions only
+/// ever point at another valid `runtime.params` key. See
+/// spiceai/spiceai#10970.
+fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
+    let known = known_runtime_params();
     for key in params.keys() {
-        if !key.starts_with(prefix) || known.contains(&key.as_str()) {
+        if known.contains(&key.as_str()) {
             continue;
         }
-        if let Some(suggestion) = util::levenshtein::closest_match(key, known) {
+        if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
             tracing::warn!(
-                "runtime.params.{key} is not a recognized {family_label} tunable; did you mean '{suggestion}'? Ignoring."
+                "runtime.params.{key} is not a recognized runtime parameter; did you mean '{suggestion}'? Ignoring."
             );
         } else {
-            tracing::warn!(
-                "runtime.params.{key} is not a recognized {family_label} tunable; ignoring."
-            );
+            tracing::warn!("runtime.params.{key} is not a recognized runtime parameter; ignoring.");
         }
     }
 }
@@ -997,23 +1020,53 @@ mod test {
     }
 
     #[test]
-    fn known_cayenne_runtime_params_suggests_typo_corrections() {
-        // Pins the cayenne allowlist as the input to the shared closest-match
-        // helper so typos like `cayenne_footer_cach_mb` resolve to the
-        // intended `cayenne_footer_cache_mb`.
+    fn known_runtime_params_covers_every_family() {
+        // The section vocabulary must include a representative key from each
+        // family that feeds it, so the unknown-param check doesn't false-warn
+        // on valid keys owned by other subsystems.
+        let known = known_runtime_params();
+        for key in [
+            CAYENNE_FOOTER_CACHE_MB_PARAM,
+            "cdc_prefetch_buffer",
+            "http_max_concurrent_requests",
+            "shuffle_location",
+            "geo",
+            "url_tables",
+            "parquet_page_index",
+            "dedicated_thread_pool",
+        ] {
+            assert!(
+                known.contains(&key),
+                "known_runtime_params() missing `{key}`; a valid runtime param would false-warn"
+            );
+        }
+        // No accidental duplicates across the merged family lists.
+        let mut deduped = known.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
         assert_eq!(
-            util::levenshtein::closest_match(
-                "cayenne_footer_cach_mb",
-                KNOWN_CAYENNE_RUNTIME_PARAMS,
-            )
-            .as_deref(),
+            deduped.len(),
+            known.len(),
+            "duplicate keys in known_runtime_params()"
+        );
+    }
+
+    #[test]
+    fn runtime_param_typos_suggest_within_section() {
+        // A typo resolves to the intended key, and the suggestion is drawn from
+        // the whole `runtime.params` section vocabulary — across families.
+        let known = known_runtime_params();
+        assert_eq!(
+            util::levenshtein::closest_match("cayenne_footer_cach_mb", &known).as_deref(),
             Some("cayenne_footer_cache_mb"),
         );
         assert_eq!(
-            util::levenshtein::closest_match(
-                "cayenne_completely_made_up",
-                KNOWN_CAYENNE_RUNTIME_PARAMS,
-            ),
+            util::levenshtein::closest_match("shuffle_locatin", &known).as_deref(),
+            Some("shuffle_location"),
+        );
+        // A wholly unrelated key gets no misleading suggestion.
+        assert_eq!(
+            util::levenshtein::closest_match("totally_unrelated_key", &known),
             None,
         );
     }
