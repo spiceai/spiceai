@@ -390,12 +390,12 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, true),
-            Field::new("fetched_at", DataType::Int64, true),
+            Field::new("_fetched_at", DataType::Int64, true),
         ]))
     }
 
     fn expected_output_schema() -> SchemaRef {
-        // User expects only 2 columns (no fetched_at)
+        // User expects only 2 columns (no _fetched_at)
         Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, true),
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn test_schema_returns_expected_schema_not_input_schema() {
         // Simulates the cache HIT scenario from GitHub issue #9019:
-        // Input has 3 columns (including internal fetched_at), but user only requested 2 columns.
+        // Input has 3 columns (including internal _fetched_at), but user only requested 2 columns.
         // SchemaCastScanExec should return the expected 2-column schema, not the input's 3-column schema.
         let input = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
         let expected_schema = expected_output_schema();
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(
             actual_schema.fields().len(),
             2,
-            "Schema should have 2 fields, not 3 (fetched_at should be stripped)"
+            "Schema should have 2 fields, not 3 (_fetched_at should be stripped)"
         );
         assert_eq!(
             actual_schema.field(0).name(),

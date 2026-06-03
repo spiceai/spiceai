@@ -49,6 +49,7 @@ impl super::AcceleratedTable {
         accelerator_write_mutex: Arc<Mutex<()>>,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
+        interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut nullable_time_column_warning_emitted = false;
 
         loop {

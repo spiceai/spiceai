@@ -875,7 +875,8 @@ mod tests {
     #[test]
     fn format_plumbs_footer_initial_read_size() {
         let mut opts = VortexTableOptions::default();
-        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+        opts.set("footer_initial_read_size_bytes", "12345")
+            .expect("setting footer_initial_read_size_bytes should succeed");
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
@@ -884,7 +885,8 @@ mod tests {
     #[test]
     fn format_plumbs_target_file_size_mb() {
         let mut opts = VortexTableOptions::default();
-        opts.set("target_file_size_mb", "123").unwrap();
+        opts.set("target_file_size_mb", "123")
+            .expect("setting target_file_size_mb should succeed");
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().target_file_size_mb, 123);
@@ -911,18 +913,22 @@ mod tests {
     #[test]
     fn format_plumbs_projection_pushdown_modes() {
         let mut opts = VortexTableOptions::default();
-        opts.set("projection_pushdown", "auto").unwrap();
+        opts.set("projection_pushdown", "auto")
+            .expect("setting projection_pushdown to auto should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::Auto);
         assert!(opts.projection_pushdown.enabled());
 
-        opts.set("projection_pushdown", "on").unwrap();
+        opts.set("projection_pushdown", "on")
+            .expect("setting projection_pushdown to on should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
         assert!(opts.projection_pushdown.enabled());
 
-        opts.set("projection_pushdown", "true").unwrap();
+        opts.set("projection_pushdown", "true")
+            .expect("setting projection_pushdown to true should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
 
-        opts.set("projection_pushdown", "off").unwrap();
+        opts.set("projection_pushdown", "off")
+            .expect("setting projection_pushdown to off should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::Off);
         assert!(!opts.projection_pushdown.enabled());
     }
@@ -930,16 +936,20 @@ mod tests {
     #[test]
     fn format_plumbs_scan_concurrency_modes() {
         let mut opts = VortexTableOptions::default();
-        opts.set("scan_concurrency", "auto").unwrap();
+        opts.set("scan_concurrency", "auto")
+            .expect("setting scan_concurrency to auto should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Auto);
 
-        opts.set("scan_concurrency", "off").unwrap();
+        opts.set("scan_concurrency", "off")
+            .expect("setting scan_concurrency to off should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
 
-        opts.set("scan_concurrency", "00").unwrap();
+        opts.set("scan_concurrency", "00")
+            .expect("setting scan_concurrency to 00 should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
 
-        opts.set("scan_concurrency", "3").unwrap();
+        opts.set("scan_concurrency", "3")
+            .expect("setting scan_concurrency to 3 should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Explicit(3));
     }
 

@@ -694,7 +694,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
 
         assert_eq!(
@@ -852,7 +852,8 @@ mod tests {
     fn test_output_file_path_single_file_and_collection() {
         use super::output_file_path;
 
-        let single = ListingTableUrl::parse("file:///tmp/output.vortex").unwrap();
+        let single = ListingTableUrl::parse("file:///tmp/output.vortex")
+            .expect("single-file listing table URL should parse");
         assert_eq!(
             output_file_path(&single, 0, "vortex", true, "wid").to_string(),
             "tmp/output.vortex"
@@ -862,7 +863,8 @@ mod tests {
             "tmp/output_00002.vortex"
         );
 
-        let collection = ListingTableUrl::parse("file:///tmp/table/").unwrap();
+        let collection = ListingTableUrl::parse("file:///tmp/table/")
+            .expect("collection listing table URL should parse");
         assert_eq!(
             output_file_path(&collection, 3, "vortex", false, "wid").to_string(),
             "tmp/table/wid_00003.vortex"
@@ -1068,7 +1070,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
 
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
@@ -1274,7 +1276,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
 
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
@@ -1376,7 +1378,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
@@ -1461,7 +1463,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
@@ -1572,7 +1574,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
@@ -1693,7 +1695,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
@@ -1814,7 +1816,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap()
+            .expect("count column should be an Int64Array")
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 

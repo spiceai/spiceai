@@ -345,8 +345,6 @@ impl Query {
         request_context: Arc<RequestContext>,
         span: Span,
     ) -> Result<QueryHandle> {
-        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
@@ -586,8 +584,6 @@ impl Query {
     }
 
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
-        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {

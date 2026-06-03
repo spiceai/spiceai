@@ -373,6 +373,9 @@ snowflake = [
     "data_components/snowflake",
 ]
 spark = ["data_components/spark_connect"]
+# Registers the Cayenne catalog connector. Intended for benchmarking only;
+# deliberately excluded from the default feature set.
+spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
     "db_connection_pool/sqlite",

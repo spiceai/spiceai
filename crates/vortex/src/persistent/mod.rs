@@ -209,7 +209,10 @@ mod tests {
 
         // Register an in-memory object store for the test.
         let store = Arc::new(InMemory::new());
-        ctx.register_object_store(&url::Url::try_from("file://").unwrap(), store);
+        ctx.register_object_store(
+            &url::Url::try_from("file://").expect("file:// should parse as a URL"),
+            store,
+        );
 
         // [create]
         ctx.sql(

@@ -680,7 +680,7 @@ impl RefreshTask {
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
-                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
                 return self.refresh_stale_cached_rows(refresh).await;
             }
             RefreshMode::Snapshot => {

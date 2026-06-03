@@ -549,6 +549,8 @@ async fn test_wal_persists_on_move_failure_impl(
 // ============================================================================
 
 test_with_backends!(test_prepared_lifecycle_matches_commit_impl);
+test_with_backends!(test_prepared_apply_under_barrier_waits_for_write_lock_impl);
+test_with_backends!(test_held_barrier_current_snapshot_requires_write_lock_impl);
 
 async fn test_prepared_lifecycle_matches_commit_impl(
     fixture: common::TestFixture,
@@ -607,6 +609,68 @@ async fn test_prepared_lifecycle_matches_commit_impl(
         ]
     );
     assert_staging_empty(&staging);
+
+    Ok(())
+}
+
+async fn test_prepared_apply_under_barrier_waits_for_write_lock_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "lifecycle_write_lock").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let prepared = staged.prepare().await?;
+
+    let lock_holder = begin_staged_append_with_rows(&table, &[(99, "Held")]).await?;
+
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), prepared.apply_under_barrier()).await;
+    assert!(
+        result.is_err(),
+        "current-snapshot apply_under_barrier must wait for write_lock before moving files"
+    );
+
+    lock_holder.rollback().await?;
+    prepared.apply_under_barrier().await?;
+    assert_eq!(prepared.finish().await?, 1);
+
+    let rows = query_all(&ctx, "lifecycle_write_lock").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+    assert_staging_empty(&staging_dir(&table));
+
+    Ok(())
+}
+
+async fn test_held_barrier_current_snapshot_requires_write_lock_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) = setup_table(&fixture, "held_barrier_write_lock").await;
+
+    let staged = begin_staged_append_with_rows(&table, &[(1, "Alice")]).await?;
+    let prepared = staged.prepare().await?;
+
+    let lock_holder = begin_staged_append_with_rows(&table, &[(99, "Held")]).await?;
+
+    let fence = prepared.lock_listing_fence_write_owned().await;
+    let err = prepared
+        .apply_under_held_barrier()
+        .await
+        .expect_err("held-barrier current-snapshot apply must fail while write_lock is held");
+    assert!(
+        err.to_string().contains("Failed to acquire write_lock"),
+        "unexpected error: {err}"
+    );
+    drop(fence);
+
+    lock_holder.rollback().await?;
+    let fence = prepared.lock_listing_fence_write_owned().await;
+    prepared.apply_under_held_barrier().await?;
+    drop(fence);
+    assert_eq!(prepared.finish().await?, 1);
+
+    let rows = query_all(&ctx, "held_barrier_write_lock").await;
+    assert_eq!(rows, vec![(1, "Alice".to_string())]);
+    assert_staging_empty(&staging_dir(&table));
 
     Ok(())
 }
@@ -1056,6 +1120,7 @@ async fn test_wal_with_files_in_snapshot_self_heals_impl(
 // ============================================================================
 
 test_with_backends!(test_writer_wal_survives_inline_compaction_impl);
+test_with_backends!(test_compaction_skips_pending_current_snapshot_finalize_impl);
 
 async fn test_writer_wal_survives_inline_compaction_impl(
     fixture: common::TestFixture,
@@ -1099,6 +1164,44 @@ async fn test_writer_wal_survives_inline_compaction_impl(
         staging_wal_paths(&table).is_empty(),
         "writer's WAL must be removed after successful commit across compaction boundary"
     );
+
+    Ok(())
+}
+
+async fn test_compaction_skips_pending_current_snapshot_finalize_impl(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (table, ctx) =
+        setup_table_with_aggressive_compaction(&fixture, "pending_current_compact").await;
+
+    let batch_rows = 1500_i64;
+    for batch_idx in 0..4_i64 {
+        let start = 1 + batch_idx * batch_rows;
+        begin_staged_append_with_batch(&table, large_batch(start, batch_rows))
+            .await?
+            .commit()
+            .await?;
+    }
+
+    let pending = begin_staged_append_with_batch(&table, large_batch(10_001, batch_rows)).await?;
+    let prepared = pending.prepare().await?;
+
+    assert!(
+        !table.maybe_compact_small_files().await?,
+        "compaction must skip while a current-snapshot staged append is pending finalize"
+    );
+
+    prepared.apply_under_barrier().await?;
+    assert_eq!(prepared.finish().await?, u64::try_from(batch_rows)?);
+
+    let total = row_count(&ctx, "pending_current_compact").await;
+    assert_eq!(total, usize::try_from(batch_rows * 5)?);
+
+    assert!(
+        table.maybe_compact_small_files().await?,
+        "compaction should run after the pending finalize completes"
+    );
+    assert_eq!(row_count(&ctx, "pending_current_compact").await, total);
 
     Ok(())
 }
@@ -1257,6 +1360,23 @@ fn make_batch(ids: &[i64], names: &[&str]) -> RecordBatch {
     .expect("valid batch")
 }
 
+fn large_batch(start_id: i64, rows: i64) -> RecordBatch {
+    let ids: Vec<i64> = (start_id..start_id + rows).collect();
+    let names: Vec<String> = ids.iter().map(|id| value_payload("n", *id)).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    make_batch(&ids, &name_refs)
+}
+
+fn value_payload(prefix: &str, row_id: i64) -> String {
+    let row_id = u64::try_from(row_id).expect("test id should be non-negative");
+    format!(
+        "{prefix}_{row_id:020}_{:016x}_{:016x}_{:016x}",
+        row_id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        row_id.wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+        row_id.wrapping_mul(0x1656_67B1_9E37_79F9),
+    )
+}
+
 /// Build the `_staging/` directory path for a table.
 fn staging_dir(table: &CayenneTableProvider) -> PathBuf {
     let meta = table.metadata();
@@ -1374,6 +1494,22 @@ async fn setup_table_with_compaction(
         compaction_max_levels: 1,
         compaction_max_files_per_pick: 2,
         compaction_background_interval_ms: 0,
+        ..Default::default()
+    };
+    setup_table_with_vortex_config(fixture, table_name, vortex_config).await
+}
+
+async fn setup_table_with_aggressive_compaction(
+    fixture: &common::TestFixture,
+    table_name: &str,
+) -> (Arc<CayenneTableProvider>, SessionContext) {
+    let vortex_config = cayenne::metadata::VortexConfig {
+        target_vortex_file_size_mb: 1,
+        compaction_trigger_files: 4,
+        compaction_max_levels: 1,
+        compaction_max_files_per_pick: 4,
+        compaction_background_interval_ms: 0,
+        inline_max_rows: 0,
         ..Default::default()
     };
     setup_table_with_vortex_config(fixture, table_name, vortex_config).await

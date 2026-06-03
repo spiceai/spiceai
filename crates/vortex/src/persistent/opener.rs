@@ -746,7 +746,8 @@ mod tests {
     async fn test_open() -> anyhow::Result<()> {
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "part=1/file.vortex";
-        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("test record batch should build");
         let data_size =
             write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
 
@@ -764,7 +765,11 @@ mod tests {
         let filter = logical2physical(&filter, table_schema.table_schema());
 
         let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
-        let stream = opener.open(file.clone()).unwrap().await.unwrap();
+        let stream = opener
+            .open(file.clone())
+            .expect("opener should open file with matching filter")
+            .await
+            .expect("opening matching-filter file should produce a stream");
 
         let data = stream.try_collect::<Vec<_>>().await?;
         let num_batches = data.len();
@@ -777,7 +782,11 @@ mod tests {
         let filter = logical2physical(&filter, table_schema.table_schema());
 
         let opener = make_opener(object_store.clone(), table_schema.clone(), Some(filter));
-        let stream = opener.open(file.clone()).unwrap().await.unwrap();
+        let stream = opener
+            .open(file.clone())
+            .expect("opener should open file with non-matching filter")
+            .await
+            .expect("opening non-matching-filter file should produce a stream");
 
         let data = stream.try_collect::<Vec<_>>().await?;
         let num_batches = data.len();
@@ -792,7 +801,8 @@ mod tests {
         use futures::TryStreamExt;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let data_batch = record_batch!(("a", Int32, Vec::<i32>::new())).unwrap();
+        let data_batch = record_batch!(("a", Int32, Vec::<i32>::new()))
+            .expect("empty record batch should build");
         let file_path = "part=1/empty.vortex";
         let file_size =
             write_arrow_to_vortex(Arc::clone(&object_store), file_path, data_batch.clone()).await?;
@@ -821,7 +831,8 @@ mod tests {
 
         let file1 = {
             let file1_path = "/path/file1.vortex";
-            let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+            let batch1 = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+                .expect("Int32 record batch should build");
             let data_size1 =
                 write_arrow_to_vortex(object_store.clone(), file1_path, batch1).await?;
             PartitionedFile::new(file1_path.to_string(), data_size1)
@@ -829,7 +840,8 @@ mod tests {
 
         let file2 = {
             let file2_path = "/path/file2.vortex";
-            let batch2 = record_batch!(("a", Int16, vec![Some(-1), Some(-2), Some(-3)])).unwrap();
+            let batch2 = record_batch!(("a", Int16, vec![Some(-1), Some(-2), Some(-3)]))
+                .expect("Int16 record batch should build");
             let data_size2 =
                 write_arrow_to_vortex(object_store.clone(), file2_path, batch2).await?;
             PartitionedFile::new(file2_path.to_string(), data_size2)
@@ -919,7 +931,7 @@ mod tests {
             ("b", Int32, vec![Some(200), Some(201), Some(202)]),
             ("a", Int32, vec![Some(100), Some(101), Some(102)])
         )
-        .unwrap();
+        .expect("column-order test record batch should build");
         let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
         let file = PartitionedFile::new(file_path.to_string(), data_size);
 
@@ -1060,7 +1072,7 @@ mod tests {
             ("b", Utf8, vec![Some("test")]),
             ("c", Int32, vec![Some(2)])
         )
-        .unwrap();
+        .expect("projection-repro record batch should build");
         let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
 
         // Table schema has columns in DIFFERENT order: c, a, b
@@ -1139,7 +1151,7 @@ mod tests {
                 (0..=9).map(|i| Some(format!("r{}", i))).collect::<Vec<_>>()
             )
         )
-        .unwrap()
+        .expect("10-row test record batch should build")
     }
 
     fn make_test_opener(
@@ -1328,7 +1340,7 @@ mod tests {
             ("a", Int32, vec![Some(1), Some(2), Some(3)]),
             ("b", Int32, vec![Some(10), Some(20), Some(30)])
         )
-        .unwrap();
+        .expect("projection-pushdown record batch should build");
         let data_size =
             write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
 
