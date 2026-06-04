@@ -69,7 +69,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, terminals).await?);
+        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
@@ -104,6 +104,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("scale_factor", scale_factor.to_string()),
             KeyValue::new("terminals", terminals.to_string()),
             KeyValue::new("duration_secs", duration.as_secs().to_string()),
+            KeyValue::new("concurrency", test_args.common.concurrency.to_string()),
+            KeyValue::new(
+                "target_oltp_rate",
+                args.rate
+                    .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
+            ),
         ])
         .build();
 
@@ -140,7 +146,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         test_args,
         &app,
         NotStarted::new()
-            .with_parallel_count(1)
+            .with_parallel_count(test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 test_args.common.duration,
             )))
