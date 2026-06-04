@@ -49,6 +49,7 @@ use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use cache::result::query::QueryResult;
