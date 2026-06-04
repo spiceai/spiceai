@@ -622,7 +622,7 @@ impl FileFormat for VortexFormat {
                     tracing::debug!(
                         target: "vortex::footer_cache",
                         path = %object.location,
-                        footer_bytes = cached_metadata.memory_size(),
+                        footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached_metadata.as_ref()),
                         src = "infer_schema",
                         "footer cached",
                     );
@@ -713,7 +713,7 @@ impl FileFormat for VortexFormat {
                 tracing::debug!(
                     target: "vortex::footer_cache",
                     path = %object.location,
-                    footer_bytes = cached.memory_size(),
+                    footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached.as_ref()),
                     src = "infer_stats",
                     "footer cached",
                 );
