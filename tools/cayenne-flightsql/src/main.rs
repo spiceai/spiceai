@@ -182,6 +182,10 @@ async fn main() -> Result<()> {
                 inline_flush_max_segments: None,
                 inline_flush_max_bytes: None,
                 pk_conflict_detection: None,
+                compaction_trigger_files: None,
+                compaction_trigger_protected_snapshots: None,
+                compaction_max_files_per_pick: None,
+                pk_keyset_cache_mb: None,
             },
             ctx.runtime_env(),
         )
