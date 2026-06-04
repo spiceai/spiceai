@@ -56,6 +56,14 @@ fn utf8_pk_schema() -> Arc<Schema> {
     ]))
 }
 
+fn composite_pk_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
 async fn setup_table(
     fixture: &TestFixture,
     table_name: &str,
@@ -752,3 +760,121 @@ async fn test_mixed_inline_and_file_conflicts_impl(fixture: TestFixture) -> Test
 }
 
 test_with_backends!(test_mixed_inline_and_file_conflicts_impl);
+
+// =============================================================================
+// Test: Upsert after an inline checkpoint tombstones the flushed prior version
+// =============================================================================
+//
+// Insert a PK small enough to stay inline → checkpoint (flush the memtable to a
+// file) → upsert the same PK. The checkpoint rewrites the keyset entry from
+// `Inlined` to `FileUnlocated`, so the upsert's supersede delete routes to the
+// file delete list and tombstones the now-on-disk row — one live row per key,
+// no duplicate PK.
+
+async fn test_inline_checkpoint_then_upsert_no_duplicate_pk_int64_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let schema = simple_schema();
+    let (table, ctx) = setup_table(
+        &fixture,
+        "inline_ckpt_dup_int64",
+        Arc::clone(&schema),
+        vec!["id".into()],
+    )
+    .await?;
+
+    // 1. Insert id=1 → absorbed into the inline memtable; keyset entry = Inlined.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+
+    // 2. Checkpoint: flush the inline memtable to a file; the keyset entry for
+    //    id=1 is rewritten from Inlined to FileUnlocated.
+    table.checkpoint_inlined_data().await?;
+
+    // 3. Upsert id=1 → routed as a file delete and tombstones the flushed row.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+
+    assert_eq!(
+        row_count(&ctx, "inline_ckpt_dup_int64").await?,
+        1,
+        "an upsert after an inline checkpoint must tombstone the flushed prior version (no duplicate PK)"
+    );
+    let vals = query_value(&ctx, "SELECT value FROM inline_ckpt_dup_int64 WHERE id = 1").await?;
+    assert_eq!(vals, vec![100], "upsert must keep only the latest value");
+
+    Ok(())
+}
+
+test_with_backends!(test_inline_checkpoint_then_upsert_no_duplicate_pk_int64_impl);
+
+// Composite-PK counterpart (`RowConverterBased` strategy — the shape used by the
+// CDC tables exercised in benchmarks). Same guarantee as the int64 variant: the
+// checkpoint rewrites the flushed key's entry from `Inlined` to `FileUnlocated`,
+// so the next upsert's key-based delete tombstones the now-on-disk row.
+
+async fn test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
+    let schema = composite_pk_schema();
+    let (table, ctx) = setup_table(
+        &fixture,
+        "inline_ckpt_dup_composite",
+        Arc::clone(&schema),
+        vec!["k1".into(), "k2".into()],
+    )
+    .await?;
+
+    // 1. Insert composite key (1,1) → inlined; keyset entry = Inlined.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+
+    // 2. Checkpoint: flush to a file; keyset entry rewritten Inlined → FileUnlocated.
+    table.checkpoint_inlined_data().await?;
+
+    // 3. Upsert (1,1) → key-based file delete tombstones the flushed row.
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )?;
+    insert_batch(&table, batch).await?;
+
+    assert_eq!(
+        row_count(&ctx, "inline_ckpt_dup_composite").await?,
+        1,
+        "a composite-PK upsert after an inline checkpoint must tombstone the flushed prior version (no duplicate PK)"
+    );
+    let vals = query_value(
+        &ctx,
+        "SELECT value FROM inline_ckpt_dup_composite WHERE k1 = 1 AND k2 = 1",
+    )
+    .await?;
+    assert_eq!(vals, vec![100], "upsert must keep only the latest value");
+
+    Ok(())
+}
+
+test_with_backends!(test_inline_checkpoint_then_upsert_no_duplicate_pk_composite_impl);

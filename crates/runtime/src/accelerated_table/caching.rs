@@ -56,7 +56,7 @@ use util::expr::combine_exprs_balanced;
 /// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
 pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
-pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
+pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
 /// Reserved column name added to caching-mode accelerator storage to scope
 /// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
@@ -2001,7 +2001,7 @@ mod cache_namespace_column_tests {
     fn reserved_column_name_is_case_insensitive() {
         assert!(is_reserved_caching_column(CACHE_NAMESPACE_COLUMN));
         assert!(is_reserved_caching_column("__SPICE_CACHE_NAMESPACE"));
-        assert!(!is_reserved_caching_column("fetched_at"));
+        assert!(!is_reserved_caching_column("_fetched_at"));
         assert!(!is_reserved_caching_column("request_path"));
     }
 
@@ -2995,7 +2995,7 @@ mod tests {
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
-            "Batches without fetched_at column should be expired"
+            "Batches without _fetched_at column should be expired"
         );
     }
 
@@ -3024,7 +3024,7 @@ mod tests {
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
-            "Batches with NULL fetched_at should be expired"
+            "Batches with NULL _fetched_at should be expired"
         );
     }
 
