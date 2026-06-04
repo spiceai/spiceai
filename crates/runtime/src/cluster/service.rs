@@ -1018,7 +1018,7 @@ async fn handle_partitions_loaded(
     // Fail closed: if we can't refresh we may be looking at a stale
     // assignment, which could flip a dataset to `Ready` based on outdated
     // executor membership. Skip this evaluation and let the next ack or
-    // reconcile cycle retry.
+    // readiness sweep retry.
     if let Err(err) = partition_store.refresh().await {
         tracing::warn!(
             table = %loaded.table_name,
@@ -1026,36 +1026,103 @@ async fn handle_partitions_loaded(
         );
         return;
     }
-    let Some(metadata) = partition_store.get_cached_table_metadata(&table) else {
-        // No partition metadata yet — likely raced with first discovery
-        // cycle; the next reconcile will re-evaluate.
+
+    evaluate_table_readiness(datafusion, &table).await;
+}
+
+/// Evaluates whether every assigned partition for `table` is covered by an
+/// executor ack and, if so, flips the dataset's status to `Ready`. Reads the
+/// partition store's *cached* metadata — callers must refresh the store
+/// first. No-op when the dataset is already `Ready`, when partition metadata
+/// hasn't been seeded yet, or when ack coverage is incomplete.
+///
+/// `table` must be the canonical (fully resolved) reference — the same form
+/// `handle_partitions_loaded` uses as the tracker key.
+pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &TableReference) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
         return;
     };
 
-    if tracker.is_table_loaded(&table, &metadata, datafusion).await {
-        // Find the dataset key that was registered as `Refreshing` at init
-        // time. The original key may be bare/partial (`foo`) while the
-        // canonical form is full (`spice.public.foo`); calling
-        // `update_dataset(&canonical)` would create a *new* status entry and
-        // leave the original stuck in `Refreshing`, keeping `/v1/ready` at
-        // 503. Match by resolve-equality to update the existing entry.
-        let target = datafusion
-            .runtime_status
-            .get_dataset_statuses()
-            .into_keys()
-            .find(|key| {
-                key.clone()
-                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                    == resolved
-            })
-            .unwrap_or_else(|| table.clone());
+    let resolved = table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+    // Find the dataset key that was registered as `Refreshing` at init
+    // time. The original key may be bare/partial (`foo`) while the
+    // canonical form is full (`spice.public.foo`); calling
+    // `update_dataset(&canonical)` would create a *new* status entry and
+    // leave the original stuck in `Refreshing`, keeping `/v1/ready` at
+    // 503. Match by resolve-equality to update the existing entry.
+    let target = datafusion
+        .runtime_status
+        .get_dataset_statuses()
+        .into_iter()
+        .find(|(key, _)| {
+            key.clone()
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                == resolved
+        });
+
+    // Already `Ready` — skip so re-acks and periodic readiness sweeps don't
+    // re-emit the status-change log/metric every time.
+    if matches!(&target, Some((_, crate::status::ComponentStatus::Ready))) {
+        return;
+    }
+
+    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
+        // No partition metadata yet — the ack raced the first discovery
+        // cycle; the readiness sweep after the next reconcile re-evaluates.
+        return;
+    };
+
+    if tracker.is_table_loaded(table, &metadata, datafusion).await {
+        let target = target.map_or_else(|| table.clone(), |(key, _)| key);
         tracing::info!(
-            table = %loaded.table_name,
+            table = %table,
             "All assigned partitions loaded; marking dataset Ready"
         );
         datafusion
             .runtime_status
             .update_dataset(&target, crate::status::ComponentStatus::Ready);
+    }
+}
+
+/// Re-evaluates readiness for every table with at least one recorded executor
+/// ack. Called from the partition-assignment task after metadata seeding and
+/// after each reconcile cycle: an ack that arrives *before* the table's
+/// partition metadata is seeded (e.g. replayed by an executor that connected
+/// while the scheduler was still starting up) is recorded in the tracker but
+/// can't flip the dataset to `Ready` at arrival time — this sweep picks it up
+/// once metadata exists.
+pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
+        return;
+    };
+
+    let acked = tracker.acked_tables().await;
+    if acked.is_empty() {
+        return;
+    }
+    if let Err(err) = partition_store.refresh().await {
+        tracing::warn!("Skipping readiness sweep: partition store refresh failed: {err}");
+        return;
+    }
+    for table in acked {
+        evaluate_table_readiness(datafusion, &table).await;
     }
 }
 
