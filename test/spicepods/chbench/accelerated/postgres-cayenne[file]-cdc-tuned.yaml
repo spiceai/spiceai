@@ -5,7 +5,11 @@ name: postgres-cayenne[file]-cdc-tuned
 runtime:
   params:
     cdc_prefetch_buffer: '1024'
-    cdc_max_coalesced_envelopes: '8192'
+    # 4096 = the runtime max (changes.rs:CDC_MAX_COALESCED_ENVELOPES_MAX). 8192
+    # was silently rejected and fell back to the default 256 — ~16x smaller CDC
+    # batches, multiplying the per-batch apply_on_conflict_deletions O(N)
+    # deletion-index clone and starving WAL drain under bursty OLTP.
+    cdc_max_coalesced_envelopes: '4096'
     cdc_max_coalesced_bytes: '134217728' # 128 MB
     cdc_max_coalesce_age_ms: '4000'
     cdc_commit_timeout_ms: '60000'
