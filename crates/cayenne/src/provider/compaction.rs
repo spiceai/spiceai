@@ -40,7 +40,7 @@ use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
 use datafusion_execution::runtime_env::RuntimeEnv;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -347,9 +347,8 @@ pub(crate) trait CompactionRunner: Send + Sync {
 /// Owns a tokio task that wakes every `interval`, acquires a permit from the
 /// shared semaphore, and calls `runner.run_compaction_trigger()`. Cancellation
 /// happens via [`Drop`]: dropping the `BackgroundCompactor` fires the shutdown
-/// `Notify`, lets any in-flight compaction finish its current write within a
-/// bounded window (so the Vortex IO runtime is not dropped out from under it),
-/// then aborts the task's `JoinHandle`.
+/// `Notify`, then moves bounded task draining to a detached OS thread so dropping
+/// the provider never blocks a Tokio worker thread.
 ///
 /// The runner is held via `Weak` so the task does not keep the
 /// `CayenneTableProvider` alive past its caller's `Arc` lifetime.
@@ -422,15 +421,54 @@ impl BackgroundCompactor {
     }
 }
 
-/// How long [`Drop`] lets an in-flight compaction finish its current Vortex
-/// write before force-aborting. Bounded so shutdown can never hang.
+/// How long the detached drain thread lets an in-flight compaction finish its
+/// current Vortex write before force-aborting. Bounded so shutdown can never hang.
 const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
-// Cleanup happens in `Drop`: the shutdown signal is fired, the current pass is
-// given a bounded window to drain, then the `JoinHandle` is aborted. Callers
-// don't need explicit `shutdown` / `join` methods — when the provider's last
-// `Arc` drops, the `OnceLock<BackgroundCompactor>` inside drops too, which runs
-// the impl below.
+fn drain_and_abort_compactor(handle: JoinHandle<()>) {
+    // Let an in-flight compaction finish its current write before the
+    // surrounding runtime tears down. vortex-io panics ("Runtime dropped task
+    // without completing it") if a task's runtime is dropped while the task is
+    // still pending, and the sharded encode keeps several such IO tasks in
+    // flight per compaction — so force-aborting mid-write races the runtime
+    // shutdown and panics. Poll `is_finished()` with plain sleeps so this never
+    // depends on the (possibly already-shutting-down) runtime timer and cannot
+    // hang past the deadline.
+    let deadline = Instant::now() + COMPACTOR_SHUTDOWN_DRAIN;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Whether it drained or hit the deadline, ensure the task is gone.
+    handle.abort();
+}
+
+fn spawn_compactor_drain_thread(handle: JoinHandle<()>) {
+    let handle = Arc::new(Mutex::new(Some(handle)));
+    let handle_for_thread = Arc::clone(&handle);
+
+    match std::thread::Builder::new()
+        .name("cayenne-compactor-drain".to_string())
+        .spawn(move || {
+            let Some(handle) = handle_for_thread.lock().take() else {
+                return;
+            };
+            drain_and_abort_compactor(handle);
+        }) {
+        Ok(join_handle) => drop(join_handle),
+        Err(error) => {
+            if let Some(handle) = handle.lock().take() {
+                handle.abort();
+            }
+            tracing::warn!(target: "cayenne::compaction", "Failed to spawn background compactor drain thread; aborted task immediately: {error}");
+        }
+    }
+}
+
+// Cleanup starts in `Drop`: the shutdown signal is fired, then the current pass
+// is given a bounded window to drain on a detached thread before the
+// `JoinHandle` is aborted. Callers don't need explicit `shutdown` / `join`
+// methods — when the provider's last `Arc` drops, the
+// `OnceLock<BackgroundCompactor>` inside drops too, which runs the impl below.
 
 impl Drop for BackgroundCompactor {
     fn drop(&mut self) {
@@ -439,20 +477,7 @@ impl Drop for BackgroundCompactor {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        // Let an in-flight compaction finish its current write before the
-        // surrounding runtime tears down. vortex-io panics ("Runtime dropped
-        // task without completing it") if a task's runtime is dropped while the
-        // task is still pending, and the sharded encode keeps several such IO
-        // tasks in flight per compaction — so force-aborting mid-write races the
-        // runtime shutdown and panics. Poll `is_finished()` with plain sleeps so
-        // this never depends on the (possibly already-shutting-down) runtime
-        // timer and cannot hang past the deadline.
-        let deadline = Instant::now() + COMPACTOR_SHUTDOWN_DRAIN;
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        // Whether it drained or hit the deadline, ensure the task is gone.
-        handle.abort();
+        spawn_compactor_drain_thread(handle);
     }
 }
 
@@ -748,8 +773,8 @@ mod tests {
     }
 
     /// Dropping the compactor while a compaction is in flight must let it finish
-    /// (drain) rather than abort it mid-write — aborting mid-write is what drops
-    /// the Vortex IO runtime's in-flight task and panics at shutdown.
+    /// (drain) rather than abort it mid-write, while `Drop` itself returns
+    /// promptly from the caller's thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_compactor_drains_in_flight_compaction_on_drop() {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -780,6 +805,13 @@ mod tests {
         );
 
         drop(compactor);
+
+        for _ in 0..400 {
+            if completed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         assert!(
             completed.load(Ordering::SeqCst),

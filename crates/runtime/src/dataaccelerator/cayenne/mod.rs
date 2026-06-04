@@ -1092,8 +1092,11 @@ impl CayenneAccelerator {
         };
 
         // Create shared Cayenne context with the runtime's RuntimeEnv
-        let context =
-            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env), table_name);
+        let context = cayenne::CayenneContext::new(
+            &table_options.vortex_config,
+            Arc::clone(&runtime_env),
+            table_name,
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
