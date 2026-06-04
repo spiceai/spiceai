@@ -4100,7 +4100,15 @@ impl CayenneTableProvider {
         // is installed (unit tests, embedders). See `write_budget`.
         let shard_count =
             self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
-        let _encode_permits = super::write_budget::acquire_encode_permits(shard_count).await;
+        // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
+        // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
+        // Acquire permits for that clamped count so a `cayenne_write_concurrency`
+        // configured above `target_partitions` can't over-subscribe the global
+        // budget and throttle other tables. (`acquire_encode_permits` also caps to
+        // the budget total, but clamping here keeps the request honest even if the
+        // budget is ever sized below the core count, e.g. reserved query threads.)
+        let encode_shards = shard_count.min(target_partitions.max(1));
+        let _encode_permits = super::write_budget::acquire_encode_permits(encode_shards).await;
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
