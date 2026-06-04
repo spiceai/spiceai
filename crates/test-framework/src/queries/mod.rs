@@ -170,6 +170,17 @@ macro_rules! generate_chbench_queries {
     }
 }
 
+macro_rules! remove_chbench_query {
+    ( $queries:expr, $( $i:literal ),* ) => {
+        {
+            let query_names: Vec<Arc<str>> = vec![ $( concat!("chbench_q", stringify!($i)).into(), )* ];
+            $queries.into_iter()
+                .filter(|query| !query_names.contains(&query.name))
+                .collect()
+        }
+    };
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
@@ -1347,7 +1358,8 @@ pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query>
     );
 
     match overrides {
-        // No engine-specific overrides yet
+        // https://github.com/spiceai/spiceai/issues/11011
+        Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
         Some(_) | None => queries,
     }
 }

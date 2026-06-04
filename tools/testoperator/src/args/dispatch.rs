@@ -441,6 +441,9 @@ pub struct HtapDispatchArgs {
     /// Override default number of concurrent analytical query clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u64>,
+    /// Engine-specific query overrides
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_overrides: Option<QueryOverridesArg>,
 }
 
 fn default_queryset() -> String {
