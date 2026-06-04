@@ -386,10 +386,65 @@ fn create_response_stream(
                                 }
                             };
 
-                            // Only report errors; a success message is sent as the final step upon successful write completion
-                            if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
-                                yield Err(err);
-                                break;
+                            // Only report errors; a success message is sent as the final step upon successful write completion.
+                            //
+                            // The send must race against polling `write_future`:
+                            // `write_future` is an unspawned future driven solely by
+                            // this loop, and the sink consumes `batch_rx` only while
+                            // it is polled. Awaiting the send directly suspends this
+                            // generator inside the branch when the channel is full,
+                            // so the sink could never be polled again to drain it —
+                            // a permanent lost-wakeup deadlock that froze all writes
+                            // to an executor whenever the sink fell one channel's
+                            // worth of batches behind the wire (e.g. during a slow
+                            // metastore WAL checkpoint under heavy ingest). Keep the
+                            // sink and the idle deadline polled while the send is
+                            // pending so backpressure propagates instead of
+                            // deadlocking.
+                            let path_str = path.to_string();
+                            let batch_send = handle_record_batch(new_batch, &batch_tx, &path_str);
+                            let mut batch_send = std::pin::pin!(batch_send);
+                            tokio::select! {
+                                biased;
+                                () = &mut deadline => {
+                                    tracing::error!(
+                                        dataset = %path,
+                                        "Timeout: write sink did not accept a record batch within {} seconds",
+                                        idle_timeout.as_secs()
+                                    );
+                                    yield Err(Status::deadline_exceeded(format!(
+                                        "Timeout: write sink did not accept a record batch within {} seconds",
+                                        idle_timeout.as_secs()
+                                    )));
+                                    break;
+                                }
+                                write_result = &mut write_future => {
+                                    match write_result {
+                                        Ok(()) => {
+                                            // Sink finished while a batch was still pending —
+                                            // mirror the early-completion arm: drain and succeed.
+                                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
+                                            while let Some(msg) = streaming_flight.next().await {
+                                                if let Err(e) = msg {
+                                                    tracing::error!("Error reading remaining message after early write completion: {e}");
+                                                }
+                                            }
+                                            yield Ok(PutResult::default());
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Write operation failed. Details included in the response.");
+                                            yield Err(Status::internal(format!("Write operation failed: {e}")));
+                                            break;
+                                        }
+                                    }
+                                }
+                                send_res = &mut batch_send => {
+                                    if let Err(err) = send_res {
+                                        yield Err(err);
+                                        break;
+                                    }
+                                }
                             }
                         }
                         None => {
@@ -397,8 +452,23 @@ fn create_response_stream(
                             drop(batch_tx);
                             tracing::trace!("No more messages in the stream, finalizing write operation for path: {path}");
 
-                            // Wait for the write operation to complete
-                            if let Err(e) = write_future.await {
+                            // Wait for the write operation to complete, logging a
+                            // heartbeat while finalization is pending so a stuck
+                            // write is visible instead of hanging silently.
+                            let finalize_start = std::time::Instant::now();
+                            let write_result = loop {
+                                match tokio::time::timeout(std::time::Duration::from_secs(30), &mut write_future).await {
+                                    Ok(res) => break res,
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            dataset = %path,
+                                            waited_s = finalize_start.elapsed().as_secs(),
+                                            "DoPut write finalization still pending",
+                                        );
+                                    }
+                                }
+                            };
+                            if let Err(e) = write_result {
                                 tracing::error!("Write operation failed. Details included in the response.");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
