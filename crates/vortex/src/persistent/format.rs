@@ -67,12 +67,12 @@ use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
-use datafusion_execution::cache::cache_manager::FileMetadata;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
+use datafusion_execution::cache::cache_manager::FileMetadata;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 const DEFAULT_TARGET_FILE_SIZE_MB: usize = 128;

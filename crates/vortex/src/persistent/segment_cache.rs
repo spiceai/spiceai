@@ -76,7 +76,7 @@ impl SegmentCache for PathSegmentCache {
             self.shared.hits.fetch_add(1, Ordering::Relaxed);
         }
         let accesses = self.shared.accesses.fetch_add(1, Ordering::Relaxed) + 1;
-        if accesses % SEGMENT_CACHE_STATS_SAMPLE_EVERY == 0 {
+        if accesses.is_multiple_of(SEGMENT_CACHE_STATS_SAMPLE_EVERY) {
             // Rare branch: flush moka's pending bookkeeping so the reported fill
             // is accurate rather than eventually-consistent.
             self.shared.cache.run_pending_tasks().await;
