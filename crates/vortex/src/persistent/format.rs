@@ -710,7 +710,7 @@ impl FileFormat for VortexFormat {
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
                 // Footer-cache right-sizing telemetry (see infer_schema above).
-                tracing::info!(
+                tracing::debug!(
                     target: "vortex::footer_cache",
                     path = %object.location,
                     footer_bytes = cached.memory_size(),
