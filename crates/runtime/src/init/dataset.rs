@@ -602,7 +602,10 @@ impl Runtime {
         // reshapes the schema, validate inferred columns against the projected
         // schema; if it can't be parsed, skip inference rather than risk injecting a
         // column the accelerator would later reject.
-        let effective_schema = match ds.acceleration.as_ref().and_then(|a| a.refresh_sql.as_ref())
+        let effective_schema = match ds
+            .acceleration
+            .as_ref()
+            .and_then(|a| a.refresh_sql.as_ref())
         {
             Some(sql) => match crate::datafusion::refresh_sql::parse_refresh_sql(
                 ds.name.clone(),

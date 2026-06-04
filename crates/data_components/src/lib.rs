@@ -87,7 +87,6 @@ pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_column
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
 pub mod arrow;
-pub mod inferred_schema;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "cosmosdb")]
@@ -112,6 +111,7 @@ pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod iceberg;
+pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
 #[cfg(feature = "mongodb")]

@@ -350,14 +350,16 @@ async fn postgres_inferred_schema_metadata(
     let mut by_index: BTreeMap<String, IndexAccumulator> = BTreeMap::new();
     for row in &rows {
         let index_name: String = row.get("index_name");
-        let acc = by_index.entry(index_name).or_insert_with(|| IndexAccumulator {
-            is_primary: row.get("is_primary"),
-            is_unique: row.get("is_unique"),
-            is_clustered: row.get("is_clustered"),
-            is_partial: row.get("is_partial"),
-            has_expressions: row.get("has_expressions"),
-            columns: Vec::new(),
-        });
+        let acc = by_index
+            .entry(index_name)
+            .or_insert_with(|| IndexAccumulator {
+                is_primary: row.get("is_primary"),
+                is_unique: row.get("is_unique"),
+                is_clustered: row.get("is_clustered"),
+                is_partial: row.get("is_partial"),
+                has_expressions: row.get("has_expressions"),
+                columns: Vec::new(),
+            });
         acc.columns.push((
             row.get::<_, i64>("column_ordinal"),
             row.get::<_, Option<String>>("column_name"),
@@ -401,9 +403,7 @@ async fn postgres_inferred_schema_metadata(
             continue;
         }
 
-        if usable
-            && let Some(names) = &column_names
-        {
+        if usable && let Some(names) = &column_names {
             indexes.push(InferredIndex {
                 columns: names.clone(),
                 unique: acc.is_unique,

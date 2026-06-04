@@ -277,8 +277,14 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["email", "age"]), "ds");
 
-        assert_eq!(acc.indexes.get(&col_ref(&["email"])), Some(&IndexType::Unique));
-        assert_eq!(acc.indexes.get(&col_ref(&["age"])), Some(&IndexType::Enabled));
+        assert_eq!(
+            acc.indexes.get(&col_ref(&["email"])),
+            Some(&IndexType::Unique)
+        );
+        assert_eq!(
+            acc.indexes.get(&col_ref(&["age"])),
+            Some(&IndexType::Enabled)
+        );
     }
 
     #[test]
@@ -293,13 +299,17 @@ mod tests {
             ..InferredSchema::default()
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["id"]), "ds");
-        assert!(acc.indexes.is_empty(), "PK-duplicate index should be skipped");
+        assert!(
+            acc.indexes.is_empty(),
+            "PK-duplicate index should be skipped"
+        );
     }
 
     #[test]
     fn skips_inferred_indexes_when_user_configured_any() {
         let mut acc = accel(Engine::DuckDB);
-        acc.indexes.insert(col_ref(&["existing"]), IndexType::Enabled);
+        acc.indexes
+            .insert(col_ref(&["existing"]), IndexType::Enabled);
         let inferred = InferredSchema {
             indexes: vec![InferredIndex {
                 columns: vec!["email".to_string()],
@@ -321,7 +331,9 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at", "id"]), "ds");
         assert_eq!(
-            acc.params.get("on_refresh_sort_columns").map(String::as_str),
+            acc.params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str),
             Some("created_at DESC, id ASC")
         );
     }
@@ -365,7 +377,9 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at"]), "ds");
         assert_eq!(
-            acc.params.get("on_refresh_sort_columns").map(String::as_str),
+            acc.params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str),
             Some("custom")
         );
     }
@@ -390,7 +404,9 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at"]), "ds");
         assert_eq!(
-            acc.params.get("on_refresh_sort_columns").map(String::as_str),
+            acc.params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str),
             Some("created_at DESC")
         );
     }
