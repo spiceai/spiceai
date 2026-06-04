@@ -148,7 +148,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [OpenAI Responses API](https://github.com/spiceai/cookbook/blob/trunk/openai-responses-api/README.md)
      - [ ] [MCP Server](https://github.com/spiceai/cookbook/blob/trunk/mcp-server/README.md)
      - [ ] [LLM Judge](https://github.com/spiceai/cookbook/blob/trunk/llm-judge/README.md)
-     - [ ] [Evals](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
      - [ ] [Generative Visualisations](https://github.com/spiceai/cookbook/blob/trunk/generative-visualisations/README.md)
      - [ ] [Web Search](https://github.com/spiceai/cookbook/blob/trunk/websearch/README.md)
      - [ ] [Elasticsearch Search](https://github.com/spiceai/cookbook/blob/trunk/search/elasticsearch/README.md)
