@@ -73,10 +73,11 @@ wait_for_spiced() {
   return 1
 }
 
-# --- spiced CPU% / RSS (5s) ---
+# --- spiced CPU% / RSS (5s); re-resolve the PID each tick so it survives a
+#     spiced restart / PID reuse rather than tracking a stale (or reused) PID. ---
 ( wait_for_spiced || exit 0
-  pid=$(pgrep -x spiced | head -1)
-  while kill -0 "$pid" 2>/dev/null; do
+  while pgrep -x spiced >/dev/null 2>&1; do
+    pid=$(pgrep -x spiced | head -1)
     read -r pct rss < <(ps -o %cpu=,rss= -p "$pid" 2>/dev/null)
     [ -n "${pct:-}" ] && echo "$(date +%s),$pct,$(( ${rss:-0} / 1024 ))" >> "$CPU"
     sleep 5

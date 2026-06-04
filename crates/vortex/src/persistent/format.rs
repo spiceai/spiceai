@@ -67,6 +67,7 @@ use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
+use datafusion_execution::cache::cache_manager::FileMetadata;
 use super::segment_cache::SharedSegmentCache;
 use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
@@ -594,6 +595,15 @@ impl FileFormat for VortexFormat {
 
                     // Cache the metadata
                     let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
+                    // Footer-cache right-sizing telemetry: the accounted footer
+                    // size (what fills the FileMetadataCache budget) per file.
+                    tracing::info!(
+                        target: "vortex::footer_cache",
+                        path = %object.location,
+                        footer_bytes = cached_metadata.memory_size(),
+                        src = "infer_schema",
+                        "footer cached",
+                    );
                     cache.put(&object, cached_metadata);
 
                     let inferred_schema = vxf.dtype().to_arrow_schema()?;
@@ -677,6 +687,14 @@ impl FileFormat for VortexFormat {
 
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
+                // Footer-cache right-sizing telemetry (see infer_schema above).
+                tracing::info!(
+                    target: "vortex::footer_cache",
+                    path = %object.location,
+                    footer_bytes = cached.memory_size(),
+                    src = "infer_stats",
+                    "footer cached",
+                );
                 file_metadata_cache.put(&object, cached);
 
                 (
