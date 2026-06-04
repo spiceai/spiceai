@@ -661,6 +661,9 @@ impl CayenneTableProvider {
                 self.target_file_size_bytes(),
                 &staging_snapshot_id,
                 target_partitions,
+                // The prepared insert is a lazily-consumed stream of unknown
+                // size; shard across the full write concurrency (prior behavior).
+                None,
             )
             .await
         {

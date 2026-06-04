@@ -530,13 +530,20 @@ pub trait MetadataCatalog: Send + Sync {
     /// Inline mutations rewrite row-store metadata entries in place instead of adding
     /// delete-marker side records. Newly appended inline data rows receive a fresh
     /// sequence number when present; rewritten rows retain their original sequence.
+    ///
+    /// Returns `Some(sequence_number)` with the sequence assigned to the newly
+    /// appended `data` rows (all appended rows in one call share that sequence),
+    /// or `None` when no new data rows were appended. Callers use this to gate
+    /// the in-memory visibility of the appended rows behind a published
+    /// watermark so concurrent scans never observe them before their paired
+    /// in-memory changes (e.g. a file deletion-cache update) are published.
     async fn commit_inlined_mutation(
         &self,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
-    ) -> CatalogResult<()>;
+    ) -> CatalogResult<Option<i64>>;
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;

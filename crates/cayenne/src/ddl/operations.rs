@@ -493,3 +493,153 @@ fn parse_label_from_sql(sql: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use tempfile::TempDir;
+
+    use crate::CayenneCatalog;
+    use crate::metadata::VortexConfig;
+
+    /// End-to-end on local FS: a Cayenne table partitioned by a user-supplied
+    /// `date_trunc` EXPRESSION over a Timestamp column (explicit `partition_by`
+    /// with the user's own `date_trunc` — the supported time-bucketing path)
+    /// must route each row to its `ts_day_bucket=<micros>/` partition and read
+    /// every row back. This is the path the prior cayenne partition tests don't
+    /// cover (they use string/Int column partitions, not an expression over
+    /// timestamps); it directly exercises per-partition staging-write → move →
+    /// scan for timestamp buckets on local FS, so no row is stranded in
+    /// `_staging/` or lost, and bucket dir names stay filesystem-safe.
+    #[tokio::test]
+    async fn test_date_trunc_expression_partition_round_trips_on_local_fs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let table_data_path = format!("{}/test/buckets/", tmp.path().to_string_lossy());
+        let db_path = tmp.path().join("meta.db");
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("payload", DataType::Utf8, false),
+        ]);
+        let vortex_schema = Arc::new(
+            transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+                .expect("schema transforms for vortex"),
+        );
+
+        let metadata_catalog: Arc<dyn MetadataCatalog> = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}", db_path.display())).expect("catalog opens"),
+        );
+        metadata_catalog
+            .init()
+            .await
+            .expect("catalog schema initializes");
+
+        let metadata_table_name = "test/buckets".to_string();
+        let create_options = CreateTableOptions {
+            table_name: metadata_table_name.clone(),
+            schema: Arc::clone(&vortex_schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: table_data_path.clone(),
+            partition_column: Some("ts_day_bucket".to_string()),
+            vortex_config: VortexConfig::default(),
+        };
+        let table_id = metadata_catalog
+            .create_table(create_options)
+            .await
+            .expect("catalog create_table");
+
+        let ctx = SessionContext::new();
+        let df_schema = vortex_schema
+            .as_ref()
+            .clone()
+            .to_dfschema()
+            .expect("df schema");
+        let expr_sql = "date_trunc('day', ts)".to_string();
+        let parsed_expr = ctx
+            .parse_sql_expr(&expr_sql, &df_schema)
+            .expect("date_trunc partition expression parses");
+        let runtime_env = ctx.runtime_env();
+
+        let provider = build_partitioned_provider(
+            &metadata_table_name,
+            &metadata_table_name,
+            &table_data_path,
+            &parsed_expr,
+            Some("ts_day_bucket"),
+            Some(&expr_sql),
+            &vortex_schema,
+            &metadata_catalog,
+            &table_id,
+            &[],
+            None,
+            &VortexConfig::default(),
+            &runtime_env,
+        )
+        .await
+        .expect("partitioned provider builds");
+
+        ctx.register_table("buckets", provider)
+            .expect("register partitioned table");
+
+        // 4 rows across 3 distinct days (ids 1 & 4 share day 2025-01-01).
+        // Integer micros via arrow_cast → exact Timestamp(Microsecond) values.
+        ctx.sql(
+            "INSERT INTO buckets VALUES \
+             (1, arrow_cast(1735693200000000, 'Timestamp(Microsecond, None)'), 'a'), \
+             (2, arrow_cast(1735783200000000, 'Timestamp(Microsecond, None)'), 'b'), \
+             (3, arrow_cast(1735862400000000, 'Timestamp(Microsecond, None)'), 'c'), \
+             (4, arrow_cast(1735689605000000, 'Timestamp(Microsecond, None)'), 'd')",
+        )
+        .await
+        .expect("insert plans")
+        .collect()
+        .await
+        .expect("insert executes");
+
+        // Every row must round-trip — nothing stranded in `_staging/` or lost.
+        let results = ctx
+            .sql("SELECT id, payload FROM buckets ORDER BY id")
+            .await
+            .expect("select plans")
+            .collect()
+            .await
+            .expect("select executes");
+        let total: usize = results
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(
+            total, 4,
+            "all 4 rows must round-trip across the day buckets"
+        );
+
+        // Exactly 3 `ts_day_bucket=<micros>/` partition dirs, all FS-safe.
+        let mut bucket_dirs = 0usize;
+        let mut entries = tokio::fs::read_dir(&table_data_path)
+            .await
+            .expect("read table dir");
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().await.expect("file type").is_dir()
+                && let Some(value) = name.strip_prefix("ts_day_bucket=")
+            {
+                bucket_dirs += 1;
+                assert!(
+                    value.chars().all(|c| c.is_ascii_digit()),
+                    "bucket dir must be a filesystem-safe integer, got {name}"
+                );
+            }
+        }
+        assert_eq!(
+            bucket_dirs, 3,
+            "expected exactly 3 day-bucket partition dirs"
+        );
+    }
+}

@@ -415,23 +415,18 @@ impl KeyDeletionIndex {
         // iterator's hint to skip Vec growth reallocations.
         let mut new_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, seq) in additions {
-            let key = Bytes::from(key);
-            let key_hash = hash_key(&key.as_ref());
-            let stored_sequence = match entries.entry(key) {
-                im::hashmap::Entry::Occupied(mut occ) => {
-                    let existing = *occ.get();
-                    if seq > existing {
-                        occ.insert(seq);
-                        seq
-                    } else {
-                        existing
-                    }
-                }
-                im::hashmap::Entry::Vacant(vac) => {
-                    vac.insert(seq);
-                    new_hashes.push(key_hash);
+            let stored_sequence = if let Some(existing) = entries.get_mut(key.as_ref()) {
+                if seq > *existing {
+                    *existing = seq;
                     seq
+                } else {
+                    *existing
                 }
+            } else {
+                let key_hash = hash_key(&key.as_ref());
+                entries.insert(Bytes::from(key), seq);
+                new_hashes.push(key_hash);
+                seq
             };
             if max_sequence_number.is_none_or(|max| stored_sequence > max) {
                 max_sequence_number = Some(stored_sequence);
