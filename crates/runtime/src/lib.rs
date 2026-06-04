@@ -312,8 +312,15 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
+    #[cfg(feature = "postgres-accel")]
     #[snafu(display(
         "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
+    ))]
+    AcceleratorEngineNotAvailable { name: String },
+
+    #[cfg(not(feature = "postgres-accel"))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
