@@ -51,12 +51,27 @@ async fn configure_sqlite_connection(
     loop {
         let result = conn
             .call(|conn| {
-                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                // 30s (was 5s): the metastore is the dominant CDC-apply cost now
+                // that the deletion index is a HAMT, so a write-lock burst should
+                // retry rather than fail a CDC change write (seen as transient
+                // "database is locked" under bursty OLTP).
+                conn.busy_timeout(std::time::Duration::from_secs(30))?;
                 conn.pragma_update(None, "journal_mode", "WAL")?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
-                conn.pragma_update(None, "cache_size", -32000)?;
+                // 64 MiB page cache (was 32 MiB): Cayenne inlines small writes
+                // into the catalog, so a larger cache keeps the hot pages
+                // (including inlined data) resident and cuts disk reads.
+                conn.pragma_update(None, "cache_size", -65536)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
+                // Memory-map the DB (256 MiB) for faster reads on the catalog
+                // hot path (keyset/stats lookups).
+                conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+                // Checkpoint the WAL ~every 40 MiB rather than the 4 MiB default
+                // so bursty writers aren't stalled by frequent auto-checkpoints;
+                // the explicit TRUNCATE checkpoint on the first connection still
+                // bounds WAL growth.
+                conn.pragma_update(None, "wal_autocheckpoint", 10_000)?;
 
                 Ok::<_, rusqlite::Error>(())
             })
