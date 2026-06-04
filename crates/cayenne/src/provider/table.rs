@@ -2081,13 +2081,44 @@ impl OnConflictDeletions {
     }
 }
 
-/// `apply_on_conflict_deletions` performs all durable deletion-vector I/O but
-/// returns the computed in-memory deletion-cache update instead of storing it,
-/// so the store can be committed synchronously — together with the protected
-/// snapshot publish — under a single `scan_state_lock.write()`. This keeps
-/// the scan-excluding guard held for microseconds rather than across the
-/// deletion-vector writes.
-pub(crate) enum OnConflictUpdate {
+/// `apply_on_conflict_deletions` performs all durable deletion-vector and
+/// inlined-data rewrite I/O but returns the computed in-memory visibility
+/// updates instead of storing them, so the stores can be committed
+/// synchronously — together with the protected snapshot publish — under a
+/// single `scan_state_lock.write()`. This keeps the scan-excluding guard held
+/// for microseconds rather than across durable writes.
+pub(crate) struct OnConflictUpdate {
+    deletion_update: OnConflictDeletionUpdate,
+    inlined_commit: Option<InlinedDurableCommit>,
+}
+
+impl OnConflictUpdate {
+    fn none() -> Self {
+        Self {
+            deletion_update: OnConflictDeletionUpdate::None,
+            inlined_commit: None,
+        }
+    }
+
+    fn from_deletion_update(deletion_update: OnConflictDeletionUpdate) -> Self {
+        Self {
+            deletion_update,
+            inlined_commit: None,
+        }
+    }
+
+    fn with_inlined_commit(mut self, inlined_commit: Option<InlinedDurableCommit>) -> Self {
+        self.inlined_commit = inlined_commit;
+        self
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self.deletion_update, OnConflictDeletionUpdate::None)
+            && self.inlined_commit.is_none()
+    }
+}
+
+enum OnConflictDeletionUpdate {
     /// No key-based deletion-cache change (pure position deletes or no deletes).
     None,
     /// New `Int64Pk` deletion snapshot to publish.
@@ -6491,7 +6522,7 @@ impl CayenneTableProvider {
             !deleted_inlined_pk_i64.is_empty() || !deleted_inlined_row_keys.is_empty();
 
         if !has_file_deletions && !has_inlined_deletions {
-            return Ok(OnConflictUpdate::None);
+            return Ok(OnConflictUpdate::none());
         }
 
         let inlined_rewrite = if has_inlined_deletions {
@@ -6507,9 +6538,11 @@ impl CayenneTableProvider {
             InlinedDataRewrite::default()
         };
 
+        let mut inlined_commit = None;
         if !inlined_rewrite.is_empty() {
             let removed_rows = inlined_rewrite.removed_rows;
-            self.commit_inlined_data_mutation(inlined_rewrite, vec![], 0)
+            inlined_commit = self
+                .commit_inlined_data_durable(inlined_rewrite, vec![])
                 .await?;
 
             tracing::debug!(
@@ -6563,7 +6596,7 @@ impl CayenneTableProvider {
         // position-delete batch has no key lists, so skip the entire
         // sequence-reservation + key-vector path.
         if deleted_pk_i64.is_empty() && deleted_row_keys.is_empty() {
-            return Ok(OnConflictUpdate::None);
+            return Ok(OnConflictUpdate::none().with_inlined_commit(inlined_commit));
         }
 
         // Reserve two consecutive sequence numbers in one metastore round-trip.
@@ -6598,7 +6631,7 @@ impl CayenneTableProvider {
             )
             .await?
         else {
-            return Ok(OnConflictUpdate::None);
+            return Ok(OnConflictUpdate::none().with_inlined_commit(inlined_commit));
         };
 
         // Build the appropriate deletion-cache update based on deletion strategy.
@@ -6632,7 +6665,7 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 );
 
-                OnConflictUpdate::Int64Pk(Arc::new(Int64PkDeletionSnapshot::from_indices(
+                OnConflictDeletionUpdate::Int64Pk(Arc::new(Int64PkDeletionSnapshot::from_indices(
                     updated_deleted,
                     updated_inserts,
                 )))
@@ -6673,7 +6706,7 @@ impl CayenneTableProvider {
                     self.table_metadata.table_name
                 );
 
-                OnConflictUpdate::RowConverter(Arc::new(
+                OnConflictDeletionUpdate::RowConverter(Arc::new(
                     RowConverterDeletionSnapshot::from_indices(updated_deleted, updated_inserts),
                 ))
             }
@@ -6691,17 +6724,17 @@ impl CayenneTableProvider {
             }
         };
 
-        Ok(update)
+        Ok(OnConflictUpdate::from_deletion_update(update).with_inlined_commit(inlined_commit))
     }
 
     /// Synchronously store a deferred on-conflict deletion-cache update into the
     /// live deletion cache. MUST be called while holding
     /// `scan_state_lock.write()` when paired with a protected-snapshot publish
     /// so concurrent scans observe both changes atomically.
-    fn commit_on_conflict_update(&self, update: OnConflictUpdate) {
+    fn commit_on_conflict_deletion_update(&self, update: OnConflictDeletionUpdate) {
         match update {
-            OnConflictUpdate::None => {}
-            OnConflictUpdate::Int64Pk(snapshot) => {
+            OnConflictDeletionUpdate::None => {}
+            OnConflictDeletionUpdate::Int64Pk(snapshot) => {
                 if let PkDeletionStrategyWithCache::Int64Pk {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
@@ -6710,7 +6743,7 @@ impl CayenneTableProvider {
                 }
                 self.refresh_deletion_memory_accounting();
             }
-            OnConflictUpdate::RowConverter(snapshot) => {
+            OnConflictDeletionUpdate::RowConverter(snapshot) => {
                 if let PkDeletionStrategyWithCache::RowConverterBased {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
@@ -6720,6 +6753,17 @@ impl CayenneTableProvider {
                 self.refresh_deletion_memory_accounting();
             }
         }
+    }
+
+    fn publish_on_conflict_update(&self, update: OnConflictUpdate) {
+        let OnConflictUpdate {
+            deletion_update,
+            inlined_commit,
+        } = update;
+        if let Some(commit) = inlined_commit {
+            self.publish_inlined_mutation(0, commit.removed_rows, commit.published_seq);
+        }
+        self.commit_on_conflict_deletion_update(deletion_update);
     }
 
     fn prepare_protected_snapshot_update(
@@ -6760,26 +6804,26 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Atomically publish an on-conflict deletion update and, when
+    /// Atomically publish on-conflict inlined/deletion updates and, when
     /// `protected_snapshot_id` is set, the protected-snapshot entry for a newly
-    /// written snapshot — both under a single `scan_state_lock.write()` guard.
+    /// written snapshot — all under a single `scan_state_lock.write()` guard.
     ///
     /// Only the synchronous in-memory commits run under the guard; all durable
     /// I/O (deletion vectors, sequence records) is performed by the caller
     /// beforehand, so the write lock is held for microseconds. When there is no
-    /// protected snapshot to publish and the deletion view is unchanged (the hot
-    /// pure-append case) the guard is skipped entirely.
+    /// protected snapshot to publish and the scan-visible views are unchanged
+    /// (the hot pure-append case) the guard is skipped entirely.
     pub(crate) async fn commit_on_conflict_publish(
         &self,
         update: OnConflictUpdate,
         protected_snapshot: Option<(&str, i64)>,
     ) {
-        if protected_snapshot.is_none() && matches!(update, OnConflictUpdate::None) {
+        if protected_snapshot.is_none() && update.is_empty() {
             return;
         }
         let Some((snapshot_id, threshold)) = protected_snapshot else {
             let _view_guard = self.scan_state_lock.write().await;
-            self.commit_on_conflict_update(update);
+            self.publish_on_conflict_update(update);
             return;
         };
 
@@ -6790,8 +6834,8 @@ impl CayenneTableProvider {
             let prepared = self.prepare_protected_snapshot_update(snapshot_id, threshold);
             let _view_guard = self.scan_state_lock.write().await;
             if self.try_commit_prepared_protected_snapshot(prepared) {
-                let update = update.take().unwrap_or(OnConflictUpdate::None);
-                self.commit_on_conflict_update(update);
+                let update = update.take().unwrap_or_else(OnConflictUpdate::none);
+                self.publish_on_conflict_update(update);
                 return;
             }
         }
