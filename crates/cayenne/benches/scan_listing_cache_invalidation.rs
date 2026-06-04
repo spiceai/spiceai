@@ -25,7 +25,7 @@ limitations under the License.
 //! lazily on the scan path.
 //!
 //! Every PK-conflict-handled write inserts a fresh snapshot into
-//! `protected_snapshots` (`publish_written_snapshot_with_sequence`,
+//! `protected_snapshots` (`commit_on_conflict_publish`,
 //! in `provider/table.rs`), so a table that absorbs upserts between compactions
 //! has N protected snapshots whose listing-table entries are still valid (their
 //! on-disk file set has not changed). A full cache clear evicts those entries

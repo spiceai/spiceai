@@ -930,10 +930,13 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
     inline_max_rows: usize,
     table_name: &str,
 ) -> TestResult<()> {
-    const NUM_KEYS: i64 = 512;
+    const NUM_KEYS: i64 = 256;
     const NUM_WRITERS: i64 = 1;
     const NUM_SCANNERS: usize = 8;
-    const DEADLINE: Duration = Duration::from_secs(20);
+    // A regressed publish surfaces a duplicate within the first second under this
+    // contention; 5s keeps a healthy safety margin while bounding CI time. A
+    // shorter run can only reduce detection power, never cause a false failure.
+    const DEADLINE: Duration = Duration::from_secs(5);
 
     let schema = composite_pk_schema();
     let vortex_config = cayenne::metadata::VortexConfig {
@@ -968,7 +971,8 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
     // The writer upserts one hot key per commit, cycling through the keyset to
     // maximise the rate of new-snapshot publishes (and protected-snapshot churn)
     // while scanners are mid-plan.
-    let mut writers = Vec::new();
+    let mut writers =
+        Vec::with_capacity(usize::try_from(NUM_WRITERS).expect("NUM_WRITERS fits in usize"));
     for writer_id in 0..NUM_WRITERS {
         let table = Arc::clone(&table);
         let schema = Arc::clone(&schema);
@@ -1014,7 +1018,7 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         }));
     }
@@ -1026,10 +1030,19 @@ async fn assert_no_duplicate_pk_under_concurrent_upserts(
         scanner.await.expect("scanner task");
     }
 
-    let detected = duplicate_sample
+    let mut detected = duplicate_sample
         .lock()
         .expect("lock duplicate sample")
         .take();
+
+    // Final deterministic check on the resting state: even if every scanner
+    // happened to miss a transient duplicate while writers were running, the
+    // table must contain no duplicate PKs once all writers have stopped. This
+    // makes the assertion hold over the resulting state, not just the sampled
+    // windows.
+    if detected.is_none() {
+        detected = scan_for_duplicate_pks(&ctx, table_name).await?;
+    }
     assert!(
         detected.is_none(),
         "concurrent upsert/scan produced a duplicate primary key with inline_max_rows={inline_max_rows}; offending keys:\n{}",
