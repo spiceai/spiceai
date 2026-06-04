@@ -44,10 +44,8 @@ use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engin
 use futures::Stream;
 use runtime_rate_control::RateController;
 use spark_connect_rs::errors::SparkError;
-use spark_connect_rs::{
-    SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
-};
-use tokio::sync::RwLock;
+use spark_connect_rs::{SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col};
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use std::error::Error;
@@ -92,8 +90,10 @@ impl SparkSessionFactory {
             .collect();
         base_options.sort();
 
-        // it's safe to use default values here for options as the session is
-        // already established. ignore token and session_id.
+        // `join_push_down_context` is a stable identifier used to match
+        // federation compute contexts. Missing options default to empty, and
+        // `token`/`session_id` are deliberately excluded so the identifier
+        // stays stable across token rotation and session rebuilds.
         let join_push_down_context = format!(
             "sc://{}:{}/;user_id={};x-databricks-cluster-id={};use_ssl={}",
             host,
@@ -165,6 +165,11 @@ struct SparkConnectInner {
     /// Current live session. Swapped out atomically when a stale/broken session
     /// is repaired via [`SparkConnect::reconnect`].
     session: RwLock<Arc<SparkSession>>,
+    /// Serializes reconnects so a burst of failing queries triggers a single
+    /// rebuild. Held across the async session build *instead of* the session
+    /// `RwLock`, so query readers are never blocked while a new session is
+    /// being established.
+    reconnect_lock: Mutex<()>,
     factory: SparkSessionFactory,
     join_push_down_context: String,
     rate_controller: Option<Arc<RateController>>,
@@ -173,10 +178,7 @@ struct SparkConnectInner {
 impl std::fmt::Debug for SparkConnect {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SparkConnect")
-            .field(
-                "join_push_down_context",
-                &self.inner.join_push_down_context,
-            )
+            .field("join_push_down_context", &self.inner.join_push_down_context)
             .finish_non_exhaustive()
     }
 }
@@ -204,6 +206,7 @@ impl SparkConnect {
         Ok(Self {
             inner: Arc::new(SparkConnectInner {
                 session: RwLock::new(session),
+                reconnect_lock: Mutex::new(()),
                 factory,
                 join_push_down_context,
                 rate_controller,
@@ -232,20 +235,39 @@ impl SparkConnect {
     /// Repairs a stale/broken session by rebuilding it with a fresh `session_id`
     /// and replacing the shared session so future queries use the new one.
     ///
-    /// If another task already reconnected (the shared session is no longer the
-    /// `stale` one), the already-established session is returned without
-    /// rebuilding again, preventing a reconnect stampede.
+    /// Reconnects are serialized by a dedicated `reconnect_lock` so a burst of
+    /// concurrently-failing queries triggers a single rebuild (no stampede).
+    /// The session `RwLock` is only taken briefly — to read the current handle
+    /// and to swap in the rebuilt one — and is never held across the async
+    /// `factory.build()`, so query readers are not blocked during a reconnect.
+    ///
+    /// If another task already reconnected while this caller waited for the
+    /// reconnect lock (the shared session is no longer the `stale` one), the
+    /// already-established session is returned without rebuilding again.
     async fn reconnect(
         &self,
         stale: &Arc<SparkSession>,
     ) -> Result<Arc<SparkSession>, Box<dyn Error + Send + Sync>> {
-        let mut guard = self.inner.session.write().await;
-        if !Arc::ptr_eq(&guard, stale) {
-            // A concurrent caller already reconnected; reuse their session.
-            return Ok(Arc::clone(&*guard));
+        let _reconnect_guard = self.inner.reconnect_lock.lock().await;
+
+        // Another caller may have rebuilt the session while we waited for the
+        // reconnect lock; if so, reuse it instead of rebuilding again.
+        {
+            let current = self.inner.session.read().await;
+            if !Arc::ptr_eq(&current, stale) {
+                return Ok(Arc::clone(&*current));
+            }
         }
+
+        // Build the replacement session without holding the session lock.
         let new_session = self.inner.factory.build().await?;
-        *guard = Arc::clone(&new_session);
+
+        // Briefly take the write lock only to swap in the rebuilt session.
+        {
+            let mut guard = self.inner.session.write().await;
+            *guard = Arc::clone(&new_session);
+        }
+
         Ok(new_session)
     }
 
@@ -660,8 +682,7 @@ mod tests {
             SparkError::AnalysisException("status: UNAVAILABLE, message: ...".to_string());
         assert!(is_recoverable_session_error(&unavailable));
 
-        let broken =
-            SparkError::AnalysisException("transport error: connection reset".to_string());
+        let broken = SparkError::AnalysisException("transport error: connection reset".to_string());
         assert!(is_recoverable_session_error(&broken));
     }
 
@@ -672,8 +693,9 @@ mod tests {
         );
         assert!(!is_recoverable_session_error(&missing_table));
 
-        let bad_sql =
-            SparkError::AnalysisException("[PARSE_SYNTAX_ERROR] Syntax error at or near".to_string());
+        let bad_sql = SparkError::AnalysisException(
+            "[PARSE_SYNTAX_ERROR] Syntax error at or near".to_string(),
+        );
         assert!(!is_recoverable_session_error(&bad_sql));
 
         let permission = SparkError::AnalysisException(
@@ -723,13 +745,19 @@ mod tests {
         );
 
         // Auth token and connection options are preserved across rebuilds.
-        assert_eq!(extract_option(&first, "token").as_deref(), Some("secret-token"));
+        assert_eq!(
+            extract_option(&first, "token").as_deref(),
+            Some("secret-token")
+        );
         assert_eq!(
             extract_option(&first, "x-databricks-cluster-id").as_deref(),
             Some("cluster-123")
         );
         assert_eq!(extract_option(&first, "use_ssl").as_deref(), Some("true"));
-        assert_eq!(extract_option(&first, "user_id").as_deref(), Some("spice.ai"));
+        assert_eq!(
+            extract_option(&first, "user_id").as_deref(),
+            Some("spice.ai")
+        );
 
         // The rendered string must remain a valid Spark Connect connection string.
         SparkConnect::validate_connection_string(&first)
