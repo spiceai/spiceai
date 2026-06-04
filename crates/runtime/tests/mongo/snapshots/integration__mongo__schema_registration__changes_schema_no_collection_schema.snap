@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/mongo/schema_registration.rs
+expression: formatted
+---
++-------------+-----------+-------------+
+| column_name | data_type | is_nullable |
++-------------+-----------+-------------+
+| _id         | Int32     | YES         |
+| name        | Utf8      | YES         |
+| version     | Int64     | YES         |
++-------------+-----------+-------------+
