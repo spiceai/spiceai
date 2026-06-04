@@ -239,6 +239,10 @@ pub struct StdioArgs {
     #[arg(long, env = "EC2_INSTANCE_TYPE", default_value = "m5.large")]
     pub ec2_instance_type: String,
 
+    /// EBS root volume size in GB for provisioned EC2 instances.
+    #[arg(long, env = "EC2_DISK_SIZE_GB", default_value = "100")]
+    pub ec2_disk_size_gb: i32,
+
     /// Assign a public IP to the provisioned EC2 `PostgreSQL` instance.
     /// Required when running spidapter outside the target VPC (e.g. local development).
     #[arg(long, env = "EC2_ASSOCIATE_PUBLIC_IP", default_value_t = false)]

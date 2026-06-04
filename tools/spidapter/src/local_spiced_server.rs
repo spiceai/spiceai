@@ -65,6 +65,7 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         ec2_security_group_id: None,
         ec2_ami_id: None,
         ec2_instance_type: "m5.large".to_string(),
+        ec2_disk_size_gb: 100,
         ec2_associate_public_ip: false,
         ec2_iam_instance_profile: None,
         spiced_binary: "spiced".to_string(),

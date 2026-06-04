@@ -94,7 +94,7 @@ pub(crate) async fn launch_mongodb_ec2(
                 .device_name("/dev/sda1")
                 .ebs(
                     EbsBlockDevice::builder()
-                        .volume_size(100)
+                        .volume_size(args.ec2_disk_size_gb)
                         .volume_type(VolumeType::Gp3)
                         .delete_on_termination(true)
                         .build(),

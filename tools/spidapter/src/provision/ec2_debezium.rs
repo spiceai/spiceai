@@ -92,7 +92,7 @@ pub(crate) async fn launch_ec2_debezium(
                 .device_name("/dev/sda1")
                 .ebs(
                     EbsBlockDevice::builder()
-                        .volume_size(40)
+                        .volume_size(args.ec2_disk_size_gb)
                         .volume_type(VolumeType::Gp3)
                         .delete_on_termination(true)
                         .build(),
