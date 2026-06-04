@@ -10222,7 +10222,6 @@ impl CayenneTableProvider {
     /// Protected snapshots skip deletions that existed when they were created
     /// (deletions with seq <= `max_delete_seq_at_creation`), but newer deletions
     /// (seq > `max_delete_seq_at_creation`) are still applied.
-    #[expect(clippy::too_many_arguments)]
     async fn scan_protected_snapshots(
         &self,
         scan: ProtectedSnapshotScan<'_>,
