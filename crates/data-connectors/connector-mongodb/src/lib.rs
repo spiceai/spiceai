@@ -407,9 +407,7 @@ fn parse_mongo_index(index_doc: &Document) -> Option<InferredIndex> {
     let mut columns: Vec<String> = Vec::new();
     for (field, value) in key_doc {
         // A non-ascending/descending key type makes the whole index unusable.
-        if index_column_direction(value).is_none() {
-            return None;
-        }
+        index_column_direction(value)?;
         columns.push(field.clone());
     }
     if columns.is_empty() {
@@ -417,6 +415,32 @@ fn parse_mongo_index(index_doc: &Document) -> Option<InferredIndex> {
     }
     let unique = index_doc.get_bool("unique").unwrap_or(false);
     Some(InferredIndex { columns, unique })
+}
+
+/// Convert a `collStats` numeric field to a `u64` (counts and sizes are
+/// non-negative integers). Returns `None` for missing, non-integer, or negative
+/// values. Pure, so it is unit-tested.
+fn bson_to_u64(value: Option<&Bson>) -> Option<u64> {
+    match value? {
+        Bson::Int32(i) => u64::try_from(*i).ok(),
+        Bson::Int64(i) => u64::try_from(*i).ok(),
+        _ => None,
+    }
+}
+
+/// Rough collection sizing via the `collStats` command: estimated document count
+/// and total data byte size. Best-effort — returns `(None, None)` on any failure.
+async fn mongo_collection_size(
+    db: &mongodb::Database,
+    collection_name: &str,
+) -> (Option<u64>, Option<u64>) {
+    let Ok(stats) = db.run_command(doc! { "collStats": collection_name }).await else {
+        return (None, None);
+    };
+    (
+        bson_to_u64(stats.get("count")),
+        bson_to_u64(stats.get("size")),
+    )
 }
 
 /// Infer the collection's primary key, secondary indexes, and sort order from
@@ -472,10 +496,14 @@ async fn mongodb_inferred_schema_metadata(
             .collect(),
     };
 
+    let (row_count, table_bytes) = mongo_collection_size(&db, collection_name).await;
+
     Ok(InferredSchema {
         primary_key,
         indexes,
         sort_columns,
+        row_count,
+        table_bytes,
     })
 }
 
@@ -501,6 +529,8 @@ async fn enrich_with_mongodb_metadata(
                 primary_key = ?inferred.primary_key,
                 indexes = inferred.indexes.len(),
                 sort_columns = inferred.sort_columns.len(),
+                row_count = ?inferred.row_count,
+                table_bytes = ?inferred.table_bytes,
                 "Inferred extended schema metadata from MongoDB catalog"
             );
             data_components::metadata_enriched_table_provider(
@@ -601,10 +631,22 @@ mod tests {
 #[cfg(test)]
 mod inferred_schema_tests {
     use super::{
-        InferredIndex, InferredSortColumn, clustered_sort_from_response, index_column_direction,
-        parse_mongo_index,
+        InferredIndex, InferredSortColumn, bson_to_u64, clustered_sort_from_response,
+        index_column_direction, parse_mongo_index,
     };
     use mongodb::bson::{Bson, doc};
+
+    #[test]
+    fn coll_stats_numbers_convert_to_u64() {
+        assert_eq!(bson_to_u64(Some(&Bson::Int32(42))), Some(42));
+        assert_eq!(
+            bson_to_u64(Some(&Bson::Int64(9_000_000_000))),
+            Some(9_000_000_000)
+        );
+        assert_eq!(bson_to_u64(Some(&Bson::Int32(-1))), None);
+        assert_eq!(bson_to_u64(Some(&Bson::String("x".to_string()))), None);
+        assert_eq!(bson_to_u64(None), None);
+    }
 
     #[test]
     fn direction_from_index_key_values() {

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::{CatalogProvider, Session},
-    common::{Constraints, Statistics},
+    common::{Constraints, Statistics, stats::Precision},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
@@ -82,6 +82,17 @@ pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
 /// The value is a JSON array of objects in sort order, each with a direction:
 /// `[{ "column": "created_at", "desc": true }, { "column": "id", "desc": false }]`.
 pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_columns";
+
+/// Schema-level metadata key for the rough estimated row count (extended schema inference).
+///
+/// The value is a base-10 integer string. This is a catalog estimate (e.g. Postgres
+/// `pg_class.reltuples`), not a precise count, and is surfaced as table statistics.
+pub const INFERRED_ROW_COUNT_METADATA_KEY: &str = "spice.inferred_row_count";
+
+/// Schema-level metadata key for the rough estimated table byte size (extended schema inference).
+///
+/// The value is a base-10 integer string of bytes (e.g. Postgres `pg_relation_size`).
+pub const INFERRED_TABLE_BYTES_METADATA_KEY: &str = "spice.inferred_table_bytes";
 
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
@@ -362,8 +373,34 @@ impl TableProvider for MetadataEnrichedTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
+        // If the schema carries an inferred rough table size, surface it as table
+        // statistics so the query optimizer, acceleration sizing, and observability
+        // can all use it. Otherwise delegate to the inner provider.
+        inferred_statistics(&self.schema).or_else(|| self.inner.statistics())
     }
+}
+
+/// Build `DataFusion` table statistics from the rough row-count / byte-size keys in
+/// `schema`'s metadata, if either was inferred (see [`inferred_schema`]). Column
+/// statistics are left unknown. Returns `None` when no size was inferred.
+fn inferred_statistics(schema: &SchemaRef) -> Option<Statistics> {
+    let inferred = inferred_schema::InferredSchema::from_metadata(schema.metadata());
+    if inferred.row_count.is_none() && inferred.table_bytes.is_none() {
+        return None;
+    }
+
+    let mut stats = Statistics::new_unknown(schema);
+    if let Some(rows) = inferred.row_count {
+        stats = stats.with_num_rows(Precision::Inexact(
+            usize::try_from(rows).unwrap_or(usize::MAX),
+        ));
+    }
+    if let Some(bytes) = inferred.table_bytes {
+        stats = stats.with_total_byte_size(Precision::Inexact(
+            usize::try_from(bytes).unwrap_or(usize::MAX),
+        ));
+    }
+    Some(stats)
 }
 
 #[async_trait]
@@ -397,6 +434,35 @@ mod tests {
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,
     };
+
+    #[test]
+    fn inferred_statistics_from_size_metadata() {
+        let metadata = HashMap::from([
+            (
+                INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                "1000".to_string(),
+            ),
+            (
+                INFERRED_TABLE_BYTES_METADATA_KEY.to_string(),
+                "2048".to_string(),
+            ),
+        ]);
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            metadata,
+        ));
+
+        let stats = inferred_statistics(&schema).expect("inferred size yields statistics");
+        assert_eq!(stats.num_rows, Precision::Inexact(1000));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2048));
+    }
+
+    #[test]
+    fn no_inferred_statistics_without_size_metadata() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        assert!(inferred_statistics(&schema).is_none());
+    }
 
     #[derive(Debug)]
     struct TestFederationProvider;

@@ -325,7 +325,21 @@ const INFERRED_SCHEMA_SQL: &str = "\
         AND ix.indislive \
     ORDER BY i.relname, k.ord";
 
+/// Rough table sizing from the catalog: the planner's estimated row count
+/// (`reltuples`, cast to bigint; `-1` when the table was never analyzed) and the
+/// table's main-fork byte size. Both are estimates — no scan.
+const TABLE_SIZE_SQL: &str = "\
+    SELECT \
+        c.reltuples::bigint AS row_estimate, \
+        pg_relation_size(c.oid) AS table_bytes \
+    FROM pg_catalog.pg_class c \
+    WHERE c.oid = to_regclass($1)";
+
 /// Accumulates the columns and flags for a single index while scanning rows.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the distinct boolean flags of a pg_index catalog row"
+)]
 struct IndexAccumulator {
     is_primary: bool,
     is_unique: bool,
@@ -367,7 +381,17 @@ async fn postgres_inferred_schema_metadata(
         ));
     }
 
-    Ok(inferred_schema_from_indexes(&by_index))
+    let mut schema = inferred_schema_from_indexes(&by_index);
+
+    // Rough table sizing (best-effort: a failure here must not fail inference).
+    if let Ok(size_rows) = conn.conn.query(TABLE_SIZE_SQL, &[&table_path]).await
+        && let Some(row) = size_rows.first()
+    {
+        schema.row_count = u64::try_from(row.get::<_, i64>("row_estimate")).ok();
+        schema.table_bytes = u64::try_from(row.get::<_, i64>("table_bytes")).ok();
+    }
+
+    Ok(schema)
 }
 
 /// Derive an [`InferredSchema`] from the per-index accumulators built from the
@@ -405,7 +429,7 @@ fn inferred_schema_from_indexes(by_index: &BTreeMap<String, IndexAccumulator>) -
 
         if acc.is_primary {
             if let Some(names) = &column_names {
-                primary_key = names.clone();
+                primary_key.clone_from(names);
             }
             continue;
         }
@@ -438,6 +462,9 @@ fn inferred_schema_from_indexes(by_index: &BTreeMap<String, IndexAccumulator>) -
         primary_key,
         indexes,
         sort_columns,
+        // Table sizing is added by the caller (it needs a second catalog query).
+        row_count: None,
+        table_bytes: None,
     }
 }
 
@@ -473,6 +500,8 @@ async fn enrich_with_postgres_metadata(
                         primary_key = ?inferred.primary_key,
                         indexes = inferred.indexes.len(),
                         sort_columns = inferred.sort_columns.len(),
+                        row_count = ?inferred.row_count,
+                        table_bytes = ?inferred.table_bytes,
                         "Inferred extended schema metadata from PostgreSQL catalog"
                     );
                 }

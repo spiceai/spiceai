@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     INFERRED_INDEXES_METADATA_KEY, INFERRED_PRIMARY_KEY_METADATA_KEY,
-    INFERRED_SORT_COLUMNS_METADATA_KEY,
+    INFERRED_ROW_COUNT_METADATA_KEY, INFERRED_SORT_COLUMNS_METADATA_KEY,
+    INFERRED_TABLE_BYTES_METADATA_KEY,
 };
 
 /// A secondary index inferred from the source table.
@@ -68,13 +69,23 @@ pub struct InferredSchema {
     pub indexes: Vec<InferredIndex>,
     /// Sort/clustering columns, in sort order.
     pub sort_columns: Vec<InferredSortColumn>,
+    /// Rough estimated row count from the source catalog (an estimate, not a
+    /// precise count). `None` when not inferred.
+    pub row_count: Option<u64>,
+    /// Rough estimated table data byte size from the source catalog. `None` when
+    /// not inferred.
+    pub table_bytes: Option<u64>,
 }
 
 impl InferredSchema {
     /// Whether nothing was inferred.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.primary_key.is_empty() && self.indexes.is_empty() && self.sort_columns.is_empty()
+        self.primary_key.is_empty()
+            && self.indexes.is_empty()
+            && self.sort_columns.is_empty()
+            && self.row_count.is_none()
+            && self.table_bytes.is_none()
     }
 
     /// Serialize the non-empty components into Arrow schema-metadata entries.
@@ -103,6 +114,18 @@ impl InferredSchema {
                 &self.sort_columns,
             );
         }
+        if let Some(row_count) = self.row_count {
+            metadata.insert(
+                INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                row_count.to_string(),
+            );
+        }
+        if let Some(table_bytes) = self.table_bytes {
+            metadata.insert(
+                INFERRED_TABLE_BYTES_METADATA_KEY.to_string(),
+                table_bytes.to_string(),
+            );
+        }
 
         metadata
     }
@@ -126,6 +149,12 @@ impl InferredSchema {
                 .get(INFERRED_SORT_COLUMNS_METADATA_KEY)
                 .and_then(|raw| parse_json_or_warn(raw, INFERRED_SORT_COLUMNS_METADATA_KEY))
                 .unwrap_or_default(),
+            row_count: metadata
+                .get(INFERRED_ROW_COUNT_METADATA_KEY)
+                .and_then(|raw| raw.parse().ok()),
+            table_bytes: metadata
+                .get(INFERRED_TABLE_BYTES_METADATA_KEY)
+                .and_then(|raw| raw.parse().ok()),
         }
     }
 }
@@ -186,6 +215,8 @@ mod tests {
                     desc: false,
                 },
             ],
+            row_count: Some(123_456),
+            table_bytes: Some(7_890_123),
         }
     }
 
@@ -193,10 +224,22 @@ mod tests {
     fn round_trips_through_metadata() {
         let original = sample();
         let metadata = original.to_metadata();
-        // All three keys present.
+        // All keys present.
         assert!(metadata.contains_key(INFERRED_PRIMARY_KEY_METADATA_KEY));
         assert!(metadata.contains_key(INFERRED_INDEXES_METADATA_KEY));
         assert!(metadata.contains_key(INFERRED_SORT_COLUMNS_METADATA_KEY));
+        assert_eq!(
+            metadata
+                .get(INFERRED_ROW_COUNT_METADATA_KEY)
+                .map(String::as_str),
+            Some("123456")
+        );
+        assert_eq!(
+            metadata
+                .get(INFERRED_TABLE_BYTES_METADATA_KEY)
+                .map(String::as_str),
+            Some("7890123")
+        );
 
         let parsed = InferredSchema::from_metadata(&metadata);
         assert_eq!(parsed, original);
