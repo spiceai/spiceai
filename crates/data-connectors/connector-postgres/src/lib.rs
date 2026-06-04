@@ -23,6 +23,7 @@ limitations under the License.
 //! change-by-change replication into the local accelerator without Debezium.
 
 use async_trait::async_trait;
+use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
@@ -40,7 +41,7 @@ use runtime::parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -291,32 +292,200 @@ async fn postgres_comment_metadata(
     Ok(data_components::postgres::provider::postgres_metadata_from_rows(rows))
 }
 
-async fn enrich_with_postgres_comments(
+/// One row per index column for the target table, carrying the flags needed to
+/// reconstruct the primary key, secondary indexes, and clustered sort order.
+///
+/// `indkey`/`indoption` are `int2vector`s; routing them through text to `int2[]`
+/// yields standard 1-based arrays that line up with `WITH ORDINALITY` and works
+/// across all supported PostgreSQL versions. Expression index keys have `attnum`
+/// 0 (no matching `pg_attribute` row, so `column_name` is NULL); partial indexes
+/// have a non-null `indpred`.
+const INFERRED_SCHEMA_SQL: &str = "\
+    SELECT \
+        i.relname AS index_name, \
+        ix.indisprimary AS is_primary, \
+        ix.indisunique AS is_unique, \
+        ix.indisclustered AS is_clustered, \
+        (ix.indpred IS NOT NULL) AS is_partial, \
+        (ix.indexprs IS NOT NULL) AS has_expressions, \
+        k.ord AS column_ordinal, \
+        a.attname AS column_name, \
+        COALESCE(((string_to_array(ix.indoption::text, ' ')::int[])[k.ord] & 1) = 1, false) AS is_desc \
+    FROM pg_catalog.pg_index ix \
+    JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid \
+    JOIN LATERAL unnest(string_to_array(ix.indkey::text, ' ')::int2[]) \
+        WITH ORDINALITY AS k(attnum, ord) ON true \
+    LEFT JOIN pg_catalog.pg_attribute a \
+        ON a.attrelid = ix.indrelid \
+        AND a.attnum = k.attnum \
+        AND a.attnum > 0 \
+        AND NOT a.attisdropped \
+    WHERE ix.indrelid = to_regclass($1) \
+        AND ix.indisvalid \
+        AND ix.indislive \
+    ORDER BY i.relname, k.ord";
+
+/// Accumulates the columns and flags for a single index while scanning rows.
+struct IndexAccumulator {
+    is_primary: bool,
+    is_unique: bool,
+    is_clustered: bool,
+    is_partial: bool,
+    has_expressions: bool,
+    /// (ordinal, column name (None for expression keys), descending)
+    columns: Vec<(i64, Option<String>, bool)>,
+}
+
+/// Query `pg_catalog` for the target table's primary key, secondary indexes, and
+/// clustered sort order. Returns an [`InferredSchema`]; empty when nothing usable
+/// was found (e.g. a heap table with no indexes).
+async fn postgres_inferred_schema_metadata(
+    pool: &Arc<PostgresConnectionPool>,
+    table_path: &str,
+) -> std::result::Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = pool.connect_direct().await?;
+    let rows = conn.conn.query(INFERRED_SCHEMA_SQL, &[&table_path]).await?;
+
+    // Group rows by index name; BTreeMap keeps iteration deterministic.
+    let mut by_index: BTreeMap<String, IndexAccumulator> = BTreeMap::new();
+    for row in &rows {
+        let index_name: String = row.get("index_name");
+        let acc = by_index.entry(index_name).or_insert_with(|| IndexAccumulator {
+            is_primary: row.get("is_primary"),
+            is_unique: row.get("is_unique"),
+            is_clustered: row.get("is_clustered"),
+            is_partial: row.get("is_partial"),
+            has_expressions: row.get("has_expressions"),
+            columns: Vec::new(),
+        });
+        acc.columns.push((
+            row.get::<_, i64>("column_ordinal"),
+            row.get::<_, Option<String>>("column_name"),
+            row.get::<_, bool>("is_desc"),
+        ));
+    }
+
+    let mut primary_key: Vec<String> = Vec::new();
+    let mut indexes: Vec<InferredIndex> = Vec::new();
+    let mut clustered_sort: Option<Vec<InferredSortColumn>> = None;
+
+    for acc in by_index.values() {
+        let mut columns = acc.columns.clone();
+        columns.sort_by_key(|(ord, _, _)| *ord);
+
+        // Every key part must map to a real column. Expression and partial indexes
+        // are skipped: a partial unique index is not a table-wide guarantee, and an
+        // expression key has no column to apply.
+        let column_names: Option<Vec<String>> =
+            columns.iter().map(|(_, name, _)| name.clone()).collect();
+        let usable = column_names.is_some() && !acc.has_expressions && !acc.is_partial;
+
+        if acc.is_clustered && usable {
+            clustered_sort = Some(
+                columns
+                    .iter()
+                    .filter_map(|(_, name, desc)| {
+                        name.clone().map(|column| InferredSortColumn {
+                            column,
+                            desc: *desc,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        if acc.is_primary {
+            if let Some(names) = &column_names {
+                primary_key = names.clone();
+            }
+            continue;
+        }
+
+        if usable
+            && let Some(names) = &column_names
+        {
+            indexes.push(InferredIndex {
+                columns: names.clone(),
+                unique: acc.is_unique,
+            });
+        }
+    }
+
+    // The primary key is also reported as a unique index — drop the duplicate.
+    if !primary_key.is_empty() {
+        indexes.retain(|index| index.columns != primary_key);
+    }
+
+    // Sort heuristic: clustered index (with direction), else the primary key ascending.
+    let sort_columns = clustered_sort.unwrap_or_else(|| {
+        primary_key
+            .iter()
+            .map(|column| InferredSortColumn {
+                column: column.clone(),
+                desc: false,
+            })
+            .collect()
+    });
+
+    Ok(InferredSchema {
+        primary_key,
+        indexes,
+        sort_columns,
+    })
+}
+
+/// Enrich the provider's schema with PostgreSQL metadata: column/table comments
+/// and source types (always), plus inferred primary key / indexes / sort columns
+/// when the dataset opts into `schema_inference: extended`.
+async fn enrich_with_postgres_metadata(
     pool: &Arc<PostgresConnectionPool>,
     dataset: &Dataset,
     provider: Arc<dyn TableProvider>,
 ) -> Arc<dyn TableProvider> {
-    match postgres_comment_metadata(pool, dataset.path()).await {
-        Ok((table_metadata, field_metadata)) => {
-            if table_metadata.is_empty() && field_metadata.is_empty() {
-                provider
-            } else {
-                data_components::metadata_enriched_table_provider(
-                    provider,
-                    table_metadata,
-                    field_metadata,
-                )
+    let (mut table_metadata, field_metadata) =
+        match postgres_comment_metadata(pool, dataset.path()).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    source = %dataset.path(),
+                    error = %error,
+                    "Failed to query PostgreSQL comments; registering without comment metadata"
+                );
+                (HashMap::new(), data_components::FieldMetadata::new())
+            }
+        };
+
+    if dataset.schema_inference.is_extended() {
+        match postgres_inferred_schema_metadata(pool, dataset.path()).await {
+            Ok(inferred) => {
+                if !inferred.is_empty() {
+                    tracing::debug!(
+                        dataset = %dataset.name,
+                        source = %dataset.path(),
+                        primary_key = ?inferred.primary_key,
+                        indexes = inferred.indexes.len(),
+                        sort_columns = inferred.sort_columns.len(),
+                        "Inferred extended schema metadata from PostgreSQL catalog"
+                    );
+                }
+                table_metadata.extend(inferred.to_metadata());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    source = %dataset.path(),
+                    error = %error,
+                    "Failed to infer extended schema from PostgreSQL catalog; registering without inferred metadata"
+                );
             }
         }
-        Err(error) => {
-            tracing::warn!(
-                dataset = %dataset.name,
-                source = %dataset.path(),
-                error = %error,
-                "Failed to query PostgreSQL comments; registering without comment metadata"
-            );
-            provider
-        }
+    }
+
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        provider
+    } else {
+        data_components::metadata_enriched_table_provider(provider, table_metadata, field_metadata)
     }
 }
 
@@ -335,7 +504,7 @@ impl DataConnector for Postgres {
             .read_write_table_provider(dataset.path().into())
             .await
         {
-            Ok(provider) => Some(Ok(enrich_with_postgres_comments(
+            Ok(provider) => Some(Ok(enrich_with_postgres_metadata(
                 &self.pool, dataset, provider,
             )
             .await)),
@@ -381,7 +550,7 @@ impl DataConnector for Postgres {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match self.factory.table_provider(dataset.path().into()).await {
-            Ok(provider) => Ok(enrich_with_postgres_comments(&self.pool, dataset, provider).await),
+            Ok(provider) => Ok(enrich_with_postgres_metadata(&self.pool, dataset, provider).await),
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {

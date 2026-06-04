@@ -23,7 +23,7 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 #[cfg(feature = "duckdb")]
 use common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    start_mongodb_replica_set_docker_container,
+    make_mongodb_change_stream_dataset_inferred, start_mongodb_replica_set_docker_container,
 };
 use mongodb::{Collection, bson::doc};
 
@@ -45,6 +45,8 @@ use tracing::instrument;
 const MONGODB_PORT1: u16 = 27019;
 #[cfg(feature = "duckdb")]
 const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
+#[cfg(feature = "duckdb")]
+const MONGODB_CHANGE_STREAM_INFERENCE_PORT: u16 = 27021;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
@@ -341,6 +343,100 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
             assert!(
                 changes_applied,
                 "MongoDB Change Streams should apply insert, update, and delete events"
+            );
+
+            rt.shutdown().await;
+            running_container.remove().await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// MongoDB Streams (`refresh_mode: changes`) work with `schema_inference: extended`
+/// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
+/// primary key plus the matching upsert, which the change-stream path requires.
+#[cfg(feature = "duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,connector_mongodb=debug,data_components=debug,info",
+    ));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mongodb_replica_set_docker_container(MONGODB_CHANGE_STREAM_INFERENCE_PORT)
+                    .await?;
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mongodb_change_stream_db(MONGODB_CHANGE_STREAM_INFERENCE_PORT)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            let app = AppBuilder::new("mongodb_change_streams_infer_primary_key")
+                .with_dataset(make_mongodb_change_stream_dataset_inferred(
+                    "change_stream_users",
+                    "change_stream_users",
+                    MONGODB_CHANGE_STREAM_INFERENCE_PORT,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            crate::utils::runtime_ready_check(&rt).await;
+            let rt = Arc::new(rt);
+
+            // The change stream only starts if `resolve_primary_keys` succeeds, which
+            // requires `primary_key: _id` plus an `_id` upsert. Both come from extended
+            // schema inference here, not explicit configuration.
+            let initial_rows_loaded = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![(1, "Ada".to_string()), (2, "Grace".to_string())]
+                    })
+                }
+            })
+            .await;
+            assert!(
+                initial_rows_loaded,
+                "MongoDB change stream should start and snapshot via the inferred `_id` primary key"
+            );
+
+            // An UPDATE should upsert in place (inferred on_conflict), not append.
+            let client =
+                get_mongodb_replica_set_client(MONGODB_CHANGE_STREAM_INFERENCE_PORT).await?;
+            let collection: Collection<mongodb::bson::Document> =
+                client.database("testdb").collection("change_stream_users");
+            collection
+                .update_one(doc! { "_id": 2 }, doc! { "$set": { "name": "Grace Hopper" } })
+                .await?;
+
+            let update_applied = wait_until_true(std::time::Duration::from_secs(30), || {
+                let rt = Arc::clone(&rt);
+                async move {
+                    change_stream_rows(&rt).await.is_ok_and(|rows| {
+                        rows == vec![(1, "Ada".to_string()), (2, "Grace Hopper".to_string())]
+                    })
+                }
+            })
+            .await;
+            assert!(
+                update_applied,
+                "the inferred `_id` upsert should apply UPDATE events in place"
             );
 
             rt.shutdown().await;

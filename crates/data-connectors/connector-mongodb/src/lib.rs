@@ -27,10 +27,12 @@ mod changes;
 
 use async_trait::async_trait;
 use data_components::Read;
+use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
+use mongodb::bson::{Bson, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
@@ -333,6 +335,182 @@ impl From<ReadProviderError> for DataConnectorError {
     }
 }
 
+/// Maps a MongoDB index-key value to a sort direction: `1` ascending, `-1`
+/// descending. Returns `None` for non-b-tree key types (`text`, `2dsphere`,
+/// `hashed`, ...), which cannot be expressed as accelerator sort/index columns.
+fn index_column_direction(value: &Bson) -> Option<bool> {
+    let n = match value {
+        Bson::Int32(i) => i64::from(*i),
+        Bson::Int64(i) => *i,
+        Bson::Double(f) if (*f - 1.0).abs() < f64::EPSILON => 1,
+        Bson::Double(f) if (*f + 1.0).abs() < f64::EPSILON => -1,
+        _ => return None,
+    };
+    match n {
+        1 => Some(false),
+        -1 => Some(true),
+        _ => None,
+    }
+}
+
+/// If the collection is a clustered collection (MongoDB 5.3+), return its cluster
+/// key columns with direction — the physical-order analog of a Postgres clustered
+/// index. Returns `None` (best-effort) when not clustered or on any parse miss.
+async fn mongodb_clustered_sort(
+    db: &mongodb::Database,
+    collection_name: &str,
+) -> Option<Vec<InferredSortColumn>> {
+    let response = db
+        .run_command(doc! { "listCollections": 1, "filter": { "name": collection_name } })
+        .await
+        .ok()?;
+    let key_doc = response
+        .get_document("cursor")
+        .ok()?
+        .get_array("firstBatch")
+        .ok()?
+        .first()?
+        .as_document()?
+        .get_document("options")
+        .ok()?
+        .get_document("clusteredIndex")
+        .ok()?
+        .get_document("key")
+        .ok()?;
+
+    let mut sort_columns = Vec::new();
+    for (field, value) in key_doc {
+        let desc = index_column_direction(value)?;
+        sort_columns.push(InferredSortColumn {
+            column: field.clone(),
+            desc,
+        });
+    }
+    (!sort_columns.is_empty()).then_some(sort_columns)
+}
+
+/// Infer the collection's primary key, secondary indexes, and sort order from
+/// MongoDB catalog commands (`listIndexes`, `listCollections`).
+///
+/// MongoDB's document key is always `_id`, so the primary key is `["_id"]` — this
+/// is what makes `refresh_mode: changes` (MongoDB Streams) work without manual
+/// configuration, since the change-stream path requires `primary_key: _id` plus a
+/// matching `on_conflict` upsert.
+async fn mongodb_inferred_schema_metadata(
+    pool: &Arc<MongoDBConnectionPool>,
+    collection_name: &str,
+) -> Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
+    let connection = pool
+        .connect()
+        .await
+        .map_err(|e| format!("failed to connect to MongoDB: {e}"))?;
+    let db = connection.client.database(&connection.db_name);
+
+    // MongoDB's document key is always `_id`.
+    let primary_key = vec!["_id".to_string()];
+
+    // Secondary indexes via the `listIndexes` command (indexes are few and fit in
+    // the first cursor batch, so there is no need to exhaust the cursor).
+    let mut indexes: Vec<InferredIndex> = Vec::new();
+    let index_response = db
+        .run_command(doc! { "listIndexes": collection_name })
+        .await?;
+    if let Ok(cursor) = index_response.get_document("cursor")
+        && let Ok(first_batch) = cursor.get_array("firstBatch")
+    {
+        for entry in first_batch {
+            let Some(index_doc) = entry.as_document() else {
+                continue;
+            };
+            // Partial indexes are not a table-wide guarantee — skip.
+            if index_doc.contains_key("partialFilterExpression") {
+                continue;
+            }
+            let Ok(key_doc) = index_doc.get_document("key") else {
+                continue;
+            };
+            // Collect plain b-tree columns; drop the whole index if any key part is
+            // a non-ascending/descending key type (text, 2dsphere, hashed, ...).
+            let mut columns: Vec<String> = Vec::new();
+            let mut usable = true;
+            for (field, value) in key_doc {
+                if index_column_direction(value).is_some() {
+                    columns.push(field.clone());
+                } else {
+                    usable = false;
+                    break;
+                }
+            }
+            if !usable || columns.is_empty() || columns == primary_key {
+                continue; // unusable, empty, or the `_id_` index (the primary key)
+            }
+            let unique = index_doc.get_bool("unique").unwrap_or(false);
+            indexes.push(InferredIndex { columns, unique });
+        }
+    }
+
+    // Sort heuristic: clustered collection key (with direction), else the primary
+    // key ascending — mirrors the Postgres "clustered, else primary key" rule.
+    let sort_columns = match mongodb_clustered_sort(&db, collection_name).await {
+        Some(sort) => sort,
+        None => primary_key
+            .iter()
+            .map(|column| InferredSortColumn {
+                column: column.clone(),
+                desc: false,
+            })
+            .collect(),
+    };
+
+    Ok(InferredSchema {
+        primary_key,
+        indexes,
+        sort_columns,
+    })
+}
+
+/// Enrich the provider's schema with inferred primary key / indexes / sort columns
+/// when the dataset opts into `schema_inference: extended`.
+async fn enrich_with_mongodb_metadata(
+    pool: &Arc<MongoDBConnectionPool>,
+    dataset: &Dataset,
+    provider: Arc<dyn TableProvider>,
+) -> Arc<dyn TableProvider> {
+    if !dataset.schema_inference.is_extended() {
+        return provider;
+    }
+
+    match mongodb_inferred_schema_metadata(pool, dataset.path()).await {
+        Ok(inferred) => {
+            if inferred.is_empty() {
+                return provider;
+            }
+            tracing::debug!(
+                dataset = %dataset.name,
+                collection = %dataset.path(),
+                primary_key = ?inferred.primary_key,
+                indexes = inferred.indexes.len(),
+                sort_columns = inferred.sort_columns.len(),
+                "Inferred extended schema metadata from MongoDB catalog"
+            );
+            data_components::metadata_enriched_table_provider(
+                provider,
+                inferred.to_metadata(),
+                data_components::FieldMetadata::new(),
+            )
+        }
+        Err(error) => {
+            tracing::warn!(
+                dataset = %dataset.name,
+                collection = %dataset.path(),
+                error = %error,
+                "Failed to infer extended schema from MongoDB catalog; registering without inferred metadata"
+            );
+            provider
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for MongoDB {
     fn as_any(&self) -> &dyn Any {
@@ -343,14 +521,13 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.mongodb_factory, dataset.path().into())
-                .await
-                .context(UnableToGetReadProviderSnafu {
-                    dataconnector: "mongodb",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        let provider = Read::table_provider(&self.mongodb_factory, dataset.path().into())
+            .await
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "mongodb",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
+        Ok(enrich_with_mongodb_metadata(&self.pool, dataset, provider).await)
     }
 
     fn supports_changes_stream(&self) -> bool {

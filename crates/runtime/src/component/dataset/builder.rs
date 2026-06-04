@@ -18,7 +18,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::{
     CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, OnSchemaChange, ReadyState,
-    Result, TimeFormat, UnsupportedTypeAction, acceleration, replication, validate_identifier,
+    Result, SchemaInference, TimeFormat, UnsupportedTypeAction, acceleration, replication,
+    validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
@@ -65,6 +66,7 @@ pub struct DatasetBuilder {
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<FtsStore>,
     pub check_availability: CheckAvailability,
+    pub schema_inference: SchemaInference,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -153,6 +155,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             vectors: dataset.vectors,
             full_text_search: dataset.full_text_search,
             check_availability: CheckAvailability::from(dataset.check_availability),
+            schema_inference: SchemaInference::from(dataset.schema_inference),
         })
     }
 }
@@ -186,6 +189,7 @@ impl DatasetBuilder {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
+            schema_inference: SchemaInference::default(),
         })
     }
 
@@ -289,6 +293,7 @@ impl DatasetBuilder {
             vectors: self.vectors,
             full_text_search: self.full_text_search,
             check_availability: self.check_availability,
+            schema_inference: self.schema_inference,
         };
 
         Ok(dataset)

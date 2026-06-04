@@ -64,10 +64,30 @@ pub const CLUSTERING_METADATA_KEY: &str = "clustering";
 /// Canonical Arrow schema metadata key for a source-native clustering expression.
 pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
 
+/// Schema-level metadata key for an inferred primary key (extended schema inference).
+///
+/// The value is a JSON array of column names in key order, e.g. `["tenant_id","id"]`.
+/// Emitted by connectors that perform extended schema inference and consumed by the
+/// runtime to fill `acceleration.primary_key` when the user left it unset.
+pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key";
+
+/// Schema-level metadata key for inferred secondary indexes (extended schema inference).
+///
+/// The value is a JSON array of objects, each describing one index:
+/// `[{ "columns": ["email"], "unique": true }]`.
+pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
+
+/// Schema-level metadata key for inferred sort/clustering columns (extended schema inference).
+///
+/// The value is a JSON array of objects in sort order, each with a direction:
+/// `[{ "column": "created_at", "desc": true }, { "column": "id", "desc": false }]`.
+pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_columns";
+
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
 pub mod arrow;
+pub mod inferred_schema;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "cosmosdb")]
