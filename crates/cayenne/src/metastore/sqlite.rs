@@ -58,15 +58,21 @@ async fn configure_sqlite_connection(
                 conn.busy_timeout(std::time::Duration::from_secs(30))?;
                 conn.pragma_update(None, "journal_mode", "WAL")?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
-                // 64 MiB page cache (was 32 MiB): Cayenne inlines small writes
-                // into the catalog, so a larger cache keeps the hot pages
-                // (including inlined data) resident and cuts disk reads.
-                conn.pragma_update(None, "cache_size", -65536)?;
+                // 256 MiB page cache (was 64 MiB): Cayenne inlines small writes
+                // into the catalog AND high-update tables (e.g. TPC-C district)
+                // grow the catalog DB to hundreds of MiB of snapshot/sequence
+                // rows, so a cache that covers it keeps the hot index pages
+                // resident — the per-write sequence UPDATE/INSERT (the
+                // `publish_seq` write phase) then does not fault them in from
+                // disk. The cache only grows to the DB size, so tiny per-table
+                // DBs pay nothing for the larger ceiling.
+                conn.pragma_update(None, "cache_size", -262144)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
-                // Memory-map the DB (256 MiB) for faster reads on the catalog
-                // hot path (keyset/stats lookups).
-                conn.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+                // Memory-map the DB (1 GiB) for faster reads on the catalog hot
+                // path (keyset/stats lookups) and to cover the larger high-update
+                // catalog DBs without falling back to read() syscalls.
+                conn.pragma_update(None, "mmap_size", 1_073_741_824_i64)?;
                 // Checkpoint the WAL ~every 40 MiB rather than the 4 MiB default
                 // so bursty writers aren't stalled by frequent auto-checkpoints;
                 // the explicit TRUNCATE checkpoint on the first connection still
