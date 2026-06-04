@@ -4554,6 +4554,7 @@ mod tests {
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                schema_inference: crate::component::dataset::SchemaInference::Standard,
             }
         }
 

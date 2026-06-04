@@ -354,7 +354,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
         .await
 }
 
-/// MongoDB Streams (`refresh_mode: changes`) work with `schema_inference: extended`
+/// `MongoDB` Streams (`refresh_mode: changes`) work with `schema_inference: extended`
 /// and no explicit `primary_key`/`on_conflict`: inference supplies `_id` as the
 /// primary key plus the matching upsert, which the change-stream path requires.
 #[cfg(feature = "duckdb")]

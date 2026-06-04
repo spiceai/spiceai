@@ -86,7 +86,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
 
 /// Like [`make_mongodb_change_stream_dataset`] but omits `primary_key` and
 /// `on_conflict`, relying on `schema_inference: extended` to infer `_id` as the
-/// primary key (and seed the matching upsert) so MongoDB Streams work without
+/// primary key (and seed the matching upsert) so `MongoDB` Streams work without
 /// manual configuration.
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port: u16) -> Dataset {

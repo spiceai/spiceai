@@ -46,6 +46,7 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// `MongoDB` data connector.
 pub struct MongoDB {
@@ -80,6 +81,12 @@ const DEFAULT_CONNECTION_POOL_MIN: usize = 1;
 const DEFAULT_CONNECTION_POOL_MIN_STR: &str = "1";
 const DEFAULT_CONNECTION_POOL_MAX: usize = 5;
 const DEFAULT_CONNECTION_POOL_MAX_STR: &str = "5";
+
+/// Time bound for best-effort `MongoDB` catalog enrichment (secondary indexes,
+/// sort order, sizing). The constant `_id` primary key is inferred regardless;
+/// this only caps the optional extras so a slow or unavailable catalog can never
+/// block dataset load/readiness (which would otherwise stall `refresh_mode: changes`).
+const MONGODB_CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("connection_string")
@@ -443,25 +450,55 @@ async fn mongo_collection_size(
     )
 }
 
-/// Infer the collection's primary key, secondary indexes, and sort order from
-/// `MongoDB` catalog commands (`listIndexes`, `listCollections`).
-///
-/// `MongoDB`'s document key is always `_id`, so the primary key is `["_id"]` — this
-/// is what makes `refresh_mode: changes` (`MongoDB` Streams) work without manual
-/// configuration, since the change-stream path requires `primary_key: _id` plus a
-/// matching `on_conflict` upsert.
-async fn mongodb_inferred_schema_metadata(
+/// Primary-key-ascending sort, used when the collection has no clustered key or
+/// when catalog enrichment is skipped.
+fn default_sort_from_primary_key(primary_key: &[String]) -> Vec<InferredSortColumn> {
+    primary_key
+        .iter()
+        .map(|column| InferredSortColumn {
+            column: column.clone(),
+            desc: false,
+        })
+        .collect()
+}
+
+/// Best-effort catalog details for a `MongoDB` collection — everything beyond the
+/// constant `_id` primary key: secondary indexes, sort/clustering order, and rough
+/// sizing.
+struct MongoCatalogDetails {
+    indexes: Vec<InferredIndex>,
+    sort_columns: Vec<InferredSortColumn>,
+    row_count: Option<u64>,
+    table_bytes: Option<u64>,
+}
+
+impl MongoCatalogDetails {
+    /// Details when only the primary key is known (catalog unavailable or skipped):
+    /// no secondary indexes, primary-key-ascending sort, no sizing.
+    fn primary_key_only(primary_key: &[String]) -> Self {
+        Self {
+            indexes: Vec::new(),
+            sort_columns: default_sort_from_primary_key(primary_key),
+            row_count: None,
+            table_bytes: None,
+        }
+    }
+}
+
+/// Best-effort `MongoDB` catalog details — secondary indexes (`listIndexes`),
+/// sort/clustering order (`listCollections`), and rough sizing (`collStats`).
+/// Kept separate from the constant `_id` primary key so a slow or unavailable
+/// catalog can degrade to "primary key only" without blocking dataset readiness.
+async fn mongodb_catalog_details(
     pool: &Arc<MongoDBConnectionPool>,
     collection_name: &str,
-) -> Result<InferredSchema, Box<dyn std::error::Error + Send + Sync>> {
+    primary_key: &[String],
+) -> Result<MongoCatalogDetails, Box<dyn std::error::Error + Send + Sync>> {
     let connection = pool
         .connect()
         .await
         .map_err(|e| format!("failed to connect to MongoDB: {e}"))?;
     let db = connection.client.database(&connection.db_name);
-
-    // MongoDB's document key is always `_id`.
-    let primary_key = vec!["_id".to_string()];
 
     // Secondary indexes via the `listIndexes` command (indexes are few and fit in
     // the first cursor batch, so there is no need to exhaust the cursor).
@@ -487,24 +524,67 @@ async fn mongodb_inferred_schema_metadata(
     // key ascending — mirrors the Postgres "clustered, else primary key" rule.
     let sort_columns = match mongodb_clustered_sort(&db, collection_name).await {
         Some(sort) => sort,
-        None => primary_key
-            .iter()
-            .map(|column| InferredSortColumn {
-                column: column.clone(),
-                desc: false,
-            })
-            .collect(),
+        None => default_sort_from_primary_key(primary_key),
     };
 
     let (row_count, table_bytes) = mongo_collection_size(&db, collection_name).await;
 
-    Ok(InferredSchema {
-        primary_key,
+    Ok(MongoCatalogDetails {
         indexes,
         sort_columns,
         row_count,
         table_bytes,
     })
+}
+
+/// Infer the collection's primary key, plus best-effort secondary indexes, sort
+/// order, and sizing.
+///
+/// `MongoDB`'s document key is always `_id`, so the primary key is the constant
+/// `["_id"]` and needs no catalog round-trip — this is what makes
+/// `refresh_mode: changes` (`MongoDB` Streams) work without manual configuration,
+/// since the change-stream path requires `primary_key: _id` plus a matching
+/// `on_conflict` upsert. The remaining details require catalog commands, so they
+/// are time-bounded ([`MONGODB_CATALOG_TIMEOUT`]): a slow or unavailable catalog
+/// degrades to "primary key only" rather than blocking dataset load/readiness.
+async fn mongodb_inferred_schema_metadata(
+    pool: &Arc<MongoDBConnectionPool>,
+    collection_name: &str,
+) -> InferredSchema {
+    let primary_key = vec!["_id".to_string()];
+
+    let details = match tokio::time::timeout(
+        MONGODB_CATALOG_TIMEOUT,
+        mongodb_catalog_details(pool, collection_name, &primary_key),
+    )
+    .await
+    {
+        Ok(Ok(details)) => details,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                collection = collection_name,
+                %error,
+                "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
+            );
+            MongoCatalogDetails::primary_key_only(&primary_key)
+        }
+        Err(_) => {
+            tracing::debug!(
+                collection = collection_name,
+                timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
+                "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
+            );
+            MongoCatalogDetails::primary_key_only(&primary_key)
+        }
+    };
+
+    InferredSchema {
+        primary_key,
+        indexes: details.indexes,
+        sort_columns: details.sort_columns,
+        row_count: details.row_count,
+        table_bytes: details.table_bytes,
+    }
 }
 
 /// Enrich the provider's schema with inferred primary key / indexes / sort columns
@@ -518,37 +598,25 @@ async fn enrich_with_mongodb_metadata(
         return provider;
     }
 
-    match mongodb_inferred_schema_metadata(pool, dataset.path()).await {
-        Ok(inferred) => {
-            if inferred.is_empty() {
-                return provider;
-            }
-            tracing::debug!(
-                dataset = %dataset.name,
-                collection = %dataset.path(),
-                primary_key = ?inferred.primary_key,
-                indexes = inferred.indexes.len(),
-                sort_columns = inferred.sort_columns.len(),
-                row_count = ?inferred.row_count,
-                table_bytes = ?inferred.table_bytes,
-                "Inferred extended schema metadata from MongoDB catalog"
-            );
-            data_components::metadata_enriched_table_provider(
-                provider,
-                inferred.to_metadata(),
-                data_components::FieldMetadata::new(),
-            )
-        }
-        Err(error) => {
-            tracing::warn!(
-                dataset = %dataset.name,
-                collection = %dataset.path(),
-                error = %error,
-                "Failed to infer extended schema from MongoDB catalog; registering without inferred metadata"
-            );
-            provider
-        }
+    let inferred = mongodb_inferred_schema_metadata(pool, dataset.path()).await;
+    if inferred.is_empty() {
+        return provider;
     }
+    tracing::debug!(
+        dataset = %dataset.name,
+        collection = %dataset.path(),
+        primary_key = ?inferred.primary_key,
+        indexes = inferred.indexes.len(),
+        sort_columns = inferred.sort_columns.len(),
+        row_count = ?inferred.row_count,
+        table_bytes = ?inferred.table_bytes,
+        "Inferred extended schema metadata from MongoDB catalog"
+    );
+    data_components::metadata_enriched_table_provider(
+        provider,
+        inferred.to_metadata(),
+        data_components::FieldMetadata::new(),
+    )
 }
 
 #[async_trait]
@@ -631,8 +699,9 @@ mod tests {
 #[cfg(test)]
 mod inferred_schema_tests {
     use super::{
-        InferredIndex, InferredSortColumn, bson_to_u64, clustered_sort_from_response,
-        index_column_direction, parse_mongo_index,
+        InferredIndex, InferredSortColumn, MongoCatalogDetails, bson_to_u64,
+        clustered_sort_from_response, default_sort_from_primary_key, index_column_direction,
+        parse_mongo_index,
     };
     use mongodb::bson::{Bson, doc};
 
@@ -737,5 +806,40 @@ mod inferred_schema_tests {
     fn non_clustered_collection_has_no_sort() {
         let response = doc! { "cursor": { "firstBatch": [ { "name": "events", "options": {} } ] } };
         assert_eq!(clustered_sort_from_response(&response), None);
+    }
+
+    #[test]
+    fn default_sort_is_primary_key_ascending() {
+        assert_eq!(
+            default_sort_from_primary_key(&["a".to_string(), "b".to_string()]),
+            vec![
+                InferredSortColumn {
+                    column: "a".to_string(),
+                    desc: false
+                },
+                InferredSortColumn {
+                    column: "b".to_string(),
+                    desc: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_key_only_details_skip_indexes_and_sizing() {
+        // When catalog enrichment is unavailable (timeout/error), the fallback still
+        // yields a primary-key-ascending sort and nothing else; the constant `_id`
+        // primary key the caller adds is enough for change streams.
+        let details = MongoCatalogDetails::primary_key_only(&["_id".to_string()]);
+        assert!(details.indexes.is_empty());
+        assert_eq!(
+            details.sort_columns,
+            vec![InferredSortColumn {
+                column: "_id".to_string(),
+                desc: false
+            }]
+        );
+        assert_eq!(details.row_count, None);
+        assert_eq!(details.table_bytes, None);
     }
 }
