@@ -205,10 +205,10 @@ pub(crate) async fn ensure_spice_cloud_app(
     eprintln!("[stdio] CreateAppRequest: {create_app_request:?}");
 
     let create_result = cloud.create_app(&create_app_request).await;
-
+    eprintln!("[stdio] create_result: {create_result:?}");
     match create_result {
         Ok(app) => {
-            eprintln!("[stdio] create_result: {create_result:?}");
+
             apply_storage_config(cloud, app.id, config).await?;
             Ok(app.id)
         }
