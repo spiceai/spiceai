@@ -1092,8 +1092,11 @@ impl CayenneAccelerator {
         };
 
         // Create shared Cayenne context with the runtime's RuntimeEnv
-        let context =
-            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env));
+        let context = cayenne::CayenneContext::new(
+            &table_options.vortex_config,
+            Arc::clone(&runtime_env),
+            table_name,
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -2087,7 +2090,7 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env);
+        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
 
         Self {
             table_name,
