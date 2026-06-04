@@ -87,9 +87,11 @@ pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
+pub(crate) mod write_budget;
 
 // Re-export the main type at the module level for convenience
 pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
+pub use write_budget::set_global_encode_concurrency;
 pub use context::CayenneContext;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};

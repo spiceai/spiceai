@@ -1368,6 +1368,19 @@ impl DataFusion {
         // post-write compaction run isolated from queries and CDC on both CPU
         // (this runtime's threads) and memory (the carved pool).
         cayenne::set_compaction_runtime_handle(tokio_handle);
+        // Install the process-global encode-concurrency budget: cap the aggregate
+        // number of concurrent Vortex encode shards across ALL Cayenne tables at
+        // the host core count. Per-table `cayenne_write_concurrency` is sized in
+        // isolation (and defaults to the core count), so without this a fleet of
+        // tables receiving CDC at once would sum their shard counts and
+        // oversubscribe the machine. CPU-bound encode past the core count buys no
+        // throughput, only contention — so the core count is the natural ceiling.
+        let encode_budget = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        cayenne::set_global_encode_concurrency(encode_budget);
+        tracing::info!(
+            encode_budget,
+            "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
+        );
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }
