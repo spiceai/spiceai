@@ -604,6 +604,14 @@ impl VortexConfig {
             );
         }
 
+        // Likewise the protected-snapshot subset merge needs at least two
+        // snapshots; 1 is clamped up to 2 at the trigger.
+        if self.compaction_trigger_protected_snapshots == 1 {
+            warnings.push(
+                "cayenne_compaction_trigger_protected_snapshots is 1, but a single protected snapshot cannot be merged; it is clamped to a minimum of 2.".to_owned(),
+            );
+        }
+
         // A trigger above the per-pass pick cap still fires, but each pass only
         // consolidates `max_files_per_pick` of the accumulated files, so a backlog
         // drains over several passes instead of in one.
@@ -743,7 +751,21 @@ mod tests {
             config
                 .config_warnings(16)
                 .iter()
-                .any(|w| w.contains("clamped to a minimum of 2"))
+                .any(|w| w.contains("a single file cannot be compacted"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_single_protected_snapshot_trigger() {
+        let config = VortexConfig {
+            compaction_trigger_protected_snapshots: 1,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("a single protected snapshot cannot be merged"))
         );
     }
 

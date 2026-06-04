@@ -101,6 +101,20 @@ impl CayenneCatalogConnector {
     }
 
     fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
+        // Parse a numeric catalog parameter, warning (and ignoring) on a value
+        // that does not parse, so a typo surfaces instead of being silently
+        // dropped — matching the acceleration-param path's behavior.
+        fn parse_num_param<T: std::str::FromStr>(value: &str, key: &str) -> Option<T> {
+            match value.parse::<T>() {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    tracing::warn!(
+                        "Invalid Cayenne catalog parameter `{key}` value `{value}`; expected a number, ignoring it. See https://spiceai.org/docs/components/catalogs/cayenne"
+                    );
+                    None
+                }
+            }
+        }
         let data_dir = self
             .params
             .get("data_dir")
@@ -119,13 +133,13 @@ impl CayenneCatalogConnector {
             .get("segment_cache_mb")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "segment_cache_mb"));
         let target_file_size_mb = self
             .params
             .get("target_file_size_mb")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "target_file_size_mb"));
         let compression_strategy = self
             .params
             .get("compression_strategy")
@@ -134,66 +148,78 @@ impl CayenneCatalogConnector {
             .and_then(|v| match v.to_lowercase().as_str() {
                 "zstd" => Some(cayenne::metadata::CompressionStrategy::Zstd),
                 "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
-                _ => None,
+                other => {
+                    tracing::warn!(
+                        "Invalid Cayenne catalog parameter `compression_strategy` value `{other}`; expected `zstd` or `btrblocks`, ignoring it."
+                    );
+                    None
+                }
             });
         let pk_conflict_detection = self
             .params
             .get("pk_conflict_detection")
             .expose()
             .ok()
-            .and_then(cayenne::metadata::PkConflictDetection::parse);
+            .and_then(|v| {
+                cayenne::metadata::PkConflictDetection::parse(v).or_else(|| {
+                    tracing::warn!(
+                        "Invalid Cayenne catalog parameter `pk_conflict_detection` value `{v}`; expected `auto` or `none`, ignoring it."
+                    );
+                    None
+                })
+            });
         let upload_concurrency = self
             .params
             .get("upload_concurrency")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| parse_num_param::<usize>(v, "upload_concurrency"))
             .map(|v| v.max(1));
         let write_concurrency = self
             .params
             .get("write_concurrency")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| parse_num_param::<usize>(v, "write_concurrency"))
             .map(|v| v.max(1));
         let inline_max_rows = self
             .params
             .get("inline_max_rows")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_rows"));
         let inline_max_bytes = self
             .params
             .get("inline_max_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_bytes"));
         let inline_max_buffer_bytes = self
             .params
             .get("inline_max_buffer_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_buffer_bytes"));
         let inline_flush_max_rows = self
             .params
             .get("inline_flush_max_rows")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_rows"))
             .map(|v| v.max(0));
         let inline_flush_max_segments = self
             .params
             .get("inline_flush_max_segments")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_segments"))
             .map(|v| v.max(0));
         let inline_flush_max_bytes = self
             .params
             .get("inline_flush_max_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_bytes"))
             .map(|v| v.max(0));
 
         CayenneCatalogProviderConfig {
