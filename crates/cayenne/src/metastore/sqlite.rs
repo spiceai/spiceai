@@ -66,7 +66,7 @@ async fn configure_sqlite_connection(
                 // `publish_seq` write phase) then does not fault them in from
                 // disk. The cache only grows to the DB size, so tiny per-table
                 // DBs pay nothing for the larger ceiling.
-                conn.pragma_update(None, "cache_size", -262144)?;
+                conn.pragma_update(None, "cache_size", -262_144)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
                 // Memory-map the DB (1 GiB) for faster reads on the catalog hot

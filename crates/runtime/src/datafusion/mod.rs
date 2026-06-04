@@ -1375,7 +1375,8 @@ impl DataFusion {
         // table — so without this a fleet of tables receiving CDC at once would
         // sum their per-table shard counts and oversubscribe the machine. CPU-bound encode past the core count buys no
         // throughput, only contention — so the core count is the natural ceiling.
-        let encode_budget = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let encode_budget =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,
