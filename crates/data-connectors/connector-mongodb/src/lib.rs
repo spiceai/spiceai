@@ -26,7 +26,6 @@ limitations under the License.
 mod changes;
 
 use async_trait::async_trait;
-use data_components::Read;
 use data_components::inferred_schema::{InferredIndex, InferredSchema, InferredSortColumn};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
@@ -521,7 +520,9 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let provider = Read::table_provider(&self.mongodb_factory, dataset.path().into())
+        let provider = self
+            .mongodb_factory
+            .table_provider(dataset.path().into(), dataset.schema.clone())
             .await
             .context(UnableToGetReadProviderSnafu {
                 dataconnector: "mongodb",

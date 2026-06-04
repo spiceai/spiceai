@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_schema::SchemaRef;
+
 use super::{find_first_delimiter, validate_identifier};
 use crate::{Runtime, component::access::AccessMode, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
@@ -114,6 +116,12 @@ pub enum Error {
 
     #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
     InvalidConfiguration { config_key: String, message: String },
+
+    #[snafu(display("Invalid column type in dataset '{dataset}': {source}"))]
+    InvalidColumnType {
+        dataset: String,
+        source: declared_schema::DeclaredSchemaError,
+    },
 
     #[snafu(display(
         "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
@@ -328,6 +336,10 @@ pub struct Dataset {
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
+    /// Arrow schema derived from `columns[].type` declarations. `None` when no
+    /// column carries an explicit type. Connectors merge this with their inferred
+    /// schema so declared types take precedence.
+    pub schema: Option<SchemaRef>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
@@ -357,6 +369,7 @@ impl std::fmt::Debug for Dataset {
             .field("params", &self.params)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
+            .field("schema", &self.schema)
             .field("has_metadata_table", &self.has_metadata_table)
             .field("replication", &self.replication)
             .field("time_column", &self.time_column)

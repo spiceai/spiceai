@@ -17,9 +17,9 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    CheckAvailability, Dataset, Error, InvalidConfigurationSnafu, OnSchemaChange, ReadyState,
-    Result, SchemaInference, TimeFormat, UnsupportedTypeAction, acceleration, replication,
-    validate_identifier,
+    CheckAvailability, Dataset, Error, InvalidColumnTypeSnafu, InvalidConfigurationSnafu,
+    OnSchemaChange, ReadyState, Result, SchemaInference, TimeFormat, UnsupportedTypeAction,
+    acceleration, declared_schema, replication, validate_identifier,
 };
 use crate::Runtime;
 use crate::component::access::AccessMode;
@@ -269,6 +269,11 @@ impl DatasetBuilder {
         self.full_text_search =
             fts_store_from_column_overrides(self.full_text_search, &self.columns, &self.name)?;
 
+        let schema = declared_schema::schema_from_columns(&self.name.to_string(), &self.columns)
+            .context(InvalidColumnTypeSnafu {
+                dataset: self.name.to_string(),
+            })?;
+
         let dataset = Dataset {
             from: self.from,
             name: self.name,
@@ -276,6 +281,7 @@ impl DatasetBuilder {
             params: self.params,
             metadata: self.metadata,
             columns: self.columns,
+            schema,
             has_metadata_table: self.has_metadata_table,
             replication: self.replication,
             time_column: self.time_column,
