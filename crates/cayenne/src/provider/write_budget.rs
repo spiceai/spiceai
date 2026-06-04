@@ -17,9 +17,10 @@ limitations under the License.
 //! Process-global encode-concurrency budget shared across all Cayenne tables.
 //!
 //! Per-table `cayenne_write_concurrency` sizes each table's intra-write encode
-//! sharding *in isolation* — and when unset it defaults to the host core count.
-//! Under a fleet of tables receiving CDC simultaneously the per-table values
-//! simply SUM, with nothing coordinating them: e.g. `order_line` 48, `stock` 32,
+//! sharding *in isolation* — the unset default is conservative, but it can be
+//! raised per table. Under a fleet of tables receiving CDC simultaneously the
+//! per-table values simply SUM, with nothing coordinating them: e.g.
+//! `order_line` 48, `stock` 32,
 //! `customer` 32, … easily exceeds the core count, so independent datasets
 //! oversubscribe the machine — contending for cores, encode-buffer memory, and
 //! the query threads. Compaction already guards against exactly this with a

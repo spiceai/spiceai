@@ -1371,9 +1371,9 @@ impl DataFusion {
         // Install the process-global encode-concurrency budget: cap the aggregate
         // number of concurrent Vortex encode shards across ALL Cayenne tables at
         // the host core count. Per-table `cayenne_write_concurrency` is sized in
-        // isolation (and defaults to the core count), so without this a fleet of
-        // tables receiving CDC at once would sum their shard counts and
-        // oversubscribe the machine. CPU-bound encode past the core count buys no
+        // isolation — its unset default is conservative, but it can be raised per
+        // table — so without this a fleet of tables receiving CDC at once would
+        // sum their per-table shard counts and oversubscribe the machine. CPU-bound encode past the core count buys no
         // throughput, only contention — so the core count is the natural ceiling.
         let encode_budget = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         cayenne::set_global_encode_concurrency(encode_budget);

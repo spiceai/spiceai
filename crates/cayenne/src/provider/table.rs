@@ -4091,9 +4091,10 @@ impl CayenneTableProvider {
         use std::time::Instant;
 
         // Bound aggregate encode concurrency across all tables. Per-table
-        // `cayenne_write_concurrency` is sized in isolation (and defaults to the
-        // host core count), so simultaneous CDC writes across a fleet of tables
-        // would otherwise sum and oversubscribe the machine. Acquire this write's
+        // `cayenne_write_concurrency` is sized in isolation (a conservative unset
+        // default of `DEFAULT_WRITE_CONCURRENCY`, but raisable per table), so
+        // simultaneous CDC writes across a fleet of tables would otherwise sum and
+        // oversubscribe the machine. Acquire this write's
         // shard permits from the process-global budget before sharding the
         // encode, held until the write completes. No-op (ungated) when no budget
         // is installed (unit tests, embedders). See `write_budget`.
