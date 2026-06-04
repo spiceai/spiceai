@@ -403,7 +403,7 @@ impl VortexFormat {
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
 
         Self {
             session,
@@ -448,6 +448,28 @@ impl VortexFormat {
             access_plan_provider: self.access_plan_provider.clone(),
             segment_cache: self.segment_cache.clone(),
             write_shard: Some(config),
+        }
+    }
+
+    /// Returns a format whose segment cache reports its right-sizing metrics
+    /// (hit rate, fill) under the given `dataset` label. Rebuilds the (empty)
+    /// segment cache to attach the label, so call once at construction before any
+    /// scans run. No-op label-wise when this format has no segment cache.
+    #[must_use]
+    pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let dataset = dataset.into();
+        let segment_cache = self
+            .opts
+            .segment_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache,
+            write_shard: self.write_shard.clone(),
         }
     }
 
