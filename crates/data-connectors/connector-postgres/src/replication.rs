@@ -110,6 +110,15 @@ pub fn build_changes_stream(
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
 
+        // Seed bootstrap progress from the inferred rough row count (extended schema
+        // inference), if available, so the initial snapshot can report progress/ETA.
+        if let Some(expected) =
+            data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata())
+                .row_count
+        {
+            metrics.set_bootstrap_rows_expected(expected);
+        }
+
         let primary_keys = if declared_pks.is_empty() {
             extract_primary_keys(&table_provider)
         } else {
@@ -251,6 +260,15 @@ const METRICS: &[MetricSpec] = &[
     )
     .description("Total rows loaded during the initial-snapshot bootstrap phase."),
     MetricSpec::new(
+        "replication_bootstrap_rows_expected",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Estimated total rows for the initial-snapshot bootstrap, from extended schema \
+             inference (0 when unknown). Progress = bootstrap_rows_total / bootstrap_rows_expected.",
+    )
+    .auto_register(),
+    MetricSpec::new(
         "replication_bootstrap_complete",
         MetricType::ObservableGaugeU64,
     )
@@ -375,6 +393,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_bootstrap_rows_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.bootstrap_rows_total(), &attributes);
+                })))
+            }
+            "replication_bootstrap_rows_expected" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.bootstrap_rows_expected(), &attributes);
                 })))
             }
             "replication_bootstrap_complete" => {

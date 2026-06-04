@@ -44,7 +44,8 @@ pub struct MetricsCollector {
 
     // Bootstrap progress.
     bootstrap_rows_total: AtomicU64,
-    bootstrap_complete: AtomicU64, // 0 = running/not-started, 1 = done
+    bootstrap_rows_expected: AtomicU64, // 0 = unknown; set from extended schema inference
+    bootstrap_complete: AtomicU64,      // 0 = running/not-started, 1 = done
 
     // LSN position.
     confirmed_flush_lsn: AtomicU64, // last LSN we acknowledged to the server
@@ -91,6 +92,27 @@ impl MetricsCollector {
     }
     pub fn mark_bootstrap_complete(&self) {
         self.bootstrap_complete.store(1, Ordering::Relaxed);
+    }
+
+    /// Set the estimated total rows to bootstrap (from extended schema inference).
+    /// `0` leaves the total unknown. Enables a progress fraction during the snapshot.
+    pub fn set_bootstrap_rows_expected(&self, n: u64) {
+        self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+    }
+    #[must_use]
+    pub fn bootstrap_rows_expected(&self) -> u64 {
+        self.bootstrap_rows_expected.load(Ordering::Relaxed)
+    }
+    /// Bootstrap progress as a percent (0–100), or `None` when the expected total
+    /// is unknown. Clamped to 100 since the source estimate is approximate.
+    #[must_use]
+    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+        let expected = self.bootstrap_rows_expected.load(Ordering::Relaxed);
+        if expected == 0 {
+            return None;
+        }
+        let total = self.bootstrap_rows_total.load(Ordering::Relaxed);
+        Some((total.saturating_mul(100) / expected).min(100))
     }
 
     pub fn set_confirmed_flush_lsn(&self, lsn: u64) {
@@ -192,6 +214,15 @@ impl Metrics {
     pub fn bootstrap_complete(&self) -> u64 {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
     }
+    #[must_use]
+    pub fn bootstrap_rows_expected(&self) -> u64 {
+        self.collector.bootstrap_rows_expected()
+    }
+    /// Bootstrap progress percent (0–100), or `None` when the expected total is unknown.
+    #[must_use]
+    pub fn bootstrap_progress_percent(&self) -> Option<u64> {
+        self.collector.bootstrap_progress_percent()
+    }
 
     #[must_use]
     pub fn confirmed_flush_lsn(&self) -> u64 {
@@ -274,6 +305,23 @@ mod tests {
         assert_eq!(m.wal_deletes_total(), 1);
         assert_eq!(m.wal_truncates_total(), 1);
         assert_eq!(m.wal_transactions_total(), 1);
+    }
+
+    #[test]
+    fn bootstrap_progress_tracks_expected() {
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        // Unknown until an expected total is set.
+        assert_eq!(m.bootstrap_progress_percent(), None);
+
+        c.set_bootstrap_rows_expected(200);
+        c.add_bootstrap_rows(50);
+        assert_eq!(m.bootstrap_rows_expected(), 200);
+        assert_eq!(m.bootstrap_progress_percent(), Some(25));
+
+        // The estimate can be exceeded; progress clamps at 100.
+        c.add_bootstrap_rows(1000);
+        assert_eq!(m.bootstrap_progress_percent(), Some(100));
     }
 
     #[test]

@@ -205,6 +205,15 @@ pub fn snapshot_stream(
                     .collect::<Result<Vec<_>>>()
                     .map_err(super::err_to_stream)?;
                 yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false);
+                if let Some(percent) = metrics.bootstrap_progress_percent() {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        rows = total_rows,
+                        expected = metrics.bootstrap_rows_expected(),
+                        progress_percent = percent,
+                        "initial snapshot bootstrap progress"
+                    );
+                }
             }
         }
 
@@ -241,6 +250,7 @@ pub fn snapshot_stream(
         tracing::info!(
             dataset = %dataset_name,
             rows = total_rows,
+            expected = metrics.bootstrap_rows_expected(),
             "initial snapshot bootstrap complete"
         );
 
