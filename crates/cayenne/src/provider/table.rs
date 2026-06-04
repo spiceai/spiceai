@@ -2166,6 +2166,21 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
     }
 }
 
+struct ProtectedSnapshotScan<'a> {
+    state: &'a dyn Session,
+    projection: Option<&'a Vec<usize>>,
+    filters: &'a [Expr],
+    limit: Option<usize>,
+    pk_indices_in_projection: &'a [usize],
+    protected_snapshots: Arc<HashMap<String, i64>>,
+    deletion_snapshot: &'a PkDeletionSnapshot,
+}
+
+struct PreparedProtectedSnapshotUpdate {
+    expected: Arc<HashMap<String, i64>>,
+    updated: Arc<HashMap<String, i64>>,
+}
+
 /// Tier-0 size ceiling for protected-snapshot leveling, in bytes (8 MiB).
 ///
 /// Runs at or below this size are tier 0; each subsequent tier is
@@ -3959,10 +3974,8 @@ impl CayenneTableProvider {
         // data; each applies its own partial deletion filter from when it was created.
         // Publish under `scan_state_lock` so scans that capture the deletion view,
         // protected map, and inlined data under `.read()` observe a consistent view.
-        {
-            let _view_guard = self.scan_state_lock.write().await;
-            self.commit_protected_snapshot(&new_snapshot_id, sequence_number);
-        }
+        self.commit_protected_snapshot_with_scan_lock(&new_snapshot_id, sequence_number)
+            .await;
 
         // The listing table stays as-is. Protected snapshots are handled at scan time.
         // See the doc comment above for why we do NOT update current_snapshot.
@@ -6579,15 +6592,42 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Synchronously insert a protected-snapshot entry. Callers that pair this
-    /// with a deletion-view change MUST hold `scan_state_lock.write()` so
-    /// scans never observe the new protected snapshot with a stale deletion view.
-    fn commit_protected_snapshot(&self, snapshot_id: &str, threshold: i64) {
-        self.protected_snapshots.rcu(|current| {
-            let mut new_map = (**current).clone();
-            new_map.insert(snapshot_id.to_string(), threshold);
-            Arc::new(new_map)
-        });
+    fn prepare_protected_snapshot_update(
+        &self,
+        snapshot_id: &str,
+        threshold: i64,
+    ) -> PreparedProtectedSnapshotUpdate {
+        let expected = self.protected_snapshots.load_full();
+        let mut updated = (*expected).clone();
+        updated.insert(snapshot_id.to_string(), threshold);
+        PreparedProtectedSnapshotUpdate {
+            expected,
+            updated: Arc::new(updated),
+        }
+    }
+
+    fn try_commit_prepared_protected_snapshot(
+        &self,
+        prepared: PreparedProtectedSnapshotUpdate,
+    ) -> bool {
+        let PreparedProtectedSnapshotUpdate { expected, updated } = prepared;
+        let previous = self
+            .protected_snapshots
+            .compare_and_swap(&expected, updated);
+        Arc::ptr_eq(&expected, &previous)
+    }
+
+    /// Insert a protected-snapshot entry while holding `scan_state_lock.write()`
+    /// only for the atomic store. The map clone happens before the guard is
+    /// acquired; if another publisher wins the race, rebuild and retry.
+    async fn commit_protected_snapshot_with_scan_lock(&self, snapshot_id: &str, threshold: i64) {
+        loop {
+            let prepared = self.prepare_protected_snapshot_update(snapshot_id, threshold);
+            let _view_guard = self.scan_state_lock.write().await;
+            if self.try_commit_prepared_protected_snapshot(prepared) {
+                return;
+            }
+        }
     }
 
     /// Atomically publish an on-conflict deletion update and, when
@@ -6607,12 +6647,23 @@ impl CayenneTableProvider {
         if protected_snapshot.is_none() && matches!(update, OnConflictUpdate::None) {
             return;
         }
-        let _view_guard = self.scan_state_lock.write().await;
-        self.commit_on_conflict_update(update);
-        if let Some((snapshot_id, threshold)) = protected_snapshot {
-            // Threshold = this snapshot's OWN allocated sequence number, matching
-            // `load_protected_snapshots` so scans are reload-stable.
-            self.commit_protected_snapshot(snapshot_id, threshold);
+        let Some((snapshot_id, threshold)) = protected_snapshot else {
+            let _view_guard = self.scan_state_lock.write().await;
+            self.commit_on_conflict_update(update);
+            return;
+        };
+
+        // Threshold = this snapshot's OWN allocated sequence number, matching
+        // `load_protected_snapshots` so scans are reload-stable.
+        let mut update = Some(update);
+        loop {
+            let prepared = self.prepare_protected_snapshot_update(snapshot_id, threshold);
+            let _view_guard = self.scan_state_lock.write().await;
+            if self.try_commit_prepared_protected_snapshot(prepared) {
+                let update = update.take().unwrap_or(OnConflictUpdate::None);
+                self.commit_on_conflict_update(update);
+                return;
+            }
         }
     }
 
@@ -8895,6 +8946,19 @@ impl CayenneTableProvider {
         self.inlined_generation.load(Ordering::Relaxed)
     }
 
+    fn try_read_inlined_batches_cached(&self) -> Option<Vec<RecordBatch>> {
+        let current_gen = self.inlined_generation.load(Ordering::Acquire);
+        let cached = self.inlined_cache.load();
+        (cached.generation == current_gen).then(|| (*cached.batches).clone())
+    }
+
+    fn try_read_inlined_batches_for_scan(&self) -> Option<Vec<RecordBatch>> {
+        if self.cached_inlined_row_count() <= 0 {
+            return Some(Vec::new());
+        }
+        self.try_read_inlined_batches_cached()
+    }
+
     /// Read visible inlined data for this table and return as `RecordBatch`es.
     ///
     /// Used at scan time to union inlined data with the file-based data. For
@@ -8914,16 +8978,11 @@ impl CayenneTableProvider {
     /// produces identical results for the same generation, and the last
     /// `ArcSwap::store` wins without corrupting data.
     pub(crate) async fn read_inlined_batches(&self) -> Result<Vec<RecordBatch>> {
-        // Acquire-load the generation so we observe all catalog writes that
-        // happened before the corresponding Release bump.
-        let current_gen = self.inlined_generation.load(Ordering::Acquire);
-        {
-            let cached = self.inlined_cache.load();
-            if cached.generation == current_gen {
-                // Cache hit: each RecordBatch clone is cheap (Arc refcount on Arrow buffers).
-                return Ok((*cached.batches).clone());
-            }
+        if let Some(batches) = self.try_read_inlined_batches_cached() {
+            return Ok(batches);
         }
+
+        let current_gen = self.inlined_generation.load(Ordering::Acquire);
         // Cache miss: populate both `batches` and `view` together.
         self.populate_inlined_cache(current_gen).await?;
         Ok((*self.inlined_cache.load().batches).clone())
@@ -9961,53 +10020,53 @@ impl CayenneTableProvider {
     #[expect(clippy::too_many_arguments)]
     async fn scan_protected_snapshots(
         &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-        pk_indices_in_projection: &[usize],
-        protected_snapshots: Arc<HashMap<String, i64>>,
-        deletion_snapshot: &PkDeletionSnapshot,
+        scan: ProtectedSnapshotScan<'_>,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
         // `protected_snapshots` is captured by the caller together with the deletion snapshot
-        if protected_snapshots.is_empty() {
+        if scan.protected_snapshots.is_empty() {
             return Ok(Vec::new());
         }
 
         tracing::trace!(
             table = %self.table_metadata.table_name,
-            protected_snapshot_count = protected_snapshots.len(),
+            protected_snapshot_count = scan.protected_snapshots.len(),
             "Scanning protected snapshots for Cayenne table"
         );
         tracing::debug!(
             table = %self.table_metadata.table_name,
-            protected_snapshot_count = protected_snapshots.len(),
+            protected_snapshot_count = scan.protected_snapshots.len(),
             "Cayenne scan includes protected snapshots"
         );
         let protected_snapshot_trigger = self.context.compaction_trigger_protected_snapshots();
         let protected_snapshot_warn_threshold = protected_snapshot_trigger.max(1);
-        if protected_snapshots.len() >= protected_snapshot_warn_threshold {
+        if scan.protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
-                protected_snapshot_count = protected_snapshots.len(),
+                protected_snapshot_count = scan.protected_snapshots.len(),
                 protected_snapshot_warn_threshold,
                 "Cayenne scan has high protected snapshot amplification"
             );
         }
 
-        let mut plans = Vec::with_capacity(protected_snapshots.len());
+        let mut plans = Vec::with_capacity(scan.protected_snapshots.len());
 
-        for (snapshot_id, max_delete_seq_at_creation) in protected_snapshots.iter() {
+        for (snapshot_id, max_delete_seq_at_creation) in scan.protected_snapshots.iter() {
             let plan = self
-                .create_snapshot_scan_plan(state, snapshot_id, projection, filters, limit)
+                .create_snapshot_scan_plan(
+                    scan.state,
+                    snapshot_id,
+                    scan.projection,
+                    scan.filters,
+                    scan.limit,
+                )
                 .await?;
 
             // Apply partial deletion filter - only deletions with seq > max_delete_seq_at_creation
             let filtered_plan = self.apply_partial_deletion_filter(
                 plan,
-                pk_indices_in_projection,
+                scan.pk_indices_in_projection,
                 *max_delete_seq_at_creation,
-                deletion_snapshot,
+                scan.deletion_snapshot,
             )?;
 
             plans.push(filtered_plan);
@@ -10757,6 +10816,8 @@ impl TableProvider for CayenneTableProvider {
 
         // Warm the inlined cache before taking the consistency guards so the
         // read under `scan_state_lock` is a cheap cache hit in the common case.
+        // If a writer invalidates the cache after this point, the guarded
+        // capture below drops the guard, rebuilds, and retries.
         if self.cached_inlined_row_count() > 0 {
             self.read_inlined_batches().await.map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -10784,26 +10845,29 @@ impl TableProvider for CayenneTableProvider {
         // triple atomically under `scan_state_lock.read()`. This serializes with
         // non-staged publish paths that update the deletion view and protected
         // snapshot map without taking the listing fence.
-        let (deletion_snapshot, protected_map, inlined_batches) = {
-            let _view_guard = self.scan_state_lock.read().await;
-            // Read any inlined data while the guard is held so it is consistent
-            // with the captured deletion view. The warm-up above makes this a
-            // cache hit in the common case.
-            let inlined_batches = if self.cached_inlined_row_count() > 0 {
-                self.read_inlined_batches().await.map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "Failed to read inlined data for table {}: {e}",
-                        self.table_metadata.table_name
-                    ))
-                })?
-            } else {
-                Vec::new()
+        let (deletion_snapshot, protected_map, inlined_batches) = loop {
+            let captured = {
+                let _view_guard = self.scan_state_lock.read().await;
+                self.try_read_inlined_batches_for_scan()
+                    .map(|inlined_batches| {
+                        (
+                            self.pk_deletion_snapshot(),
+                            self.protected_snapshots.load_full(),
+                            inlined_batches,
+                        )
+                    })
             };
-            (
-                self.pk_deletion_snapshot(),
-                self.protected_snapshots.load_full(),
-                inlined_batches,
-            )
+
+            if let Some(captured) = captured {
+                break captured;
+            }
+
+            self.read_inlined_batches().await.map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to read inlined data for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
         };
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
@@ -10936,15 +11000,15 @@ impl TableProvider for CayenneTableProvider {
 
         // Check for protected snapshots that need to be scanned with partial deletion filter.
         let protected_snapshot_plans = self
-            .scan_protected_snapshots(
+            .scan_protected_snapshots(ProtectedSnapshotScan {
                 state,
-                effective_projection.as_ref(),
-                scan_filters,
+                projection: effective_projection.as_ref(),
+                filters: scan_filters,
                 limit,
-                &pk_indices_in_projection,
-                protected_map,
-                &deletion_snapshot,
-            )
+                pk_indices_in_projection: &pk_indices_in_projection,
+                protected_snapshots: protected_map,
+                deletion_snapshot: &deletion_snapshot,
+            })
             .await?;
 
         // Build a MemoryExec plan for the inlined data captured under the
