@@ -78,8 +78,8 @@ pub(crate) async fn launch_mongodb_ec2(
     let instance_name = format!("spidapter-mongodb-{run_id_short}");
     eprintln!(
         "[stdio] EC2: launching MongoDB instance \
-         (name={instance_name}, ami={ami_id}, type={}, subnet={subnet_id})",
-        args.ec2_instance_type
+         (name={instance_name}, ami={ami_id}, type={}, subnet={subnet_id}, disk={}GB)",
+        args.ec2_instance_type, args.ec2_disk_size_gb
     );
 
     let mut run_req = ec2
