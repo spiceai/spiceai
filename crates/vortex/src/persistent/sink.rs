@@ -17,13 +17,18 @@ use datafusion_datasource::sink::DataSink;
 use datafusion_datasource::write::get_writer_schema;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::metrics::MetricsSet;
+use datafusion_physical_plan::metrics::Time;
+use datafusion_physical_plan::repartition::BatchPartitioner;
 use futures::SinkExt;
 use futures::StreamExt;
+use object_store::Error as ObjectStoreError;
 use object_store::ObjectStore;
 use object_store::path::Path;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use vortex::array::ArrayRef;
@@ -38,6 +43,53 @@ use vortex::io::object_store::ObjectStoreWrite;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::hash_set::HashSet;
 
+/// How [`VortexSink`] fans a single input stream into N concurrent file writers.
+///
+/// `Single` reproduces the historical one-writer-per-statement behavior. The
+/// parallel variants spawn one [`ActiveFileWriter`] per shard so Vortex column
+/// compression runs concurrently across cores within a single write. The input
+/// stream is always a single (coalesced) partition — `DataSinkExec` requires
+/// `SinglePartition` — so the fan-out is performed here, in the sink.
+#[derive(Debug, Clone)]
+pub enum ShardSpec {
+    /// One writer; byte-for-byte identical to the pre-sharding behavior.
+    Single,
+    /// `n` writers, batches distributed round-robin (parallel encode, no clustering).
+    RoundRobin(usize),
+    /// `n` writers, rows hash-partitioned by `exprs` (parallel encode + key-clustered files).
+    Hash {
+        exprs: Vec<PhysicalExprRef>,
+        partitions: usize,
+    },
+}
+
+impl ShardSpec {
+    /// Number of output shards (concurrent writers) this spec requests.
+    #[must_use]
+    pub fn partitions(&self) -> usize {
+        match self {
+            ShardSpec::Single => 1,
+            ShardSpec::RoundRobin(n) => *n,
+            ShardSpec::Hash { partitions, .. } => *partitions,
+        }
+    }
+
+    /// Build a `BatchPartitioner` that routes each input batch to one of
+    /// `num_shards` shards according to this spec. `Single`/`RoundRobin` route
+    /// whole batches; `Hash` splits batches row-wise on the key expressions.
+    fn batch_partitioner(&self, num_shards: usize) -> BatchPartitioner {
+        let timer = Time::default();
+        match self {
+            ShardSpec::Hash { exprs, .. } => {
+                BatchPartitioner::new_hash_partitioner(exprs.clone(), num_shards, timer)
+            }
+            ShardSpec::Single | ShardSpec::RoundRobin(_) => {
+                BatchPartitioner::new_round_robin_partitioner(num_shards, timer, 0, 1)
+            }
+        }
+    }
+}
+
 struct WriteOutputOptions<'a> {
     base_output_path: &'a ListingTableUrl,
     target_file_size: Option<u64>,
@@ -45,6 +97,7 @@ struct WriteOutputOptions<'a> {
     write_id: &'a str,
     partition_column_names: &'a [String],
     keep_partition_by_columns: bool,
+    shard_spec: &'a ShardSpec,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +162,7 @@ pub struct VortexSink {
     schema: SchemaRef,
     session: VortexSession,
     target_file_size: Option<u64>,
+    shard_spec: ShardSpec,
 }
 
 impl VortexSink {
@@ -117,12 +171,14 @@ impl VortexSink {
         schema: SchemaRef,
         session: VortexSession,
         target_file_size: Option<u64>,
+        shard_spec: ShardSpec,
     ) -> Self {
         Self {
             config,
             schema,
             session,
             target_file_size,
+            shard_spec,
         }
     }
 
@@ -198,6 +254,7 @@ impl DataSink for VortexSink {
                 write_id: &write_id,
                 partition_column_names: &partition_column_names,
                 keep_partition_by_columns: self.config.keep_partition_by_columns,
+                shard_spec: &self.shard_spec,
             },
         )
         .await?;
@@ -218,12 +275,18 @@ impl DataSink for VortexSink {
     }
 }
 
-/// Write batches from a single input stream to one or more output files.
+/// Write batches from a single input stream to one or more output files,
+/// fanning the work across `ShardSpec::partitions()` concurrent shard writers.
 ///
-/// For collection paths, files are emitted using the `{write_id}_{file_index:05}.{extension}`
-/// naming scheme as produced by the underlying writer implementation.
-/// For a single-file path, the original target path is used unless rolling is needed,
-/// in which case additional files follow the same naming scheme.
+/// `DataSinkExec` always hands us a single (coalesced) input partition, so the
+/// parallelism is created here: the input is demuxed (round-robin or hashed by
+/// key) across N shards, each shard runs an independent [`run_shard_writer`]
+/// task, and Vortex column compression therefore runs concurrently across
+/// cores. Single-file output and Hive-partitioned writes stay on one shard.
+///
+/// For collection paths, files are emitted using the
+/// `{write_id}_{file_index:05}.{extension}` scheme for a single shard, or
+/// `{write_id}_p{shard:03}_{file_index:05}.{extension}` when sharded.
 async fn write_record_batch_stream_to_files(
     session: VortexSession,
     object_store: Arc<dyn ObjectStore>,
@@ -235,13 +298,55 @@ async fn write_record_batch_stream_to_files(
     let single_file_output = !output_options.base_output_path.is_collection()
         && output_options.base_output_path.file_extension().is_some();
 
-    let mut results: Vec<(Path, WriteSummary)> = Vec::new();
-    let mut active_writer: Option<ActiveFileWriter> = None;
-    let mut uncompressed_bytes_in_file = 0_u64;
-    let mut file_index = 0_usize;
-    let mut compression_estimate = CompressionEstimate::identity();
+    // Single-file output (an exact target path) and Hive-partitioned writes
+    // stay on one writer to preserve their path / sub-directory contracts.
+    let num_shards = if single_file_output || !output_options.partition_column_names.is_empty() {
+        1
+    } else {
+        output_options.shard_spec.partitions().max(1)
+    };
 
-    let write_result: DFResult<()> = async {
+    // Owned copies for the spawned shard tasks.
+    let write_id = output_options.write_id.to_string();
+    let extension = output_options.extension.to_string();
+    let base_output_path = output_options.base_output_path.clone();
+
+    // One writer task per shard, each fed by a bounded channel so a slow shard
+    // exerts backpressure on the demux loop (peak buffer ~= 2 * N batches).
+    let mut senders = Vec::with_capacity(num_shards);
+    let mut handles = Vec::with_capacity(num_shards);
+    let started_paths = Arc::new(Mutex::new(HashSet::new()));
+    for shard_id in 0..num_shards {
+        let (tx, rx) = futures::channel::mpsc::channel::<RecordBatch>(1);
+        senders.push(tx);
+        handles.push(tokio::spawn(run_shard_writer(
+            session.clone(),
+            Arc::clone(&object_store),
+            dtype.clone(),
+            rx,
+            target,
+            write_id.clone(),
+            base_output_path.clone(),
+            extension.clone(),
+            single_file_output,
+            shard_id,
+            num_shards,
+            Arc::clone(&started_paths),
+        )));
+    }
+
+    let mut partitioner =
+        (num_shards > 1).then(|| output_options.shard_spec.batch_partitioner(num_shards));
+
+    // A failed send means a shard writer already dropped its receiver — i.e. it
+    // exited early with an error (the happy path holds the receiver open until
+    // we drop the sender below). Record that and stop routing; the join loop
+    // surfaces that shard's real error, so we never mask the root cause (a
+    // disk-full write, a cancelled task on shutdown, etc.) behind a generic
+    // "receiver is gone". Genuine upstream/transform failures still propagate
+    // via `?` and take precedence.
+    let mut shard_closed_early = false;
+    let demux_result: DFResult<()> = async {
         while let Some(batch) = data.next().await.transpose()? {
             let batch = if output_options.keep_partition_by_columns
                 || output_options.partition_column_names.is_empty()
@@ -251,14 +356,120 @@ async fn write_record_batch_stream_to_files(
                 remove_partition_columns(&batch, output_options.partition_column_names)?
             };
 
+            match partitioner.as_mut() {
+                None => {
+                    if senders[0].send(batch).await.is_err() {
+                        shard_closed_early = true;
+                        break;
+                    }
+                }
+                Some(partitioner) => {
+                    // `partition` invokes the closure synchronously, so collect
+                    // the (shard, sub-batch) pairs and await the sends afterward.
+                    let mut routed: Vec<(usize, RecordBatch)> = Vec::new();
+                    partitioner.partition(batch, |idx, sub| {
+                        routed.push((idx, sub));
+                        Ok(())
+                    })?;
+                    for (idx, sub) in routed {
+                        if senders[idx].send(sub).await.is_err() {
+                            shard_closed_early = true;
+                            break;
+                        }
+                    }
+                    if shard_closed_early {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Close all senders so each shard finalizes its trailing file.
+    drop(senders);
+
+    // Join every shard, aggregating results and surfacing the first error.
+    // Precedence: a real upstream/transform error from the demux, then any
+    // shard writer's own error, then a defensive fallback if a shard closed its
+    // receiver early yet somehow reported success.
+    let mut results: Vec<(Path, WriteSummary)> = Vec::new();
+    let mut first_err = demux_result.err();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(shard_results)) => results.extend(shard_results),
+            Ok(Err(err)) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    first_err = Some(exec_datafusion_err!(
+                        "Vortex sink shard writer task failed to join: {join_err}"
+                    ));
+                }
+            }
+        }
+    }
+
+    if first_err.is_none() && shard_closed_early {
+        first_err = Some(exec_datafusion_err!(
+            "Vortex sink shard writer closed early before the input stream was fully routed"
+        ));
+    }
+
+    if let Some(err) = first_err {
+        let cleanup_paths = {
+            let started_paths = started_paths.lock().await;
+            started_paths.iter().cloned().collect()
+        };
+        cleanup_failed_write(object_store, Vec::new(), cleanup_paths).await;
+        return Err(err);
+    }
+
+    Ok(results)
+}
+
+/// A single shard writer: drains its receiver, rolling output files by
+/// estimated compressed size (independent per shard), and returns the files it
+/// wrote. On error it cleans up its own active + finished files before
+/// returning; the caller aggregates across shards.
+#[expect(clippy::too_many_arguments)]
+async fn run_shard_writer(
+    session: VortexSession,
+    object_store: Arc<dyn ObjectStore>,
+    dtype: DType,
+    mut receiver: futures::channel::mpsc::Receiver<RecordBatch>,
+    target: Option<u64>,
+    write_id: String,
+    base_output_path: ListingTableUrl,
+    extension: String,
+    single_file_output: bool,
+    shard_id: usize,
+    num_shards: usize,
+    started_paths: Arc<Mutex<HashSet<Path>>>,
+) -> DFResult<Vec<(Path, WriteSummary)>> {
+    let mut results: Vec<(Path, WriteSummary)> = Vec::new();
+    let mut active_writer: Option<ActiveFileWriter> = None;
+    let mut uncompressed_bytes_in_file = 0_u64;
+    let mut file_index = 0_usize;
+    let mut compression_estimate = CompressionEstimate::identity();
+
+    let write_result: DFResult<()> = async {
+        while let Some(batch) = receiver.next().await {
             if active_writer.is_none() {
                 let file_path = output_file_path(
-                    output_options.base_output_path,
+                    &base_output_path,
                     file_index,
-                    output_options.extension,
+                    &extension,
                     single_file_output,
-                    output_options.write_id,
+                    &write_id,
+                    shard_id,
+                    num_shards,
                 );
+                started_paths.lock().await.insert(file_path.clone());
                 active_writer = Some(start_file_writer(
                     &session,
                     Arc::clone(&object_store),
@@ -268,16 +479,21 @@ async fn write_record_batch_stream_to_files(
             }
 
             let batch_bytes = batch_uncompressed_bytes(&batch)?;
-            let writer = active_writer.as_mut().ok_or_else(|| {
-                exec_datafusion_err!("Missing active file writer for sink output")
-            })?;
-            send_batch_to_active_writer(writer, batch).await?;
+            send_batch_to_active_writer(&mut active_writer, batch).await?;
+            let active_path = active_writer
+                .as_ref()
+                .ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "Missing active file writer while updating sink byte counter"
+                    )
+                })?
+                .path
+                .as_ref();
             uncompressed_bytes_in_file = uncompressed_bytes_in_file
                 .checked_add(batch_bytes)
                 .ok_or_else(|| {
                     exec_datafusion_err!(
-                        "Uncompressed byte counter overflow for output file {}",
-                        writer.path
+                        "Uncompressed byte counter overflow for sink output file {active_path}"
                     )
                 })?;
 
@@ -402,21 +618,42 @@ async fn cleanup_failed_write(
     }
 
     for path in cleanup_paths {
-        if let Err(e) = object_store.delete(&path).await {
-            tracing::warn!(path = %path, error = %e, "Failed to delete sink output during error cleanup");
+        match object_store.delete(&path).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "Failed to delete sink output during error cleanup");
+            }
         }
     }
 }
 
+/// Send a batch to the shard's active encoder task. A failed send means that
+/// task already dropped its receiver — i.e. it exited, ~always with an error —
+/// so finish the writer to surface that real error (e.g. a disk-full write)
+/// instead of the generic "receiver is gone" send failure. Takes the writer
+/// slot so the dead writer is consumed and its task joined exactly once, never
+/// double-joined by later cleanup.
 async fn send_batch_to_active_writer(
-    writer: &mut ActiveFileWriter,
+    active_writer: &mut Option<ActiveFileWriter>,
     batch: RecordBatch,
 ) -> DFResult<()> {
-    writer.sender.send(batch).await.map_err(|e| {
-        exec_datafusion_err!(
-            "Failed to send batch to active writer for '{}': {e}",
-            writer.path
-        )
+    let writer = active_writer
+        .as_mut()
+        .ok_or_else(|| exec_datafusion_err!("Missing active file writer for sink output"))?;
+    if writer.sender.send(batch).await.is_ok() {
+        return Ok(());
+    }
+    let writer = active_writer
+        .take()
+        .ok_or_else(|| exec_datafusion_err!("Missing active file writer after failed send"))?;
+    let path = writer.path.clone();
+    Err(match finish_file_writer(writer).await {
+        Ok(_) => {
+            exec_datafusion_err!(
+                "Vortex writer task for '{path}' exited before consuming all input"
+            )
+        }
+        Err(real) => real,
     })
 }
 
@@ -472,12 +709,19 @@ fn remove_partition_columns(
 }
 
 /// Build the output path for a rolling write.
+///
+/// With a single shard (`num_shards <= 1`) the historical
+/// `{write_id}_{file_index:05}` scheme is used; with multiple shards the path
+/// gains a `_p{shard_id:03}` segment so concurrent shards never collide while
+/// keeping a single `write_id` per statement.
 fn output_file_path(
     base_output_path: &ListingTableUrl,
     file_index: usize,
     extension: &str,
     single_file_output: bool,
     write_id: &str,
+    shard_id: usize,
+    num_shards: usize,
 ) -> Path {
     if single_file_output {
         if file_index == 0 {
@@ -490,7 +734,13 @@ fn output_file_path(
     if !base.ends_with('/') {
         base.push('/');
     }
-    Path::from(format!("{base}{write_id}_{file_index:05}.{extension}"))
+    if num_shards > 1 {
+        Path::from(format!(
+            "{base}{write_id}_p{shard_id:03}_{file_index:05}.{extension}"
+        ))
+    } else {
+        Path::from(format!("{base}{write_id}_{file_index:05}.{extension}"))
+    }
 }
 
 #[cfg(test)]
@@ -518,11 +768,29 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::Duration;
 
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    use arrow_schema::SchemaRef;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_expr::PhysicalExprRef;
+    use datafusion_physical_expr::expressions::Column;
+    use object_store::path::Path;
+    use vortex::VortexSessionDefault;
+    use vortex::dtype::DType;
+    use vortex::dtype::arrow::FromArrowType;
+    use vortex::file::WriteSummary;
+    use vortex::session::VortexSession;
+
     use crate::common_tests::TestSessionContext;
     use crate::persistent::VortexFormatFactory;
     use crate::persistent::VortexTableOptions;
     use crate::persistent::sink::ActiveFileWriter;
+    use crate::persistent::sink::ShardSpec;
+    use crate::persistent::sink::WriteOutputOptions;
     use crate::persistent::sink::finish_file_writer;
+    use crate::persistent::sink::write_record_batch_stream_to_files;
 
     fn split_path(
         base_path: &object_store::path::Path,
@@ -854,19 +1122,25 @@ mod tests {
         let single = ListingTableUrl::parse("file:///tmp/output.vortex")
             .expect("single-file listing table URL should parse");
         assert_eq!(
-            output_file_path(&single, 0, "vortex", true, "wid").to_string(),
+            output_file_path(&single, 0, "vortex", true, "wid", 0, 1).to_string(),
             "tmp/output.vortex"
         );
         assert_eq!(
-            output_file_path(&single, 2, "vortex", true, "wid").to_string(),
+            output_file_path(&single, 2, "vortex", true, "wid", 0, 1).to_string(),
             "tmp/output_00002.vortex"
         );
 
         let collection = ListingTableUrl::parse("file:///tmp/table/")
             .expect("collection listing table URL should parse");
+        // Single shard: historical naming (no shard segment).
         assert_eq!(
-            output_file_path(&collection, 3, "vortex", false, "wid").to_string(),
+            output_file_path(&collection, 3, "vortex", false, "wid", 0, 1).to_string(),
             "tmp/table/wid_00003.vortex"
+        );
+        // Multiple shards: a `_p{shard}` segment disambiguates concurrent shards.
+        assert_eq!(
+            output_file_path(&collection, 3, "vortex", false, "wid", 1, 4).to_string(),
+            "tmp/table/wid_p001_00003.vortex"
         );
     }
 
@@ -1819,6 +2093,602 @@ mod tests {
             .value(0);
         assert_eq!(count, expected_total_rows, "Total row count mismatch");
 
+        Ok(())
+    }
+
+    // ---- Intra-write sharding (parallel encode) ---------------------------
+    //
+    // Drive `write_record_batch_stream_to_files` directly with an explicit
+    // `ShardSpec` — the same fan-out the Cayenne accelerator selects via
+    // `VortexFormat::with_write_shard`. Covers the file-count / naming contract,
+    // round-trip correctness, PK-hash clustering, per-shard rolling, and
+    // cleanup-on-error.
+
+    const SHARD_WRITE_ID: &str = "testwriteid";
+
+    fn batches_to_stream(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        let stream = futures::stream::iter(
+            batches
+                .into_iter()
+                .map(Ok::<RecordBatch, datafusion_common::DataFusionError>),
+        );
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
+
+    async fn run_sharded_write(
+        store: Arc<dyn object_store::ObjectStore>,
+        schema: SchemaRef,
+        data: SendableRecordBatchStream,
+        target_file_size: Option<u64>,
+        shard_spec: ShardSpec,
+    ) -> datafusion_common::Result<Vec<(Path, WriteSummary)>> {
+        let dtype = DType::from_arrow(Arc::clone(&schema));
+        let base = ListingTableUrl::parse("file:///table/")
+            .expect("file:///table/ should parse as a listing url");
+        write_record_batch_stream_to_files(
+            VortexSession::default(),
+            store,
+            dtype,
+            data,
+            &WriteOutputOptions {
+                base_output_path: &base,
+                target_file_size,
+                extension: "vortex",
+                write_id: SHARD_WRITE_ID,
+                partition_column_names: &[],
+                keep_partition_by_columns: false,
+                shard_spec: &shard_spec,
+            },
+        )
+        .await
+    }
+
+    /// An [`object_store::ObjectStore`] that delegates to `inner` but fails
+    /// every write whose path contains `fail_marker`. Used to make a single
+    /// shard's writer error mid-write so we can assert the demux surfaces that
+    /// writer's real error rather than the downstream "receiver is gone" send
+    /// failure.
+    #[derive(Debug)]
+    struct FailWritesContaining {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail_marker: String,
+    }
+
+    impl std::fmt::Display for FailWritesContaining {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailWritesContaining({})", self.fail_marker)
+        }
+    }
+
+    impl FailWritesContaining {
+        fn injected(&self, location: &Path) -> Option<object_store::Error> {
+            location
+                .as_ref()
+                .contains(self.fail_marker.as_str())
+                .then(|| object_store::Error::Generic {
+                    store: "FailWritesContaining",
+                    source: "injected shard write failure".into(),
+                })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailWritesContaining {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            match self.injected(location) {
+                Some(e) => Err(e),
+                None => self.inner.put_opts(location, payload, opts).await,
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            match self.injected(location) {
+                Some(e) => Err(e),
+                None => self.inner.put_multipart_opts(location, opts).await,
+            }
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// The `_p{shard:03}` segment of a sharded output path, if present.
+    fn shard_segment(path: &Path) -> Option<String> {
+        let marker = format!("{SHARD_WRITE_ID}_p");
+        path.as_ref()
+            .split(marker.as_str())
+            .nth(1)
+            .and_then(|rest| rest.get(..3).map(str::to_string))
+    }
+
+    fn one_col_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
+    }
+
+    fn one_col_batch(schema: &SchemaRef, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("single-column i64 batch")
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_sharding_writes_one_file_per_shard() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // 8 batches, round-robin across 4 shards → 2 batches each → 4 files
+        // (rolling disabled).
+        let batches: Vec<RecordBatch> = (0i64..8)
+            .map(|i| one_col_batch(&schema, vec![i; 16]))
+            .collect();
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::RoundRobin(4),
+        )
+        .await?;
+
+        assert_eq!(results.len(), 4, "expected one file per shard");
+
+        // One write_id, four distinct shard segments.
+        let segments: HashSet<String> = results
+            .iter()
+            .filter_map(|(p, _)| shard_segment(p))
+            .collect();
+        assert_eq!(
+            segments.len(),
+            4,
+            "expected 4 distinct shard segments, got files {:?}",
+            results
+                .iter()
+                .map(|(p, _)| p.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, 8 * 16);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_sharding_round_trips_all_rows() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // Values 0..50 across 5 batches; round-robin into 3 shards.
+        let batches: Vec<RecordBatch> = (0i64..5)
+            .map(|b| one_col_batch(&schema, (b * 10..b * 10 + 10).collect()))
+            .collect();
+
+        run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::RoundRobin(3),
+        )
+        .await?;
+
+        let got = ctx
+            .session
+            .sql("SELECT a FROM '/table/' ORDER BY a")
+            .await?
+            .collect()
+            .await?;
+        let mut got_vals = Vec::new();
+        for batch in &got {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("a column should be Int64Array");
+            for i in 0..col.len() {
+                got_vals.push(col.value(i));
+            }
+        }
+        assert_eq!(got_vals, (0..50).collect::<Vec<i64>>());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_sharding_clusters_keys_into_disjoint_files() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        // 100 distinct keys spread across 4 batches.
+        let batches: Vec<RecordBatch> = (0i64..4)
+            .map(|b| {
+                let keys: Vec<i64> = (b * 25..b * 25 + 25).collect();
+                let vals: Vec<i64> = keys.iter().map(|k| k * 2).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(keys)),
+                        Arc::new(Int64Array::from(vals)),
+                    ],
+                )
+                .expect("key/val batch")
+            })
+            .collect();
+
+        let exprs: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("key", 0))];
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Hash {
+                exprs,
+                partitions: 4,
+            },
+        )
+        .await?;
+
+        // Every key must land in exactly one file (deterministic hash routing),
+        // and all 100 keys must be present across the file set.
+        let mut key_to_file: HashMap<i64, String> = HashMap::new();
+        for (path, _) in &results {
+            let url = format!("/{path}");
+            let rows = ctx
+                .session
+                .sql(&format!("SELECT DISTINCT key FROM '{url}'"))
+                .await?
+                .collect()
+                .await?;
+            for batch in &rows {
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("key column should be Int64Array");
+                for i in 0..col.len() {
+                    let key = col.value(i);
+                    if let Some(prev) = key_to_file.insert(key, url.clone()) {
+                        assert_eq!(
+                            prev, url,
+                            "key {key} appeared in two shard files: {prev} and {url}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            key_to_file.len(),
+            100,
+            "all keys should be present exactly once"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_per_shard_rolling_rolls_each_shard_independently() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // ~8 MiB of incompressible data, round-robin across 2 shards, 1 MiB
+        // target → each shard must roll into multiple files.
+        let batch_rows = 8192usize;
+        let num_batches = 128usize;
+        let batches: Vec<RecordBatch> = (0..num_batches)
+            .map(|i| {
+                one_col_batch(
+                    &schema,
+                    pseudo_random_i64s(batch_rows, (i * batch_rows) as i64),
+                )
+            })
+            .collect();
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            Some(1024 * 1024),
+            ShardSpec::RoundRobin(2),
+        )
+        .await?;
+
+        let mut files_per_shard: HashMap<String, usize> = HashMap::new();
+        for (path, _) in &results {
+            if let Some(seg) = shard_segment(path) {
+                *files_per_shard.entry(seg).or_default() += 1;
+            }
+        }
+        assert_eq!(
+            files_per_shard.len(),
+            2,
+            "both shards should have written files"
+        );
+        for (seg, count) in &files_per_shard {
+            assert!(
+                *count >= 2,
+                "shard {seg} rolled only {count} file(s), expected >= 2"
+            );
+        }
+
+        let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+        assert_eq!(total_rows, (num_batches * batch_rows) as u64);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_single_shard_keeps_unsuffixed_file_names() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        let batches: Vec<RecordBatch> = (0i64..3)
+            .map(|i| one_col_batch(&schema, vec![i; 16]))
+            .collect();
+
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::Single,
+        )
+        .await?;
+
+        assert_eq!(results.len(), 1, "Single shard writes exactly one file");
+        let name = results[0].0.to_string();
+        assert!(
+            name.ends_with(&format!("{SHARD_WRITE_ID}_00000.vortex")),
+            "unexpected single-shard file name: {name}"
+        );
+        assert!(
+            shard_segment(&results[0].0).is_none(),
+            "Single shard must not be _p-suffixed"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sharded_write_cleans_up_all_files_on_stream_error() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // Four good batches (one per shard) then an injected error.
+        let mut items: Vec<datafusion_common::Result<RecordBatch>> = (0i64..4)
+            .map(|i| Ok(one_col_batch(&schema, vec![i; 16])))
+            .collect();
+        items.push(Err(exec_datafusion_err!("injected mid-stream failure")));
+        let data: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(items),
+        ));
+
+        let result = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            data,
+            None,
+            ShardSpec::RoundRobin(4),
+        )
+        .await;
+        assert!(result.is_err(), "stream error should fail the write");
+
+        let remaining = ctx
+            .store
+            .list(Some(&"table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(
+            remaining.is_empty(),
+            "failed write must clean up every shard file, found {}",
+            remaining.len()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_shard_writer_surfaces_real_error_not_receiver_gone() -> anyhow::Result<()>
+    {
+        let schema = one_col_schema();
+        // Writes to shard 2's file (`..._p002_...`) fail; every other shard
+        // succeeds. The failing shard drops its receiver, which would make the
+        // demux's next send report "receiver is gone" — assert we surface the
+        // writer's real error instead of masking it behind the send failure.
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(FailWritesContaining {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            fail_marker: "_p002_".to_string(),
+        });
+        // 12 batches round-robin across 4 shards → shard 2 opens its file early
+        // and fails, while the demux keeps routing further batches to it.
+        let batches: Vec<RecordBatch> = (0i64..12)
+            .map(|i| one_col_batch(&schema, vec![i; 16]))
+            .collect();
+
+        // `WriteSummary` is not `Debug`, so match rather than `expect_err`.
+        let err = match run_sharded_write(
+            Arc::clone(&store),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), batches),
+            None,
+            ShardSpec::RoundRobin(4),
+        )
+        .await
+        {
+            Ok(_) => panic!("a failing shard writer must fail the whole write"),
+            Err(e) => e,
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injected shard write failure"),
+            "expected the shard writer's real error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("receiver is gone"),
+            "must not mask the root cause behind the demux send failure, got: {msg}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_sharding_handles_null_keys() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        // Nullable key column with interleaved NULLs — NULL keys must hash
+        // deterministically, not panic or drop rows.
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let keys: Vec<Option<i64>> = (0i64..40)
+            .map(|i| if i % 3 == 0 { None } else { Some(i) })
+            .collect();
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(keys))])
+                .expect("nullable key batch");
+
+        let exprs: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("key", 0))];
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), vec![batch]),
+            None,
+            ShardSpec::Hash {
+                exprs,
+                partitions: 4,
+            },
+        )
+        .await?;
+
+        let mut total = 0usize;
+        for (path, _) in &results {
+            let url = format!("/{path}");
+            total += ctx
+                .session
+                .sql(&format!("SELECT key FROM '{url}'"))
+                .await?
+                .count()
+                .await?;
+        }
+        assert_eq!(total, 40, "every row including NULL keys must round-trip");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_hash_sharding_composite_key_round_trips() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        // Composite (multi-column) key, as real PKs often are, e.g. (w_id, d_id).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("w", DataType::Int64, false),
+            Field::new("d", DataType::Int64, false),
+        ]));
+        let ws: Vec<i64> = (0i64..36).map(|i| i / 6).collect();
+        let ds: Vec<i64> = (0i64..36).map(|i| i % 6).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ws)),
+                Arc::new(Int64Array::from(ds)),
+            ],
+        )
+        .expect("composite key batch");
+
+        let exprs: Vec<PhysicalExprRef> =
+            vec![Arc::new(Column::new("w", 0)), Arc::new(Column::new("d", 1))];
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), vec![batch]),
+            None,
+            ShardSpec::Hash {
+                exprs,
+                partitions: 4,
+            },
+        )
+        .await?;
+
+        let mut total = 0usize;
+        for (path, _) in &results {
+            let url = format!("/{path}");
+            total += ctx
+                .session
+                .sql(&format!("SELECT w FROM '{url}'"))
+                .await?
+                .count()
+                .await?;
+        }
+        assert_eq!(total, 36, "composite-key hash must round-trip every row");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sharded_write_with_empty_input_writes_no_files() -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let schema = one_col_schema();
+        // An empty stream must open no files on any shard (no empty artifacts).
+        let results = run_sharded_write(
+            ctx.store.clone(),
+            Arc::clone(&schema),
+            batches_to_stream(Arc::clone(&schema), vec![]),
+            None,
+            ShardSpec::RoundRobin(4),
+        )
+        .await?;
+
+        assert!(
+            results.is_empty(),
+            "empty input must produce no files, got {}",
+            results.len()
+        );
+        let listed = ctx
+            .store
+            .list(Some(&"table".into()))
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(
+            listed.is_empty(),
+            "no objects should be written for empty input, found {}",
+            listed.len()
+        );
         Ok(())
     }
 }

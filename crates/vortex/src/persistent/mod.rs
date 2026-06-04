@@ -19,6 +19,7 @@ pub use format::ScanConcurrency;
 pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
+pub use format::WriteShardConfig;
 pub use source::VortexSource;
 
 #[cfg(test)]
