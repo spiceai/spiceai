@@ -1,0 +1,23 @@
+---
+source: crates/runtime-search/src/types.rs
+expression: sort_result(transpose_and_convert(column_format))
+---
+[
+  [
+    [
+      "key1",
+      [
+        "A"
+      ]
+    ]
+  ],
+  [],
+  [
+    [
+      "key1",
+      [
+        "B"
+      ]
+    ]
+  ]
+]
