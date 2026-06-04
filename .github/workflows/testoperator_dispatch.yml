@@ -378,6 +378,16 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
+      - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - CH-BenCHmark - SF1
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 \
+            --workflow ${{ github.event.inputs.workflow_type }} \
+            --update-snapshots ${{ github.event.inputs.update_snapshots }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ github.event.ref }}
+
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - CH-BenCHmark - SF10
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 \
