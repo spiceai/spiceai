@@ -149,6 +149,13 @@ pub struct StdioArgs {
     /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
+
+    /// Extra params for the generated Cayenne catalog as comma-separated
+    /// `key=value` pairs, e.g.
+    /// `cayenne_write_concurrency=1,cayenne_compaction_max_files_per_pick=512`.
+    /// Applied on top of (and overriding) the params spidapter sets itself.
+    #[arg(long, env = "SPIDAPTER_CAYENNE_PARAMS")]
+    pub cayenne_params: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -181,6 +188,11 @@ pub struct LocalSpicedArgs {
     /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
     #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
     pub query_memory_limit: Option<String>,
+
+    /// Extra params for the generated Cayenne catalog as comma-separated
+    /// `key=value` pairs (see `StdioArgs::cayenne_params`).
+    #[arg(long, env = "SPIDAPTER_CAYENNE_PARAMS")]
+    pub cayenne_params: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]

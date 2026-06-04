@@ -18,6 +18,10 @@ on:
         required: false
         type: boolean
         default: false
+      tag:
+        description: 'Custom image tag for branch builds (replaces latest; trunk pushes still tag latest)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -103,6 +107,6 @@ jobs:
           push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/spidapter:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/spidapter:latest
+            ghcr.io/${{ github.repository_owner }}/spidapter:${{ inputs.tag || 'latest' }}
           cache-from: type=gha,scope=spidapter
           cache-to: type=gha,scope=spidapter,mode=max

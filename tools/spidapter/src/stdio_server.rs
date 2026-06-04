@@ -1666,6 +1666,28 @@ fn generate_adbc_spicepod(
         );
     }
 
+    // Extra catalog params passed through verbatim (e.g.
+    // `cayenne_write_concurrency=1,cayenne_compaction_max_files_per_pick=512`).
+    // Applied last so they override the params spidapter sets itself.
+    if let Some(raw) = &args.cayenne_params {
+        for pair in raw.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            match pair.split_once('=') {
+                Some((key, value)) if !key.trim().is_empty() && !value.trim().is_empty() => {
+                    params_map.insert(key.trim().to_string(), value.trim().to_string());
+                }
+                _ => {
+                    eprintln!(
+                        "[stdio] ignoring malformed SPIDAPTER_CAYENNE_PARAMS entry: {pair:?} (expected key=value)"
+                    );
+                }
+            }
+        }
+    }
+
     if !params_map.is_empty() {
         cayenne_catalog.params = Some(Params::from_string_map(params_map));
     }
@@ -1785,7 +1807,55 @@ mod tests {
             ephemeral_storage_limit_gb: None,
             organization_tag: None,
             query_memory_limit: None,
+            cayenne_params: None,
         }
+    }
+
+    #[test]
+    fn adbc_spicepod_applies_cayenne_params_passthrough() {
+        let mut args = test_stdio_args();
+        args.cayenne_data_dir = Some("/data/cayenne".to_string());
+        args.cayenne_params = Some(
+            " cayenne_write_concurrency=1, cayenne_compaction_max_files_per_pick = 512 ,, bogus , also=  "
+                .to_string(),
+        );
+
+        let run_id = Uuid::new_v4();
+        let spicepod = generate_adbc_spicepod(&run_id, None, &args);
+
+        let catalog = spicepod
+            .catalogs
+            .iter()
+            .find_map(|c| match c {
+                ComponentOrReference::Component(c) if c.name == "spicebench" => Some(c),
+                _ => None,
+            })
+            .expect("generated spicepod should contain the spicebench catalog");
+        let params = catalog
+            .params
+            .as_ref()
+            .expect("catalog params should be set")
+            .as_string_map();
+
+        // Well-formed entries are applied (trimmed)...
+        assert_eq!(
+            params.get("cayenne_write_concurrency").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            params
+                .get("cayenne_compaction_max_files_per_pick")
+                .map(String::as_str),
+            Some("512")
+        );
+        // ...existing spidapter-set params are preserved...
+        assert_eq!(
+            params.get("cayenne_data_dir").map(String::as_str),
+            Some("/data/cayenne")
+        );
+        // ...and malformed entries (no '=', empty value) are ignored.
+        assert!(!params.contains_key("bogus"));
+        assert!(!params.contains_key("also"));
     }
 
     #[test]
