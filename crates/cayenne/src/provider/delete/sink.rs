@@ -671,6 +671,7 @@ impl CayenneDeletionSink {
         row_keys: Vec<Box<[u8]>>,
         delete_sequence: i64,
     ) -> super::super::Result<u64> {
+        let start = std::time::Instant::now();
         let table_name = &self.table_metadata.table_name;
 
         // Get the row keys snapshot from the PkDeletionStrategy (only valid for RowConverterBased)
@@ -745,9 +746,10 @@ impl CayenneDeletionSink {
             })?;
 
         tracing::debug!(
-            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
+            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) duration_ms={} at {:?}",
             deleted_count,
             delete_sequence,
+            start.elapsed().as_millis(),
             result.path
         );
 
