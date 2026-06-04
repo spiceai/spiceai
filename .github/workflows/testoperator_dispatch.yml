@@ -236,7 +236,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       # HTAP CH-benCHmark — one SF per schedule. SF1 rides with daily-main;
-      # SF10 / SF100 each fire on their own staggered cron (see the schedule block).
+      # SF10 / SF100 each fire on their own cron.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
         if: ${{ steps.sched.outputs.name == 'daily-main' }}
         run: |
