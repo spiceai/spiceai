@@ -123,7 +123,7 @@ spice run
 ```bash
 # Install system dependencies
 sudo apt update
-sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake
+sudo apt install build-essential curl openssl libssl-dev pkg-config protobuf-compiler cmake lld
 
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y # install unattended
