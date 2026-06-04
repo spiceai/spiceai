@@ -31,7 +31,7 @@ use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
 };
-use mongodb::bson::{Bson, doc};
+use mongodb::bson::{Bson, Document, doc};
 use runtime::component::dataset::Dataset;
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::dataconnector::{
@@ -334,7 +334,7 @@ impl From<ReadProviderError> for DataConnectorError {
     }
 }
 
-/// Maps a MongoDB index-key value to a sort direction: `1` ascending, `-1`
+/// Maps a `MongoDB` index-key value to a sort direction: `1` ascending, `-1`
 /// descending. Returns `None` for non-b-tree key types (`text`, `2dsphere`,
 /// `hashed`, ...), which cannot be expressed as accelerator sort/index columns.
 fn index_column_direction(value: &Bson) -> Option<bool> {
@@ -352,7 +352,7 @@ fn index_column_direction(value: &Bson) -> Option<bool> {
     }
 }
 
-/// If the collection is a clustered collection (MongoDB 5.3+), return its cluster
+/// If the collection is a clustered collection (`MongoDB` 5.3+), return its cluster
 /// key columns with direction — the physical-order analog of a Postgres clustered
 /// index. Returns `None` (best-effort) when not clustered or on any parse miss.
 async fn mongodb_clustered_sort(
@@ -363,6 +363,13 @@ async fn mongodb_clustered_sort(
         .run_command(doc! { "listCollections": 1, "filter": { "name": collection_name } })
         .await
         .ok()?;
+    clustered_sort_from_response(&response)
+}
+
+/// Parse the clustered-collection sort order out of a `listCollections` response.
+/// Pure (no I/O) so it is unit-tested against synthetic responses. Returns `None`
+/// when the collection is not clustered or the response cannot be parsed.
+fn clustered_sort_from_response(response: &Document) -> Option<Vec<InferredSortColumn>> {
     let key_doc = response
         .get_document("cursor")
         .ok()?
@@ -388,11 +395,35 @@ async fn mongodb_clustered_sort(
     (!sort_columns.is_empty()).then_some(sort_columns)
 }
 
+/// Parse one `listIndexes` entry into an [`InferredIndex`], or `None` if it should
+/// be skipped: a partial index (not a table-wide guarantee), an index with no key
+/// columns, or any non-b-tree key type (`text`, `2dsphere`, `hashed`, ...). Pure so
+/// it is unit-tested against synthetic index documents.
+fn parse_mongo_index(index_doc: &Document) -> Option<InferredIndex> {
+    if index_doc.contains_key("partialFilterExpression") {
+        return None;
+    }
+    let key_doc = index_doc.get_document("key").ok()?;
+    let mut columns: Vec<String> = Vec::new();
+    for (field, value) in key_doc {
+        // A non-ascending/descending key type makes the whole index unusable.
+        if index_column_direction(value).is_none() {
+            return None;
+        }
+        columns.push(field.clone());
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    let unique = index_doc.get_bool("unique").unwrap_or(false);
+    Some(InferredIndex { columns, unique })
+}
+
 /// Infer the collection's primary key, secondary indexes, and sort order from
-/// MongoDB catalog commands (`listIndexes`, `listCollections`).
+/// `MongoDB` catalog commands (`listIndexes`, `listCollections`).
 ///
-/// MongoDB's document key is always `_id`, so the primary key is `["_id"]` — this
-/// is what makes `refresh_mode: changes` (MongoDB Streams) work without manual
+/// `MongoDB`'s document key is always `_id`, so the primary key is `["_id"]` — this
+/// is what makes `refresh_mode: changes` (`MongoDB` Streams) work without manual
 /// configuration, since the change-stream path requires `primary_key: _id` plus a
 /// matching `on_conflict` upsert.
 async fn mongodb_inferred_schema_metadata(
@@ -418,33 +449,13 @@ async fn mongodb_inferred_schema_metadata(
         && let Ok(first_batch) = cursor.get_array("firstBatch")
     {
         for entry in first_batch {
-            let Some(index_doc) = entry.as_document() else {
+            let Some(index) = entry.as_document().and_then(parse_mongo_index) else {
                 continue;
             };
-            // Partial indexes are not a table-wide guarantee — skip.
-            if index_doc.contains_key("partialFilterExpression") {
-                continue;
+            if index.columns == primary_key {
+                continue; // the `_id_` index — already captured as the primary key
             }
-            let Ok(key_doc) = index_doc.get_document("key") else {
-                continue;
-            };
-            // Collect plain b-tree columns; drop the whole index if any key part is
-            // a non-ascending/descending key type (text, 2dsphere, hashed, ...).
-            let mut columns: Vec<String> = Vec::new();
-            let mut usable = true;
-            for (field, value) in key_doc {
-                if index_column_direction(value).is_some() {
-                    columns.push(field.clone());
-                } else {
-                    usable = false;
-                    break;
-                }
-            }
-            if !usable || columns.is_empty() || columns == primary_key {
-                continue; // unusable, empty, or the `_id_` index (the primary key)
-            }
-            let unique = index_doc.get_bool("unique").unwrap_or(false);
-            indexes.push(InferredIndex { columns, unique });
+            indexes.push(index);
         }
     }
 
@@ -584,5 +595,105 @@ mod tests {
         assert!(!is_srv_host("192.168.1.1"));
         assert!(!is_srv_host("mongo.example.com"));
         assert!(!is_srv_host("mongodb.net")); // bare domain, no subdomain
+    }
+}
+
+#[cfg(test)]
+mod inferred_schema_tests {
+    use super::{
+        InferredIndex, InferredSortColumn, clustered_sort_from_response, index_column_direction,
+        parse_mongo_index,
+    };
+    use mongodb::bson::{Bson, doc};
+
+    #[test]
+    fn direction_from_index_key_values() {
+        assert_eq!(index_column_direction(&Bson::Int32(1)), Some(false));
+        assert_eq!(index_column_direction(&Bson::Int32(-1)), Some(true));
+        assert_eq!(index_column_direction(&Bson::Int64(1)), Some(false));
+        assert_eq!(index_column_direction(&Bson::Double(-1.0)), Some(true));
+        // Non-b-tree key types are not sort directions.
+        assert_eq!(
+            index_column_direction(&Bson::String("text".to_string())),
+            None
+        );
+        assert_eq!(index_column_direction(&Bson::Int32(2)), None);
+    }
+
+    #[test]
+    fn parses_simple_unique_index() {
+        let index =
+            parse_mongo_index(&doc! { "key": { "email": 1 }, "name": "uq_email", "unique": true })
+                .expect("usable index");
+        assert_eq!(
+            index,
+            InferredIndex {
+                columns: vec!["email".to_string()],
+                unique: true
+            }
+        );
+    }
+
+    #[test]
+    fn parses_compound_non_unique_index() {
+        let index = parse_mongo_index(&doc! { "key": { "a": 1, "b": -1 }, "name": "idx_ab" })
+            .expect("usable index");
+        assert_eq!(
+            index,
+            InferredIndex {
+                columns: vec!["a".to_string(), "b".to_string()],
+                unique: false
+            }
+        );
+    }
+
+    #[test]
+    fn skips_partial_index() {
+        assert!(
+            parse_mongo_index(&doc! {
+                "key": { "sku": 1 },
+                "unique": true,
+                "partialFilterExpression": { "active": true }
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn skips_non_btree_indexes() {
+        assert!(parse_mongo_index(&doc! { "key": { "body": "text" }, "name": "txt" }).is_none());
+        assert!(parse_mongo_index(&doc! { "key": { "loc": "2dsphere" }, "name": "geo" }).is_none());
+    }
+
+    #[test]
+    fn _id_index_parses_as_primary_key_columns() {
+        // The implicit `_id_` index; the caller drops it as the primary key.
+        let index = parse_mongo_index(&doc! { "key": { "_id": 1 }, "name": "_id_" })
+            .expect("usable index");
+        assert_eq!(index.columns, vec!["_id".to_string()]);
+    }
+
+    #[test]
+    fn parses_clustered_collection_sort() {
+        let response = doc! {
+            "cursor": {
+                "firstBatch": [
+                    { "name": "events", "options": { "clusteredIndex": { "key": { "_id": 1 } } } }
+                ]
+            }
+        };
+        assert_eq!(
+            clustered_sort_from_response(&response),
+            Some(vec![InferredSortColumn {
+                column: "_id".to_string(),
+                desc: false
+            }])
+        );
+    }
+
+    #[test]
+    fn non_clustered_collection_has_no_sort() {
+        let response = doc! { "cursor": { "firstBatch": [ { "name": "events", "options": {} } ] } };
+        assert_eq!(clustered_sort_from_response(&response), None);
     }
 }

@@ -297,7 +297,7 @@ async fn postgres_comment_metadata(
 ///
 /// `indkey`/`indoption` are `int2vector`s; routing them through text to `int2[]`
 /// yields standard 1-based arrays that line up with `WITH ORDINALITY` and works
-/// across all supported PostgreSQL versions. Expression index keys have `attnum`
+/// across all supported `PostgreSQL` versions. Expression index keys have `attnum`
 /// 0 (no matching `pg_attribute` row, so `column_name` is NULL); partial indexes
 /// have a non-null `indpred`.
 const INFERRED_SCHEMA_SQL: &str = "\
@@ -367,6 +367,13 @@ async fn postgres_inferred_schema_metadata(
         ));
     }
 
+    Ok(inferred_schema_from_indexes(&by_index))
+}
+
+/// Derive an [`InferredSchema`] from the per-index accumulators built from the
+/// `pg_catalog` rows. Pure (no I/O) so the grouping/derivation rules are unit-tested
+/// against synthetic catalog rows.
+fn inferred_schema_from_indexes(by_index: &BTreeMap<String, IndexAccumulator>) -> InferredSchema {
     let mut primary_key: Vec<String> = Vec::new();
     let mut indexes: Vec<InferredIndex> = Vec::new();
     let mut clustered_sort: Option<Vec<InferredSortColumn>> = None;
@@ -427,14 +434,14 @@ async fn postgres_inferred_schema_metadata(
             .collect()
     });
 
-    Ok(InferredSchema {
+    InferredSchema {
         primary_key,
         indexes,
         sort_columns,
-    })
+    }
 }
 
-/// Enrich the provider's schema with PostgreSQL metadata: column/table comments
+/// Enrich the provider's schema with `PostgreSQL` metadata: column/table comments
 /// and source types (always), plus inferred primary key / indexes / sort columns
 /// when the dataset opts into `schema_inference: extended`.
 async fn enrich_with_postgres_metadata(
@@ -624,4 +631,183 @@ pub const CONNECTOR_NAME: &str = "postgres";
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     PostgresFactory::new_arc()
+}
+
+#[cfg(test)]
+mod inferred_schema_tests {
+    use super::{IndexAccumulator, InferredIndex, InferredSortColumn, inferred_schema_from_indexes};
+    use std::collections::BTreeMap;
+
+    /// Build `(ordinal, column, descending)` tuples from `(name, descending)` pairs.
+    fn cols(items: &[(&str, bool)]) -> Vec<(i64, Option<String>, bool)> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                (
+                    i64::try_from(i).expect("ordinal fits in i64"),
+                    Some((*name).to_string()),
+                    *desc,
+                )
+            })
+            .collect()
+    }
+
+    /// A plain (non-primary, non-unique, non-clustered) index; tests flip flags as needed.
+    fn index(columns: Vec<(i64, Option<String>, bool)>) -> IndexAccumulator {
+        IndexAccumulator {
+            is_primary: false,
+            is_unique: false,
+            is_clustered: false,
+            is_partial: false,
+            has_expressions: false,
+            columns,
+        }
+    }
+
+    fn by_index(entries: Vec<(&str, IndexAccumulator)>) -> BTreeMap<String, IndexAccumulator> {
+        entries
+            .into_iter()
+            .map(|(name, acc)| (name.to_string(), acc))
+            .collect()
+    }
+
+    #[test]
+    fn composite_primary_key_with_pk_fallback_sort() {
+        let mut pk = index(cols(&[("warehouse_id", false), ("sku", false)]));
+        pk.is_primary = true;
+        pk.is_unique = true;
+
+        let schema = inferred_schema_from_indexes(&by_index(vec![("orders_pkey", pk)]));
+
+        assert_eq!(
+            schema.primary_key,
+            vec!["warehouse_id".to_string(), "sku".to_string()]
+        );
+        assert!(schema.indexes.is_empty());
+        // No clustered index → sort falls back to the primary key, ascending.
+        assert_eq!(
+            schema.sort_columns,
+            vec![
+                InferredSortColumn {
+                    column: "warehouse_id".to_string(),
+                    desc: false
+                },
+                InferredSortColumn {
+                    column: "sku".to_string(),
+                    desc: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unique_and_non_unique_secondary_indexes() {
+        let mut pk = index(cols(&[("id", false)]));
+        pk.is_primary = true;
+        pk.is_unique = true;
+        let mut uq = index(cols(&[("email", false)]));
+        uq.is_unique = true;
+        let plain = index(cols(&[("quantity", false)]));
+
+        let schema = inferred_schema_from_indexes(&by_index(vec![
+            ("orders_pkey", pk),
+            ("uq_email", uq),
+            ("idx_qty", plain),
+        ]));
+
+        assert_eq!(schema.primary_key, vec!["id".to_string()]);
+        assert_eq!(schema.indexes.len(), 2);
+        assert!(schema.indexes.contains(&InferredIndex {
+            columns: vec!["email".to_string()],
+            unique: true
+        }));
+        assert!(schema.indexes.contains(&InferredIndex {
+            columns: vec!["quantity".to_string()],
+            unique: false
+        }));
+    }
+
+    #[test]
+    fn skips_partial_and_expression_indexes() {
+        let mut pk = index(cols(&[("id", false)]));
+        pk.is_primary = true;
+        pk.is_unique = true;
+        let mut partial = index(cols(&[("sku", false)]));
+        partial.is_unique = true;
+        partial.is_partial = true;
+        let mut expr = index(vec![(0, None, false)]); // expression key → NULL column
+        expr.has_expressions = true;
+
+        let schema = inferred_schema_from_indexes(&by_index(vec![
+            ("orders_pkey", pk),
+            ("uq_partial", partial),
+            ("idx_expr", expr),
+        ]));
+
+        assert_eq!(schema.primary_key, vec!["id".to_string()]);
+        assert!(
+            schema.indexes.is_empty(),
+            "partial and expression indexes must be skipped"
+        );
+    }
+
+    #[test]
+    fn drops_index_duplicating_primary_key() {
+        let mut pk = index(cols(&[("id", false)]));
+        pk.is_primary = true;
+        pk.is_unique = true;
+        let mut dup = index(cols(&[("id", false)]));
+        dup.is_unique = true;
+
+        let schema =
+            inferred_schema_from_indexes(&by_index(vec![("orders_pkey", pk), ("uq_id", dup)]));
+
+        assert_eq!(schema.primary_key, vec!["id".to_string()]);
+        assert!(
+            schema.indexes.is_empty(),
+            "the primary key's own unique index must not be re-listed"
+        );
+    }
+
+    #[test]
+    fn clustered_index_drives_sort_with_direction() {
+        let mut pk = index(cols(&[("id", false)]));
+        pk.is_primary = true;
+        pk.is_unique = true;
+        let mut clustered = index(cols(&[("updated_at", true), ("id", false)]));
+        clustered.is_clustered = true;
+
+        let schema = inferred_schema_from_indexes(&by_index(vec![
+            ("orders_pkey", pk),
+            ("idx_updated", clustered),
+        ]));
+
+        assert_eq!(schema.primary_key, vec!["id".to_string()]);
+        // The clustered index defines the physical sort order, preserving DESC.
+        assert_eq!(
+            schema.sort_columns,
+            vec![
+                InferredSortColumn {
+                    column: "updated_at".to_string(),
+                    desc: true
+                },
+                InferredSortColumn {
+                    column: "id".to_string(),
+                    desc: false
+                },
+            ]
+        );
+        // It is also surfaced as a usable secondary index.
+        assert!(schema.indexes.contains(&InferredIndex {
+            columns: vec!["updated_at".to_string(), "id".to_string()],
+            unique: false
+        }));
+    }
+
+    #[test]
+    fn empty_when_no_indexes() {
+        let schema = inferred_schema_from_indexes(&BTreeMap::new());
+        assert!(schema.is_empty());
+    }
 }
