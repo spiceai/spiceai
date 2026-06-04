@@ -1365,7 +1365,6 @@ mod tests {
         Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(stub_udf), vec![]))
     }
 
-
     #[test]
     fn test_parse_argument_exprs() {
         // Empty call

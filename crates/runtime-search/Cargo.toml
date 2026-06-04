@@ -51,9 +51,10 @@ tracing.workspace = true
 default = []
 duckdb = ["search/duckdb"]
 elasticsearch = ["search/elasticsearch"]
-models = []
+models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]
 s3_vectors = ["search/s3_vectors"]
+text_search = ["search/text_search"]
 
 [dev-dependencies]
-insta.workspace = true
+insta = {workspace = true, features = ["json"] }

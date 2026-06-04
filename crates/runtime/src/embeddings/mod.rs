@@ -51,9 +51,9 @@ mod rrf_vector_search_tests {
     use llms::model2vec::Model2Vec;
     use runtime_datafusion_udfs::embed;
     use runtime_request_context::{Protocol, RequestContext};
-    use runtime_search::embeddings::table::EmbeddingTable;
     use runtime_search::embeddings::EmbeddingModelStore;
-    use runtime_search::rrf::{RRF_UDF_NAME, RRF_FUSED_SCORE_COLUMN_NAME, ReciprocalRankFusion};
+    use runtime_search::embeddings::table::EmbeddingTable;
+    use runtime_search::rrf::{RRF_FUSED_SCORE_COLUMN_NAME, RRF_UDF_NAME, ReciprocalRankFusion};
     use runtime_search::udtf::{
         EmbeddingColumnConfig, EmbeddingInputMode, VECTOR_SEARCH_UDTF_NAME,
     };
@@ -107,10 +107,7 @@ mod rrf_vector_search_tests {
     /// Build a minimal `DataFusion` instance with embed, vector_search, and
     /// RRF UDFs registered — enough to run end-to-end `vector_search` +
     /// `rrf(...)` SQL queries against in-memory `EmbeddingTable`s.
-    async fn make_test_session() -> Result<(
-        Arc<DataFusion>,
-        Arc<RwLock<EmbeddingModelStore>>,
-    )> {
+    async fn make_test_session() -> Result<(Arc<DataFusion>, Arc<RwLock<EmbeddingModelStore>>)> {
         let df = Arc::new(
             DataFusion::builder(
                 status::RuntimeStatus::new(),
@@ -143,9 +140,7 @@ mod rrf_vector_search_tests {
 
         // vector_search UDF + UDTF — requires the valid `Weak<DataFusion>`
         let weak_df = Arc::downgrade(&df);
-        ctx.register_udf(
-            VectorSearchTableFunc::new(Weak::clone(&weak_df), HashMap::new()).into(),
-        );
+        ctx.register_udf(VectorSearchTableFunc::new(Weak::clone(&weak_df), HashMap::new()).into());
         ctx.register_udtf(
             VECTOR_SEARCH_UDTF_NAME,
             Arc::new(VectorSearchTableFunc::new(weak_df, HashMap::new())),
@@ -153,10 +148,7 @@ mod rrf_vector_search_tests {
 
         // RRF UDF + UDTF
         ctx.register_udf(ReciprocalRankFusion::from_ctx(ctx).into());
-        ctx.register_udtf(
-            RRF_UDF_NAME,
-            Arc::new(ReciprocalRankFusion::from_ctx(ctx)),
-        );
+        ctx.register_udtf(RRF_UDF_NAME, Arc::new(ReciprocalRankFusion::from_ctx(ctx)));
 
         Ok((df, embedding_models))
     }
@@ -422,10 +414,12 @@ mod rrf_vector_search_tests {
         let fruit_df = make_fruit_dataframe(&df)
             .await?
             .with_column("timestamp", now())?;
-        let fruit_table =
-            df_as_embedding_table(Arc::clone(&embedding_models), fruit_df.clone());
+        let fruit_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df.clone());
 
-        let no_fruit_df = fruit_df.clone().limit(0, Some(0)).expect("Must have fruit DF");
+        let no_fruit_df = fruit_df
+            .clone()
+            .limit(0, Some(0))
+            .expect("Must have fruit DF");
         let no_fruit_table = df_as_embedding_table(Arc::clone(&embedding_models), no_fruit_df);
 
         df.ctx.register_table("foo", fruit_table)?;

@@ -27,9 +27,13 @@ limitations under the License.
 //! The schema of the resultant table will be: `schema(tbl) ∪ {score}`, where:
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 
+#[cfg(feature = "text_search")]
 use arrow_schema::DataType;
+#[cfg(feature = "text_search")]
 use datafusion::common::exec_err;
+#[cfg(feature = "text_search")]
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+#[cfg(feature = "text_search")]
 use datafusion::{
     catalog::{TableFunctionImpl, TableProvider},
     common::Column,
@@ -37,30 +41,46 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
+#[cfg(feature = "text_search")]
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 
+#[cfg(feature = "text_search")]
 use futures::FutureExt;
+#[cfg(feature = "text_search")]
+use search::generation::text_search::index::FullTextDatabaseIndex;
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchTextIndex;
+#[cfg(feature = "text_search")]
 use search::{
-    generation::text_search::index::FullTextDatabaseIndex,
     index::SearchIndex,
     provider::{SearchQueryProvider, UdtfSource},
 };
+#[cfg(feature = "text_search")]
 use std::any::Any;
+#[cfg(feature = "text_search")]
 use std::sync::LazyLock;
+#[cfg(feature = "text_search")]
 use std::sync::{Arc, Weak};
 
+#[cfg(not(feature = "text_search"))]
 use crate::table_provider_explorer::TableProviderExplorer;
+#[cfg(feature = "text_search")]
+use crate::table_provider_explorer::TableProviderExplorer;
+#[cfg(feature = "text_search")]
 use crate::udtf::{
     TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs, parse_limit_scalar, table_ref_from_column_expr,
 };
+#[cfg(feature = "text_search")]
 use runtime_query_engine::query_engine::QueryEngine;
+#[cfg(feature = "text_search")]
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+#[cfg(feature = "text_search")]
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+#[cfg(feature = "text_search")]
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 
+#[cfg(feature = "text_search")]
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
@@ -88,6 +108,7 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 /// Collect the sorted, deduped set of indexed column names across every FTS index on a
 /// table. Used on error paths to build "Indexed column(s): …" messages — never on the
 /// happy query path.
+#[cfg(feature = "text_search")]
 fn all_indexed_fields(fts_indexes: &[&FullTextDatabaseIndex]) -> Vec<String> {
     let mut fields: Vec<String> = fts_indexes
         .iter()
@@ -100,10 +121,12 @@ fn all_indexed_fields(fts_indexes: &[&FullTextDatabaseIndex]) -> Vec<String> {
 
 /// Suggest the closest indexed column for a misspelled column name using
 /// case-insensitive Levenshtein distance. Returns `None` if no column is reasonably close.
+#[cfg(feature = "text_search")]
 fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
     crate::udtf::closest_column(target, candidates)
 }
 
+#[cfg(feature = "text_search")]
 #[derive(Debug)]
 pub struct TextSearchTableFunc<E: TableProviderExplorer> {
     df: Weak<dyn QueryEngine>,
@@ -111,20 +134,30 @@ pub struct TextSearchTableFunc<E: TableProviderExplorer> {
     explorer: E,
 }
 
+#[cfg(not(feature = "text_search"))]
+#[derive(Debug)]
+pub struct TextSearchTableFunc<E: TableProviderExplorer> {
+    _marker: std::marker::PhantomData<E>,
+}
+
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer> PartialEq for TextSearchTableFunc<E> {
     fn eq(&self, other: &Self) -> bool {
         self.df_ptr == other.df_ptr
     }
 }
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer> Eq for TextSearchTableFunc<E> {}
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer> std::hash::Hash for TextSearchTableFunc<E> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.df_ptr.hash(state);
     }
 }
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     #[must_use]
     pub fn new(df: Weak<dyn QueryEngine>, explorer: E) -> Self {
@@ -227,6 +260,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     }
 }
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
         // Split args into positional and named. Named args carry a
@@ -385,6 +419,7 @@ impl<E: TableProviderExplorer> TextSearchTableFunc<E> {
     }
 }
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFunc<E> {
     fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let args = Self::parse_args(args)?;
@@ -504,6 +539,7 @@ impl<E: TableProviderExplorer + 'static> TableFunctionImpl for TextSearchTableFu
     }
 }
 
+#[cfg(feature = "text_search")]
 impl<E: TableProviderExplorer + 'static> ScalarUDFImpl for TextSearchTableFunc<E> {
     fn as_any(&self) -> &dyn Any {
         self
@@ -531,7 +567,7 @@ impl<E: TableProviderExplorer + 'static> ScalarUDFImpl for TextSearchTableFunc<E
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "text_search"))]
 mod tests {
     use super::{TextSearchTableFunc, TextSearchTableFuncArgs, suggest_column};
     use crate::table_provider_explorer::TableProviderExplorer;

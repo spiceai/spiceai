@@ -13,25 +13,36 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#[cfg(feature = "text_search")]
 use std::sync::Arc;
 
+#[cfg(feature = "text_search")]
 use crate::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFuncArgs};
+#[cfg(feature = "text_search")]
 use datafusion::catalog::TableProvider;
+#[cfg(feature = "text_search")]
 use datafusion::error::DataFusionError;
 
+#[cfg(feature = "text_search")]
 use datafusion::sql::TableReference;
+#[cfg(feature = "text_search")]
 use search::generation::CandidateGeneration;
+#[cfg(feature = "text_search")]
 use search::generation::text_search::FullTextSearchFieldIndex;
+#[cfg(feature = "text_search")]
 use tonic::async_trait;
 
+#[cfg(feature = "text_search")]
 use runtime_query_engine::query_engine::QueryEngine;
 
+#[cfg(feature = "text_search")]
 pub struct TextSearchCandidate {
     inner: Arc<FullTextSearchFieldIndex>,
     df: Arc<dyn QueryEngine>,
     tbl: TableReference,
 }
 
+#[cfg(feature = "text_search")]
 impl TextSearchCandidate {
     pub fn new(
         inner: Arc<FullTextSearchFieldIndex>,
@@ -42,6 +53,7 @@ impl TextSearchCandidate {
     }
 }
 
+#[cfg(feature = "text_search")]
 #[async_trait]
 impl CandidateGeneration for TextSearchCandidate {
     fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {

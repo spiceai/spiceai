@@ -1189,12 +1189,175 @@ mod tests {
     use arrow::array::{Float32Array, StringArray};
     use arrow::util::pretty::pretty_format_batches;
     use async_trait::async_trait;
+    use datafusion::catalog::TableProvider;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{Volatility, create_udf};
     use datafusion::prelude::SessionContext;
-    use runtime_query_engine::{query_engine::QueryEngine, session::QuerySession};
+    use datafusion::sql::TableReference;
+    use runtime_query_engine::query_engine::QueryEngine;
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// A test-specific QueryEngine that wraps both a SessionContext and a HashMap of tables.
+    /// Supports both sync and async table lookups.
+    struct TestQueryEngine {
+        ctx: Arc<SessionContext>,
+        tables: std::sync::Arc<
+            std::sync::RwLock<std::collections::HashMap<String, Arc<dyn TableProvider>>>,
+        >,
+    }
+
+    impl std::fmt::Debug for TestQueryEngine {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TestQueryEngine")
+                .field("tables", &"<tables>")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl TestQueryEngine {
+        fn new(ctx: Arc<SessionContext>) -> Self {
+            Self {
+                ctx,
+                tables: std::sync::Arc::new(std::sync::RwLock::new(
+                    std::collections::HashMap::new(),
+                )),
+            }
+        }
+
+        fn register_table(&self, name: &str, provider: Arc<dyn TableProvider>) {
+            self.tables
+                .write()
+                .expect("lock not poisoned")
+                .insert(name.to_string(), provider);
+        }
+    }
+
+    #[async_trait]
+    impl QueryEngine for TestQueryEngine {
+        fn session_context(&self) -> &Arc<SessionContext> {
+            &self.ctx
+        }
+
+        async fn get_table(&self, table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            // First try the HashMap
+            let table_name = table_ref.table();
+            if let Some(provider) = self
+                .tables
+                .read()
+                .expect("lock not poisoned")
+                .get(table_name)
+            {
+                return Some(Arc::clone(provider));
+            }
+            // Fall back to SessionContext
+            self.ctx.table_provider(table_ref.clone()).await.ok()
+        }
+
+        fn get_table_sync(&self, table_ref: &TableReference) -> Option<Arc<dyn TableProvider>> {
+            // Try the HashMap first (synchronous)
+            let table_name = table_ref.table();
+            self.tables
+                .read()
+                .expect("lock not poisoned")
+                .get(table_name)
+                .map(Arc::clone)
+        }
+
+        fn table_exists(&self, table_ref: &TableReference) -> bool {
+            let table_name = table_ref.table();
+            self.tables
+                .read()
+                .expect("lock not poisoned")
+                .contains_key(table_name)
+                || self.ctx.table_exist(table_ref.clone()).unwrap_or(false)
+        }
+
+        async fn get_arrow_schema(
+            &self,
+            table_ref: TableReference,
+        ) -> runtime_query_engine::query_engine::Result<arrow_schema::Schema> {
+            Ok(self
+                .get_table(&table_ref)
+                .await
+                .ok_or_else(|| runtime_query_engine::query_engine::Error::GetSchema {
+                    table_ref: table_ref.to_string(),
+                    source: datafusion::error::DataFusionError::Plan(format!(
+                        "Table '{table_ref}' not found"
+                    )),
+                })?
+                .schema()
+                .as_ref()
+                .clone())
+        }
+
+        fn get_user_table_names(&self) -> Vec<TableReference> {
+            let mut names: Vec<TableReference> = self
+                .tables
+                .read()
+                .expect("lock not poisoned")
+                .keys()
+                .map(|name: &String| TableReference::bare(name.clone()))
+                .collect();
+            // Also get names from SessionContext
+            if let Some(default_catalog) = self.ctx.catalog_names().first() {
+                if let Some(catalog) = self.ctx.catalog(default_catalog) {
+                    let schema_names = catalog.schema_names();
+                    for schema_name in schema_names {
+                        if let Some(schema) = catalog.schema(&schema_name) {
+                            for table_name in schema.table_names() {
+                                names.push(TableReference::bare(table_name));
+                            }
+                        }
+                    }
+                }
+            }
+            names
+        }
+
+        async fn execute_query(
+            &self,
+            _request: runtime_query_engine::query_engine::QueryRequest,
+        ) -> runtime_query_engine::query_engine::Result<
+            datafusion::execution::SendableRecordBatchStream,
+        > {
+            unimplemented!("execute_query not needed for rerank tests")
+        }
+
+        fn get_public_table_names(
+            &self,
+        ) -> runtime_query_engine::query_engine::Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        fn is_writable(&self, _table_ref: &TableReference) -> bool {
+            false
+        }
+
+        fn is_path_catalog_writable(&self, _table_ref: &TableReference) -> bool {
+            false
+        }
+
+        async fn execute_plan(
+            &self,
+            _plan: datafusion::logical_expr::LogicalPlan,
+        ) -> runtime_query_engine::query_engine::Result<
+            datafusion::execution::SendableRecordBatchStream,
+        > {
+            unimplemented!("execute_plan not needed for rerank tests")
+        }
+
+        async fn write_data(
+            &self,
+            _table_ref: &TableReference,
+            _schema: std::sync::Arc<arrow_schema::Schema>,
+            _data: Vec<arrow::record_batch::RecordBatch>,
+            _update_type: runtime_query_engine::query_engine::UpdateType,
+        ) -> runtime_query_engine::query_engine::Result<()> {
+            unimplemented!("write_data not needed for rerank tests")
+        }
+    }
 
     fn lit_utf8(s: &str) -> Expr {
         Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
@@ -1558,6 +1721,7 @@ mod tests {
         Arc<SessionContext>,
         Arc<RwLock<llms::rerank::RerankerModelStore>>,
         Arc<RwLock<ChatModelStore>>,
+        Arc<TestQueryEngine>,
     ) {
         // Use PostgreSQL dialect so that `name => value` named args in UDTF
         // calls are parsed as `FunctionArg::ExprNamed`, which is the variant
@@ -1565,8 +1729,7 @@ mod tests {
         // default GenericDialect produces `FunctionArg::Named` instead, which
         // hits the unhandled fallback and returns a plan error.
         let mut config = datafusion::prelude::SessionConfig::new();
-        config.options_mut().sql_parser.dialect =
-            datafusion::common::config::Dialect::PostgreSQL;
+        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
         let ctx = Arc::new(SessionContext::new_with_config(config));
         ctx.state().config_mut().set_extension(Arc::new(
             RequestContext::builder(Protocol::Internal).build(),
@@ -1583,10 +1746,12 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new()));
         let chat_models: Arc<RwLock<ChatModelStore>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Register rerank UDTF
-        let weak_ctx: std::sync::Weak<dyn QueryEngine> = Arc::downgrade(
-            &(Arc::new(QuerySession::new(Arc::clone(&ctx))) as Arc<dyn QueryEngine>),
-        );
+        // Register rerank UDTF. Use our TestQueryEngine which supports both sync and async
+        // table lookups.
+        let test_engine = Arc::new(TestQueryEngine::new(Arc::clone(&ctx)));
+        let weak_ctx: std::sync::Weak<dyn QueryEngine> =
+            Arc::downgrade(&(Arc::clone(&test_engine) as Arc<dyn QueryEngine>));
+
         ctx.register_udf(
             RerankTableFunc::new(
                 std::sync::Weak::clone(&weak_ctx),
@@ -1604,7 +1769,7 @@ mod tests {
             )),
         );
 
-        (ctx, rerankers, chat_models)
+        (ctx, rerankers, chat_models, test_engine)
     }
 
     /// Register a small test table and insert a mock reranker.
@@ -1653,8 +1818,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_bare_table_ordering_and_limit() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models) = make_rerank_session();
+        let (ctx, rerankers, _chat_models, test_engine) = make_rerank_session();
         setup_test_table(&ctx, &rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
+
+        // Register the table with TestQueryEngine for sync lookups
+        if let Some(provider) = ctx
+            .table_provider(TableReference::bare("test_docs"))
+            .await
+            .ok()
+        {
+            test_engine.register_table("test_docs", provider);
+        }
 
         let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker', limit => 3)";
 
@@ -1669,10 +1843,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_filter_pushdown_reduces_candidates() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models) = make_rerank_session();
+        let (ctx, rerankers, _chat_models, test_engine) = make_rerank_session();
         // 5 scores but only 2 rows match category='electronics' (ids 1,2).
         // MockRerank returns scores in positional order of the filtered input.
         setup_test_table(&ctx, &rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
+
+        // Register the table with TestQueryEngine for sync lookups
+        if let Some(provider) = ctx
+            .table_provider(TableReference::bare("test_docs"))
+            .await
+            .ok()
+        {
+            test_engine.register_table("test_docs", provider);
+        }
 
         let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker') WHERE category = 'electronics'";
 
