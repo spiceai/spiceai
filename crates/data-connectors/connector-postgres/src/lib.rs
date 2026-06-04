@@ -635,7 +635,9 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 #[cfg(test)]
 mod inferred_schema_tests {
-    use super::{IndexAccumulator, InferredIndex, InferredSortColumn, inferred_schema_from_indexes};
+    use super::{
+        IndexAccumulator, InferredIndex, InferredSortColumn, inferred_schema_from_indexes,
+    };
     use std::collections::BTreeMap;
 
     /// Build `(ordinal, column, descending)` tuples from `(name, descending)` pairs.

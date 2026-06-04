@@ -668,8 +668,8 @@ mod inferred_schema_tests {
     #[test]
     fn _id_index_parses_as_primary_key_columns() {
         // The implicit `_id_` index; the caller drops it as the primary key.
-        let index = parse_mongo_index(&doc! { "key": { "_id": 1 }, "name": "_id_" })
-            .expect("usable index");
+        let index =
+            parse_mongo_index(&doc! { "key": { "_id": 1 }, "name": "_id_" }).expect("usable index");
         assert_eq!(index.columns, vec!["_id".to_string()]);
     }
 
