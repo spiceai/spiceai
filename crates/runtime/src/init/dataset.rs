@@ -1271,9 +1271,18 @@ impl Runtime {
                     let sent = b
                         .broadcast_partitions_loaded(table_name.clone(), bytes)
                         .await;
-                    tracing::info!(
-                        "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
-                    );
+                    if sent == 0 {
+                        // Fast initial loads can finish before any scheduler
+                        // control stream is connected; the broadcaster caches
+                        // the ack and replays it on scheduler connect.
+                        tracing::info!(
+                            "Initial PartitionsLoaded for {table_name} cached; no scheduler connected yet, will replay on connect"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                        );
+                    }
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");

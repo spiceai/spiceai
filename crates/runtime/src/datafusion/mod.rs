@@ -4549,6 +4549,7 @@ mod tests {
                 params: HashMap::new(),
                 metadata: HashMap::new(),
                 columns: vec![],
+                schema: None,
                 has_metadata_table: false,
                 replication: None,
                 time_column,

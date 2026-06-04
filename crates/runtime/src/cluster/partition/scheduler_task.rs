@@ -94,6 +94,11 @@ impl PartitionAssignmentTask {
                 match result {
                     Ok(()) => {
                         self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                        // Pick up executor acks that arrived before metadata
+                        // seeding completed (e.g. replayed on control-stream
+                        // connect during scheduler startup) — they couldn't
+                        // flip their dataset to `Ready` at arrival time.
+                        crate::cluster::service::evaluate_acked_tables_readiness(&self.df).await;
                     }
                     Err(err) => {
                         tracing::warn!("Failed to initialize partition metadata: {err}");
@@ -133,6 +138,13 @@ impl PartitionAssignmentTask {
                             );
                         }
                     }
+
+                    // Re-evaluate acks recorded before their table's partition
+                    // metadata existed; no-op for tables already `Ready`. Runs
+                    // regardless of the cycle's outcome — readiness depends on
+                    // recorded acks + stored metadata, not on this cycle
+                    // having succeeded.
+                    crate::cluster::service::evaluate_acked_tables_readiness(&self.df).await;
 
                     let cycle_duration = cycle_start.elapsed();
                     if cycle_duration > self.interval {

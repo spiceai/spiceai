@@ -36,6 +36,7 @@ use crate::utils::wait_until_true;
 use crate::utils::{register_test_connectors, run_query, test_request_context};
 
 pub mod common;
+mod schema_registration;
 
 use super::*;
 use app::AppBuilder;

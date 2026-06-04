@@ -79,6 +79,19 @@ impl PartitionLoadTracker {
         }
     }
 
+    /// Returns the tables that have at least one executor ack recorded.
+    /// Used by the scheduler's periodic readiness sweep to re-evaluate acks
+    /// that arrived before the table's partition metadata was seeded (e.g.
+    /// acks replayed by executors that connected during scheduler startup).
+    pub async fn acked_tables(&self) -> Vec<TableReference> {
+        let guard = self.loaded.read().await;
+        guard
+            .iter()
+            .filter(|(_, executors)| !executors.is_empty())
+            .map(|(table, _)| table.clone())
+            .collect()
+    }
+
     /// Returns true when every partition in `metadata` has at least one
     /// of its `assigned_executors` reporting the partition's bytes as
     /// loaded. Returns false on any unassigned partition or encoding
@@ -224,6 +237,23 @@ mod tests {
             .get(&table_b)
             .expect("table_b entry should exist after replace()");
         assert!(acks_other.get("exec-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn acked_tables_lists_tables_with_recorded_acks() {
+        let tracker = PartitionLoadTracker::new();
+        assert!(tracker.acked_tables().await.is_empty());
+
+        let table = TableReference::parse_str("t");
+        // An empty ack (zero-partition dataset) still counts as an ack.
+        tracker
+            .replace(table.clone(), "exec-1".to_string(), HashSet::new())
+            .await;
+        assert_eq!(tracker.acked_tables().await, vec![table.clone()]);
+
+        // Dropping the only acking executor leaves the table without acks.
+        tracker.drop_executor("exec-1").await;
+        assert!(tracker.acked_tables().await.is_empty());
     }
 
     #[tokio::test]
