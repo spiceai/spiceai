@@ -271,6 +271,7 @@ fn collect_file_scan_configs<'a>(
 /// the ones that live in other crates or are crate-private. Adding a new
 /// wrapper requires touching this function explicitly — that's intentional;
 /// it stops a future operator from silently being treated as transparent.
+#[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let any = plan.as_any();
     if any.downcast_ref::<ProjectionExec>().is_some()
@@ -424,6 +425,10 @@ impl DisplayAs for CayenneAccelerationExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "CayenneAccelerationExec"
     }

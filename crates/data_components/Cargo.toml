@@ -101,7 +101,7 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 source-arrow = { package = "arrow", version = "57", optional = true }
 source-arrow-ipc = { package = "arrow-ipc", version = "57", optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "75badc149f3c4d783b912c88d10bae443a7330f6", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
     "tls",
 ], optional = true } # branch: spiceai-58
 telemetry = { path = "../telemetry" }
@@ -187,7 +187,7 @@ snowflake = [
     "datafusion-table-providers/federation",
     "db_connection_pool/snowflake",
 ]
-spark_connect = ["dep:spark-connect-rs", "dep:source-arrow", "dep:source-arrow-ipc"]
+spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",
     "datafusion-table-providers/sqlite",

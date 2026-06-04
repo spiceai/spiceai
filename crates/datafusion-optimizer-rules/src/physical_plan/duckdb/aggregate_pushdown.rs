@@ -45,6 +45,10 @@ impl DuckDBAggregatePushdownMarkerExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         Self::name()
     }

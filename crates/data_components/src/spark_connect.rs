@@ -158,10 +158,7 @@ async fn get_table_provider(
     let dataframe = session.table(spark_table_reference.as_str())?;
 
     let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref()).await?;
-    let arrow_schema = crate::source_arrow_compat::record_batch_to_arrow(
-        &dataframe.clone().limit(0).collect().await?,
-    )?
-    .schema();
+    let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
     drop(rate_controller_permit);
 
     Ok(Arc::new(SparkConnectTableProvider {
@@ -386,11 +383,7 @@ fn dataframe_to_stream(
         let data = dataframe
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)
-            .and_then(|batch| {
-                crate::source_arrow_compat::record_batch_to_arrow(&batch)
-                    .map_err(DataFusionError::from)
-            })?;
+            .map_err(map_error_to_datafusion_err)?;
         drop(rate_controller_permit);
         yield (Ok(data))
     }

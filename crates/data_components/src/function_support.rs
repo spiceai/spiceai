@@ -30,6 +30,7 @@ pub enum FunctionRestriction {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(clippy::struct_field_names)]
 pub struct FunctionSupport {
     scalar_functions: Option<FunctionRestriction>,
     aggregate_functions: Option<FunctionRestriction>,

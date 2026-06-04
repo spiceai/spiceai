@@ -817,7 +817,7 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: merged_limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
@@ -945,7 +945,7 @@ pub fn query_to_stream(
                                 }
                             }
                         },
-                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
+                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error } ))
                 }
             }
         };

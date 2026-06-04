@@ -117,7 +117,7 @@ pub mod s3_vectors;
 pub mod schema_discovery;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
-#[cfg(any(feature = "snowflake", feature = "spark_connect"))]
+#[cfg(feature = "snowflake")]
 pub(crate) mod source_arrow_compat;
 pub mod sql_expr;
 

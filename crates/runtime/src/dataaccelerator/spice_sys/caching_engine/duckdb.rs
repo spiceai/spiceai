@@ -33,7 +33,7 @@ impl CachingEngineSys {
 
         // Determine the actual table name (internal or direct)
         let table_name = match (internal_tables.pop(), has_table) {
-            (Some((internal_name, _)), _) => internal_name.to_string(),
+            (Some((internal_name, _)), _) => internal_name,
             (None, true) => self.dataset_name.clone(),
             (None, false) => {
                 // No table exists yet

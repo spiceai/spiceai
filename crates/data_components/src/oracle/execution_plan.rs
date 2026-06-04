@@ -235,7 +235,7 @@ impl ExecutionPlan for OracleExecPlan {
             filters: self.filters.clone(),
             limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
         }))
     }
 

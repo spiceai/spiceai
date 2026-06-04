@@ -42,6 +42,7 @@ use anyhow::{Context, Result, anyhow};
 use app::AppBuilder;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use futures::StreamExt;
+use object_store::ObjectStoreExt;
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use runtime::Runtime;
 use spicepod::{

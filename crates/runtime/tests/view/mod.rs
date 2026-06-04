@@ -38,7 +38,7 @@ async fn accelerated_view_duckdb() -> Result<(), anyhow::Error> {
     use datafusion_table_providers::sql::db_connection_pool::{
         DbConnectionPool, duckdbpool::DuckDbConnectionPool,
     };
-    use duckdb::AccessMode;
+    use spiceai_duckdb::AccessMode;
 
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;

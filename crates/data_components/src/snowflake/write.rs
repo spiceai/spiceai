@@ -328,7 +328,7 @@ impl std::fmt::Debug for DmlCountExec {
         formatter
             .debug_struct("DmlCountExec")
             .field("count", &self.count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

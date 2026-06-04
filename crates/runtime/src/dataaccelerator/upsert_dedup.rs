@@ -239,7 +239,7 @@ impl UpsertDedupExec {
         constraints: Constraints,
         upsert_options: UpsertOptions,
     ) -> Self {
-        let properties = input.properties().clone();
+        let properties = Arc::clone(input.properties());
         Self {
             input,
             constraints,
@@ -395,7 +395,7 @@ pub(crate) fn deduplicate_batch(
 }
 
 fn first_unique_constraint_columns(constraints: &Constraints) -> Option<Vec<usize>> {
-    for constraint in &**constraints {
+    if let Some(constraint) = (**constraints).iter().next() {
         match constraint {
             Constraint::PrimaryKey(columns) | Constraint::Unique(columns) => {
                 return Some(columns.clone());

@@ -272,9 +272,9 @@ mod tests {
         let mut optimizer = executor
             .logical_optimizer()
             .expect("deny-list should install optimizer");
-        let optimized = optimizer(federated_plan(plan.clone())).expect("optimize plan");
+        let rewritten = optimizer(federated_plan(plan.clone())).expect("optimize plan");
         assert!(
-            optimized == plan,
+            rewritten == plan,
             "deny-listed function in projection must block federation"
         );
     }
@@ -288,8 +288,8 @@ mod tests {
         let mut optimizer = executor
             .logical_optimizer()
             .expect("deny-list should install optimizer");
-        let optimized = optimizer(federated).expect("optimize plan");
-        assert_federated_plan_contains(&optimized, &plan);
+        let rewritten = optimizer(federated).expect("optimize plan");
+        assert_federated_plan_contains(&rewritten, &plan);
     }
 
     #[test]

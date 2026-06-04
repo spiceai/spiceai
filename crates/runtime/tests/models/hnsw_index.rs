@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![expect(clippy::expect_used, reason = "integration-test helpers")]
 
 //! Integration tests verifying `DuckDB` HNSW vector indexes.
 //!
@@ -28,10 +29,10 @@ use arrow::array::{RecordBatch, StringArray};
 use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
+use spiceai_duckdb::AccessMode;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::Embeddings;

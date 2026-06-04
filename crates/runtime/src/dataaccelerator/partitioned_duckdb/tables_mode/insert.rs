@@ -229,7 +229,7 @@ impl InsertStrategy for DuckDBPartitionedInsertStrategy {
             schema,
             partitioner,
         )
-        .with_write_settings(self.write_settings.clone())
+        .with_write_settings(self.write_settings)
         .with_partition_buffer_config(self.partition_buffer_config.clone());
 
         let data_sink_exec = Arc::new(DataSinkExec::new(input, Arc::new(data_sink), None));

@@ -248,7 +248,7 @@ impl KeyBasedDeletionFilterExec {
         row_converter: Arc<RowConverter>,
         min_delete_seq_to_apply: Option<i64>,
     ) -> Self {
-        let properties = input.properties().clone();
+        let properties = Arc::clone(input.properties());
         Self {
             input,
             deleted_row_keys,
@@ -517,7 +517,7 @@ impl Int64PkDeletionFilterExec {
         pk_column_index: usize,
         min_delete_seq_to_apply: Option<i64>,
     ) -> Self {
-        let properties = input.properties().clone();
+        let properties = Arc::clone(input.properties());
         Self {
             input,
             deleted_pk_values,

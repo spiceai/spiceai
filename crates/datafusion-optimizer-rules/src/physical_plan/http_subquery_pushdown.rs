@@ -336,6 +336,10 @@ impl DisplayAs for HttpWithDeferredParamsExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for HttpWithDeferredParamsExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "HttpWithDeferredParamsExec"
     }

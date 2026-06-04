@@ -110,7 +110,6 @@ use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
@@ -979,7 +978,11 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(repartitioned.input());
     }
 
-    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalesceBatchesExec>() {
+    #[expect(deprecated)]
+    if let Some(coalesce) =
+        plan.as_any()
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+    {
         return flatten_transparent_nodes(coalesce.input());
     }
 

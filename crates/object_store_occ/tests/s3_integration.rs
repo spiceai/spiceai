@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store_occ::{InsertResult, ObjectState, UpdateResult, WriteResult};
 use serde::{Deserialize, Serialize};

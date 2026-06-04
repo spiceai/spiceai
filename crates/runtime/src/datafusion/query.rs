@@ -1763,9 +1763,9 @@ fn scalar_to_json_value(
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
-        ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
-        ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
-        ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
+        ScalarValue::Union(Some((_, value)), _, _)
+        | ScalarValue::Dictionary(_, value)
+        | ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
         ScalarValue::Null
         | ScalarValue::Float16(None)
         | ScalarValue::Float32(None)

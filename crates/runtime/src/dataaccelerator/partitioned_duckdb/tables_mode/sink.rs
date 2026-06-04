@@ -173,7 +173,7 @@ impl DataSink for DuckDBPartitionedDataSink {
         let on_conflict = self.on_conflict.clone();
         let indexes = self.indexes.clone();
         let constraints = self.constraints.clone();
-        let write_settings = self.write_settings.clone();
+        let write_settings = self.write_settings;
 
         let (batch_tx, batch_rx): (
             Sender<(String, PartitionData)>,
@@ -574,6 +574,7 @@ fn execute_analyze_sql(tx: &Transaction<'_>, table_name: &str) {
 }
 
 impl DuckDBPartitionedDataSink {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
@@ -628,6 +629,7 @@ impl DisplayAs for DuckDBPartitionedDataSink {
     }
 }
 
+#[expect(clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref)]
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
@@ -697,7 +699,7 @@ fn insert_overwrite(
         }
 
         // partition still exists so should NOT be deleted
-        candidates_to_drop.remove(&new_table.definition_name().to_string());
+        candidates_to_drop.remove(new_table.definition_name());
     }
 
     // Drop obsolete partition tables that no longer exist after the latest full refresh.
@@ -735,6 +737,7 @@ fn insert_overwrite(
     Ok(num_rows)
 }
 
+#[expect(clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref)]
 fn insert_append(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
@@ -829,6 +832,7 @@ fn insert_append(
     Ok(num_rows)
 }
 
+#[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn write_to_tables(
     table_definition: &Arc<TableDefinition>,
     tx: &Transaction<'_>,
@@ -924,6 +928,7 @@ fn write_to_tables(
     Ok((total_rows, created_partitions.into_values().collect()))
 }
 
+#[expect(clippy::needless_pass_by_value)]
 fn write_data_chunk_to_table(
     table: &PartitionTableManager,
     tx: &Transaction<'_>,
@@ -954,7 +959,8 @@ fn write_data_chunk_to_table(
     );
     if let Some(on_conflict) = on_conflict {
         let on_conflict_sql = on_conflict.build_on_conflict_statement(&schema);
-        insert_sql.push_str(&format!(" {on_conflict_sql}"));
+        insert_sql.push(' ');
+        insert_sql.push_str(&on_conflict_sql);
     }
     let rows = tx
         .execute(&insert_sql, [])
@@ -1009,6 +1015,7 @@ fn write_parquet_file_to_table(
 }
 
 /// Gets all existing partition tables for a given base table definition.
+#[expect(clippy::needless_pass_by_value)]
 fn get_existing_partition_tables(
     tx: &Transaction<'_>,
     base_table_definition: &Arc<TableDefinition>,
@@ -1561,10 +1568,11 @@ mod test {
         let batch = make_partition_batch(&schema, "us-east-1", &[1, 2]);
 
         batch_tx
-            .blocking_send((
+            .send((
                 "region=us-east-1".to_string(),
                 PartitionData::Batches(vec![batch]),
             ))
+            .await
             .expect("to send partition batch");
         drop(batch_tx);
 
@@ -1612,10 +1620,11 @@ mod test {
         let batch = make_partition_batch(&schema, "us-west-1", &[10, 11, 12]);
 
         batch_tx
-            .blocking_send((
+            .send((
                 "region=us-west-1".to_string(),
                 PartitionData::Batches(vec![batch]),
             ))
+            .await
             .expect("to send partition batch");
         drop(batch_tx);
 

@@ -490,7 +490,7 @@ impl DataAccelerator for SqliteAccelerator {
         false
     }
 
-    /// SQLite snapshot reload is disabled until the upstream factory exposes
+    /// `SQLite` snapshot reload is disabled until the upstream factory exposes
     /// safe connection-pool invalidation again.
     async fn reload_from_snapshot(
         &self,

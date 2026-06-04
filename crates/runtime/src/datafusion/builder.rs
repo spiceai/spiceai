@@ -1088,6 +1088,7 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
         .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
+#[derive(Default)]
 pub struct AnalyzerRulesBuilder {
     extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
 }
@@ -1124,14 +1125,6 @@ impl AnalyzerRulesBuilder {
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
         ]);
         rules.into_iter().chain(self.extra_rules).collect()
-    }
-}
-
-impl Default for AnalyzerRulesBuilder {
-    fn default() -> Self {
-        Self {
-            extra_rules: vec![],
-        }
     }
 }
 

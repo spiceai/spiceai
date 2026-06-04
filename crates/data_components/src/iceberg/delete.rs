@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Iceberg delete support.
 //!
-//! `DELETE FROM` currently fails with a structured DataFusion error because
+//! `DELETE FROM` currently fails with a structured `DataFusion` error because
 //! Iceberg 0.9.0 no longer exposes the `RowDeltaAction` API needed to commit
 //! equality delete files safely.
 

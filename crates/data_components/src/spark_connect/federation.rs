@@ -112,11 +112,7 @@ impl SQLExecutor for SparkConnectTableProvider {
         let schema = dataframe
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)
-            .and_then(|batch| {
-                crate::source_arrow_compat::record_batch_to_arrow(&batch)
-                    .map_err(DataFusionError::from)
-            })?
+            .map_err(map_error_to_datafusion_err)?
             .schema();
         drop(rate_controller_permit);
         Ok(schema)
@@ -141,11 +137,7 @@ fn spark_query_to_stream(
             .map_err(map_error_to_datafusion_err)?
             .collect()
             .await
-            .map_err(map_error_to_datafusion_err)
-            .and_then(|batch| {
-                crate::source_arrow_compat::record_batch_to_arrow(&batch)
-                    .map_err(DataFusionError::from)
-            })?;
+            .map_err(map_error_to_datafusion_err)?;
         drop(rate_controller_permit);
         yield (Ok(data))
     }

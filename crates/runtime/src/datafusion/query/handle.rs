@@ -484,7 +484,7 @@ impl QueryHandle {
             .get(&job_id)
             .cloned();
         let scheduler_for_cancel = Arc::clone(&scheduler);
-        let cancel_job_id = job_id.clone();
+        let cancel_job_id = job_id;
         handle.spawn(
             async move {
                 let mut final_error = error;

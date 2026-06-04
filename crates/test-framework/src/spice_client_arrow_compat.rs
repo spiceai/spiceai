@@ -14,54 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::io::Cursor;
+//! The Spice Rust SDK (`spiceai`) is now built against the same Arrow version as the
+//! workspace, so its `RecordBatch` is identical to ours. These helpers used to re-encode
+//! batches over Arrow IPC to bridge an Arrow version gap between the SDK and the workspace;
+//! that gap no longer exists, so the conversions are now thin pass-throughs kept only to
+//! keep existing call sites stable.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-
-type SpiceRecordBatch = spice_client_arrow::record_batch::RecordBatch;
-
-pub fn to_spice_record_batch(batch: &RecordBatch) -> Result<SpiceRecordBatch> {
-    let mut data = Vec::new();
-    {
-        let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut data, batch.schema().as_ref())?;
-        writer.write(batch)?;
-        writer.finish()?;
-    }
-
-    let mut reader =
-        spice_client_arrow::ipc::reader::StreamReader::try_new(Cursor::new(data), None)?;
-    reader
-        .next()
-        .transpose()?
-        .ok_or_else(|| anyhow!("Arrow IPC conversion produced no record batch"))
-}
-
-pub fn from_spice_record_batch(batch: &SpiceRecordBatch) -> Result<RecordBatch> {
-    let mut data = Vec::new();
-    {
-        let mut writer = spice_client_arrow::ipc::writer::StreamWriter::try_new(
-            &mut data,
-            batch.schema().as_ref(),
-        )?;
-        writer.write(batch)?;
-        writer.finish()?;
-    }
-
-    let mut reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(data), None)?;
-    reader
-        .next()
-        .transpose()?
-        .ok_or_else(|| anyhow!("Arrow IPC conversion produced no record batch"))
-}
-
-pub fn optional_params_to_spice(params: Option<RecordBatch>) -> Result<Option<SpiceRecordBatch>> {
-    params
-        .map(|batch| to_spice_record_batch(&batch))
-        .transpose()
-}
 
 pub async fn query_to_batches(
     spice_client: &spiceai::Client,
@@ -71,7 +32,7 @@ pub async fn query_to_batches(
     let mut batches = Vec::new();
 
     while let Some(batch) = stream.next().await {
-        batches.push(from_spice_record_batch(&batch?)?);
+        batches.push(batch?);
     }
 
     Ok(batches)
@@ -82,12 +43,11 @@ pub async fn query_with_params_to_batches(
     sql: &str,
     params: Option<RecordBatch>,
 ) -> Result<Vec<RecordBatch>> {
-    let params = optional_params_to_spice(params)?;
     let mut stream = spice_client.sql_with_params(sql, params).await?;
     let mut batches = Vec::new();
 
     while let Some(batch) = stream.next().await {
-        batches.push(from_spice_record_batch(&batch?)?);
+        batches.push(batch?);
     }
 
     Ok(batches)

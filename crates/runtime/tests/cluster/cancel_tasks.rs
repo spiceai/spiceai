@@ -50,7 +50,7 @@ async fn wait_for_executor_count(
     let start = Instant::now();
     loop {
         let count = executor_manager
-            .get_executor_state()
+            .get_executors_state()
             .await
             .map_err(|err| anyhow::Error::msg(err.to_string()))?
             .len();
@@ -328,7 +328,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
 
             wait_for_active_tasks_eq(executor.as_ref(), 0, Duration::from_secs(20)).await?;
 
-            let completion = timeout(Duration::from_secs(20), query_handle.wait_for_completion())
+            let completion = timeout(Duration::from_secs(20), query_handle.into_stream())
                 .await
                 .map_err(|_| anyhow::Error::msg("Timed out waiting for query cancellation"))?;
             assert!(

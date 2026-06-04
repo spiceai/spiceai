@@ -55,6 +55,9 @@ use datafusion::{
 };
 
 pub trait ColumnBounds: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns an error if the bounds cannot be lowered into a physical expression.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
@@ -66,10 +69,19 @@ pub trait CollectLeftAccumulator: Sized + Send + Sync {
 
     fn static_name() -> &'static str;
 
+    /// # Errors
+    ///
+    /// Returns an error if the accumulator cannot be initialized for `expr` and `schema`.
     fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> DataFusionResult<Self>;
 
+    /// # Errors
+    ///
+    /// Returns an error if `batch` cannot be accumulated.
     fn update_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()>;
 
+    /// # Errors
+    ///
+    /// Returns an error if the accumulated bounds cannot be finalized.
     fn evaluate(self) -> DataFusionResult<Arc<dyn ColumnBounds>>;
 }
 

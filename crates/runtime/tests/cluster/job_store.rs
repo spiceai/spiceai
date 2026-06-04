@@ -19,6 +19,7 @@ use app::AppBuilder;
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStoreExt;
 use object_store::{ObjectStore, path::Path};
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;

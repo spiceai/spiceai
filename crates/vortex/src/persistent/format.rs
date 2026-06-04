@@ -808,13 +808,13 @@ fn scalar_stat_to_df(
     stats_dtype: &DType,
     target_dtype: &DType,
 ) -> stats::Precision<datafusion_common::ScalarValue> {
-    let Some(stat_dtype) = stat.dtype(stats_dtype) else {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
         return stats::Precision::Absent;
     };
 
     value
         .map(|stat_value| {
-            Scalar::try_new(stat_dtype, Some(stat_value))?
+            Scalar::try_new(scalar_dtype, Some(stat_value))?
                 .cast(target_dtype)?
                 .try_to_df()
         })

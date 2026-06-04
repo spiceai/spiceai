@@ -85,7 +85,7 @@ impl MetadataColumn {
     pub fn value_to_array(&self, meta: &ObjectMeta) -> ArrayRef {
         match self {
             MetadataColumn::Location(prefix) => {
-                let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or_default();
+                let prefix = prefix.as_deref().unwrap_or_default();
                 Arc::new(StringArray::from(vec![format!(
                     "{prefix}{}",
                     meta.location

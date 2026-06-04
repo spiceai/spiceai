@@ -91,7 +91,6 @@ use futures::TryStreamExt;
 use std::{sync::Arc, time::Duration};
 
 use crate::queries::Query;
-use crate::spice_client_arrow_compat::{from_spice_record_batch, optional_params_to_spice};
 
 /// Result of executing a single query
 #[derive(Debug)]
@@ -167,17 +166,13 @@ impl QueryExecutor for FlightExecutor {
 
         let mut result_stream = self
             .client
-            .sql_with_params(
-                &query.sql,
-                optional_params_to_spice(query.get_parameters_batch().transpose()?)?,
-            )
+            .sql_with_params(&query.sql, query.get_parameters_batch().transpose()?)
             .await?;
 
         let mut batches = Vec::new();
         let mut row_count = 0;
 
         while let Some(batch) = result_stream.try_next().await? {
-            let batch = from_spice_record_batch(&batch)?;
             let batch_rows = batch.num_rows();
             row_count += batch_rows;
             batches.push(batch);

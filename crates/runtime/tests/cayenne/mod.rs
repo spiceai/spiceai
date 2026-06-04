@@ -34,6 +34,7 @@ use data_components::RefreshableCatalogProvider;
 use datafusion::assert_batches_eq;
 use datafusion::sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStoreExt;
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
 use rand::RngExt as _;
 use runtime::auth::EndpointAuth;

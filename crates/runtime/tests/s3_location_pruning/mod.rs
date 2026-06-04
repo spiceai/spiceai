@@ -21,7 +21,7 @@ const RUSTFS_SECRET_KEY: &str = "spiceintegrationsecret";
 
 use app::AppBuilder;
 use futures::StreamExt;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 

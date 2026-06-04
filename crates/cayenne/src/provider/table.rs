@@ -1252,7 +1252,7 @@ struct UpsertOptions {
 }
 
 impl UpsertOptions {
-    fn is_default(&self) -> bool {
+    fn is_default(self) -> bool {
         !self.remove_duplicates && !self.last_write_wins
     }
 }
@@ -2905,7 +2905,7 @@ impl CayenneTableProvider {
             })?;
 
         for common_prefix in list_result.common_prefixes {
-            if let Some(snapshot_id) = common_prefix.parts().last() {
+            if let Some(snapshot_id) = common_prefix.parts().next_back() {
                 let snapshot_id_str = snapshot_id.as_ref();
                 // Skip current snapshot, protected snapshots, and the staging directory
                 if snapshot_id_str == current_snapshot

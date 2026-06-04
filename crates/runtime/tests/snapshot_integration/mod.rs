@@ -39,7 +39,7 @@ use datafusion::sql::TableReference;
 use duckdb::Connection;
 use futures::{StreamExt, future::try_join_all};
 use object_store::{
-    ClientOptions, ObjectMeta, ObjectStore,
+    ClientOptions, ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::AmazonS3Builder,
     path::{Path as ObjectPath, PathPart},
 };
@@ -101,7 +101,7 @@ impl SnapshotS3Context {
     }
 
     async fn metadata_json(&self) -> Result<Value> {
-        let metadata_path = self.base_path.child(PathPart::from("metadata.json"));
+        let metadata_path = self.base_path.clone().join(PathPart::from("metadata.json"));
         let data = self
             .store
             .get(&metadata_path)
@@ -176,7 +176,7 @@ impl SnapshotS3Context {
     }
 
     async fn write_metadata(&self, metadata: &Value) -> Result<()> {
-        let metadata_path = self.base_path.child(PathPart::from("metadata.json"));
+        let metadata_path = self.base_path.clone().join(PathPart::from("metadata.json"));
         let bytes =
             serde_json::to_vec_pretty(metadata).context("Serializing snapshot metadata to JSON")?;
         self.store

@@ -21,9 +21,9 @@ limitations under the License.
 //! terminal state (success, failure, or cancellation). Walks the in-process
 //! `ExecutionGraph` and produces child rows via the existing `OTel` pipeline
 //! - child spans created inside `parent_span.in_scope(...)` inherit the
-//! parent's `OTel` context, so the exporter at
-//! `crate::task_history::otel_exporter` writes them with the correct
-//! `parent_span_id`.
+//!   parent's `OTel` context, so the exporter at
+//!   `crate::task_history::otel_exporter` writes them with the correct
+//!   `parent_span_id`.
 //!
 //! Tracing spans use wall-clock time, so without intervention the span
 //! window would just be the brief moment in which this module emitted

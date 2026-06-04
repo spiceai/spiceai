@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![expect(clippy::expect_used, reason = "integration-test helper")]
 #![allow(clippy::expect_used)]
 
 use std::{
@@ -47,7 +47,7 @@ use datafusion::{
 };
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
-use datafusion_federation::{FederatedTableProviderAdaptor, sql::MultiPartTableReference};
+use datafusion_federation::{FederatedTableProviderAdaptor, sql::RemoteTableRef};
 use futures::{Stream, TryStreamExt};
 
 use runtime::{
@@ -180,7 +180,8 @@ impl DataConnector for SlowFederatedDataConnector {
         let federation_provider = Arc::new(SQLFederationProvider::new(executor));
 
         // Create table source
-        let table_reference = MultiPartTableReference::TableReference(dataset.name.clone());
+        let table_reference = RemoteTableRef::parse_with_default_dialect(&dataset.name.to_string())
+            .expect("dataset name should be a valid table reference");
 
         let source = SQLTableSource::new_with_schema(
             federation_provider,

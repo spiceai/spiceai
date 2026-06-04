@@ -52,7 +52,7 @@ use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch, UInt64Array};
 use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use runtime::Runtime;
 use secrecy::SecretString;
 use spicepod::{component::dataset::Dataset, param::Params};

@@ -295,8 +295,8 @@ fn snowflake_batches_to_arrow(
     batches: Vec<snowflake_api::RecordBatch>,
 ) -> Result<Vec<RecordBatch>, Error> {
     batches
-        .iter()
-        .map(snowflake_record_batch_to_arrow)
+        .into_iter()
+        .map(|batch| snowflake_record_batch_to_arrow(&batch))
         .collect()
 }
 

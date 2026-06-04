@@ -186,7 +186,7 @@ impl ClusterHarness {
             sleep(Duration::from_millis(200)).await;
             let count = self
                 .executor_manager
-                .get_executor_state()
+                .get_executors_state()
                 .await
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?
                 .len();

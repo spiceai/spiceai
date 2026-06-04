@@ -47,7 +47,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::scan::state::{DvInfo, Stats};
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -202,9 +202,12 @@ impl DeltaTable {
         let parquet_object_store: Arc<dyn object_store::ObjectStore> =
             Arc::from(parquet_object_store);
 
-        let engine = Arc::new(DefaultEngine::new(
-            store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
-        ));
+        let engine = Arc::new(
+            DefaultEngine::builder(
+                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
+            )
+            .build(),
+        );
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())
@@ -852,17 +855,17 @@ struct PartitionFileContext {
     _transform: Option<ExpressionRef>,
 }
 
-#[expect(clippy::needless_pass_by_value)]
 #[expect(clippy::cast_sign_loss)]
-fn handle_scan_file(
-    scan_context: &mut ScanContext,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
+fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
+    let ScanFile {
+        path,
+        size,
+        dv_info,
+        transform,
+        partition_values,
+        ..
+    } = scan_file;
+
     let root_url = &scan_context.table_root;
 
     let path = if root_url.path().ends_with('/') {
