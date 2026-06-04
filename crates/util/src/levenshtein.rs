@@ -113,7 +113,11 @@ pub fn closest_match<S: AsRef<str>>(typo: &str, candidates: &[S]) -> Option<Stri
     }
     let (i, d) = best?;
     let candidate = candidates[i].as_ref();
-    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    // Count chars, not bytes: `distance()` is computed over `.chars()`, so the
+    // "one edit per 3 chars" bound must use char counts too — otherwise a
+    // multi-byte (non-ASCII) candidate gets a looser byte-derived threshold
+    // that disagrees with the char-based distance.
+    let max_allowed = (candidate.chars().count().max(typo.chars().count()) / 3).max(1);
     if d <= max_allowed {
         Some(candidate.to_string())
     } else {

@@ -322,20 +322,20 @@ impl RuntimeBuilder {
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
         log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
         let cayenne_filter_propagation_enabled =
-            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+            cayenne_filter_propagation.is_some_and(CayenneFilterPropagation::is_enabled);
+        // Only log "applied" for a value the user validly set; an unset or
+        // invalid value yields `None` (and an invalid value already warned).
         log_applied_cayenne_param(
             CAYENNE_FILTER_PROPAGATION_PARAM,
-            spicepod_rt
-                .params
-                .get(CAYENNE_FILTER_PROPAGATION_PARAM)
-                .map(|_| {
-                    if cayenne_filter_propagation_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                }),
+            cayenne_filter_propagation.map(|propagation| {
+                if propagation.is_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            }),
         );
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
@@ -892,19 +892,24 @@ impl CayenneFilterPropagation {
     }
 }
 
-fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
-    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
-        return CayenneFilterPropagation::Disabled;
-    };
+/// Parse the Cayenne filter-propagation tunable. Returns `None` when the key is
+/// unset or holds an invalid value (in which case the effective behavior is
+/// `Disabled` and an invalid value warns) — mirroring [`parse_usize_runtime_param`]
+/// /[`parse_f64_runtime_param`], so callers only log "applied" for a value the
+/// user validly set.
+fn parse_cayenne_filter_propagation(
+    params: &HashMap<String, String>,
+) -> Option<CayenneFilterPropagation> {
+    let raw = params.get(CAYENNE_FILTER_PROPAGATION_PARAM)?;
 
     match raw.trim().to_ascii_lowercase().as_str() {
-        "enabled" => CayenneFilterPropagation::Enabled,
-        "disabled" => CayenneFilterPropagation::Disabled,
+        "enabled" => Some(CayenneFilterPropagation::Enabled),
+        "disabled" => Some(CayenneFilterPropagation::Disabled),
         _ => {
             tracing::warn!(
                 "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
             );
-            CayenneFilterPropagation::Disabled
+            None
         }
     }
 }
@@ -1080,22 +1085,19 @@ mod test {
 
     #[test]
     fn known_runtime_params_covers_every_family() {
-        // The section vocabulary must include a representative key from each
-        // family that feeds it, so the unknown-param check doesn't false-warn
-        // on valid keys owned by other subsystems.
+        // The section vocabulary must include *every* key from *every* family
+        // that feeds it — not just a representative key — so a future addition
+        // to any family list (e.g. a new `cayenne_*` tunable) can't silently
+        // fall out of the merged vocabulary and false-warn on a valid key.
         let known = known_runtime_params();
-        for key in [
-            CAYENNE_FOOTER_CACHE_MB_PARAM,
-            "cdc_prefetch_buffer",
-            "http_max_concurrent_requests",
-            "shuffle_location",
-            "geo",
-            "url_tables",
-            "parquet_page_index",
-            "dedicated_thread_pool",
-        ] {
+        let family_keys = KNOWN_CAYENNE_RUNTIME_PARAMS
+            .iter()
+            .chain(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS)
+            .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(MISC_RUNTIME_PARAMS);
+        for key in family_keys {
             assert!(
-                known.contains(&key),
+                known.contains(key),
                 "known_runtime_params() missing `{key}`; a valid runtime param would false-warn"
             );
         }
@@ -1150,26 +1152,26 @@ mod test {
 
         assert_eq!(
             parse_cayenne_filter_propagation(&params),
-            CayenneFilterPropagation::Enabled
+            Some(CayenneFilterPropagation::Enabled)
         );
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "disabled".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            Some(CayenneFilterPropagation::Disabled)
         );
+        // An invalid value warns and yields `None` (effective behavior is
+        // disabled, but nothing was validly applied so callers won't log it).
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "true".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            None
         );
-        assert_eq!(
-            parse_cayenne_filter_propagation(&HashMap::new()),
-            CayenneFilterPropagation::Disabled
-        );
+        // An unset key also yields `None`.
+        assert_eq!(parse_cayenne_filter_propagation(&HashMap::new()), None);
     }
 
     #[test]
