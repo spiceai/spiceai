@@ -104,6 +104,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("scale_factor", scale_factor.to_string()),
             KeyValue::new("terminals", terminals.to_string()),
             KeyValue::new("duration_secs", duration.as_secs().to_string()),
+            KeyValue::new("concurrency", test_args.common.concurrency.to_string()),
         ])
         .build();
 
@@ -140,7 +141,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         test_args,
         &app,
         NotStarted::new()
-            .with_parallel_count(1)
+            .with_parallel_count(test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 test_args.common.duration,
             )))

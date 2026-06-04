@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: '600'
+      concurrency:
+        description: 'Number of concurrent analytical query clients'
+        required: false
+        type: string
+        default: '4'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -112,6 +117,7 @@ jobs:
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
             --duration ${{ github.event.inputs.duration }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --metrics

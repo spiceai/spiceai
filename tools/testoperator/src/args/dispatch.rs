@@ -438,6 +438,9 @@ pub struct HtapDispatchArgs {
     /// Override the number of OLTP terminals (default: `scale_factor` * 10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminals: Option<usize>,
+    /// Override default number of concurrent analytical query clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
 }
 
 fn default_queryset() -> String {
