@@ -444,6 +444,9 @@ pub struct HtapDispatchArgs {
     /// Engine-specific query overrides
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_overrides: Option<QueryOverridesArg>,
+    /// Optional target OLTP transaction rate for the OLTP workload (txn/s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
 }
 
 fn default_queryset() -> String {

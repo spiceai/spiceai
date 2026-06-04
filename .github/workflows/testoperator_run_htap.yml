@@ -21,6 +21,10 @@ on:
         description: 'Override OLTP terminal count (default: scale_factor * 10)'
         required: false
         type: string
+      rate:
+        description: 'Target OLTP transaction rate (txns/sec); empty = unlimited'
+        required: false
+        type: string
       duration:
         description: 'Duration of the HTAP workload in seconds'
         required: false
@@ -124,6 +128,7 @@ jobs:
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
+            ${{ github.event.inputs.rate && format('--rate {0}', github.event.inputs.rate) || '' }} \
             --duration ${{ github.event.inputs.duration }} \
             --concurrency ${{ github.event.inputs.concurrency }} \
             ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
