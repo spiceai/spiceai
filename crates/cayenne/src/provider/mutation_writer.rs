@@ -739,9 +739,17 @@ impl<'a> AppendMutationWriter<'a> {
         } = take_post_validation(post_validation);
 
         let superseded = on_conflict_deletions.total_superseded();
-        let deletion_start = Instant::now();
+        // Acquiring the visibility lock + listing fence serializes this table's
+        // commits; under concurrent upserts `publish_lock_wait` is the contention
+        // signal (commits queueing). Split it out so it is not hidden inside the
+        // deletion-apply phase below — apply_on_conflict_deletions now measures
+        // only the merge/delete work, not the wait for these locks.
+        let lock_start = Instant::now();
         let _visibility = self.table.visibility_lock_arc().lock_owned().await;
         let _fence = self.table.lock_listing_fence_write_owned().await;
+        record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
+
+        let deletion_start = Instant::now();
         let update = self
             .table
             .apply_on_conflict_deletions(on_conflict_deletions)
@@ -752,7 +760,11 @@ impl<'a> AppendMutationWriter<'a> {
             deletion_start,
         );
 
+        // `publish` is the metastore finalization total; the sub-phases attribute
+        // it — `publish_seq` is sequence allocation + the durable sequence record,
+        // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.
         let publish_start = Instant::now();
+        let seq_start = Instant::now();
         let new_sequence = self
             .table
             .catalog()
@@ -763,11 +775,14 @@ impl<'a> AppendMutationWriter<'a> {
         self.table
             .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
             .await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish_seq", seq_start);
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
+        let cas_start = Instant::now();
         self.table
             .commit_on_conflict_publish(update, Some((&new_snapshot_id, new_sequence)))
             .await;
+        record_cayenne_write_phase(self.table.table_name(), "publish_cas", cas_start);
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok((rows, stats_acc, validated_keys, superseded))
