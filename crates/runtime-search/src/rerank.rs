@@ -1559,7 +1559,15 @@ mod tests {
         Arc<RwLock<llms::rerank::RerankerModelStore>>,
         Arc<RwLock<ChatModelStore>>,
     ) {
-        let ctx = Arc::new(SessionContext::new());
+        // Use PostgreSQL dialect so that `name => value` named args in UDTF
+        // calls are parsed as `FunctionArg::ExprNamed`, which is the variant
+        // handled by the Spice DataFusion fork's UDTF relation planner. The
+        // default GenericDialect produces `FunctionArg::Named` instead, which
+        // hits the unhandled fallback and returns a plan error.
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config.options_mut().sql_parser.dialect =
+            datafusion::common::config::Dialect::PostgreSQL;
+        let ctx = Arc::new(SessionContext::new_with_config(config));
         ctx.state().config_mut().set_extension(Arc::new(
             RequestContext::builder(Protocol::Internal).build(),
         ));
