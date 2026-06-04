@@ -10270,6 +10270,18 @@ impl CayenneTableProvider {
         &self,
         scan: ProtectedSnapshotScan<'_>,
     ) -> datafusion_common::Result<Vec<Arc<dyn ExecutionPlan>>> {
+        // Warn only on genuine amplification (compaction losing ground), not the
+        // normal steady-state equilibrium. Under sustained CDC the protected-
+        // snapshot count naturally sits at/above the compaction TRIGGER — fresh
+        // deltas arrive during each merge pass — so a threshold equal to the
+        // trigger fired on nearly every scan (pure noise). Derive the threshold
+        // purely from the CONFIGURED trigger (no hardcoded absolute, so it
+        // respects a custom `compaction_trigger_protected_snapshots`): warn once
+        // the count reaches a multiple of the trigger, i.e. compaction has fallen
+        // well behind. The per-scan DEBUG below already covers the informational
+        // "scan includes protected snapshots" case.
+        const PROTECTED_SNAPSHOT_WARN_TRIGGER_MULTIPLE: usize = 8;
+
         // `protected_snapshots` is captured by the caller together with the deletion snapshot
         if scan.protected_snapshots.is_empty() {
             return Ok(Vec::new());
@@ -10286,7 +10298,8 @@ impl CayenneTableProvider {
             "Cayenne scan includes protected snapshots"
         );
         let protected_snapshot_trigger = self.context.compaction_trigger_protected_snapshots();
-        let protected_snapshot_warn_threshold = protected_snapshot_trigger.max(1);
+        let protected_snapshot_warn_threshold =
+            protected_snapshot_trigger.saturating_mul(PROTECTED_SNAPSHOT_WARN_TRIGGER_MULTIPLE);
         if scan.protected_snapshots.len() >= protected_snapshot_warn_threshold {
             tracing::warn!(
                 table = %self.table_metadata.table_name,
