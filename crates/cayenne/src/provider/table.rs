@@ -7953,7 +7953,7 @@ impl CayenneTableProvider {
         // by sequence number and still apply to the merged snapshot.
         let serialize_position_deletes = self.should_capture_positions();
         let _position_write_guard = if serialize_position_deletes {
-            if let Ok(guard) = self.write_lock.try_lock() {
+            if let Ok(guard) = self.write_lock_arc().try_lock_owned() {
                 Some(guard)
             } else {
                 tracing::trace!(

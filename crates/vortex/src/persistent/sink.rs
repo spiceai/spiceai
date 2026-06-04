@@ -51,7 +51,7 @@ use vortex_utils::aliases::hash_set::HashSet;
 /// stream is always a single (coalesced) partition — `DataSinkExec` requires
 /// `SinglePartition` — so the fan-out is performed here, in the sink.
 #[derive(Debug, Clone)]
-pub enum ShardSpec {
+pub(super) enum ShardSpec {
     /// One writer; byte-for-byte identical to the pre-sharding behavior.
     Single,
     /// `n` writers, batches distributed round-robin (parallel encode, no clustering).
@@ -66,7 +66,7 @@ pub enum ShardSpec {
 impl ShardSpec {
     /// Number of output shards (concurrent writers) this spec requests.
     #[must_use]
-    pub fn partitions(&self) -> usize {
+    fn partitions(&self) -> usize {
         match self {
             ShardSpec::Single => 1,
             ShardSpec::RoundRobin(n) => *n,
@@ -166,7 +166,7 @@ pub struct VortexSink {
 }
 
 impl VortexSink {
-    pub fn new(
+    pub(super) fn new(
         config: FileSinkConfig,
         schema: SchemaRef,
         session: VortexSession,
