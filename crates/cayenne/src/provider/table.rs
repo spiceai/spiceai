@@ -6535,12 +6535,16 @@ impl CayenneTableProvider {
                 ))
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
-                // This branch should never be reached - position-based tables don't have PKs
-                // and don't support upserts.
-                unreachable!(
-                    "apply_on_conflict_deletions called for position-based strategy on table {}",
-                    self.table_metadata.table_name
-                );
+                // Position-based tables have no PKs and don't support upserts, so
+                // this branch should never be reached. Fail safely with a
+                // structured error instead of panicking if a higher-level routing
+                // bug ever calls it.
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "apply_on_conflict_deletions called for position-based strategy on table {}",
+                        self.table_metadata.table_name
+                    ),
+                });
             }
         };
 
@@ -9954,6 +9958,7 @@ impl CayenneTableProvider {
     /// Protected snapshots skip deletions that existed when they were created
     /// (deletions with seq <= `max_delete_seq_at_creation`), but newer deletions
     /// (seq > `max_delete_seq_at_creation`) are still applied.
+    #[expect(clippy::too_many_arguments)]
     async fn scan_protected_snapshots(
         &self,
         state: &dyn Session,
