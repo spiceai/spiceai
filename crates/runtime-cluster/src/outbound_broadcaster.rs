@@ -141,30 +141,47 @@ impl ExecutorOutboundBroadcaster {
         }
 
         let executor_id = self.inner.executor_id.read().await.clone();
+        let total = cached.len();
         let mut replayed = 0usize;
         for (table_name, partition_expr_bytes) in cached {
             let payload =
                 partitions_loaded_message(executor_id.clone(), table_name, partition_expr_bytes);
+            // Fail fast on a closed channel or a timed-out send: both mean
+            // this connection is gone or wedged, so the remaining sends are
+            // guaranteed to fail too — without the break, a large cache would
+            // keep the replay task spinning for `tables * SEND_TIMEOUT`. The
+            // cache is retained; the next (re)connect replays everything.
             match tokio::time::timeout(SEND_TIMEOUT, tx.send(payload)).await {
                 Ok(Ok(())) => replayed += 1,
                 Ok(Err(err)) => {
                     tracing::debug!(
-                        "PartitionsLoaded replay to {scheduler_address} failed (channel closed): {err}"
+                        "PartitionsLoaded replay to {scheduler_address} aborted (channel closed): {err}"
                     );
+                    break;
                 }
                 Err(_) => {
                     tracing::warn!(
                         scheduler = %scheduler_address,
-                        "Timed out replaying PartitionsLoaded; scheduler may miss this ack until next refresh"
+                        "Timed out replaying PartitionsLoaded; aborting replay, will retry on next reconnect"
                     );
+                    break;
                 }
             }
         }
-        tracing::info!(
-            scheduler = %scheduler_address,
-            count = replayed,
-            "Replayed cached PartitionsLoaded acks to connected scheduler"
-        );
+        if replayed == total {
+            tracing::info!(
+                scheduler = %scheduler_address,
+                count = replayed,
+                "Replayed cached PartitionsLoaded acks to connected scheduler"
+            );
+        } else {
+            tracing::warn!(
+                scheduler = %scheduler_address,
+                replayed,
+                total,
+                "Replayed only part of the cached PartitionsLoaded acks; will retry on next reconnect"
+            );
+        }
         replayed
     }
 
@@ -398,7 +415,8 @@ mod tests {
                 .await,
             0
         );
-        assert!(rx1.try_recv().is_err());
+        rx1.try_recv()
+            .expect_err("nothing should be emitted when the cache is empty");
 
         let sent = broadcaster
             .broadcast_partitions_loaded("spice.public.lineitem".to_string(), vec![vec![7]])
@@ -429,12 +447,16 @@ mod tests {
     }
 
     /// Replaying onto a torn-down stream (receiver dropped) fails fast and
-    /// reports zero queued acks — the next reconnect replays.
+    /// reports zero queued acks — even with multiple cached tables, the
+    /// replay aborts on the first failed send. The next reconnect replays.
     #[tokio::test]
     async fn replay_on_closed_channel_queues_nothing() {
         let broadcaster = ExecutorOutboundBroadcaster::new("exec-1".to_string());
         broadcaster
             .broadcast_partitions_loaded("spice.public.region".to_string(), vec![vec![1]])
+            .await;
+        broadcaster
+            .broadcast_partitions_loaded("spice.public.orders".to_string(), vec![vec![2]])
             .await;
         let (tx, rx) = mpsc::channel(8);
         drop(rx);
