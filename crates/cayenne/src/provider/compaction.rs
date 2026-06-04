@@ -425,7 +425,7 @@ impl BackgroundCompactor {
 /// current Vortex write before force-aborting. Bounded so shutdown can never hang.
 const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
-fn drain_and_abort_compactor(handle: JoinHandle<()>) {
+fn drain_and_abort_compactor(handle: &JoinHandle<()>) {
     // Let an in-flight compaction finish its current write before the
     // surrounding runtime tears down. vortex-io panics ("Runtime dropped task
     // without completing it") if a task's runtime is dropped while the task is
@@ -452,7 +452,7 @@ fn spawn_compactor_drain_thread(handle: JoinHandle<()>) {
             let Some(handle) = handle_for_thread.lock().take() else {
                 return;
             };
-            drain_and_abort_compactor(handle);
+            drain_and_abort_compactor(&handle);
         }) {
         Ok(join_handle) => drop(join_handle),
         Err(error) => {
