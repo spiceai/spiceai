@@ -36,4 +36,8 @@ pub struct HtapArgs {
     /// Override the number of concurrent OLTP terminals (default: `scale_factor` * 10).
     #[arg(long)]
     pub(crate) terminals: Option<usize>,
+
+    /// Target OLTP transaction rate for the OLTP workload. Omit for unlimited (maximum-throughput).
+    #[arg(long)]
+    pub(crate) rate: Option<u32>,
 }
