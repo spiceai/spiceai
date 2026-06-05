@@ -5672,6 +5672,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.23.1",
+ "wiremock",
  "zip 8.5.1",
  "zstd",
 ]
