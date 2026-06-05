@@ -11,7 +11,7 @@ compute:
       executor_replicas: ${SPIDAPTER_EXECUTOR_REPLICAS:-4}
       executor_memory: ${SPIDAPTER_EXECUTOR_MEMORY_LIMIT:-62Gi}
       executor_storage_size_gb: ${SPIDAPTER_EXECUTOR_STORAGE_SIZE_GB:-~}
-      ephemeral_storage_gb: ${SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB:-256Gi}
+      ephemeral_storage_gb: ${SPIDAPTER_EPHEMERAL_STORAGE_LIMIT_GB:-}
 acceleration: ${SPICE_ACCELERATION:-cayenne}
 source:
   direct:
