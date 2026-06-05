@@ -67,7 +67,7 @@ mod rrf_vector_search_tests {
         LazyLock::new(|| Arc::new(RequestContext::builder(Protocol::Internal).build()));
 
     /// Shared embedding model — a single `LazyLock` prevents concurrent
-    /// `Model2Vec::from_params` calls from contending on the HuggingFace
+    /// `Model2Vec::from_params` calls from contending on the `HuggingFace`
     /// file lock when tests run in parallel.
     static TEST_EMBEDDING_MODEL: LazyLock<Arc<Model2Vec>> = LazyLock::new(|| {
         Arc::new(
@@ -104,7 +104,7 @@ mod rrf_vector_search_tests {
         }};
     }
 
-    /// Build a minimal `DataFusion` instance with embed, vector_search, and
+    /// Build a minimal `DataFusion` instance with embed, `vector_search`, and
     /// RRF UDFs registered — enough to run end-to-end `vector_search` +
     /// `rrf(...)` SQL queries against in-memory `EmbeddingTable`s.
     async fn make_test_session() -> Result<(Arc<DataFusion>, Arc<RwLock<EmbeddingModelStore>>)> {
