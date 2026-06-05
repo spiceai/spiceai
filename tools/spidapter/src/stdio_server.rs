@@ -416,9 +416,10 @@ impl SpidapterHandler {
             cayenne: Some(ref c),
         }) = self.scenario.source
             && let Some(ref r) = c.aws_region
-                && !r.is_empty() {
-                    return r.clone();
-                }
+            && !r.is_empty()
+        {
+            return r.clone();
+        }
         std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string())
@@ -666,28 +667,150 @@ impl Handler for SpidapterHandler {
 
         // For Cayenne (DirectIngest): provision spiced first (Flight URL needed to build SinkConfig).
         // For all other backends: build SinkConfig first, then provision spiced.
-        let (sink, mut state) =
-            if matches!(&setup_config.storage, FederatedStorageConfig::Direct) {
-                let deployment_mode = setup_config.storage.deployment_mode();
-                let provision_result = match self.compute() {
-                    SpiceCompute::Scp => {
-                        let scp = self.scp_config().ok_or_else(|| {
+        let (sink, mut state) = if matches!(&setup_config.storage, FederatedStorageConfig::Direct) {
+            let deployment_mode = setup_config.storage.deployment_mode();
+            let provision_result = match self.compute() {
+                SpiceCompute::Scp => {
+                    let scp = self.scp_config().ok_or_else(|| {
                         "direct-ingest with SCP compute requires a scenario with `compute: scp:`"
                             .to_string()
                     })?;
-                        provision_scp_app(
+                    provision_scp_app(
+                        run_id,
+                        &self.args,
+                        scp,
+                        &setup_config,
+                        &datasets,
+                        &deployment_mode,
+                        true,
+                        cayenne_cfg,
+                    )
+                    .await
+                }
+                SpiceCompute::Local => {
+                    provision_local_spiced_cluster(
+                        run_id,
+                        Duration::from_secs(self.args.ready_wait),
+                        &setup_config,
+                        &datasets,
+                        &self.args,
+                        self.scp_config(),
+                    )
+                    .await
+                }
+            };
+            let mut state = match provision_result {
+                Ok(s) => s,
+                Err(e) => return Err(format!("direct-ingest setup: provisioning failed:{e}")),
+            };
+            match &mut state {
+                RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                RunState::Local(local) => local.storage = setup_config.storage.clone(),
+            }
+
+            let sql_url = state.sql_url().to_string();
+            let api_key = state.api_key().map(str::to_string);
+            post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
+                .await
+                .map_err(|e| format!("direct-ingest post-setup SQL failed:{e}"))?;
+
+            let mut db_kwargs = HashMap::from([
+                (
+                    "uri".to_string(),
+                    serde_json::Value::String(state.flight_url().to_string()),
+                ),
+                (
+                    "username".to_string(),
+                    serde_json::Value::String(String::new()),
+                ),
+                (
+                    "password".to_string(),
+                    serde_json::Value::String(state.password().to_string()),
+                ),
+                (
+                    "spicebench.write_schema".to_string(),
+                    serde_json::Value::String("spicebench.bench".to_string()),
+                ),
+            ]);
+            if let RunState::Local(local_state) = &state
+                && let Some(ak) = &local_state.flight_api_key
+            {
+                db_kwargs.insert(
+                    "adbc.flight.sql.rpc.call_header.authorization".to_string(),
+                    serde_json::Value::String(format!("Bearer {ak}")),
+                );
+            }
+            (
+                SinkConfig::Adbc {
+                    driver: AdbcDriver::Flightsql,
+                    db_kwargs,
+                },
+                state,
+            )
+        } else {
+            let sink = match &setup_config.storage {
+                FederatedStorageConfig::Postgres { pg, .. }
+                | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
+                    let mut write_db_kwargs = pg.adbc_kwargs();
+                    write_db_kwargs.insert(
+                        "spicebench.write_schema".to_string(),
+                        serde_json::Value::String(pg.schema.clone()),
+                    );
+                    SinkConfig::Adbc {
+                        driver: AdbcDriver::Postgresql,
+                        db_kwargs: write_db_kwargs,
+                    }
+                }
+                FederatedStorageConfig::DynamoDB { .. } => {
+                    let region = resolve_aws_region(&setup_config);
+                    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+                    let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+                    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                    SinkConfig::DynamoDb {
+                        region,
+                        access_key_id,
+                        secret_access_key,
+                        session_token,
+                    }
+                }
+                FederatedStorageConfig::MongoDB { uri, .. } => {
+                    SinkConfig::MongoDb { uri: uri.clone() }
+                }
+                FederatedStorageConfig::Direct => unreachable!(),
+            };
+
+            let deployment_mode = setup_config.storage.deployment_mode();
+            let provision_result = match self.compute() {
+                SpiceCompute::Scp => {
+                    let scp = self.scp_config().ok_or_else(|| {
+                        "SCP compute requires a scenario with `compute: scp:`".to_string()
+                    })?;
+                    provision_scp_app(
+                        run_id,
+                        &self.args,
+                        scp,
+                        &setup_config,
+                        &datasets,
+                        &deployment_mode,
+                        false,
+                        cayenne_cfg,
+                    )
+                    .await
+                }
+                SpiceCompute::Local => match deployment_mode {
+                    DeploymentMode::SingleNode => {
+                        provision_local_single_node(
                             run_id,
-                            &self.args,
-                            scp,
+                            Duration::from_secs(self.args.ready_wait),
                             &setup_config,
                             &datasets,
-                            &deployment_mode,
-                            true,
+                            &self.args,
+                            self.scp_config(),
                             cayenne_cfg,
                         )
                         .await
                     }
-                    SpiceCompute::Local => {
+                    DeploymentMode::Cluster => {
                         provision_local_spiced_cluster(
                             run_id,
                             Duration::from_secs(self.args.ready_wait),
@@ -698,149 +821,26 @@ impl Handler for SpidapterHandler {
                         )
                         .await
                     }
-                };
-                let mut state = match provision_result {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("direct-ingest setup: provisioning failed:{e}")),
-                };
-                match &mut state {
-                    RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
-                    RunState::Local(local) => local.storage = setup_config.storage.clone(),
-                }
-
-                let sql_url = state.sql_url().to_string();
-                let api_key = state.api_key().map(str::to_string);
-                post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
-                    .await
-                    .map_err(|e| format!("direct-ingest post-setup SQL failed:{e}"))?;
-
-                let mut db_kwargs = HashMap::from([
-                    (
-                        "uri".to_string(),
-                        serde_json::Value::String(state.flight_url().to_string()),
-                    ),
-                    (
-                        "username".to_string(),
-                        serde_json::Value::String(String::new()),
-                    ),
-                    (
-                        "password".to_string(),
-                        serde_json::Value::String(state.password().to_string()),
-                    ),
-                    (
-                        "spicebench.write_schema".to_string(),
-                        serde_json::Value::String("spicebench.bench".to_string()),
-                    ),
-                ]);
-                if let RunState::Local(local_state) = &state
-                    && let Some(ak) = &local_state.flight_api_key
-                {
-                    db_kwargs.insert(
-                        "adbc.flight.sql.rpc.call_header.authorization".to_string(),
-                        serde_json::Value::String(format!("Bearer {ak}")),
-                    );
-                }
-                (
-                    SinkConfig::Adbc {
-                        driver: AdbcDriver::Flightsql,
-                        db_kwargs,
-                    },
-                    state,
-                )
-            } else {
-                let sink = match &setup_config.storage {
-                    FederatedStorageConfig::Postgres { pg, .. }
-                    | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
-                        let mut write_db_kwargs = pg.adbc_kwargs();
-                        write_db_kwargs.insert(
-                            "spicebench.write_schema".to_string(),
-                            serde_json::Value::String(pg.schema.clone()),
-                        );
-                        SinkConfig::Adbc {
-                            driver: AdbcDriver::Postgresql,
-                            db_kwargs: write_db_kwargs,
-                        }
-                    }
-                    FederatedStorageConfig::DynamoDB { .. } => {
-                        let region = resolve_aws_region(&setup_config);
-                        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
-                        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-                        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-                        SinkConfig::DynamoDb {
-                            region,
-                            access_key_id,
-                            secret_access_key,
-                            session_token,
-                        }
-                    }
-                    FederatedStorageConfig::MongoDB { uri, .. } => {
-                        SinkConfig::MongoDb { uri: uri.clone() }
-                    }
-                    FederatedStorageConfig::Direct => unreachable!(),
-                };
-
-                let deployment_mode = setup_config.storage.deployment_mode();
-                let provision_result = match self.compute() {
-                    SpiceCompute::Scp => {
-                        let scp = self.scp_config().ok_or_else(|| {
-                            "SCP compute requires a scenario with `compute: scp:`".to_string()
-                        })?;
-                        provision_scp_app(
-                            run_id,
-                            &self.args,
-                            scp,
-                            &setup_config,
-                            &datasets,
-                            &deployment_mode,
-                            false,
-                            cayenne_cfg,
-                        )
-                        .await
-                    }
-                    SpiceCompute::Local => match deployment_mode {
-                        DeploymentMode::SingleNode => {
-                            provision_local_single_node(
-                                run_id,
-                                Duration::from_secs(self.args.ready_wait),
-                                &setup_config,
-                                &datasets,
-                                &self.args,
-                                self.scp_config(),
-                                cayenne_cfg,
-                            )
-                            .await
-                        }
-                        DeploymentMode::Cluster => {
-                            provision_local_spiced_cluster(
-                                run_id,
-                                Duration::from_secs(self.args.ready_wait),
-                                &setup_config,
-                                &datasets,
-                                &self.args,
-                                self.scp_config(),
-                            )
-                            .await
-                        }
-                    },
-                };
-
-                let state = match provision_result {
-                    Ok(mut s) => {
-                        match &mut s {
-                            RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
-                            RunState::Local(local) => {
-                                local.storage = setup_config.storage.clone();
-                            }
-                        }
-                        s
-                    }
-                    Err(e) => {
-                        return Err(format!("Setup failed: provisioning failed: {e}"));
-                    }
-                };
-
-                (sink, state)
+                },
             };
+
+            let state = match provision_result {
+                Ok(mut s) => {
+                    match &mut s {
+                        RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
+                        RunState::Local(local) => {
+                            local.storage = setup_config.storage.clone();
+                        }
+                    }
+                    s
+                }
+                Err(e) => {
+                    return Err(format!("Setup failed: provisioning failed: {e}"));
+                }
+            };
+
+            (sink, state)
+        };
 
         let mut read_db_kwargs = HashMap::from([
             (

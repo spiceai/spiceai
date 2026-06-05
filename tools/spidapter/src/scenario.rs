@@ -200,14 +200,17 @@ pub(crate) fn envsubst(input: &str) -> anyhow::Result<String> {
     // Group 2: optional default value (everything after :-)
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}").unwrap_or_else(|e| panic!("invalid regex: {e}"))
+        regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}")
+            .unwrap_or_else(|e| panic!("invalid regex: {e}"))
     });
 
     let mut result = String::with_capacity(input.len());
     let mut last = 0usize;
 
     for cap in re.captures_iter(input) {
-        let Some(full_match) = cap.get(0) else { continue };
+        let Some(full_match) = cap.get(0) else {
+            continue;
+        };
         result.push_str(&input[last..full_match.start()]);
 
         let var_name = cap.get(1).map_or("", |m| m.as_str());
