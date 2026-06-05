@@ -15,24 +15,15 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-#[cfg(feature = "text_search")]
 use std::sync::Arc;
 
-#[cfg(feature = "text_search")]
 use datafusion::sql::TableReference;
-#[cfg(feature = "text_search")]
-use search::generation::CandidateGeneration;
-#[cfg(feature = "text_search")]
-use search::generation::text_search::index::FullTextDatabaseIndex;
-
-#[cfg(feature = "text_search")]
 use runtime_query_engine::query_engine::QueryEngine;
+use search::generation::{CandidateGeneration, text_search::index::FullTextDatabaseIndex};
 
-#[cfg(feature = "text_search")]
 use crate::candidate::text::TextSearchCandidate;
 
 /// Constructs a [`CandidateGeneration`] for full text search on the underlying [`tantivy::Index`] with full filter and column support via the underlying [`TableProvider`].
-#[cfg(feature = "text_search")]
 pub async fn as_candidate_generations(
     database_index: &FullTextDatabaseIndex,
     df: Arc<dyn QueryEngine>,
@@ -41,7 +32,7 @@ pub async fn as_candidate_generations(
     let mut generators = vec![];
     for search_field in database_index.search_fields.as_slice() {
         let base = database_index
-            .full_text_search_field_index(search_field as &str)
+            .full_text_search_field_index(search_field.as_str())
             .map_err(|source| search::generation::Error::TextSearchError { source })?;
 
         let candidate: TextSearchCandidate =

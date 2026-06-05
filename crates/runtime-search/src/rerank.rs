@@ -1199,7 +1199,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    /// A test-specific QueryEngine that wraps both a SessionContext and a HashMap of tables.
+    /// A test-specific `QueryEngine` that wraps both a `SessionContext` and a `HashMap` of tables.
     /// Supports both sync and async table lookups.
     struct TestQueryEngine {
         ctx: Arc<SessionContext>,
@@ -1301,14 +1301,13 @@ mod tests {
                 .map(|name: &String| TableReference::bare(name.clone()))
                 .collect();
             // Also get names from SessionContext
-            if let Some(default_catalog) = self.ctx.catalog_names().first() {
-                if let Some(catalog) = self.ctx.catalog(default_catalog) {
-                    let schema_names = catalog.schema_names();
-                    for schema_name in schema_names {
-                        if let Some(schema) = catalog.schema(&schema_name) {
-                            for table_name in schema.table_names() {
-                                names.push(TableReference::bare(table_name));
-                            }
+            if let Some(default_catalog) = self.ctx.catalog_names().first()
+                && let Some(catalog) = self.ctx.catalog(default_catalog)
+            {
+                for schema_name in catalog.schema_names() {
+                    if let Some(schema) = catalog.schema(&schema_name) {
+                        for table_name in schema.table_names() {
+                            names.push(TableReference::bare(table_name));
                         }
                     }
                 }
@@ -1822,11 +1821,7 @@ mod tests {
         setup_test_table(&ctx, &rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
 
         // Register the table with TestQueryEngine for sync lookups
-        if let Some(provider) = ctx
-            .table_provider(TableReference::bare("test_docs"))
-            .await
-            .ok()
-        {
+        if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
             test_engine.register_table("test_docs", provider);
         }
 
@@ -1849,11 +1844,7 @@ mod tests {
         setup_test_table(&ctx, &rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
 
         // Register the table with TestQueryEngine for sync lookups
-        if let Some(provider) = ctx
-            .table_provider(TableReference::bare("test_docs"))
-            .await
-            .ok()
-        {
+        if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
             test_engine.register_table("test_docs", provider);
         }
 

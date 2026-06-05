@@ -35,7 +35,7 @@ runtime-request-context = { path = "../runtime-request-context" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-search = { path = "../search", default-features = false }
+search = { path = "../search", default-features = false, features = ["text_search"] }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 rayon = "1.11.0"
@@ -54,7 +54,6 @@ elasticsearch = ["search/elasticsearch"]
 models = ["runtime-datafusion-udfs/models"]
 openapi = ["dep:utoipa"]
 s3_vectors = ["search/s3_vectors"]
-text_search = ["search/text_search"]
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"] }

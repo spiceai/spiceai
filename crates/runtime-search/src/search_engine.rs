@@ -183,7 +183,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         Some(embedding_columns.into_iter().collect())
     }
 
-    #[cfg(feature = "text_search")]
     async fn full_text_search_candidates(
         &self,
         tbl: &TableReference,
@@ -229,14 +228,6 @@ impl<E: TableProviderExplorer> SearchEngine<E> {
         }
 
         Some(Ok(vec![]))
-    }
-
-    #[cfg(not(feature = "text_search"))]
-    async fn full_text_search_candidates(
-        &self,
-        _tbl: &TableReference,
-    ) -> Option<Result<Vec<Arc<dyn CandidateGeneration>>>> {
-        None
     }
 
     fn get_vector_index(
