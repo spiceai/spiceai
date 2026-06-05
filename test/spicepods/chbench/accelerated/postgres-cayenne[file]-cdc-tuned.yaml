@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-cdc-tuned
 
-# Target: xlarger-runner — 64 vCPU / 256 GiB RAM, SSD storage.
+# Target: xlarge-runner — 64 vCPU / 256 GiB RAM, SSD storage.
 #
 # Key tuning:
 #   - cdc_max_coalesced_envelopes 4096 (runtime max): larger CDC batches cut metastore round-trips.
