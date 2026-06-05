@@ -260,6 +260,53 @@ impl RuntimeBuilder {
         );
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+
+        // Process-global SQLite metastore pragma tuning (cache, mmap, busy
+        // timeout, WAL autocheckpoint, auto_vacuum). Applied once at startup;
+        // connections opened afterward pick up the values. Unset params keep the
+        // defaults on `SqliteMetastoreConfig`.
+        {
+            let mut metastore_cfg = cayenne::SqliteMetastoreConfig::default();
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_cache_mb")
+            {
+                metastore_cfg.cache_size_mb = v;
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_mmap_mb")
+            {
+                metastore_cfg.mmap_size_bytes = i64::try_from(v.saturating_mul(1024 * 1024))
+                    .unwrap_or(metastore_cfg.mmap_size_bytes);
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_busy_timeout_ms")
+            {
+                metastore_cfg.busy_timeout_ms =
+                    u64::try_from(v).unwrap_or(metastore_cfg.busy_timeout_ms);
+            }
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                "cayenne_metastore_wal_autocheckpoint_pages",
+            ) {
+                metastore_cfg.wal_autocheckpoint_pages =
+                    u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
+            }
+            if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
+                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
+                    "none" => cayenne::SqliteAutoVacuum::None,
+                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
+                    "full" => cayenne::SqliteAutoVacuum::Full,
+                    other => {
+                        tracing::warn!(
+                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                        );
+                        cayenne::SqliteAutoVacuum::None
+                    }
+                };
+            }
+            cayenne::set_sqlite_metastore_config(metastore_cfg);
+        }
+
         let cayenne_filter_propagation_enabled =
             parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
         let cayenne_optimizer_rules =
