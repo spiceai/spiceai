@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Metadata catalog implementation for Cayenne.
 
-use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
+use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
@@ -398,6 +398,86 @@ impl CayenneCatalog {
             .map_err(|e| CatalogError::FailedToSetCurrentSnapshot {
                 source: Box::new(e),
             })
+    }
+
+    /// CAS-validate and swap a subset of protected-snapshot sequence rows
+    /// inside the caller's `MetastoreTransaction`, without opening a new one.
+    ///
+    /// Returns `Ok(false)` (and makes no mutation) if any input snapshot is no
+    /// longer present in `cayenne_snapshot_sequence` — the caller should roll
+    /// back / discard the rewritten output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::InvalidOperationNoSource`] if any UUID is
+    /// malformed, or propagates the metastore error if a statement fails.
+    pub async fn swap_protected_snapshots_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool> {
+        // Validate UUIDs to keep the interpolated batch SQL injection-free.
+        // All ids are generated internally via `uuid::Uuid::now_v7()`, but we
+        // enforce the invariant here since they are interpolated as SQL literals.
+        if uuid::Uuid::parse_str(table_id).is_err() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("table_id is not a valid UUID: {table_id}"),
+            });
+        }
+        if uuid::Uuid::parse_str(new_snapshot_id).is_err() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!("new_snapshot_id is not a valid UUID: {new_snapshot_id}"),
+            });
+        }
+        for id in old_snapshot_ids {
+            if uuid::Uuid::parse_str(id).is_err() {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!("old_snapshot_id is not a valid UUID: {id}"),
+                });
+            }
+        }
+
+        if old_snapshot_ids.is_empty() {
+            return Ok(false);
+        }
+
+        let table_id_literal = sql_text_literal(table_id);
+        let id_list = old_snapshot_ids
+            .iter()
+            .map(|id| sql_text_literal(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // CAS guard: every input snapshot must still be active. If a concurrent
+        // compaction already consumed one of them, abort without mutating.
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM cayenne_snapshot_sequence \
+             WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list})"
+        );
+        let count_values = txn
+            .query_row_values(QueryRowParams {
+                sql: &count_sql,
+                params: vec![],
+            })
+            .await?;
+        let existing = i64::from_value(metastore_value_at(&count_values, 0)?)?;
+        if existing != i64::try_from(old_snapshot_ids.len()).unwrap_or(i64::MAX) {
+            return Ok(false);
+        }
+
+        let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
+        let batch_sql = format!(
+            "DELETE FROM cayenne_snapshot_sequence \
+                WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); \
+             INSERT OR REPLACE INTO cayenne_snapshot_sequence \
+                (table_id, snapshot_id, sequence_number) \
+                VALUES ({table_id_literal}, {new_snapshot_id_literal}, {new_sequence_number});"
+        );
+        txn.execute_batch(&batch_sql).await?;
+        Ok(true)
     }
 
     /// Apply an overwrite commit's catalog mutations inside the caller's
@@ -1590,6 +1670,72 @@ impl MetadataCatalog for CayenneCatalog {
         })
     }
 
+    async fn swap_protected_snapshots(
+        &self,
+        table_id: &str,
+        old_snapshot_ids: &[String],
+        new_snapshot_id: &str,
+        new_sequence_number: i64,
+    ) -> CatalogResult<bool> {
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+        if max_attempts == 0 {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: "swap_protected_snapshots requires at least one attempt".to_string(),
+            });
+        }
+
+        for attempt in 1..=max_attempts {
+            let mut tx = self.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
+                }
+            })?;
+
+            match self
+                .swap_protected_snapshots_in_txn(
+                    &mut *tx,
+                    table_id,
+                    old_snapshot_ids,
+                    new_snapshot_id,
+                    new_sequence_number,
+                )
+                .await
+            {
+                // CAS guard failed — an input snapshot is no longer active.
+                // The transaction made no changes; nothing to commit.
+                Ok(false) => return Ok(false),
+                Ok(true) => match tx.commit().await {
+                    Ok(()) => return Ok(true),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying protected-snapshot swap after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
+                Err(e) => {
+                    // Transaction auto-rolls-back on drop.
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "swap_protected_snapshots exhausted {max_attempts} attempts without success or a terminal error"
+            ),
+        })
+    }
+
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -1804,12 +1950,16 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
-                      (table_id, statistics_blob, num_rows) \
-                      VALUES (?1, ?2, ?3)",
+                      (table_id, statistics_blob, num_rows, ndv_sketches) \
+                      VALUES (?1, ?2, ?3, ?4)",
                 params: vec![
                     MetastoreValue::Text(stats.table_id.clone()),
                     MetastoreValue::Blob(stats.statistics_blob.clone()),
                     MetastoreValue::Integer(stats.num_rows),
+                    stats
+                        .ndv_sketches
+                        .clone()
+                        .map_or(MetastoreValue::Null, MetastoreValue::Blob),
                 ],
             })
             .await
@@ -1821,7 +1971,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, statistics_blob, num_rows
+                    SELECT table_id, statistics_blob, num_rows, ndv_sketches
                     FROM cayenne_table_statistics
                     WHERE table_id = ?1
                     ",
@@ -1832,6 +1982,7 @@ impl MetadataCatalog for CayenneCatalog {
                         table_id: row.get_string(0)?,
                         statistics_blob: row.get_blob(1)?,
                         num_rows: row.get_i64(2)?,
+                        ndv_sketches: row.get_optional_blob(3)?,
                     })
                 },
             )
@@ -2071,9 +2222,9 @@ impl MetadataCatalog for CayenneCatalog {
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
-    ) -> CatalogResult<()> {
+    ) -> CatalogResult<Option<i64>> {
         if updated_data.is_empty() && deleted_inlined_ids.is_empty() && data.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         for updated in &updated_data {
@@ -2118,19 +2269,38 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
+            // Sequence assigned to the appended `data` rows (all share one
+            // sequence per call).
+            let mut assigned_sequence: Option<i64> = None;
+
             if sequence_increment > 0 {
-                tx.execute(ExecuteParams {
-                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2",
-                    params: vec![
-                        MetastoreValue::Integer(sequence_increment),
-                        MetastoreValue::Text(table_id.to_string()),
-                    ],
-                })
-                .await
-                .map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to execute inline mutation transaction".to_string(),
-                    source: Box::new(e),
-                })?;
+                let row_values = tx
+                    .query_row_values(QueryRowParams {
+                        sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2 RETURNING current_sequence_number",
+                        params: vec![
+                            MetastoreValue::Integer(sequence_increment),
+                            MetastoreValue::Text(table_id.to_string()),
+                        ],
+                    })
+                    .await
+                    .map_err(|e| CatalogError::InvalidOperation {
+                        message: "Failed to execute inline mutation transaction".to_string(),
+                        source: Box::new(e),
+                    })?;
+                let value =
+                    row_values
+                        .first()
+                        .ok_or_else(|| CatalogError::InvalidOperationNoSource {
+                            message: "Inline mutation sequence update returned no columns"
+                                .to_string(),
+                        })?;
+                assigned_sequence =
+                    Some(
+                        i64::from_value(value).map_err(|e| CatalogError::InvalidOperation {
+                            message: "Failed to parse inline mutation sequence number".to_string(),
+                            source: Box::new(e),
+                        })?,
+                    );
             }
 
             for updated in &updated_data {
@@ -2197,7 +2367,7 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             match tx.commit().await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(assigned_sequence),
                 Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
                     let delay = retry_backoff_delay(attempt);
                     tracing::debug!(
@@ -2230,6 +2400,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         insert_pk_bytes_list: Vec<Vec<u8>>,
         insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
         // SQLite param limit chunking (mirrors add_insert_records_batch).
         const PARAMS_PER_ROW: usize = 4;
@@ -2248,7 +2419,8 @@ impl MetadataCatalog for CayenneCatalog {
         // the delete+insert pair) before entering this transaction; the txn
         // itself only does the durable catalog writes for the DeleteFiles and
         // InsertRecords.
-        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() {
+        if delete_files.is_empty() && insert_pk_bytes_list.is_empty() && snapshot_sequence.is_none()
+        {
             return Ok(());
         }
 
@@ -2387,6 +2559,36 @@ impl MetadataCatalog for CayenneCatalog {
                         source: Box::new(e),
                     });
                 }
+            }
+
+            if let Some(snapshot_sequence) = &snapshot_sequence
+                && let Err(e) = tx
+                    .execute(ExecuteParams {
+                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        params: vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
+                            MetastoreValue::Integer(snapshot_sequence.sequence_number),
+                        ],
+                    })
+                    .await
+            {
+                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                    drop(tx);
+                    sleep_before_metastore_write_retry(
+                        attempt,
+                        max_attempts,
+                        "insert snapshot sequence inside on-conflict transaction",
+                    )
+                    .await;
+                    continue 'attempts;
+                }
+                drop(tx);
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to insert snapshot sequence inside on-conflict transaction"
+                        .to_string(),
+                    source: Box::new(e),
+                });
             }
 
             match tx.commit().await {
@@ -3427,11 +3629,17 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(
+                vec![delete_file.clone()],
+                &table_id,
+                vec![vec![1_u8]],
+                2,
+                None,
+            )
             .await
             .expect("initial on-conflict deletion commit should succeed");
         catalog
-            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(vec![delete_file], &table_id, vec![vec![1_u8]], 2, None)
             .await
             .expect("replayed on-conflict deletion commit should be idempotent");
 
@@ -3497,7 +3705,13 @@ mod tests {
         };
 
         catalog
-            .commit_on_conflict_deletions(vec![delete_file.clone()], &table_id, vec![vec![1_u8]], 2)
+            .commit_on_conflict_deletions(
+                vec![delete_file.clone()],
+                &table_id,
+                vec![vec![1_u8]],
+                2,
+                None,
+            )
             .await
             .expect("initial on-conflict deletion commit should succeed");
 
@@ -3510,6 +3724,7 @@ mod tests {
                 &table_id,
                 vec![vec![2_u8]],
                 3,
+                None,
             )
             .await
             .expect_err("conflicting delete-file metadata should be rejected");
@@ -3603,7 +3818,7 @@ mod tests {
         let insert_pks: Vec<Vec<u8>> = (0..5_u8).map(|i| vec![i]).collect();
 
         catalog
-            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2)
+            .commit_on_conflict_deletions(delete_files.clone(), &table_id, insert_pks, 2, None)
             .await
             .expect("batched on-conflict deletion commit should succeed");
 
@@ -3624,7 +3839,7 @@ mod tests {
 
         // Replay should be idempotent across the whole batch.
         catalog
-            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2)
+            .commit_on_conflict_deletions(delete_files, &table_id, vec![vec![0_u8]], 2, None)
             .await
             .expect("replayed batched on-conflict deletion commit should be idempotent");
         let stored = catalog

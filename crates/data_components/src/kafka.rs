@@ -101,6 +101,19 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Returns `true` when `e` indicates the topic does not exist on the broker yet.
+#[must_use]
+pub fn is_unknown_topic_or_partition(e: &Error) -> bool {
+    use rdkafka::error::KafkaError as RdKafkaError;
+    use rdkafka::types::RDKafkaErrorCode;
+    matches!(
+        e,
+        Error::UnableToReceiveMessage {
+            source: RdKafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition)
+        }
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct KafkaOffset {
     pub topic: String,
@@ -524,6 +537,47 @@ impl KafkaConsumer {
             })?;
 
         Ok(())
+    }
+
+    /// Returns `true` if the topic has any messages (high watermark > low watermark on any
+    /// partition), `false` if every partition is empty, or an error if metadata cannot be
+    /// fetched within `timeout`.
+    ///
+    /// Uses the existing authenticated consumer to avoid a new SASL handshake.
+    ///
+    /// # Errors
+    /// Returns an error if topic metadata or watermarks cannot be fetched within `timeout`.
+    pub fn topic_has_messages(&self, topic: &str, timeout: Duration) -> Result<bool> {
+        let metadata = self.consumer.fetch_metadata(Some(topic), timeout).context(
+            UnableToRestartTopicSnafu {
+                message: "Failed to fetch topic metadata".to_string(),
+            },
+        )?;
+
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|t| t.name() == topic)
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
+
+        for partition in topic_metadata.partitions() {
+            let (low, high) = self
+                .consumer
+                .fetch_watermarks(topic, partition.id(), timeout)
+                .context(UnableToRestartTopicSnafu {
+                    message: format!(
+                        "Failed to fetch watermarks for partition {}",
+                        partition.id()
+                    ),
+                })?;
+            if high > low {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     #[must_use]

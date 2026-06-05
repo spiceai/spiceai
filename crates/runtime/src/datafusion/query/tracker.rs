@@ -95,6 +95,12 @@ impl QueryTracker {
 
         labels.extend(request_context.to_dimensions());
 
+        // Record the execution count here (rather than at query submission) so it
+        // shares the same `datasets`/`tags` dimensions as the duration metrics
+        // below. `finish` is the single terminal step for every tracked query
+        // (normal completion, cache hit, and error paths all route through it),
+        // so this counts each execution exactly once.
+        crate::metrics::telemetry::track_query_count(&labels);
         crate::metrics::telemetry::track_query_duration(query_duration, &labels);
         crate::metrics::telemetry::track_query_execution_duration(
             query_execution_duration,

@@ -1415,7 +1415,7 @@ impl TableProvider for AcceleratedTable {
 
         // For caching mode, extend the accelerator scan projection to
         // include the storage-only columns the caching pipeline needs:
-        // `fetched_at` (freshness check inside
+        // `_fetched_at` (freshness check inside
         // `CachingAccelerationScanExec`) and `__spice_cache_namespace`
         // (per-principal isolation `FilterExec` applied below). The added
         // columns are stripped from the user-facing output by
@@ -1611,7 +1611,7 @@ impl TableProvider for AcceleratedTable {
         };
 
         // Compute the target schema based on user's original projection.
-        // SchemaCastScanExec strips extra columns (like fetched_at added for caching)
+        // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
         // and casts types. The schema should match what the user requested.
         let target_schema = match projection {
             Some(indices) => {
@@ -1846,7 +1846,7 @@ impl TableProvider for AcceleratedTable {
 }
 
 /// Extends projection to include columns required by the caching pipeline
-/// for accelerator scans: `fetched_at` (freshness check) and
+/// for accelerator scans: `_fetched_at` (freshness check) and
 /// `__spice_cache_namespace` (per-principal isolation filter applied as a
 /// hard `FilterExec` on top of the scan).
 ///
@@ -2123,7 +2123,7 @@ mod tests {
         assert_eq!(
             extended,
             vec![0, 2, 3],
-            "Should add fetched_at index at end"
+            "Should add _fetched_at index at end"
         );
     }
 
@@ -2136,7 +2136,7 @@ mod tests {
         assert_eq!(
             extended,
             vec![2, 3],
-            "Should add fetched_at to single column"
+            "Should add _fetched_at to single column"
         );
     }
 

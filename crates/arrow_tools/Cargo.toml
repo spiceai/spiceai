@@ -12,14 +12,15 @@ version.workspace = true
 arrow.workspace = true
 arrow-cast.workspace = true
 arrow-schema.workspace = true
+base64 = "0.22.1"
 snafu.workspace = true
 datafusion.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 insta = {workspace = true, features = ["json"]}
 arrow-json.workspace = true
-serde_json.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 
 [[bench]]

@@ -26,7 +26,6 @@ limitations under the License.
 mod changes;
 
 use async_trait::async_trait;
-use data_components::Read;
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::mongodb::{
     Error as MongoDBError, MongoDBTableFactory, connection_pool::MongoDBConnectionPool,
@@ -343,14 +342,14 @@ impl DataConnector for MongoDB {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.mongodb_factory, dataset.path().into())
-                .await
-                .context(UnableToGetReadProviderSnafu {
-                    dataconnector: "mongodb",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        Ok(self
+            .mongodb_factory
+            .table_provider(dataset.path().into(), dataset.schema.clone())
+            .await
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "mongodb",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
     }
 
     fn supports_changes_stream(&self) -> bool {

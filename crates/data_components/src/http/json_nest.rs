@@ -41,7 +41,7 @@ limitations under the License.
 //! In addition, declared columns whose names match one of the HTTP
 //! connector's built-in metadata fields (`request_path`,
 //! `request_query`, `request_body`, `request_headers`, `content`,
-//! `response_status`, `response_headers`, `fetched_at`) are *passed
+//! `response_status`, `response_headers`, `_fetched_at`) are *passed
 //! through* from the HTTP request/response rather than being decomposed
 //! from the JSON body. This lets queries reference both decomposed
 //! columns and the original HTTP metadata (e.g. for direct fetches via
@@ -52,9 +52,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to parse HTTP response row as JSON: {source}"))]
-    JsonParse { source: serde_json::Error },
-
     #[snafu(display("Failed to serialize catch-all JSON column: {source}"))]
     JsonSerialize { source: serde_json::Error },
 }
@@ -126,10 +123,42 @@ pub type DecomposedRow = HashMap<String, Option<String>>;
 /// row is placed into the catch-all column and every declared static
 /// field resolves to `NULL`. This preserves data without silently
 /// dropping values.
+///
+/// Behavior for rows that are *not valid JSON at all* (empty bodies,
+/// HTML error pages, plain text): the row is preserved losslessly
+/// rather than failing the query — every declared static field resolves
+/// to `NULL`, and the catch-all column receives the raw row text encoded
+/// as a JSON string (or `NULL` when the body is empty/whitespace-only).
+/// This mirrors the non-nested code path ([`HttpExec::parse_content`]),
+/// which already returns a non-JSON body as a single raw `content` row.
+/// Hard-erroring here previously crashed any `SELECT` against an HTTP
+/// dataset that declared `columns:` whenever the endpoint returned a
+/// non-JSON body (e.g. fetching a base URL with no path) — see
+/// <https://github.com/spiceai/spiceai/issues/11155>.
+///
+/// [`HttpExec::parse_content`]: super::provider::HttpExec
 pub fn decompose_json_row(json_row: &str, nesting: &HttpJsonNesting) -> Result<DecomposedRow> {
-    let value: serde_json::Value = serde_json::from_str(json_row).context(JsonParseSnafu)?;
-
     let mut out: DecomposedRow = HashMap::new();
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_row) else {
+        // Not valid JSON: preserve the raw row instead of failing the
+        // whole query. All declared static fields are NULL; the
+        // catch-all keeps the raw text as a JSON string (NULL when the
+        // body is empty/whitespace).
+        for name in &nesting.static_fields {
+            out.insert(name.clone(), None);
+        }
+        let catchall = if json_row.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&serde_json::Value::String(json_row.to_string()))
+                    .context(JsonSerializeSnafu)?,
+            )
+        };
+        out.insert(nesting.json_field_name.clone(), catchall);
+        return Ok(out);
+    };
 
     match value {
         serde_json::Value::Object(map) => {
@@ -279,6 +308,62 @@ mod tests {
         let catchall = d.get("data").expect("data").as_deref().expect("val");
         // BTreeMap ordering => keys alphabetical
         assert_eq!(catchall, r#"{"alpha":2,"mu":3,"zeta":1}"#);
+    }
+
+    #[test]
+    fn non_json_row_is_preserved_in_catchall() {
+        // Regression for https://github.com/spiceai/spiceai/issues/11155:
+        // a non-JSON HTTP body (e.g. an HTML error page returned when the
+        // base URL is fetched with no path) must not crash the query.
+        let n = nesting(&["id", "title", "data"], "data");
+        let row = "<!DOCTYPE html><html><body>not json</body></html>";
+        let d = decompose_json_row(row, &n).expect("non-JSON row must not error");
+        assert!(d.get("id").expect("id present").is_none());
+        assert!(d.get("title").expect("title present").is_none());
+        let catchall = d
+            .get("data")
+            .expect("data present")
+            .as_deref()
+            .expect("catchall not null");
+        // The raw text is preserved as a JSON string, so the catch-all
+        // column always contains valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(catchall).expect("catchall is valid JSON");
+        assert_eq!(parsed, serde_json::Value::String(row.to_string()));
+    }
+
+    #[test]
+    fn empty_row_yields_all_null() {
+        // An empty HTTP body (e.g. a 5xx with no content) decomposes to a
+        // single all-NULL row rather than erroring.
+        let n = nesting(&["id", "data"], "data");
+        for row in ["", "   ", "\n\t "] {
+            let d = decompose_json_row(row, &n).expect("empty row must not error");
+            assert!(d.get("id").expect("id present").is_none());
+            assert!(
+                d.get("data").expect("data present").is_none(),
+                "empty body => catch-all NULL, got {:?}",
+                d.get("data")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_is_preserved_not_dropped() {
+        // Truncated/garbage JSON is preserved verbatim, not silently
+        // discarded.
+        let n = nesting(&["id", "data"], "data");
+        let row = r#"{"id": "abc", "#; // truncated, invalid JSON
+        let d = decompose_json_row(row, &n).expect("malformed JSON must not error");
+        assert!(d.get("id").expect("id present").is_none());
+        let catchall = d
+            .get("data")
+            .expect("data present")
+            .as_deref()
+            .expect("catchall not null");
+        let parsed: serde_json::Value =
+            serde_json::from_str(catchall).expect("catchall is valid JSON");
+        assert_eq!(parsed, serde_json::Value::String(row.to_string()));
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub struct DataFile {
 }
 
 /// The type of deletion vector: position-based or key-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DeletionType {
     /// Position-based deletion using row IDs (for tables without primary key).
     /// Requires consistent ordering between delete and read operations.
@@ -118,7 +118,7 @@ pub enum DeletionType {
 }
 
 /// Represents a deletion vector file tracking deleted rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFile {
     /// Unique identifier for this delete file (`UUIDv7`)
     pub delete_file_id: String,
@@ -650,12 +650,11 @@ pub struct CreateTableOptions {
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
-/// Stores per-column statistics (min, max, null count, sum, etc.) captured from
-/// the most recent write (the write's `ColumnStatsAccumulator`). The row in
-/// `cayenne_table_statistics` is keyed by `table_id` and upserted on every write,
-/// so entries represent last-write-wins snapshots rather than aggregates across
-/// every file ever produced; a future change will merge new writes into the
-/// existing blob.
+/// Stores per-column statistics (min, max, null count) maintained incrementally
+/// on the write path. The row in `cayenne_table_statistics` is keyed by
+/// `table_id` and upserted on every write: each write's `ColumnStatsAccumulator`
+/// is *merged* into the existing blob (min/max widen, null counts accumulate),
+/// so the entry is a running per-table aggregate, not a last-write snapshot.
 ///
 /// Consumers should treat these values as optimization hints only. Uses Vortex's
 /// native statistics format for zero-conversion overhead and compatibility with
@@ -666,14 +665,20 @@ pub struct CreateTableOptions {
 pub struct TableStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
     pub table_id: String,
-    /// Serialized Vortex `FileStatistics` flatbuffer bytes. Today the write
-    /// path populates only min, max, and null count per column; other fields
-    /// supported by the Vortex format (sum, NaN count, `is_constant`, etc.)
-    /// remain `Absent` until future writer work fills them in.
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
+    /// and null count). Other fields supported by the Vortex format (sum, NaN
+    /// count, `is_constant`, etc.) remain `Absent`.
     pub statistics_blob: Vec<u8>,
-    /// Row count captured by the most recent write's accumulator (not an
-    /// aggregate across every file ever produced — see the struct docs).
+    /// Live row count, maintained incrementally on commit: inserts add and
+    /// supersedes/deletes subtract, so it tracks `SELECT COUNT(*)` rather than
+    /// the sum of every insert ever made. Compaction and overwrite reset it to
+    /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
+    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
+    /// Merged across writes register-wise; used to size distributed joins on
+    /// sparse integer keys. See [`crate::hll`].
+    pub ndv_sketches: Option<Vec<u8>>,
 }
 
 /// A small batch of insert data inlined directly in the metastore.
