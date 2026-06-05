@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The storage location '{url}' uses scheme '{scheme}', which is not supported for Unity Catalog credential vending. Supported schemes: s3, abfss, gs. Provide static storage credentials for this table instead."
+        "The storage location '{url}' uses scheme '{scheme}', which is not supported for Unity Catalog credential vending. Supported schemes: s3, s3a, abfss, abfs, az, azure, wasbs, wasb, gs. Provide static storage credentials for this table instead."
     ))]
     UnsupportedScheme { url: String, scheme: String },
 
@@ -310,6 +310,15 @@ impl CredentialProvider for VendedGcpCredentialProvider {
     }
 }
 
+/// The AWS region to use for vended S3 access: the explicit `aws_region`
+/// parameter wins, then the `AWS_REGION`/`AWS_DEFAULT_REGION` environment
+/// variables. `None` means the region must be resolved from the bucket.
+fn configured_aws_region(aws_region: Option<String>) -> Option<String> {
+    aws_region
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+}
+
 /// Parses an Azure SAS token (with or without a leading `?`) into the
 /// key/value pairs expected by [`AzureCredential::SASToken`].
 fn parse_sas_token(sas: &str) -> Vec<(String, String)> {
@@ -336,10 +345,7 @@ pub async fn vended_object_store(
                 .host_str()
                 .context(MissingBucketSnafu { url: url.clone() })?
                 .to_string();
-            let region = match aws_region
-                .or_else(|| std::env::var("AWS_REGION").ok())
-                .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            {
+            let region = match configured_aws_region(aws_region) {
                 Some(region) => region,
                 None => resolve_bucket_region(&bucket, &ClientOptions::new())
                     .await
@@ -581,6 +587,88 @@ mod tests {
         // Synthetic TTL is 15 minutes from fetch.
         assert!(!cached.should_refresh(15 * MINUTE_MS));
         assert!(cached.should_refresh(25 * MINUTE_MS));
+    }
+
+    mod object_store_dispatch {
+        use super::*;
+        use crate::unity_catalog::Endpoint;
+
+        fn dummy_credentials() -> Arc<VendedTableCredentials> {
+            let client = UnityCatalog::new(Endpoint("http://127.0.0.1:9".to_string()), None, None)
+                .expect("client should build");
+            Arc::new(VendedTableCredentials::new(
+                Arc::new(client),
+                "table-uuid".to_string(),
+                TableOperation::Read,
+            ))
+        }
+
+        #[tokio::test]
+        async fn test_s3_scheme_builds_with_explicit_region() {
+            let url = Url::parse("s3://my-bucket/path/to/table").expect("valid url");
+            let store =
+                vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string())).await;
+            assert!(store.is_ok(), "expected S3 store, got: {:?}", store.err());
+        }
+
+        #[tokio::test]
+        async fn test_s3_scheme_missing_bucket() {
+            let url = Url::parse("s3:///no-bucket").expect("valid url");
+            let err = vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string()))
+                .await
+                .expect_err("expected missing bucket error");
+            assert!(matches!(err, Error::MissingBucket { .. }), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn test_azure_scheme_builds() {
+            let url = Url::parse("abfss://container@account.dfs.core.windows.net/path")
+                .expect("valid url");
+            let store = vended_object_store(&url, dummy_credentials(), None).await;
+            assert!(
+                store.is_ok(),
+                "expected Azure store, got: {:?}",
+                store.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_gcs_scheme_builds() {
+            let url = Url::parse("gs://bucket/path").expect("valid url");
+            let store = vended_object_store(&url, dummy_credentials(), None).await;
+            assert!(store.is_ok(), "expected GCS store, got: {:?}", store.err());
+        }
+
+        #[tokio::test]
+        async fn test_unsupported_scheme() {
+            let url = Url::parse("file:///tmp/table").expect("valid url");
+            let err = vended_object_store(&url, dummy_credentials(), None)
+                .await
+                .expect_err("expected unsupported scheme error");
+            assert!(
+                matches!(&err, Error::UnsupportedScheme { scheme, .. } if scheme == "file"),
+                "got: {err}"
+            );
+            // The error must list the schemes that are actually supported.
+            for scheme in [
+                "s3", "s3a", "abfss", "abfs", "az", "azure", "wasbs", "wasb", "gs",
+            ] {
+                assert!(
+                    err.to_string().contains(scheme),
+                    "error message missing scheme '{scheme}': {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_configured_aws_region_prefers_parameter() {
+            // The explicit parameter takes precedence over any environment
+            // configuration.
+            assert_eq!(
+                configured_aws_region(Some("eu-central-1".to_string())).as_deref(),
+                Some("eu-central-1")
+            );
+        }
     }
 
     mod vending {

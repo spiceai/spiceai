@@ -406,7 +406,8 @@ impl UnityCatalog {
             if status.is_success() {
                 response.json().await.context(ConnectionSnafu)
             } else if matches!(status.as_u16(), 400 | 401 | 403 | 404) {
-                let message = response.text().await.unwrap_or_default();
+                let message =
+                    Self::sanitize_response_body(&response.text().await.unwrap_or_default());
                 CredentialVendingDeniedSnafu {
                     table_id: table_id.to_string(),
                     status,
@@ -505,6 +506,21 @@ impl UnityCatalog {
             .await
             .context(RateControlSnafu)
             .map(Some)
+    }
+
+    /// Collapses whitespace (including newlines) and truncates an HTTP
+    /// response body so it can be embedded in single-line error messages and
+    /// logs without inflating them.
+    fn sanitize_response_body(body: &str) -> String {
+        const MAX_CHARS: usize = 512;
+        let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.chars().count() > MAX_CHARS {
+            let mut truncated: String = collapsed.chars().take(MAX_CHARS).collect();
+            truncated.push_str("… (truncated)");
+            truncated
+        } else {
+            collapsed
+        }
     }
 
     /// Percent-encodes each dot-separated segment of a UC name individually.
@@ -1179,6 +1195,23 @@ mod tests {
             gcp.gcp_oauth_token.expect("token present").oauth_token,
             "ya29.token"
         );
+    }
+
+    #[test]
+    fn test_sanitize_response_body_collapses_whitespace() {
+        let body = "{\n  \"error_code\": \"PERMISSION_DENIED\",\n\t\"message\":   \"denied\"\n}";
+        assert_eq!(
+            super::UnityCatalog::sanitize_response_body(body),
+            "{ \"error_code\": \"PERMISSION_DENIED\", \"message\": \"denied\" }"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_response_body_truncates_large_bodies() {
+        let body = "x".repeat(10_000);
+        let sanitized = super::UnityCatalog::sanitize_response_body(&body);
+        assert!(sanitized.ends_with("… (truncated)"));
+        assert!(sanitized.chars().count() < 600);
     }
 
     #[test]
