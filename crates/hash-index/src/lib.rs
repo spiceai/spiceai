@@ -61,7 +61,8 @@ pub use extract::{
 };
 pub use index::{
     HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, PrehashedBuildHasher, PrehashedHasher,
-    RowLocation, XxHash3BuildHasher, hash_key, hash_key_128, hash_key_bytes, index_threshold,
+    RowLocation, XxHash3BuildHasher, XxHash3Hasher, hash_key, hash_key_128, hash_key_bytes,
+    hash_key_i64, index_threshold,
 };
 
 use snafu::prelude::*;

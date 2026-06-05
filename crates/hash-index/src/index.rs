@@ -129,10 +129,27 @@ pub fn hash_key_128(key: &[u8]) -> u128 {
     XxHash3_128::oneshot_with_seed(HASH_SEED, key)
 }
 
-/// [`BuildHasher`](std::hash::BuildHasher) producing the same seeded XXH3-64
-/// hashers as [`hash_key`], for keyed containers (e.g. `HashMap`/`im::HashMap`)
-/// that should share this crate's hashing instead of the standard library's
-/// SipHash default.
+/// One-shot XXH3-64 of an `i64` key. Produces the same value as
+/// [`hash_key`]`(&key)` — both hash the value's native-endian bytes with the
+/// crate seed — but skips the streaming hasher construction, which dominates
+/// per-probe cost when the entire input is 8 bytes. The equality is pinned by
+/// the `hash_key_i64_matches_streaming_hash_key` test.
+#[inline]
+#[must_use]
+pub fn hash_key_i64(key: i64) -> u64 {
+    XxHash3_64::oneshot_with_seed(HASH_SEED, &key.to_ne_bytes())
+}
+
+/// [`BuildHasher`](std::hash::BuildHasher) producing seeded XXH3-64 hashers
+/// that agree with [`hash_key`], for keyed containers (e.g.
+/// `HashMap`/`im::HashMap`) that should share this crate's hashing instead of
+/// the standard library's SipHash default.
+///
+/// The produced [`XxHash3Hasher`] buffers short inputs and hashes them with
+/// the **one-shot** XXH3-64 at `finish()`, skipping the streaming hasher's
+/// per-probe setup cost — the dominant term for 8-byte integer keys. Values
+/// are identical to streaming XXH3 over the same byte sequence, so containers
+/// using this hasher agree with [`hash_key`] / [`hash_key_i64`].
 ///
 /// The seed is fixed (not per-process random), matching [`hash_key`]: keys
 /// hashed here are internal primary-key values already fronted by fixed-seed
@@ -142,11 +159,66 @@ pub fn hash_key_128(key: &[u8]) -> u128 {
 pub struct XxHash3BuildHasher;
 
 impl std::hash::BuildHasher for XxHash3BuildHasher {
-    type Hasher = XxHash3_64;
+    type Hasher = XxHash3Hasher;
 
     #[inline]
-    fn build_hasher(&self) -> XxHash3_64 {
-        XxHash3_64::with_seed(HASH_SEED)
+    fn build_hasher(&self) -> XxHash3Hasher {
+        XxHash3Hasher {
+            buf: [0; XXH3_HASHER_INLINE_BUF],
+            len: 0,
+            spill: None,
+        }
+    }
+}
+
+/// Inline buffer size for [`XxHash3Hasher`]. Covers integer keys and small
+/// composites; longer inputs spill to the streaming implementation.
+const XXH3_HASHER_INLINE_BUF: usize = 32;
+
+/// Hasher produced by [`XxHash3BuildHasher`]. Buffers written bytes (up to
+/// [`XXH3_HASHER_INLINE_BUF`] inline) and hashes them one-shot at `finish()`;
+/// longer inputs spill to streaming XXH3-64, producing identical values.
+pub struct XxHash3Hasher {
+    buf: [u8; XXH3_HASHER_INLINE_BUF],
+    len: usize,
+    spill: Option<XxHash3_64>,
+}
+
+impl std::fmt::Debug for XxHash3Hasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `XxHash3_64` has no `Debug` impl; report the mode instead.
+        f.debug_struct("XxHash3Hasher")
+            .field("buffered_len", &self.len)
+            .field("spilled", &self.spill.is_some())
+            .finish()
+    }
+}
+
+impl std::hash::Hasher for XxHash3Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        match &self.spill {
+            Some(streaming) => std::hash::Hasher::finish(streaming),
+            None => XxHash3_64::oneshot_with_seed(HASH_SEED, &self.buf[..self.len]),
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(streaming) = &mut self.spill {
+            std::hash::Hasher::write(streaming, bytes);
+            return;
+        }
+        let new_len = self.len + bytes.len();
+        if new_len <= XXH3_HASHER_INLINE_BUF {
+            self.buf[self.len..new_len].copy_from_slice(bytes);
+            self.len = new_len;
+        } else {
+            let mut streaming = XxHash3_64::with_seed(HASH_SEED);
+            std::hash::Hasher::write(&mut streaming, &self.buf[..self.len]);
+            std::hash::Hasher::write(&mut streaming, bytes);
+            self.spill = Some(streaming);
+        }
     }
 }
 
@@ -204,6 +276,59 @@ impl std::hash::Hasher for PrehashedHasher {
     #[inline]
     fn write_u64(&mut self, value: u64) {
         self.state = value;
+    }
+}
+
+#[cfg(test)]
+mod hashing_tests {
+    use super::*;
+    use std::hash::{BuildHasher, Hasher};
+
+    /// Pins the one-shot/streaming equality that bloom filters and maps rely
+    /// on to agree: `hash_key_i64` must equal `hash_key(&i64)` forever.
+    #[test]
+    fn hash_key_i64_matches_streaming_hash_key() {
+        for key in [0_i64, 1, -1, 42, i64::MIN, i64::MAX, 0x5370_6963] {
+            assert_eq!(hash_key_i64(key), hash_key(&key), "mismatch for {key}");
+        }
+    }
+
+    /// The buffered one-shot hasher must agree with [`hash_key`] for hashed
+    /// integer keys (a container keyed with `XxHash3BuildHasher` and a filter
+    /// fed by `hash_key`/`hash_key_i64` see the same values).
+    #[test]
+    fn build_hasher_matches_hash_key_for_i64() {
+        for key in [0_i64, 7, -7, i64::MIN, i64::MAX] {
+            let mut hasher = XxHash3BuildHasher.build_hasher();
+            std::hash::Hash::hash(&key, &mut hasher);
+            assert_eq!(hasher.finish(), hash_key(&key), "mismatch for {key}");
+        }
+    }
+
+    /// Split writes must hash like one contiguous write, and inputs past the
+    /// inline buffer must spill to streaming with identical results.
+    #[test]
+    fn buffered_hasher_is_write_boundary_invariant() {
+        let payload: Vec<u8> = (0_u8..=63).collect(); // 64 bytes: forces spill
+        for split in [1_usize, 8, 31, 32, 33, 63] {
+            let mut split_hasher = XxHash3BuildHasher.build_hasher();
+            split_hasher.write(&payload[..split]);
+            split_hasher.write(&payload[split..]);
+
+            let mut whole_hasher = XxHash3BuildHasher.build_hasher();
+            whole_hasher.write(&payload);
+
+            assert_eq!(
+                split_hasher.finish(),
+                whole_hasher.finish(),
+                "mismatch at split {split}"
+            );
+            assert_eq!(
+                whole_hasher.finish(),
+                XxHash3_64::oneshot_with_seed(HASH_SEED, &payload),
+                "spill path must match one-shot at split {split}"
+            );
+        }
     }
 }
 

@@ -56,7 +56,7 @@ limitations under the License.
 //! for the rebuild policy.
 
 use hash_index::{
-    PrehashedBuildHasher, SplitBlockBloomFilter, XxHash3BuildHasher, hash_key, hash_key_128,
+    PrehashedBuildHasher, SplitBlockBloomFilter, XxHash3BuildHasher, hash_key_128, hash_key_i64,
 };
 use im::HashMap as PersistentHashMap;
 use std::collections::HashMap;
@@ -70,8 +70,8 @@ const MIN_BLOOM_CAPACITY: usize = 64;
 /// (SipHash-1-3), which showed up as `im::nodes::hamt::hash_key` in executor
 /// profiles of changes-mode ingest — every probe was paying a SipHash walk on
 /// top of the seeded-XXH3 bloom hash. [`XxHash3BuildHasher`] uses the same
-/// seeded XXH3-64 as [`hash_key`], so map and bloom hashing now agree at a
-/// fraction of SipHash's per-key cost.
+/// seeded XXH3-64 as [`hash_key_i64`], so map and bloom hashing now agree at
+/// a fraction of SipHash's per-key cost.
 pub type DeletionIndexHasher = XxHash3BuildHasher;
 
 /// Bloom capacity for a deletion set of `len` keys: sized with 2x headroom so the
@@ -255,7 +255,7 @@ impl DeletionIndex {
         let capacity = bloom_capacity_for(deleted.len());
         let bloom = SplitBlockBloomFilter::new(capacity);
         for &pk in deleted.keys() {
-            bloom.insert(hash_key(&pk));
+            bloom.insert(hash_key_i64(pk));
         }
         let max_sequence_number = deleted.values().copied().max();
         let delete_count = deleted.len();
@@ -356,7 +356,7 @@ impl DeletionIndex {
     #[inline]
     #[must_use]
     pub fn might_contain(&self, pk: i64) -> bool {
-        self.bloom.might_contain(hash_key(&pk))
+        self.bloom.might_contain(hash_key_i64(pk))
     }
 
     /// Bloom-prefiltered lookup. Returns the key's [`Tombstone`] if `pk` has a
@@ -369,7 +369,7 @@ impl DeletionIndex {
     #[inline]
     #[must_use]
     pub fn get(&self, pk: i64) -> Option<Tombstone> {
-        if !self.bloom.might_contain(hash_key(&pk)) {
+        if !self.bloom.might_contain(hash_key_i64(pk)) {
             return None;
         }
         self.entries.get(&pk).and_then(Tombstone::from_entry)
@@ -486,7 +486,7 @@ impl DeletionIndex {
             let bloom = SplitBlockBloomFilter::new(new_capacity);
             for (pk, entry) in &entries {
                 if entry.delete_seq != SEQUENCE_ABSENT {
-                    bloom.insert(hash_key(pk));
+                    bloom.insert(hash_key_i64(*pk));
                 }
             }
             return Self {
@@ -502,7 +502,7 @@ impl DeletionIndex {
         // Common path: insert only the newly-deleted keys into the shared
         // filter (O(K) relaxed atomic stores; see the safety argument above).
         for pk in &new_delete_keys {
-            self.bloom.insert(hash_key(pk));
+            self.bloom.insert(hash_key_i64(*pk));
         }
         Self {
             entries,
