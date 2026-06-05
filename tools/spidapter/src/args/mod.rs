@@ -40,6 +40,10 @@ pub struct StdioArgs {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Enable debug mode on the Spice Cloud deployment (sets debug=true on the deployment request).
+    #[arg(long, env = "SPIDAPTER_SPICE_DEBUG", default_value_t = false)]
+    pub spice_debug: bool,
+
     /// Named scenario to load (e.g. `postgres-wal`). Defines the source and EC2/cloud config.
     /// Built-in: `direct-ingest`, `postgres-wal`, `postgres-debezium`, `dynamodb-streams`, `mongodb-streams`.
     #[arg(long, env = "SPIDAPTER_SCENARIO")]

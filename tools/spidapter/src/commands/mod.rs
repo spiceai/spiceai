@@ -322,22 +322,20 @@ pub(crate) async fn create_deployment(
     cloud: &CloudClient,
     app_id: i64,
     channel: Option<&UpdateChannel>,
+    debug: bool,
 ) -> anyhow::Result<()> {
-    let created = cloud
-        .create_deployment(
-            app_id,
-            &CreateDeploymentRequest {
-                image: None,
-                image_tag: None,
-                replicas: Some(1),
-                branch: None,
-                commit_sha: None,
-                commit_message: None,
-                channel: channel.map(ToString::to_string),
-                debug: false,
-            },
-        )
-        .await?;
+    let req = CreateDeploymentRequest {
+        image: None,
+        image_tag: None,
+        replicas: Some(1),
+        branch: None,
+        commit_sha: None,
+        commit_message: None,
+        channel: channel.map(ToString::to_string),
+        debug,
+    };
+    eprintln!("[stdio] CreateDeploymentRequest: {req:?}");
+    let created = cloud.create_deployment(app_id, &req).await?;
     eprintln!("Deployment {} created", created.id);
     Ok(())
 }

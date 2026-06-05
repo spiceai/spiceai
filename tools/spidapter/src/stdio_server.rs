@@ -241,7 +241,7 @@ impl Drop for DynamoDbGuard {
 /// Configuration for the federated storage backend for a benchmark run.
 #[derive(Debug, Clone)]
 enum FederatedStorageConfig {
-    DirectIngest,
+    Direct,
     Postgres {
         pg: PgConfig,
         acceleration: AccelerationEngine,
@@ -266,7 +266,7 @@ enum FederatedStorageConfig {
 impl FederatedStorageConfig {
     fn deployment_mode(&self) -> DeploymentMode {
         match self {
-            Self::DirectIngest => DeploymentMode::Cluster,
+            Self::Direct => DeploymentMode::Cluster,
             _ => DeploymentMode::SingleNode,
         }
     }
@@ -294,7 +294,7 @@ impl SetupConfig {
         Self {
             region: metadata_string(metadata, "etl_region"),
             spicepod_path: metadata_string(metadata, "spicepod_path"),
-            storage: FederatedStorageConfig::DirectIngest,
+            storage: FederatedStorageConfig::Direct,
             aws_region_override: None,
         }
     }
@@ -461,7 +461,7 @@ impl Handler for SpidapterHandler {
         };
 
         let storage = match &self.scenario.source {
-            SourceConfig::Direct(_) => FederatedStorageConfig::DirectIngest,
+            SourceConfig::Direct(_) => FederatedStorageConfig::Direct,
 
             SourceConfig::PostgresWal(PgEndpoint::Provision(prov)) => {
                 let ec2 = launch_postgres_ec2(&prov.ec2, &region, short_id)
@@ -667,7 +667,7 @@ impl Handler for SpidapterHandler {
         // For Cayenne (DirectIngest): provision spiced first (Flight URL needed to build SinkConfig).
         // For all other backends: build SinkConfig first, then provision spiced.
         let (sink, mut state) =
-            if matches!(&setup_config.storage, FederatedStorageConfig::DirectIngest) {
+            if matches!(&setup_config.storage, FederatedStorageConfig::Direct) {
                 let deployment_mode = setup_config.storage.deployment_mode();
                 let provision_result = match self.compute() {
                     SpiceCompute::Scp => {
@@ -776,7 +776,7 @@ impl Handler for SpidapterHandler {
                     FederatedStorageConfig::MongoDB { uri, .. } => {
                         SinkConfig::MongoDb { uri: uri.clone() }
                     }
-                    FederatedStorageConfig::DirectIngest => unreachable!(),
+                    FederatedStorageConfig::Direct => unreachable!(),
                 };
 
                 let deployment_mode = setup_config.storage.deployment_mode();
@@ -866,7 +866,7 @@ impl Handler for SpidapterHandler {
         }
 
         let catalog_namespace = match &setup_config.storage {
-            FederatedStorageConfig::DirectIngest => Some("spicebench.bench".to_string()),
+            FederatedStorageConfig::Direct => Some("spicebench.bench".to_string()),
             FederatedStorageConfig::DynamoDB { prefix, .. } if !prefix.is_empty() => {
                 Some(prefix.clone())
             }
@@ -1029,7 +1029,7 @@ impl Handler for SpidapterHandler {
             }
             FederatedStorageConfig::DynamoDB { .. }
             | FederatedStorageConfig::MongoDB { .. }
-            | FederatedStorageConfig::DirectIngest => {}
+            | FederatedStorageConfig::Direct => {}
         }
 
         let mut cleanup: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -1429,7 +1429,7 @@ async fn generate_initial_spicepod(
                 datasets,
                 acceleration_engine_str(*acceleration),
             ),
-            FederatedStorageConfig::DirectIngest => generate_cayenne_sink_spicepod(
+            FederatedStorageConfig::Direct => generate_cayenne_sink_spicepod(
                 run_id,
                 flight_api_key,
                 cayenne,
@@ -1521,6 +1521,7 @@ mod tests {
             api_key: None,
             spice_cloud_api_url: "https://api.spice.ai".to_string(),
             spiced_binary: "spiced".to_string(),
+            spice_debug: false,
         }
     }
 
@@ -1572,7 +1573,7 @@ mod tests {
         let setup_config = SetupConfig {
             region: None,
             spicepod_path: None,
-            storage: FederatedStorageConfig::DirectIngest,
+            storage: FederatedStorageConfig::Direct,
             aws_region_override: None,
         };
 
@@ -1636,7 +1637,7 @@ mod tests {
         let setup_config = SetupConfig {
             region: None,
             spicepod_path: Some(path.to_string_lossy().into_owned()),
-            storage: FederatedStorageConfig::DirectIngest,
+            storage: FederatedStorageConfig::Direct,
             aws_region_override: None,
         };
         let datasets: HashMap<String, DatasetConfig> = HashMap::new();

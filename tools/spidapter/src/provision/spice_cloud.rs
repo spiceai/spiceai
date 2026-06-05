@@ -161,7 +161,7 @@ pub(crate) async fn provision_scp_app(
     }
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, scp.channel.as_ref()).await?;
+    commands::create_deployment(&cloud, app_id, scp.channel.as_ref(), args.spice_debug).await?;
 
     // Always wait for spiced to accept SQL queries before returning.
     let poll_client = reqwest::Client::builder()
@@ -197,7 +197,7 @@ pub(crate) async fn provision_scp_app(
         flight_url,
         sql_url,
         cloud,
-        storage: FederatedStorageConfig::DirectIngest, // will be replaced by setup() caller
+        storage: FederatedStorageConfig::Direct, // will be replaced by setup() caller
         ec2_guards: vec![],
         dynamodb_guard: None,
     })))

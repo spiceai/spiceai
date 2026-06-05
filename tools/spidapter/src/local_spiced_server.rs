@@ -31,5 +31,6 @@ fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
         spice_cloud_api_url: String::new(),
         api_key: None,
         spiced_binary: args.spiced_binary.clone(),
+        spice_debug: false,
     }
 }

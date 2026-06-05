@@ -82,7 +82,7 @@ pub(crate) async fn provision_local_single_node(
     let ports = allocate_local_ports(LOCAL_BIND_HOST)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
-    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::DirectIngest)
+    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::Direct)
         .then(|| format!("spidapter-local-{run_id}"));
 
     let spicepod_path = match async {
@@ -191,7 +191,7 @@ pub(crate) async fn provision_local_spiced_cluster(
     let cluster_ports = allocate_cluster_ports(LOCAL_BIND_HOST, num_exec)?;
 
     let working_dir = create_local_working_dir(run_id).await?;
-    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::DirectIngest)
+    let local_flight_api_key = matches!(setup_config.storage, FederatedStorageConfig::Direct)
         .then(|| format!("spidapter-local-{run_id}"));
 
     let setup_result = async {
