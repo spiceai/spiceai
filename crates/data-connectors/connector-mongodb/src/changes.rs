@@ -69,7 +69,9 @@ pub fn build_changes_stream(
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
+        eprintln!("DIAGTEMP cs: entered build_changes_stream body, got table_provider for {}", dataset.name);
         let primary_keys = resolve_primary_keys(&dataset.name, dataset.acceleration.as_ref(), &schema)?;
+        eprintln!("DIAGTEMP cs: resolved primary_keys={primary_keys:?} for {}", dataset.name);
         let config = ChangeStreamConfig::from_params(&params)?;
         let invalid_token_behavior = ResumeTokenInvalidBehavior::from_params(&params)?;
         let collection_name = dataset.path().to_string();
@@ -81,6 +83,7 @@ pub fn build_changes_stream(
                 "Failed to connect to MongoDB Change Stream for dataset `{}` collection `{collection_name}`: {error}",
                 dataset.name
             )))?;
+        eprintln!("DIAGTEMP cs: connected to mongo for change stream {}", dataset.name);
         let collection = connection
             .client
             .database(&connection.db_name)
@@ -177,7 +180,9 @@ pub fn build_changes_stream(
                 .map_err(StreamError::MongoDB)?;
             yield ChangeEnvelope::new(Box::new(NoOpCommitter), truncate, false);
 
+            eprintln!("DIAGTEMP cs: change stream opened, creating snapshot stream for {}", dataset.name);
             let mut snapshot_stream = snapshot_stream(table_provider).await?;
+            eprintln!("DIAGTEMP cs: snapshot_stream created for {}", dataset.name);
             while let Some(batch) = FuturesStreamExt::next(&mut snapshot_stream).await {
                 let batch = batch.map_err(|error| StreamError::Arrow(error.to_string()))?;
                 if batch.num_rows() == 0 {

@@ -31,7 +31,7 @@ use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
 };
 
-use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior};
+use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, RefreshMode};
 
 /// Fill acceleration settings the user left unset using `inferred` source metadata.
 ///
@@ -117,9 +117,19 @@ pub fn apply_inferred_schema(
         }
     }
 
-    // 3) Sort columns — only when no engine sort param is configured.
-    let applied_sort = apply_inferred_sort(acceleration, inferred, effective_schema);
+    // 3) Sort columns — only when no engine sort param is configured, and not for
+    // `refresh_mode: changes`. For CDC the accelerator is driven by the upsert key,
+    // not a refresh-time sort; applying `on_refresh_sort_columns` to a change-stream
+    // dataset is at best a no-op and risks perturbing its initial snapshot/refresh,
+    // so inferred-CDC acceleration stays equivalent to a hand-configured one.
+    let is_changes = acceleration.refresh_mode == Some(RefreshMode::Changes);
+    let applied_sort = !is_changes && apply_inferred_sort(acceleration, inferred, effective_schema);
 
+    eprintln!(
+        "DIAGTEMP apply_inferred_schema: ds={dataset_name} is_changes={is_changes} pk_set={} on_conflict={} indexes={applied_indexes} sort_applied={applied_sort}",
+        acceleration.primary_key.is_some(),
+        !acceleration.on_conflict.is_empty(),
+    );
     tracing::debug!(
         dataset = %dataset_name,
         indexes = applied_indexes,
