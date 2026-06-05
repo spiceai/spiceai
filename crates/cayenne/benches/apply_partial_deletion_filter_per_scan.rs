@@ -95,8 +95,12 @@ fn run_full_rebuild(cache: &Arc<DeletionIndex>, snapshot_count: usize, min_seq: 
         let filtered: HashMap<i64, i64> = cache
             .entries()
             .iter()
-            .filter(|(_, seq)| **seq > min_seq)
-            .map(|(&pk, &seq)| (pk, seq))
+            .filter_map(|(&pk, entry)| {
+                entry
+                    .delete_sequence()
+                    .filter(|seq| *seq > min_seq)
+                    .map(|seq| (pk, seq))
+            })
             .collect();
         let index = DeletionIndex::from_map(filtered);
         black_box(index);

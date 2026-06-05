@@ -49,17 +49,19 @@ limitations under the License.
 mod bloom;
 mod extract;
 mod index;
+mod sbbf;
 
 #[cfg(test)]
 mod tests;
 
 pub use bloom::{BatchBloomFilter, BloomFilter};
+pub use sbbf::SplitBlockBloomFilter;
 pub use extract::{
     KeyExtractor, PrimitiveKeyExtractor, RowConverterKeyExtractor, Utf8KeyExtractor,
 };
 pub use index::{
-    HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, RowLocation, hash_key, hash_key_bytes,
-    index_threshold,
+    HashIndex, HashIndexBuilder, InsertResult, NUM_SHARDS, PrehashedBuildHasher, PrehashedHasher,
+    RowLocation, XxHash3BuildHasher, hash_key, hash_key_128, hash_key_bytes, index_threshold,
 };
 
 use snafu::prelude::*;

@@ -54,7 +54,7 @@ use std::time::Instant;
 use arrow::array::RecordBatch;
 use parking_lot::RwLock;
 use snafu::OptionExt;
-use twox_hash::XxHash3_64;
+use twox_hash::{XxHash3_64, XxHash3_128};
 
 use crate::bloom::BloomFilter;
 use crate::extract::create_key_extractor;
@@ -114,6 +114,97 @@ pub fn hash_key_bytes(parts: &[&[u8]]) -> u64 {
         hasher.write(part);
     }
     hasher.finish()
+}
+
+/// Computes a 128-bit XXH3 hash for a byte key, using the same fixed seed as
+/// [`hash_key`].
+///
+/// Use this where a hash value serves as the key's *identity* (the key bytes
+/// are not retained for comparison): a 64-bit hash reaches ~0.3% collision
+/// probability at one billion keys (birthday bound), while 128 bits stays
+/// below ~1e-20 at the same scale — far under hardware error rates.
+#[inline]
+#[must_use]
+pub fn hash_key_128(key: &[u8]) -> u128 {
+    XxHash3_128::oneshot_with_seed(HASH_SEED, key)
+}
+
+/// [`BuildHasher`](std::hash::BuildHasher) producing the same seeded XXH3-64
+/// hashers as [`hash_key`], for keyed containers (e.g. `HashMap`/`im::HashMap`)
+/// that should share this crate's hashing instead of the standard library's
+/// SipHash default.
+///
+/// The seed is fixed (not per-process random), matching [`hash_key`]: keys
+/// hashed here are internal primary-key values already fronted by fixed-seed
+/// bloom filters, so per-process seeding would add cost without changing the
+/// trust model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XxHash3BuildHasher;
+
+impl std::hash::BuildHasher for XxHash3BuildHasher {
+    type Hasher = XxHash3_64;
+
+    #[inline]
+    fn build_hasher(&self) -> XxHash3_64 {
+        XxHash3_64::with_seed(HASH_SEED)
+    }
+}
+
+/// [`BuildHasher`](std::hash::BuildHasher) for maps whose keys are *already*
+/// uniform hash values (e.g. a `u128` from [`hash_key_128`]): passes the key's
+/// own entropy through instead of re-hashing it. `u128` keys contribute their
+/// low 64 bits; `u64` keys pass through unchanged.
+///
+/// Only meaningful for pre-hashed keys — using it with structured keys would
+/// forfeit hashing entirely (non-integer writes fall back to seeded XXH3-64 to
+/// stay correct, at normal hashing cost).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrehashedBuildHasher;
+
+impl std::hash::BuildHasher for PrehashedBuildHasher {
+    type Hasher = PrehashedHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> PrehashedHasher {
+        PrehashedHasher { state: 0 }
+    }
+}
+
+/// Hasher produced by [`PrehashedBuildHasher`]. See its docs for the contract.
+#[derive(Debug)]
+pub struct PrehashedHasher {
+    state: u64,
+}
+
+impl std::hash::Hasher for PrehashedHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback for non-integer keys: real hashing so correctness never
+        // depends on callers honoring the pre-hashed contract.
+        let mut hasher = XxHash3_64::with_seed(HASH_SEED);
+        std::hash::Hasher::write(&mut hasher, &self.state.to_le_bytes());
+        std::hash::Hasher::write(&mut hasher, bytes);
+        self.state = std::hash::Hasher::finish(&hasher);
+    }
+
+    #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "low 64 bits of a uniform 128-bit hash are themselves uniform"
+    )]
+    fn write_u128(&mut self, value: u128) {
+        self.state = value as u64;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.state = value;
+    }
 }
 
 /// Location of a row in the accelerator's storage.

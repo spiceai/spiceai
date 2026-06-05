@@ -118,8 +118,7 @@ fn build_index(rows: usize, ratio: f64) -> DeletionIndex {
 fn keep_mask_vec_bool(
     batch: &RecordBatch,
     pk_column_index: usize,
-    deleted_pk_values: &DeletionIndex,
-    insert_records: &DeletionIndex,
+    tombstones: &DeletionIndex,
 ) -> RecordBatch {
     let batch_size = batch.num_rows();
     let pk_column = batch.column(pk_column_index);
@@ -131,11 +130,11 @@ fn keep_mask_vec_bool(
     let mut keep_mask: Vec<bool> = Vec::with_capacity(batch_size);
     let mut keep_count: usize = 0;
     for &pk in pk_slice {
-        let visible = match deleted_pk_values.get(pk) {
+        let visible = match tombstones.get(pk) {
             None => true,
-            Some(delete_seq) => insert_records
-                .get(pk)
-                .is_some_and(|insert_seq| insert_seq > delete_seq),
+            Some(t) => t
+                .insert_sequence
+                .is_some_and(|insert_seq| insert_seq > t.delete_sequence),
         };
         keep_mask.push(visible);
         keep_count += usize::from(visible);
@@ -158,8 +157,7 @@ fn keep_mask_vec_bool(
 fn keep_mask_boolean_buffer(
     batch: &RecordBatch,
     pk_column_index: usize,
-    deleted_pk_values: &DeletionIndex,
-    insert_records: &DeletionIndex,
+    tombstones: &DeletionIndex,
 ) -> RecordBatch {
     let batch_size = batch.num_rows();
     let pk_column = batch.column(pk_column_index);
@@ -171,11 +169,11 @@ fn keep_mask_boolean_buffer(
     let mut builder = BooleanBufferBuilder::new(batch_size);
     let mut keep_count: usize = 0;
     for &pk in pk_slice {
-        let visible = match deleted_pk_values.get(pk) {
+        let visible = match tombstones.get(pk) {
             None => true,
-            Some(delete_seq) => insert_records
-                .get(pk)
-                .is_some_and(|insert_seq| insert_seq > delete_seq),
+            Some(t) => t
+                .insert_sequence
+                .is_some_and(|insert_seq| insert_seq > t.delete_sequence),
         };
         builder.append(visible);
         keep_count += usize::from(visible);
@@ -195,7 +193,6 @@ fn bench_keep_mask(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
 
     let batch = make_batch(ROWS_PER_BATCH);
-    let empty_inserts = DeletionIndex::empty();
 
     for (shape_name, ratio) in SHAPES {
         let index = build_index(ROWS_PER_BATCH, *ratio);
@@ -209,7 +206,6 @@ fn bench_keep_mask(c: &mut Criterion) {
                         black_box(&batch),
                         black_box(0),
                         black_box(&index),
-                        black_box(&empty_inserts),
                     );
                     black_box(out);
                 });
@@ -225,7 +221,6 @@ fn bench_keep_mask(c: &mut Criterion) {
                         black_box(&batch),
                         black_box(0),
                         black_box(&index),
-                        black_box(&empty_inserts),
                     );
                     black_box(out);
                 });
