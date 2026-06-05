@@ -105,14 +105,13 @@ impl CayenneCatalogConnector {
         // that does not parse, so a typo surfaces instead of being silently
         // dropped — matching the acceleration-param path's behavior.
         fn parse_num_param<T: std::str::FromStr>(value: &str, key: &str) -> Option<T> {
-            match value.parse::<T>() {
-                Ok(parsed) => Some(parsed),
-                Err(_) => {
-                    tracing::warn!(
-                        "Invalid Cayenne catalog parameter `{key}` value `{value}`; expected a number, ignoring it. See https://spiceai.org/docs/components/catalogs/cayenne"
-                    );
-                    None
-                }
+            if let Ok(parsed) = value.parse::<T>() {
+                Some(parsed)
+            } else {
+                tracing::warn!(
+                    "Invalid Cayenne catalog parameter `{key}` value `{value}`; expected a number, ignoring it. See https://spiceai.org/docs/components/catalogs/cayenne"
+                );
+                None
             }
         }
         let data_dir = self
