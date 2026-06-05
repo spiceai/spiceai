@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Display,
+    sync::Arc,
+};
 
 use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
@@ -291,34 +295,18 @@ impl Query {
     /// - The query contains multiple statements (only single statements are supported)
     pub fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
         use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
-        use datafusion::sql::sqlparser::parser::Parser;
         use std::ops::ControlFlow;
 
-        // Parse the SQL query using sqlparser
-        let dialect = datafusion::sql::sqlparser::dialect::PostgreSqlDialect {};
-        let mut statements = Parser::parse_sql(&dialect, &self.sql).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse query '{}' for reference schema rewrite: {}",
-                self.name,
-                e
-            )
-        })?;
-
-        // Should have exactly one statement
-        if statements.len() != 1 {
-            anyhow::bail!(
-                "Query '{}' has {} SQL statements (expected 1) for reference schema rewrite",
-                self.name,
-                statements.len()
-            );
-        }
-
-        let statement = &mut statements[0];
+        let mut statement = self.parse_single_statement("reference schema rewrite")?;
+        let cte_names = collect_cte_names(&statement);
 
         // Visit and rewrite all table references in the statement
-        let _ = visit_relations_mut(statement, |table_name| {
+        let _ = visit_relations_mut(&mut statement, |table_name| {
             // Only rewrite if the table doesn't already have a schema prefix (single-part name)
-            if table_name.0.len() == 1 {
+            if table_name.0.len() == 1
+                && let ObjectNamePart::Identifier(ident) = &table_name.0[0]
+                && !cte_names.contains(ident.value.as_str())
+            {
                 // Prepend the reference schema to the table name
                 table_name
                     .0
@@ -337,6 +325,85 @@ impl Query {
             parameters: self.parameters.clone(),
         })
     }
+
+    /// Returns unqualified physical table names referenced by the query.
+    /// Existing schema-qualified tables and CTE references are excluded.
+    ///
+    /// # Errors
+    /// Returns an error if the SQL query cannot be parsed, or if it contains multiple statements.
+    pub fn unqualified_table_names(&self) -> anyhow::Result<BTreeSet<String>> {
+        use datafusion::sql::sqlparser::ast::{ObjectNamePart, visit_relations};
+        use std::ops::ControlFlow;
+
+        let statement = self.parse_single_statement("table name extraction")?;
+        let cte_names = collect_cte_names(&statement);
+        let mut table_names = BTreeSet::new();
+
+        let _ = visit_relations(&statement, |table_name| {
+            if table_name.0.len() == 1
+                && let ObjectNamePart::Identifier(ident) = &table_name.0[0]
+                && !cte_names.contains(ident.value.as_str())
+            {
+                table_names.insert(ident.value.clone());
+            }
+
+            ControlFlow::<()>::Continue(())
+        });
+
+        Ok(table_names)
+    }
+
+    fn parse_single_statement(
+        &self,
+        action: &str,
+    ) -> anyhow::Result<datafusion::sql::sqlparser::ast::Statement> {
+        use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let dialect = PostgreSqlDialect {};
+        let mut statements = Parser::parse_sql(&dialect, &self.sql).map_err(|e| {
+            anyhow::anyhow!("Failed to parse query '{}' for {action}: {e}", self.name)
+        })?;
+
+        if statements.len() != 1 {
+            anyhow::bail!(
+                "Query '{}' has {} SQL statements (expected 1) for {action}",
+                self.name,
+                statements.len()
+            );
+        }
+
+        Ok(statements.remove(0))
+    }
+}
+
+fn collect_cte_names(statement: &datafusion::sql::sqlparser::ast::Statement) -> BTreeSet<String> {
+    use datafusion::sql::sqlparser::ast::{Query as SqlQuery, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct CteNameCollector {
+        names: BTreeSet<String>,
+    }
+
+    impl Visitor for CteNameCollector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                self.names.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.value.clone()),
+                );
+            }
+
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = CteNameCollector::default();
+    let _ = statement.visit(&mut collector);
+    collector.names
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -1107,10 +1174,8 @@ pub fn get_tpch_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
         Some(QueryOverrides::Turso) => remove_tpch_query!(
             queries,
             2, // Correlated scalar subquery not supported; DF limitation, Turso tests are not cross-table federated
-            4, // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
             17, // Correlated scalar subquery not supported
-            21, // Correlated scalar subquery not supported
-            22 // Federation fails for cross-provider EXISTS subquery filters; https://github.com/spiceai/spiceai/issues/10167
+            21  // Correlated scalar subquery not supported
         ),
         Some(QueryOverrides::BigQuery) => {
             let mut queries: Vec<Query> = remove_tpch_query!(
@@ -1489,12 +1554,27 @@ mod tests {
             .expect("Failed to rewrite query with CTE");
 
         let sql = rewritten.sql.as_ref();
-        // Note: The current implementation rewrites ALL table references, including CTE references
-        // This is acceptable for test purposes - if a CTE is prefixed incorrectly, the query will fail
-        // which is fine for validation scenarios
         assert!(sql.contains("arrow.customer"));
         assert!(sql.contains("arrow.orders"));
-        assert!(sql.contains("arrow.cte")); // CTE reference also gets prefixed
+        assert!(sql.contains("FROM cte"));
+        assert!(!sql.contains("arrow.cte"));
+    }
+
+    #[test]
+    fn test_unqualified_table_names_excludes_ctes() {
+        let query = Query::new(
+            "test_cte_tables".into(),
+            "WITH cte AS (SELECT * FROM customer) SELECT * FROM cte JOIN orders ON cte.c_custkey = orders.o_custkey".into(),
+            false,
+        );
+
+        let table_names = query
+            .unqualified_table_names()
+            .expect("Failed to extract table names");
+
+        assert!(table_names.contains("customer"));
+        assert!(table_names.contains("orders"));
+        assert!(!table_names.contains("cte"));
     }
 
     #[test]

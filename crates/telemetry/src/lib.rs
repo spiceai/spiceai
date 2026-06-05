@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 pub use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Histogram};
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::metrics::{Gauge, UpDownCounter};
 use std::{sync::OnceLock, time::Duration};
 
@@ -362,13 +363,33 @@ pub fn track_hash_index_lookup_rows(rows: u64, dimensions: &[KeyValue]) {
         .add(rows, dimensions);
 }
 
+/// Meter for Cayenne operational (operator-facing) metrics.
+///
+/// Unlike the anonymous-telemetry [`meter::METER`], these instruments bind to
+/// the OpenTelemetry **global** provider that the runtime installs during
+/// `init_metrics` with the operator's Prometheus `/metrics`, `spice.runtime.metrics`,
+/// and OTLP readers. Cayenne write-path and scan timings are operator
+/// observability, not product-usage telemetry, so they must NOT route to the
+/// anonymous provider.
+///
+/// The global meter handle is intentionally **not** cached (no `OnceLock` /
+/// `LazyLock`): caching binds permanently to whatever provider is global at first
+/// access, so an early access could freeze it to the startup noop provider — the
+/// same race [`meter::METER`] avoids by being set only after the provider is
+/// installed. Fetching it fresh defers binding to each instrument's first record
+/// (inside the `get_or_init` closures below), which on the scan/write paths
+/// always runs after `init_metrics`.
+fn cayenne_operational_meter() -> Meter {
+    global::meter("cayenne")
+}
+
 static CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES: OnceLock<Gauge<u64>> = OnceLock::new();
 
 pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
     CAYENNE_SCAN_LISTING_TABLE_CACHE_ENTRIES
         .get_or_init(|| {
-            m.u64_gauge("cayenne_scan_listing_table_cache_entries")
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_scan_listing_table_cache_entries")
                 .with_description("Number of entries in the Cayenne scan ListingTable cache.")
                 .with_unit("entries")
                 .build()
@@ -379,10 +400,10 @@ pub fn track_cayenne_scan_listing_table_cache_entries(entries: u64, dimensions: 
 static CAYENNE_LISTING_FENCE_WAIT_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_listing_fence_wait_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
     CAYENNE_LISTING_FENCE_WAIT_DURATION_MS
         .get_or_init(|| {
-            m.f64_histogram("cayenne_listing_fence_wait_duration_ms")
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_listing_fence_wait_duration_ms")
                 .with_description(
                     "Time Cayenne scans spend waiting to acquire the listing fence read lock.",
                 )
@@ -396,10 +417,10 @@ pub fn track_cayenne_listing_fence_wait_duration(duration: Duration, dimensions:
 static CAYENNE_LISTING_SCAN_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_listing_scan_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
     CAYENNE_LISTING_SCAN_DURATION_MS
         .get_or_init(|| {
-            m.f64_histogram("cayenne_listing_scan_duration_ms")
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_listing_scan_duration_ms")
                 .with_description(
                     "Time Cayenne scans spend building the main ListingTable execution plan while holding the listing fence.",
                 )
@@ -413,16 +434,100 @@ pub fn track_cayenne_listing_scan_duration(duration: Duration, dimensions: &[Key
 static CAYENNE_WRITE_PHASE_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
     CAYENNE_WRITE_PHASE_DURATION_MS
         .get_or_init(|| {
-            m.f64_histogram("cayenne_write_phase_duration_ms")
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_write_phase_duration_ms")
                 .with_description("Time spent in Cayenne write-path phases.")
                 .with_unit("ms")
                 .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
                 .build()
         })
         .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Build-once accessor for the compaction-duration histogram. The first call
+/// installs the instrument against whatever global meter is current, so the
+/// binary forces this (via [`register_cayenne_compaction_metrics`]) only after
+/// the Prometheus meter provider is installed — otherwise the instrument would
+/// bind permanently to the early noop meter and never reach `/metrics`.
+fn cayenne_compaction_duration_ms() -> &'static Histogram<f64> {
+    CAYENNE_COMPACTION_DURATION_MS.get_or_init(|| {
+        cayenne_operational_meter()
+            .f64_histogram("cayenne_compaction_duration_ms")
+            .with_description("Wall-clock time of Cayenne background compaction passes.")
+            .with_unit("ms")
+            .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+            .build()
+    })
+}
+
+/// Records the wall-clock duration of a Cayenne background compaction pass.
+/// `dimensions` should carry `table` and `result` (`"completed"` | `"failed"`).
+/// The histogram's count doubles as the compaction-pass counter.
+pub fn track_cayenne_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
+    cayenne_compaction_duration_ms().record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_COMPACTION_MEMORY_POOL_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Build-once accessor for the carved compaction-pool-size gauge.
+fn cayenne_compaction_memory_pool_bytes() -> &'static Gauge<u64> {
+    CAYENNE_COMPACTION_MEMORY_POOL_BYTES.get_or_init(|| {
+        cayenne_operational_meter()
+            .u64_gauge("cayenne_compaction_memory_pool_bytes")
+            .with_description(
+                "Size of the dedicated compaction memory pool carved from the query memory limit.",
+            )
+            .with_unit("By")
+            .build()
+    })
+}
+
+/// Records the size in bytes of the dedicated compaction memory pool carved from
+/// the query memory limit. Published once via [`register_cayenne_compaction_metrics`].
+pub fn track_cayenne_compaction_memory_pool_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    cayenne_compaction_memory_pool_bytes().record(bytes, dimensions);
+}
+
+static CAYENNE_COMPACTION_MEMORY_EXHAUSTED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Build-once accessor for the compaction-pool-exhaustion counter.
+fn cayenne_compaction_memory_exhausted() -> &'static Counter<u64> {
+    CAYENNE_COMPACTION_MEMORY_EXHAUSTED.get_or_init(|| {
+        cayenne_operational_meter()
+            .u64_counter("cayenne_compaction_memory_exhausted_total")
+            .with_description(
+                "Compaction passes that hit ResourcesExhausted on the dedicated compaction memory pool.",
+            )
+            .build()
+    })
+}
+
+/// Counts compaction passes that failed because the dedicated compaction memory
+/// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
+/// means the carve fraction is too small for the rewrite working set.
+pub fn track_cayenne_compaction_memory_exhausted(dimensions: &[KeyValue]) {
+    cayenne_compaction_memory_exhausted().add(1, dimensions);
+}
+
+/// Register the Cayenne compaction instruments against the global meter so they
+/// appear in Prometheus `/metrics` from startup — and so the one-shot pool-size
+/// gauge binds to the real Prometheus meter rather than the early noop one.
+///
+/// The binary MUST call this once, AFTER `init_metrics` has installed the
+/// Prometheus meter provider (the compaction runtime is set up earlier, before
+/// metrics init, so emitting these at carve time would bind them to the noop
+/// meter permanently). `compaction_pool_bytes` is the carved pool size to publish.
+pub fn register_cayenne_compaction_metrics(compaction_pool_bytes: u64) {
+    // Force the histogram + counter to build now (Prometheus-backed); they show
+    // up at zero until the first compaction pass updates them.
+    let _ = cayenne_compaction_duration_ms();
+    let _ = cayenne_compaction_memory_exhausted();
+    // Publish the carved pool size against the real meter.
+    cayenne_compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
 }
 
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();

@@ -24,7 +24,7 @@ use vortex::VortexSessionDefault;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
 use vortex_session::VortexSession;
 
-use crate::metadata::{PkConflictDetection, VortexConfig};
+use crate::metadata::{DeletionMode, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -55,14 +55,27 @@ pub struct CayenneContext {
     runtime_env: Arc<RuntimeEnv>,
 }
 
+/// Default byte budget for the in-memory PK keyset cache when
+/// `cayenne_pk_keyset_cache_mb` is unset. 256 MiB preserves historical behavior;
+/// raise the param on memory-rich hosts so high-cardinality tables keep their
+/// keyset resident instead of rebuilding it from a full-table scan every CDC
+/// batch.
+pub(crate) const DEFAULT_PK_KEYSET_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Hard ceiling on the configurable PK keyset cache budget. The budget doubles as
+/// the bloom allocation size (`PkBloom::with_byte_budget`), so an out-of-range or
+/// typo'd `cayenne_pk_keyset_cache_mb` must not be able to request a
+/// near-`usize::MAX` allocation. Matches the auto-default's 8 GiB ceiling.
+pub(crate) const PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
 impl CayenneContext {
     /// Create a new Cayenne context from configuration.
     ///
     /// This creates a new `VortexFormat`. The shared runtime's file metadata cache
     /// is configured once by the owning runtime before table providers are created.
     #[must_use]
-    pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>) -> Arc<Self> {
-        let vortex_format = Self::create_vortex_format(config);
+    pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
+        let vortex_format = Self::create_vortex_format(config, dataset);
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
@@ -170,6 +183,29 @@ impl CayenneContext {
         self.config.pk_conflict_detection
     }
 
+    /// How primary-key deletions are recorded and applied for PK tables.
+    /// The default `auto` resolves to `position` (merge-on-read position-delete
+    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
+    #[must_use]
+    pub(crate) fn deletion_mode(&self) -> DeletionMode {
+        self.config.deletion_mode
+    }
+
+    /// Byte budget for the in-memory PK keyset cache used during upsert conflict
+    /// detection. See [`DEFAULT_PK_KEYSET_CACHE_MAX_BYTES`].
+    #[must_use]
+    pub(crate) fn pk_keyset_cache_max_bytes(&self) -> usize {
+        self.config
+            .pk_keyset_cache_mb
+            .map_or(DEFAULT_PK_KEYSET_CACHE_MAX_BYTES, |mb| {
+                // Cap the configured budget: it doubles as the bloom allocation
+                // size, so a huge/typo'd value would otherwise saturate and try
+                // to allocate ~`usize::MAX`. `0` is preserved (forces the bloom).
+                mb.saturating_mul(1024 * 1024)
+                    .min(PK_KEYSET_CACHE_MAX_CONFIGURABLE_BYTES)
+            })
+    }
+
     /// Build the compaction picker config from the underlying `VortexConfig`.
     #[must_use]
     pub(crate) fn compaction_picker_config(&self) -> super::compaction::CompactionPickerConfig {
@@ -231,7 +267,7 @@ impl CayenneContext {
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
-    fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
+    fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings
         // Note: Write strategy configuration (e.g., compression) is applied at write time via
         // `session.write_options().with_strategy(...)`, not at the VortexFormat level
@@ -257,7 +293,9 @@ impl CayenneContext {
             ..VortexTableOptions::default()
         };
 
-        Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
+        Arc::new(
+            VortexFormat::new_with_options(vortex_session, vortex_opts).with_dataset_label(dataset),
+        )
     }
 }
 
@@ -268,7 +306,7 @@ mod tests {
     #[test]
     fn cayenne_enables_vortex_projection_pushdown_by_default() {
         let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
 
         assert_eq!(
             context.file_format().options().projection_pushdown,

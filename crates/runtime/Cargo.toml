@@ -288,14 +288,6 @@ cosmosdb = ["data_components/cosmosdb"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks", "dep:duration-parse"]
 debezium = ["kafka", "data_components/debezium"]
-default = [
-    "keyring-secret-store",
-    "aws-secrets-manager",
-    "hashicorp_vault",
-    "sharepoint",
-    "bedrock",
-    "flightsql",
-]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
@@ -335,6 +327,7 @@ keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = [
+    "bedrock",
     "model_components/full",
     "mcp",
     "runtime-datafusion-udfs/models",

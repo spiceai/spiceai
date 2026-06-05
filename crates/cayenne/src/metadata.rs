@@ -106,7 +106,7 @@ pub struct DataFile {
 }
 
 /// The type of deletion vector: position-based or key-based.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DeletionType {
     /// Position-based deletion using row IDs (for tables without primary key).
     /// Requires consistent ordering between delete and read operations.
@@ -118,7 +118,7 @@ pub enum DeletionType {
 }
 
 /// Represents a deletion vector file tracking deleted rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteFile {
     /// Unique identifier for this delete file (`UUIDv7`)
     pub delete_file_id: String,
@@ -281,6 +281,95 @@ impl PkConflictDetection {
     }
 }
 
+/// How Cayenne records and applies primary-key deletions for upsert/delete on
+/// tables that have a primary key (`Int64Pk` / `RowConverterBased` strategies).
+///
+/// PK-less tables always use position-based deletion regardless of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeletionMode {
+    /// Resolve the mode from the table's configuration (the default). `Auto`
+    /// resolves to [`Self::Position`] — the merge-on-read path — for every table:
+    /// a primary-key table captures positions via the `row_idx()` read-back
+    /// (with key-based fallback for not-yet-captured rows), and a PK-less table
+    /// uses the long-standing `PositionBased` strategy. The presence of a primary
+    /// key selects the *mechanism*; the resolved *mode* is position either way.
+    /// Use [`Self::Key`] to explicitly opt out. See [`Self::resolved`].
+    #[default]
+    Auto,
+    /// Record deletions by primary-key bytes + sequence number and apply them
+    /// above the Vortex scan via a `RowConverter`/`HashSet` probe per scanned
+    /// row. Position-independent and reorganization-proof, but pays an
+    /// O(scanned-rows) re-encode on every scan with a non-empty delete set and
+    /// is invisible to Vortex page-skipping.
+    Key,
+    /// Record deletions as per-file row-position `RoaringBitmap`s and push them
+    /// into the Vortex scan (`Selection::ExcludeRoaring`), so deleted pages are
+    /// skipped at the storage layer with zero per-row CPU. Requires the writer
+    /// to know each row's `(file, file-local position)`, captured via a
+    /// `row_idx()` read-back after each write. Rows whose position is unknown
+    /// (cold-rebuilt keysets, over-budget bloom tables, inlined rows) fall back
+    /// to the `Key` path, so a table can mix both within one snapshot.
+    Position,
+}
+
+impl DeletionMode {
+    /// Parse a spicepod parameter value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "key" => Some(Self::Key),
+            "position" => Some(Self::Position),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Key => "key",
+            Self::Position => "position",
+        }
+    }
+
+    /// Resolve `Auto` against the table's configuration, returning a concrete
+    /// [`Self::Key`] or [`Self::Position`].
+    ///
+    /// `Auto` resolves to **position** — the merge-on-read path that pushes
+    /// per-file position deletes into the Vortex scan. For a table **with** a
+    /// primary key, positions are captured by the `row_idx()` read-back after
+    /// each write (and any row whose position isn't yet known falls back to a
+    /// key-based delete, so this is always correct — under bursty back-to-back
+    /// writes the capture may not have run yet and the key path is used); for a
+    /// table **without** a primary key it is the long-standing `PositionBased`
+    /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
+    /// resolved *mode* is position either way.
+    ///
+    /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
+    /// meaning with a PK; a PK-less table can only do position-based deletion, so
+    /// `Key` there resolves to `Position`.
+    #[must_use]
+    pub const fn resolved(self, has_primary_key: bool) -> Self {
+        match self {
+            // `Key` is only honored when there is a key to record.
+            Self::Key if has_primary_key => Self::Key,
+            // Everything else is position-based: `Auto` and `Position` always,
+            // and `Key` on a PK-less table (there is no key to record).
+            Self::Auto | Self::Position | Self::Key => Self::Position,
+        }
+    }
+
+    /// Whether this mode (already resolved via [`Self::resolved`]) records and
+    /// applies deletions as per-file row positions.
+    #[must_use]
+    pub const fn is_position(self) -> bool {
+        matches!(self, Self::Position)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -395,6 +484,25 @@ pub struct VortexConfig {
     /// when the source enforces PK uniqueness and ingestion cannot replay existing rows.
     #[serde(default)]
     pub pk_conflict_detection: PkConflictDetection,
+    /// Byte budget (set in MB via `cayenne_pk_keyset_cache_mb`) for the in-memory
+    /// primary-key index used to detect upsert conflicts. Within budget an exact
+    /// keyset is kept. Over budget, `OnConflict::Upsert` tables fall back to a
+    /// bounded bloom existence filter (O(batch) maintenance, no per-batch
+    /// rebuild); `DoNothing` tables rebuild the keyset from a full-table scan on
+    /// the next batch (a bloom's false positives are harmless for upsert but
+    /// would wrongly drop rows under `DoNothing`). `None` uses the built-in default
+    /// (256 MiB); the accelerator auto-derives a memory-aware default when the
+    /// param is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pk_keyset_cache_mb: Option<usize>,
+    /// How primary-key deletions are recorded and applied for PK tables.
+    /// Defaults to [`DeletionMode::Auto`], which resolves to `position`
+    /// (merge-on-read): deletes are pushed into the Vortex scan as per-file
+    /// row-position bitmaps, eliminating the per-row `RowConverter` deletion tax
+    /// above the scan. Set `cayenne_deletion_mode: key` to opt out and keep the
+    /// above-scan key-based filter.
+    #[serde(default)]
+    pub deletion_mode: DeletionMode,
 }
 
 fn default_concurrency() -> usize {
@@ -453,6 +561,73 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
+impl VortexConfig {
+    /// Surface parameter values that *parse* but won't behave as a user likely
+    /// intends — out-of-range values that get silently clamped at their use site,
+    /// and combinations that don't compose with each other. Returns
+    /// human-readable warnings; the caller logs each with the dataset context.
+    ///
+    /// Pure and side-effect-free so the rules stay unit-testable. The actual
+    /// clamping still happens at the use sites — this only makes it visible
+    /// instead of silent. `available_cores` is the host's logical core count (the
+    /// encode-shard ceiling); pass `std::thread::available_parallelism()`.
+    #[must_use]
+    pub fn config_warnings(&self, available_cores: usize) -> Vec<String> {
+        let cores = available_cores.max(1);
+        let mut warnings = Vec::new();
+
+        // Vortex encode is CPU-bound, so `write_concurrency` above the core count
+        // is capped at encode time (`VortexFormat::build_shard_spec`); the surplus
+        // only inflates the per-snapshot file count (read amplification).
+        if let Some(write_concurrency) = self.write_concurrency
+            && write_concurrency > cores
+        {
+            warnings.push(format!(
+                "cayenne_write_concurrency ({write_concurrency}) exceeds the host core count ({cores}); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
+            ));
+        }
+
+        // `target_vortex_file_size_mb` feeds both the sink's size-based file
+        // rolling and the size-tiered compaction picker (its small/mid tiers derive
+        // from it), so 0 disables both.
+        if self.target_vortex_file_size_mb == 0 {
+            warnings.push(
+                "cayenne_target_file_size_mb is 0, which disables size-based file rolling and the size-tiered compaction picker; compaction then relies only on the protected-snapshot count/age triggers. Set a positive size (e.g. 256) unless one file per write is intended.".to_owned(),
+            );
+        }
+
+        // The picker needs at least two files in a tier to merge, so 1 is clamped
+        // up to 2 — surface that rather than silently changing the value.
+        if self.compaction_trigger_files == 1 {
+            warnings.push(
+                "cayenne_compaction_trigger_files is 1, but a single file cannot be compacted; it is clamped to a minimum of 2.".to_owned(),
+            );
+        }
+
+        // Likewise the protected-snapshot subset merge needs at least two
+        // snapshots; 1 is clamped up to 2 at the trigger.
+        if self.compaction_trigger_protected_snapshots == 1 {
+            warnings.push(
+                "cayenne_compaction_trigger_protected_snapshots is 1, but a single protected snapshot cannot be merged; it is clamped to a minimum of 2.".to_owned(),
+            );
+        }
+
+        // A trigger above the per-pass pick cap still fires, but each pass only
+        // consolidates `max_files_per_pick` of the accumulated files, so a backlog
+        // drains over several passes instead of in one.
+        if self.compaction_trigger_files > self.compaction_max_files_per_pick {
+            warnings.push(format!(
+                "cayenne_compaction_trigger_files ({}) exceeds cayenne_compaction_max_files_per_pick ({}); each compaction pass consolidates at most {} files, so a backlog drains over several passes. Consider raising cayenne_compaction_max_files_per_pick.",
+                self.compaction_trigger_files,
+                self.compaction_max_files_per_pick,
+                self.compaction_max_files_per_pick
+            ));
+        }
+
+        warnings
+    }
+}
+
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
@@ -479,6 +654,8 @@ impl Default for VortexConfig {
             inline_flush_max_segments: default_inline_flush_max_segments(),
             inline_flush_max_bytes: default_inline_flush_max_bytes(),
             pk_conflict_detection: PkConflictDetection::default(),
+            pk_keyset_cache_mb: None,
+            deletion_mode: DeletionMode::default(),
         }
     }
 }
@@ -503,6 +680,93 @@ mod tests {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn config_warnings_clean_default_is_silent() {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert!(
+            VortexConfig::default().config_warnings(cores).is_empty(),
+            "the default config must not produce any warnings"
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_write_concurrency_over_cores() {
+        let config = VortexConfig {
+            write_concurrency: Some(64),
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(8) // 64 > 8 cores
+                .iter()
+                .any(|w| w.contains("cayenne_write_concurrency") && w.contains("64")),
+            "expected a write_concurrency-over-cores warning"
+        );
+        // At or below the core count is fine.
+        let ok = VortexConfig {
+            write_concurrency: Some(8),
+            ..VortexConfig::default()
+        };
+        assert!(ok.config_warnings(8).is_empty());
+    }
+
+    #[test]
+    fn config_warnings_flags_zero_target_file_size() {
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 0,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("cayenne_target_file_size_mb"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_trigger_above_pick_cap() {
+        let config = VortexConfig {
+            compaction_trigger_files: 64,
+            compaction_max_files_per_pick: 32,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("exceeds cayenne_compaction_max_files_per_pick"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_single_file_trigger() {
+        let config = VortexConfig {
+            compaction_trigger_files: 1,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("a single file cannot be compacted"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_single_protected_snapshot_trigger() {
+        let config = VortexConfig {
+            compaction_trigger_protected_snapshots: 1,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("a single protected snapshot cannot be merged"))
+        );
     }
 
     #[test]
@@ -540,12 +804,11 @@ pub struct CreateTableOptions {
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
-/// Stores per-column statistics (min, max, null count, sum, etc.) captured from
-/// the most recent write (the write's `ColumnStatsAccumulator`). The row in
-/// `cayenne_table_statistics` is keyed by `table_id` and upserted on every write,
-/// so entries represent last-write-wins snapshots rather than aggregates across
-/// every file ever produced; a future change will merge new writes into the
-/// existing blob.
+/// Stores per-column statistics (min, max, null count) maintained incrementally
+/// on the write path. The row in `cayenne_table_statistics` is keyed by
+/// `table_id` and upserted on every write: each write's `ColumnStatsAccumulator`
+/// is *merged* into the existing blob (min/max widen, null counts accumulate),
+/// so the entry is a running per-table aggregate, not a last-write snapshot.
 ///
 /// Consumers should treat these values as optimization hints only. Uses Vortex's
 /// native statistics format for zero-conversion overhead and compatibility with
@@ -556,14 +819,20 @@ pub struct CreateTableOptions {
 pub struct TableStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
     pub table_id: String,
-    /// Serialized Vortex `FileStatistics` flatbuffer bytes. Today the write
-    /// path populates only min, max, and null count per column; other fields
-    /// supported by the Vortex format (sum, NaN count, `is_constant`, etc.)
-    /// remain `Absent` until future writer work fills them in.
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
+    /// and null count). Other fields supported by the Vortex format (sum, NaN
+    /// count, `is_constant`, etc.) remain `Absent`.
     pub statistics_blob: Vec<u8>,
-    /// Row count captured by the most recent write's accumulator (not an
-    /// aggregate across every file ever produced — see the struct docs).
+    /// Live row count, maintained incrementally on commit: inserts add and
+    /// supersedes/deletes subtract, so it tracks `SELECT COUNT(*)` rather than
+    /// the sum of every insert ever made. Compaction and overwrite reset it to
+    /// the authoritative rewritten count.
     pub num_rows: i64,
+    /// Serialized per-column NDV (distinct-count) `HyperLogLog` sketches
+    /// ([`crate::hll::NdvSketches`]), `None` when no integer column has a sketch.
+    /// Merged across writes register-wise; used to size distributed joins on
+    /// sparse integer keys. See [`crate::hll`].
+    pub ndv_sketches: Option<Vec<u8>>,
 }
 
 /// A small batch of insert data inlined directly in the metastore.

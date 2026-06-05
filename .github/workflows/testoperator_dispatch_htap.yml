@@ -20,7 +20,7 @@ on:
 jobs:
   dispatch-htap:
     name: Dispatch HTAP - ${{ github.event.inputs.scale_factor }}
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     concurrency:
       group: testoperator-dispatch-htap-${{ github.event.ref }}
       cancel-in-progress: false

@@ -137,8 +137,12 @@ async fn execute_partition_discovery_query(
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
     let table_name = table.to_string();
 
-    // Wait for table to be registered.
-    df.runtime_status().wait_for_dataset_ready(table).await;
+    // Wait for the table provider to be registered. Cannot use
+    // `wait_for_dataset_ready` here because on a cluster scheduler the
+    // dataset stays `Refreshing` until executors ack their partition loads,
+    // and PartitionsLoaded acks can't happen until discovery completes —
+    // waiting for `Ready` would deadlock.
+    df.runtime_status().wait_for_dataset_registered(table).await;
 
     // Must get table source of `AcceleratedTable` to get true value of partition.
     // The table may be registered directly as AcceleratedTable, or wrapped in a

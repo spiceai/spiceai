@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Regression bench: `CayenneTableProvider::get_max_delete_sequence`
-//! walks the entire deletion HashMap on every snapshot publish
-//! (`src/provider/table.rs:3289-3311`), even though
-//! [`DeletionIndex::max_sequence_number`] (`src/provider/deletion_index.rs:125`)
-//! returns the same value in O(1) from a cached field.
+//! Regression bench: the deletion-index "max delete sequence" lookup must
+//! stay O(1). The scan / deletion-application path reads
+//! [`DeletionIndex::max_sequence_number`] (`src/provider/deletion_index.rs`)
+//! to bound the partial-deletion filter; an earlier implementation walked
+//! the entire deletion HashMap (`entries().values().max()`) on every lookup.
+//! This bench guards against regressing back to that O(N) walk.
 //!
-//! Current implementation:
+//! Historical (pre-cache) implementation:
 //!
 //! ```ignore
 //! deletion_snapshot
@@ -33,38 +34,37 @@ limitations under the License.
 //!     .unwrap_or(0)
 //! ```
 //!
-//! [`DeletionIndex::from_map`] (`deletion_index.rs:96`) eagerly computes
+//! [`DeletionIndex::from_map`] eagerly computes
 //! `max_sequence_number = entries.values().copied().max()` and stores it
 //! on the struct. [`DeletionIndex::extend_max`] (the incremental insert
 //! path used during writes) maintains the invariant by taking
 //! `max(self.max_sequence_number, new_seq)`.
 //!
-//! `get_max_delete_sequence` is called twice per write that creates a
-//! protected snapshot (`table.rs:3248` and `table.rs:3279`). For an upsert
-//! workload with N cached deletes the per-write cost grows as:
+//! For a table with N cached deletes, the per-lookup cost of the O(N) walk
+//! grows as:
 //!
-//!   - N =   1 K:    ~1 µs per call ×  2 = ~2 µs per publish.
-//!   - N = 100 K:  ~100 µs per call ×  2 = ~200 µs per publish.
-//!   - N =   1 M:    ~10 ms per call × 2 = ~20 ms per publish.
+//!   - N =   1 K:    ~1 µs per call.
+//!   - N = 100 K:  ~100 µs per call.
+//!   - N =   1 M:    ~10 ms per call.
 //!
-//! The 1 M case multiplies write tail latency by an order of magnitude
-//! over no-op behaviour, especially noticeable on long-running tables
-//! that have accumulated deletions between compactions.
+//! The 1 M case multiplies scan-setup tail latency by an order of magnitude
+//! over the cached read, especially on long-running tables that have
+//! accumulated deletions between compactions.
 //!
-//! ## Fix
+//! ## Invariant under test
 //!
-//! Replace `entries().values().max().copied().unwrap_or(0)` with
-//! `max_sequence_number().unwrap_or(0)` for both the `Int64Pk` and
-//! `RowConverterBased` arms. One-line change per arm.
+//! `max_sequence_number().unwrap_or(0)` (O(1) cached read) must stay
+//! asymptotically flat as occupancy grows, versus the O(N)
+//! `entries().values().max().copied().unwrap_or(0)` walk.
 //!
 //! ## What this bench measures
 //!
-//! Pure CPU shape — same `Arc<HashMap<i64, i64>>` populated to four sizes
-//! that bracket realistic deletion-index occupancy. Two lanes per size:
+//! Pure CPU shape: the same deletion index populated to four sizes that
+//! bracket realistic occupancy. Two lanes per size:
 //!
-//! - `o_n_walk_entries_values_max` — current implementation; walks all
+//! - `o_n_walk_entries_values_max` — historical baseline; walks all
 //!   entries.
-//! - `o_1_cached_max_sequence`     — proposed fix; reads the cached
+//! - `o_1_cached_max_sequence`     — current implementation; reads the cached
 //!   `max_sequence_number` field directly.
 //!
 //! `cargo bench --bench get_max_delete_sequence_walk -p cayenne`.
@@ -93,10 +93,13 @@ fn build_index(size: usize) -> DeletionIndex {
     DeletionIndex::from_map(map)
 }
 
-/// Mirror of `CayenneTableProvider::get_max_delete_sequence` Int64 arm
-/// (`table.rs:3291-3298`).
+/// Mirror of the historical O(N) walk (pre-`max_sequence_number` cache).
 fn o_n_walk(index: &DeletionIndex) -> i64 {
-    index.entries().values().max().copied().unwrap_or(0)
+    index
+        .iter_entries()
+        .filter_map(|(_, entry)| entry.delete_sequence())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Proposed: read the cached max directly.

@@ -658,6 +658,22 @@ pub async fn run(args: Args) -> Result<()> {
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 
             rt.datafusion().set_refresh_runtime(refresh_runtime);
+
+            // Bring up the dedicated compaction runtime whenever dedicated
+            // thread pools are enabled. Cayenne can be activated lazily after
+            // startup (for example via Iceberg DDL acceleration defaults), so
+            // install the runtime handle even when the DataFusion builder did
+            // not carve a compaction memory environment from the initial
+            // spicepod. `set_compaction_runtime` injects the carved memory
+            // environment only when one is available.
+            let compaction_runtime = ManagedTokioRuntime::builder()
+                .with_low_priority()
+                .with_thread_name("compaction-worker")
+                .build()
+                .boxed()
+                .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
+
+            rt.datafusion().set_compaction_runtime(compaction_runtime);
         }
         Some("disabled") => {
             tracing::info!(
@@ -726,6 +742,16 @@ pub async fn run(args: Args) -> Result<()> {
             metric_prefix,
         )
         .context(UnableToInitializeMetricsSnafu)?;
+
+        // Metrics are now initialized (the Prometheus meter provider is installed).
+        // Register the Cayenne compaction instruments so the carved pool-size gauge
+        // plus the duration + exhaustion metrics appear in `/metrics` from startup.
+        // The compaction runtime is set up earlier (before metrics init), so the
+        // instruments must be (re)bound to the real meter here rather than at carve
+        // time — otherwise they'd bind to the early noop meter and never export.
+        if let Some(bytes) = rt.datafusion().compaction_memory_pool_bytes() {
+            telemetry::register_cayenne_compaction_metrics(bytes);
+        }
     }
 
     let (tls_config, client_auth_mode) = tls::load_tls_config(

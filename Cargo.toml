@@ -95,7 +95,7 @@ license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.94.1"
-version = "2.0.0-rc.5-enterprise"
+version = "2.0.0-enterprise"
 
 [workspace.dependencies]
 adbc_core = "0.23.0"
@@ -175,7 +175,7 @@ datafusion-datasource = "52.0.0"
 datafusion-execution = "52.0.0"
 datafusion-expr = "52.0.0"
 datafusion-ffi = "52.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "a4fce79433e5c2fe779427c0bfce6a599193e300", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6b6bfb0d30da8e5c2eb851094e366d98fa839575", features = ["sql"] } # branch: trunk; SHA format (short vs full) must match to what datafusion-table-providers use for datafusion-federation
 datafusion-functions = "52.0.0"
 datafusion-functions-json = "0.52"
 datafusion-physical-expr = "52.0.0"
@@ -183,6 +183,7 @@ datafusion-physical-expr-adapter = "52.0.0"
 datafusion-physical-expr-common = "52.0.0"
 datafusion-physical-plan = "52.0.0"
 datafusion-proto = { version = "52.0.0", features = ["json"] }
+datafusion-proto-common = { version = "52.0.0" }
 datafusion-pruning = "52.0.0"
 datafusion-spark = "52.0.0"
 datafusion-substrait = "52.0.0"
@@ -196,7 +197,7 @@ delta_kernel = { version = "0.18.2", features = [
 derive_builder = "0.20.2"
 dotenvy = "0.15"
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.10502" # 1.10502.x corresponds to DuckDB v1.5.2
+duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
 fallible-iterator = "0.3.0"
 fundu = "2.0.1"
@@ -449,7 +450,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "06e4b624c6073c40c7b2127ce620e281ec1979ae" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "29f66085875f1d4d7b80fc1947e68c6835302241" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "4af854228e9f503bbaf6858fb76a9f4fcdcf091c" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "47e2b4946762c834d4a11532a25cc99c9e8a0b9d" } # spiceai-52.5
@@ -458,7 +459,7 @@ ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "119fc5df0568fa165154697eb9c6a302938fe848" } # spiceai-1.5.2
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "7648ff8c7d1ff06576478d518415e1ba0eac659c" } # spiceai-1.5.3 + static VSS (vendored, DuckDB version pinned to v1.5.3)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113

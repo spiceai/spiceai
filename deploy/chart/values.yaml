@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: ghcr.io/spicehq/spiceai-enterprise
-  tag: 2.0.0-rc.5-enterprise-models
+  tag: 2.0.0-enterprise-models
 replicaCount: 1
 
 service:

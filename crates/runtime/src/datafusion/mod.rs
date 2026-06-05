@@ -76,6 +76,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
@@ -100,6 +101,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_datafusion_index::IndexedTableProvider;
 use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
@@ -129,6 +131,7 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub use runtime_datafusion::managed_runtime;
 pub use runtime_datafusion::param_utils;
+pub mod pg_catalog;
 #[cfg(not(windows))]
 pub mod planner;
 pub(crate) mod policy_enforcer;
@@ -619,7 +622,7 @@ pub enum Table {
     },
 }
 
-fn table_provider_with_spicepod_metadata(
+pub(crate) fn table_provider_with_spicepod_metadata(
     provider: Arc<dyn TableProvider>,
     table_metadata: &HashMap<String, String>,
     columns: &[Column],
@@ -627,6 +630,21 @@ fn table_provider_with_spicepod_metadata(
     let field_metadata = field_metadata_from_columns(columns);
     if table_metadata.is_empty() && field_metadata.is_empty() {
         return provider;
+    }
+
+    // If the provider is an IndexedTableProvider, push the metadata enrichment
+    // inside it so that the IndexTableScan analyzer can still discover it via
+    // downcast_ref::<IndexedTableProvider>().
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        let enriched_underlying = metadata_enriched_table_provider(
+            indexed.get_underlying(),
+            table_metadata.clone(),
+            field_metadata,
+        );
+        return Arc::new(IndexedTableProvider::with_indexes(
+            enriched_underlying,
+            indexed.get_all_indexes(),
+        ));
     }
 
     metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
@@ -694,6 +712,18 @@ pub struct DataFusion {
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated runtime for background Cayenne compaction (size-tiered protected-snapshot
+    // merge + full snapshot rewrite). Isolated from the query and refresh runtimes so the
+    // CPU-heavy rewrite can't steal worker threads from queries or CDC ingest.
+    compaction_runtime: OnceLock<ManagedTokioRuntime>,
+    // Dedicated DataFusion environment for compaction whose memory pool is a separate
+    // budget carved from the query memory limit (sized in the builder). `Some` only when
+    // Cayenne acceleration is configured and dedicated thread pools are enabled; compaction
+    // executes against it so its memory is accounted separately and cannot starve queries.
+    compaction_runtime_env: Option<Arc<RuntimeEnv>>,
+    // Size in bytes of the carved compaction memory pool, retained for the
+    // startup confirmation log + the `cayenne_compaction_memory_pool_bytes` gauge.
+    compaction_memory_bytes: Option<u64>,
     pub(crate) io_runtime: Handle,
     metrics: Option<Metrics>,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
@@ -707,6 +737,10 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
+    /// Tracks executor `PartitionsLoaded` acks so dataset readiness on the
+    /// scheduler reflects actual data availability on executors. Only set
+    /// in scheduler mode.
+    pub(crate) partition_load_tracker: Option<Arc<runtime_cluster::PartitionLoadTracker>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
     /// Cedar-based policy engine for query authorization. `None` when no
@@ -1329,6 +1363,82 @@ impl DataFusion {
             .get()
             .map(ManagedTokioRuntime::handle)
             .or_else(|| self.cpu_runtime())
+    }
+
+    /// Set the dedicated compaction runtime for background Cayenne compaction
+    /// (size-tiered protected-snapshot merge + full snapshot rewrite).
+    ///
+    /// Also injects the runtime's [`Handle`](tokio::runtime::Handle) into the
+    /// Cayenne accelerator crate, so its background and post-write compaction
+    /// tasks spawn here instead of on the ambient (refresh/query) runtime.
+    /// Isolating compaction keeps the CPU-heavy snapshot rewrite off the
+    /// latency-sensitive query and CDC paths while letting it use spare cores.
+    pub fn set_compaction_runtime(&self, handle: ManagedTokioRuntime) {
+        let tokio_handle = handle.handle().clone();
+        if self.compaction_runtime.set(handle).is_err() {
+            // Already set — e.g. a concurrent first-Cayenne-table registration
+            // lost the race. Drop this redundant runtime WITHOUT injecting its
+            // handle into Cayenne: Cayenne must reference the runtime we actually
+            // retained, never one that is about to be dropped here.
+            tracing::debug!("Dedicated compaction runtime already set; dropping the redundant one");
+            return;
+        }
+        // Inject the dedicated runtime handle and the carved compaction memory
+        // environment into the Cayenne accelerator crate, so background and
+        // post-write compaction run isolated from queries and CDC on both CPU
+        // (this runtime's threads) and memory (the carved pool).
+        cayenne::set_compaction_runtime_handle(tokio_handle);
+        // Install the process-global encode-concurrency budget: cap the aggregate
+        // number of concurrent Vortex encode shards across ALL Cayenne tables at
+        // the host core count. Per-table `cayenne_write_concurrency` is sized in
+        // isolation — its unset default is conservative, but it can be raised per
+        // table — so without this a fleet of tables receiving CDC at once would
+        // sum their per-table shard counts and oversubscribe the machine. CPU-bound encode past the core count buys no
+        // throughput, only contention — so the core count is the natural ceiling.
+        let encode_budget =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        cayenne::set_global_encode_concurrency(encode_budget);
+        tracing::info!(
+            encode_budget,
+            "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
+        );
+        if let Some(env) = &self.compaction_runtime_env {
+            cayenne::set_compaction_runtime_env(Arc::clone(env));
+        }
+        if let Some(bytes) = self.compaction_memory_bytes {
+            // The compaction metrics (incl. the pool-size gauge) are registered by
+            // the binary AFTER metrics init via
+            // `telemetry::register_cayenne_compaction_metrics`. This runs before the
+            // Prometheus meter exists, so emitting the gauge here would bind it to
+            // the noop meter and it would never reach `/metrics`.
+            tracing::info!(
+                compaction_memory_bytes = bytes,
+                "Dedicated Cayenne compaction runtime active (carved memory pool + low-priority worker threads)"
+            );
+        }
+    }
+
+    /// Returns the dedicated compaction runtime, if one has been set.
+    #[must_use]
+    pub fn compaction_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.compaction_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
+    }
+
+    /// Returns the dedicated compaction memory environment, if one was carved
+    /// (Cayenne acceleration configured + dedicated thread pools enabled).
+    #[must_use]
+    pub fn compaction_runtime_env(&self) -> Option<&Arc<RuntimeEnv>> {
+        self.compaction_runtime_env.as_ref()
+    }
+
+    /// Returns the size in bytes of the carved compaction memory pool, if one was
+    /// carved. Used by the binary to register/publish the compaction pool-size
+    /// metric after the Prometheus meter is installed.
+    #[must_use]
+    pub fn compaction_memory_pool_bytes(&self) -> Option<u64> {
+        self.compaction_memory_bytes
     }
 
     async fn get_table_provider(
@@ -2630,20 +2740,36 @@ impl DataFusion {
             );
             return;
         };
-        let Some(parent_table_federation_adaptor) = parent_table
+
+        // The parent's registered provider takes one of two shapes depending on its
+        // acceleration engine:
+        // - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a
+        //   federated source, so `AcceleratedTable::table_provider()` wraps the table in a
+        //   `FederatedTableProviderAdaptor`.
+        // - The in-memory Arrow accelerator has no federated source, so
+        //   `create_federated_table_source()` returns `None` and `table_provider()` hands back the
+        //   bare `AcceleratedTable`.
+        // Unwrap the adaptor when present so we can find the parent `AcceleratedTable` in either
+        // case; otherwise a child of an Arrow-accelerated parent would never synchronize. The
+        // downcast borrows `parent_table`, so clone out the inner provider first to release the
+        // borrow before falling back to `parent_table` itself.
+        let adaptor_inner = parent_table
             .as_any()
-            .downcast_ref::<FederatedTableProviderAdaptor>(
-        ) else {
-            tracing::debug!(
-                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent table is not a federated table."
-            );
-            return;
-        };
-        let Some(parent_table) = parent_table_federation_adaptor.table_provider.clone() else {
-            tracing::debug!(
-                "Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider."
-            );
-            return;
+            .downcast_ref::<FederatedTableProviderAdaptor>()
+            .map(|adaptor| adaptor.table_provider.clone());
+        let parent_table = match adaptor_inner {
+            // FederatedTableProviderAdaptor wrapping an inner provider.
+            Some(Some(inner)) => inner,
+            // FederatedTableProviderAdaptor with no inner provider — nothing to synchronize with.
+            Some(None) => {
+                tracing::debug!(
+                    "Could not synchronize refreshes with parent table {parent_table_reference}. Parent federated table doesn't contain a table provider."
+                );
+                return;
+            }
+            // Not a FederatedTableProviderAdaptor (e.g. a bare AcceleratedTable from the in-memory
+            // Arrow accelerator).
+            None => parent_table,
         };
         let Some(parent_table) = parent_table.as_any().downcast_ref::<AcceleratedTable>() else {
             tracing::debug!(
@@ -4190,7 +4316,7 @@ mod tests {
             registered_schema_with_metadata("dataset_meta", &metadata, &dataset.columns).await;
 
         assert_eq!(
-            schema.metadata().get("comment").map(String::as_str),
+            schema.metadata().get("description").map(String::as_str),
             Some("dataset description")
         );
         assert_eq!(
@@ -4199,7 +4325,7 @@ mod tests {
         );
         let id_field = schema.field_with_name("id").expect("id field should exist");
         assert_eq!(
-            id_field.metadata().get("comment").map(String::as_str),
+            id_field.metadata().get("description").map(String::as_str),
             Some("stable row id")
         );
     }
@@ -4217,14 +4343,14 @@ mod tests {
         let schema = registered_schema_with_metadata("view_meta", &metadata, &view.columns).await;
 
         assert_eq!(
-            schema.metadata().get("comment").map(String::as_str),
+            schema.metadata().get("description").map(String::as_str),
             Some("view description")
         );
         let name_field = schema
             .field_with_name("name")
             .expect("name field should exist");
         assert_eq!(
-            name_field.metadata().get("comment").map(String::as_str),
+            name_field.metadata().get("description").map(String::as_str),
             Some("display name")
         );
     }

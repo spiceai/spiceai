@@ -126,6 +126,7 @@ default = [
     "wasm-functions-compile", # Enterprise feature
     "keyring-secret-store",
     "client_tls",             # Enterprise feature
+    "runtime/bedrock",        # Enterprise: bedrock without models (was in runtime default features)
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]

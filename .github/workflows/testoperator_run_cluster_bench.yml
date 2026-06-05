@@ -85,11 +85,11 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spicehq-dev-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
-          - 'spiceai-dev-large-runners'
+          - 'spicehq-dev-runners'
+          - 'spicehq-dev-large-runners'
 
 permissions:
   contents: read
@@ -110,12 +110,12 @@ env:
   CB_VALIDATE_RESULTS: ${{ github.event.inputs.validate_results || 'false' }}
   CB_UPDATE_SNAPSHOTS: ${{ github.event.inputs.update_snapshots || 'default' }}
   CB_READY_WAIT: ${{ github.event.inputs.ready_wait || '600' }}
-  CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
+  CB_RUNNER_TYPE: ${{ github.event.inputs.runner_type || 'spicehq-dev-runners' }}
 
 jobs:
   run-cluster-bench:
     name: Run cluster benchmark
-    runs-on: ${{ github.event.inputs.runner_type || 'spiceai-dev-runners' }}
+    runs-on: ${{ github.event.inputs.runner_type || 'spicehq-dev-runners' }}
     timeout-minutes: 600
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

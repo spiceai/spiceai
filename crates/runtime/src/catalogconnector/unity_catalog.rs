@@ -68,6 +68,8 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
         .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("Enables insecure HTTP connections to the AWS endpoint. Defaults to false."),
     // Azure storage options
     ParameterSpec::component("azure_storage_account_name")
         .description("The storage account to use for Azure storage.")

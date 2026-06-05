@@ -137,6 +137,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let (_, test_builder) = super::build_test_with_validation(
         test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::Duration(Duration::from_secs(

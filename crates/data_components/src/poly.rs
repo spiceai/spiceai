@@ -86,6 +86,15 @@ impl PolyTableProvider {
     pub fn writer(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.write)
     }
+
+    /// Borrow the inner write provider without cloning the `Arc`, so callers can
+    /// downcast through this wrapper to a concrete provider type with a borrow
+    /// that lives as long as `&self` (e.g. the CDC apply path peeling to the
+    /// inner `CayenneTableProvider`).
+    #[must_use]
+    pub fn writer_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.write
+    }
 }
 
 impl FederationProvider for PolyTableProvider {
@@ -111,7 +120,9 @@ impl TableProvider for PolyTableProvider {
     }
     fn schema(&self) -> SchemaRef {
         let schema = self.write.schema().as_ref().clone();
-        Arc::new(schema.with_metadata(self.schema_metadata.clone()))
+        let mut metadata = schema.metadata().clone();
+        metadata.extend(self.schema_metadata.clone());
+        Arc::new(schema.with_metadata(metadata))
     }
     fn constraints(&self) -> Option<&Constraints> {
         self.write.constraints()

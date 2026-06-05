@@ -27,6 +27,7 @@ use crate::config::ClusterRole;
 use crate::config::Config;
 #[cfg(not(windows))]
 use crate::dataaccelerator::cayenne::CayenneAccelerator;
+use crate::datafusion::builder::CayenneOptimizerRules;
 use crate::datafusion::udf::register_udfs;
 use crate::metrics_reader::MetricsReader;
 use crate::{
@@ -56,6 +57,15 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+/// Runtime param: fraction of `runtime.query.memory_limit` carved into a
+/// dedicated Cayenne compaction memory pool when Cayenne acceleration is
+/// configured on a dataset and dedicated thread pools are enabled.
+const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memory_fraction";
+/// Default carve fraction when the param is unset: 20% of the query budget to
+/// compaction, 80% retained for queries.
+const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
+const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
+const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -250,8 +260,91 @@ impl RuntimeBuilder {
         );
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+
+        // Process-global SQLite metastore pragma tuning (cache, mmap, busy
+        // timeout, WAL autocheckpoint, auto_vacuum). Applied once at startup;
+        // connections opened afterward pick up the values. Unset params keep the
+        // defaults on `SqliteMetastoreConfig`.
+        {
+            let mut metastore_cfg = cayenne::SqliteMetastoreConfig::default();
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_cache_mb")
+            {
+                metastore_cfg.cache_size_mb = v;
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_mmap_mb")
+            {
+                metastore_cfg.mmap_size_bytes = i64::try_from(v.saturating_mul(1024 * 1024))
+                    .unwrap_or(metastore_cfg.mmap_size_bytes);
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_busy_timeout_ms")
+            {
+                metastore_cfg.busy_timeout_ms =
+                    u64::try_from(v).unwrap_or(metastore_cfg.busy_timeout_ms);
+            }
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                "cayenne_metastore_wal_autocheckpoint_pages",
+            ) {
+                metastore_cfg.wal_autocheckpoint_pages =
+                    u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
+            }
+            if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
+                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
+                    "none" => cayenne::SqliteAutoVacuum::None,
+                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
+                    "full" => cayenne::SqliteAutoVacuum::Full,
+                    other => {
+                        tracing::warn!(
+                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                        );
+                        cayenne::SqliteAutoVacuum::None
+                    }
+                };
+            }
+            cayenne::set_sqlite_metastore_config(metastore_cfg);
+        }
+
         let cayenne_filter_propagation_enabled =
             parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+        let cayenne_optimizer_rules =
+            parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
+
+        // Carve a dedicated compaction memory pool only when Cayenne acceleration
+        // is configured (and enabled) on a dataset AND dedicated thread pools are
+        // enabled. This keeps non-Cayenne deployments at full query budget and
+        // matches the dedicated compaction runtime's "create only if Cayenne is
+        // enabled" lifecycle — the carved env is the signal spiced uses to bring
+        // up the compaction worker threads.
+        let cayenne_configured = self.app.as_ref().is_some_and(|app| {
+            app.datasets.iter().any(|dataset| {
+                dataset.acceleration.as_ref().is_some_and(|accel| {
+                    accel.enabled
+                        && accel
+                            .engine
+                            .as_deref()
+                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+                })
+            })
+        });
+        let dedicated_thread_pools_enabled = !matches!(
+            spicepod_rt
+                .params
+                .get("dedicated_thread_pool")
+                .map(String::as_str),
+            Some("disabled")
+        );
+        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+            .then(|| {
+                let requested = parse_f64_runtime_param(
+                    &spicepod_rt.params,
+                    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+                )
+                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
+                clamp_cayenne_compaction_memory_fraction(requested)
+            });
 
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
@@ -362,6 +455,9 @@ impl RuntimeBuilder {
                                 accelerations_partitions_store,
                                 catalog_partitions_store,
                                 partition_service,
+                                partition_load_tracker: Arc::new(
+                                    runtime_cluster::PartitionLoadTracker::new(),
+                                ),
                             })
                         }
                         Err(e) => {
@@ -407,11 +503,15 @@ impl RuntimeBuilder {
                         accelerations_partitions_store,
                         catalog_partitions_store,
                         partition_service,
+                        partition_load_tracker: Arc::new(
+                            runtime_cluster::PartitionLoadTracker::new(),
+                        ),
                     })
                 }
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
+                outbound_broadcaster: crate::cluster::ExecutorOutboundBroadcaster::default(),
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
@@ -433,17 +533,20 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
-        .cayenne_filter_propagation_enabled(cayenne_filter_propagation_enabled);
+        .compaction_memory_fraction(compaction_memory_fraction)
+        .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
             executor_registry,
             partition_service,
+            partition_load_tracker,
             ..
         }) = distributed.as_ref()
         {
             df_builder = df_builder
                 .with_executor_registry(Arc::clone(executor_registry))
-                .with_partition_service(Arc::clone(partition_service));
+                .with_partition_service(Arc::clone(partition_service))
+                .with_partition_load_tracker(Arc::clone(partition_load_tracker));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
@@ -799,7 +902,21 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
+    let clamped = value.clamp(
+        MIN_COMPACTION_MEMORY_FRACTION,
+        MAX_COMPACTION_MEMORY_FRACTION,
+    );
+    if !(MIN_COMPACTION_MEMORY_FRACTION..=MAX_COMPACTION_MEMORY_FRACTION).contains(&value) {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM}={value} is outside supported range [{MIN_COMPACTION_MEMORY_FRACTION}, {MAX_COMPACTION_MEMORY_FRACTION}]; using {clamped}"
+        );
+    }
+    clamped
+}
+
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
@@ -827,6 +944,86 @@ fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> Cayenne
             );
             CayenneFilterPropagation::Disabled
         }
+    }
+}
+
+fn default_cayenne_optimizer_rules(filter_propagation_enabled: bool) -> CayenneOptimizerRules {
+    let mut rules = CayenneOptimizerRules::auto_enabled();
+    rules.set_filter_propagation(filter_propagation_enabled);
+    rules.set_inlist_to_range(filter_propagation_enabled);
+    rules
+}
+
+fn parse_cayenne_optimizer_rules(
+    params: &HashMap<String, String>,
+    filter_propagation_enabled: bool,
+) -> CayenneOptimizerRules {
+    let default_rules = default_cayenne_optimizer_rules(filter_propagation_enabled);
+    let Some(raw) = params.get(CAYENNE_OPTIMIZER_RULES_PARAM) else {
+        return default_rules;
+    };
+
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" => return default_rules,
+        "all" => return CayenneOptimizerRules::all_enabled(),
+        "none" | "disabled" => return CayenneOptimizerRules::none(),
+        _ => {}
+    }
+
+    let mut rules = CayenneOptimizerRules::none();
+    let mut saw_rule = false;
+    let mut unknown_rules: Vec<String> = Vec::new();
+    for token in normalized
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
+    {
+        let rule_name = token.replace('-', "_");
+        match rule_name.as_str() {
+            "filter_propagation" | "logical_filter_propagation" | "propagate_filter" => {
+                rules.set_filter_propagation(true);
+            }
+            "cross_join_reassociation" | "reassociate_cross_join" | "join_reassociation" => {
+                rules.set_cross_join_reassociation(true);
+            }
+            "inlist_to_range" | "in_list_to_range" => {
+                rules.set_inlist_to_range(true);
+            }
+            "semi_join_pushdown" | "push_down_semi_join" | "semi_join" => {
+                rules.set_semi_join_pushdown(true);
+            }
+            "dynamic_filter_sharing" | "dynamic_filters" => {
+                rules.set_dynamic_filter_sharing(true);
+            }
+            "anti_join_sort_merge" | "anti_sort_merge" => {
+                rules.set_anti_join_sort_merge(true);
+            }
+            "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
+                rules.set_exact_join_filter(true);
+            }
+            _ => {
+                // Don't discard the rest of an explicit list because of one bad
+                // token; collect the unknown ones, keep the recognized rules,
+                // and warn below.
+                unknown_rules.push(token.to_string());
+                continue;
+            }
+        }
+        saw_rule = true;
+    }
+
+    if saw_rule {
+        if !unknown_rules.is_empty() {
+            tracing::warn!(
+                "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} contains unknown Cayenne optimizer rule(s) {unknown_rules:?}; ignoring them and using the recognized rules"
+            );
+        }
+        rules
+    } else {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_OPTIMIZER_RULES_PARAM}={raw:?} did not include any recognized Cayenne optimizer rules; using auto"
+        );
+        default_rules
     }
 }
 
@@ -920,6 +1117,17 @@ mod test {
     }
 
     #[test]
+    fn test_clamp_cayenne_compaction_memory_fraction() {
+        for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
+            let actual = clamp_cayenne_compaction_memory_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_cayenne_filter_propagation() {
         let params = HashMap::from([(
             CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
@@ -947,6 +1155,99 @@ mod test {
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::new()),
             CayenneFilterPropagation::Disabled
+        );
+    }
+
+    #[test]
+    fn test_parse_cayenne_optimizer_rules() {
+        let mut legacy_enabled = CayenneOptimizerRules::auto_enabled();
+        legacy_enabled.set_filter_propagation(true);
+        legacy_enabled.set_inlist_to_range(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(&HashMap::new(), true),
+            legacy_enabled
+        );
+
+        let legacy_disabled = CayenneOptimizerRules::auto_enabled();
+        assert_eq!(
+            parse_cayenne_optimizer_rules(&HashMap::new(), false),
+            legacy_disabled
+        );
+
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "none".to_string(),
+                )]),
+                true,
+            ),
+            CayenneOptimizerRules::none()
+        );
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(CAYENNE_OPTIMIZER_RULES_PARAM.to_string(), "all".to_string(),)]),
+                false,
+            ),
+            CayenneOptimizerRules::all_enabled()
+        );
+
+        let mut selected_rules = CayenneOptimizerRules::none();
+        selected_rules.set_filter_propagation(true);
+        selected_rules.set_cross_join_reassociation(true);
+        selected_rules.set_exact_join_filter(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "filter-propagation,cross_join_reassociation,join_rewriter".to_string(),
+                )]),
+                true,
+            ),
+            selected_rules
+        );
+
+        // `semi_join_pushdown` is on under both `auto` and `all`, and is also
+        // selectable by token (including its aliases) without enabling anything else.
+        assert!(CayenneOptimizerRules::auto_enabled().semi_join_pushdown());
+        assert!(CayenneOptimizerRules::all_enabled().semi_join_pushdown());
+        let mut semi_join_only = CayenneOptimizerRules::none();
+        semi_join_only.set_semi_join_pushdown(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "semi-join".to_string(),
+                )]),
+                false,
+            ),
+            semi_join_only
+        );
+
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "not_a_rule".to_string(),
+                )]),
+                false,
+            ),
+            legacy_disabled
+        );
+
+        // A partially-valid explicit list keeps the recognized rules instead of
+        // silently reverting to auto when it hits an unknown token.
+        let mut partial_rules = CayenneOptimizerRules::none();
+        partial_rules.set_filter_propagation(true);
+        assert_eq!(
+            parse_cayenne_optimizer_rules(
+                &HashMap::from([(
+                    CAYENNE_OPTIMIZER_RULES_PARAM.to_string(),
+                    "filter_propagation,not_a_rule".to_string(),
+                )]),
+                false,
+            ),
+            partial_rules
         );
     }
 }

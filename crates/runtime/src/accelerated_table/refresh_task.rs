@@ -47,7 +47,9 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
-use data_components::{FieldMetadata, metadata_enriched_table_provider};
+use data_components::{
+    FieldMetadata, MetadataEnrichedTableProvider, metadata_enriched_table_provider,
+};
 use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
@@ -74,14 +76,15 @@ use runtime_datafusion::execution_plan::schema_cast::EnsureSchema;
 use runtime_datafusion::extension::ExtensionPlanQueryPlanner;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedPhysicalOptimizer;
 use runtime_datafusion::optimizer_rule::avoid_vector_columns_on_index::AvoidDerivedVectorColumnOnIndexRule;
-use runtime_datafusion_index::analyzer::{
-    IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule,
+use runtime_datafusion_index::{
+    IndexedTableProvider,
+    analyzer::{IndexTableScanExtensionPlanner, IndexTableScanOptimizerRule},
 };
 use runtime_object_store::registry::default_runtime_env;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, UNIX_EPOCH};
@@ -121,6 +124,62 @@ fn table_provider_with_existing_metadata(
 
     if table_metadata.is_empty() && field_metadata.is_empty() {
         return provider;
+    }
+
+    metadata_enriched_table_provider_preserving_indexes(provider, table_metadata, field_metadata)
+}
+
+fn metadata_enriched_table_provider_preserving_indexes(
+    provider: Arc<dyn TableProvider>,
+    table_metadata: HashMap<String, String>,
+    field_metadata: FieldMetadata,
+) -> Arc<dyn TableProvider> {
+    if table_metadata.is_empty() && field_metadata.is_empty() {
+        return provider;
+    }
+
+    if let Some(indexed) = provider.as_any().downcast_ref::<IndexedTableProvider>() {
+        let enriched_underlying = metadata_enriched_table_provider_preserving_indexes(
+            indexed.get_underlying(),
+            table_metadata,
+            field_metadata,
+        );
+
+        return Arc::new(IndexedTableProvider::with_indexes(
+            enriched_underlying,
+            indexed.get_all_indexes(),
+        ));
+    }
+
+    if let Some(metadata_enriched) = provider
+        .as_any()
+        .downcast_ref::<MetadataEnrichedTableProvider>()
+    {
+        return metadata_enriched_table_provider_preserving_indexes(
+            Arc::clone(metadata_enriched.get_inner_ref()),
+            table_metadata,
+            field_metadata,
+        );
+    }
+
+    if let Some(adaptor) = provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+    {
+        let Some(table_provider) = &adaptor.table_provider else {
+            return Arc::clone(&provider);
+        };
+
+        let enriched_provider = metadata_enriched_table_provider_preserving_indexes(
+            Arc::clone(table_provider),
+            table_metadata,
+            field_metadata,
+        );
+
+        return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+            Arc::clone(&adaptor.source),
+            enriched_provider,
+        ));
     }
 
     metadata_enriched_table_provider(provider, table_metadata, field_metadata)
@@ -601,7 +660,7 @@ impl RefreshTask {
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
-                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
                 return self.refresh_stale_cached_rows(refresh).await;
             }
             RefreshMode::Snapshot => {
@@ -1084,6 +1143,29 @@ impl RefreshTask {
 
         let info = match download_result {
             Ok(Some(info)) => info,
+            Ok(None) if current_local_id.is_none() => {
+                // No snapshot has ever been loaded and none is available at the configured location.
+                tracing::warn!(
+                    dataset = %self.dataset_name,
+                    snapshot_location = %state.manager.snapshot_location(),
+                    "refresh_mode: snapshot - no snapshot found at the configured location. Ensure the snapshot location is correct and that a snapshot has been created."
+                );
+                self.set_refresh_status(
+                    None,
+                    status::ComponentStatus::error_with_message(
+                        "no snapshot available".to_string(),
+                    ),
+                )
+                .await;
+                return Err(RetryError::transient(
+                    super::Error::FailedToRefreshDataset {
+                        source: datafusion::error::DataFusionError::Internal(
+                            "refresh_mode: snapshot - no snapshot found at the configured location"
+                                .to_string(),
+                        ),
+                    },
+                ));
+            }
             Ok(None) => {
                 tracing::debug!(
                     dataset = %self.dataset_name,
@@ -2252,7 +2334,7 @@ fn filter_records(
                     .context(super::FailedToFilterUpdatesSnafu)?;
                 Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
             })
-            .collect::<Result<Vec<_>, _>>()?,
+            .collect::<Result<Vec<_>, super::Error>>()?,
     );
 
     for existing in existing_records {
@@ -2267,7 +2349,7 @@ fn filter_records(
                         .context(super::FailedToFilterUpdatesSnafu)?;
                     Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, super::Error>>()?,
         );
 
         comparators.push((
@@ -2369,6 +2451,79 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[derive(Debug)]
+    struct TestRefreshIndex;
+
+    #[async_trait::async_trait]
+    impl runtime_datafusion_index::Index for TestRefreshIndex {
+        fn name(&self) -> &'static str {
+            "test_refresh_index"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["id".to_string()]
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn table_provider_with_existing_metadata_preserves_indexed_provider() {
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![
+                Field::new("id", DataType::Int64, false)
+                    .with_metadata([("field_meta".to_string(), "field_value".to_string())].into()),
+            ],
+            [("table_meta".to_string(), "table_value".to_string())].into(),
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("record batch should be created");
+        let mem_table: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("mem table should be created"),
+        );
+        let index: Arc<dyn runtime_datafusion_index::Index + Send + Sync> =
+            Arc::new(TestRefreshIndex);
+        let indexed_provider: Arc<dyn TableProvider> = Arc::new(
+            IndexedTableProvider::with_indexes(mem_table, vec![Arc::clone(&index)]),
+        );
+
+        let wrapped = table_provider_with_existing_metadata(indexed_provider);
+        let indexed = wrapped
+            .as_any()
+            .downcast_ref::<IndexedTableProvider>()
+            .expect("indexed provider should remain the outer provider");
+        assert_eq!(indexed.get_all_indexes().len(), 1);
+        assert!(
+            indexed
+                .get_underlying()
+                .as_any()
+                .downcast_ref::<MetadataEnrichedTableProvider>()
+                .is_some()
+        );
+
+        let wrapped_schema = wrapped.schema();
+        assert_eq!(
+            wrapped_schema
+                .metadata()
+                .get("table_meta")
+                .map(String::as_str),
+            Some("table_value")
+        );
+        let id_field = wrapped_schema
+            .field_with_name("id")
+            .expect("id field should exist");
+        assert_eq!(
+            id_field.metadata().get("field_meta").map(String::as_str),
+            Some("field_value")
+        );
+    }
 
     #[test]
     fn test_data_load_tracing_tracks_bytes_and_rows() {
