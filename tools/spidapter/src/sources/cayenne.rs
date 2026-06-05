@@ -24,14 +24,15 @@ use spicepod::param::Params;
 use spicepod::spec::SpicepodDefinition;
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
+use crate::scenario::CayenneConfig;
 
 /// Generate the spicepod for Cayenne ADBC sink mode: a Cayenne catalog with
 /// Flight SQL auth, rate-limit disabled, and optional data/metadata dirs.
 pub(crate) fn generate_cayenne_sink_spicepod(
     run_id: &Uuid,
     flight_api_key: Option<&str>,
-    args: &StdioArgs,
+    cayenne: Option<&CayenneConfig>,
+    query_memory_limit: Option<&str>,
 ) -> SpicepodDefinition {
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -55,9 +56,8 @@ pub(crate) fn generate_cayenne_sink_spicepod(
             ..Flight::default()
         }),
         query: Some(Query {
-            memory_limit: args
-                .query_memory_limit
-                .clone()
+            memory_limit: query_memory_limit
+                .map(str::to_string)
                 .or(Some("150Gi".to_string())),
             ..Query::default()
         }),
@@ -69,25 +69,24 @@ pub(crate) fn generate_cayenne_sink_spicepod(
 
     let mut params_map = HashMap::new();
 
-    if let Some(cayenne_data_dir) = &args
-        .cayenne_data_dir
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        params_map.insert("cayenne_data_dir".to_string(), cayenne_data_dir.clone());
-    }
+    if let Some(cfg) = cayenne {
+        if let Some(data_dir) = cfg
+            .data_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            params_map.insert("cayenne_data_dir".to_string(), data_dir.to_string());
+        }
 
-    if let Some(cayenne_metadata_dir) = &args
-        .cayenne_metadata_dir
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        params_map.insert(
-            "cayenne_metadata_dir".to_string(),
-            cayenne_metadata_dir.clone(),
-        );
+        if let Some(metadata_dir) = cfg
+            .metadata_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            params_map.insert("cayenne_metadata_dir".to_string(), metadata_dir.to_string());
+        }
     }
 
     if !params_map.is_empty() {

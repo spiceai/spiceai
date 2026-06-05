@@ -26,22 +26,26 @@ use super::super::{
 };
 use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
+use crate::scenario::{CayenneConfig, ScpConfig};
 
 pub(crate) async fn provision_scp_app(
     run_id: Uuid,
     args: &StdioArgs,
+    scp: &ScpConfig,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     deployment_mode: &DeploymentMode,
     wait_for_ready: bool,
+    cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<RunState> {
     let api_url = args.spice_cloud_api_url.trim_end_matches('/');
     let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
-    let flight_url = args
+    let flight_url = scp
         .flight_url
         .clone()
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| commands::flight_url_from_cname(&cname));
     let run_id_str = run_id.to_string();
     let short_id = run_id_str.split('-').next().unwrap_or_default();
@@ -52,21 +56,22 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
 
+    let res = &scp.resources;
     let app_create_config = commands::AppCreateConfig {
-        app_memory_limit: args.app_memory_limit.clone(),
-        app_cpu_limit: args.app_cpu_limit.clone(),
-        app_cpu_request: args.app_cpu_request.clone(),
-        app_memory_request: args.app_memory_request.clone(),
-        app_replicas: args.app_replicas,
-        app_storage_size_gb: args.app_storage_size_gb,
-        executor_replicas: args.executor_replicas,
-        executor_memory_limit: args.executor_memory_limit.clone(),
-        executor_cpu_limit: args.executor_cpu_limit.clone(),
-        executor_cpu_request: args.executor_cpu_request.clone(),
-        executor_memory_request: args.executor_memory_request.clone(),
-        executor_storage_size_gb: args.executor_storage_size_gb,
-        ephemeral_storage_limit_gb: args.ephemeral_storage_limit_gb.clone(),
-        organization_tag: args.organization_tag.clone(),
+        app_memory_limit: res.app_memory.clone(),
+        app_cpu_limit: res.app_cpu.clone(),
+        app_cpu_request: res.app_cpu_request.clone(),
+        app_memory_request: res.app_memory_request.clone(),
+        app_replicas: res.app_replicas,
+        app_storage_size_gb: res.app_storage_size_gb,
+        executor_replicas: res.executor_replicas.unwrap_or(1),
+        executor_memory_limit: res.executor_memory.clone(),
+        executor_cpu_limit: res.executor_cpu.clone(),
+        executor_cpu_request: res.executor_cpu_request.clone(),
+        executor_memory_request: res.executor_memory_request.clone(),
+        executor_storage_size_gb: res.executor_storage_size_gb,
+        ephemeral_storage_limit_gb: res.ephemeral_storage_gb.clone(),
+        organization_tag: scp.organization_tag.clone(),
     };
     eprintln!(
         "[stdio] App resource config: \
@@ -106,7 +111,8 @@ pub(crate) async fn provision_scp_app(
     eprintln!("[stdio] App ID: {app_id}");
     eprintln!("[stdio] Deployment mode: {deployment_mode:?}");
 
-    let spicepod = generate_initial_spicepod(&run_id, setup_config, datasets, None, args).await?;
+    let spicepod =
+        generate_initial_spicepod(&run_id, setup_config, datasets, None, args, scp, cayenne).await?;
     let spicepod_yaml = serialize_spicepod(&spicepod)?;
     eprintln!(
         "[stdio] Generated spicepod for app '{app_name}' ({} bytes):\n{spicepod_yaml}",
@@ -129,21 +135,19 @@ pub(crate) async fn provision_scp_app(
     }
 
     // Apply custom image configuration if any image-related overrides are provided.
-    // This updates the app's image_tag/update_channel before creating the deployment,
-    // so the deployment picks up the requested image version instead of the default.
-    let has_custom_image = args.image_tag.is_some() || args.channel.is_some();
+    let has_custom_image = scp.image_tag.is_some() || scp.channel.is_some();
 
     if has_custom_image {
         eprintln!(
             "[stdio] Applying custom image config: tag={:?}, channel={:?}",
-            args.image_tag, args.channel
+            scp.image_tag, scp.channel
         );
         cloud
             .update_app(
                 app_id,
                 &UpdateAppRequest {
-                    image_tag: args.image_tag.clone(),
-                    update_channel: args.channel.as_ref().map(ToString::to_string),
+                    image_tag: scp.image_tag.clone(),
+                    update_channel: scp.channel.as_ref().map(ToString::to_string),
                     ..UpdateAppRequest::default()
                 },
             )
@@ -155,11 +159,9 @@ pub(crate) async fn provision_scp_app(
     }
 
     eprintln!("[stdio] Creating deployment...");
-    commands::create_deployment(&cloud, app_id, args.channel.as_ref()).await?;
+    commands::create_deployment(&cloud, app_id, scp.channel.as_ref()).await?;
 
-    // Always wait for spiced to accept SQL queries before returning — without
-    // this, spicebench workers start querying before the instance is up and
-    // get "instance not found" FlightSQL errors.
+    // Always wait for spiced to accept SQL queries before returning.
     let poll_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
@@ -177,8 +179,6 @@ pub(crate) async fn provision_scp_app(
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(120);
 
-        // after the deployment is reported "ready", wait for executors to connect.
-        // not all executors may be connected yet. executors should know to create missing tables when they join: https://github.com/spiceai/spiceai/issues/9848
         eprintln!(
             "[stdio] Deployment is ready, waiting an additional {executor_wait_timeout}s for executors to connect..."
         );
@@ -195,7 +195,7 @@ pub(crate) async fn provision_scp_app(
         flight_url,
         sql_url,
         cloud,
-        storage: FederatedStorageConfig::Cayenne, // will be replaced by setup() caller
+        storage: FederatedStorageConfig::DirectIngest, // will be replaced by setup() caller
         ec2_guards: vec![],
         dynamodb_guard: None,
     })))

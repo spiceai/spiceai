@@ -26,8 +26,6 @@ use system_adapter_protocol::DatasetConfig;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
-
 pub(crate) fn tpch_schema_name(run_id: &Uuid) -> String {
     format!("tpch_{}", crate::commands::run_id_short(run_id))
 }
@@ -55,24 +53,6 @@ pub(crate) struct PgConfig {
 }
 
 impl PgConfig {
-    pub(crate) fn from_args(args: &StdioArgs, run_id: &Uuid) -> Option<Self> {
-        let host = args.pg_host.clone()?;
-        Some(Self {
-            host,
-            port: args.pg_port,
-            user: args
-                .pg_user
-                .clone()
-                .unwrap_or_else(|| "postgres".to_string()),
-            password: args.pg_password.clone(),
-            database: args
-                .pg_database
-                .clone()
-                .unwrap_or_else(|| "spicebench".to_string()),
-            schema: tpch_schema_name(run_id),
-        })
-    }
-
     pub(crate) fn adbc_uri(&self) -> String {
         // Embed search_path so ADBC UPDATE/INSERT statements can resolve
         // unqualified table names without requiring callers to schema-qualify.

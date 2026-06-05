@@ -24,7 +24,7 @@ use aws_sdk_ec2::types::{
 use base64::Engine as _;
 use tokio_postgres::NoTls;
 
-use crate::args::StdioArgs;
+use crate::scenario::Ec2Spec;
 
 const DEFAULT_PG_USER: &str = "postgres";
 const DEFAULT_PG_DATABASE: &str = "spicebench";
@@ -41,42 +41,19 @@ pub(crate) struct Ec2PostgresInstance {
     pub(crate) region: String,
 }
 
-/// Returns true when EC2 provisioning mode is requested.
-pub(crate) fn is_ec2_mode(args: &StdioArgs) -> bool {
-    args.storage_compute == crate::args::StorageCompute::Ec2
-}
-
 /// Launch an EC2 instance, install `PostgreSQL`, and wait until it accepts connections.
 pub(crate) async fn launch_postgres_ec2(
-    args: &StdioArgs,
+    spec: &Ec2Spec,
+    region: &str,
     run_id_short: &str,
 ) -> anyhow::Result<Ec2PostgresInstance> {
-    let region = args
-        .aws_region
-        .clone()
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-        .unwrap_or_else(|| "us-east-1".to_string());
-
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(region.clone()))
+        .region(Region::new(region.to_string()))
         .load()
         .await;
     let ec2 = Ec2Client::new(&config);
 
-    let subnet_id = args
-        .ec2_subnet_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_SUBNET_ID is required for EC2 mode"))?;
-    let sg_id = args
-        .ec2_security_group_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_SECURITY_GROUP_ID is required for EC2 mode"))?;
-    let ami_id = args
-        .ec2_ami_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_AMI_ID is required for EC2 mode"))?;
-    let instance_type = InstanceType::from(args.ec2_instance_type.as_str());
+    let instance_type = InstanceType::from(spec.instance_type.as_str());
 
     let pg_password = uuid::Uuid::new_v4().to_string().replace('-', "");
 
@@ -86,13 +63,13 @@ pub(crate) async fn launch_postgres_ec2(
     let instance_name = format!("spidapter-postgres-{run_id_short}");
     eprintln!(
         "[stdio] EC2: launching PostgreSQL instance \
-         (name={instance_name}, ami={ami_id}, type={}, subnet={subnet_id}, disk={}GB)",
-        args.ec2_instance_type, args.ec2_disk_size_gb
+         (name={instance_name}, ami={}, type={}, subnet={}, disk={}GB)",
+        spec.ami_id, spec.instance_type, spec.subnet_id, spec.disk_size_gb
     );
 
     let mut run_req = ec2
         .run_instances()
-        .image_id(ami_id)
+        .image_id(&spec.ami_id)
         .instance_type(instance_type)
         .min_count(1)
         .max_count(1)
@@ -102,7 +79,7 @@ pub(crate) async fn launch_postgres_ec2(
                 .device_name("/dev/sda1")
                 .ebs(
                     EbsBlockDevice::builder()
-                        .volume_size(args.ec2_disk_size_gb)
+                        .volume_size(spec.disk_size_gb)
                         .volume_type(VolumeType::Gp3)
                         .delete_on_termination(true)
                         .build(),
@@ -116,8 +93,9 @@ pub(crate) async fn launch_postgres_ec2(
                 .build(),
         );
 
-    if let Some(profile) = &args.ec2_iam_instance_profile {
-        let spec = if profile.starts_with("arn:") {
+    if !spec.iam_instance_profile.is_empty() {
+        let profile = &spec.iam_instance_profile;
+        let ispec = if profile.starts_with("arn:") {
             IamInstanceProfileSpecification::builder()
                 .arn(profile)
                 .build()
@@ -126,20 +104,22 @@ pub(crate) async fn launch_postgres_ec2(
                 .name(profile)
                 .build()
         };
-        run_req = run_req.iam_instance_profile(spec);
+        run_req = run_req.iam_instance_profile(ispec);
     }
 
-    if args.ec2_associate_public_ip {
+    if spec.associate_public_ip {
         run_req = run_req.network_interfaces(
             InstanceNetworkInterfaceSpecification::builder()
                 .device_index(0)
-                .subnet_id(subnet_id)
-                .groups(sg_id)
+                .subnet_id(&spec.subnet_id)
+                .groups(&spec.security_group_id)
                 .associate_public_ip_address(true)
                 .build(),
         );
     } else {
-        run_req = run_req.subnet_id(subnet_id).security_group_ids(sg_id);
+        run_req = run_req
+            .subnet_id(&spec.subnet_id)
+            .security_group_ids(&spec.security_group_id);
     }
 
     let run_result = run_req
@@ -157,14 +137,14 @@ pub(crate) async fn launch_postgres_ec2(
     eprintln!("[stdio] EC2: instance {instance_id} launched, waiting for running state...");
     wait_for_instance_running(&ec2, &instance_id).await?;
 
-    let host = if args.ec2_associate_public_ip {
+    let host = if spec.associate_public_ip {
         get_instance_public_ip(&ec2, &instance_id).await?
     } else {
         get_instance_private_ip(&ec2, &instance_id).await?
     };
     eprintln!("[stdio] EC2: instance {instance_id} running at {host}");
 
-    if args.ec2_iam_instance_profile.is_some() {
+    if !spec.iam_instance_profile.is_empty() {
         eprintln!(
             "[stdio] EC2: Session Manager console: \
              https://{region}.console.aws.amazon.com/systems-manager/session-manager/{instance_id}?region={region}"
@@ -189,7 +169,7 @@ pub(crate) async fn launch_postgres_ec2(
         pg_password,
         pg_database: DEFAULT_PG_DATABASE.to_string(),
         pg_port: PG_PORT,
-        region,
+        region: region.to_string(),
     })
 }
 

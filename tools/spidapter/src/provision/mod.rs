@@ -20,9 +20,7 @@ pub(super) mod spice_local;
 
 pub(super) use ec2_debezium::launch_ec2_debezium;
 pub(super) use ec2_mongodb::launch_mongodb_ec2;
-pub(super) use ec2_postgres::{
-    Ec2PostgresInstance, is_ec2_mode, launch_postgres_ec2, terminate_ec2_instance,
-};
+pub(super) use ec2_postgres::{launch_postgres_ec2, terminate_ec2_instance};
 pub(super) use spice_cloud::provision_scp_app;
 pub(super) use spice_local::{
     provision_local_single_node, provision_local_spiced_cluster, teardown_local_run,

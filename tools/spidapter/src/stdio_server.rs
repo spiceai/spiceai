@@ -33,7 +33,12 @@ use tokio::process::Child;
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::args::{AccelerationEngine, DeploymentMode, SpiceCompute, StdioArgs, Storage};
+use crate::args::{DeploymentMode, StdioArgs};
+use crate::scenario::{
+    AccelerationEngine, CayenneConfig, ComputeConfig, DirectConfig, DynamoDbConfig,
+    MongoEndpoint, PgEndpoint, ScenarioConfig, ScpConfig, SourceConfig, SpiceCompute,
+    load_scenario,
+};
 use crate::commands;
 
 #[path = "sources/mod.rs"]
@@ -43,9 +48,8 @@ mod sources;
 mod provision;
 
 use provision::{
-    Ec2PostgresInstance, is_ec2_mode, launch_ec2_debezium, launch_mongodb_ec2, launch_postgres_ec2,
-    provision_local_single_node, provision_local_spiced_cluster, provision_scp_app,
-    teardown_local_run, terminate_ec2_instance,
+    launch_ec2_debezium, launch_mongodb_ec2, launch_postgres_ec2, provision_local_single_node,
+    provision_local_spiced_cluster, provision_scp_app, teardown_local_run, terminate_ec2_instance,
 };
 use sources::cayenne::generate_cayenne_sink_spicepod;
 use sources::dynamodb::{
@@ -152,9 +156,6 @@ impl Drop for LocalRunState {
 }
 
 /// RAII guard that terminates an EC2 instance when dropped.
-///
-/// Call [`disarm`](Self::disarm) before async teardown to extract the cleanup data and
-/// prevent the sequential blocking [`Drop`] from running.
 struct Ec2Guard {
     instance_id: Option<String>,
     region: String,
@@ -198,9 +199,6 @@ impl Drop for Ec2Guard {
 }
 
 /// RAII guard that deletes `DynamoDB` tables when dropped.
-///
-/// Call [`disarm`](Self::disarm) before async teardown to extract the cleanup data and
-/// prevent the sequential blocking [`Drop`] from running.
 struct DynamoDbGuard {
     info: Option<DynamoDbTeardownInfo>,
 }
@@ -244,7 +242,7 @@ impl Drop for DynamoDbGuard {
 /// Configuration for the federated storage backend for a benchmark run.
 #[derive(Debug, Clone)]
 enum FederatedStorageConfig {
-    Cayenne,
+    DirectIngest,
     Postgres {
         pg: PgConfig,
         acceleration: AccelerationEngine,
@@ -269,7 +267,7 @@ enum FederatedStorageConfig {
 impl FederatedStorageConfig {
     fn deployment_mode(&self) -> DeploymentMode {
         match self {
-            Self::Cayenne => DeploymentMode::Cluster,
+            Self::DirectIngest => DeploymentMode::Cluster,
             _ => DeploymentMode::SingleNode,
         }
     }
@@ -285,13 +283,10 @@ fn acceleration_engine_str(engine: AccelerationEngine) -> &'static str {
 #[derive(Debug, Clone)]
 struct SetupConfig {
     region: Option<String>,
-    /// Absolute path to a spicepod the client wants deployed verbatim
-    /// (testoperator's cluster-bench path passes this; spicebench leaves it
-    /// empty and relies on the `datasets` JSON-RPC parameter instead).
+    /// Absolute path to a spicepod the client wants deployed verbatim.
     spicepod_path: Option<String>,
     storage: FederatedStorageConfig,
-    /// Explicit AWS region from CLI args — overrides `region` (from `etl_region` metadata)
-    /// for the `DynamoDB` write path so the benchmark source region doesn't bleed through.
+    /// Explicit AWS region override for the DynamoDB write path.
     aws_region_override: Option<String>,
 }
 
@@ -300,7 +295,7 @@ impl SetupConfig {
         Self {
             region: metadata_string(metadata, "etl_region"),
             spicepod_path: metadata_string(metadata, "spicepod_path"),
-            storage: FederatedStorageConfig::Cayenne,
+            storage: FederatedStorageConfig::DirectIngest,
             aws_region_override: None,
         }
     }
@@ -312,9 +307,6 @@ impl SetupConfig {
 }
 
 fn resolve_aws_region(setup_config: &SetupConfig) -> String {
-    // CLI --aws-region wins over etl_region metadata so the benchmark source
-    // region (e.g. S3 us-east-1) doesn't route DynamoDB traffic to localhost
-    // via a /etc/hosts redirect meant for a different service.
     setup_config
         .aws_region_override
         .clone()
@@ -389,14 +381,54 @@ struct SpidapterHandler {
     run_datasets: HashMap<Uuid, HashMap<String, DatasetConfig>>,
     /// Full CLI args (includes all flags and env-var-backed configuration).
     args: StdioArgs,
+    /// Loaded scenario configuration (source type, compute, channel, acceleration).
+    scenario: ScenarioConfig,
 }
 
 impl SpidapterHandler {
-    fn new(args: &StdioArgs) -> Self {
+    fn new(args: &StdioArgs, scenario: ScenarioConfig) -> Self {
         Self {
             runs: HashMap::new(),
             run_datasets: HashMap::new(),
             args: args.clone(),
+            scenario,
+        }
+    }
+
+    /// Return the SCP config from the scenario, if present.
+    fn scp_config(&self) -> Option<&ScpConfig> {
+        match &self.scenario.compute {
+            Some(ComputeConfig::Scp(scp)) => Some(scp),
+            _ => None,
+        }
+    }
+
+    /// Resolve the acceleration engine from the scenario.
+    fn acceleration(&self) -> AccelerationEngine {
+        self.scenario.acceleration.unwrap_or(AccelerationEngine::Cayenne)
+    }
+
+    /// Resolve the AWS region for EC2/DynamoDB provisioning.
+    fn aws_region(&self) -> String {
+        // For direct-ingest with a CayenneConfig, use the cayenne aws_region if set.
+        if let SourceConfig::Direct(DirectConfig { cayenne: Some(ref c) }) = self.scenario.source {
+            if let Some(ref r) = c.aws_region {
+                if !r.is_empty() {
+                    return r.clone();
+                }
+            }
+        }
+        std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string())
+    }
+
+    /// Resolve the compute target from the scenario.
+    fn compute(&self) -> SpiceCompute {
+        match &self.scenario.compute {
+            Some(ComputeConfig::Scp(_)) => SpiceCompute::Scp,
+            Some(ComputeConfig::Local) => SpiceCompute::Local,
+            None => SpiceCompute::Local,
         }
     }
 }
@@ -414,126 +446,94 @@ impl Handler for SpidapterHandler {
             metadata.keys().collect::<Vec<_>>()
         );
 
-        // Guards accumulate as resources are provisioned. If setup returns Err at any
-        // point before they are moved into RunState, their Drop impls clean up.
         let mut ec2_guards: Vec<Ec2Guard> = Vec::new();
         let mut dynamodb_guard: Option<DynamoDbGuard> = None;
 
-        // Build the FederatedStorageConfig (same logic as setup()).
-        let storage = match self.args.storage {
-            Storage::Cayenne => FederatedStorageConfig::Cayenne,
-            Storage::PostgresWAL => {
-                let run_id_str = run_id.to_string();
-                let short_id = run_id_str.split('-').next().unwrap_or_default();
+        let acceleration = self.acceleration();
+        let region = self.aws_region();
+        let run_id_str = run_id.to_string();
+        let short_id = run_id_str.split('-').next().unwrap_or_default();
 
-                let ec2_instance: Option<Ec2PostgresInstance> = if is_ec2_mode(&self.args) {
-                    let instance = launch_postgres_ec2(&self.args, short_id)
-                        .await
-                        .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
-                    ec2_guards.push(Ec2Guard::new(
-                        instance.instance_id.clone(),
-                        instance.region.clone(),
-                    ));
-                    Some(instance)
-                } else {
-                    None
+        // Extract CayenneConfig from the scenario source for use in spicepod generation.
+        let cayenne_cfg: Option<&CayenneConfig> = match &self.scenario.source {
+            SourceConfig::Direct(DirectConfig { cayenne }) => cayenne.as_ref(),
+            _ => None,
+        };
+
+        let storage = match &self.scenario.source {
+            SourceConfig::Direct(_) => FederatedStorageConfig::DirectIngest,
+
+            SourceConfig::PostgresWal(PgEndpoint::Provision(prov)) => {
+                let ec2 = launch_postgres_ec2(&prov.ec2, &region, short_id)
+                    .await
+                    .map_err(|e| format!("Failed to provision EC2 PostgreSQL instance: {e}"))?;
+                ec2_guards.push(Ec2Guard::new(ec2.instance_id.clone(), ec2.region.clone()));
+                let pg = PgConfig {
+                    host: ec2.host,
+                    port: ec2.pg_port,
+                    user: ec2.pg_user,
+                    password: ec2.pg_password,
+                    database: ec2.pg_database,
+                    schema: tpch_schema_name(&run_id),
                 };
-
-                let pg = if let Some(ref ec2) = ec2_instance {
-                    Some(PgConfig {
-                        host: ec2.host.clone(),
-                        port: ec2.pg_port,
-                        user: ec2.pg_user.clone(),
-                        password: ec2.pg_password.clone(),
-                        database: ec2.pg_database.clone(),
-                        schema: tpch_schema_name(&run_id),
-                    })
-                } else {
-                    PgConfig::from_args(&self.args, &run_id)
-                };
-
-                let pg = pg.ok_or_else(|| {
-                    "postgres-wal storage requires PG_HOST (or EC2 provisioning via --storage-compute ec2)".to_string()
-                })?;
-
                 setup_postgres_for_wal(&pg, &datasets)
                     .await
                     .map_err(|e| format!("Failed to set up PostgreSQL for WAL CDC: {e}"))?;
-
-                FederatedStorageConfig::Postgres {
-                    pg,
-                    acceleration: self.args.acceleration,
-                }
+                FederatedStorageConfig::Postgres { pg, acceleration }
             }
-            Storage::PostgresDebezium => {
-                let run_id_str = run_id.to_string();
-                let short_id = run_id_str.split('-').next().unwrap_or_default();
 
-                // In EC2 mode: launch Postgres + Debezium EC2 instances concurrently.
-                // In local mode: read KAFKA_BROKERS and DEBEZIUM_CONNECT_URL from env.
-                let (ec2_pg_instance, kafka_brokers, debezium_connect_url) = if is_ec2_mode(
-                    &self.args,
-                ) {
-                    let (pg_res, deb_res) = tokio::join!(
-                        launch_postgres_ec2(&self.args, short_id),
-                        launch_ec2_debezium(&self.args, short_id)
-                    );
+            SourceConfig::PostgresWal(PgEndpoint::Connect(pg_conf)) => {
+                let pg = PgConfig {
+                    host: pg_conf.host.clone(),
+                    port: pg_conf.port,
+                    user: pg_conf.user.clone(),
+                    password: pg_conf.password.clone(),
+                    database: pg_conf.database.clone(),
+                    schema: tpch_schema_name(&run_id),
+                };
+                setup_postgres_for_wal(&pg, &datasets)
+                    .await
+                    .map_err(|e| format!("Failed to set up PostgreSQL for WAL CDC: {e}"))?;
+                FederatedStorageConfig::Postgres { pg, acceleration }
+            }
 
-                    let ec2_pg = match pg_res {
-                        Ok(inst) => {
-                            ec2_guards
-                                .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
-                            Some(inst)
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "Failed to provision EC2 PostgreSQL instance: {e}"
-                            ));
-                        }
-                    };
+            SourceConfig::PostgresDebezium(PgEndpoint::Provision(prov)) => {
+                let ec2_spec = &prov.ec2;
+                let (pg_res, deb_res) = tokio::join!(
+                    launch_postgres_ec2(ec2_spec, &region, short_id),
+                    launch_ec2_debezium(ec2_spec, &region, short_id)
+                );
 
-                    let ec2_deb = match deb_res {
-                        Ok(inst) => {
-                            ec2_guards
-                                .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
-                            inst
-                        }
-                        Err(e) => {
-                            return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
-                        }
-                    };
-
-                    (ec2_pg, ec2_deb.kafka_brokers, ec2_deb.connect_url)
-                } else {
-                    let kafka_brokers = std::env::var("KAFKA_BROKERS").map_err(|_| {
-                        "KAFKA_BROKERS env var is required for local postgres-debezium mode"
-                            .to_string()
-                    })?;
-                    let debezium_connect_url =
-                            std::env::var("DEBEZIUM_CONNECT_URL").map_err(|_| {
-                                "DEBEZIUM_CONNECT_URL env var is required for local postgres-debezium mode"
-                                    .to_string()
-                            })?;
-                    (None, kafka_brokers, debezium_connect_url)
+                let ec2_pg = match pg_res {
+                    Ok(inst) => {
+                        ec2_guards
+                            .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
+                        inst
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to provision EC2 PostgreSQL instance: {e}"));
+                    }
                 };
 
-                let pg = if let Some(ref ec2) = ec2_pg_instance {
-                    Some(PgConfig {
-                        host: ec2.host.clone(),
-                        port: ec2.pg_port,
-                        user: ec2.pg_user.clone(),
-                        password: ec2.pg_password.clone(),
-                        database: ec2.pg_database.clone(),
-                        schema: tpch_schema_name(&run_id),
-                    })
-                } else {
-                    PgConfig::from_args(&self.args, &run_id)
+                let ec2_deb = match deb_res {
+                    Ok(inst) => {
+                        ec2_guards
+                            .push(Ec2Guard::new(inst.instance_id.clone(), inst.region.clone()));
+                        inst
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to provision EC2 Debezium instance: {e}"));
+                    }
                 };
 
-                let pg = pg.ok_or_else(|| {
-                    "FederatedStorage::PostgresDebezium requires PG_HOST or EC2 provisioning"
-                        .to_string()
-                })?;
+                let pg = PgConfig {
+                    host: ec2_pg.host,
+                    port: ec2_pg.pg_port,
+                    user: ec2_pg.pg_user,
+                    password: ec2_pg.pg_password,
+                    database: ec2_pg.pg_database,
+                    schema: tpch_schema_name(&run_id),
+                };
 
                 setup_postgres_for_debezium(&pg, &datasets)
                     .await
@@ -541,62 +541,86 @@ impl Handler for SpidapterHandler {
 
                 FederatedStorageConfig::PostgresDebezium {
                     pg,
+                    kafka_brokers: ec2_deb.kafka_brokers,
+                    debezium_connect_url: ec2_deb.connect_url,
+                    acceleration,
+                }
+            }
+
+            SourceConfig::PostgresDebezium(PgEndpoint::Connect(pg_conf)) => {
+                let kafka_brokers = std::env::var("KAFKA_BROKERS").map_err(|_| {
+                    "KAFKA_BROKERS env var is required for local postgres-debezium mode".to_string()
+                })?;
+                let debezium_connect_url = std::env::var("DEBEZIUM_CONNECT_URL").map_err(|_| {
+                    "DEBEZIUM_CONNECT_URL env var is required for local postgres-debezium mode"
+                        .to_string()
+                })?;
+                let pg = PgConfig {
+                    host: pg_conf.host.clone(),
+                    port: pg_conf.port,
+                    user: pg_conf.user.clone(),
+                    password: pg_conf.password.clone(),
+                    database: pg_conf.database.clone(),
+                    schema: tpch_schema_name(&run_id),
+                };
+                setup_postgres_for_debezium(&pg, &datasets)
+                    .await
+                    .map_err(|e| format!("Failed to set up PostgreSQL for Debezium CDC: {e}"))?;
+                FederatedStorageConfig::PostgresDebezium {
+                    pg,
                     kafka_brokers,
                     debezium_connect_url,
-                    acceleration: self.args.acceleration,
+                    acceleration,
                 }
             }
-            Storage::DynamoDBStreams => {
-                let region = self
-                    .args
-                    .aws_region
-                    .clone()
-                    .or_else(|| std::env::var("AWS_REGION").ok())
-                    .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-                    .or_else(|| metadata_string(&metadata, "etl_region"))
-                    .unwrap_or_else(|| "us-east-1".to_string());
+
+            SourceConfig::DynamoDbStreams(DynamoDbConfig {
+                region: dynamo_region,
+            }) => {
+                let effective_region = if !dynamo_region.is_empty() {
+                    dynamo_region.clone()
+                } else {
+                    std::env::var("AWS_REGION")
+                        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                        .or_else(|_| metadata_string(&metadata, "etl_region").ok_or(()))
+                        .unwrap_or_else(|_| "us-east-1".to_string())
+                };
                 FederatedStorageConfig::DynamoDB {
                     prefix: String::new(),
-                    region,
-                    acceleration: self.args.acceleration,
+                    region: effective_region,
+                    acceleration,
                 }
             }
-            Storage::MongoDB => {
-                let run_id_str = run_id.to_string();
-                let short_id = run_id_str.split('-').next().unwrap_or_default();
 
-                let uri = if is_ec2_mode(&self.args) {
-                    let instance = launch_mongodb_ec2(&self.args, short_id)
-                        .await
-                        .map_err(|e| format!("Failed to provision EC2 MongoDB instance: {e}"))?;
-                    ec2_guards.push(Ec2Guard::new(
-                        instance.instance_id.clone(),
-                        instance.region.clone(),
-                    ));
-                    eprintln!(
-                        "[stdio] EC2 MongoDB: instance {} ready at {}",
-                        instance.instance_id, instance.host
-                    );
-                    instance.uri
-                } else {
-                    self.args
-                        .mongodb_uri
-                        .clone()
-                        .or_else(|| std::env::var("MONGODB_URI").ok())
-                        .ok_or_else(|| {
-                            "MONGODB_URI env var or --mongodb-uri arg is required for local MongoDB mode"
-                                .to_string()
-                        })?
-                };
+            SourceConfig::MongodbStreams(MongoEndpoint::Provision(prov)) => {
+                let instance = launch_mongodb_ec2(&prov.ec2, &region, short_id)
+                    .await
+                    .map_err(|e| format!("Failed to provision EC2 MongoDB instance: {e}"))?;
+                ec2_guards.push(Ec2Guard::new(
+                    instance.instance_id.clone(),
+                    instance.region.clone(),
+                ));
+                eprintln!(
+                    "[stdio] EC2 MongoDB: instance {} ready at {}",
+                    instance.instance_id, instance.host
+                );
                 FederatedStorageConfig::MongoDB {
-                    uri,
-                    acceleration: self.args.acceleration,
+                    uri: instance.uri,
+                    acceleration,
+                }
+            }
+
+            SourceConfig::MongodbStreams(MongoEndpoint::Connect(mongo_conf)) => {
+                FederatedStorageConfig::MongoDB {
+                    uri: mongo_conf.uri.clone(),
+                    acceleration,
                 }
             }
         };
 
         let mut setup_config = SetupConfig::from_metadata(&metadata).set_storage(storage);
-        setup_config.aws_region_override = self.args.aws_region.clone();
+        // For non-direct sources, still honour the env AWS_REGION override.
+        setup_config.aws_region_override = std::env::var("AWS_REGION").ok();
 
         // DynamoDB: create tables now so spicebench can write via the native sink.
         if let FederatedStorageConfig::DynamoDB { ref region, .. } = setup_config.storage {
@@ -620,8 +644,7 @@ impl Handler for SpidapterHandler {
             }
         }
 
-        // Debezium/PostgreSQL: register the connector so Kafka topics are created
-        // before spicebench starts writing data.
+        // Debezium/PostgreSQL: register the connector.
         if let FederatedStorageConfig::PostgresDebezium {
             ref pg,
             ref debezium_connect_url,
@@ -641,20 +664,26 @@ impl Handler for SpidapterHandler {
             .map_err(|e| format!("Failed to register Debezium PostgreSQL connector: {e}"))?;
         }
 
-        // For Cayenne: provision spiced first (Flight URL needed to build SinkConfig).
+        // For Cayenne (DirectIngest): provision spiced first (Flight URL needed to build SinkConfig).
         // For all other backends: build SinkConfig first, then provision spiced.
-        let (sink, mut state) = if matches!(&setup_config.storage, FederatedStorageConfig::Cayenne)
+        let (sink, mut state) = if matches!(&setup_config.storage, FederatedStorageConfig::DirectIngest)
         {
             let deployment_mode = setup_config.storage.deployment_mode();
-            let provision_result = match self.args.compute {
+            let provision_result = match self.compute() {
                 SpiceCompute::Scp => {
+                    let scp = self.scp_config().ok_or_else(|| {
+                        "direct-ingest with SCP compute requires a scenario with `compute: scp:`"
+                            .to_string()
+                    })?;
                     provision_scp_app(
                         run_id,
                         &self.args,
+                        scp,
                         &setup_config,
                         &datasets,
                         &deployment_mode,
                         true,
+                        cayenne_cfg,
                     )
                     .await
                 }
@@ -665,13 +694,14 @@ impl Handler for SpidapterHandler {
                         &setup_config,
                         &datasets,
                         &self.args,
+                        self.scp_config(),
                     )
                     .await
                 }
             };
             let mut state = match provision_result {
                 Ok(s) => s,
-                Err(e) => return Err(format!("Cayenne setup: provisioning failed: {e}")),
+                Err(e) => return Err(format!("direct-ingest setup: provisioning failed:{e}")),
             };
             match &mut state {
                 RunState::Scp(scp) => scp.storage = setup_config.storage.clone(),
@@ -682,7 +712,7 @@ impl Handler for SpidapterHandler {
             let api_key = state.api_key().map(str::to_string);
             post_setup_sink_action(&datasets, &sql_url, api_key.as_deref())
                 .await
-                .map_err(|e| format!("Cayenne post-setup SQL failed: {e}"))?;
+                .map_err(|e| format!("direct-ingest post-setup SQL failed:{e}"))?;
 
             let mut db_kwargs = HashMap::from([
                 (
@@ -746,19 +776,24 @@ impl Handler for SpidapterHandler {
                 FederatedStorageConfig::MongoDB { uri, .. } => {
                     SinkConfig::MongoDb { uri: uri.clone() }
                 }
-                FederatedStorageConfig::Cayenne => unreachable!(),
+                FederatedStorageConfig::DirectIngest => unreachable!(),
             };
 
             let deployment_mode = setup_config.storage.deployment_mode();
-            let provision_result = match self.args.compute {
+            let provision_result = match self.compute() {
                 SpiceCompute::Scp => {
+                    let scp = self.scp_config().ok_or_else(|| {
+                        "SCP compute requires a scenario with `compute: scp:`".to_string()
+                    })?;
                     provision_scp_app(
                         run_id,
                         &self.args,
+                        scp,
                         &setup_config,
                         &datasets,
                         &deployment_mode,
-                        false, // DynamoDB/postgres-debezium writes bypass spiced; don't block on readiness
+                        false,
+                        cayenne_cfg,
                     )
                     .await
                 }
@@ -770,6 +805,8 @@ impl Handler for SpidapterHandler {
                             &setup_config,
                             &datasets,
                             &self.args,
+                            self.scp_config(),
+                            cayenne_cfg,
                         )
                         .await
                     }
@@ -780,6 +817,7 @@ impl Handler for SpidapterHandler {
                             &setup_config,
                             &datasets,
                             &self.args,
+                            self.scp_config(),
                         )
                         .await
                     }
@@ -797,7 +835,6 @@ impl Handler for SpidapterHandler {
                     s
                 }
                 Err(e) => {
-                    // ec2_guards and dynamodb_guard drop here, cleaning up AWS resources.
                     return Err(format!("Setup failed: provisioning failed: {e}"));
                 }
             };
@@ -829,14 +866,13 @@ impl Handler for SpidapterHandler {
         }
 
         let catalog_namespace = match &setup_config.storage {
-            FederatedStorageConfig::Cayenne => Some("spicebench.bench".to_string()),
+            FederatedStorageConfig::DirectIngest => Some("spicebench.bench".to_string()),
             FederatedStorageConfig::DynamoDB { prefix, .. } if !prefix.is_empty() => {
                 Some(prefix.clone())
             }
             _ => None,
         };
 
-        // Move guards into the run state so they live for the duration of the run.
         match &mut state {
             RunState::Scp(scp) => {
                 scp.ec2_guards = ec2_guards;
@@ -929,8 +965,6 @@ impl Handler for SpidapterHandler {
             RunState::Local(local) => local.storage.clone(),
         };
 
-        // Extract guards now; they drop at end of function, AFTER Postgres cleanup below.
-        // This ensures the EC2 instance (which hosts Postgres) is still alive during teardown.
         let (ec2_guards, dynamodb_guard) = match &mut state {
             RunState::Scp(scp) => (
                 std::mem::take(&mut scp.ec2_guards),
@@ -982,7 +1016,6 @@ impl Handler for SpidapterHandler {
             }
         }
 
-        // Postgres cleanup must happen before EC2 guards run (EC2 hosts Postgres).
         match &storage {
             FederatedStorageConfig::Postgres { pg, .. }
             | FederatedStorageConfig::PostgresDebezium { pg, .. } => {
@@ -992,10 +1025,9 @@ impl Handler for SpidapterHandler {
             }
             FederatedStorageConfig::DynamoDB { .. }
             | FederatedStorageConfig::MongoDB { .. }
-            | FederatedStorageConfig::Cayenne => {}
+            | FederatedStorageConfig::DirectIngest => {}
         }
 
-        // Disarm guards and run all AWS cleanup concurrently.
         let mut cleanup: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         for mut guard in ec2_guards {
             if let Some((instance_id, region)) = guard.disarm() {
@@ -1035,7 +1067,6 @@ impl Handler for SpidapterHandler {
         source_dataset: &str,
         staging_table_name: &str,
     ) -> std::result::Result<system_adapter_protocol::CreateStagingTableResponse, String> {
-        // Extract state fields upfront, cloning to release the borrow before async ops.
         let (storage, sql_url, api_key) = {
             let state = self
                 .runs
@@ -1065,7 +1096,6 @@ impl Handler for SpidapterHandler {
         if let FederatedStorageConfig::Postgres { pg, .. }
         | FederatedStorageConfig::PostgresDebezium { pg, .. } = &storage
         {
-            // PostgresCdc/Debezium: create staging table directly in PostgreSQL.
             let source_config = self
                 .run_datasets
                 .get(&run_id)
@@ -1076,9 +1106,6 @@ impl Handler for SpidapterHandler {
             let ddl = pg_create_table_ddl(&pg.schema, staging_table_name, source_config).map_err(
                 |e| format!("Failed to generate staging table DDL for '{staging_table_name}': {e}"),
             )?;
-            // eprintln!(
-            //     "[stdio] create_staging_table (postgres): source={source_dataset}, staging={staging_table_name}, sql={ddl}"
-            // );
             let client = pg
                 .connect()
                 .await
@@ -1096,9 +1123,6 @@ impl Handler for SpidapterHandler {
                     )
                 })?;
         } else {
-            // Cayenne/other: copy schema from source via Spice SQL.
-            // Use CREATE TABLE ... LIKE ... to copy schema, partition expression,
-            // and partition-to-executor assignments from the source table.
             let quoted_staging = quote_identifier(staging_table_name);
             let quoted_source = quote_identifier(source_dataset);
             let ddl = format!(
@@ -1117,19 +1141,27 @@ impl Handler for SpidapterHandler {
 }
 
 pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
-    let handler = SpidapterHandler::new(args);
+    let scenario = if let Some(scenario_name) = &args.scenario {
+        let s = load_scenario(scenario_name, args.scenario_base_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("Failed to load scenario '{scenario_name}': {e}"))?;
+        eprintln!("[stdio] Loaded scenario '{scenario_name}': source={:?}", s.source);
+        s
+    } else {
+        ScenarioConfig {
+            compute: None,
+            acceleration: None,
+            source: SourceConfig::Direct(DirectConfig::default()),
+        }
+    };
+
+    let handler = SpidapterHandler::new(args, scenario);
     let mut server = Server::new(handler);
-    // Wrap in a select so that SIGINT/Ctrl-C drops the server future immediately.
-    // Dropping the future cascades through any in-flight handler call (e.g. setup()),
-    // dropping all local RAII guards (Ec2Guard, DynamoDbGuard) and running their
-    // cleanup logic before the process exits.
     tokio::select! {
         r = server.run_stdio() => {
             r.map_err(|e| anyhow::anyhow!("Stdio server error: {e}"))
         }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("[stdio] Received interrupt, cleaning up resources...");
-            // server drops here → SpidapterHandler drops → RunState drops → guards drop
             Ok(())
         }
     }
@@ -1140,7 +1172,7 @@ async fn post_setup_sink_action(
     sql_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<()> {
-    eprintln!("[stdio] Executing post-setup actions for Cayenne ADBC sink...");
+    eprintln!("[stdio] Executing post-setup actions for direct-ingest sink...");
 
     let create_table_statements = generate_adbc_create_table_statements(datasets)?;
     if create_table_statements.is_empty() {
@@ -1153,11 +1185,10 @@ async fn post_setup_sink_action(
         execute_sql_statement(sql_url, api_key, &statement).await?;
     }
 
-    eprintln!("[stdio] Cayenne post-setup table creation complete");
+    eprintln!("[stdio] direct-ingest post-setup table creation complete");
     Ok(())
 }
 
-/// Execute a single SQL statement against the system's HTTP SQL endpoint.
 async fn execute_sql_statement(
     sql_url: &str,
     api_key: Option<&str>,
@@ -1336,11 +1367,11 @@ async fn write_local_spicepod(
     let spicepod_yaml = serialize_spicepod(spicepod)?;
     let spicepod_path = working_dir.join("spicepod.yaml");
     eprintln!(
-        "[stdio] Writing local spicepod ({} bytes) to {}",
+        "[stdio] Generated local spicepod ({} bytes) at {}:\n{spicepod_yaml}",
         spicepod_yaml.len(),
         spicepod_path.display()
     );
-    tokio::fs::write(&spicepod_path, spicepod_yaml).await?;
+    tokio::fs::write(&spicepod_path, &spicepod_yaml).await?;
     Ok(spicepod_path)
 }
 
@@ -1348,10 +1379,6 @@ fn serialize_spicepod(spicepod: &SpicepodDefinition) -> anyhow::Result<String> {
     yaml::to_string(spicepod).map_err(|e| anyhow::anyhow!("Failed to serialize spicepod: {e}"))
 }
 
-/// Read a spicepod YAML file from disk and rename it to the per-run app name
-/// before deploying. Used by testoperator's cluster-bench path: the client
-/// passes a `spicepod_path` in setup metadata; we deploy whatever's there
-/// (datasets, runtime config, etc.) verbatim, only overriding the `name`.
 async fn load_spicepod_from_path(path: &str, run_id: &Uuid) -> anyhow::Result<SpicepodDefinition> {
     let contents = tokio::fs::read_to_string(path)
         .await
@@ -1369,14 +1396,19 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 }
 
 /// Generate the initial [`SpicepodDefinition`] for the benchmark run.
+///
+/// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
+/// `scp` provides the scheduler state location and query memory limit.
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
     flight_api_key: Option<&str>,
-    args: &StdioArgs,
+    _args: &StdioArgs,
+    scp: &ScpConfig,
+    cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<SpicepodDefinition> {
-    let scheduler_state_location = args.scheduler_state_location.as_deref();
+    let scheduler_state_location = scp.scheduler_state_location.as_deref();
 
     let mut spicepod = if let Some(path) = setup_config.spicepod_path.as_deref() {
         load_spicepod_from_path(path, run_id).await?
@@ -1390,8 +1422,13 @@ async fn generate_initial_spicepod(
                 datasets,
                 acceleration_engine_str(*acceleration),
             ),
-            FederatedStorageConfig::Cayenne => {
-                generate_cayenne_sink_spicepod(run_id, flight_api_key, args)
+            FederatedStorageConfig::DirectIngest => {
+                generate_cayenne_sink_spicepod(
+                    run_id,
+                    flight_api_key,
+                    cayenne,
+                    scp.query_memory_limit.as_deref(),
+                )
             }
             FederatedStorageConfig::DynamoDB {
                 prefix,
@@ -1432,12 +1469,6 @@ async fn generate_initial_spicepod(
         }
         let state_location = format!("{path}/{run_id}");
         if !path.is_empty() {
-            // Wire `s3_key`/`s3_secret` through `${secrets:...}` references
-            // so the runtime's cluster-secret lookup resolves them against
-            // the AWS_*-named secrets `set_spicepod_secrets` already uploads.
-            // Without these references, the scheduler's S3 client asks the
-            // cluster secret store for literal keys `s3_key`/`s3_secret` and
-            // fails ("Secret not found").
             let mut sched = Scheduler {
                 state_location,
                 params: Some(Params::from_string_map(HashMap::from([
@@ -1479,49 +1510,19 @@ mod tests {
     fn test_stdio_args() -> StdioArgs {
         StdioArgs {
             verbose: false,
-            spice_cloud_api_url: "https://api.spice.ai".to_string(),
+            scenario: None,
+            scenario_base_path: None,
             ready_wait: 600,
-            channel: None,
-            image_tag: None,
             api_key: None,
-            compute: SpiceCompute::Scp,
-            flight_url: None,
-            app_memory_limit: None,
-            app_cpu_limit: None,
-            app_cpu_request: None,
-            app_memory_request: None,
-            app_replicas: None,
-            executor_replicas: 1,
-            executor_memory_limit: None,
-            executor_cpu_limit: None,
-            executor_cpu_request: None,
-            executor_memory_request: None,
-            app_storage_size_gb: None,
-            executor_storage_size_gb: None,
-            scheduler_state_location: Some("s3://bucket/state".to_string()),
-            aws_region: None,
-            cayenne_data_dir: None,
-            cayenne_metadata_dir: None,
-            ephemeral_storage_limit_gb: None,
-            organization_tag: None,
-            query_memory_limit: None,
-            storage: Storage::Cayenne,
-            pg_host: None,
-            pg_port: 5432,
-            pg_user: None,
-            pg_password: String::new(),
-            pg_database: None,
-            acceleration: AccelerationEngine::Cayenne,
-            storage_compute: crate::args::StorageCompute::Local,
-            ec2_subnet_id: None,
-            ec2_security_group_id: None,
-            ec2_ami_id: None,
-            ec2_instance_type: "m5.large".to_string(),
-            ec2_disk_size_gb: 100,
-            ec2_associate_public_ip: false,
-            ec2_iam_instance_profile: None,
+            spice_cloud_api_url: "https://api.spice.ai".to_string(),
             spiced_binary: "spiced".to_string(),
-            mongodb_uri: None,
+        }
+    }
+
+    fn test_scp_config() -> ScpConfig {
+        ScpConfig {
+            scheduler_state_location: Some("s3://bucket/state".to_string()),
+            ..ScpConfig::default()
         }
     }
 
@@ -1537,10 +1538,10 @@ mod tests {
     }
 
     #[test]
-    fn compute_mode_cloud_is_default() {
+    fn compute_mode_scp_parses() {
         use clap::ValueEnum;
         assert!(matches!(
-            SpiceCompute::from_str("cloud", true),
+            SpiceCompute::from_str("scp", true),
             Ok(SpiceCompute::Scp)
         ));
     }
@@ -1566,7 +1567,7 @@ mod tests {
         let setup_config = SetupConfig {
             region: None,
             spicepod_path: None,
-            storage: FederatedStorageConfig::Cayenne,
+            storage: FederatedStorageConfig::DirectIngest,
             aws_region_override: None,
         };
 
@@ -1583,8 +1584,9 @@ mod tests {
         )]);
 
         let args = test_stdio_args();
+        let scp = test_scp_config();
         let spicepod =
-            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args)
+            generate_initial_spicepod(&Uuid::nil(), &setup_config, &datasets, None, &args, &scp, None)
                 .await
                 .expect("spicepod should generate");
         let spicepod_yaml =
@@ -1612,8 +1614,6 @@ mod tests {
     async fn generate_spicepod_uses_loaded_spicepod_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("input.yaml");
-        // Original name is intentionally different from the per-run name so we
-        // can assert the override below.
         tokio::fs::write(
             &path,
             "version: v1\nkind: Spicepod\nname: user-supplied\ndatasets:\n  - from: s3://public-bucket/customer.parquet\n    name: customer\n    params:\n      file_format: parquet\n      s3_auth: public\n",
@@ -1624,14 +1624,15 @@ mod tests {
         let setup_config = SetupConfig {
             region: None,
             spicepod_path: Some(path.to_string_lossy().into_owned()),
-            storage: FederatedStorageConfig::Cayenne,
+            storage: FederatedStorageConfig::DirectIngest,
             aws_region_override: None,
         };
         let datasets: HashMap<String, DatasetConfig> = HashMap::new();
         let args = test_stdio_args();
+        let scp = test_scp_config();
         let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
 
-        let spicepod = generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args)
+        let spicepod = generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args, &scp, None)
             .await
             .expect("spicepod loads from disk");
 

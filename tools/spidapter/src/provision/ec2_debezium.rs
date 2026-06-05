@@ -23,7 +23,7 @@ use aws_sdk_ec2::types::{
 };
 use base64::Engine as _;
 
-use crate::args::StdioArgs;
+use crate::scenario::Ec2Spec;
 
 const KAFKA_PORT: u16 = 9092;
 const CONNECT_PORT: u16 = 8083;
@@ -40,35 +40,17 @@ pub(crate) struct Ec2DebeziumInstance {
 
 /// Launch an EC2 instance, install Redpanda + Debezium Connect, and wait until both are ready.
 pub(crate) async fn launch_ec2_debezium(
-    args: &StdioArgs,
+    spec: &Ec2Spec,
+    region: &str,
     run_id_short: &str,
 ) -> anyhow::Result<Ec2DebeziumInstance> {
-    let region = args
-        .aws_region
-        .clone()
-        .or_else(|| std::env::var("AWS_REGION").ok())
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-        .unwrap_or_else(|| "us-east-1".to_string());
-
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(region.clone()))
+        .region(Region::new(region.to_string()))
         .load()
         .await;
     let ec2 = Ec2Client::new(&config);
 
-    let subnet_id = args
-        .ec2_subnet_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_SUBNET_ID is required for EC2 mode"))?;
-    let sg_id = args
-        .ec2_security_group_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_SECURITY_GROUP_ID is required for EC2 mode"))?;
-    let ami_id = args
-        .ec2_ami_id
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("EC2_AMI_ID is required for EC2 mode"))?;
-    let instance_type = InstanceType::from(args.ec2_instance_type.as_str());
+    let instance_type = InstanceType::from(spec.instance_type.as_str());
 
     let user_data = debezium_user_data();
     let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(user_data.as_bytes());
@@ -76,13 +58,13 @@ pub(crate) async fn launch_ec2_debezium(
     let instance_name = format!("spidapter-debezium-{run_id_short}");
     eprintln!(
         "[stdio] EC2: launching Debezium instance \
-         (name={instance_name}, ami={ami_id}, type={}, subnet={subnet_id}, disk={}GB)",
-        args.ec2_instance_type, args.ec2_disk_size_gb
+         (name={instance_name}, ami={}, type={}, subnet={}, disk={}GB)",
+        spec.ami_id, spec.instance_type, spec.subnet_id, spec.disk_size_gb
     );
 
     let mut run_req = ec2
         .run_instances()
-        .image_id(ami_id)
+        .image_id(&spec.ami_id)
         .instance_type(instance_type)
         .min_count(1)
         .max_count(1)
@@ -92,7 +74,7 @@ pub(crate) async fn launch_ec2_debezium(
                 .device_name("/dev/sda1")
                 .ebs(
                     EbsBlockDevice::builder()
-                        .volume_size(args.ec2_disk_size_gb)
+                        .volume_size(spec.disk_size_gb)
                         .volume_type(VolumeType::Gp3)
                         .delete_on_termination(true)
                         .build(),
@@ -106,8 +88,9 @@ pub(crate) async fn launch_ec2_debezium(
                 .build(),
         );
 
-    if let Some(profile) = &args.ec2_iam_instance_profile {
-        let spec = if profile.starts_with("arn:") {
+    if !spec.iam_instance_profile.is_empty() {
+        let profile = &spec.iam_instance_profile;
+        let ispec = if profile.starts_with("arn:") {
             IamInstanceProfileSpecification::builder()
                 .arn(profile)
                 .build()
@@ -116,20 +99,22 @@ pub(crate) async fn launch_ec2_debezium(
                 .name(profile)
                 .build()
         };
-        run_req = run_req.iam_instance_profile(spec);
+        run_req = run_req.iam_instance_profile(ispec);
     }
 
-    if args.ec2_associate_public_ip {
+    if spec.associate_public_ip {
         run_req = run_req.network_interfaces(
             InstanceNetworkInterfaceSpecification::builder()
                 .device_index(0)
-                .subnet_id(subnet_id)
-                .groups(sg_id)
+                .subnet_id(&spec.subnet_id)
+                .groups(&spec.security_group_id)
                 .associate_public_ip_address(true)
                 .build(),
         );
     } else {
-        run_req = run_req.subnet_id(subnet_id).security_group_ids(sg_id);
+        run_req = run_req
+            .subnet_id(&spec.subnet_id)
+            .security_group_ids(&spec.security_group_id);
     }
 
     let run_result = run_req
@@ -149,7 +134,7 @@ pub(crate) async fn launch_ec2_debezium(
     );
     wait_for_instance_running(&ec2, &instance_id).await?;
 
-    let host = if args.ec2_associate_public_ip {
+    let host = if spec.associate_public_ip {
         get_instance_public_ip(&ec2, &instance_id).await?
     } else {
         get_instance_private_ip(&ec2, &instance_id).await?
@@ -164,7 +149,7 @@ pub(crate) async fn launch_ec2_debezium(
         instance_id,
         kafka_brokers: format!("{host}:{KAFKA_PORT}"),
         connect_url: format!("http://{host}:{CONNECT_PORT}"),
-        region,
+        region: region.to_string(),
     })
 }
 
