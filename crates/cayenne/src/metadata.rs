@@ -561,6 +561,73 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
+impl VortexConfig {
+    /// Surface parameter values that *parse* but won't behave as a user likely
+    /// intends — out-of-range values that get silently clamped at their use site,
+    /// and combinations that don't compose with each other. Returns
+    /// human-readable warnings; the caller logs each with the dataset context.
+    ///
+    /// Pure and side-effect-free so the rules stay unit-testable. The actual
+    /// clamping still happens at the use sites — this only makes it visible
+    /// instead of silent. `available_cores` is the host's logical core count (the
+    /// encode-shard ceiling); pass `std::thread::available_parallelism()`.
+    #[must_use]
+    pub fn config_warnings(&self, available_cores: usize) -> Vec<String> {
+        let cores = available_cores.max(1);
+        let mut warnings = Vec::new();
+
+        // Vortex encode is CPU-bound, so `write_concurrency` above the core count
+        // is capped at encode time (`VortexFormat::build_shard_spec`); the surplus
+        // only inflates the per-snapshot file count (read amplification).
+        if let Some(write_concurrency) = self.write_concurrency
+            && write_concurrency > cores
+        {
+            warnings.push(format!(
+                "cayenne_write_concurrency ({write_concurrency}) exceeds the host core count ({cores}); encode is CPU-bound so it is capped at {cores} — the surplus only inflates the per-snapshot file count without speeding the write. Set it to {cores} or below."
+            ));
+        }
+
+        // `target_vortex_file_size_mb` feeds both the sink's size-based file
+        // rolling and the size-tiered compaction picker (its small/mid tiers derive
+        // from it), so 0 disables both.
+        if self.target_vortex_file_size_mb == 0 {
+            warnings.push(
+                "cayenne_target_file_size_mb is 0, which disables size-based file rolling and the size-tiered compaction picker; compaction then relies only on the protected-snapshot count/age triggers. Set a positive size (e.g. 256) unless one file per write is intended.".to_owned(),
+            );
+        }
+
+        // The picker needs at least two files in a tier to merge, so 1 is clamped
+        // up to 2 — surface that rather than silently changing the value.
+        if self.compaction_trigger_files == 1 {
+            warnings.push(
+                "cayenne_compaction_trigger_files is 1, but a single file cannot be compacted; it is clamped to a minimum of 2.".to_owned(),
+            );
+        }
+
+        // Likewise the protected-snapshot subset merge needs at least two
+        // snapshots; 1 is clamped up to 2 at the trigger.
+        if self.compaction_trigger_protected_snapshots == 1 {
+            warnings.push(
+                "cayenne_compaction_trigger_protected_snapshots is 1, but a single protected snapshot cannot be merged; it is clamped to a minimum of 2.".to_owned(),
+            );
+        }
+
+        // A trigger above the per-pass pick cap still fires, but each pass only
+        // consolidates `max_files_per_pick` of the accumulated files, so a backlog
+        // drains over several passes instead of in one.
+        if self.compaction_trigger_files > self.compaction_max_files_per_pick {
+            warnings.push(format!(
+                "cayenne_compaction_trigger_files ({}) exceeds cayenne_compaction_max_files_per_pick ({}); each compaction pass consolidates at most {} files, so a backlog drains over several passes. Consider raising cayenne_compaction_max_files_per_pick.",
+                self.compaction_trigger_files,
+                self.compaction_max_files_per_pick,
+                self.compaction_max_files_per_pick
+            ));
+        }
+
+        warnings
+    }
+}
+
 impl Default for VortexConfig {
     fn default() -> Self {
         Self {
@@ -613,6 +680,93 @@ mod tests {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    #[test]
+    fn config_warnings_clean_default_is_silent() {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert!(
+            VortexConfig::default().config_warnings(cores).is_empty(),
+            "the default config must not produce any warnings"
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_write_concurrency_over_cores() {
+        let config = VortexConfig {
+            write_concurrency: Some(64),
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(8) // 64 > 8 cores
+                .iter()
+                .any(|w| w.contains("cayenne_write_concurrency") && w.contains("64")),
+            "expected a write_concurrency-over-cores warning"
+        );
+        // At or below the core count is fine.
+        let ok = VortexConfig {
+            write_concurrency: Some(8),
+            ..VortexConfig::default()
+        };
+        assert!(ok.config_warnings(8).is_empty());
+    }
+
+    #[test]
+    fn config_warnings_flags_zero_target_file_size() {
+        let config = VortexConfig {
+            target_vortex_file_size_mb: 0,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("cayenne_target_file_size_mb"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_trigger_above_pick_cap() {
+        let config = VortexConfig {
+            compaction_trigger_files: 64,
+            compaction_max_files_per_pick: 32,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("exceeds cayenne_compaction_max_files_per_pick"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_single_file_trigger() {
+        let config = VortexConfig {
+            compaction_trigger_files: 1,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("a single file cannot be compacted"))
+        );
+    }
+
+    #[test]
+    fn config_warnings_flags_single_protected_snapshot_trigger() {
+        let config = VortexConfig {
+            compaction_trigger_protected_snapshots: 1,
+            ..VortexConfig::default()
+        };
+        assert!(
+            config
+                .config_warnings(16)
+                .iter()
+                .any(|w| w.contains("a single protected snapshot cannot be merged"))
+        );
     }
 
     #[test]
