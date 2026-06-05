@@ -6,3 +6,4 @@ tests:
     duration: 600
     ready_wait: 300
     query_overrides: duckdb
+    rate: 5000
