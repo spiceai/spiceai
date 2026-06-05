@@ -627,6 +627,20 @@ impl DeletionIndex {
     /// keyed on deletion membership, and visibility treats "no deletion" and
     /// "insert-only" identically. One probe answers both the deletion and the
     /// re-insertion question.
+    ///
+    /// # Inlining trade-off (measured)
+    ///
+    /// Keeping the tier walk fully inlined here is a deliberate choice that
+    /// favors present-key probes over bloom rejects. With the walk inlined,
+    /// out-of-cache present-key probes overlap their base-map misses across
+    /// loop iterations (memory-level parallelism): 92µs vs 143µs per 8192
+    /// probes at 1M entries when the walk is forced out of line. The cost is
+    /// the inverse effect on the bloom-reject path, whose tight probe loop no
+    /// longer unrolls as densely (~3.7ns → ~6ns per rejected probe; composite
+    /// keys are unaffected). Changes-mode scans — the workload this index is
+    /// hot in — are present-key heavy, so the walk stays inlined. Batch-level
+    /// probing (bloom-sweep the batch, then walk the survivors) would win on
+    /// both paths and is the natural next step if profiles call for it.
     #[inline]
     #[must_use]
     pub fn get(&self, pk: i64) -> Option<Tombstone> {

@@ -220,7 +220,11 @@ mod tests {
     #[test]
     fn false_positive_rate_at_capacity() {
         let n = 100_000_i64;
-        #[expect(clippy::cast_sign_loss, reason = "n is positive")]
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "n is a small positive test constant"
+        )]
         let filter = SplitBlockBloomFilter::new(n as usize);
         for key in 0..n {
             filter.insert(hash_key(&key));

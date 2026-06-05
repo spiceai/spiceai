@@ -5431,6 +5431,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.23.2",
+ "wiremock",
  "zip 8.6.0",
  "zstd",
 ]
@@ -6266,7 +6267,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=4af854228e9f503bbaf6858fb76a9f4fcdcf091c#4af854228e9f503bbaf6858fb76a9f4fcdcf091c"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=4547bee1b5ab39b4b825f0c44c6026533c1f08c5#4547bee1b5ab39b4b825f0c44c6026533c1f08c5"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6291,7 +6292,7 @@ dependencies = [
  "fundu",
  "futures",
  "geo-types",
- "hickory-resolver 0.25.2",
+ "hickory-resolver",
  "itertools 0.14.0",
  "mongodb",
  "mysql_async",
@@ -9001,36 +9002,11 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "idna",
  "ipnet",
  "jni",
  "rand 0.10.1",
- "thiserror 2.0.18",
- "tinyvec",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "hickory-proto"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
-dependencies = [
- "async-trait",
- "cfg-if",
- "data-encoding",
- "enum-as-inner",
- "futures-channel",
- "futures-io",
- "futures-util",
- "idna",
- "ipnet",
- "once_cell",
- "rand 0.9.4",
- "ring",
  "thiserror 2.0.18",
  "tinyvec",
  "tokio",
@@ -9060,27 +9036,6 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
-dependencies = [
- "cfg-if",
- "futures-util",
- "hickory-proto 0.25.2",
- "ipconfig",
- "moka",
- "once_cell",
- "parking_lot 0.12.5",
- "rand 0.9.4",
- "resolv-conf",
- "smallvec 1.15.1",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "hickory-resolver"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
@@ -9088,7 +9043,7 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "ipconfig",
  "ipnet",
  "jni",
@@ -11875,8 +11830,8 @@ dependencies = [
  "futures-util",
  "hex",
  "hickory-net",
- "hickory-proto 0.26.1",
- "hickory-resolver 0.26.1",
+ "hickory-proto",
+ "hickory-resolver",
  "hmac 0.12.1",
  "macro_magic",
  "md-5 0.10.6",
@@ -12349,7 +12304,7 @@ dependencies = [
 name = "ns_lookup"
 version = "2.0.0-unstable"
 dependencies = [
- "hickory-resolver 0.25.2",
+ "hickory-resolver",
  "snafu",
  "tokio",
  "tracing",
