@@ -296,10 +296,12 @@ async fn postgres_comment_metadata(
 /// reconstruct the primary key, secondary indexes, and clustered sort order.
 ///
 /// `indkey`/`indoption` are `int2vector`s; routing them through text to `int2[]`
-/// yields standard 1-based arrays that line up with `WITH ORDINALITY` and works
-/// across all supported `PostgreSQL` versions. Expression index keys have `attnum`
-/// 0 (no matching `pg_attribute` row, so `column_name` is NULL); partial indexes
-/// have a non-null `indpred`.
+/// yields standard 1-based arrays that line up with `WITH ORDINALITY`. Expression
+/// index keys have `attnum` 0 (no matching `pg_attribute` row, so `column_name` is
+/// NULL); partial indexes have a non-null `indpred`. `k.ord <= ix.indnkeyatts`
+/// bounds the unnest to *key* columns, excluding PG 11+ `INCLUDE` (non-key) columns
+/// from the inferred key/sort; on servers without `indnkeyatts` (< 11) the query
+/// errors and enrichment is skipped (warn-and-continue).
 const INFERRED_SCHEMA_SQL: &str = "\
     SELECT \
         i.relname AS index_name, \
@@ -322,7 +324,7 @@ const INFERRED_SCHEMA_SQL: &str = "\
         AND NOT a.attisdropped \
     WHERE ix.indrelid = to_regclass($1) \
         AND ix.indisvalid \
-        AND ix.indislive \
+        AND k.ord <= ix.indnkeyatts \
     ORDER BY i.relname, k.ord";
 
 /// Rough table sizing from the catalog: the planner's estimated row count

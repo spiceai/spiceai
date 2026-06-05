@@ -155,7 +155,8 @@ pub enum CheckAvailability {
 /// the user did not specify in the Spicepod.
 ///
 /// Applies to all refresh modes. Only connectors that emit inferred-schema
-/// metadata (currently `PostgreSQL`) are affected; others treat `extended` as a no-op.
+/// metadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat
+/// `extended` as a no-op.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -269,7 +270,7 @@ pub struct Dataset {
     /// Options: `standard` / `extended`. Defaults to `standard` (base column/type
     /// inference only, exactly as before). When `extended`, the runtime additionally
     /// fills any acceleration settings the user left unset using metadata inferred from
-    /// the source (currently the `PostgreSQL` connector).
+    /// the source (currently the `PostgreSQL` and `MongoDB` connectors).
     #[serde(default, skip_serializing_if = "is_default")]
     pub schema_inference: SchemaInference,
 }

@@ -63,14 +63,15 @@ pub fn apply_inferred_schema(
         if inferred.primary_key.iter().all(|c| has_column(c)) {
             let pk = ColumnReference::new(inferred.primary_key.clone());
             acceleration.primary_key = Some(pk.clone());
-            // Seed an upsert on_conflict on the PK when the user configured none.
-            // The accelerator would derive this anyway; declaring it explicitly is
-            // also what `refresh_mode: changes` requires to apply UPDATEs as upserts.
-            if acceleration.on_conflict.is_empty() {
-                acceleration
-                    .on_conflict
-                    .insert(pk, OnConflictBehavior::Upsert(UpsertOptions::default()));
-            }
+            // Seed an upsert on_conflict for the inferred primary key unless the user
+            // configured one for it specifically (any on_conflict entries the user set
+            // for other columns are preserved). The accelerator would derive this
+            // anyway; declaring it explicitly is also what `refresh_mode: changes`
+            // requires to apply UPDATE events as upserts on the primary key.
+            acceleration
+                .on_conflict
+                .entry(pk)
+                .or_insert(OnConflictBehavior::Upsert(UpsertOptions::default()));
             tracing::debug!(
                 dataset = %dataset_name,
                 primary_key = ?inferred.primary_key,
@@ -236,6 +237,30 @@ mod tests {
             acc.on_conflict.get(&col_ref(&["id"])),
             Some(OnConflictBehavior::Upsert(_))
         ));
+    }
+
+    #[test]
+    fn seeds_primary_key_upsert_alongside_other_on_conflict() {
+        // A user-configured on_conflict for a non-PK column must not prevent the
+        // inferred primary key from getting its own upsert (CDC requires it).
+        let mut acc = accel(Engine::DuckDB);
+        acc.on_conflict.insert(
+            col_ref(&["name"]),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
+        );
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["id", "name"]), "ds");
+
+        assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+        assert!(matches!(
+            acc.on_conflict.get(&col_ref(&["id"])),
+            Some(OnConflictBehavior::Upsert(_))
+        ));
+        // The user's other on_conflict entry is preserved.
+        assert!(acc.on_conflict.contains_key(&col_ref(&["name"])));
     }
 
     #[test]

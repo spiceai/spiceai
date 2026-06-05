@@ -373,10 +373,23 @@ impl TableProvider for MetadataEnrichedTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        // If the schema carries an inferred rough table size, surface it as table
-        // statistics so the query optimizer, acceleration sizing, and observability
-        // can all use it. Otherwise delegate to the inner provider.
-        inferred_statistics(&self.schema).or_else(|| self.inner.statistics())
+        // Surface the inferred rough table size as table statistics so the query
+        // optimizer, acceleration sizing, and observability can use it. Prefer the
+        // inner provider's statistics where it has them (they may be exact or
+        // cheaper), filling only the row-count / byte-size fields it leaves `Absent`
+        // with the inferred estimate.
+        match (inferred_statistics(&self.schema), self.inner.statistics()) {
+            (Some(inferred), Some(mut inner)) => {
+                if matches!(inner.num_rows, Precision::Absent) {
+                    inner.num_rows = inferred.num_rows;
+                }
+                if matches!(inner.total_byte_size, Precision::Absent) {
+                    inner.total_byte_size = inferred.total_byte_size;
+                }
+                Some(inner)
+            }
+            (inferred, inner) => inferred.or(inner),
+        }
     }
 }
 
@@ -390,15 +403,13 @@ fn inferred_statistics(schema: &SchemaRef) -> Option<Statistics> {
     }
 
     let mut stats = Statistics::new_unknown(schema);
-    if let Some(rows) = inferred.row_count {
-        stats = stats.with_num_rows(Precision::Inexact(
-            usize::try_from(rows).unwrap_or(usize::MAX),
-        ));
+    // Leave a field unset (rather than saturating to `usize::MAX`) when the inferred
+    // u64 doesn't fit `usize` — a wrong, huge estimate is worse than no estimate.
+    if let Some(rows) = inferred.row_count.and_then(|r| usize::try_from(r).ok()) {
+        stats = stats.with_num_rows(Precision::Inexact(rows));
     }
-    if let Some(bytes) = inferred.table_bytes {
-        stats = stats.with_total_byte_size(Precision::Inexact(
-            usize::try_from(bytes).unwrap_or(usize::MAX),
-        ));
+    if let Some(bytes) = inferred.table_bytes.and_then(|b| usize::try_from(b).ok()) {
+        stats = stats.with_total_byte_size(Precision::Inexact(bytes));
     }
     Some(stats)
 }
