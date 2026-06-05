@@ -712,6 +712,17 @@ impl SnowflakeConnectionPool {
             "Snowflake connectivity validation succeeded"
         );
 
+        // Pin the session timezone to UTC. Federated `AT TIME ZONE` predicates are
+        // unparsed to `CAST(CONVERT_TIMEZONE('tz', ...) AS TIMESTAMP_NTZ)`; chained
+        // conversions interpret the intermediate naive timestamp in the session zone,
+        // so a non-UTC session default would silently shift predicate boundaries.
+        if let Err(err) = api.exec("ALTER SESSION SET TIMEZONE = 'UTC'").await {
+            tracing::warn!(
+                error = %err,
+                "Failed to pin Snowflake session TIMEZONE to UTC; federated AT TIME ZONE predicates may be evaluated against the session default timezone"
+            );
+        }
+
         let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
             let _ = write!(join_push_context_str, ",warehouse={warehouse}");

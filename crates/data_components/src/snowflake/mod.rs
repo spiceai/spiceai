@@ -144,6 +144,12 @@ fn parse_snowflake_table_reference(path: &str) -> std::result::Result<TableRefer
 fn snowflake_dialect() -> dialect::CustomDialect {
     dialect::CustomDialectBuilder::new()
         .with_identifier_quote_style('"')
+        // Render `expr AT TIME ZONE 'tz'` as `CAST(CONVERT_TIMEZONE('tz', expr) AS
+        // TIMESTAMP_NTZ)` rather than dropping the zone name (which silently changed
+        // the meaning of federated predicates). Correct composition of chained
+        // conversions relies on the session TIMEZONE being pinned to UTC — see
+        // `SnowflakeConnectionPool::new` and https://github.com/spiceai/datafusion/pull/160.
+        .with_timezone_cast_style(dialect::TimezoneCastStyle::ConvertTimezone)
         .build()
 }
 
@@ -762,6 +768,50 @@ impl SnowflakeTableFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snowflake_dialect_unparses_at_time_zone_as_convert_timezone() {
+        use datafusion::logical_expr::expr::Cast;
+        use datafusion::logical_expr::{Expr, col};
+        use datafusion::sql::unparser::Unparser;
+
+        let dialect = snowflake_dialect();
+        let unparser = Unparser::new(&dialect);
+
+        // MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'
+        let inner = Expr::Cast(Cast {
+            expr: Box::new(col("MQL_AT")),
+            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        });
+        let outer = Expr::Cast(Cast {
+            expr: Box::new(inner),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+
+        let sql = unparser
+            .expr_to_sql(&outer)
+            .expect("unparse AT TIME ZONE chain")
+            .to_string();
+
+        // Both zones must survive as CONVERT_TIMEZONE calls with a naive NTZ result,
+        // never the zone-dropping `CAST(... AS TIMESTAMP WITH TIME ZONE)`.
+        assert!(
+            sql.contains("CONVERT_TIMEZONE('UTC'"),
+            "inner zone dropped: {sql}"
+        );
+        assert!(
+            sql.contains("CONVERT_TIMEZONE('America/Los_Angeles'"),
+            "outer zone dropped: {sql}"
+        );
+        assert!(sql.contains("AS TIMESTAMP_NTZ"), "missing NTZ cast: {sql}");
+        assert!(
+            !sql.to_uppercase().contains("TIMESTAMP WITH TIME ZONE"),
+            "timezone was silently stripped: {sql}"
+        );
+    }
 
     #[test]
     fn test_parse_information_schema_json_preserves_comment_metadata() {
