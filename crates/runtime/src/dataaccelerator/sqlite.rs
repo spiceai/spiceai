@@ -265,18 +265,39 @@ async fn apply_sqlite_pragmas(
     pragmas: &[&'static str],
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+    use futures::StreamExt;
     let conn = pool.connect().await?;
     let Some(async_conn) = conn.as_async() else {
         unreachable!("SqliteConnectionPool only returns async-capable SQLite connections");
     };
     for pragma in pragmas {
-        if let Err(err) = async_conn.execute(pragma, &[]).await {
-            tracing::warn!(
-                pragma,
-                error = %err,
-                "Failed to apply SQLite storage-profile pragma"
-            );
-            return Err(err);
+        // Issue each pragma as a query rather than `execute`. Value-setting
+        // pragmas such as `PRAGMA mmap_size=N` / `PRAGMA cache_size=N` echo the
+        // applied value back as a result row, and the upgraded rusqlite driver
+        // rejects `execute()` on any statement that returns rows
+        // ("Execute returned results - did you mean to call query?"). We drain
+        // (and discard) the stream so the pragma takes effect either way.
+        match async_conn.query_arrow(pragma, &[], None).await {
+            Ok(mut stream) => {
+                while let Some(batch) = stream.next().await {
+                    if let Err(err) = batch {
+                        tracing::warn!(
+                            pragma,
+                            error = %err,
+                            "Failed to apply SQLite storage-profile pragma"
+                        );
+                        return Err(Box::new(err));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pragma,
+                    error = %err,
+                    "Failed to apply SQLite storage-profile pragma"
+                );
+                return Err(err);
+            }
         }
     }
     Ok(())

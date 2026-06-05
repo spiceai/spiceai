@@ -385,17 +385,19 @@ impl TursoAccelerator {
 
     /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
     ///
-    /// On EBS-class network-attached storage we bump the page cache and enable
-    /// mmap to absorb random I/O latency. Local SSD, tmpfs, and unknown
-    /// storage keep the engine defaults.
+    /// On EBS-class network-attached storage we bump the page cache to absorb
+    /// random I/O latency. Local SSD, tmpfs, and unknown storage keep the
+    /// engine defaults.
+    ///
+    /// Note: unlike rusqlite-backed SQLite, the Turso engine does not implement
+    /// `PRAGMA mmap_size` and rejects it as an unknown pragma name, so we only
+    /// tune the supported `cache_size` here.
     fn storage_setup_pragmas(
         storage: ResolvedAccelerationStorage,
     ) -> &'static [(&'static str, &'static str)] {
         match storage {
-            // 200_000 KiB is about a 200 MiB page cache, plus a 256 MiB mmap window.
-            ResolvedAccelerationStorage::Ebs => {
-                &[("cache_size", "-200000"), ("mmap_size", "268435456")]
-            }
+            // 200_000 KiB is about a 200 MiB page cache.
+            ResolvedAccelerationStorage::Ebs => &[("cache_size", "-200000")],
             ResolvedAccelerationStorage::LocalSsd
             | ResolvedAccelerationStorage::Tmpfs
             | ResolvedAccelerationStorage::Unknown => &[],
