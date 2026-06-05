@@ -31,7 +31,7 @@ pub enum Error {
     #[snafu(display("Failed to decode base64-encoded decimal: {source}"))]
     Base64Decode { source: base64::DecodeError },
 
-    #[snafu(display("Decimal bytes must be exactly 16, got {}", value.len()))]
+    #[snafu(display("Decimal value exceeds the 16-byte `i128` range, got {} bytes", value.len()))]
     BytesLength { value: Vec<u8> },
 
     #[snafu(display("Missing `scale` field in decimal object"))]
@@ -75,16 +75,30 @@ pub fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128
 }
 
 /// Decodes a base64-encoded big-endian signed integer into an `i128`.
+///
+/// Debezium encodes decimals as the minimal-width big-endian two's-complement
+/// representation of a Java `BigInteger` (`BigInteger.toByteArray()`), so a
+/// negative value arrives with fewer than 16 bytes and the sign bit set in its
+/// most-significant byte (e.g. `-1` is the single byte `0xFF`). The value must
+/// therefore be *sign-extended* to 16 bytes — left-padding with `0x00` would
+/// turn `-1` into `255`. Positive values whose top bit is clear are zero-padded
+/// as before.
 fn decode_base64_decimal(s: &str) -> Result<i128> {
-    let mut bytes = BASE64_STANDARD.decode(s).context(Base64DecodeSnafu)?;
+    let bytes = BASE64_STANDARD.decode(s).context(Base64DecodeSnafu)?;
 
-    while bytes.len() < 16 {
-        bytes.insert(0, 0);
+    if bytes.len() > 16 {
+        return BytesLengthSnafu { value: bytes }.fail();
     }
 
-    let arr: [u8; 16] = bytes
-        .try_into()
-        .map_err(|v| Error::BytesLength { value: v })?;
+    // Sign-extend using the high bit of the most-significant (first) byte.
+    let pad = if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+        0xFF
+    } else {
+        0x00
+    };
+    let mut arr = [pad; 16];
+    let start = 16 - bytes.len();
+    arr[start..].copy_from_slice(&bytes);
     Ok(i128::from_be_bytes(arr))
 }
 
@@ -188,5 +202,79 @@ pub fn convert_json_to_decimal(v: &Json, target_scale: i8) -> Result<Option<i128
             };
             UnsupportedTypeSnafu { actual_type }.fail()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Encodes `bytes` exactly as Debezium does — minimal-width big-endian
+    /// two's-complement, base64 — without zero/sign padding to 16 bytes.
+    fn b64(bytes: &[u8]) -> String {
+        BASE64_STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn negative_minimal_width_base64_is_sign_extended() {
+        // Debezium encodes -1 as the single byte 0xFF (BigInteger.toByteArray()).
+        // Zero-padding to 16 bytes would decode this as 255 — the value must be
+        // sign-extended instead.
+        let v =
+            convert_json_to_decimal(&Json::String(b64(&[0xFF])), 0).expect("decode should succeed");
+        assert_eq!(v, Some(-1));
+
+        // -123 minimally encoded as the single byte 0x85.
+        let v =
+            convert_json_to_decimal(&Json::String(b64(&[0x85])), 0).expect("decode should succeed");
+        assert_eq!(v, Some(-123));
+
+        // A larger negative value, -12_345 == 0xCFC7 in two's complement.
+        let v = convert_json_to_decimal(&Json::String(b64(&[0xCF, 0xC7])), 0)
+            .expect("decode should succeed");
+        assert_eq!(v, Some(-12_345));
+    }
+
+    #[test]
+    fn positive_minimal_width_base64_is_zero_extended() {
+        // 255 minimally encoded as 0x00 0xFF — the leading zero marks it positive
+        // and must not be treated as sign-extension.
+        let v = convert_json_to_decimal(&Json::String(b64(&[0x00, 0xFF])), 0)
+            .expect("decode should succeed");
+        assert_eq!(v, Some(255));
+
+        // 127 == 0x7F (top bit clear), single byte.
+        let v =
+            convert_json_to_decimal(&Json::String(b64(&[0x7F])), 0).expect("decode should succeed");
+        assert_eq!(v, Some(127));
+    }
+
+    #[test]
+    fn negative_object_value_is_rescaled_correctly() {
+        // VariableScaleDecimal precise mode: {"scale": 2, "value": <base64>}.
+        // -12.34 has unscaled value -1234 == 0xFB2E in two's complement.
+        let input = json!({ "scale": 2, "value": b64(&[0xFB, 0x2E]) });
+        let v = convert_json_to_decimal(&input, 2).expect("decode should succeed");
+        assert_eq!(v, Some(-1234));
+    }
+
+    #[test]
+    fn full_width_16_byte_encoding_still_decodes() {
+        // A full 16-byte encoding (e.g. produced by i128::to_be_bytes) must keep
+        // decoding correctly for both signs.
+        let v = convert_json_to_decimal(&Json::String(b64(&(-12_345_i128).to_be_bytes())), 0)
+            .expect("decode should succeed");
+        assert_eq!(v, Some(-12_345));
+
+        let v = convert_json_to_decimal(&Json::String(b64(&(98_765_i128).to_be_bytes())), 0)
+            .expect("decode should succeed");
+        assert_eq!(v, Some(98_765));
+    }
+
+    #[test]
+    fn over_16_bytes_is_rejected() {
+        let result = convert_json_to_decimal(&Json::String(b64(&[0x01; 17])), 0);
+        result.expect_err("a value wider than 16 bytes must be rejected, not truncated");
     }
 }
