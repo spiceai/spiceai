@@ -32,9 +32,16 @@ const REGEXP_MATCH_NAME: &str = "regexp_match";
 const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 const REGEXP_COUNT_NAME: &str = "regexp_count";
 
-/// Creates a new instance of the `DuckDB` dialect with support for Spice internal UDFs
-pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
-    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(vec![
+/// The scalar functions the `DuckDB` unparser dialect rewrites to native
+/// `DuckDB` SQL, paired with their handlers.
+///
+/// This is the single source of truth for both [`new_duckdb_dialect`] (which
+/// installs the handlers) and [`duckdb_native_function_names`] (which the
+/// federation deny-list consults to decide what can be pushed down). Keeping
+/// them derived from one list guarantees the dialect's translation capability
+/// and the deny-list carve-out can never drift apart.
+fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
+    vec![
         (
             COSINE_DISTANCE_UDF_NAME,
             Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
@@ -83,7 +90,29 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
                     .to_datafusion_function(REGEXP_COUNT_FLAGS_POSITION),
             ) as ScalarFnToSqlHandler,
         ),
-    ]);
+    ]
+}
+
+/// Names of the functions [`new_duckdb_dialect`] rewrites to native `DuckDB`
+/// SQL.
+///
+/// Any Spice-specific function in this list has a real `DuckDB` equivalent and
+/// can therefore be federated (pushed down) to `DuckDB` rather than denied. The
+/// federation deny-list derives its `DuckDB` carve-out from this list (see
+/// `runtime::datafusion::udf::deny_spice_functions_for_duckdb`), so the dialect
+/// and the deny-list stay in sync automatically.
+#[must_use]
+pub fn duckdb_native_function_names() -> Vec<&'static str> {
+    duckdb_scalar_overrides()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Creates a new instance of the `DuckDB` dialect with support for Spice internal UDFs
+#[must_use]
+pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
+    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(duckdb_scalar_overrides());
 
     Arc::new(dialect) as Arc<dyn Dialect>
 }
