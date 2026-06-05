@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{ListingTableConnector, build_fragments};
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
-    parameters::{Validator, gcs::GcsAuthValidator},
-};
+mod parameters;
 
-use crate::{
-    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-};
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+use parameters::gcs::GcsAuthValidator;
+use runtime::Runtime;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
+};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters, parameters::Validator,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -38,7 +40,7 @@ use url::Url;
 static PREFIX: &str = "gcs";
 
 static VALIDATORS: LazyLock<
-    Vec<Box<dyn Validator<Error = super::parameters::gcs::Error> + Send + Sync + 'static>>,
+    Vec<Box<dyn Validator<Error = parameters::gcs::Error> + Send + Sync + 'static>>,
 > = LazyLock::new(|| vec![Box::new(GcsAuthValidator)]);
 
 #[derive(Debug, Snafu)]
@@ -139,7 +141,7 @@ impl DataConnectorFactory for GoogleCloudStorageFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             // Run all validators
             for validator in VALIDATORS.iter() {
@@ -198,7 +200,7 @@ impl ListingTableConnector for GoogleCloudStorage {
         let mut gcs_url =
             Url::parse(url)
                 .boxed()
-                .context(super::InvalidConfigurationSnafu {
+                .context(runtime::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -288,26 +290,21 @@ impl ListingTableConnector for GoogleCloudStorage {
     }
 }
 
-register_data_connector!(
-    register_gcs_connector,
-    REGISTER_GCS_CONNECTOR,
-    "gcs",
-    GoogleCloudStorageFactory
-);
+/// The name used to identify this connector in configuration (primary scheme).
+pub const CONNECTOR_NAME: &str = "gcs";
 
-register_data_connector!(
-    register_gs_connector,
-    REGISTER_GS_CONNECTOR,
-    "gs",
-    GoogleCloudStorageFactory
-);
+/// Returns a new instance of the GCS connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GoogleCloudStorageFactory::new_arc()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataconnector::listing::ListingTableConnector;
-    use crate::parameters::ParameterSpec;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::dataconnector::listing::ListingTableConnector;
+    use runtime::parameters::ParameterSpec;
     use std::collections::HashMap;
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[

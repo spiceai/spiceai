@@ -11,7 +11,14 @@ version.workspace = true
 [dependencies]
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
+connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
+connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
+connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
+connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
+connector-git = { path = "../../crates/data-connectors/connector-git" }
+connector-glue = { path = "../../crates/data-connectors/connector-glue" }
+connector-kafka = { path = "../../crates/data-connectors/connector-kafka", optional = true }
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks", optional = true }
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
@@ -68,7 +75,7 @@ util = { path = "../../crates/util"}
 
 # Non-default features should be added to `lint-rust` make target.
 [features]
-adbc = ["runtime/adbc"]
+adbc = ["dep:connector-adbc", "runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-snmalloc = []
@@ -78,7 +85,7 @@ aws-secrets-manager = ["runtime/aws-secrets-manager"]
 azure-keyvault = ["runtime/azure-keyvault"]
 hashicorp_vault = ["runtime/hashicorp_vault"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
-cosmosdb = ["runtime/cosmosdb"]
+cosmosdb = ["dep:connector-cosmosdb"]
 cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -134,7 +141,7 @@ wasm-functions = ["runtime/wasm-functions"]
 wasm-functions-compile = ["runtime/wasm-functions-compile"]
 iceberg-write = ["runtime/iceberg-write"]
 imap = ["connector-imap", "runtime/imap"]
-kafka = ["runtime/kafka"]
+kafka = ["dep:connector-kafka", "runtime/kafka"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 mcp = ["runtime/mcp"]
 metal = ["runtime/metal"]

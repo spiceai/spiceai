@@ -21,7 +21,7 @@ use rusqlite::OptionalExtension;
 
 use super::super::offsets::{self, sort_offsets};
 use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaSys, Result};
-use crate::dataconnector::kafka::KafkaMetadata;
+use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 
 impl KafkaSys {

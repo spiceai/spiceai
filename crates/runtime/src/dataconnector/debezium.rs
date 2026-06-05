@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
+use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::{Engine, RefreshMode};
-use crate::component::metrics::MetricsProvider;
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::DebeziumKafkaSys};
-use crate::dataconnector::{
-    ConnectorComponent,
-    kafka::{SidecarOffsetCommitHook, SidecarOffsetStore},
-};
+use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use arrow::datatypes::SchemaRef;
@@ -32,7 +30,10 @@ use data_components::cdc::ChangesStream;
 use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
-use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
+use data_components::kafka::{
+    KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, SidecarOffsetCommitHook,
+    SidecarOffsetStore,
+};
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::util::schema::merge_inferred_and_declared_schemas;
 use futures::StreamExt;
@@ -517,12 +518,93 @@ impl DataConnector for Debezium {
     }
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
-        if let Some(metrics) = self.kafka_config.metrics_store.as_ref() {
-            Some(Arc::new(super::kafka::KafkaMetricsProvider::new(
-                Arc::clone(metrics),
-            )))
-        } else {
-            None
+        self.kafka_config.metrics_store.as_ref().map(|m| {
+            Arc::new(KafkaMetricsProvider {
+                metrics: Arc::clone(m),
+            }) as Arc<dyn MetricsProvider>
+        })
+    }
+}
+
+/// Local Kafka metrics provider for the Debezium connector.
+/// Mirrors the one in `connector-kafka`; kept here to avoid a circular dep.
+#[derive(Debug, Clone)]
+struct KafkaMetricsProvider {
+    metrics: Arc<KafkaMetrics>,
+}
+
+const KAFKA_METRICS: &[MetricSpec] = &[
+    MetricSpec {
+        name: "records_consumed_total",
+        description: Some("Total number of records consumed"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
+    },
+    MetricSpec {
+        name: "bytes_consumed_total",
+        description: Some("Total bytes consumed"),
+        unit: Some("bytes"),
+        metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
+    },
+    MetricSpec {
+        name: "records_lag",
+        description: Some("Total consumer lag across all partitions"),
+        unit: Some("records"),
+        metric_type: MetricType::ObservableGaugeU64,
+        auto_register: false,
+    },
+];
+
+impl MetricsProvider for KafkaMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "debezium"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        KAFKA_METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<opentelemetry::KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            "records_consumed_total" => {
+                let m = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |obs| {
+                    obs.observe(
+                        m.records_consumed
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "bytes_consumed_total" => {
+                let m = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |obs| {
+                    obs.observe(
+                        m.bytes_consumed.load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "records_lag" => {
+                let m = Arc::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |obs| {
+                    obs.observe(
+                        m.records_lag.load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            _ => None,
         }
     }
 }
@@ -552,8 +634,13 @@ async fn set_metadata_to_accelerator(
 
 #[async_trait]
 impl SidecarOffsetStore for DebeziumKafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        DebeziumKafkaSys::upsert_offsets(self, offsets).await
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        DebeziumKafkaSys::upsert_offsets(self, offsets)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 

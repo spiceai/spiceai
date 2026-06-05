@@ -30,12 +30,10 @@ use super::{
     ConnectorComponent, DATA_CONNECTOR_FACTORY_REGISTRY, DataConnectorError, ODBC_DATACONNECTOR,
 };
 
-pub(crate) mod aws;
-pub(crate) mod azure;
-pub(crate) mod gcs;
+pub mod aws;
 
 #[async_trait]
-pub(crate) trait Validator {
+pub trait Validator {
     type Error;
 
     /// Parameters may be changed while validating.

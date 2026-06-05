@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,23 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::listing::{ListingTableConnector, build_fragments};
-use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
-    parameters::{
-        Validator,
-        azure::{
-            AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator,
-            AzureSasTokenNormalizer,
-        },
-    },
-};
+mod parameters;
 
-use crate::{
-    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
-};
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
+use parameters::azure::{
+    AzureAccountValidator, AzureAuthValidator, AzureEndpointValidator, AzureSasTokenNormalizer,
+};
+use runtime::Runtime;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
+};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters, parameters::Validator,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -44,7 +42,7 @@ use url::Url;
 static PREFIX: &str = "abfs";
 
 static VALIDATORS: LazyLock<
-    Vec<Box<dyn Validator<Error = super::parameters::azure::Error> + Send + Sync + 'static>>,
+    Vec<Box<dyn Validator<Error = parameters::azure::Error> + Send + Sync + 'static>>,
 > = LazyLock::new(|| {
     vec![
         Box::new(AzureSasTokenNormalizer),
@@ -207,7 +205,7 @@ impl DataConnectorFactory for AzureBlobFSFactory {
     fn create(
         &self,
         mut params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         // Validate versioning parameter early
         if let Some(versioning) = params.parameters.get("versioning").expose().ok()
             && !matches!(versioning, "enabled" | "disabled")
@@ -281,7 +279,7 @@ impl ListingTableConnector for AzureBlobFS {
         let mut azure_url =
             Url::parse(url)
                 .boxed()
-                .context(super::InvalidConfigurationSnafu {
+                .context(runtime::dataconnector::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
                     message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
@@ -386,27 +384,22 @@ impl ListingTableConnector for AzureBlobFS {
     }
 }
 
-register_data_connector!(
-    register_abfs_connector,
-    REGISTER_ABFS_CONNECTOR,
-    "abfs",
-    AzureBlobFSFactory
-);
+/// The name used to identify this connector in configuration (primary scheme).
+pub const CONNECTOR_NAME: &str = "abfs";
 
-register_data_connector!(
-    register_abfss_connector,
-    REGISTER_ABFSS_CONNECTOR,
-    "abfss",
-    AzureBlobFSFactory
-);
+/// Returns a new instance of the ABFS connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    AzureBlobFSFactory::new_arc()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataconnector::listing::ListingTableConnector;
-    use crate::parameters::ParameterSpec;
     use datafusion::parquet::arrow::async_reader::ObjectVersionType;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::dataconnector::listing::ListingTableConnector;
+    use runtime::parameters::ParameterSpec;
     use std::collections::HashMap;
 
     const TEST_PARAMETERS: &[ParameterSpec] = &[

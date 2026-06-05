@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,18 +18,19 @@ use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::{
     cdc::{ChangesStream, CommitError},
-    kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook},
+    kafka::{
+        KafkaConfig, KafkaConsumer, KafkaMetadata, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook,
+    },
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{any::Any, pin::Pin, sync::Arc};
 use tonic::async_trait;
 
-use crate::{
+use runtime::{
     component::{
         ComponentType,
         dataset::{Dataset, acceleration::RefreshMode},
@@ -269,7 +270,7 @@ impl DataConnectorFactory for KafkaFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let kafka = Kafka::new(params.parameters)?;
             Ok(Arc::new(kafka) as Arc<dyn DataConnector>)
@@ -302,13 +303,13 @@ impl DataConnector for Kafka {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let Some(acceleration) = dataset
             .acceleration
             .as_ref()
             .filter(|acceleration| acceleration.enabled)
         else {
-            return super::InvalidConfigurationNoSourceSnafu {
+            return runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
@@ -318,7 +319,7 @@ impl DataConnector for Kafka {
 
         ensure!(
             acceleration.refresh_mode == Some(RefreshMode::Append),
-            super::InvalidConfigurationNoSourceSnafu {
+            runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
                 connector_component: ConnectorComponent::from(dataset),
@@ -330,7 +331,7 @@ impl DataConnector for Kafka {
                 KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
                     .await
                     .boxed()
-                    .context(super::UnableToGetReadProviderSnafu {
+                    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
                         dataconnector: "kafka",
                         connector_component: ConnectorComponent::from(dataset),
                     })?,
@@ -359,12 +360,14 @@ impl DataConnector for Kafka {
             refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
                 .map(|(_, schema)| schema)
                 .boxed()
-                .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-                    dataconnector: "kafka".to_string(),
-                    message: format!("The refresh SQL is invalid: {e}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: e,
-                })?
+                .map_err(
+                    |e| runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+                        dataconnector: "kafka".to_string(),
+                        message: format!("The refresh SQL is invalid: {e}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e,
+                    },
+                )?
         } else {
             schema
         };
@@ -409,6 +412,29 @@ impl DataConnector for Kafka {
     }
 }
 
+/// Implement the shared `SidecarOffsetStore` trait for `KafkaSys` so that
+/// `SidecarOffsetCommitHook<KafkaSys>` can be constructed.
+#[async_trait]
+impl SidecarOffsetStore for KafkaSys {
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        KafkaSys::upsert_offsets(self, offsets)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "kafka";
+
+/// Returns a new instance of the Kafka connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    KafkaFactory::new_arc()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,15 +477,14 @@ async fn init_kafka_consumer(
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
     kafka_sys: Option<&KafkaSys>,
-) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
+) -> runtime::dataconnector::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let metadata = if let Some(kafka_sys) = kafka_sys {
-        get_metadata_from_accelerator(kafka_sys)
-            .await
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
+        kafka_sys.get().await.boxed().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
-            })?
+            },
+        )?
     } else {
         None
     };
@@ -471,7 +496,7 @@ async fn init_kafka_consumer(
 
     ensure!(
         topic == metadata.topic,
-        super::InvalidConfigurationNoSourceSnafu {
+        runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
             dataconnector: "kafka",
             message: format!(
                 "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
@@ -484,7 +509,7 @@ async fn init_kafka_consumer(
     if let Some(ref group_id) = kafka_config.consumer_group_id {
         ensure!(
             group_id == &metadata.consumer_group_id,
-            super::InvalidConfigurationNoSourceSnafu {
+            runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "kafka",
                 message: format!(
                     "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file or rename the dataset to proceed.",
@@ -501,78 +526,19 @@ async fn init_kafka_consumer(
         &metadata.offsets,
     )
     .boxed()
-    .context(super::UnableToGetReadProviderSnafu {
+    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
         dataconnector: "kafka",
         connector_component: ConnectorComponent::from(dataset),
     })?;
 
-    kafka_consumer
-        .subscribe(topic)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
+    kafka_consumer.subscribe(topic).boxed().context(
+        runtime::dataconnector::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",
             connector_component: ConnectorComponent::from(dataset),
-        })?;
+        },
+    )?;
 
     Ok((kafka_consumer, metadata.schema))
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct KafkaMetadata {
-    pub(crate) consumer_group_id: String,
-    pub(crate) topic: String,
-    pub(crate) schema: SchemaRef,
-    #[serde(default)]
-    pub(crate) offsets: Vec<KafkaOffset>,
-}
-
-async fn get_metadata_from_accelerator(
-    kafka_sys: &KafkaSys,
-) -> Result<Option<KafkaMetadata>, spice_sys::Error> {
-    kafka_sys.get().await
-}
-
-async fn set_metadata_to_accelerator(
-    kafka_sys: &KafkaSys,
-    metadata: &KafkaMetadata,
-) -> Result<(), spice_sys::Error> {
-    kafka_sys.upsert(metadata).await
-}
-
-#[async_trait]
-pub(crate) trait SidecarOffsetStore: Send + Sync {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()>;
-}
-
-#[async_trait]
-impl SidecarOffsetStore for KafkaSys {
-    async fn upsert_offsets(&self, offsets: &[KafkaOffset]) -> spice_sys::Result<()> {
-        KafkaSys::upsert_offsets(self, offsets).await
-    }
-}
-
-pub(crate) struct SidecarOffsetCommitHook<T> {
-    store: Arc<T>,
-}
-
-impl<T> SidecarOffsetCommitHook<T> {
-    pub(crate) fn new(store: Arc<T>) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait]
-impl<T> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T>
-where
-    T: SidecarOffsetStore,
-{
-    async fn commit_offsets(&self, offsets: &[KafkaOffset]) -> Result<(), CommitError> {
-        self.store
-            .upsert_offsets(offsets)
-            .await
-            .boxed()
-            .map_err(|e| CommitError::UnableToCommitChange { source: e })
-    }
 }
 
 async fn bootstrap_new_kafka_consumer(
@@ -581,7 +547,7 @@ async fn bootstrap_new_kafka_consumer(
     kafka_config: &KafkaConfig,
     json_options: &Arc<SpiceJsonOptions>,
     kafka_sys: Option<&KafkaSys>,
-) -> super::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
+) -> runtime::dataconnector::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
         &dataset_name,
@@ -589,18 +555,17 @@ async fn bootstrap_new_kafka_consumer(
         kafka_config,
     )
     .boxed()
-    .context(super::UnableToGetReadProviderSnafu {
+    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
         dataconnector: "kafka",
         connector_component: ConnectorComponent::from(dataset),
     })?;
 
-    kafka_consumer
-        .subscribe(topic)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
+    kafka_consumer.subscribe(topic).boxed().context(
+        runtime::dataconnector::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",
             connector_component: ConnectorComponent::from(dataset),
-        })?;
+        },
+    )?;
 
     let schema_inference_sample_count = json_options
         .schema_infer_max_rec
@@ -617,17 +582,21 @@ async fn bootstrap_new_kafka_consumer(
         {
             Ok(Some(msg)) => sample_values.push(msg),
             Ok(None) => {
-                return Err(super::DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "kafka".to_string(),
-                    source: "No message received from Kafka.".into(),
-                    connector_component: ConnectorComponent::from(dataset),
-                });
+                return Err(
+                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                        dataconnector: "kafka".to_string(),
+                        source: "No message received from Kafka.".into(),
+                        connector_component: ConnectorComponent::from(dataset),
+                    },
+                );
             }
             Err(e) => {
-                return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "kafka",
-                    connector_component: ConnectorComponent::from(dataset),
-                });
+                return Err(e).boxed().context(
+                    runtime::dataconnector::UnableToGetReadProviderSnafu {
+                        dataconnector: "kafka",
+                        connector_component: ConnectorComponent::from(dataset),
+                    },
+                );
             }
         }
     }
@@ -636,11 +605,13 @@ async fn bootstrap_new_kafka_consumer(
 
     // Infer Arrow schema from the JSON value in the message
     let schema = datafusion::arrow::json::reader::infer_json_schema_from_iterator(value_iter)
-        .map_err(|e| super::DataConnectorError::UnableToGetReadProvider {
-            dataconnector: "kafka".to_string(),
-            source: format!("Failed to infer schema from Kafka message: {e}").into(),
-            connector_component: ConnectorComponent::from(dataset),
-        })
+        .map_err(
+            |e| runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "kafka".to_string(),
+                source: format!("Failed to infer schema from Kafka message: {e}").into(),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )
         .map(|schema| {
             // If flatten_json is set, unnest the schema
             if let Some(separator) = &json_options.flatten_json {
@@ -659,34 +630,32 @@ async fn bootstrap_new_kafka_consumer(
     };
 
     if let Some(kafka_sys) = kafka_sys {
-        set_metadata_to_accelerator(kafka_sys, &metadata)
-            .await
-            .boxed()
-            .context(super::UnableToGetReadProviderSnafu {
+        kafka_sys.upsert(&metadata).await.boxed().context(
+            runtime::dataconnector::UnableToGetReadProviderSnafu {
                 dataconnector: "kafka",
                 connector_component: ConnectorComponent::from(dataset),
-            })?;
+            },
+        )?;
     }
 
     // Restart the stream from the beginning
-    kafka_consumer
-        .restart_topic(topic)
-        .boxed()
-        .context(super::UnableToGetReadProviderSnafu {
+    kafka_consumer.restart_topic(topic).boxed().context(
+        runtime::dataconnector::UnableToGetReadProviderSnafu {
             dataconnector: "kafka",
             connector_component: ConnectorComponent::from(dataset),
-        })?;
+        },
+    )?;
 
     Ok((kafka_consumer, schema))
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct KafkaMetricsProvider {
+pub struct KafkaMetricsProvider {
     metrics: Arc<KafkaMetrics>,
 }
 
 impl KafkaMetricsProvider {
-    pub(crate) fn new(metrics: Arc<KafkaMetrics>) -> Self {
+    pub fn new(metrics: Arc<KafkaMetrics>) -> Self {
         Self { metrics }
     }
 }
@@ -771,5 +740,3 @@ impl MetricsProvider for KafkaMetricsProvider {
         }
     }
 }
-
-register_data_connector!("kafka", KafkaFactory);

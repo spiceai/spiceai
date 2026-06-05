@@ -67,6 +67,8 @@ pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
+#[cfg(feature = "adbc")]
+pub mod adbc_helpers;
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
@@ -91,6 +93,8 @@ pub mod elasticsearch;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "glue")]
+pub mod glue;
 pub mod iceberg;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;

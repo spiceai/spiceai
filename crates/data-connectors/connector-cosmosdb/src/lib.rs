@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2026 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Azure Cosmos DB (`NoSQL` / Core SQL API) data connector.
+//! Azure Cosmos DB (`NoSQL` / Core SQL API) data connector for Spice.ai runtime.
 //!
-//! Read-only scan with schema inferred from a sample of documents, backed by
-//! RC-level connection resilience (concurrency limiting, retry with backoff,
-//! permanent-error detection) and an `inflight_operations` metric gauge.
+//! This crate provides the Cosmos DB connector implementation, allowing
+//! Spice.ai to connect to Azure Cosmos DB as a data source.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -37,17 +40,24 @@ use data_components::cosmosdb::{
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction;
 use opentelemetry::KeyValue;
-use tokio::sync::Semaphore;
-
-use super::{
+use runtime::component::ComponentType;
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters,
 };
-use crate::component::ComponentType;
-use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use snafu::prelude::*;
+use tokio::sync::Semaphore;
 
-const CONNECTOR_NAME: &str = "cosmosdb";
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "cosmosdb";
+
+/// Returns a new instance of the Cosmos DB connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    CosmosDBFactory::new_arc()
+}
 
 /// Semaphore paired with the numeric limit it was constructed with, so
 /// mismatches across datasets targeting the same Cosmos account can be
@@ -220,7 +230,7 @@ impl DataConnectorFactory for CosmosDBFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
@@ -470,8 +480,6 @@ impl DataConnector for CosmosDB {
     }
 }
 
-register_data_connector!("cosmosdb", CosmosDBFactory);
-
 #[cfg(test)]
 mod tests {
     use super::{parse_database_and_container, shared_disabled_flag, shared_semaphore};
@@ -541,9 +549,6 @@ mod tests {
 
     #[test]
     fn dot_takes_precedence_over_slash() {
-        // Documents current behavior: the first `.` wins even when a `/` is
-        // also present. Cosmos DB names do not legally contain `.`, so this
-        // mainly matters for malformed input.
         let (db, container) =
             parse_database_and_container("a/b.c", None).expect("dot takes precedence over slash");
         assert_eq!(db, "a/b");
@@ -560,8 +565,6 @@ mod tests {
 
     #[test]
     fn shared_semaphore_returns_same_instance_for_same_endpoint() {
-        // Use a unique endpoint per test to avoid cross-test interference
-        // through the process-wide `COSMOS_CONCURRENCY_LIMITS` map.
         let endpoint = "https://shared-semaphore-same-endpoint.documents.azure.com:443/";
         let sem_a = shared_semaphore(endpoint, 4);
         let sem_b = shared_semaphore(endpoint, 4);
@@ -572,8 +575,6 @@ mod tests {
     fn shared_semaphore_keeps_first_seen_limit_on_mismatch() {
         let endpoint = "https://shared-semaphore-mismatch.documents.azure.com:443/";
         let sem_a = shared_semaphore(endpoint, 4);
-        // A conflicting request should be resolved in favor of the first-seen
-        // limit rather than silently bumping or panicking.
         let sem_b = shared_semaphore(endpoint, 16);
         assert!(std::sync::Arc::ptr_eq(&sem_a, &sem_b));
         assert_eq!(sem_a.available_permits(), 4);

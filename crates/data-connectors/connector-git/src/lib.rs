@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2026 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::ComponentType;
-use crate::component::dataset::Dataset;
-use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
-use crate::dataconnector::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
-};
+//! Git data connector for Spice.ai runtime.
+//!
+//! This crate provides the Git connector implementation, allowing
+//! Spice.ai to connect to Git repositories as data sources.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds - changes to this connector only require rebuilding
+//! this crate, not the entire runtime.
+
 use async_trait::async_trait;
 use data_components::git::{
     BackoffMethod, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES,
@@ -30,45 +32,41 @@ use data_components::rate_limit::RateLimiter;
 use datafusion::datasource::TableProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use opentelemetry::KeyValue;
+use runtime::component::ComponentType;
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
+};
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
-use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::{any::Any, future::Future, pin::Pin};
 use tokio::sync::Semaphore;
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "git";
+
+/// Returns a new instance of the Git connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GitFactory::new_arc()
+}
 
 /// A concurrency semaphore paired with the numeric limit it was constructed
 /// with, so that mismatches between datasets sharing the same repository URL
 /// can be detected and surfaced as a warning.
 type SemaphoreEntry = (Arc<Semaphore>, usize);
 
-/// Per-repository concurrency semaphores. Keyed by the fully-qualified
-/// repository URL so that multiple datasets sharing the same remote share a
-/// single concurrency budget.
-///
-/// Entries are never evicted during the runtime's lifetime: each slot holds an
-/// `Arc<Semaphore>` + `usize` (~40 bytes on 64-bit platforms), and typical
-/// deployments configure a bounded set of repositories. Workloads that
-/// dynamically materialize many distinct Git URLs should treat this as a
-/// known upper bound on memory use.
 static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, SemaphoreEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Per-repository disabled-state flags. Shared across all `Git` connector
-/// instances that target the same repository so that a permanent error
-/// observed by one dataset latches the connector for every dataset pointing
-/// at the same remote. Same memory footprint trade-off as
-/// `GIT_CONCURRENCY_LIMITS` above.
 static GIT_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Resolve (or create) the shared semaphore for a repository URL.
-///
-/// When multiple datasets target the same URL with different
-/// `max_concurrent_requests` values, the first configuration wins (to keep
-/// the concurrency budget deterministic) and subsequent mismatches are
-/// logged so the operator can reconcile the configuration.
 fn shared_semaphore(key: &str, max_concurrent: usize) -> Arc<Semaphore> {
     let mut guard = GIT_CONCURRENCY_LIMITS
         .lock()
@@ -107,8 +105,6 @@ fn shared_disabled_flag(key: &str) -> Arc<AtomicBool> {
 #[derive(Debug)]
 pub struct Git {
     params: Parameters,
-    /// Shared counters updated by every `GitClient` instance created by this
-    /// connector. Used by the metrics provider to expose observability.
     metrics: Arc<GitMetrics>,
 }
 
@@ -121,19 +117,12 @@ impl Git {
         }
     }
 
-    /// Parse the Git URL from the dataset path
-    /// Supports formats like:
-    /// - git:https://github.com/spiceai/spiceai.git
-    /// - git:https://user:token@github.com/spiceai/spiceai.git@trunk
-    /// - git:git@github.com:spiceai/spiceai.git@v1.0.0
-    /// - git:file:///tmp/repo@main
     fn parse_git_url(path: &str) -> Result<(String, Option<String>), String> {
         let path = path.strip_prefix("git:").unwrap_or(path).trim();
         if path.is_empty() {
             return Err("Git path is empty".to_string());
         }
 
-        // SSH shorthand: git@host:org/repo[@ref]
         if path.starts_with("git@") {
             if let Some(colon_pos) = path.find(':') {
                 let suffix = &path[colon_pos + 1..];
@@ -147,12 +136,6 @@ impl Git {
             return Ok((path.to_string(), None));
         }
 
-        // Standard URL: `<scheme>://[userinfo@]authority[/path][@<ref>]`.
-        //
-        // The reference separator is the last `@` that appears *after* the
-        // start of the path component (the first `/` following `://`). This
-        // way a URL that contains userinfo (e.g. `https://user:token@host/`)
-        // is never mistaken for a `@ref` suffix.
         if let Some(scheme_end) = path.find("://") {
             let after_scheme = scheme_end + 3;
             let path_start = path[after_scheme..]
@@ -167,8 +150,6 @@ impl Git {
             return Ok((path.to_string(), None));
         }
 
-        // No scheme (bare path, etc.): fall back to treating the last `@`
-        // as the ref separator.
         if let Some(at_pos) = path.rfind('@') {
             let url = path[..at_pos].to_string();
             let reference = path[at_pos + 1..].to_string();
@@ -179,14 +160,6 @@ impl Git {
     }
 
     fn build_credentials(&self) -> GitCredentials {
-        // Credentials and tuning values are sourced exclusively from the
-        // validated, secret-resolved connector parameters. Using
-        // `self.params` guarantees:
-        //
-        // * secret-store references such as `${ env:GIT_TOKEN }` are
-        //   resolved into their real values, and
-        // * prefixed/unprefixed keys are normalized by
-        //   `ConnectorParamsBuilder`.
         let username = self
             .params
             .get("username")
@@ -269,9 +242,6 @@ impl Git {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        // Use a sanitized URL as the map key so inline credentials (e.g.
-        // `https://user:token@host/repo`) do not end up as a long-lived map
-        // key in the global resilience tables.
         let key = data_components::git::sanitize_repo_url(repo_url);
         let semaphore = shared_semaphore(&key, max_concurrent_requests);
         let disabled = shared_disabled_flag(&key);
@@ -286,7 +256,6 @@ impl Git {
         }
     }
 
-    /// Create a `GitTableProvider` from dataset configuration
     async fn create_table_provider(
         &self,
         dataset: &Dataset,
@@ -307,12 +276,6 @@ impl Git {
             reference
         );
 
-        // All runtime parameters are sourced from the validated, normalized
-        // `self.params` (produced by `ConnectorParamsBuilder`) so that
-        // secret-store references are resolved and prefix/validation rules
-        // are honored. Avoid reading these from `dataset.params` directly
-        // because that bypasses validation and would silently accept keys
-        // that are rejected by the parameter spec.
         let include = self
             .params
             .get("include")
@@ -368,7 +331,6 @@ impl Git {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(false);
 
-        // Create a no-op rate limiter (Git operations are local after initial clone)
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);
 
         let credentials = self.build_credentials();
@@ -434,7 +396,6 @@ impl GitFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    // File selection / limits
     ParameterSpec::runtime("include")
         .description("Include only files matching the glob pattern. Multiple patterns can be separated by comma or semicolon.")
         .examples(&["*.rs", "**/*.yaml;src/**/*.json"]),
@@ -449,8 +410,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         .default("5000"),
     ParameterSpec::runtime("max_file_bytes")
         .description("Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB)."),
-
-    // Authentication (HTTPS / HTTP)
     ParameterSpec::component("username")
         .description("Username for HTTP(S) basic authentication."),
     ParameterSpec::component("password")
@@ -459,8 +418,6 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token")
         .description("Personal access token used for HTTP(S) authentication. Equivalent to providing a username of 'x-access-token' with the token as the password.")
         .secret(),
-
-    // Authentication (SSH)
     ParameterSpec::component("ssh_key")
         .description("Absolute path to an SSH private key used to authenticate to the remote repository."),
     ParameterSpec::component("ssh_passphrase")
@@ -470,14 +427,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("When 'true', attempt to authenticate via the running ssh-agent when no explicit ssh_key is provided. Defaults to 'true'.")
         .default("true")
         .is_boolean(),
-
-    // Large File Storage
     ParameterSpec::runtime("enable_lfs")
         .description("Whether to fetch git-lfs objects after clone/fetch. Requires the 'git-lfs' CLI to be available on PATH.")
         .default("false")
         .is_boolean(),
-
-    // Resilience / connection tuning
     ParameterSpec::runtime("max_concurrent_requests")
         .description("Maximum number of concurrent Git network operations (clone/fetch) across datasets that share the same repository URL.")
         .default("4"),
@@ -492,13 +445,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("When true, a permanent error (authentication failure, access denied) will disable the connector to prevent a thundering herd of failed requests.")
         .default("true")
         .is_boolean(),
-
-    // Backwards-compat aliases: earlier releases of the Git connector read
-    // these runtime options from `dataset.params` using a `git_`-prefixed
-    // key. Runtime parameters normally reject the prefix, but these
-    // deprecated entries keep those existing spicepods working while they
-    // migrate to the unprefixed forms above. Emit a deprecation warning so
-    // the mis-prefixed keys surface in logs.
     ParameterSpec::component("include")
         .description("[deprecated] Use unprefixed 'include'.")
         .deprecated("Rename 'git_include' to 'include'."),
@@ -527,7 +473,7 @@ impl DataConnectorFactory for GitFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(Git::new(params.parameters)) as Arc<dyn DataConnector>) })
     }
 
@@ -540,11 +486,6 @@ impl DataConnectorFactory for GitFactory {
     }
 }
 
-/// Metrics recorded by the Git data connector.
-///
-/// The counters are incremented by every `GitClient` created by this
-/// connector so that dashboards reflect the combined behavior across all
-/// datasets using the same connector instance.
 #[derive(Debug, Default)]
 struct GitMetrics {
     inflight_operations: Arc<AtomicU64>,
@@ -595,7 +536,7 @@ impl MetricsProvider for GitMetricsProvider {
     }
 }
 
-/// Parse glob patterns from a comma or semicolon separated string
+/// Parse glob patterns from a comma or semicolon separated string.
 pub fn parse_globs(
     component: &ConnectorComponent,
     input: &str,
@@ -619,19 +560,15 @@ pub fn parse_globs(
     Ok(Arc::new(glob_set))
 }
 
-/// A no-op rate limiter for Git operations (local operations after clone)
+/// A no-op rate limiter for Git operations (local operations after clone).
 #[derive(Debug)]
 struct NoOpRateLimiter;
 
 #[async_trait]
 impl RateLimiter for NoOpRateLimiter {
-    async fn update_from_headers(&self, _headers: &reqwest::header::HeaderMap) {
-        // No rate limiting needed for local Git operations
-    }
+    async fn update_from_headers(&self, _headers: &reqwest::header::HeaderMap) {}
 
     async fn check_rate_limit(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 }
-
-register_data_connector!("git", GitFactory);

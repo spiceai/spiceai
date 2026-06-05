@@ -1,8 +1,8 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this Https except in compliance with the License.
+you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
      https://www.apache.org/licenses/LICENSE-2.0
@@ -35,12 +35,9 @@ use snafu::prelude::*;
 use std::sync::LazyLock;
 use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::Dataset,
-    parameters::{ParameterSpec, Parameters},
-};
-
-use super::{
+use data_components::glue::InputFormat;
+use runtime::component::dataset::Dataset;
+use runtime::dataconnector::{
     DataConnector, DataConnectorFactory,
     parameters::{
         ConnectorParams,
@@ -48,6 +45,7 @@ use super::{
     },
     s3::S3,
 };
+use runtime::parameters::{ParameterSpec, Parameters};
 
 static PREFIX: &str = "glue";
 
@@ -82,14 +80,6 @@ pub enum Error {
     ))]
     MissingMetadataLocation { table: String, message: String },
     #[snafu(display(
-        "Cannot retrieve input format for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
-    ))]
-    MissingInputFormat { table: String },
-    #[snafu(display(
-        "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
-    ))]
-    InvalidInputFormat { input_format: String, table: String },
-    #[snafu(display(
         "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageDescriptor { table: String },
@@ -117,9 +107,9 @@ impl GlueDataConnector {
     async fn create_table_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.parse_path(false, None).map_err(|e| {
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: format!("Cannot parse path for dataset '{}': {e}", dataset.name),
@@ -130,7 +120,7 @@ impl GlueDataConnector {
             let e = Error::MissingSchema {
                 path: path.to_string(),
             };
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -141,7 +131,7 @@ impl GlueDataConnector {
 
         let config = self.config().await.map_err(|e| {
             let e = Error::AWSConfig { source: e };
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -162,7 +152,7 @@ impl GlueDataConnector {
                 database: database.to_string(),
                 table: table.to_string(),
             };
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -175,7 +165,7 @@ impl GlueDataConnector {
                 database: database.to_string(),
                 table: table.to_string(),
             };
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -184,7 +174,7 @@ impl GlueDataConnector {
         })?;
 
         match InputFormat::try_from(&table).map_err(|e| {
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -241,7 +231,7 @@ impl GlueDataConnectorFactory {
 pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
-    all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
+    all_parameters.extend_from_slice(runtime::dataconnector::s3::PARAMETERS.as_ref());
     all_parameters
 });
 
@@ -253,7 +243,7 @@ impl DataConnectorFactory for GlueDataConnectorFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
             Ok(Arc::new(glue) as Arc<dyn DataConnector>)
@@ -278,7 +268,7 @@ impl DataConnector for GlueDataConnector {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         self.create_table_provider(dataset).await
     }
 
@@ -286,72 +276,9 @@ impl DataConnector for GlueDataConnector {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
         Some(self.create_table_provider(dataset).await)
-    }
-}
-
-register_data_connector!("glue", GlueDataConnectorFactory);
-
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum InputFormat {
-    // Avro,
-    Csv,
-    // Json,
-    // Xml,
-    Parquet,
-    // Orc,
-    Iceberg,
-}
-
-impl InputFormat {
-    /// Return the file format of the [`InputFormat`]. For
-    /// [`InputFormat::Iceberg`], it's not a file format but we return a value
-    /// rather than have to use an `Option` return type for convenience.
-    fn file_format(self) -> &'static str {
-        match self {
-            InputFormat::Csv => "csv",
-            InputFormat::Parquet => "parquet",
-            InputFormat::Iceberg => "iceberg",
-        }
-    }
-}
-
-impl TryFrom<&Table> for InputFormat {
-    type Error = Error;
-    fn try_from(table: &Table) -> Result<Self, Self::Error> {
-        if table
-            .parameters
-            .as_ref()
-            .and_then(|params| params.get("table_type"))
-            .is_some_and(|value| value.to_lowercase() == "iceberg")
-        {
-            return Ok(Self::Iceberg);
-        }
-
-        let Some(storage_descriptor) = table.storage_descriptor() else {
-            return Err(Error::MissingStorageDescriptor {
-                table: table.name().to_string(),
-            });
-        };
-
-        let Some(input_format) = storage_descriptor.input_format() else {
-            return Err(Error::MissingInputFormat {
-                table: table.name().to_string(),
-            });
-        };
-
-        Ok(match input_format {
-            "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat" => Self::Parquet,
-            "org.apache.hadoop.mapred.TextInputFormat" => Self::Csv,
-            input_format => {
-                return Err(Error::InvalidInputFormat {
-                    input_format: input_format.to_string(),
-                    table: table.name().to_string(),
-                });
-            }
-        })
     }
 }
 
@@ -360,10 +287,10 @@ async fn create_iceberg_provider(
     config: &SdkConfig,
     database: String,
     table: &Table,
-) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
     let region = config.region().ok_or_else(|| {
         let e = Error::MissingRegion;
-        super::DataConnectorError::InvalidConfiguration {
+        runtime::dataconnector::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
             message: e.to_string(),
@@ -375,7 +302,7 @@ async fn create_iceberg_provider(
         .credentials_provider()
         .ok_or_else(|| {
             let e = Error::MissingCredentials;
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -386,7 +313,7 @@ async fn create_iceberg_provider(
         .await
         .map_err(|e| {
             let e = Error::InvalidCredentials { source: e };
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: e.to_string(),
@@ -395,7 +322,7 @@ async fn create_iceberg_provider(
         })?;
 
     let metadata_location = get_metadata_location(table).map_err(|e| {
-        super::DataConnectorError::InvalidConfiguration {
+        runtime::dataconnector::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
             message: e.to_string(),
@@ -463,7 +390,7 @@ async fn create_iceberg_provider(
         .load("glue", props)
         .await
         .map_err(|e| {
-            super::DataConnectorError::InvalidConfiguration {
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
@@ -479,7 +406,7 @@ async fn create_iceberg_provider(
         identifier.name().to_string(),
     )
     .await
-    .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+    .map_err(|e| runtime::dataconnector::DataConnectorError::InvalidConfiguration {
         dataconnector: PREFIX.to_string(),
         connector_component: dataset.into(),
         message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
@@ -495,29 +422,33 @@ async fn create_s3_provider(
     mut params: Parameters,
     table: &Table,
     tokio_io_runtime: tokio::runtime::Handle,
-) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
         let e = Error::MissingStorageDescriptor {
             table: table.name().to_string(),
         };
-        return Err(super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: (&dataset).into(),
-            message: e.to_string(),
-            source: Box::new(e),
-        });
+        return Err(
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: (&dataset).into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            },
+        );
     };
 
     let Some(from) = storage_descriptor.location().map(String::from) else {
         let e = Error::MissingStorageLocation {
             table: table.name().to_string(),
         };
-        return Err(super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: (&dataset).into(),
-            message: e.to_string(),
-            source: Box::new(e),
-        });
+        return Err(
+            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: (&dataset).into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            },
+        );
     };
 
     let from = ensure_s3_trailing_slash(&from);
@@ -590,6 +521,15 @@ fn get_metadata_location(table: &Table) -> Result<String, Error> {
             message: "No parameters found".to_string(),
         }),
     }
+}
+
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "glue";
+
+/// Returns a new instance of the Glue connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    GlueDataConnectorFactory::new_arc()
 }
 
 #[cfg(test)]

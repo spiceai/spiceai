@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2026 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+//! ADBC data connector for Spice.ai runtime.
+//!
+//! This connector is extracted from the runtime crate to enable faster
+//! incremental builds.
+
 use adbc_core::options::{AdbcVersion, OptionDatabase};
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
@@ -40,11 +44,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
 
-use super::{
+use data_components::adbc_helpers::{
+    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_metadata,
+};
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::parameters::Parameters;
+use runtime::parameters::Parameters;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -233,7 +240,7 @@ impl ConnectorInitializationGuard {
         }
     }
 
-    fn complete(&mut self, result: &super::NewDataConnectorResult) {
+    fn complete(&mut self, result: &runtime::dataconnector::NewDataConnectorResult) {
         {
             let mut state = self.entry.state.lock();
             *state = match result {
@@ -334,7 +341,9 @@ const PARAMETERS: &[ParameterSpec] = &[
 
 impl AdbcFactory {
     /// Performs the actual ADBC driver initialization.
-    async fn init_connector(params: ConnectorParams) -> super::NewDataConnectorResult {
+    async fn init_connector(
+        params: ConnectorParams,
+    ) -> runtime::dataconnector::NewDataConnectorResult {
         let driver_name = params
             .parameters
             .get("driver")
@@ -554,204 +563,6 @@ async fn enrich_with_bigquery_metadata_from_weak_pool(
     enrich_with_bigquery_metadata(driver_name, &pool, table_reference, provider).await
 }
 
-pub(crate) async fn enrich_with_bigquery_metadata(
-    driver_name: &str,
-    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
-    table_reference: &TableReference,
-    provider: Arc<dyn TableProvider>,
-) -> Arc<dyn TableProvider> {
-    if !driver_name.eq_ignore_ascii_case("bigquery") {
-        return provider;
-    }
-
-    match bigquery_schema_metadata(pool, table_reference).await {
-        Ok((table_metadata, field_metadata)) => {
-            if table_metadata.is_empty() && field_metadata.is_empty() {
-                provider
-            } else {
-                metadata_enriched_table_provider(provider, table_metadata, field_metadata)
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                table = %table_reference,
-                error = %error,
-                "Failed to query BigQuery schema metadata via ADBC; registering without source metadata"
-            );
-            provider
-        }
-    }
-}
-
-async fn bigquery_schema_metadata(
-    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
-    table_reference: &TableReference,
-) -> std::result::Result<
-    (HashMap<String, String>, FieldMetadata),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let table_name = bigquery_string_literal(table_reference.table());
-    let table_options = bigquery_information_schema_table(table_reference, "TABLE_OPTIONS");
-    let column_field_paths =
-        bigquery_information_schema_table(table_reference, "COLUMN_FIELD_PATHS");
-    let columns = bigquery_information_schema_table(table_reference, "COLUMNS");
-
-    let table_sql = format!(
-        "SELECT option_value FROM {table_options} WHERE table_name = {table_name} AND option_name = 'description' AND option_value IS NOT NULL AND option_value != ''"
-    );
-    let comment_sql = format!(
-        "SELECT field_path, description FROM {column_field_paths} WHERE table_name = {table_name} AND description IS NOT NULL AND description != ''"
-    );
-    let column_sql = format!(
-        "SELECT column_name, data_type, CASE WHEN is_partitioning_column = 'YES' THEN 'true' ELSE NULL END, CAST(clustering_ordinal_position AS STRING) FROM {columns} WHERE table_name = {table_name}"
-    );
-
-    let mut table_metadata = HashMap::new();
-    if let Some(comment) = first_string_result(pool, table_sql).await? {
-        table_metadata.insert(
-            data_components::DESCRIPTION_METADATA_KEY.to_string(),
-            comment,
-        );
-    }
-
-    let mut field_metadata = FieldMetadata::new();
-    for row in string_column_results(pool, column_sql, 4).await? {
-        let [column_name, source_type, partition, clustering] = row.as_slice() else {
-            continue;
-        };
-        let Some(column_name) = column_name else {
-            continue;
-        };
-        let metadata = field_metadata.entry(column_name.clone()).or_default();
-        if let Some(source_type) = source_type {
-            metadata.insert(
-                data_components::SOURCE_TYPE_METADATA_KEY.to_string(),
-                source_type.clone(),
-            );
-        }
-        if partition.as_deref() == Some("true") {
-            metadata.insert(
-                data_components::PARTITION_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
-        }
-        if let Some(clustering) = clustering {
-            metadata.insert(
-                data_components::CLUSTERING_METADATA_KEY.to_string(),
-                clustering.clone(),
-            );
-        }
-    }
-
-    for row in string_column_results(pool, comment_sql, 2).await? {
-        let [field_path, comment] = row.as_slice() else {
-            continue;
-        };
-        let (Some(field_path), Some(comment)) = (field_path, comment) else {
-            continue;
-        };
-        if field_path.contains('.') {
-            continue;
-        }
-        field_metadata
-            .entry(field_path.clone())
-            .or_default()
-            .insert(
-                data_components::DESCRIPTION_METADATA_KEY.to_string(),
-                comment.clone(),
-            );
-    }
-
-    Ok((table_metadata, field_metadata))
-}
-
-async fn first_string_result(
-    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
-    sql: String,
-) -> std::result::Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = Arc::clone(pool).connect().await?;
-    let batches: Vec<_> = query_arrow(conn, sql, None).await?.try_collect().await?;
-    for batch in &batches {
-        if batch.num_columns() == 0 {
-            continue;
-        }
-        let values = batch.column(0);
-        for row in 0..batch.num_rows() {
-            if let Some(value) = string_value(values, row) {
-                return Ok(Some(value.to_string()));
-            }
-        }
-    }
-    Ok(None)
-}
-
-async fn string_column_results(
-    pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
-    sql: String,
-    column_count: usize,
-) -> std::result::Result<Vec<Vec<Option<String>>>, Box<dyn std::error::Error + Send + Sync>> {
-    let conn = Arc::clone(pool).connect().await?;
-    let batches: Vec<_> = query_arrow(conn, sql, None).await?.try_collect().await?;
-    let mut values = Vec::new();
-    for batch in &batches {
-        if batch.num_columns() < column_count {
-            continue;
-        }
-        for row in 0..batch.num_rows() {
-            values.push(
-                (0..column_count)
-                    .map(|column| string_value(batch.column(column), row).map(ToString::to_string))
-                    .collect(),
-            );
-        }
-    }
-    Ok(values)
-}
-
-fn string_value(array: &ArrayRef, row: usize) -> Option<&str> {
-    if array.is_null(row) {
-        return None;
-    }
-
-    array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .map(|array| array.value(row))
-        .or_else(|| {
-            array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .map(|array| array.value(row))
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn bigquery_information_schema_table(table_reference: &TableReference, view: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(catalog) = table_reference.catalog() {
-        parts.push(catalog.to_string());
-    }
-    if let Some(schema) = table_reference.schema() {
-        parts.push(schema.to_string());
-    }
-    parts.push("INFORMATION_SCHEMA".to_string());
-    parts.push(view.to_string());
-
-    format!(
-        "`{}`",
-        parts
-            .into_iter()
-            .map(|part| part.replace('`', "\\`"))
-            .collect::<Vec<_>>()
-            .join(".")
-    )
-}
-
-fn bigquery_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-}
-
 impl DataConnectorFactory for AdbcFactory {
     fn as_any(&self) -> &dyn Any {
         self
@@ -760,7 +571,7 @@ impl DataConnectorFactory for AdbcFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         let cache_key = compute_adbc_cache_key(&params);
 
         let entry = {
@@ -875,44 +686,6 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
 }
 
 /// Builds the list of ADBC database options from connector parameters.
-pub(crate) fn build_db_options(
-    uri: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    driver_options: Option<&str>,
-) -> Vec<(OptionDatabase, adbc_core::options::OptionValue)> {
-    let mut opts = vec![(OptionDatabase::Uri, uri.into())];
-    if let Some(u) = username {
-        opts.push((OptionDatabase::Username, u.into()));
-    }
-    if let Some(p) = password {
-        opts.push((OptionDatabase::Password, p.into()));
-    }
-    if let Some(options_str) = driver_options {
-        for pair in options_str.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() {
-                continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                let key = key.trim();
-                if key.is_empty() {
-                    tracing::warn!("Ignoring ADBC driver option with empty key");
-                    continue;
-                }
-                let key = if key.starts_with("adbc.") {
-                    key.to_string()
-                } else {
-                    format!("adbc.{key}")
-                };
-                opts.push((OptionDatabase::Other(key), value.trim().into()));
-            } else {
-                tracing::warn!("Ignoring malformed ADBC driver option (expected 'key=value')");
-            }
-        }
-    }
-    opts
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConnectionNamespace {
@@ -1078,38 +851,6 @@ fn build_conn_options(
 ///   enabling federated join pushdown
 /// - Different usernames, catalogs, or schemas produce different hashes,
 ///   preventing incorrect cross-credential pushdown
-pub(crate) fn build_join_context(
-    uri: &str,
-    username: Option<&str>,
-    catalog: Option<&str>,
-    schema: Option<&str>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(uri.as_bytes());
-    hasher.update(b"\0");
-    if let Some(u) = username {
-        hasher.update(u.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(c) = catalog {
-        hasher.update(c.as_bytes());
-    }
-    hasher.update(b"\0");
-    if let Some(s) = schema {
-        hasher.update(s.as_bytes());
-    }
-    hasher.finalize().iter().fold(String::new(), |mut hash, b| {
-        let _ = write!(hash, "{b:02x}");
-        hash
-    })
-}
-
-pub(crate) fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
-    match driver_name {
-        "bigquery" => Some(Arc::new(BigQueryDialect::new())),
-        _ => None,
-    }
-}
 
 /// Checks if an error message indicates an authentication or authorization failure.
 ///
@@ -1174,7 +915,7 @@ impl DataConnector for Adbc {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let adbc_factory =
             self.factory
                 .as_ref()
@@ -1210,7 +951,7 @@ impl DataConnector for Adbc {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let adbc_factory =
             self.factory
                 .as_ref()
@@ -1266,689 +1007,11 @@ fn is_query_federation_enabled(params: &Parameters) -> Result<bool> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use secrecy::SecretString;
-
-    #[test]
-    fn test_factory_as_any() {
-        let factory = AdbcFactory::new();
-        assert!(factory.as_any().is::<AdbcFactory>());
-    }
-
-    #[test]
-    fn test_factory_prefix() {
-        let factory = AdbcFactory::new();
-        assert_eq!(factory.prefix(), "adbc");
-    }
-
-    #[test]
-    fn test_factory_parameters() {
-        let factory = AdbcFactory::new();
-        let params = factory.parameters();
-
-        let param_names: Vec<&str> = params.iter().map(|p| p.name).collect();
-        assert!(param_names.contains(&"driver"));
-        assert!(param_names.contains(&"driver_path"));
-        assert!(param_names.contains(&"uri"));
-        assert!(param_names.contains(&"username"));
-        assert!(param_names.contains(&"password"));
-        assert!(param_names.contains(&"driver_options"));
-        assert!(param_names.contains(&"catalog"));
-        assert!(param_names.contains(&"schema"));
-        assert!(param_names.contains(&"connection_pool_size"));
-        assert!(param_names.contains(&"connection_pool_min_idle"));
-    }
-
-    #[test]
-    fn test_error_display() {
-        let err = Error::MissingAdbcDriver;
-        assert_eq!(err.to_string(), "Missing required parameter: adbc_driver");
-
-        let _boxed: Box<dyn std::error::Error> = Box::new(err);
-    }
-
-    #[test]
-    fn test_factory_new_arc() {
-        let factory = AdbcFactory::new_arc();
-        assert_eq!(factory.prefix(), "adbc");
-    }
-
-    #[test]
-    fn test_debug_impl() {
-        let factory = AdbcFactory::new();
-        let debug_str = format!("{factory:?}");
-        assert!(debug_str.contains("AdbcFactory"));
-    }
-
-    #[test]
-    fn test_build_db_options_uri_only() {
-        let opts = build_db_options("file:test.db", None, None, None);
-        assert_eq!(opts.len(), 1);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(
-            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "file:test.db")
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_with_username_password() {
-        let opts = build_db_options("postgres://host/db", Some("admin"), Some("secret"), None);
-        assert_eq!(opts.len(), 3);
-
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert!(
-            matches!(&opts[0].1, adbc_core::options::OptionValue::String(s) if s == "postgres://host/db")
-        );
-
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "admin"));
-
-        assert_eq!(opts[2].0, OptionDatabase::Password);
-        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "secret"));
-    }
-
-    #[test]
-    fn test_build_db_options_username_only() {
-        let opts = build_db_options("sqlite:test.db", Some("user"), None, None);
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(opts[1].0, OptionDatabase::Username);
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "user"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_unprefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("snowflake.sql.db=MY_DB;snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(opts[0].0, OptionDatabase::Uri);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "MY_DB"));
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-        assert!(matches!(&opts[2].1, adbc_core::options::OptionValue::String(s) if s == "PUBLIC"));
-    }
-
-    #[test]
-    fn test_build_db_options_with_driver_options_prefixed() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("adbc.snowflake.sql.db=MY_DB;adbc.snowflake.sql.schema=PUBLIC"),
-        );
-        assert_eq!(opts.len(), 3);
-        assert_eq!(
-            opts[1].0,
-            OptionDatabase::Other("adbc.snowflake.sql.db".to_string())
-        );
-        assert_eq!(
-            opts[2].0,
-            OptionDatabase::Other("adbc.snowflake.sql.schema".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_trailing_semicolon() {
-        let opts = build_db_options("uri://db", None, None, Some("key=value;"));
-        assert_eq!(opts.len(), 2);
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.key".to_string()));
-        assert!(matches!(&opts[1].1, adbc_core::options::OptionValue::String(s) if s == "value"));
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_malformed_ignored() {
-        let opts = build_db_options(
-            "uri://db",
-            None,
-            None,
-            Some("good=val;bad_no_equals;another=ok"),
-        );
-        assert_eq!(opts.len(), 3); // uri + good + another (bad_no_equals skipped)
-    }
-
-    #[test]
-    fn test_build_db_options_driver_options_empty_key_ignored() {
-        let opts = build_db_options("uri://db", None, None, Some("=value;good=ok"));
-        assert_eq!(opts.len(), 2); // uri + good (empty key skipped)
-        assert_eq!(opts[1].0, OptionDatabase::Other("adbc.good".to_string()));
-    }
-
-    #[test]
-    fn test_build_conn_options_none_when_empty() {
-        let opts = build_conn_options(None, None);
-        assert!(opts.is_none());
-    }
-
-    #[test]
-    fn test_build_conn_options_both() {
-        let opts =
-            build_conn_options(Some("my_catalog"), Some("my_schema")).expect("should have options");
-        assert_eq!(opts.len(), 2);
-        assert_eq!(
-            opts.get("adbc.connection.catalog"),
-            Some(&"my_catalog".to_string())
-        );
-        assert_eq!(
-            opts.get("adbc.connection.db_schema"),
-            Some(&"my_schema".to_string())
-        );
-    }
-
-    #[test]
-    fn test_build_conn_options_catalog_only() {
-        let opts = build_conn_options(Some("cat"), None).expect("should have options");
-        assert_eq!(opts.len(), 1);
-        assert_eq!(
-            opts.get("adbc.connection.catalog"),
-            Some(&"cat".to_string())
-        );
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_bigquery_invalid_grant() {
-        assert!(is_auth_or_permission_error(
-            r#"Unknown: [BigQuery] Get "https://bigquery.googleapis.com:443/bigquery/v2/projects/my-project/datasets/my_dataset/tables/my_table?alt=json&prettyPrint=false": auth: "invalid_grant" "reauth related error (invalid_rapt)" "https://support.google.com/a/answer/9368756""#
-        ));
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_permission_denied() {
-        assert!(is_auth_or_permission_error(
-            "Permission denied on resource project my-project"
-        ));
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_access_denied() {
-        assert!(is_auth_or_permission_error("Access Denied"));
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_unauthenticated() {
-        assert!(is_auth_or_permission_error("Request is unauthenticated"));
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_forbidden() {
-        assert!(is_auth_or_permission_error("403 Forbidden"));
-    }
-
-    #[test]
-    fn test_is_auth_or_permission_error_not_auth() {
-        assert!(!is_auth_or_permission_error("Table not found"));
-        assert!(!is_auth_or_permission_error("Connection reset by peer"));
-        assert!(!is_auth_or_permission_error("timeout"));
-    }
-
-    async fn test_dataset(from: &str, name: &str) -> Dataset {
-        use crate::component::dataset::builder::DatasetBuilder;
-        use app::AppBuilder;
-
-        let app = AppBuilder::new("test_app").build();
-        let rt = crate::Runtime::builder().build().await;
-        DatasetBuilder::try_new(from.to_string(), name)
-            .expect("valid builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("valid dataset")
-    }
-
-    #[tokio::test]
-    async fn test_classify_adbc_error_bigquery_auth() {
-        let dataset = test_dataset("bigquery:my_project.my_dataset.my_table", "my_table").await;
-        let error: Box<dyn std::error::Error + Send + Sync> =
-            "invalid_grant: reauth related error".into();
-        let result = classify_adbc_error(error, "bigquery", &dataset, |dc, cc, src| {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: dc,
-                connector_component: cc,
-                source: src,
-            }
-        });
-        let msg = result.to_string();
-        assert!(
-            msg.contains("BigQuery credentials"),
-            "Expected BigQuery-specific hint, got: {msg}"
-        );
-        assert!(
-            msg.contains("gcloud auth application-default login"),
-            "Expected gcloud re-auth guidance, got: {msg}"
-        );
-        assert!(
-            msg.contains("service account"),
-            "Expected service-account guidance, got: {msg}"
-        );
-        assert!(
-            msg.contains("invalid_grant"),
-            "Expected original error, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_classify_adbc_error_generic_auth() {
-        let dataset = test_dataset("adbc:snowflake://host/db", "my_table").await;
-        let error: Box<dyn std::error::Error + Send + Sync> = "403 Forbidden".into();
-        let result = classify_adbc_error(error, "snowflake", &dataset, |dc, cc, src| {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: dc,
-                connector_component: cc,
-                source: src,
-            }
-        });
-        let msg = result.to_string();
-        assert!(
-            msg.contains("credentials are valid"),
-            "Expected generic auth hint, got: {msg}"
-        );
-        assert!(
-            !msg.contains("BigQuery"),
-            "Should not mention BigQuery for non-BigQuery driver, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_classify_adbc_error_non_auth_uses_fallback() {
-        let dataset = test_dataset("adbc:postgres://host/db", "my_table").await;
-        let error: Box<dyn std::error::Error + Send + Sync> = "Connection refused".into();
-        let result = classify_adbc_error(error, "postgres", &dataset, |dc, cc, src| {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: dc,
-                connector_component: cc,
-                source: src,
-            }
-        });
-        let msg = result.to_string();
-        assert!(
-            msg.contains("Connection refused"),
-            "Expected original error in fallback, got: {msg}"
-        );
-        assert!(
-            !msg.contains("credentials"),
-            "Should not mention credentials for non-auth error, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cache_key_identical_configs_match() {
-        let dataset_a = test_dataset("adbc:bigquery/my_project.dataset.table_a", "table_a").await;
-        let dataset_b = test_dataset("adbc:bigquery/my_project.dataset.table_b", "table_b").await;
-
-        let make_params = |dataset: &Dataset| {
-            use runtime_parameters::Parameters;
-
-            let parameters = Parameters::new(
-                vec![
-                    ("driver".to_string(), SecretString::from("bigquery")),
-                    (
-                        "uri".to_string(),
-                        SecretString::from("grpc://bigquery.googleapis.com"),
-                    ),
-                    ("catalog".to_string(), SecretString::from("my_project")),
-                ],
-                "adbc",
-                PARAMETERS,
-            );
-
-            ConnectorParams {
-                parameters,
-                unsupported_type_action: None,
-                component: ConnectorComponent::from(dataset),
-                app: None,
-                runtime: None,
-                io_runtime: tokio::runtime::Handle::current(),
-            }
-        };
-
-        let params_a = make_params(&dataset_a);
-        let params_b = make_params(&dataset_b);
-
-        // Same config params → same cache key, despite different datasets
-        assert_eq!(
-            compute_adbc_cache_key(&params_a),
-            compute_adbc_cache_key(&params_b)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cache_key_different_configs_differ() {
-        let dataset = test_dataset("adbc:bigquery/my_project.dataset.table_a", "table_a").await;
-
-        let make_params = |uri: &str| {
-            use runtime_parameters::Parameters;
-
-            let parameters = Parameters::new(
-                vec![
-                    ("driver".to_string(), SecretString::from("bigquery")),
-                    ("uri".to_string(), SecretString::from(uri)),
-                ],
-                "adbc",
-                PARAMETERS,
-            );
-
-            ConnectorParams {
-                parameters,
-                unsupported_type_action: None,
-                component: ConnectorComponent::from(&dataset),
-                app: None,
-                runtime: None,
-                io_runtime: tokio::runtime::Handle::current(),
-            }
-        };
-
-        let params_a = make_params("grpc://bigquery.googleapis.com");
-        let params_b = make_params("grpc://other-endpoint.example.com");
-
-        // Different URIs → different cache keys
-        assert_ne!(
-            compute_adbc_cache_key(&params_a),
-            compute_adbc_cache_key(&params_b)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_infers_from_hyphenated_project_path() {
-        let dataset = test_dataset("adbc:my-project.my_dataset.my_table", "my_table").await;
-
-        let parameters = Parameters::new(
-            vec![
-                ("driver".to_string(), SecretString::from("bigquery")),
-                (
-                    "uri".to_string(),
-                    SecretString::from("bigquery:///my-project"),
-                ),
-            ],
-            "adbc",
-            PARAMETERS,
-        );
-
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("bigquery namespace should resolve");
-
-        assert_eq!(namespace.catalog.as_deref(), Some("my-project"));
-        assert_eq!(namespace.schema.as_deref(), Some("my_dataset"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_connection_namespace_bigquery_preserves_explicit_values() {
-        let dataset = test_dataset("adbc:my-project.path_dataset.my_table", "my_table").await;
-
-        let parameters = Parameters::new(
-            vec![
-                ("driver".to_string(), SecretString::from("bigquery")),
-                (
-                    "uri".to_string(),
-                    SecretString::from("bigquery:///my-project"),
-                ),
-                (
-                    "catalog".to_string(),
-                    SecretString::from("configured-project"),
-                ),
-                (
-                    "schema".to_string(),
-                    SecretString::from("configured_dataset"),
-                ),
-            ],
-            "adbc",
-            PARAMETERS,
-        );
-
-        let namespace = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect("explicit namespace should be preserved");
-
-        assert_eq!(namespace.catalog.as_deref(), Some("configured-project"));
-        assert_eq!(namespace.schema.as_deref(), Some("configured_dataset"));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_connection_namespace_rejects_empty_schema() {
-        let dataset = test_dataset("adbc:my_dataset.my_table", "my_table").await;
-
-        let parameters = Parameters::new(
-            vec![
-                ("driver".to_string(), SecretString::from("bigquery")),
-                (
-                    "uri".to_string(),
-                    SecretString::from("bigquery:///my-project"),
-                ),
-                ("schema".to_string(), SecretString::from("")),
-            ],
-            "adbc",
-            PARAMETERS,
-        );
-
-        let err = resolve_connection_namespace(
-            "bigquery",
-            &ConnectorComponent::from(&dataset),
-            &parameters,
-        )
-        .expect_err("empty schema should be rejected");
-
-        assert_eq!(
-            err.to_string(),
-            "Invalid value for parameter 'adbc_schema': expected a non-empty string"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cache_key_bigquery_inferred_schema_differs() {
-        let dataset_a = test_dataset("adbc:my_project.dataset_a.table_a", "table_a").await;
-        let dataset_b = test_dataset("adbc:my_project.dataset_b.table_b", "table_b").await;
-
-        let make_params = |dataset: &Dataset| {
-            let parameters = Parameters::new(
-                vec![
-                    ("driver".to_string(), SecretString::from("bigquery")),
-                    (
-                        "uri".to_string(),
-                        SecretString::from("bigquery:///my_project"),
-                    ),
-                ],
-                "adbc",
-                PARAMETERS,
-            );
-
-            ConnectorParams {
-                parameters,
-                unsupported_type_action: None,
-                component: ConnectorComponent::from(dataset),
-                app: None,
-                runtime: None,
-                io_runtime: tokio::runtime::Handle::current(),
-            }
-        };
-
-        let params_a = make_params(&dataset_a);
-        let params_b = make_params(&dataset_b);
-
-        assert_ne!(
-            compute_adbc_cache_key(&params_a),
-            compute_adbc_cache_key(&params_b)
-        );
-    }
-
-    #[test]
-    fn test_bigquery_information_schema_table_uses_comment_source_path() {
-        let table_reference = TableReference::full("project-a", "analytics", "customers");
-
-        assert_eq!(
-            bigquery_information_schema_table(&table_reference, "COLUMN_FIELD_PATHS"),
-            "`project-a.analytics.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS`"
-        );
-    }
-
-    #[test]
-    fn test_bigquery_string_literal_escapes_comment_query_value() {
-        assert_eq!(
-            bigquery_string_literal("customer's\\table"),
-            "'customer\\'s\\\\table'"
-        );
-    }
-
-    #[derive(Debug)]
-    struct TestConnector;
-
-    #[async_trait]
-    impl DataConnector for TestConnector {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        async fn read_provider(
-            &self,
-            _dataset: &Dataset,
-        ) -> crate::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
-            unreachable!("test connector is not used to read data")
-        }
-    }
-
-    #[test]
-    fn test_connector_cache_state_prunes_expired_ready_entries() {
-        let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
-        let state = ConnectorCacheState::Ready(Arc::downgrade(&connector));
-
-        assert!(state.should_retain());
-
-        drop(connector);
-
-        assert!(!state.should_retain());
-    }
-
-    #[test]
-    fn test_connector_cache_entry_retains_inflight_initialization() {
-        let entry = ConnectorCacheEntry::new();
-        *entry.state.lock() = ConnectorCacheState::Initializing;
-
-        assert!(entry.should_retain());
-    }
-
-    #[tokio::test]
-    async fn test_connector_initialization_guard_resets_state_on_drop() {
-        let entry = Arc::new(ConnectorCacheEntry::new());
-        *entry.state.lock() = ConnectorCacheState::Initializing;
-
-        let notified = entry.notify.notified();
-        let guard = ConnectorInitializationGuard::new(Arc::clone(&entry));
-        drop(guard);
-
-        notified.await;
-
-        assert!(matches!(&*entry.state.lock(), ConnectorCacheState::Vacant));
-    }
-
-    fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
-        Parameters::new(
-            pairs
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), SecretString::from(v.to_string())))
-                .collect(),
-            "adbc",
-            PARAMETERS,
-        )
-    }
-
-    #[test]
-    fn test_query_federation_enabled() {
-        let params = make_params(vec![("query_federation", "enabled")]);
-        assert!(is_query_federation_enabled(&params).expect("to parse"));
-    }
-
-    #[test]
-    fn test_query_federation_disabled() {
-        let params = make_params(vec![("query_federation", "disabled")]);
-        assert!(!is_query_federation_enabled(&params).expect("to parse"));
-    }
-
-    #[test]
-    fn test_query_federation_missing_defaults_enabled() {
-        let params = make_params(vec![]);
-        assert!(is_query_federation_enabled(&params).expect("to parse"));
-    }
-
-    #[test]
-    fn test_query_federation_invalid_value() {
-        let params = make_params(vec![("query_federation", "invalid")]);
-        is_query_federation_enabled(&params).expect_err("should error on invalid value");
-    }
-
-    #[test]
-    fn test_build_join_context_no_secrets_in_output() {
-        let ctx = build_join_context(
-            "bigquery:///project?DatasetId=tpch_sf1&token=SECRET123",
-            Some("admin"),
-            Some("my_catalog"),
-            Some("my_schema"),
-        );
-        // Hash output must not contain any raw URI or credential fragments
-        assert!(
-            !ctx.contains("SECRET123"),
-            "context must not contain secrets from URI"
-        );
-        assert!(
-            !ctx.contains("bigquery:///"),
-            "context must not contain raw URI"
-        );
-        assert!(
-            !ctx.contains("admin"),
-            "context must not contain raw username"
-        );
-        assert!(
-            !ctx.contains("my_catalog"),
-            "context must not contain raw catalog"
-        );
-        // Must be a fixed-length hex string (SHA-256 = 64 hex chars)
-        assert_eq!(
-            ctx.len(),
-            64,
-            "context should be a 64-char SHA-256 hex digest"
-        );
-        assert!(
-            ctx.chars().all(|c| c.is_ascii_hexdigit()),
-            "context should be hex only"
-        );
-    }
-
-    #[test]
-    fn test_build_join_context_deterministic() {
-        let ctx1 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
-        let ctx2 = build_join_context("postgresql://host:5432/db", Some("user"), None, None);
-        assert_eq!(ctx1, ctx2, "same inputs must produce the same hash");
-    }
-
-    #[test]
-    fn test_build_join_context_differs_by_username() {
-        let ctx_a = build_join_context("postgresql://host/db", Some("alice"), None, None);
-        let ctx_b = build_join_context("postgresql://host/db", Some("bob"), None, None);
-        assert_ne!(
-            ctx_a, ctx_b,
-            "different usernames must produce different hashes"
-        );
-    }
-
-    #[test]
-    fn test_build_join_context_differs_by_uri() {
-        let ctx_a = build_join_context("bigquery:///project-a?DatasetId=ds1", None, None, None);
-        let ctx_b = build_join_context("bigquery:///project-b?DatasetId=ds1", None, None, None);
-        assert_ne!(ctx_a, ctx_b, "different URIs must produce different hashes");
-    }
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "adbc";
+
+/// Returns a new instance of the ADBC connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    AdbcFactory::new_arc()
 }

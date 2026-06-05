@@ -17,9 +17,9 @@ limitations under the License.
 use snafu::prelude::*;
 use tonic::async_trait;
 
-use crate::parameters::ParamLookup;
+use runtime::parameters::ParamLookup;
 
-use super::{ConnectorParams, Validator};
+use runtime::dataconnector::parameters::{ConnectorParams, Validator};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,7 +50,7 @@ pub enum Error {
 }
 
 /// Validates and normalizes Azure endpoint configuration.
-pub(crate) struct AzureEndpointValidator;
+pub struct AzureEndpointValidator;
 
 #[async_trait]
 impl Validator for AzureEndpointValidator {
@@ -86,7 +86,7 @@ impl Validator for AzureEndpointValidator {
 }
 
 /// Validates required Azure account parameter.
-pub(crate) struct AzureAccountValidator;
+pub struct AzureAccountValidator;
 
 #[async_trait]
 impl Validator for AzureAccountValidator {
@@ -110,7 +110,7 @@ impl Validator for AzureAccountValidator {
 
 /// Validates Azure authentication configuration.
 /// Ensures only one authentication method is used and validates completeness.
-pub(crate) struct AzureAuthValidator;
+pub struct AzureAuthValidator;
 
 #[async_trait]
 impl Validator for AzureAuthValidator {
@@ -209,7 +209,7 @@ impl Validator for AzureAuthValidator {
 }
 
 /// Normalizes SAS token by stripping leading '?' if present.
-pub(crate) struct AzureSasTokenNormalizer;
+pub struct AzureSasTokenNormalizer;
 
 #[async_trait]
 impl Validator for AzureSasTokenNormalizer {
@@ -230,12 +230,12 @@ impl Validator for AzureSasTokenNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::parameters::{ParameterSpec, Parameters};
     use app::AppBuilder;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime::dataconnector::ConnectorComponent;
+    use runtime::parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::runtime::Handle;

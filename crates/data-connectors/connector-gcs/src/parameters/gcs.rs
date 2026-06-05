@@ -17,7 +17,7 @@ limitations under the License.
 use snafu::prelude::*;
 use tonic::async_trait;
 
-use super::{ConnectorParams, Validator};
+use runtime::dataconnector::parameters::{ConnectorParams, Validator};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -29,7 +29,7 @@ pub enum Error {
 
 /// Validates GCS authentication configuration.
 /// Ensures only one authentication method is used.
-pub(crate) struct GcsAuthValidator;
+pub struct GcsAuthValidator;
 
 #[async_trait]
 impl Validator for GcsAuthValidator {
@@ -88,12 +88,12 @@ impl Validator for GcsAuthValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::RuntimeBuilder;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::parameters::{ParameterSpec, Parameters};
     use app::AppBuilder;
     use datafusion_table_providers::util::secrets::to_secret_map;
+    use runtime::builder::RuntimeBuilder;
+    use runtime::component::dataset::builder::DatasetBuilder;
+    use runtime::dataconnector::ConnectorComponent;
+    use runtime::parameters::{ParameterSpec, Parameters};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::runtime::Handle;

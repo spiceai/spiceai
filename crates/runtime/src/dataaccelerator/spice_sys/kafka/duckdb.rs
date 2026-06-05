@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use super::super::offsets::{self, sort_offsets};
-use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaSys, Result};
+use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use std::sync::Arc;

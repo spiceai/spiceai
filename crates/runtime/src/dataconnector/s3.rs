@@ -101,9 +101,9 @@ pub enum Error {
 }
 
 pub struct S3 {
-    pub(crate) params: Parameters,
-    pub(crate) runtime: Option<Runtime>,
-    pub(crate) tokio_io_runtime: tokio::runtime::Handle,
+    pub params: Parameters,
+    pub runtime: Option<Runtime>,
+    pub tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for S3 {
@@ -127,9 +127,9 @@ impl S3Factory {
     }
 }
 
-pub(crate) const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
+pub const S3_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/s3";
 
-pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+pub static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     let mut all_parameters = Vec::new();
     all_parameters.extend_from_slice(&[
             ParameterSpec::component("region")

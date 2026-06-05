@@ -202,7 +202,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             glue::GlueCatalog::new_connector,
             glue::PREFIX,
-            &super::dataconnector::glue::PARAMETERS,
+            &glue::PARAMETERS,
         ),
     );
 

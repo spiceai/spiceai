@@ -77,7 +77,41 @@ pub async fn register_external_connectors() {
     )
     .await;
 
+    register_connector_factory(connector_abfs::CONNECTOR_NAME, connector_abfs::factory()).await;
+    // Also register the abfss:// scheme alias
+    register_connector_factory("abfss", connector_abfs::factory()).await;
+
+    register_connector_factory(connector_gcs::CONNECTOR_NAME, connector_gcs::factory()).await;
+    // Also register the gs:// scheme alias
+    register_connector_factory("gs", connector_gcs::factory()).await;
+
+    register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
+
+    register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
+
+    // Register the Glue data connector factory with the catalog connector so the
+    // Glue catalog connector can create data connectors without a circular dep.
+    runtime::catalogconnector::glue::register_glue_data_connector_factory(std::sync::Arc::new(
+        |params, io_runtime| {
+            std::sync::Arc::new(connector_glue::GlueDataConnector::new(params, io_runtime))
+                as std::sync::Arc<dyn runtime::dataconnector::DataConnector>
+        },
+    ));
+
     // Feature-gated connectors
+    #[cfg(feature = "adbc")]
+    register_connector_factory(connector_adbc::CONNECTOR_NAME, connector_adbc::factory()).await;
+
+    #[cfg(feature = "cosmosdb")]
+    register_connector_factory(
+        connector_cosmosdb::CONNECTOR_NAME,
+        connector_cosmosdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "kafka")]
+    register_connector_factory(connector_kafka::CONNECTOR_NAME, connector_kafka::factory()).await;
+
     #[cfg(feature = "clickhouse")]
     register_connector_factory(
         connector_clickhouse::CONNECTOR_NAME,

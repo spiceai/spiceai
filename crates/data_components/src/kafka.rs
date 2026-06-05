@@ -1207,6 +1207,55 @@ where
     }
 }
 
+/// Trait for a sidecar store that persists Kafka partition offsets.
+///
+/// Used by both `connector-kafka` and `connector-debezium` (still in runtime) to
+/// commit offsets to the spice_sys accelerator without depending on its concrete types.
+#[async_trait::async_trait]
+pub trait SidecarOffsetStore: Send + Sync {
+    async fn upsert_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// A [`KafkaOffsetCommitHook`] that writes committed offsets into a [`SidecarOffsetStore`].
+pub struct SidecarOffsetCommitHook<T> {
+    store: std::sync::Arc<T>,
+}
+
+impl<T> SidecarOffsetCommitHook<T> {
+    pub fn new(store: std::sync::Arc<T>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: SidecarOffsetStore> KafkaOffsetCommitHook for SidecarOffsetCommitHook<T> {
+    async fn commit_offsets(
+        &self,
+        offsets: &[KafkaOffset],
+    ) -> std::result::Result<(), crate::cdc::CommitError> {
+        self.store
+            .upsert_offsets(offsets)
+            .await
+            .map_err(|e| crate::cdc::CommitError::UnableToCommitChange { source: e })
+    }
+}
+
+/// Metadata persisted to the Kafka sidecar accelerator table for state recovery across restarts.
+///
+/// Shared between the `connector-kafka` data connector and `runtime::dataaccelerator::spice_sys::kafka`
+/// (which stores/retrieves it) so neither creates a circular dependency.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct KafkaMetadata {
+    pub consumer_group_id: String,
+    pub topic: String,
+    pub schema: SchemaRef,
+    #[serde(default)]
+    pub offsets: Vec<KafkaOffset>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,8 +17,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use super::super::offsets::{self, sort_offsets};
-use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaMetadata, KafkaSys, Result};
+use super::{Error, KAFKA_OFFSETS_TABLE_NAME, KAFKA_TABLE_NAME, KafkaSys, Result};
 use crate::dataaccelerator::turso::TursoConnectionPool;
+use data_components::kafka::KafkaMetadata;
 use data_components::kafka::KafkaOffset;
 
 impl KafkaSys {

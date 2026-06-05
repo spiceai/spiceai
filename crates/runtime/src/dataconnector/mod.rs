@@ -148,22 +148,15 @@ macro_rules! register_data_connector {
     };
 }
 
-pub mod abfs;
-#[cfg(feature = "adbc")]
-pub mod adbc;
-#[cfg(feature = "cosmosdb")]
-pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
 
-pub mod git;
 pub mod github;
 pub mod https;
-#[cfg(feature = "kafka")]
-pub mod kafka;
+
 pub mod localpod;
 pub mod memory;
 
@@ -171,8 +164,6 @@ pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible whe
 pub mod deferred;
 #[cfg(feature = "duckdb")]
 pub mod ducklake;
-pub mod gcs;
-pub mod glue;
 pub mod iceberg;
 pub mod parameters;
 pub mod s3;

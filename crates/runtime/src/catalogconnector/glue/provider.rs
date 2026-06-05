@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::DatabaseName;
-use crate::dataconnector::glue::{GlueDataConnector, InputFormat};
 use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
 use crate::dataconnector::{DataConnector, parameters};
+use crate::parameters::Parameters;
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
@@ -30,6 +30,7 @@ use aws_sdk_glue::error::SdkError;
 use aws_sdk_glue::operation::get_databases::GetDatabasesError;
 use aws_sdk_glue::operation::get_tables::GetTablesError;
 use data_components::RefreshableCatalogProvider;
+use data_components::glue::InputFormat;
 use datafusion::{
     catalog::{CatalogProvider, SchemaProvider, TableProvider},
     common::Result as DFResult,
@@ -82,6 +83,12 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Factory function type for creating a Glue data connector.
+/// Injected at construction time to avoid a circular dependency between this
+/// crate and the `connector-glue` crate (which itself depends on `runtime`).
+pub type GlueDataConnectorFactory =
+    Arc<dyn Fn(Parameters, tokio::runtime::Handle) -> Arc<dyn DataConnector> + Send + Sync>;
+
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
     client: Client,
@@ -92,6 +99,8 @@ pub struct GlueCatalogProvider {
     parameters: ConnectorParams,
     catalog_id: Option<String>,
     databases: RwLock<HashMap<DatabaseName, Arc<dyn SchemaProvider>>>,
+    /// Factory for creating the Glue data connector to read individual tables.
+    data_connector_factory: GlueDataConnectorFactory,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -115,6 +124,7 @@ impl GlueCatalogProvider {
         catalog: &Catalog,
         runtime: Arc<Runtime>,
         app: Arc<App>,
+        data_connector_factory: GlueDataConnectorFactory,
     ) -> Result<Self> {
         Self::validate_parameters(&mut parameters).await?;
 
@@ -145,6 +155,7 @@ impl GlueCatalogProvider {
             databases,
             catalog_id: catalog.catalog_id.clone(),
             parameters,
+            data_connector_factory,
         })
     }
 
@@ -180,7 +191,7 @@ impl GlueCatalogProvider {
                 }
 
                 let connector =
-                    GlueDataConnector::new(parameters, self.parameters.io_runtime.clone());
+                    (self.data_connector_factory)(parameters, self.parameters.io_runtime.clone());
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())

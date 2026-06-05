@@ -20,15 +20,15 @@ limitations under the License.
 //! and provides schema/table discovery using the ADBC metadata API.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
-use crate::dataconnector::adbc::{
-    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_metadata,
-};
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
+use data_components::adbc_helpers::{
+    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_metadata,
+};
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
