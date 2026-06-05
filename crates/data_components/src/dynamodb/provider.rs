@@ -32,6 +32,7 @@ use crate::dynamodb::schema::infer_arrow_schema_from_rows;
 use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
+use crate::schema_discovery::merge_inferred_and_declared_schemas;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -63,7 +64,6 @@ use datafusion::{
     },
     prelude::Expr,
 };
-use datafusion_table_providers::util::schema::merge_inferred_and_declared_schemas;
 use dynamodb_streams::{Checkpoint, Client as StreamsClient, Metrics, MetricsCollector};
 use futures::Stream;
 use futures::pin_mut;

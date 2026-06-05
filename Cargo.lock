@@ -24,8 +24,8 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46b169525a7c41670fe95874103c7c6ce713ac699123f81a200bc31f9ad3b02e"
 dependencies = [
- "arrow-array 58.3.0",
- "arrow-schema 58.3.0",
+ "arrow-array 57.3.1",
+ "arrow-schema 57.3.1",
 ]
 
 [[package]]
@@ -36,8 +36,8 @@ checksum = "12aa1ae565ec6d45cfe71c20b5c2b3cbd6ba5d7176ecd0c0a448e970a93c35e4"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
- "arrow-array 58.3.0",
- "arrow-schema 58.3.0",
+ "arrow-array 57.3.1",
+ "arrow-schema 57.3.1",
  "libloading 0.8.9",
  "path-slash",
  "regex",
@@ -53,8 +53,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
 dependencies = [
  "adbc_core",
- "arrow-array 58.3.0",
- "arrow-schema 58.3.0",
+ "arrow-array 57.3.1",
+ "arrow-schema 57.3.1",
 ]
 
 [[package]]
@@ -867,6 +867,9 @@ name = "arrow-schema"
 version = "57.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4cf0d4a6609679e03002167a61074a21d7b1ad9ea65e462b2c0a97f8a3b2bc6"
+dependencies = [
+ "bitflags 2.10.0",
+]
 
 [[package]]
 name = "arrow-schema"
@@ -3648,7 +3651,7 @@ dependencies = [
  "datafusion-dml",
  "datafusion-execution",
  "datafusion-expr",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
@@ -4245,7 +4248,7 @@ dependencies = [
  "async-trait",
  "data_components",
  "datafusion",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "flight_client",
  "linkme",
  "ns_lookup",
@@ -5600,7 +5603,7 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
@@ -6045,19 +6048,6 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f88162c5f8650eab86bbe23cac990bdca261c95cf52c05b9a0848ad5b8b2b7f8"
-dependencies = [
- "arrow-json 58.3.0",
- "async-stream",
- "async-trait",
- "datafusion",
- "futures",
-]
-
-[[package]]
-name = "datafusion-federation"
-version = "0.5.3"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135#ac7bde412057e7f4146bb409f8495aef82583135"
 dependencies = [
  "arrow-json 58.3.0",
@@ -6279,7 +6269,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "datafusion-table-providers",
  "duckdb",
  "flight_client",
@@ -6551,7 +6541,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "datafusion-federation 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "datafusion-federation",
  "dyn-clone",
  "fallible-iterator 0.3.0",
  "fundu",
@@ -8464,8 +8454,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -9575,7 +9565,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -14139,8 +14129,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.0",
- "parking_lot 0.12.5",
+ "hashbrown 0.5.0",
+ "parking_lot 0.11.2",
  "rand 0.8.5",
 ]
 
@@ -14616,7 +14606,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph",
@@ -14650,7 +14640,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16183,7 +16173,7 @@ dependencies = [
  "datafusion-ddl",
  "datafusion-dml",
  "datafusion-expr",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-proto",
@@ -16470,7 +16460,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
- "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
+ "datafusion-federation",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
  "datafusion-table-providers",
@@ -17584,7 +17574,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
