@@ -28,7 +28,7 @@ limitations under the License.
 //! Entries live in two tiers (the in-memory analogue of an LSM memtable over a
 //! frozen run):
 //!
-//! - **base**: an `Arc<std::collections::HashMap>` (SwissTable). Frozen — never
+//! - **base**: an `Arc<std::collections::HashMap>` (`SwissTable`). Frozen — never
 //!   mutated after construction — so publishing a new index generation shares it
 //!   with an `Arc` clone, and probing it costs 1–2 cache lines regardless of
 //!   size. This tier holds the overwhelming majority of entries at scale.
@@ -109,9 +109,9 @@ fn delta_merge_threshold(base_len: usize) -> usize {
 /// Hasher for the Int64 index maps. `im::HashMap`/`std::collections::HashMap`
 /// default to `RandomState` (SipHash-1-3), which showed up as
 /// `im::nodes::hamt::hash_key` in executor profiles of changes-mode ingest —
-/// every probe was paying a SipHash walk on top of the seeded-XXH3 bloom hash.
+/// every probe was paying a `SipHash` walk on top of the seeded-XXH3 bloom hash.
 /// [`XxHash3BuildHasher`] uses the same seeded XXH3-64 as [`hash_key_i64`], so
-/// map and bloom hashing now agree at a fraction of SipHash's per-key cost.
+/// map and bloom hashing now agree at a fraction of `SipHash`'s per-key cost.
 pub type DeletionIndexHasher = XxHash3BuildHasher;
 
 /// Bloom capacity for a deletion set of `len` keys: sized with 2x headroom so the
@@ -593,7 +593,7 @@ impl DeletionIndex {
     }
 
     /// Approximate resident bytes for memory accounting. Base entries are
-    /// flat-table slots (`i64 -> (i64, i64)` payload plus SwissTable load
+    /// flat-table slots (`i64 -> (i64, i64)` payload plus `SwissTable` load
     /// factor and control bytes); delta entries carry HAMT node/bitmap/Arc
     /// overhead. Shared structure retained by older reader-pinned generations
     /// is intentionally not charged to the latest snapshot again.
@@ -831,7 +831,7 @@ impl KeyDeletionIndex {
     }
 
     /// Approximate resident bytes for memory accounting. Base entries are
-    /// flat-table slots (`u128 -> (i64, i64)` payload plus SwissTable load
+    /// flat-table slots (`u128 -> (i64, i64)` payload plus `SwissTable` load
     /// factor and control bytes); delta entries carry HAMT node/bitmap/Arc
     /// overhead. Key bytes are not retained (hash-keyed identity), so the
     /// estimate no longer depends on composite-key width. Shared structure
