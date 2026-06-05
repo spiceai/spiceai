@@ -10,6 +10,13 @@ postgres_connection_params: &postgres_params
   pg_pass: bench
   pg_sslmode: disable
 
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
 
