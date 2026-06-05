@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/kafka/mod.rs
+expression: formatted
+---
++-------------+-----------+-------------+
+| column_name | data_type | is_nullable |
++-------------+-----------+-------------+
+| id          | Int32     | YES         |
+| name        | Utf8      | YES         |
+| version     | Int64     | YES         |
++-------------+-----------+-------------+

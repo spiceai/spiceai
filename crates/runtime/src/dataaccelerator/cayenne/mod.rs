@@ -894,6 +894,17 @@ impl CayenneAccelerator {
                 "; 0 disables the background task",
             );
 
+            // Surface cross-parameter and out-of-range issues that parse cleanly
+            // but won't behave as intended (silently clamped at use, or don't
+            // compose with each other) — see `VortexConfig::config_warnings`.
+            for warning in config.config_warnings(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            ) {
+                tracing::warn!(
+                    "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+            }
+
             tracing::debug!(
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
                 "Cayenne Vortex config: segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
@@ -1092,8 +1103,11 @@ impl CayenneAccelerator {
         };
 
         // Create shared Cayenne context with the runtime's RuntimeEnv
-        let context =
-            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env));
+        let context = cayenne::CayenneContext::new(
+            &table_options.vortex_config,
+            Arc::clone(&runtime_env),
+            table_name,
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -2087,7 +2101,7 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env);
+        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
 
         Self {
             table_name,

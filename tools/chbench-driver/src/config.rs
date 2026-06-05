@@ -26,6 +26,9 @@ pub struct ChBenchConfig {
     /// Number of concurrent OLTP terminals for the HTAP workload.
     pub terminals: usize,
 
+    /// Optional target transaction rate for the OLTP workload
+    pub rate: Option<u32>,
+
     /// Transaction mix weights: \[`NewOrder`, Payment, Delivery, `OrderStatus`, `StockLevel`\].
     /// Must sum to 100.
     pub mix: [u32; 5],
@@ -40,6 +43,7 @@ impl Default for ChBenchConfig {
             warehouses: 1,
             seed: Some(DEFAULT_SEED),
             terminals: 10,
+            rate: None,
             mix: crate::txn::DEFAULT_MIX,
         }
     }

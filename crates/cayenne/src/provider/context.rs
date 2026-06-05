@@ -74,8 +74,8 @@ impl CayenneContext {
     /// This creates a new `VortexFormat`. The shared runtime's file metadata cache
     /// is configured once by the owning runtime before table providers are created.
     #[must_use]
-    pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>) -> Arc<Self> {
-        let vortex_format = Self::create_vortex_format(config);
+    pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
+        let vortex_format = Self::create_vortex_format(config, dataset);
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
@@ -267,7 +267,7 @@ impl CayenneContext {
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
-    fn create_vortex_format(config: &VortexConfig) -> Arc<VortexFormat> {
+    fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
         // Create a Vortex session with default encodings
         // Note: Write strategy configuration (e.g., compression) is applied at write time via
         // `session.write_options().with_strategy(...)`, not at the VortexFormat level
@@ -293,7 +293,9 @@ impl CayenneContext {
             ..VortexTableOptions::default()
         };
 
-        Arc::new(VortexFormat::new_with_options(vortex_session, vortex_opts))
+        Arc::new(
+            VortexFormat::new_with_options(vortex_session, vortex_opts).with_dataset_label(dataset),
+        )
     }
 }
 
@@ -304,7 +306,7 @@ mod tests {
     #[test]
     fn cayenne_enables_vortex_projection_pushdown_by_default() {
         let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&VortexConfig::default(), runtime_env);
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
 
         assert_eq!(
             context.file_format().options().projection_pushdown,
