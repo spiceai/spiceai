@@ -197,9 +197,17 @@ pub struct CdcConfig {
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
-const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
+// Prefetch depth is the REAL coalescing ceiling: the burst drain is a non-blocking
+// `try_recv` loop (no await), so a batch can only grow as large as what is already
+// buffered in this channel. With the old 1024 max the 4096 envelope cap never bound.
+// Raised 1024 -> 16384 so high-throughput tables form larger bursts, amortizing the
+// fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
+// over more rows. `max_coalesced_bytes` (128 MiB default) still bounds peak burst memory,
+// and the drain never waits, so low-load latency is unchanged (burst.len()==1).
+const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
-const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+// Raised 4096 -> 16384 to match the prefetch ceiling (otherwise it would re-clip the burst).
+const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 16384;
 const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
 const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
