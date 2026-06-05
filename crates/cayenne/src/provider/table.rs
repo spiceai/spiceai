@@ -20,7 +20,7 @@ limitations under the License.
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 use super::delete::{
     CayenneDeletionSink, DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec,
-    DeletionVectorWriter, FileBasedDeletionSink, Int64PkDeletionFilterExec,
+    DeletionVectorWriter, FileBasedDeletionSink, InsertRecordHandling, Int64PkDeletionFilterExec,
     KeyBasedDeletionFilterExec,
 };
 use super::mutation_writer::AppendMutationWriter;
@@ -2137,32 +2137,22 @@ enum OnConflictDeletionUpdate {
 #[derive(Clone)]
 enum PkDeletionSnapshot {
     PositionBased,
-    Int64Pk {
-        deleted_pk_values: Arc<DeletionIndex>,
-        insert_records: Arc<DeletionIndex>,
-    },
-    RowConverterBased {
-        deleted_row_keys: Arc<KeyDeletionIndex>,
-        insert_records: Arc<KeyDeletionIndex>,
-    },
+    Int64Pk { tombstones: Arc<DeletionIndex> },
+    RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
 impl PkDeletionSnapshot {
     fn has_deletions(&self) -> bool {
         match self {
             Self::PositionBased => false,
-            Self::Int64Pk {
-                deleted_pk_values, ..
-            } => !deleted_pk_values.is_empty(),
-            Self::RowConverterBased {
-                deleted_row_keys, ..
-            } => !deleted_row_keys.is_empty(),
+            Self::Int64Pk { tombstones } => tombstones.has_deletions(),
+            Self::RowConverterBased { tombstones } => tombstones.has_deletions(),
         }
     }
 
     /// The highest delete sequence reflected in THIS coherent snapshot.
     ///
-    /// Because every deletion update does `extend_max(...)` followed by a single
+    /// Because every deletion update builds an extended index followed by a single
     /// atomic `deletion_snapshot.store(...)`, a snapshot obtained from one load
     /// reflects all deletions up to this value. Deriving the compaction fence
     /// from the same snapshot (rather than a second, independent
@@ -2171,12 +2161,8 @@ impl PkDeletionSnapshot {
     fn max_sequence_number(&self) -> Option<i64> {
         match self {
             Self::PositionBased => None,
-            Self::Int64Pk {
-                deleted_pk_values, ..
-            } => deleted_pk_values.max_sequence_number(),
-            Self::RowConverterBased {
-                deleted_row_keys, ..
-            } => deleted_row_keys.max_sequence_number(),
+            Self::Int64Pk { tombstones } => tombstones.max_sequence_number(),
+            Self::RowConverterBased { tombstones } => tombstones.max_sequence_number(),
         }
     }
 }
@@ -2189,8 +2175,7 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
         } => {
             let snapshot = deletion_snapshot.load_full();
             PkDeletionSnapshot::Int64Pk {
-                deleted_pk_values: Arc::clone(&snapshot.deleted_pk),
-                insert_records: Arc::clone(&snapshot.insert_records),
+                tombstones: Arc::clone(&snapshot.tombstones),
             }
         }
         PkDeletionStrategyWithCache::RowConverterBased {
@@ -2198,8 +2183,7 @@ fn pk_deletion_snapshot_for_strategy(strategy: &PkDeletionStrategyWithCache) -> 
         } => {
             let snapshot = deletion_snapshot.load_full();
             PkDeletionSnapshot::RowConverterBased {
-                deleted_row_keys: Arc::clone(&snapshot.deleted_row_keys),
-                insert_records: Arc::clone(&snapshot.insert_records),
+                tombstones: Arc::clone(&snapshot.tombstones),
             }
         }
     }
@@ -5049,14 +5033,14 @@ impl CayenneTableProvider {
         let deleted_pk_i64: Option<Arc<DeletionIndex>> = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().deleted_pk)),
+            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
             _ => None,
         };
 
         let deleted_row_keys: Option<Arc<KeyDeletionIndex>> = match &self.pk_deletion_strategy {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
-            } => Some(Arc::clone(&deletion_snapshot.load_full().deleted_row_keys)),
+            } => Some(Arc::clone(&deletion_snapshot.load_full().tombstones)),
             _ => None,
         };
 
@@ -5466,9 +5450,9 @@ impl CayenneTableProvider {
                             let pk_value = pk_array.value(row_idx);
                             match deleted_pks.get(pk_value) {
                                 None => false, // not deleted (bloom-prefiltered)
-                                Some(del_seq) => match min_delete_seq_threshold {
+                                Some(tombstone) => match min_delete_seq_threshold {
                                     None => true, // all deletions apply
-                                    Some(threshold) => del_seq > threshold,
+                                    Some(threshold) => tombstone.delete_sequence > threshold,
                                 },
                             }
                         } else {
@@ -5480,9 +5464,9 @@ impl CayenneTableProvider {
                             let key = rows.row(row_idx);
                             match deleted_keys.get(key.as_ref()) {
                                 None => false, // not deleted (bloom-prefiltered)
-                                Some(del_seq) => match min_delete_seq_threshold {
+                                Some(tombstone) => match min_delete_seq_threshold {
                                     None => true, // all deletions apply
-                                    Some(threshold) => del_seq > threshold,
+                                    Some(threshold) => tombstone.delete_sequence > threshold,
                                 },
                             }
                         } else {
@@ -6051,13 +6035,10 @@ impl CayenneTableProvider {
                     return;
                 }
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current
-                    .deleted_pk
-                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_arcs(
-                    Arc::new(updated_deleted),
-                    Arc::clone(&current.insert_records),
-                )));
+                let updated = current
+                    .tombstones
+                    .extend_max_deletes(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::RowConverterBased {
@@ -6067,15 +6048,11 @@ impl CayenneTableProvider {
                     return;
                 }
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current.deleted_row_keys.extend_max(
-                    deleted_row_keys
-                        .iter()
-                        .map(|key| (key.clone(), delete_sequence)),
-                );
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_arcs(
-                    Arc::new(updated_deleted),
-                    Arc::clone(&current.insert_records),
-                )));
+                let updated = current
+                    .tombstones
+                    .extend_max_deletes(deleted_row_keys.iter().map(|key| (key, delete_sequence)));
+                deletion_snapshot
+                    .store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
@@ -6477,36 +6454,25 @@ impl CayenneTableProvider {
                 deletion_snapshot, ..
             } => {
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current
-                    .deleted_pk
-                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
-                let updated_inserts = current
-                    .insert_records
-                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
-                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_indices(
-                    updated_deleted,
-                    updated_inserts,
-                )));
+                let updated = current.tombstones.extend_max_conflicts(
+                    deleted_pk_i64.iter().copied(),
+                    delete_sequence,
+                    insert_sequence,
+                );
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current.deleted_row_keys.extend_max(
-                    deleted_row_keys
-                        .iter()
-                        .map(|key| (key.clone(), delete_sequence)),
+                let updated = current.tombstones.extend_max_conflicts(
+                    deleted_row_keys,
+                    delete_sequence,
+                    insert_sequence,
                 );
-                let updated_inserts = current.insert_records.extend_max(
-                    deleted_row_keys
-                        .into_iter()
-                        .map(|key| (key, insert_sequence)),
-                );
-                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
-                    updated_deleted,
-                    updated_inserts,
-                )));
+                deletion_snapshot
+                    .store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
                 self.refresh_deletion_memory_accounting();
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
@@ -6677,38 +6643,34 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
             } => {
-                // Build new deletion + insert snapshots and publish both in one
-                // ArcSwap store so readers never observe mismatched generations.
-                // Writers are serialised by the per-table write lock so the load+rebuild+store
-                // sequence is race-free.
+                // Record the deletion and the re-insertion in ONE fused-index
+                // pass and one ArcSwap store, so readers never observe
+                // mismatched generations. Writers are serialised by the
+                // per-table write lock so the load+rebuild+store sequence is
+                // race-free.
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current
-                    .deleted_pk
-                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, delete_sequence)));
-                let deleted_count = updated_deleted.len();
-                let updated_inserts = current
-                    .insert_records
-                    .extend_max(deleted_pk_i64.iter().map(|&pk| (pk, insert_sequence)));
-                let insert_count = updated_inserts.len();
+                let updated = current.tombstones.extend_max_conflicts(
+                    deleted_pk_i64.iter().copied(),
+                    delete_sequence,
+                    insert_sequence,
+                );
                 tracing::debug!(
                     "Prepared Int64 PK deletion cache update with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
-                    deleted_count,
+                    updated.delete_len(),
                     delete_sequence,
-                    insert_count,
+                    updated.insert_len(),
                     insert_sequence,
                     self.table_metadata.table_name
                 );
 
-                OnConflictDeletionUpdate::Int64Pk(Arc::new(Int64PkDeletionSnapshot::from_indices(
-                    updated_deleted,
-                    updated_inserts,
+                OnConflictDeletionUpdate::Int64Pk(Arc::new(Int64PkDeletionSnapshot::from_index(
+                    updated,
                 )))
             }
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                // Consume `results` to take owned `Box<[u8]>` keys; the second
-                // extend_max then MOVES them in instead of cloning. The branch
+                // Consume `results` to take owned `Box<[u8]>` keys. The branch
                 // is invariantly the sole `KeyBased` producer (one spec built
                 // above, results non-empty by the early-return at 4669).
                 let written_keys: Vec<Box<[u8]>> = results
@@ -6721,27 +6683,22 @@ impl CayenneTableProvider {
                         message: "RowConverterBased on-conflict deletion did not produce a key-based write result".to_string(),
                     })?;
                 let current = deletion_snapshot.load_full();
-                let updated_deleted = current.deleted_row_keys.extend_max(
-                    written_keys
-                        .iter()
-                        .map(|key| (key.clone(), delete_sequence)),
+                let updated = current.tombstones.extend_max_conflicts(
+                    written_keys,
+                    delete_sequence,
+                    insert_sequence,
                 );
-                let deleted_count = updated_deleted.len();
-                let updated_inserts = current
-                    .insert_records
-                    .extend_max(written_keys.into_iter().map(|key| (key, insert_sequence)));
-                let insert_count = updated_inserts.len();
                 tracing::debug!(
                     "Prepared RowConverter deletion cache update with {} deleted keys (seq={}) and {} insert records (seq={}) for table {}",
-                    deleted_count,
+                    updated.delete_len(),
                     delete_sequence,
-                    insert_count,
+                    updated.insert_len(),
                     insert_sequence,
                     self.table_metadata.table_name
                 );
 
                 OnConflictDeletionUpdate::RowConverter(Arc::new(
-                    RowConverterDeletionSnapshot::from_indices(updated_deleted, updated_inserts),
+                    RowConverterDeletionSnapshot::from_index(updated),
                 ))
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => {
@@ -8523,10 +8480,10 @@ impl CayenneTableProvider {
             } => !cached_deleted_row_ids.load().is_empty(),
             PkDeletionStrategyWithCache::Int64Pk {
                 deletion_snapshot, ..
-            } => !deletion_snapshot.load().deleted_pk.is_empty(),
+            } => deletion_snapshot.load().tombstones.has_deletions(),
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
-            } => !deletion_snapshot.load().deleted_row_keys.is_empty(),
+            } => deletion_snapshot.load().tombstones.has_deletions(),
         }
     }
 
@@ -9425,7 +9382,7 @@ impl CayenneTableProvider {
                             batch.column(pk_index).data_type()
                         ),
                     })?;
-                let deleted_pk = Arc::clone(&deletion_snapshot.load_full().deleted_pk);
+                let deleted_pk = Arc::clone(&deletion_snapshot.load_full().tombstones);
 
                 for row_index in 0..batch.num_rows() {
                     if pk_array.is_null(row_index) {
@@ -9437,6 +9394,7 @@ impl CayenneTableProvider {
                     let pk = pk_array.value(row_index);
                     let max_delete_sequence = deleted_pk
                         .get(pk)
+                        .map(|tombstone| tombstone.delete_sequence)
                         .into_iter()
                         .chain(inlined_deletions.int64_pk.get(&pk).copied())
                         .max();
@@ -9455,7 +9413,7 @@ impl CayenneTableProvider {
                     .map(|idx| Arc::clone(batch.column(*idx)))
                     .collect();
                 let rows = converter.convert_columns(&pk_columns)?;
-                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().deleted_row_keys);
+                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
 
                 for row_index in 0..batch.num_rows() {
                     if pk_columns.iter().any(|column| column.is_null(row_index)) {
@@ -9467,6 +9425,7 @@ impl CayenneTableProvider {
                     let row_key = rows.row(row_index);
                     let max_delete_sequence = deleted_row_keys
                         .get(row_key.as_ref())
+                        .map(|tombstone| tombstone.delete_sequence)
                         .into_iter()
                         .chain(inlined_deletions.row_keys.get(row_key.as_ref()).copied())
                         .max();
@@ -10060,10 +10019,10 @@ impl CayenneTableProvider {
                 }
                 PkDeletionStrategy::Int64Pk => PkDeletionStrategyWithCache::Int64Pk {
                     deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                        Int64PkDeletionSnapshot::from_indices(
-                            DeletionIndex::empty(),
-                            DeletionIndex::from_map(insert_records_pk_i64),
-                        ),
+                        Int64PkDeletionSnapshot::from_index(DeletionIndex::from_maps(
+                            HashMap::new(),
+                            insert_records_pk_i64,
+                        )),
                     )),
                     // No delete files => no position deletes either.
                     position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
@@ -10071,10 +10030,10 @@ impl CayenneTableProvider {
                 PkDeletionStrategy::RowConverterBased => {
                     PkDeletionStrategyWithCache::RowConverterBased {
                         deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                            RowConverterDeletionSnapshot::from_indices(
-                                KeyDeletionIndex::empty(),
-                                KeyDeletionIndex::from_map(insert_records_row_keys),
-                            ),
+                            RowConverterDeletionSnapshot::from_index(KeyDeletionIndex::from_maps(
+                                HashMap::new(),
+                                insert_records_row_keys,
+                            )),
                         )),
                         position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
                     }
@@ -10148,10 +10107,10 @@ impl CayenneTableProvider {
                 );
                 PkDeletionStrategyWithCache::Int64Pk {
                     deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                        Int64PkDeletionSnapshot::from_indices(
-                            DeletionIndex::from_map(int64_pks),
-                            DeletionIndex::from_map(insert_records_pk_i64),
-                        ),
+                        Int64PkDeletionSnapshot::from_index(DeletionIndex::from_maps(
+                            int64_pks,
+                            insert_records_pk_i64,
+                        )),
                     )),
                     // Position-delete files (written under `deletion_mode: position`
                     // for located rows) load here; empty for key-mode tables.
@@ -10173,10 +10132,10 @@ impl CayenneTableProvider {
                 );
                 PkDeletionStrategyWithCache::RowConverterBased {
                     deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                        RowConverterDeletionSnapshot::from_indices(
-                            KeyDeletionIndex::from_map(deleted_row_keys),
-                            KeyDeletionIndex::from_map(insert_records_row_keys),
-                        ),
+                        RowConverterDeletionSnapshot::from_index(KeyDeletionIndex::from_maps(
+                            deleted_row_keys,
+                            insert_records_row_keys,
+                        )),
                     )),
                     // Position-delete files (written under `deletion_mode: position`
                     // for located rows) load here; empty for key-mode tables.
@@ -10729,10 +10688,8 @@ impl CayenneTableProvider {
         // `crates/cayenne/benches/apply_partial_deletion_filter_per_scan.rs`
         // for the before-numbers.
         match deletion_snapshot {
-            PkDeletionSnapshot::Int64Pk {
-                deleted_pk_values, ..
-            } => {
-                if deleted_pk_values
+            PkDeletionSnapshot::Int64Pk { tombstones } => {
+                if tombstones
                     .max_sequence_number()
                     .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
                 {
@@ -10748,17 +10705,15 @@ impl CayenneTableProvider {
 
                 Ok(Arc::new(Int64PkDeletionFilterExec::new(
                     plan,
-                    Arc::clone(deleted_pk_values),
-                    DeletionIndex::shared_empty(),
+                    Arc::clone(tombstones),
+                    InsertRecordHandling::Ignore,
                     pk_column_index,
                     Some(min_delete_seq_to_apply),
                 )))
             }
-            PkDeletionSnapshot::RowConverterBased {
-                deleted_row_keys, ..
-            } => {
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
                 if let Some(ref row_converter) = self.pk_row_converter {
-                    if deleted_row_keys
+                    if tombstones
                         .max_sequence_number()
                         .is_none_or(|max_sequence| max_sequence <= min_delete_seq_to_apply)
                     {
@@ -10767,8 +10722,8 @@ impl CayenneTableProvider {
 
                     Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
-                        Arc::clone(deleted_row_keys),
-                        KeyDeletionIndex::shared_empty(),
+                        Arc::clone(tombstones),
+                        InsertRecordHandling::Ignore,
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
                         Some(min_delete_seq_to_apply),
@@ -10792,12 +10747,10 @@ impl CayenneTableProvider {
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         match deletion_snapshot {
-            PkDeletionSnapshot::Int64Pk {
-                deleted_pk_values, ..
-            } => {
+            PkDeletionSnapshot::Int64Pk { tombstones } => {
                 // Protected snapshots already handle new data without filtering,
-                // so insert_records is the shared-static empty index.
-                if !deleted_pk_values.is_empty() {
+                // so insert records are ignored here.
+                if tombstones.has_deletions() {
                     let pk_column_index =
                         pk_indices_in_projection.first().copied().ok_or_else(|| {
                             datafusion_common::DataFusionError::Internal(
@@ -10808,23 +10761,21 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        Arc::clone(deleted_pk_values),
-                        DeletionIndex::shared_empty(),
+                        Arc::clone(tombstones),
+                        InsertRecordHandling::Ignore,
                         pk_column_index,
                         None,
                     )));
                 }
             }
-            PkDeletionSnapshot::RowConverterBased {
-                deleted_row_keys, ..
-            } => {
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
                 if let Some(ref row_converter) = self.pk_row_converter
-                    && !deleted_row_keys.is_empty()
+                    && tombstones.has_deletions()
                 {
                     return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
-                        Arc::clone(deleted_row_keys),
-                        KeyDeletionIndex::shared_empty(),
+                        Arc::clone(tombstones),
+                        InsertRecordHandling::Ignore,
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
                         None,
@@ -10850,15 +10801,12 @@ impl CayenneTableProvider {
         deletion_snapshot: &PkDeletionSnapshot,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         match deletion_snapshot {
-            PkDeletionSnapshot::Int64Pk {
-                deleted_pk_values,
-                insert_records,
-            } => {
-                if !deleted_pk_values.is_empty() {
+            PkDeletionSnapshot::Int64Pk { tombstones } => {
+                if tombstones.has_deletions() {
                     tracing::debug!(
                         "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                        deleted_pk_values.len(),
-                        insert_records.len(),
+                        tombstones.delete_len(),
+                        tombstones.insert_len(),
                         self.table_metadata.table_name
                     );
 
@@ -10872,31 +10820,28 @@ impl CayenneTableProvider {
 
                     return Ok(Arc::new(Int64PkDeletionFilterExec::new(
                         plan,
-                        Arc::clone(deleted_pk_values),
-                        Arc::clone(insert_records),
+                        Arc::clone(tombstones),
+                        InsertRecordHandling::Apply,
                         pk_column_index,
                         None,
                     )));
                 }
             }
-            PkDeletionSnapshot::RowConverterBased {
-                deleted_row_keys,
-                insert_records,
-            } => {
+            PkDeletionSnapshot::RowConverterBased { tombstones } => {
                 if let Some(ref row_converter) = self.pk_row_converter
-                    && !deleted_row_keys.is_empty()
+                    && tombstones.has_deletions()
                 {
                     tracing::debug!(
                         "Applying RowConverter-based deletion filter ({} deleted keys, {} insert records) to scan of table {}",
-                        deleted_row_keys.len(),
-                        insert_records.len(),
+                        tombstones.delete_len(),
+                        tombstones.insert_len(),
                         self.table_metadata.table_name
                     );
 
                     return Ok(Arc::new(KeyBasedDeletionFilterExec::new(
                         plan,
-                        Arc::clone(deleted_row_keys),
-                        Arc::clone(insert_records),
+                        Arc::clone(tombstones),
+                        InsertRecordHandling::Apply,
                         pk_indices_in_projection.to_vec(),
                         Arc::clone(row_converter),
                         None,
@@ -12320,39 +12265,38 @@ mod tests {
             position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         };
 
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(
             KeyDeletionIndex::from_map(HashMap::from([(
                 Box::<[u8]>::from([42_u8].as_slice()),
                 1_i64,
             )])),
-            KeyDeletionIndex::empty(),
         )));
 
         let scan_snapshot = pk_deletion_snapshot_for_strategy(&strategy);
         assert!(scan_snapshot.has_deletions());
 
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_indices(
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(
             KeyDeletionIndex::from_map(HashMap::from([(
                 Box::<[u8]>::from([99_u8].as_slice()),
                 2_i64,
             )])),
-            KeyDeletionIndex::empty(),
         )));
 
-        let PkDeletionSnapshot::RowConverterBased {
-            deleted_row_keys, ..
-        } = scan_snapshot
-        else {
+        let PkDeletionSnapshot::RowConverterBased { tombstones } = scan_snapshot else {
             panic!("expected row-converter deletion snapshot");
         };
-        assert_eq!(deleted_row_keys.get(&[42_u8]), Some(1_i64));
-        assert_eq!(deleted_row_keys.get(&[99_u8]), None);
         assert_eq!(
-            deletion_snapshot.load().deleted_row_keys.get(&[42_u8]),
-            None
+            tombstones.get(&[42_u8]).map(|t| t.delete_sequence),
+            Some(1_i64)
         );
+        assert_eq!(tombstones.get(&[99_u8]), None);
+        assert_eq!(deletion_snapshot.load().tombstones.get(&[42_u8]), None);
         assert_eq!(
-            deletion_snapshot.load().deleted_row_keys.get(&[99_u8]),
+            deletion_snapshot
+                .load()
+                .tombstones
+                .get(&[99_u8])
+                .map(|t| t.delete_sequence),
             Some(2_i64)
         );
     }
@@ -12776,10 +12720,7 @@ mod tests {
         let deleted_index = DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)]));
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
             deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                Int64PkDeletionSnapshot::from_indices(
-                    deleted_index.clone(),
-                    DeletionIndex::empty(),
-                ),
+                Int64PkDeletionSnapshot::from_index(deleted_index.clone()),
             )),
             position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         };
@@ -12816,10 +12757,7 @@ mod tests {
             DeletionIndex::from_map(HashMap::from([(1_i64, 5_i64), (2_i64, 15_i64)]));
         let strategy = PkDeletionStrategyWithCache::Int64Pk {
             deletion_snapshot: Arc::new(ArcSwap::from_pointee(
-                Int64PkDeletionSnapshot::from_indices(
-                    deleted_index.clone(),
-                    DeletionIndex::empty(),
-                ),
+                Int64PkDeletionSnapshot::from_index(deleted_index.clone()),
             )),
             position_deletions: Arc::new(ArcSwap::from_pointee(PositionBitmap::new())),
         };
