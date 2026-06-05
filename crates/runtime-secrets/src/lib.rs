@@ -84,7 +84,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Secret store types this binary was compiled with. Must match the cases in
-/// [`spicepod_secret_store_type`] so unknown-store errors don't lie about what's
+/// `spicepod_secret_store_type` so unknown-store errors don't lie about what's
 /// available in the current build (e.g. `keyring` is only present with the
 /// `keyring-secret-store` feature).
 #[must_use]
@@ -109,6 +109,31 @@ pub const SECRETS: &str = "secrets";
 pub trait SecretStore: Send + Sync {
     /// `get_secret` will load a secret from the secret store with the given key.
     async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>>;
+}
+
+/// Stands in for a configured secret store that failed to initialize.
+///
+/// Keeping the name registered (instead of dropping the store) means a later
+/// `${ <name>:KEY }` lookup surfaces the original initialization error at the
+/// point of use, rather than a misleading "undefined store" error. In the
+/// `${ secrets:KEY }` precedence walk the placeholder behaves like any other
+/// erroring store: it is skipped with a warning and only surfaces when no
+/// healthy store can answer.
+struct FailedSecretStore {
+    store_name: String,
+    /// Display-formatted initialization error, captured at load time.
+    init_error: String,
+}
+
+#[async_trait]
+impl SecretStore for FailedSecretStore {
+    async fn get_secret(&self, _key: &str) -> AnyErrorResult<Option<SecretString>> {
+        Err(format!(
+            "Secret store `{}` failed to initialize: {}",
+            self.store_name, self.init_error
+        )
+        .into())
+    }
 }
 
 pub struct Secrets {
@@ -153,7 +178,15 @@ impl Secrets {
 
     /// Initializes the runtime secrets based on the provided secret store configuration.
     ///
-    /// If no secret stores are provided, the default secret store is set to `env`.
+    /// If no secret stores are provided — or none of the configured stores
+    /// initializes successfully — the default `env` store is (also) loaded, so
+    /// `${ env:KEY }` and `${ secrets:KEY }` keep resolving from the
+    /// environment.
+    ///
+    /// A configured store that fails to initialize stays registered as a
+    /// placeholder (`FailedSecretStore`): lookups against it return the
+    /// original initialization error instead of reporting the store as
+    /// undefined.
     ///
     /// # Errors
     ///
@@ -168,31 +201,46 @@ impl Secrets {
         // for the whole secrets section.
         let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
 
+        let mut any_healthy_store_loaded = false;
         for secret in secrets {
             let store_type = spicepod_secret_store_type(secret, bootstrap_env.as_ref()).await?;
 
             let secret_store = match load_secret_store(store_type).await {
-                Ok(secret_store) => secret_store,
+                Ok(secret_store) => {
+                    any_healthy_store_loaded = true;
+                    secret_store
+                }
                 Err(e) => {
-                    // Swallowing this as a `continue` means any `${ <name>:KEY }` that later
-                    // references this store resolves to an empty string, masking the real
-                    // cause. Log a big actionable error and keep going so other stores can
-                    // still be loaded; the ref-resolution path now surfaces which store is
-                    // missing.
+                    // Log a big actionable error and keep going so other stores
+                    // can still be loaded. The store stays registered as a
+                    // placeholder so a later `${ <name>:KEY }` lookup reports
+                    // this initialization error (the root cause) instead of a
+                    // misleading "undefined store".
                     tracing::error!(
                         "Failed to initialize secret store `{name}`: {e}. Secret references `${{ {name}:KEY }}` in spicepod.yaml will fail to resolve. Check the store's `params:` block (e.g. region/credentials for aws_secrets_manager) and retry. Docs: https://spiceai.org/docs/components/secret-stores",
                         name = secret.name
                     );
-                    continue;
+                    Arc::new(FailedSecretStore {
+                        store_name: secret.name.clone(),
+                        init_error: e.to_string(),
+                    }) as Arc<dyn SecretStore>
                 }
             };
 
             self.stores.insert(secret.name.clone(), secret_store);
         }
 
-        if self.stores.is_empty() {
-            let default_store = load_default_store();
-            self.stores.insert("env".to_string(), default_store);
+        if !any_healthy_store_loaded {
+            // Long-standing fallback, now keyed on *healthy* stores rather
+            // than registry emptiness (placeholders occupy the registry but
+            // can't serve lookups): with no secrets section, or with every
+            // configured store failing to initialize, `env` remains available
+            // so `${ env:KEY }` / `${ secrets:KEY }` resolve as before.
+            // `or_insert_with` keeps a user-configured store named `env` (or
+            // its placeholder) authoritative over the implicit default.
+            self.stores
+                .entry("env".to_string())
+                .or_insert_with(load_default_store);
         }
 
         // Reverse the order of the secret stores to maintain the expected precedence order.
@@ -842,6 +890,108 @@ mod tests {
             .inject_secrets("api_key", super::ParamStr("key=${ secrets:API_KEY }"))
             .await;
         assert_eq!("key=s3cret", result.expose_secret());
+    }
+
+    /// A spicepod store entry that passes config validation but
+    /// deterministically fails `load_secret_store` (the `scheduler_rpc` store
+    /// is cluster-internal and rejects spicepod configuration) — a no-network
+    /// stand-in for any store whose `init()` fails.
+    fn failing_spicepod_secret(name: &str) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: "scheduler_rpc".to_string(),
+            name: name.to_string(),
+            description: None,
+            params: None,
+        }
+    }
+
+    fn env_spicepod_secret(name: &str) -> spicepod::component::secret::Secret {
+        spicepod::component::secret::Secret {
+            from: "env".to_string(),
+            name: name.to_string(),
+            description: None,
+            params: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_failed_store_registers_placeholder_with_init_error() {
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[failing_spicepod_secret("rpc")])
+            .await
+            .expect("load_from should not abort on a store init failure");
+
+        let store = secrets
+            .stores
+            .get("rpc")
+            .expect("a failed store should stay registered as a placeholder");
+        let Err(err) = store.get_secret("ANY_KEY").await else {
+            panic!("placeholder lookups must return the initialization error");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`rpc` failed to initialize"), "got {msg}");
+        assert!(
+            msg.contains("scheduler_rpc"),
+            "placeholder error must carry the init root cause; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_stores_failed_keeps_env_fallback() {
+        let _env_guard = lock_env().await;
+        let var = format!("SPICE_TEST_FALLBACK_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&var, "from_env") };
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[failing_spicepod_secret("rpc")])
+            .await
+            .expect("load_from should not abort on a store init failure");
+
+        // With zero healthy stores the implicit `env` fallback still loads,
+        // preserving the long-standing `${ secrets:KEY }` behavior...
+        let injected = secrets
+            .inject_secrets(&var, super::ParamStr(&format!("v=${{ secrets:{var} }}")))
+            .await;
+        assert_eq!("v=from_env", injected.expose_secret());
+
+        // ...while `${ rpc:KEY }` substitutes empty (the init root cause is
+        // logged by the lookup error branch).
+        let injected = secrets
+            .inject_secrets(&var, super::ParamStr(&format!("v=${{ rpc:{var} }}")))
+            .await;
+        assert_eq!("v=", injected.expose_secret());
+
+        unsafe { std::env::remove_var(&var) };
+    }
+
+    #[tokio::test]
+    async fn test_failed_store_does_not_break_healthy_stores_or_force_fallback() {
+        let _env_guard = lock_env().await;
+        let var = format!("SPICE_TEST_HEALTHY_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&var, "healthy_value") };
+
+        let mut secrets = super::Secrets::new();
+        secrets
+            .load_from(&[env_spicepod_secret("myenv"), failing_spicepod_secret("rpc")])
+            .await
+            .expect("load_from should not abort on a store init failure");
+
+        // A healthy store loaded, so no implicit `env` fallback is added.
+        assert!(secrets.stores.get("env").is_none());
+
+        // The placeholder sits earlier in the precedence walk (later spicepod
+        // entries take precedence); its error is skipped and the healthy
+        // store answers.
+        let secret = secrets
+            .get_secret(&var)
+            .await
+            .expect("the healthy store should answer despite the failed store")
+            .expect("secret should be found");
+        assert_eq!("healthy_value", secret.expose_secret());
+
+        unsafe { std::env::remove_var(&var) };
     }
 
     #[test]
