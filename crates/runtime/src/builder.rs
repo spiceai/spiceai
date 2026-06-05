@@ -63,8 +63,8 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
-/// Process-global SQLite metastore pragma tuning keys (cache, mmap, busy
-/// timeout, WAL autocheckpoint, auto_vacuum). Consumed once at startup in
+/// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
+/// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
 /// `build_internal`; declared here so they're part of the recognized
 /// `runtime.params` vocabulary and don't false-warn as unknown.
 const CAYENNE_METASTORE_CACHE_MB_PARAM: &str = "cayenne_metastore_cache_mb";
