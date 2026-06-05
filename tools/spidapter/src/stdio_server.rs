@@ -915,8 +915,8 @@ impl Handler for SpidapterHandler {
         }
     }
 
-    async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
-        eprintln!("[stdio] teardown: run_id={run_id}");
+    async fn teardown(&mut self, run_id: Uuid, preserve_resources: bool) -> Result<TeardownResponse, String> {
+        eprintln!("[stdio] teardown: run_id={run_id} preserve_resources={preserve_resources}");
 
         let Some(mut state) = self.runs.remove(&run_id) else {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
@@ -941,6 +941,27 @@ impl Handler for SpidapterHandler {
                 local.dynamodb_guard.take(),
             ),
         };
+
+        if preserve_resources {
+            // Disarm all guards so their Drop impls don't clean up anything.
+            // The run state is removed from the map (no further RPC calls possible)
+            // but all provisioned resources stay alive for post-run inspection.
+            for mut guard in ec2_guards {
+                if let Some((instance_id, region)) = guard.disarm() {
+                    eprintln!(
+                        "[stdio] teardown(preserve): keeping EC2 instance {instance_id} \
+                         (region={region}) alive"
+                    );
+                }
+            }
+            if let Some(mut guard) = dynamodb_guard {
+                guard.disarm();
+                eprintln!("[stdio] teardown(preserve): keeping DynamoDB tables alive");
+            }
+            // For SCP: skip app deletion so the deployed spiced stays running.
+            eprintln!("[stdio] teardown(preserve): skipping resource deletion");
+            return Ok(TeardownResponse { ok: true });
+        }
 
         match state {
             RunState::Scp(scp) => {
