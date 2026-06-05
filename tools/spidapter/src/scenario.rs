@@ -72,7 +72,7 @@ pub(crate) struct ScpConfig {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ComputeConfig {
     Local,
-    Scp(ScpConfig),
+    Scp(Box<ScpConfig>),
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -84,7 +84,7 @@ pub(crate) struct ScenarioConfig {
 
 /// Cayenne-specific configuration nested under `source: direct: cayenne:`.
 #[derive(Debug, Default, serde::Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) struct CayenneConfig {
     pub aws_region: Option<String>,
     pub data_dir: Option<String>,
@@ -198,16 +198,19 @@ pub(crate) fn envsubst(input: &str) -> anyhow::Result<String> {
     // Pattern: ${VAR} or ${VAR:-default}
     // Group 1: variable name (A-Z, 0-9, _)
     // Group 2: optional default value (everything after :-)
-    let re = regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}").expect("valid regex");
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\$\{([A-Z_][A-Z0-9_]*)(?::-(.*?))?\}").unwrap_or_else(|e| panic!("invalid regex: {e}"))
+    });
 
     let mut result = String::with_capacity(input.len());
     let mut last = 0usize;
 
     for cap in re.captures_iter(input) {
-        let full_match = cap.get(0).expect("full match");
+        let Some(full_match) = cap.get(0) else { continue };
         result.push_str(&input[last..full_match.start()]);
 
-        let var_name = cap.get(1).expect("group 1").as_str();
+        let var_name = cap.get(1).map_or("", |m| m.as_str());
         let default_val = cap.get(2).map(|m| m.as_str());
 
         let value = match std::env::var(var_name) {

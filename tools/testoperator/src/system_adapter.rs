@@ -52,7 +52,7 @@ impl SystemAdapterSession {
     /// callers can always run teardown in their cleanup path regardless of
     /// whether the test succeeded.
     pub async fn teardown(mut self) {
-        match self.client.teardown(self.run_id).await {
+        match self.client.teardown(self.run_id, false).await {
             Ok(response) if response.ok => {
                 println!(
                     "System adapter teardown ({transport}, run_id={run_id}): ok",

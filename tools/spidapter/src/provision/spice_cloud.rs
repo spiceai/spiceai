@@ -28,6 +28,7 @@ use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
 use crate::scenario::{CayenneConfig, ScpConfig};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn provision_scp_app(
     run_id: Uuid,
     args: &StdioArgs,

@@ -1,6 +1,6 @@
 compute:
   scp:
-    channel: nightly
+    channel: ${SPIDAPTER_CHANNEL:-nightly}
     scheduler_state_location: ${SCHEDULER_STATE_LOCATION:-}
     organization_tag: ${SPIDAPTER_ORGANIZATION_TAG:-}
     resources:

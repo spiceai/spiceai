@@ -285,7 +285,7 @@ struct SetupConfig {
     /// Absolute path to a spicepod the client wants deployed verbatim.
     spicepod_path: Option<String>,
     storage: FederatedStorageConfig,
-    /// Explicit AWS region override for the DynamoDB write path.
+    /// Explicit AWS region override for the `DynamoDB` write path.
     aws_region_override: Option<String>,
 }
 
@@ -415,13 +415,10 @@ impl SpidapterHandler {
         if let SourceConfig::Direct(DirectConfig {
             cayenne: Some(ref c),
         }) = self.scenario.source
-        {
-            if let Some(ref r) = c.aws_region {
-                if !r.is_empty() {
+            && let Some(ref r) = c.aws_region
+                && !r.is_empty() {
                     return r.clone();
                 }
-            }
-        }
         std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string())
@@ -431,8 +428,7 @@ impl SpidapterHandler {
     fn compute(&self) -> SpiceCompute {
         match &self.scenario.compute {
             Some(ComputeConfig::Scp(_)) => SpiceCompute::Scp,
-            Some(ComputeConfig::Local) => SpiceCompute::Local,
-            None => SpiceCompute::Local,
+            Some(ComputeConfig::Local) | None => SpiceCompute::Local,
         }
     }
 }
@@ -581,13 +577,13 @@ impl Handler for SpidapterHandler {
             SourceConfig::DynamoDbStreams(DynamoDbConfig {
                 region: dynamo_region,
             }) => {
-                let effective_region = if !dynamo_region.is_empty() {
-                    dynamo_region.clone()
-                } else {
+                let effective_region = if dynamo_region.is_empty() {
                     std::env::var("AWS_REGION")
                         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
                         .or_else(|_| metadata_string(&metadata, "etl_region").ok_or(()))
-                        .unwrap_or_else(|_| "us-east-1".to_string())
+                        .unwrap_or_else(|()| "us-east-1".to_string())
+                } else {
+                    dynamo_region.clone()
                 };
                 FederatedStorageConfig::DynamoDB {
                     prefix: String::new(),
