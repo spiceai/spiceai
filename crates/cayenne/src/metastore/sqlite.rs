@@ -145,8 +145,7 @@ async fn configure_sqlite_connection(
     // `SqliteMetastoreConfig`; the runtime overrides them via
     // `set_sqlite_metastore_config` from `runtime.params`.
     let cfg = sqlite_metastore_config();
-    let cache_size_kib =
-        i64::try_from(cfg.cache_size_mb.saturating_mul(1024)).unwrap_or(262_144);
+    let cache_size_kib = i64::try_from(cfg.cache_size_mb.saturating_mul(1024)).unwrap_or(262_144);
     let mut retry_delays = SQLITE_PRAGMA_RETRY_DELAYS_MS.iter();
     loop {
         let result = conn

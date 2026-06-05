@@ -80,13 +80,11 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
-pub use metastore::sqlite::{
-    SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config,
-};
 pub use metadata::{
     DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
     PartitionMetadata, TableMetadata, TableStatistics,
 };
+pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
