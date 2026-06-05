@@ -203,7 +203,11 @@ impl Handler for CayenneFlightsqlHandler {
         })
     }
 
-    async fn teardown(&mut self, run_id: Uuid, _preserve_resources: bool) -> Result<TeardownResponse, String> {
+    async fn teardown(
+        &mut self,
+        run_id: Uuid,
+        _preserve_resources: bool,
+    ) -> Result<TeardownResponse, String> {
         eprintln!("[cayenne] teardown: run_id={run_id}");
 
         let Some(mut state) = self.runs.remove(&run_id) else {

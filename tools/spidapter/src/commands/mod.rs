@@ -208,7 +208,6 @@ pub(crate) async fn ensure_spice_cloud_app(
     eprintln!("[stdio] create_result: {create_result:?}");
     match create_result {
         Ok(app) => {
-
             apply_storage_config(cloud, app.id, config).await?;
             Ok(app.id)
         }
