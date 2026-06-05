@@ -248,19 +248,47 @@ impl Secrets {
 
     /// Gets a secret key from the connected secret stores in precedence order.
     ///
+    /// A store that errors is logged and skipped so one unhealthy store (an
+    /// expired Vault token, a network blip) cannot mask a key that a
+    /// lower-precedence store can resolve:
+    ///
+    /// - A store returns the value → `Ok(Some(value))`, as before.
+    /// - No value, but at least one store answered healthily (`Ok(None)`) →
+    ///   `Ok(None)`; the key was not found in any healthy store. An erroring
+    ///   store might still hold it — each skipped failure is logged so that
+    ///   outcome stays diagnosable.
+    /// - Every consulted store errored → the last error, so a total outage is
+    ///   reported as an error rather than silently as "not found".
+    ///
     /// # Errors
     ///
-    /// Propagates any error returned by an underlying secret store implementation.
+    /// Returns the last store error when every consulted store failed and none
+    /// returned a healthy "not found".
     pub async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
-        for store in self.stores.values() {
+        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let mut any_healthy = false;
+        for (store_name, store) in &self.stores {
             match store.get_secret(key).await {
                 Ok(Some(secret)) => return Ok(Some(secret)),
-                Ok(None) => {}
-                Err(e) => return Err(e),
+                Ok(None) => any_healthy = true,
+                Err(e) => {
+                    // Include the failure cause: when a later store resolves
+                    // the key, this warning is the only signal that a store is
+                    // unhealthy (the returned-error path below never fires).
+                    // Matches the `{e}` logging in `lookup_for_injection`'s
+                    // error branches. Secret values are never logged.
+                    tracing::warn!(
+                        "Secret store `{store_name}` failed while looking up secret `{key}`: {e}. Trying the next store in precedence order."
+                    );
+                    last_err = Some(e);
+                }
             }
         }
 
-        Ok(None)
+        match last_err {
+            Some(e) if !any_healthy => Err(e),
+            _ => Ok(None),
+        }
     }
 
     /// Internal helper for [`Self::inject_secrets`]. Returns the value
@@ -667,6 +695,153 @@ mod tests {
                 "{executor_id}:{key}:expanded"
             )))
         }
+    }
+
+    /// A store that fails every lookup with the given message — simulates an
+    /// unhealthy backend (expired token, network failure).
+    struct ErroringStore(&'static str);
+
+    #[async_trait]
+    impl super::SecretStore for ErroringStore {
+        async fn get_secret(
+            &self,
+            _key: &str,
+        ) -> super::AnyErrorResult<Option<secrecy::SecretString>> {
+            Err(self.0.into())
+        }
+    }
+
+    /// A healthy in-memory store backed by a fixed key/value map.
+    struct MapStore(std::collections::HashMap<String, String>);
+
+    impl MapStore {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            Self(
+                entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl super::SecretStore for MapStore {
+        async fn get_secret(
+            &self,
+            key: &str,
+        ) -> super::AnyErrorResult<Option<secrecy::SecretString>> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|v| secrecy::SecretString::from(v.clone())))
+        }
+    }
+
+    /// Builds a `Secrets` registry directly from named stores, already in
+    /// precedence order (first entry is consulted first).
+    fn secrets_with_stores(
+        stores: Vec<(&str, std::sync::Arc<dyn super::SecretStore>)>,
+    ) -> super::Secrets {
+        super::Secrets {
+            stores: stores
+                .into_iter()
+                .map(|(name, store)| (name.to_string(), store))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_skips_erroring_store_when_later_store_has_value() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            (
+                "env",
+                std::sync::Arc::new(MapStore::new(&[("MY_KEY", "value")])),
+            ),
+        ]);
+
+        let secret = secrets
+            .get_secret("MY_KEY")
+            .await
+            .expect("lookup should succeed via the healthy store")
+            .expect("secret should be found");
+        assert_eq!("value", secret.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_returns_none_when_error_then_healthy_not_found() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            ("env", std::sync::Arc::new(MapStore::new(&[]))),
+        ]);
+
+        let result = secrets
+            .get_secret("MISSING_KEY")
+            .await
+            .expect("a healthy 'not found' should not surface the store error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_returns_last_error_when_all_stores_error() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("first error"))),
+            ("aws", std::sync::Arc::new(ErroringStore("second error"))),
+        ]);
+
+        let Err(err) = secrets.get_secret("MY_KEY").await else {
+            panic!("a total outage must surface an error, not 'not found'");
+        };
+        assert_eq!("second error", err.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_precedence_order_preserved() {
+        let secrets = secrets_with_stores(vec![
+            (
+                "high",
+                std::sync::Arc::new(MapStore::new(&[("MY_KEY", "high_value")])),
+            ),
+            (
+                "low",
+                std::sync::Arc::new(MapStore::new(&[("MY_KEY", "low_value")])),
+            ),
+        ]);
+
+        let secret = secrets
+            .get_secret("MY_KEY")
+            .await
+            .expect("lookup should succeed")
+            .expect("secret should be found");
+        assert_eq!("high_value", secret.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn test_get_secret_empty_registry_returns_none() {
+        let secrets = secrets_with_stores(vec![]);
+
+        let result = secrets
+            .get_secret("MY_KEY")
+            .await
+            .expect("empty registry should not error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_inject_secrets_sentinel_resolves_through_erroring_store() {
+        let secrets = secrets_with_stores(vec![
+            ("vault", std::sync::Arc::new(ErroringStore("vault is down"))),
+            (
+                "env",
+                std::sync::Arc::new(MapStore::new(&[("API_KEY", "s3cret")])),
+            ),
+        ]);
+
+        let result = secrets
+            .inject_secrets("api_key", super::ParamStr("key=${ secrets:API_KEY }"))
+            .await;
+        assert_eq!("key=s3cret", result.expose_secret());
     }
 
     #[test]
