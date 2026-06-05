@@ -138,76 +138,53 @@ fn approx_position_bitmap_bytes(bitmap: &PositionBitmap) -> usize {
 }
 
 /// Atomically-published deletion state for single-column `Int64` primary keys.
+///
+/// Holds one fused [`DeletionIndex`] whose entries carry both the delete and
+/// (for upsert conflicts) re-insert sequence numbers, so the scan hot path
+/// resolves visibility with a single probe. Previously a (deleted,
+/// insert-records) index pair published together; the fused index preserves
+/// the same atomicity with one cell.
 #[derive(Debug, Clone)]
 pub struct Int64PkDeletionSnapshot {
-    pub(crate) deleted_pk: Arc<DeletionIndex>,
-    pub(crate) insert_records: Arc<DeletionIndex>,
+    pub(crate) tombstones: Arc<DeletionIndex>,
 }
 
 impl Int64PkDeletionSnapshot {
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self {
-            deleted_pk: Arc::new(DeletionIndex::empty()),
-            insert_records: Arc::new(DeletionIndex::empty()),
+            tombstones: Arc::new(DeletionIndex::empty()),
         }
     }
 
     #[must_use]
-    pub(crate) const fn from_arcs(
-        deleted_pk: Arc<DeletionIndex>,
-        insert_records: Arc<DeletionIndex>,
-    ) -> Self {
+    pub(crate) fn from_index(tombstones: DeletionIndex) -> Self {
         Self {
-            deleted_pk,
-            insert_records,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn from_indices(deleted_pk: DeletionIndex, insert_records: DeletionIndex) -> Self {
-        Self {
-            deleted_pk: Arc::new(deleted_pk),
-            insert_records: Arc::new(insert_records),
+            tombstones: Arc::new(tombstones),
         }
     }
 }
 
 /// Atomically-published deletion state for row-converter primary keys.
+///
+/// See [`Int64PkDeletionSnapshot`] for the fused-index rationale.
 #[derive(Debug, Clone)]
 pub struct RowConverterDeletionSnapshot {
-    pub(crate) deleted_row_keys: Arc<KeyDeletionIndex>,
-    pub(crate) insert_records: Arc<KeyDeletionIndex>,
+    pub(crate) tombstones: Arc<KeyDeletionIndex>,
 }
 
 impl RowConverterDeletionSnapshot {
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self {
-            deleted_row_keys: Arc::new(KeyDeletionIndex::empty()),
-            insert_records: Arc::new(KeyDeletionIndex::empty()),
+            tombstones: Arc::new(KeyDeletionIndex::empty()),
         }
     }
 
     #[must_use]
-    pub(crate) const fn from_arcs(
-        deleted_row_keys: Arc<KeyDeletionIndex>,
-        insert_records: Arc<KeyDeletionIndex>,
-    ) -> Self {
+    pub(crate) fn from_index(tombstones: KeyDeletionIndex) -> Self {
         Self {
-            deleted_row_keys,
-            insert_records,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn from_indices(
-        deleted_row_keys: KeyDeletionIndex,
-        insert_records: KeyDeletionIndex,
-    ) -> Self {
-        Self {
-            deleted_row_keys: Arc::new(deleted_row_keys),
-            insert_records: Arc::new(insert_records),
+            tombstones: Arc::new(tombstones),
         }
     }
 }
@@ -398,9 +375,8 @@ impl PkDeletionStrategyWithCache {
                 let snapshot = deletion_snapshot.load();
                 let position_snapshot = position_deletions.load_full();
                 snapshot
-                    .deleted_pk
+                    .tombstones
                     .approx_bytes()
-                    .saturating_add(snapshot.insert_records.approx_bytes())
                     .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
             }
             Self::RowConverterBased {
@@ -410,9 +386,8 @@ impl PkDeletionStrategyWithCache {
                 let snapshot = deletion_snapshot.load();
                 let position_snapshot = position_deletions.load_full();
                 snapshot
-                    .deleted_row_keys
+                    .tombstones
                     .approx_bytes()
-                    .saturating_add(snapshot.insert_records.approx_bytes())
                     .saturating_add(approx_position_bitmap_bytes(&position_snapshot))
             }
         }
