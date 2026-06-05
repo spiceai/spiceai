@@ -61,7 +61,11 @@ async fn create_sorted_table(
         ..VortexConfig::default()
     };
 
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env));
+    let context = CayenneContext::new(
+        &vortex_config,
+        Arc::clone(&runtime_env),
+        "sort_rewrite_test",
+    );
 
     let options = CreateTableOptions {
         table_name: table_name.to_string(),
@@ -687,7 +691,11 @@ async fn test_sort_rewrite_reopen_table_impl(
         ..VortexConfig::default()
     };
 
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env));
+    let context = CayenneContext::new(
+        &vortex_config,
+        Arc::clone(&runtime_env),
+        "sort_rewrite_test",
+    );
 
     let options = CreateTableOptions {
         table_name: "sort_reopen".to_string(),

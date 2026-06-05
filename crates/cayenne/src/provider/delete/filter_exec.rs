@@ -46,87 +46,121 @@ limitations under the License.
 //!    bloom-filter prefilter that early-rejects keys that are definitely not deleted.
 //! 2. Apply the mask in one shot via [`arrow::compute::filter_record_batch`].
 
-use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex};
+use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow_row::RowConverter;
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use std::any::Any;
 use std::sync::Arc;
+
+/// Per-partition metrics for a deletion-filter exec.
+///
+/// `EXPLAIN ANALYZE` shows nothing for an exec without metrics, which made the
+/// merge-on-read deletion read-tax invisible (its only signal was an OS-level
+/// CPU sample of `KeyDeletionIndex::get`). These surface, per partition:
+/// - `output_rows` / `elapsed_compute` (`DataFusion` baseline) — the per-row probe cost.
+/// - `rows_deleted` — rows removed by the filter; scanned rows can be inferred as
+///   `rows_deleted + output_rows`.
+///
+/// The deletion-set size is shown in the exec's `DisplayAs` label (`filtered_keys=`),
+/// not as a metric: it is a per-table constant, and `DataFusion` sums metric values
+/// across partitions, which would report `partitions × keys`.
+#[derive(Clone)]
+struct DeletionFilterMetrics {
+    baseline: BaselineMetrics,
+    /// Rows removed because their key was an applicable (visible) deletion.
+    rows_deleted: Count,
+}
+
+impl DeletionFilterMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline: BaselineMetrics::new(metrics, partition),
+            rows_deleted: MetricBuilder::new(metrics).counter("rows_deleted", partition),
+        }
+    }
+}
 
 // ============================================================================
 // PK Visibility Helpers
 // ============================================================================
 //
 // A row is visible (kept) if either:
-// - Its PK is not in the deletion index, OR
-// - Its PK is in the deletion index but was re-inserted with a higher sequence
-//   number (upsert).
+// - Its PK has no tombstone in the deletion index, OR
+// - Its tombstone's deletion pre-dates the protected-snapshot cutoff, OR
+// - Insert records are honored and the PK was re-inserted with a higher
+//   sequence number (upsert).
 //
-// Both helpers run inside the per-row loop, so they avoid second probes when
-// the bloom filter on the deletion index already rejects the key.
+// The fused index answers all of this with ONE bloom-prefiltered probe per
+// row; the previous two-index design paid a second bloom + HAMT walk on every
+// confirmed deletion (the dominant per-row cost in changes-mode profiles).
+
+/// Whether the visibility check honors insert records (upsert re-insertions).
+///
+/// The main scan path applies them. Protected-snapshot paths ignore them: a
+/// re-inserted row is scanned from the snapshot's own newer files, so honoring
+/// the re-insert in the base scan would resurrect the old row version.
+/// (Previously expressed by passing the shared-static empty index as
+/// `insert_records`; the fused index makes the mode explicit.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertRecordHandling {
+    /// A deleted PK is visible again if re-inserted after the delete.
+    Apply,
+    /// Re-inserts never override a deletion.
+    Ignore,
+}
+
+/// Shared visibility verdict for a probed tombstone.
+#[inline]
+fn tombstone_visible(
+    tombstone: Tombstone,
+    insert_record_handling: InsertRecordHandling,
+    min_delete_seq_to_apply: Option<i64>,
+) -> bool {
+    if min_delete_seq_to_apply
+        .is_some_and(|min_delete_seq| tombstone.delete_sequence <= min_delete_seq)
+    {
+        // Deletion pre-dates the protected snapshot's creation — skip it. The
+        // full deletion index is reused here instead of being rebuilt with
+        // these entries filtered out.
+        return true;
+    }
+    match insert_record_handling {
+        InsertRecordHandling::Apply => tombstone
+            .insert_sequence
+            .is_some_and(|insert_seq| insert_seq > tombstone.delete_sequence),
+        InsertRecordHandling::Ignore => false,
+    }
+}
 
 /// Check if a row with the given Int64 PK is visible (not deleted, or re-inserted after deletion).
 ///
 /// `min_delete_seq_to_apply` is the protected-snapshot cutoff: when `Some(min)`,
 /// only deletions whose `delete_seq > min` apply. This lets the protected
-/// snapshot scan path share the full `deleted_pks` index across snapshots
+/// snapshot scan path share the full deletion index across snapshots
 /// instead of rebuilding a filtered [`DeletionIndex`] per snapshot — the
 /// `min_seq` is a single integer compared against the deletion sequence
-/// number returned by the existing bloom-prefiltered `HashMap` probe, so it
+/// number returned by the existing bloom-prefiltered probe, so it
 /// adds at most one comparison per confirmed match (which the bloom
 /// rejects most non-matching probes from reaching). `None` means apply every
-/// deletion in `deleted_pks` (main scan path).
+/// deletion in the index (main scan path).
 #[inline]
 pub(crate) fn is_pk_visible_i64(
     pk: i64,
-    deleted_pks: &DeletionIndex,
-    insert_records: &DeletionIndex,
+    tombstones: &DeletionIndex,
+    insert_record_handling: InsertRecordHandling,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
-    match min_delete_seq_to_apply {
-        Some(min_delete_seq_to_apply) => {
-            is_pk_visible_i64_after_min(pk, deleted_pks, insert_records, min_delete_seq_to_apply)
-        }
-        None => is_pk_visible_i64_without_min(pk, deleted_pks, insert_records),
-    }
-}
-
-#[inline]
-fn is_pk_visible_i64_without_min(
-    pk: i64,
-    deleted_pks: &DeletionIndex,
-    insert_records: &DeletionIndex,
-) -> bool {
-    match deleted_pks.get(pk) {
+    match tombstones.get(pk) {
         None => true,
-        Some(delete_seq) => insert_records
-            .get(pk)
-            .is_some_and(|insert_seq| insert_seq > delete_seq),
-    }
-}
-
-#[inline]
-fn is_pk_visible_i64_after_min(
-    pk: i64,
-    deleted_pks: &DeletionIndex,
-    insert_records: &DeletionIndex,
-    min_delete_seq_to_apply: i64,
-) -> bool {
-    match deleted_pks.get(pk) {
-        None => true,
-        Some(delete_seq) => {
-            if delete_seq <= min_delete_seq_to_apply {
-                // Deletion pre-dates the protected snapshot's creation —
-                // skip it. The full deletion index is reused here instead
-                // of being rebuilt with these entries filtered out.
-                return true;
-            }
-            insert_records
-                .get(pk)
-                .is_some_and(|insert_seq| insert_seq > delete_seq)
+        Some(tombstone) => {
+            tombstone_visible(tombstone, insert_record_handling, min_delete_seq_to_apply)
         }
     }
 }
@@ -138,51 +172,14 @@ fn is_pk_visible_i64_after_min(
 #[inline]
 pub(crate) fn is_pk_visible_row_key(
     key: &[u8],
-    deleted_keys: &KeyDeletionIndex,
-    insert_records: &KeyDeletionIndex,
+    tombstones: &KeyDeletionIndex,
+    insert_record_handling: InsertRecordHandling,
     min_delete_seq_to_apply: Option<i64>,
 ) -> bool {
-    match min_delete_seq_to_apply {
-        Some(min_delete_seq_to_apply) => is_pk_visible_row_key_after_min(
-            key,
-            deleted_keys,
-            insert_records,
-            min_delete_seq_to_apply,
-        ),
-        None => is_pk_visible_row_key_without_min(key, deleted_keys, insert_records),
-    }
-}
-
-#[inline]
-fn is_pk_visible_row_key_without_min(
-    key: &[u8],
-    deleted_keys: &KeyDeletionIndex,
-    insert_records: &KeyDeletionIndex,
-) -> bool {
-    match deleted_keys.get(key) {
+    match tombstones.get(key) {
         None => true,
-        Some(delete_seq) => insert_records
-            .get(key)
-            .is_some_and(|insert_seq| insert_seq > delete_seq),
-    }
-}
-
-#[inline]
-fn is_pk_visible_row_key_after_min(
-    key: &[u8],
-    deleted_keys: &KeyDeletionIndex,
-    insert_records: &KeyDeletionIndex,
-    min_delete_seq_to_apply: i64,
-) -> bool {
-    match deleted_keys.get(key) {
-        None => true,
-        Some(delete_seq) => {
-            if delete_seq <= min_delete_seq_to_apply {
-                return true;
-            }
-            insert_records
-                .get(key)
-                .is_some_and(|insert_seq| insert_seq > delete_seq)
+        Some(tombstone) => {
+            tombstone_visible(tombstone, insert_record_handling, min_delete_seq_to_apply)
         }
     }
 }
@@ -216,10 +213,11 @@ fn is_pk_visible_row_key_after_min(
 /// This allows upsert semantics without full table compaction.
 pub struct KeyBasedDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Deletion index of PK bytes -> delete sequence number.
-    deleted_row_keys: Arc<KeyDeletionIndex>,
-    /// Deletion index of PK bytes -> insert sequence number for upserted PKs.
-    insert_records: Arc<KeyDeletionIndex>,
+    /// Fused tombstone index of PK bytes -> (delete, insert) sequence numbers.
+    tombstones: Arc<KeyDeletionIndex>,
+    /// Whether re-inserted PKs override their deletion (main scan) or not
+    /// (protected-snapshot paths).
+    insert_record_handling: InsertRecordHandling,
     /// Indices of primary key columns in the schema
     pk_column_indices: Vec<usize>,
     /// `RowConverter` for converting PK columns to bytes
@@ -228,6 +226,8 @@ pub struct KeyBasedDeletionFilterExec {
     /// See [`Int64PkDeletionFilterExec::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     properties: datafusion_physical_plan::PlanProperties,
+    /// Execution metrics surfaced via `EXPLAIN ANALYZE` (see [`DeletionFilterMetrics`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl KeyBasedDeletionFilterExec {
@@ -235,15 +235,15 @@ impl KeyBasedDeletionFilterExec {
     ///
     /// # Arguments
     /// * `input` - The input execution plan to filter
-    /// * `deleted_row_keys` - Bloom-prefiltered index of deleted PK byte keys
-    /// * `insert_records` - Bloom-prefiltered index of upserted PK byte keys
+    /// * `tombstones` - Bloom-prefiltered fused index of deleted/upserted PK byte keys
+    /// * `insert_record_handling` - Whether upsert re-insertions override deletions
     /// * `pk_column_indices` - Indices of primary key columns in the schema
     /// * `row_converter` - `RowConverter` configured for the PK columns
     /// * `min_delete_seq_to_apply` - Optional protected-snapshot cutoff
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_row_keys: Arc<KeyDeletionIndex>,
-        insert_records: Arc<KeyDeletionIndex>,
+        tombstones: Arc<KeyDeletionIndex>,
+        insert_record_handling: InsertRecordHandling,
         pk_column_indices: Vec<usize>,
         row_converter: Arc<RowConverter>,
         min_delete_seq_to_apply: Option<i64>,
@@ -251,12 +251,13 @@ impl KeyBasedDeletionFilterExec {
         let properties = input.properties().clone();
         Self {
             input,
-            deleted_row_keys,
-            insert_records,
+            tombstones,
+            insert_record_handling,
             pk_column_indices,
             row_converter,
             min_delete_seq_to_apply,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -272,7 +273,7 @@ impl DisplayAs for KeyBasedDeletionFilterExec {
         write!(
             f,
             "KeyBasedDeletionFilterExec: filtered_keys={}",
-            self.deleted_row_keys.len()
+            self.tombstones.delete_len()
         )
     }
 }
@@ -284,6 +285,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
@@ -305,8 +310,8 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            Arc::clone(&self.deleted_row_keys),
-            Arc::clone(&self.insert_records),
+            Arc::clone(&self.tombstones),
+            self.insert_record_handling,
             self.pk_column_indices.clone(),
             Arc::clone(&self.row_converter),
             self.min_delete_seq_to_apply,
@@ -318,9 +323,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         partition: usize,
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
-        let deleted_row_keys = Arc::clone(&self.deleted_row_keys);
-        let insert_records = Arc::clone(&self.insert_records);
+        let tombstones = Arc::clone(&self.tombstones);
+        let insert_record_handling = self.insert_record_handling;
         let pk_column_indices = self.pk_column_indices.clone();
         let row_converter = Arc::clone(&self.row_converter);
         let min_delete_seq_to_apply = self.min_delete_seq_to_apply;
@@ -328,12 +334,13 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 
         Ok(Box::pin(KeyBasedDeletionFilterStream {
             input: input_stream,
-            deleted_row_keys,
-            insert_records,
+            tombstones,
+            insert_record_handling,
             pk_column_indices,
             row_converter,
             min_delete_seq_to_apply,
             schema,
+            metrics,
         }))
     }
 }
@@ -341,13 +348,14 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 /// Stream that filters out deleted rows based on primary key matching.
 pub struct KeyBasedDeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_row_keys: Arc<KeyDeletionIndex>,
-    insert_records: Arc<KeyDeletionIndex>,
+    tombstones: Arc<KeyDeletionIndex>,
+    insert_record_handling: InsertRecordHandling,
     pk_column_indices: Vec<usize>,
     row_converter: Arc<RowConverter>,
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
+    metrics: DeletionFilterMetrics,
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -366,8 +374,14 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
-                    // Fast path: empty deleted keys index
-                    if self.deleted_row_keys.is_empty() {
+                    // Time the probe + filter kernel so the merge-on-read read-tax is
+                    // visible in EXPLAIN ANALYZE. Dropped on every return/continue below.
+                    let _timer = self.metrics.baseline.elapsed_compute().timer();
+
+                    // Fast path: no deletions to apply (insert-only entries
+                    // never affect visibility)
+                    if !self.tombstones.has_deletions() {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -414,8 +428,8 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         let key: &[u8] = row.as_ref();
                         let visible = is_pk_visible_row_key(
                             key,
-                            &self.deleted_row_keys,
-                            &self.insert_records,
+                            &self.tombstones,
+                            self.insert_record_handling,
                             self.min_delete_seq_to_apply,
                         );
                         keep_mask.append(visible);
@@ -430,11 +444,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
 
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
+                        self.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
                     // If no rows are deleted, return the batch as-is (fast path)
                     if keep_count == batch_size {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -452,6 +468,12 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -486,19 +508,22 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 /// `HashMap<i64, i64>`) directly with native i64 comparisons.
 pub struct Int64PkDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    /// Bloom-prefiltered index of deleted PK -> delete sequence number.
-    deleted_pk_values: Arc<DeletionIndex>,
-    /// Bloom-prefiltered index of upserted PK -> insert sequence number.
-    insert_records: Arc<DeletionIndex>,
+    /// Bloom-prefiltered fused index of PK -> (delete, insert) sequence numbers.
+    tombstones: Arc<DeletionIndex>,
+    /// Whether re-inserted PKs override their deletion (main scan) or not
+    /// (protected-snapshot paths).
+    insert_record_handling: InsertRecordHandling,
     /// Index of the primary key column in the schema
     pk_column_index: usize,
     /// Optional minimum sequence number — only deletions with
     /// `delete_seq > min_delete_seq_to_apply` are honoured. Used by the
     /// protected-snapshot scan path to skip deletions that pre-date the
     /// protected snapshot's creation without rebuilding the deletion
-    /// index. `None` means apply every deletion in `deleted_pk_values`.
+    /// index. `None` means apply every deletion in the index.
     min_delete_seq_to_apply: Option<i64>,
     properties: datafusion_physical_plan::PlanProperties,
+    /// Execution metrics surfaced via `EXPLAIN ANALYZE` (see [`DeletionFilterMetrics`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl Int64PkDeletionFilterExec {
@@ -506,25 +531,26 @@ impl Int64PkDeletionFilterExec {
     ///
     /// # Arguments
     /// * `input` - The input execution plan to filter
-    /// * `deleted_pk_values` - Bloom-prefiltered index of deleted PK values
-    /// * `insert_records` - Bloom-prefiltered index of upserted PK values
+    /// * `tombstones` - Bloom-prefiltered fused index of deleted/upserted PK values
+    /// * `insert_record_handling` - Whether upsert re-insertions override deletions
     /// * `pk_column_index` - Index of the primary key column in the schema
     /// * `min_delete_seq_to_apply` - Optional protected-snapshot cutoff
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
-        deleted_pk_values: Arc<DeletionIndex>,
-        insert_records: Arc<DeletionIndex>,
+        tombstones: Arc<DeletionIndex>,
+        insert_record_handling: InsertRecordHandling,
         pk_column_index: usize,
         min_delete_seq_to_apply: Option<i64>,
     ) -> Self {
         let properties = input.properties().clone();
         Self {
             input,
-            deleted_pk_values,
-            insert_records,
+            tombstones,
+            insert_record_handling,
             pk_column_index,
             min_delete_seq_to_apply,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -540,7 +566,7 @@ impl DisplayAs for Int64PkDeletionFilterExec {
         write!(
             f,
             "Int64PkDeletionFilterExec: filtered_keys={}, pk_col_idx={}",
-            self.deleted_pk_values.len(),
+            self.tombstones.delete_len(),
             self.pk_column_index
         )
     }
@@ -553,6 +579,10 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
@@ -574,8 +604,8 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&children[0]),
-            Arc::clone(&self.deleted_pk_values),
-            Arc::clone(&self.insert_records),
+            Arc::clone(&self.tombstones),
+            self.insert_record_handling,
             self.pk_column_index,
             self.min_delete_seq_to_apply,
         )))
@@ -586,20 +616,22 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         partition: usize,
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
-        let deleted_pk_values = Arc::clone(&self.deleted_pk_values);
-        let insert_records = Arc::clone(&self.insert_records);
+        let tombstones = Arc::clone(&self.tombstones);
+        let insert_record_handling = self.insert_record_handling;
         let pk_column_index = self.pk_column_index;
         let min_delete_seq_to_apply = self.min_delete_seq_to_apply;
         let schema = input_stream.schema();
 
         Ok(Box::pin(Int64PkDeletionFilterStream {
             input: input_stream,
-            deleted_pk_values,
-            insert_records,
+            tombstones,
+            insert_record_handling,
             pk_column_index,
             min_delete_seq_to_apply,
             schema,
+            metrics,
         }))
     }
 }
@@ -607,14 +639,15 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 /// Stream that filters out deleted rows based on Int64 primary key matching.
 struct Int64PkDeletionFilterStream {
     input: SendableRecordBatchStream,
-    deleted_pk_values: Arc<DeletionIndex>,
-    insert_records: Arc<DeletionIndex>,
+    tombstones: Arc<DeletionIndex>,
+    insert_record_handling: InsertRecordHandling,
     pk_column_index: usize,
     /// If `Some(min)`, only deletions with `delete_seq > min` apply. Lets
-    /// protected snapshots share one `deleted_pk_values` index instead of
+    /// protected snapshots share one tombstone index instead of
     /// each snapshot owning a per-snapshot rebuilt copy.
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
+    metrics: DeletionFilterMetrics,
 }
 
 impl futures::Stream for Int64PkDeletionFilterStream {
@@ -635,8 +668,14 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
-                    // Fast path: empty deletion index
-                    if self.deleted_pk_values.is_empty() {
+                    // Time the probe + filter kernel so the merge-on-read read-tax is
+                    // visible in EXPLAIN ANALYZE. Dropped on every return/continue below.
+                    let _timer = self.metrics.baseline.elapsed_compute().timer();
+
+                    // Fast path: no deletions to apply (insert-only entries
+                    // never affect visibility)
+                    if !self.tombstones.has_deletions() {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -674,8 +713,8 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     for &pk_value in pk_slice {
                         let visible = is_pk_visible_i64(
                             pk_value,
-                            &self.deleted_pk_values,
-                            &self.insert_records,
+                            &self.tombstones,
+                            self.insert_record_handling,
                             self.min_delete_seq_to_apply,
                         );
                         keep_mask.append(visible);
@@ -690,11 +729,13 @@ impl futures::Stream for Int64PkDeletionFilterStream {
 
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
+                        self.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
                     // If no rows are deleted, return the batch as-is (fast path)
                     if keep_count == batch_size {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -712,6 +753,12 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -768,13 +815,15 @@ mod tests {
             .map(|(&pk, &seq)| (pk, seq))
             .collect();
         let filtered_index = DeletionIndex::from_map(filtered_entries);
-        let empty_inserts = DeletionIndex::empty();
 
-        // Probe every key, including some that aren't in either index.
+        // Probe every key, including some that aren't in either index. The
+        // protected-snapshot paths ignore insert records (see
+        // `InsertRecordHandling::Ignore`).
         for pk in -2..12_i64 {
             let probe_time_filter =
-                is_pk_visible_i64(pk, &full_index, &empty_inserts, Some(min_seq));
-            let rebuilt_filter = is_pk_visible_i64(pk, &filtered_index, &empty_inserts, None);
+                is_pk_visible_i64(pk, &full_index, InsertRecordHandling::Ignore, Some(min_seq));
+            let rebuilt_filter =
+                is_pk_visible_i64(pk, &filtered_index, InsertRecordHandling::Ignore, None);
             assert_eq!(
                 probe_time_filter, rebuilt_filter,
                 "pk={pk}: probe-time min_seq filter must match a rebuilt index"
@@ -793,19 +842,87 @@ mod tests {
             .map(|(k, &seq)| (k.clone(), seq))
             .collect();
         let filtered_key_index = KeyDeletionIndex::from_map(filtered_key_entries);
-        let empty_key_inserts = KeyDeletionIndex::empty();
 
         for pk in -2..12_i64 {
             let key = pk.to_be_bytes();
-            let probe_time =
-                is_pk_visible_row_key(&key, &full_key_index, &empty_key_inserts, Some(min_seq));
-            let rebuilt =
-                is_pk_visible_row_key(&key, &filtered_key_index, &empty_key_inserts, None);
+            let probe_time = is_pk_visible_row_key(
+                &key,
+                &full_key_index,
+                InsertRecordHandling::Ignore,
+                Some(min_seq),
+            );
+            let rebuilt = is_pk_visible_row_key(
+                &key,
+                &filtered_key_index,
+                InsertRecordHandling::Ignore,
+                None,
+            );
             assert_eq!(
                 probe_time, rebuilt,
                 "byte-key pk={pk}: probe-time min_seq filter must match a rebuilt KeyDeletionIndex"
             );
         }
+    }
+
+    /// Upsert semantics through the fused index: a deleted PK re-inserted at a
+    /// higher sequence is visible on the main scan path (`Apply`) and stays
+    /// hidden on protected-snapshot paths (`Ignore`).
+    #[test]
+    fn fused_tombstone_visibility_honors_handling_mode() {
+        let deleted: HashMap<i64, i64> = HashMap::from([(1, 10), (2, 20)]);
+        let inserts: HashMap<i64, i64> = HashMap::from([(1, 11), (2, 5)]);
+        let index = DeletionIndex::from_maps(deleted, inserts);
+
+        // pk=1: re-inserted after delete (11 > 10) — visible only under Apply.
+        assert!(is_pk_visible_i64(
+            1,
+            &index,
+            InsertRecordHandling::Apply,
+            None
+        ));
+        assert!(!is_pk_visible_i64(
+            1,
+            &index,
+            InsertRecordHandling::Ignore,
+            None
+        ));
+
+        // pk=2: stale insert record (5 < 20) — deleted under both modes.
+        assert!(!is_pk_visible_i64(
+            2,
+            &index,
+            InsertRecordHandling::Apply,
+            None
+        ));
+        assert!(!is_pk_visible_i64(
+            2,
+            &index,
+            InsertRecordHandling::Ignore,
+            None
+        ));
+
+        // pk=3: never deleted — visible under both modes.
+        assert!(is_pk_visible_i64(
+            3,
+            &index,
+            InsertRecordHandling::Apply,
+            None
+        ));
+        assert!(is_pk_visible_i64(
+            3,
+            &index,
+            InsertRecordHandling::Ignore,
+            None
+        ));
+
+        // The min-seq cutoff overrides everything: deletions at or below the
+        // protected snapshot's creation sequence are skipped.
+        assert!(is_pk_visible_i64(
+            2,
+            &index,
+            InsertRecordHandling::Ignore,
+            Some(20)
+        ));
     }
 
     #[tokio::test]
@@ -829,12 +946,13 @@ mod tests {
 
         let mut stream = KeyBasedDeletionFilterStream {
             input,
-            deleted_row_keys,
-            insert_records: Arc::new(KeyDeletionIndex::empty()),
+            tombstones: deleted_row_keys,
+            insert_record_handling: InsertRecordHandling::Apply,
             pk_column_indices: Vec::new(),
             row_converter,
             min_delete_seq_to_apply: None,
             schema,
+            metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         };
 
         let Some(batch) = stream.next().await.transpose()? else {
