@@ -14,17 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Iceberg delete support.
+//! Iceberg delete support via equality delete files.
 //!
-//! `DELETE FROM` currently fails with a structured `DataFusion` error because
-//! Iceberg 0.9.0 no longer exposes the `RowDeltaAction` API needed to commit
-//! equality delete files safely.
+//! This module implements `DELETE FROM` for Iceberg tables by writing equality
+//! delete files and committing them via the `RowDeltaAction` transaction.
+//!
+//! The approach:
+//! 1. Compute equality-eligible columns (primitive, non-float types)
+//! 2. Scan the table with WHERE filters, projected to only equality columns
+//! 3. Write the matching rows as equality delete Parquet files
+//! 4. Commit the delete files via `RowDeltaAction`
+//!
+//! This uses Iceberg's merge-on-read strategy: the delete files are separate
+//! from data files, and the Iceberg reader filters them out at read time.
 
 use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session};
@@ -35,10 +44,26 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::arrow::FieldMatchMode;
+use iceberg::spec::{DataFileFormat, TableProperties};
 use iceberg::table::Table;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::writer::base_writer::equality_delete_writer::{
+    EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
+};
+use iceberg::writer::file_writer::ParquetWriterBuilder;
+use iceberg::writer::file_writer::location_generator::{
+    DefaultFileNameGenerator, DefaultLocationGenerator,
+};
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, Error as IcebergError};
+use parquet::file::properties::WriterProperties;
+use uuid::Uuid;
 
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
@@ -89,6 +114,12 @@ impl IcebergDeleteExec {
             DataType::UInt64,
             false,
         )]))
+    }
+
+    fn make_count_batch(count: u64) -> DFResult<RecordBatch> {
+        let count_array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
+        RecordBatch::try_from_iter_with_nullable(vec![("count", count_array, false)])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
@@ -158,7 +189,7 @@ impl ExecutionPlan for IcebergDeleteExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
@@ -166,9 +197,148 @@ impl ExecutionPlan for IcebergDeleteExec {
             )));
         }
 
-        Err(DataFusionError::NotImplemented(
-            "DELETE FROM Iceberg tables is not supported with the current Iceberg dependency because committing equality delete files requires RowDeltaAction, which is unavailable in Iceberg 0.9.0".to_string(),
-        ))
+        let table = self.table.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let input_plan = Arc::clone(&self.input);
+        let count_schema = Self::make_count_schema();
+        let equality_ids = self.equality_ids.clone();
+
+        let stream = futures::stream::once(async move {
+            // Collect all input partitions into a single stream
+            let partition_count = input_plan
+                .properties()
+                .output_partitioning()
+                .partition_count();
+            let mut total_delete_count: u64 = 0;
+
+            // Get the iceberg schema for the equality delete writer
+            let iceberg_schema = Arc::clone(table.metadata().current_schema());
+
+            tracing::debug!(
+                table = %table.identifier(),
+                equality_id_count = equality_ids.len(),
+                ?equality_ids,
+                "Writing equality delete files"
+            );
+
+            // Set up the equality delete writer
+            let file_io = table.file_io().clone();
+            let location_generator =
+                DefaultLocationGenerator::new(table.metadata().clone()).map_err(to_df_error)?;
+            let file_name_generator = DefaultFileNameGenerator::new(
+                Uuid::now_v7().to_string(),
+                Some("eq-del".to_string()),
+                DataFileFormat::Parquet,
+            );
+
+            let target_file_size = table
+                .metadata()
+                .properties()
+                .get(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES)
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+
+            // Build a sub-schema containing only the equality-eligible
+            // fields. The input scan is already projected to these columns,
+            // so the `EqualityDeleteWriterConfig` projector must map from
+            // this sub-schema (not the full table schema) to avoid index
+            // out-of-bounds when re-projecting the already-projected batches.
+            let equality_id_set: std::collections::HashSet<i32> =
+                equality_ids.iter().copied().collect();
+            let equality_fields: Vec<_> = iceberg_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .filter(|f| equality_id_set.contains(&f.id))
+                .cloned()
+                .collect();
+            let equality_schema = Arc::new(
+                iceberg::spec::Schema::builder()
+                    .with_schema_id(iceberg_schema.schema_id())
+                    .with_fields(equality_fields)
+                    .build()
+                    .map_err(to_df_error)?,
+            );
+
+            let parquet_writer_builder = ParquetWriterBuilder::new_with_match_mode(
+                WriterProperties::default(),
+                Arc::clone(&equality_schema),
+                FieldMatchMode::Name,
+            );
+            let rolling_writer_builder = RollingFileWriterBuilder::new(
+                parquet_writer_builder,
+                target_file_size,
+                file_io,
+                location_generator,
+                file_name_generator,
+            );
+
+            let config = EqualityDeleteWriterConfig::new(equality_ids.clone(), equality_schema)
+                .map_err(to_df_error)?;
+
+            let writer_builder =
+                EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config);
+
+            let mut writer = writer_builder.build(None).await.map_err(to_df_error)?;
+
+            // Read from all partitions and write equality delete files.
+            // The input scan is already projected to only include the equality
+            // columns, so no additional projection is needed.
+            for p in 0..partition_count {
+                let mut batch_stream = input_plan.execute(p, Arc::clone(&context))?;
+                while let Some(batch_result) = batch_stream.next().await {
+                    let batch = batch_result?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+
+                    let batch_rows = u64::try_from(batch.num_rows()).map_err(|_| {
+                        DataFusionError::Internal(format!(
+                            "Batch row count {} exceeds u64 range",
+                            batch.num_rows()
+                        ))
+                    })?;
+                    total_delete_count =
+                        total_delete_count.checked_add(batch_rows).ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Total delete row count overflowed u64".to_string(),
+                            )
+                        })?;
+                    writer.write(batch).await.map_err(to_df_error)?;
+                }
+            }
+
+            // If no rows matched, return count=0
+            if total_delete_count == 0 {
+                return Self::make_count_batch(0);
+            }
+
+            // Close the writer to get the delete files
+            let delete_files = writer.close().await.map_err(to_df_error)?;
+
+            if delete_files.is_empty() {
+                return Self::make_count_batch(0);
+            }
+
+            // Commit via RowDeltaAction
+            let tx = Transaction::new(&table);
+            let action = tx.row_delta().add_delete_files(delete_files);
+
+            action
+                .apply(tx)
+                .map_err(to_df_error)?
+                .commit(catalog.as_ref())
+                .await
+                .map_err(to_df_error)?;
+
+            Self::make_count_batch(total_delete_count)
+        })
+        .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 

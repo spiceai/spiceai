@@ -139,9 +139,9 @@ aws-smithy-runtime = "1.11.1"
 aws-smithy-runtime-api = "1.11.6"
 aws-smithy-types = "1.4.5"
 axum = { version = "0.8", features = ["macros"] }
-ballista-core = "53.0.0"
-ballista-executor = "53.0.0"
-ballista-scheduler = { version = "53.0.0" }
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "e0a78666b36eb72d78455d6cfbdf5dcc2972e16d" } # spiceai-53 (clean upstream 53.0.0)
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "e0a78666b36eb72d78455d6cfbdf5dcc2972e16d" }
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "e0a78666b36eb72d78455d6cfbdf5dcc2972e16d" }
 base64 = "0.22.1"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -169,7 +169,7 @@ datafusion-common-runtime = "53.0.0"
 datafusion-datasource = "53.0.0"
 datafusion-execution = "53.0.0"
 datafusion-expr = "53.0.0"
-datafusion-federation = { version = "0.5.3", features = ["sql"] }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "ac7bde412057e7f4146bb409f8495aef82583135", features = ["sql"] } # spiceai fork (v0.5.3 DF53)
 datafusion-functions = "53.0.0"
 datafusion-functions-json = "0.53"
 datafusion-physical-expr = "53.0.0"
@@ -181,7 +181,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = "0.11.0"
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "15d4d415611bb3f19db5f2cd705ed752a10923ab" } # spiceai-53 (v0.11.0 DF53)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -438,12 +438,12 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
-iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
-iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
-iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
-iceberg_test_utils = { git = "https://github.com/apache/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "0805971c97ed025de1d3084dbb113626061971ce" }
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be

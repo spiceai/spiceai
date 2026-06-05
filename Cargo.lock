@@ -2556,8 +2556,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "53.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "140cbfc86a7ee22a1d7ce2beadbf546bb2f84382c667e9fc087ac89695c9d73d"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e0a78666b36eb72d78455d6cfbdf5dcc2972e16d#e0a78666b36eb72d78455d6cfbdf5dcc2972e16d"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2592,8 +2591,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "53.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81cd251d7dc9169cdc821a8ba4fbe793fb5aaca01847ef5d3d8c0aea378a459e"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e0a78666b36eb72d78455d6cfbdf5dcc2972e16d#e0a78666b36eb72d78455d6cfbdf5dcc2972e16d"
 dependencies = [
  "arrow 58.3.0",
  "arrow-flight",
@@ -2626,8 +2624,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "53.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4e4921eda69899d12d868e9337ce989f4f11f81ca296d1484c422a0491d9b4e"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e0a78666b36eb72d78455d6cfbdf5dcc2972e16d#e0a78666b36eb72d78455d6cfbdf5dcc2972e16d"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -3650,7 +3647,7 @@ dependencies = [
  "datafusion-dml",
  "datafusion-execution",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
@@ -4246,7 +4243,7 @@ dependencies = [
  "async-trait",
  "data_components",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "flight_client",
  "linkme",
  "ns_lookup",
@@ -5601,7 +5598,7 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
@@ -6057,6 +6054,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-federation"
+version = "0.5.3"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135#ac7bde412057e7f4146bb409f8495aef82583135"
+dependencies = [
+ "arrow-json 58.3.0",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "futures",
+]
+
+[[package]]
 name = "datafusion-flightsql"
 version = "0.1.0"
 dependencies = [
@@ -6268,7 +6277,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "datafusion-table-providers",
  "duckdb",
  "flight_client",
@@ -6523,8 +6532,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "657cc234eba1c5df39d287a69c58755fa355ff696ec49daee325c0070b7c966a"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=15d4d415611bb3f19db5f2cd705ed752a10923ab#15d4d415611bb3f19db5f2cd705ed752a10923ab"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6541,7 +6549,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "dyn-clone",
  "fallible-iterator 0.3.0",
  "fundu",
@@ -9580,7 +9588,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9615,6 +9623,7 @@ dependencies = [
  "parquet",
  "rand 0.9.4",
  "reqwest 0.12.24",
+ "reqwest-middleware",
  "roaring",
  "serde",
  "serde_bytes",
@@ -9636,7 +9645,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9651,14 +9660,20 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-sts",
+ "aws-sigv4",
  "chrono",
  "http 1.4.0",
  "iceberg",
  "itertools 0.13.0",
  "reqwest 0.12.24",
+ "reqwest-middleware",
  "serde",
  "serde_derive",
  "serde_json",
@@ -9670,7 +9685,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9686,7 +9701,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9705,7 +9720,7 @@ dependencies = [
 [[package]]
 name = "iceberg_test_utils"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=28c4800f198686f306bd80d11d03f232670feec3#28c4800f198686f306bd80d11d03f232670feec3"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=0805971c97ed025de1d3084dbb113626061971ce#0805971c97ed025de1d3084dbb113626061971ce"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -16166,7 +16181,7 @@ dependencies = [
  "datafusion-ddl",
  "datafusion-dml",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-proto",
@@ -16453,7 +16468,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
- "datafusion-federation",
+ "datafusion-federation 0.5.3 (git+https://github.com/spiceai/datafusion-federation.git?rev=ac7bde412057e7f4146bb409f8495aef82583135)",
  "datafusion-optimizer-rules",
  "datafusion-pruning",
  "datafusion-table-providers",
