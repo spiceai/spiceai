@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn envsubst_plain_text_unchanged() {
-        let result = envsubst("hello world").unwrap();
+        let result = envsubst("hello world").expect("plain text");
         assert_eq!(result, "hello world");
     }
 
@@ -248,7 +248,7 @@ mod tests {
     fn envsubst_resolves_set_var() {
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::set_var("SPIDAPTER_TEST_VAR_A", "resolved") };
-        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_A}").unwrap();
+        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_A}").expect("set var");
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_A") };
         assert_eq!(result, "value: resolved");
     }
@@ -257,7 +257,7 @@ mod tests {
     fn envsubst_uses_default_when_unset() {
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_UNSET") };
-        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_UNSET:-fallback}").unwrap();
+        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_UNSET:-fallback}").expect("default");
         assert_eq!(result, "value: fallback");
     }
 
@@ -265,7 +265,7 @@ mod tests {
     fn envsubst_empty_default_when_unset() {
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_EMPTY") };
-        let result = envsubst("iam: ${SPIDAPTER_TEST_VAR_EMPTY:-}").unwrap();
+        let result = envsubst("iam: ${SPIDAPTER_TEST_VAR_EMPTY:-}").expect("empty default");
         assert_eq!(result, "iam: ");
     }
 
@@ -273,7 +273,7 @@ mod tests {
     fn envsubst_errors_on_unset_with_no_default() {
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_NODEFAULT") };
-        let err = envsubst("value: ${SPIDAPTER_TEST_VAR_NODEFAULT}").unwrap_err();
+        let err = envsubst("value: ${SPIDAPTER_TEST_VAR_NODEFAULT}").expect_err("should fail");
         assert!(err.to_string().contains("SPIDAPTER_TEST_VAR_NODEFAULT"));
     }
 
@@ -281,7 +281,7 @@ mod tests {
     fn envsubst_set_var_overrides_default() {
         // SAFETY: test-only, single-threaded test runner
         unsafe { std::env::set_var("SPIDAPTER_TEST_VAR_B", "override") };
-        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_B:-default}").unwrap();
+        let result = envsubst("value: ${SPIDAPTER_TEST_VAR_B:-default}").expect("override");
         unsafe { std::env::remove_var("SPIDAPTER_TEST_VAR_B") };
         assert_eq!(result, "value: override");
     }
