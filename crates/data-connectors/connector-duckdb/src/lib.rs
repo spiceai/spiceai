@@ -38,6 +38,7 @@ use runtime::dataconnector::{
     DataConnectorFactory, DataConnectorResult,
 };
 use runtime::datafusion::dialect::new_duckdb_dialect;
+use runtime::datafusion::udf::deny_spice_functions_for_duckdb;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -67,6 +68,21 @@ impl std::fmt::Debug for DuckDB {
 }
 
 impl DuckDB {
+    /// Build a [`DuckDBTableFactory`] with the Spice function deny-list installed.
+    ///
+    /// Without the deny-list, federation pushes Spice-only UDFs (`json_get_str`,
+    /// the embedding/distance UDFs, etc.) into the SQL sent to `DuckDB`, where
+    /// those functions don't exist — the query then fails with an "unknown
+    /// function" error from `DuckDB`. Installing the deny-list makes `DuckDB`'s
+    /// `can_execute_plan` refuse such plans so `DataFusion` evaluates the affected
+    /// expressions locally instead. We use [`deny_spice_functions_for_duckdb`]
+    /// (rather than the generic deny-list) so functions `DuckDB` *does* support
+    /// natively — e.g. `cosine_distance`, which `DuckDB` unparses to
+    /// `array_cosine_distance` — still federate. See issue #10703.
+    fn with_spice_deny_list(factory: DuckDBTableFactory) -> DuckDBTableFactory {
+        factory.with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+    }
+
     /// Creates an in-memory `DuckDB` table factory.
     ///
     /// # Errors
@@ -87,7 +103,9 @@ impl DuckDB {
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
+        Ok(Self::with_spice_deny_list(
+            DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
+        ))
     }
 
     /// Creates a file-based `DuckDB` table factory.
@@ -110,7 +128,9 @@ impl DuckDB {
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
+        Ok(Self::with_spice_deny_list(
+            DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
+        ))
     }
 }
 
