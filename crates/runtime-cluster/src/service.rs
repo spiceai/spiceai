@@ -499,6 +499,23 @@ impl PartitionService {
 
         let diff = PartitionDiff { new, removed };
 
+        // Ensure the table has a metadata entry (with `updated_at > 0`) even
+        // when the source currently has no partitions — readiness for
+        // zero-partition tables is gated on the `updated_at > 0` shortcut in
+        // `PartitionLoadTracker::is_table_loaded`, which could never trip if
+        // the entry were only created once partitions are added. Also lets
+        // `add_partitions_with_retry` find the entry below.
+        // No-op if already initialized.
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+        if let Err(e) = self
+            .partition_store
+            .initialize_metadata(table, partition_expressions)
+            .await
+        {
+            tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
+        }
+
         if diff.is_empty() {
             return Ok(diff);
         }
@@ -509,17 +526,6 @@ impl PartitionService {
                 count = diff.new.len(),
                 "Adding new partitions"
             );
-            // Initialize metadata so add_partitions_with_retry can find it.
-            // No-op if already initialized.
-            let partition_expressions: Vec<String> =
-                partition_by.iter().map(|p| p.expression.clone()).collect();
-            if let Err(e) = self
-                .partition_store
-                .initialize_metadata(table, partition_expressions)
-                .await
-            {
-                tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
-            }
             add_partitions_with_retry(&self.partition_store, table, diff.new.clone()).await?;
             if let Some(node_id) = self.executor_registry.node_id() {
                 metrics::record_partition_state_operation(
@@ -1371,6 +1377,74 @@ mod tests {
 
     fn unassigned_partition(key: &str, val: &str) -> PartitionMetadata {
         PartitionMetadata::new(pv(key, val))
+    }
+
+    /// `PartitionOperations` stub whose discovery always returns zero
+    /// partition values, modelling an empty source table.
+    struct EmptySourceOps;
+
+    #[async_trait::async_trait]
+    impl crate::context::PartitionExprResolver for EmptySourceOps {
+        async fn try_parse_expr(
+            &self,
+            _tbl: &TableReference,
+            expr: &str,
+        ) -> std::result::Result<::datafusion_expr::Expr, datafusion::error::DataFusionError>
+        {
+            Ok(::datafusion_expr::col(expr))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::PartitionDiscoverer for EmptySourceOps {
+        async fn table_partition_values(
+            &self,
+            _table: &TableReference,
+            _partition_by: &[PartitionedBy],
+        ) -> std::result::Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Seeding a table whose source has zero partitions must still create a
+    /// metadata entry with `updated_at > 0` — readiness for zero-partition
+    /// tables is gated on the `updated_at > 0` shortcut in
+    /// `PartitionLoadTracker::is_table_loaded`, which can never trip if the
+    /// entry is only written once partitions are discovered (#11152).
+    #[tokio::test]
+    async fn seed_table_with_empty_source_writes_metadata_entry() {
+        let store = make_store().await;
+        let registry = Arc::new(ExecutorRegistry::new(
+            Arc::clone(&store),
+            make_store().await,
+        ));
+        let service = PartitionService::new(
+            Arc::clone(&store),
+            registry,
+            Arc::new(tokio::sync::RwLock::new(None)),
+        );
+
+        let table = TableReference::parse_str("empty_table");
+        let partition_by = vec![PartitionedBy {
+            name: "r_regionkey".to_string(),
+            expression: "r_regionkey".to_string(),
+        }];
+
+        service
+            .seed_table(&table, &partition_by, &EmptySourceOps)
+            .await
+            .expect("seed_table");
+
+        store.refresh().await.expect("refresh");
+        let metadata = store
+            .get_cached_table_metadata(&table)
+            .expect("metadata entry must exist for zero-partition table");
+        assert!(metadata.partitions.is_empty());
+        assert!(
+            metadata.updated_at > 0,
+            "updated_at must be stamped so the readiness shortcut can trip"
+        );
     }
 
     #[tokio::test]

@@ -29,11 +29,23 @@ pub use config::{ChBenchConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
 use ::rand::SeedableRng;
 use ::rand::rngs::StdRng;
 use async_trait::async_trait;
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
 use snafu::{Snafu, ensure};
 use tokio_util::sync::CancellationToken;
+
+/// Shared rate limiter gating the aggregate OLTP transaction rate across all terminals.
+type OltpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,6 +59,9 @@ pub enum Error {
         "{failed}/{total} OLTP terminal(s) failed — benchmark results are unreliable"
     ))]
     OltpTerminalFailures { failed: usize, total: usize },
+
+    #[snafu(display("Invalid OLTP target rate: {rate} (must be > 0)"))]
+    InvalidRate { rate: u32 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -154,17 +169,41 @@ impl ChBenchDriver for PostgresChBenchDriver {
 
         let assignments = txn::TerminalAssignment::compute(terminals, warehouses);
 
-        println!(
-            "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}",
-        );
+        // A single shared, work-conserving limiter caps the aggregate transaction rate across all terminals.
+        let rate_limiter = match self.config.rate {
+            Some(rate) => {
+                let cells = NonZeroU32::new(rate).ok_or(Error::InvalidRate { rate })?;
+                Some(Arc::new(RateLimiter::direct(Quota::per_second(cells))))
+            }
+            None => None,
+        };
+
+        match self.config.rate {
+            Some(rate) => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate={rate} txn/s",
+            ),
+            None => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate=unlimited",
+            ),
+        }
 
         let mut handles = Vec::with_capacity(terminals);
         for (terminal_id, &assignment) in assignments.iter().enumerate() {
             let conn_str = self.source.connection_string();
             let stop = stop.clone();
+            let rate_limiter = rate_limiter.clone();
 
             handles.push(tokio::spawn(async move {
-                run_terminal(terminal_id, &conn_str, stop, assignment, mix, base_seed).await
+                run_terminal(
+                    terminal_id,
+                    &conn_str,
+                    stop,
+                    assignment,
+                    mix,
+                    base_seed,
+                    rate_limiter,
+                )
+                .await
             }));
         }
 
@@ -242,6 +281,7 @@ async fn run_terminal(
     assignment: txn::TerminalAssignment,
     mix: [u32; 5],
     base_seed: u64,
+    rate_limiter: Option<Arc<OltpRateLimiter>>,
 ) -> Result<metrics::OltpMetrics> {
     let (mut client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
         .await
@@ -270,6 +310,14 @@ async fn run_terminal(
     loop {
         if stop.is_cancelled() {
             break;
+        }
+
+        // Wait for a slot from the shared rate limiter (work-conserving across all terminals)
+        if let Some(limiter) = &rate_limiter {
+            tokio::select! {
+                () = limiter.until_ready() => {}
+                () = stop.cancelled() => break,
+            }
         }
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);
