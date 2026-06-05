@@ -392,6 +392,9 @@ candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "6e
 # point it at the spiceai fork's candle-0.10-compatible fallback shim.
 candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "397d733869484e21c61a6137f75489d0eca71f5f" } # spiceai
 
+# TEMPORARY: datafusion* are pinned to a spiceai/datafusion PR-branch commit for the
+# AT TIME ZONE unparser fix (spiceai/datafusion#160). Repoint to a merged spiceai-52.5
+# commit once #160 lands. The `# spiceai-52.5` tags below mark the intended base branch.
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "accd479bae3e456b8d880d1e2eae0f66184d9b93" }                       # spiceai-52.5
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "accd479bae3e456b8d880d1e2eae0f66184d9b93" }               # spiceai-52.5
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "accd479bae3e456b8d880d1e2eae0f66184d9b93" }       # spiceai-52.5

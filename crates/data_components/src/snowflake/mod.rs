@@ -147,8 +147,10 @@ fn snowflake_dialect() -> dialect::CustomDialect {
         // Render `expr AT TIME ZONE 'tz'` as `CAST(CONVERT_TIMEZONE('tz', expr) AS
         // TIMESTAMP_NTZ)` rather than dropping the zone name (which silently changed
         // the meaning of federated predicates). Correct composition of chained
-        // conversions relies on the session TIMEZONE being pinned to UTC — see
-        // `SnowflakeConnectionPool::new` and https://github.com/spiceai/datafusion/pull/160.
+        // conversions relies on the session TIMEZONE being pinned to UTC, which the
+        // Snowflake connection pool enforces on connect (see the `ALTER SESSION SET
+        // TIMEZONE` call in `db_connection_pool::snowflakepool`). Background:
+        // https://github.com/spiceai/datafusion/pull/160.
         .with_timezone_cast_style(dialect::TimezoneCastStyle::ConvertTimezone)
         .build()
 }

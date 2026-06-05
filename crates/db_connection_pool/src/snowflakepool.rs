@@ -491,6 +491,13 @@ pub enum Error {
         "Both `snowflake_private_key` and `snowflake_private_key_path` are specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
     ))]
     MutuallyExclusivePrivateKeyParams,
+
+    #[snafu(display(
+        "Failed to set the Snowflake session timezone to UTC, which is required for correct `AT TIME ZONE` predicate pushdown. Verify the role can run `ALTER SESSION SET TIMEZONE`, and try again. {source}"
+    ))]
+    UnableToSetSessionTimezone {
+        source: snowflake_api::SnowflakeApiError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -713,15 +720,13 @@ impl SnowflakeConnectionPool {
         );
 
         // Pin the session timezone to UTC. Federated `AT TIME ZONE` predicates are
-        // unparsed to `CAST(CONVERT_TIMEZONE('tz', ...) AS TIMESTAMP_NTZ)`; chained
-        // conversions interpret the intermediate naive timestamp in the session zone,
-        // so a non-UTC session default would silently shift predicate boundaries.
-        if let Err(err) = api.exec("ALTER SESSION SET TIMEZONE = 'UTC'").await {
-            tracing::warn!(
-                error = %err,
-                "Failed to pin Snowflake session TIMEZONE to UTC; federated AT TIME ZONE predicates may be evaluated against the session default timezone"
-            );
-        }
+        // unparsed to `CAST(CONVERT_TIMEZONE('tz', ...) AS TIMESTAMP_NTZ)` chains that
+        // interpret the intermediate naive timestamp in the session zone, so a non-UTC
+        // session would silently shift predicate boundaries. Fail rather than risk
+        // returning wrong results — `ALTER SESSION SET TIMEZONE` is available to any role.
+        api.exec("ALTER SESSION SET TIMEZONE = 'UTC'")
+            .await
+            .context(UnableToSetSessionTimezoneSnafu)?;
 
         let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
