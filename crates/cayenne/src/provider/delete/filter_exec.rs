@@ -65,7 +65,8 @@ use std::sync::Arc;
 /// merge-on-read deletion read-tax invisible (its only signal was an OS-level
 /// CPU sample of `KeyDeletionIndex::get`). These surface, per partition:
 /// - `output_rows` / `elapsed_compute` (`DataFusion` baseline) — the per-row probe cost.
-/// - `rows_deleted` — rows removed by the filter (selectivity; `input_rows - output_rows`).
+/// - `rows_deleted` — rows removed by the filter; scanned rows can be inferred as
+///   `rows_deleted + output_rows`.
 ///
 /// The deletion-set size is shown in the exec's `DisplayAs` label (`filtered_keys=`),
 /// not as a metric: it is a per-table constant, and `DataFusion` sums metric values
@@ -485,9 +486,6 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
-                    self.metrics.rows_deleted.add(batch_size - keep_count);
-                    self.metrics.baseline.record_output(keep_count);
-
                     // Apply mask in one shot via Arrow's filter kernel.
                     let filter_array = BooleanArray::new(keep_mask.finish(), None);
                     let filtered_batch =
@@ -502,6 +500,12 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -765,9 +769,6 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
-                    self.metrics.rows_deleted.add(batch_size - keep_count);
-                    self.metrics.baseline.record_output(keep_count);
-
                     // Apply mask in one shot via Arrow's filter kernel.
                     let filter_array = BooleanArray::new(keep_mask.finish(), None);
                     let filtered_batch =
@@ -782,6 +783,12 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
