@@ -231,7 +231,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - charset 0.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/hsivonen/charset
 
-- chbench-driver 2.0.0-rc.5,  ../../LICENSE
+- chbench-driver 2.0.0,  ../../LICENSE
   <br/>
 
 - chrono 0.4.44, Apache-2.0 OR MIT 
@@ -261,73 +261,73 @@ Spice.ai acknowledges the following open source projects for making this project
 - comfy-table 7.1.2, MIT 
   <br/>https://github.com/nukesor/comfy-table
 
-- connector-clickhouse 2.0.0-rc.5,  ../../../LICENSE
+- connector-clickhouse 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-databricks 2.0.0-rc.5,  ../../../LICENSE
+- connector-databricks 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-delta-lake 2.0.0-rc.5,  ../../../LICENSE
+- connector-delta-lake 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-dremio 2.0.0-rc.5,  ../../../LICENSE
+- connector-dremio 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-duckdb 2.0.0-rc.5,  ../../../LICENSE
+- connector-duckdb 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-elasticsearch 2.0.0-rc.5,  ../../../LICENSE
+- connector-elasticsearch 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-flightsql 2.0.0-rc.5,  ../../../LICENSE
+- connector-flightsql 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-ftp 2.0.0-rc.5,  ../../../LICENSE
+- connector-ftp 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-graphql 2.0.0-rc.5,  ../../../LICENSE
+- connector-graphql 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-imap 2.0.0-rc.5,  ../../../LICENSE
+- connector-imap 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-mongodb 2.0.0-rc.5,  ../../../LICENSE
+- connector-mongodb 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-mssql 2.0.0-rc.5,  ../../../LICENSE
+- connector-mssql 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-mysql 2.0.0-rc.5,  ../../../LICENSE
+- connector-mysql 2.0.0,  ../../../LICENSE
   <br/>
 
 - connector-nfs 1.11.0-unstable, Apache-2.0 
   <br/>
 
-- connector-odbc 2.0.0-rc.5,  ../../../LICENSE
+- connector-odbc 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-oracle 2.0.0-rc.5,  ../../../LICENSE
+- connector-oracle 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-postgres 2.0.0-rc.5,  ../../../LICENSE
+- connector-postgres 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-scylladb 2.0.0-rc.5,  ../../../LICENSE
+- connector-scylladb 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-sftp 2.0.0-rc.5,  ../../../LICENSE
+- connector-sftp 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-sharepoint 2.0.0-rc.5,  ../../../LICENSE
+- connector-sharepoint 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-smb 2.0.0-rc.5,  ../../../LICENSE
+- connector-smb 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-snowflake 2.0.0-rc.5,  ../../../LICENSE
+- connector-snowflake 2.0.0,  ../../../LICENSE
   <br/>
 
-- connector-spark 2.0.0-rc.5,  ../../../LICENSE
+- connector-spark 2.0.0,  ../../../LICENSE
   <br/>
 
 - criterion 0.5.1, Apache-2.0 OR MIT 
@@ -408,6 +408,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - datafusion-proto 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
+- datafusion-proto-common 52.5.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
 - datafusion-pruning 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
@@ -435,10 +438,10 @@ Spice.ai acknowledges the following open source projects for making this project
 - dotenvy 0.15.7, MIT 
   <br/>https://github.com/allan2/dotenvy
 
-- duckdb 1.10502.0, MIT 
+- duckdb 1.10503.1, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
-- duration-parse 2.0.0-rc.5, Apache-2.0 
+- duration-parse 2.0.0, Apache-2.0 
   <br/>
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -447,7 +450,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - either 1.15.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- elasticsearch 2.0.0-rc.5,  ../../LICENSE
+- elasticsearch 2.0.0,  ../../LICENSE
   <br/>
 
 - flatbuffers 25.12.19, Apache-2.0 
@@ -557,6 +560,9 @@ Spice.ai acknowledges the following open source projects for making this project
 
 - iceberg_test_utils 0.9.1, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
+
+- im 15.1.0, MPL-2.0+ 
+  <br/>https://github.com/bodil/im-rs
 
 - imap 3.0.0-alpha.14, Apache-2.0 OR MIT 
   <br/>https://github.com/jonhoo/rust-imap
@@ -906,7 +912,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - spiceai 3.2.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 2.0.0-rc.5,  ../../LICENSE
+- spicepod-validator 2.0.0,  ../../LICENSE
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
