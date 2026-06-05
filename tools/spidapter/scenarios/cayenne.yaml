@@ -1,6 +1,7 @@
 compute:
   scp:
     channel: ${SPIDAPTER_CHANNEL:-nightly}
+    image_tag: ${SPIDAPTER_IMAGE_TAG:-}
     scheduler_state_location: ${SCHEDULER_STATE_LOCATION:-}
     organization_tag: ${SPIDAPTER_ORGANIZATION_TAG:-}
     query_memory_limit: ${SPIDAPTER_QUERY_MEMORY_LIMIT:-}
