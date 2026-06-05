@@ -25,6 +25,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -205,6 +206,45 @@ fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
     let mut configs = Vec::new();
     collect_file_scan_configs(plan, &mut configs);
     configs
+}
+
+/// Counts file-backed scan sources (snapshot generations) and the total files
+/// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
+///
+/// Unlike [`file_scan_configs`], this walks the WHOLE subtree and does not stop at
+/// non-identity-preserving wrappers: for read-amplification reporting we want every
+/// `DataSourceExec` that touches disk regardless of the per-snapshot deletion filter,
+/// sort, or other operator sitting above it.
+fn count_file_scan_sources(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+    let mut snapshots = 0;
+    let mut files = 0;
+    accumulate_file_scan_sources(plan, &mut snapshots, &mut files);
+    (snapshots, files)
+}
+
+fn accumulate_file_scan_sources(
+    plan: &Arc<dyn ExecutionPlan>,
+    snapshots: &mut usize,
+    files: &mut usize,
+) {
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+        if let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+        {
+            *snapshots += 1;
+            *files += file_scan_config
+                .file_groups
+                .iter()
+                .map(FileGroup::len)
+                .sum::<usize>();
+        }
+        return;
+    }
+    for child in plan.children() {
+        accumulate_file_scan_sources(child, snapshots, files);
+    }
 }
 
 /// Walks `plan` looking for underlying file-backed `DataSourceExec` nodes,
@@ -419,7 +459,20 @@ impl DisplayAs for CayenneAccelerationExec {
         _t: datafusion_physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "CayenneAccelerationExec")
+        // Surface read amplification: how many file-backed snapshots this scan unions
+        // (base + un-compacted protected snapshots) and the total Vortex files across
+        // them. Each query re-scans and merge-filters every generation, so a rising
+        // `snapshots_scanned` is the signal that compaction is behind. This is the
+        // structural read-tax that otherwise had to be hand-counted from the plan tree.
+        //
+        // NB: a full subtree walk, NOT `file_scan_configs` — the latter intentionally
+        // stops at non-identity-preserving nodes (the per-snapshot deletion filter is
+        // one), which would undercount the snapshots to zero on a real scan plan.
+        let (snapshots_scanned, files_scanned) = count_file_scan_sources(&self.inner);
+        write!(
+            f,
+            "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
+        )
     }
 }
 
