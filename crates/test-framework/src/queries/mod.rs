@@ -315,6 +315,7 @@ impl Query {
                             *alias = Some(TableAlias {
                                 name: original,
                                 columns: Vec::new(),
+                                explicit: false,
                             });
                         }
                     }
