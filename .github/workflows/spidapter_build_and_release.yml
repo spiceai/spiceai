@@ -96,8 +96,10 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Copy Dockerfile to build context
-        run: cp tools/spidapter/Dockerfile ./build/Dockerfile
+      - name: Copy Dockerfile and scenarios to build context
+        run: |
+          cp tools/spidapter/Dockerfile ./build/Dockerfile
+          cp -r tools/spidapter/scenarios ./build/scenarios
 
       - name: Build image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0

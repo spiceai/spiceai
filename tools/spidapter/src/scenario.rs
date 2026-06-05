@@ -162,39 +162,29 @@ pub(crate) struct DynamoDbConfig {
     pub region: String,
 }
 
-/// Load a scenario by name.
+/// Load a scenario by name from the filesystem.
 ///
-/// Resolution order:
-/// 1. If `base_path` is set, try `<base_path>/<name>.yaml` from the filesystem.
-/// 2. Fall back to the built-in scenarios embedded at compile time.
+/// Resolves `<base_path>/<name>.yaml` when `base_path` is set, otherwise
+/// falls back to `<name>.yaml` relative to the current directory.
 ///
 /// Env-var substitution (`${VAR}` / `${VAR:-default}`) is applied before parsing.
 pub(crate) fn load_scenario(name: &str, base_path: Option<&str>) -> anyhow::Result<ScenarioConfig> {
-    let from_fs = base_path.map(|base| {
-        let path = std::path::Path::new(base).join(format!("{name}.yaml"));
-        (path.exists(), path)
-    });
-
-    let raw_owned;
-    let raw: &str = if let Some((true, ref path)) = from_fs {
-        raw_owned = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read scenario file '{}': {e}", path.display()))?;
-        eprintln!("[stdio] Loading scenario '{name}' from {}", path.display());
-        &raw_owned
-    } else {
-        match name {
-            "cayenne" => include_str!("../scenarios/cayenne.yaml"),
-            "postgres-wal" => include_str!("../scenarios/postgres-wal.yaml"),
-            "postgres-debezium" => include_str!("../scenarios/postgres-debezium.yaml"),
-            "dynamodb-streams" => include_str!("../scenarios/dynamodb-streams.yaml"),
-            "mongodb-streams" => include_str!("../scenarios/mongodb-streams.yaml"),
-            other => anyhow::bail!(
-                "Unknown scenario '{other}'. Built-in scenarios: \
-                 direct-ingest, postgres-wal, postgres-debezium, dynamodb-streams, mongodb-streams"
-            ),
-        }
+    let path = match base_path {
+        Some(base) => std::path::Path::new(base).join(format!("{name}.yaml")),
+        None => std::path::PathBuf::from(format!("{name}.yaml")),
     };
-    let substituted = envsubst(raw)
+
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load scenario '{name}' from '{}': {e}. \
+             Set --scenario-base-path (or SPIDAPTER_SCENARIO_BASE_PATH) to the directory containing scenario YAML files.",
+            path.display()
+        )
+    })?;
+
+    eprintln!("[stdio] Loading scenario '{name}' from {}", path.display());
+
+    let substituted = envsubst(&raw)
         .map_err(|e| anyhow::anyhow!("envsubst failed for scenario '{name}': {e}"))?;
     yaml::from_str(&substituted)
         .map_err(|e| anyhow::anyhow!("Failed to parse scenario '{name}': {e}"))
