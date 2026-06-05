@@ -3901,11 +3901,15 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 name = "connector-abfs"
 version = "2.0.0-unstable"
 dependencies = [
+ "app",
+ "async-trait",
  "datafusion",
+ "datafusion-table-providers",
  "object_store",
  "runtime",
  "snafu",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -3958,8 +3962,8 @@ dependencies = [
  "datafusion-table-providers",
  "opentelemetry",
  "runtime",
- "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4086,7 +4090,10 @@ dependencies = [
 name = "connector-gcs"
 version = "2.0.0-unstable"
 dependencies = [
+ "app",
+ "async-trait",
  "datafusion",
+ "datafusion-table-providers",
  "object_store",
  "runtime",
  "snafu",
@@ -4105,7 +4112,10 @@ dependencies = [
  "opentelemetry",
  "reqwest 0.12.24",
  "runtime",
+ "secrecy",
  "snafu",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4118,6 +4128,7 @@ dependencies = [
  "aws-sdk-glue",
  "aws-sdk-s3",
  "data_components",
+ "datafusion",
  "iceberg",
  "iceberg-catalog-glue",
  "iceberg-datafusion",
@@ -4125,6 +4136,7 @@ dependencies = [
  "runtime",
  "secrecy",
  "snafu",
+ "tokio",
 ]
 
 [[package]]
@@ -4171,10 +4183,13 @@ dependencies = [
  "data_components",
  "dataformat-json",
  "datafusion",
+ "fundu",
  "futures",
+ "opentelemetry",
  "runtime",
  "runtime-secrets",
  "secrecy",
+ "serde_json",
  "snafu",
  "tokio",
  "tonic",

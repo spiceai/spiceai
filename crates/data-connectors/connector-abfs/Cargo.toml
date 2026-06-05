@@ -23,12 +23,18 @@ license-file.workspace = true
 description = "Azure Blob FileSystem (ABFS) data connector for Spice.ai runtime"
 
 [dependencies]
+async-trait.workspace = true
+tracing.workspace = true
 datafusion.workspace = true
 object_store.workspace = true
 runtime = { path = "../../runtime" }
 snafu.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+app = { path = "../../app" }
+datafusion-table-providers.workspace = true
 
 [features]
 default = []

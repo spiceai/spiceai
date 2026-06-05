@@ -45,9 +45,8 @@ use runtime::component::dataset::Dataset;
 use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
 };
-use snafu::prelude::*;
+use runtime::parameters::{ParameterSpec, Parameters};
 use tokio::sync::Semaphore;
 
 /// The name used to identify this connector in configuration.
@@ -260,12 +259,12 @@ impl CosmosDB {
         &self,
         dataset: &Dataset,
     ) -> Result<CosmosDBCredential, DataConnectorError> {
-        if let Some(conn_str) = self.params.get("connection_string").expose().ok() {
+        if let Some(conn_str) = self.params.get("connection_string").expose().ok() as Option<&str> {
             return Ok(CosmosDBCredential::ConnectionString(conn_str.to_string()));
         }
 
-        let endpoint = self.params.get("account_endpoint").expose().ok();
-        let key = self.params.get("account_key").expose().ok();
+        let endpoint: Option<&str> = self.params.get("account_endpoint").expose().ok();
+        let key: Option<&str> = self.params.get("account_key").expose().ok();
 
         match (endpoint, key) {
             (Some(endpoint), Some(key)) => Ok(CosmosDBCredential::Key {
@@ -289,7 +288,7 @@ impl CosmosDB {
             .get("max_concurrent_requests")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v: &str| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
             .max(1);
 
@@ -298,7 +297,7 @@ impl CosmosDB {
             .get("http_max_retries")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|v: &str| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_MAX_RETRIES);
 
         let backoff_value = self
@@ -317,7 +316,7 @@ impl CosmosDB {
             .get("disable_on_permanent_error")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v: &str| v.parse::<bool>().ok())
             .unwrap_or(true);
 
         let semaphore = shared_semaphore(endpoint, max_concurrent_requests);
@@ -429,7 +428,7 @@ impl DataConnector for CosmosDB {
             .expose()
             .ok()
         {
-            Some(value) => match value.parse::<usize>() {
+            Some(value) => match (value as &str).parse::<usize>() {
                 Ok(0) => {
                     tracing::warn!(
                         "Ignoring invalid schema_infer_max_records value '0' for dataset {}; using default value {}.",

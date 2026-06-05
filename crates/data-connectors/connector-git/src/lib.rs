@@ -37,9 +37,10 @@ use runtime::component::dataset::Dataset;
 use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters,
+    DataConnectorResult,
 };
-use secrecy::ExposeSecret;
+use runtime::parameters::{ParameterSpec, Parameters};
+use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -171,13 +172,13 @@ impl Git {
             .params
             .get("password")
             .ok()
-            .map(|s| s.expose_secret().to_string());
+            .map(|s: &SecretString| s.expose_secret().to_string());
 
         let token = self
             .params
             .get("token")
             .ok()
-            .map(|s| s.expose_secret().to_string());
+            .map(|s: &SecretString| s.expose_secret().to_string());
 
         let ssh_key_path = self.params.get("ssh_key").expose().ok().map(PathBuf::from);
 
@@ -185,14 +186,14 @@ impl Git {
             .params
             .get("ssh_passphrase")
             .ok()
-            .map(|s| s.expose_secret().to_string());
+            .map(|s: &SecretString| s.expose_secret().to_string());
 
         let ssh_use_agent = self
             .params
             .get("ssh_use_agent")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v: &str| v.parse::<bool>().ok())
             .unwrap_or(true);
 
         GitCredentials {
@@ -211,7 +212,7 @@ impl Git {
             .get("max_concurrent_requests")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v: &str| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
             .max(1);
 
@@ -220,7 +221,7 @@ impl Git {
             .get("git_max_retries")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|v: &str| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_MAX_RETRIES);
 
         let backoff_value = self
@@ -239,7 +240,7 @@ impl Git {
             .get("disable_on_permanent_error")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v: &str| v.parse::<bool>().ok())
             .unwrap_or(true);
 
         let key = data_components::git::sanitize_repo_url(repo_url);
@@ -297,7 +298,7 @@ impl Git {
             .get("fetch_content")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v: &str| v.parse::<bool>().ok())
             .unwrap_or(false);
 
         let cache_path = self
@@ -312,7 +313,7 @@ impl Git {
             .get("max_files")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v: &str| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_FILES);
 
         let max_file_bytes = self
@@ -320,7 +321,7 @@ impl Git {
             .get("max_file_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v: &str| v.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_FILE_BYTES);
 
         let enable_lfs = self
@@ -328,10 +329,10 @@ impl Git {
             .get("enable_lfs")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v: &str| v.parse::<bool>().ok())
             .unwrap_or(false);
 
-        let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);
+        let rate_limiter = Arc::new(NoOpRateLimiter) as Arc<dyn RateLimiter>;
 
         let credentials = self.build_credentials();
         let resilience = self.build_resilience(&repo_url);

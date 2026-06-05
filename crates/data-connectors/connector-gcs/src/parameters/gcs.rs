@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use snafu::prelude::*;
-use tonic::async_trait;
+use async_trait::async_trait;
 
 use runtime::dataconnector::parameters::{ConnectorParams, Validator};
 
@@ -56,7 +56,7 @@ impl Validator for GcsAuthValidator {
             .get("skip_signature")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         // application_default_credentials must be explicitly "true" to count as an auth method
         let has_application_default_credentials = params
@@ -64,7 +64,7 @@ impl Validator for GcsAuthValidator {
             .get("application_default_credentials")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         // Count active authentication methods
         let auth_method_count = [

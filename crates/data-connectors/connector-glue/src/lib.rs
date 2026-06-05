@@ -33,7 +33,7 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
-use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, future::Future, path::Path, pin::Pin, sync::Arc};
 
 use data_components::glue::InputFormat;
 use runtime::component::dataset::Dataset;

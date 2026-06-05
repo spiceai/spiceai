@@ -27,8 +27,9 @@ use runtime::dataconnector::listing::{
 };
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorResult, ParameterSpec, Parameters, parameters::Validator,
+    DataConnectorResult, parameters::Validator,
 };
+use runtime::parameters::{ParameterSpec, Parameters};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -276,14 +277,14 @@ impl ListingTableConnector for AzureBlobFS {
     ) -> DataConnectorResult<Url> {
         let url = url.unwrap_or(dataset.from.as_str());
 
-        let mut azure_url =
-            Url::parse(url)
-                .boxed()
-                .context(runtime::dataconnector::InvalidConfigurationSnafu {
-                    dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
-                    connector_component: ConnectorComponent::from(dataset)
-                })?;
+        let mut azure_url = Url::parse(url).map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })?;
 
         let params = build_fragments(
             &self.params,
@@ -339,7 +340,7 @@ impl ListingTableConnector for AzureBlobFS {
                     .get("use_cli")
                     .expose()
                     .ok()
-                    .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+                    .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
                 let has_client_creds = self.params.get("client_id").expose().ok().is_some();
                 let has_sas = self.params.get("sas_string").expose().ok().is_some();
 

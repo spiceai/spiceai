@@ -29,8 +29,8 @@ datafusion.workspace = true
 datafusion-table-providers.workspace = true
 opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
-snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [features]
 default = []

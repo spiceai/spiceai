@@ -16,10 +16,12 @@ limitations under the License.
 
 use arrow_schema::SchemaRef;
 use async_stream::stream;
+use async_trait::async_trait;
 use data_components::{
-    cdc::{ChangesStream, CommitError},
+    cdc::ChangesStream,
     kafka::{
-        KafkaConfig, KafkaConsumer, KafkaMetadata, KafkaMetrics, KafkaOffset, KafkaOffsetCommitHook,
+        KafkaConfig, KafkaConsumer, KafkaMetadata, KafkaMetrics, KafkaOffset,
+        SidecarOffsetCommitHook, SidecarOffsetStore,
     },
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
@@ -28,7 +30,6 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use std::time::Duration;
 use std::{any::Any, pin::Pin, sync::Arc};
-use tonic::async_trait;
 
 use runtime::{
     component::{
@@ -36,7 +37,7 @@ use runtime::{
         dataset::{Dataset, acceleration::RefreshMode},
         metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback},
     },
-    dataaccelerator::spice_sys::{self, OpenOption, kafka::KafkaSys},
+    dataaccelerator::spice_sys::{OpenOption, kafka::KafkaSys},
     dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorFactory, parameters::ConnectorParams,
     },
@@ -309,31 +310,35 @@ impl DataConnector for Kafka {
             .as_ref()
             .filter(|acceleration| acceleration.enabled)
         else {
-            return runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "kafka",
-                message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-            .fail();
+            return Err(
+                runtime::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "kafka".to_string(),
+                    message: "The Kafka data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
         };
 
-        ensure!(
-            acceleration.refresh_mode == Some(RefreshMode::Append),
-            runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "kafka",
-                message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka",
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        );
+        if !(acceleration.refresh_mode == Some(RefreshMode::Append)) {
+            return Err(
+                runtime::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "kafka".to_string(),
+                    message: "The Kafka connector is only compatible with refresh mode 'append'. For details, visit: https://spiceai.org/docs/components/data-connectors/kafka".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
+        }
 
         let kafka_sys = if dataset.is_file_accelerated() {
             Some(Arc::new(
                 KafkaSys::try_new(dataset, OpenOption::CreateIfNotExists)
                     .await
-                    .boxed()
-                    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
-                        dataconnector: "kafka",
-                        connector_component: ConnectorComponent::from(dataset),
+                    .map_err(|e| {
+                        runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                            source: Box::new(e),
+                            dataconnector: "kafka".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                        }
                     })?,
             ))
         } else {
@@ -412,20 +417,6 @@ impl DataConnector for Kafka {
     }
 }
 
-/// Implement the shared `SidecarOffsetStore` trait for `KafkaSys` so that
-/// `SidecarOffsetCommitHook<KafkaSys>` can be constructed.
-#[async_trait]
-impl SidecarOffsetStore for KafkaSys {
-    async fn upsert_offsets(
-        &self,
-        offsets: &[KafkaOffset],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        KafkaSys::upsert_offsets(self, offsets)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    }
-}
-
 /// The name used to identify this connector in configuration.
 pub const CONNECTOR_NAME: &str = "kafka";
 
@@ -478,13 +469,14 @@ async fn init_kafka_consumer(
     json_options: &Arc<SpiceJsonOptions>,
     kafka_sys: Option<&KafkaSys>,
 ) -> runtime::dataconnector::DataConnectorResult<(KafkaConsumer, SchemaRef)> {
-    let metadata = if let Some(kafka_sys) = kafka_sys {
-        kafka_sys.get().await.boxed().context(
-            runtime::dataconnector::UnableToGetReadProviderSnafu {
-                dataconnector: "kafka",
+    let metadata: Option<KafkaMetadata> = if let Some(kafka_sys) = kafka_sys {
+        kafka_sys.get().await.map_err(|e| {
+            runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                source: Box::new(e),
+                dataconnector: "kafka".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            },
-        )?
+            }
+        })?
     } else {
         None
     };
@@ -494,30 +486,32 @@ async fn init_kafka_consumer(
             .await;
     };
 
-    ensure!(
-        topic == metadata.topic,
-        runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
-            dataconnector: "kafka",
-            message: format!(
-                "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
-                metadata.topic
-            ),
-            connector_component: ConnectorComponent::from(dataset),
-        }
-    );
-
-    if let Some(ref group_id) = kafka_config.consumer_group_id {
-        ensure!(
-            group_id == &metadata.consumer_group_id,
-            runtime::dataconnector::InvalidConfigurationNoSourceSnafu {
-                dataconnector: "kafka",
+    if topic != metadata.topic {
+        return Err(
+            runtime::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "kafka".to_string(),
                 message: format!(
-                    "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file or rename the dataset to proceed.",
-                    metadata.consumer_group_id
+                    "Locally accelerated data belongs to a different Kafka topic (was '{}', now '{topic}'). Remove the acceleration file or rename the dataset to proceed.",
+                    metadata.topic
                 ),
                 connector_component: ConnectorComponent::from(dataset),
-            }
+            },
         );
+    }
+
+    if let Some(ref group_id) = kafka_config.consumer_group_id {
+        if group_id != &metadata.consumer_group_id {
+            return Err(
+                runtime::dataconnector::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "kafka".to_string(),
+                    message: format!(
+                        "Locally accelerated data belongs to a different Kafka consumer group (was '{}', now '{group_id}'). Remove the acceleration file or rename the dataset to proceed.",
+                        metadata.consumer_group_id
+                    ),
+                    connector_component: ConnectorComponent::from(dataset),
+                },
+            );
+        }
     }
 
     let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
@@ -525,18 +519,21 @@ async fn init_kafka_consumer(
         kafka_config,
         &metadata.offsets,
     )
-    .boxed()
-    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
-        dataconnector: "kafka",
-        connector_component: ConnectorComponent::from(dataset),
-    })?;
-
-    kafka_consumer.subscribe(topic).boxed().context(
-        runtime::dataconnector::UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
+    .map_err(
+        |e| runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            source: Box::new(e),
+            dataconnector: "kafka".to_string(),
             connector_component: ConnectorComponent::from(dataset),
         },
     )?;
+
+    kafka_consumer.subscribe(topic).map_err(|e| {
+        runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            source: Box::new(e),
+            dataconnector: "kafka".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+        }
+    })?;
 
     Ok((kafka_consumer, metadata.schema))
 }
@@ -554,18 +551,21 @@ async fn bootstrap_new_kafka_consumer(
         kafka_config.consumer_group_id.clone(),
         kafka_config,
     )
-    .boxed()
-    .context(runtime::dataconnector::UnableToGetReadProviderSnafu {
-        dataconnector: "kafka",
-        connector_component: ConnectorComponent::from(dataset),
-    })?;
-
-    kafka_consumer.subscribe(topic).boxed().context(
-        runtime::dataconnector::UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
+    .map_err(
+        |e| runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            source: Box::new(e),
+            dataconnector: "kafka".to_string(),
             connector_component: ConnectorComponent::from(dataset),
         },
     )?;
+
+    kafka_consumer.subscribe(topic).map_err(|e| {
+        runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            source: Box::new(e),
+            dataconnector: "kafka".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+        }
+    })?;
 
     let schema_inference_sample_count = json_options
         .schema_infer_max_rec
@@ -591,9 +591,10 @@ async fn bootstrap_new_kafka_consumer(
                 );
             }
             Err(e) => {
-                return Err(e).boxed().context(
-                    runtime::dataconnector::UnableToGetReadProviderSnafu {
-                        dataconnector: "kafka",
+                return Err(
+                    runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                        source: Box::new(e),
+                        dataconnector: "kafka".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                     },
                 );
@@ -630,21 +631,23 @@ async fn bootstrap_new_kafka_consumer(
     };
 
     if let Some(kafka_sys) = kafka_sys {
-        kafka_sys.upsert(&metadata).await.boxed().context(
-            runtime::dataconnector::UnableToGetReadProviderSnafu {
-                dataconnector: "kafka",
+        kafka_sys.upsert(&metadata).await.map_err(|e: runtime::dataaccelerator::spice_sys::Error| {
+            runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                source: Box::new(e),
+                dataconnector: "kafka".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            },
-        )?;
+            }
+        })?;
     }
 
     // Restart the stream from the beginning
-    kafka_consumer.restart_topic(topic).boxed().context(
-        runtime::dataconnector::UnableToGetReadProviderSnafu {
-            dataconnector: "kafka",
+    kafka_consumer.restart_topic(topic).map_err(|e| {
+        runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+            source: Box::new(e),
+            dataconnector: "kafka".to_string(),
             connector_component: ConnectorComponent::from(dataset),
-        },
-    )?;
+        }
+    })?;
 
     Ok((kafka_consumer, schema))
 }

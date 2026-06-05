@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use snafu::prelude::*;
-use tonic::async_trait;
+use async_trait::async_trait;
 
 use runtime::parameters::ParamLookup;
 
@@ -99,7 +99,7 @@ impl Validator for AzureAccountValidator {
             .get("use_emulator")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         if !use_emulator && matches!(params.parameters.get("account"), ParamLookup::Absent(_)) {
             return Err(Error::MissingAccount);
@@ -123,7 +123,7 @@ impl Validator for AzureAuthValidator {
             .get("use_emulator")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         if use_emulator {
             return Ok(());
@@ -145,7 +145,7 @@ impl Validator for AzureAuthValidator {
             .get("skip_signature")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         // Check client credentials (all three must be present together)
         let has_client_id = params.parameters.get("client_id").expose().ok().is_some();
@@ -170,7 +170,7 @@ impl Validator for AzureAuthValidator {
             .get("use_cli")
             .expose()
             .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .is_some_and(|v: &str| v.eq_ignore_ascii_case("true"));
 
         let has_msi_endpoint = params
             .parameters

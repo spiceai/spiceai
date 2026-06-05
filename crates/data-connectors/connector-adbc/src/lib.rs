@@ -19,27 +19,24 @@ limitations under the License.
 //! This connector is extracted from the runtime crate to enable faster
 //! incremental builds.
 
-use adbc_core::options::{AdbcVersion, OptionDatabase};
+use adbc_core::options::AdbcVersion;
 use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
-use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
-use data_components::{FieldMetadata, metadata_enriched_table_provider};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
+use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::query_arrow;
-use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
-use futures::TryStreamExt;
-use sha2::{Digest, Sha256};
+use runtime::component::dataset::Dataset;
+use runtime::register_data_connector;
+use runtime::secrets::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
-use std::fmt::Write as _;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, Weak};
@@ -49,7 +46,6 @@ use data_components::adbc_helpers::{
 };
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec,
 };
 use runtime::parameters::Parameters;
 
@@ -903,8 +899,6 @@ fn classify_adbc_error(
         fallback_variant("adbc".to_string(), ConnectorComponent::from(dataset), error)
     }
 }
-
-register_data_connector!("adbc", AdbcFactory);
 
 #[async_trait]
 impl DataConnector for Adbc {

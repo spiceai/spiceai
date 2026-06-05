@@ -26,6 +26,8 @@ description = "AWS Glue data connector for Spice.ai runtime"
 async-trait.workspace = true
 aws-config.workspace = true
 data_components = { path = "../../data_components", features = ["glue"] }
+datafusion.workspace = true
+tokio.workspace = true
 aws-credential-types.workspace = true
 aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true

@@ -29,13 +29,16 @@ async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["kafka"] }
 dataformat-json = { path = "../../dataformat-json" }
 datafusion.workspace = true
+fundu.workspace = true
 futures.workspace = true
 runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets" }
 secrecy.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+opentelemetry.workspace = true
 tracing.workspace = true
 
 [features]
