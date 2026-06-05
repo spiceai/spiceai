@@ -90,7 +90,11 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
             host: host.to_string(),
             port,
         })?
-        .build();
+        .build()
+        .map_err(|_| Error::UnableToConnect {
+            host: host.to_string(),
+            port,
+        })?;
     match resolver.lookup_ip(host).await {
         Ok(ips) => {
             for ip in ips.iter() {

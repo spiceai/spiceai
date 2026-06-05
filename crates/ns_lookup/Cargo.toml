@@ -12,5 +12,5 @@ version.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-hickory-resolver = "0.25.2"
+hickory-resolver = "0.26"
 url.workspace = true
