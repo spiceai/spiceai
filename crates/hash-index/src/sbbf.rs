@@ -120,10 +120,6 @@ impl SplitBlockBloomFilter {
     /// `2^32` (a >128 GiB filter) cannot overflow the product; the double
     /// shift keeps the result within block range, so the cast cannot truncate.
     #[inline]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "range reduction bounds the result to the block count"
-    )]
     fn block_index(&self, hash: u64) -> usize {
         ((u128::from(hash >> 32) * self.blocks.len() as u128) >> 32) as usize
     }
