@@ -1,5 +1,5 @@
-name: 'Build testoperator'
-run-name: 'Build testoperator - ${{ github.ref_name }}'
+name: 'build testoperator'
+run-name: 'build testoperator - ${{ github.ref_name }}'
 
 on:
   push:

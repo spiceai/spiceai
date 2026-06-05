@@ -1,5 +1,5 @@
-name: 'Build spidapter'
-run-name: 'Build spidapter - ${{ github.ref_name }}'
+name: 'build spidapter'
+run-name: 'build spidapter - ${{ github.ref_name }}'
 
 on:
   push:
