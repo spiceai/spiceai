@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use arrow_schema::{Field, Schema, SchemaRef};
 use snafu::{ResultExt, Snafu};
+use spicepod::semantic::Column;
 
 use crate::component::dataset::Dataset;
 use crate::component::dataset::declared_type::{ParseTypeError, parse_declared_type};
@@ -68,6 +69,38 @@ pub fn declared_schema_for(dataset: &Dataset) -> Result<Option<SchemaRef>, Decla
     }
 
     Ok(Some(Arc::new(Schema::new(fields))))
+}
+
+/// Build an Arrow schema from a set of columns that have an explicit `type`.
+///
+/// Unlike `declared_schema_for`, columns without a `type` are silently skipped rather
+/// than causing the whole result to be `None`. Returns `None` only when no column
+/// carries a `type` declaration at all.
+///
+/// `dataset_name` is used only in error messages. Columns without a `type` are
+/// skipped; an error is returned if a `type` string cannot be parsed.
+pub(crate) fn schema_from_columns(
+    dataset_name: &str,
+    columns: &[Column],
+) -> Result<Option<SchemaRef>, DeclaredSchemaError> {
+    let mut fields = Vec::new();
+    for column in columns {
+        let Some(type_str) = column.r#type.as_deref() else {
+            continue;
+        };
+        let dt = parse_declared_type(type_str).context(InvalidColumnTypeSnafu {
+            dataset: dataset_name.to_string(),
+            column: column.name.clone(),
+        })?;
+        let nullable = column.nullable.unwrap_or(true);
+        fields.push(Field::new(&column.name, dt, nullable));
+    }
+
+    if fields.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(Schema::new(fields))))
+    }
 }
 
 #[cfg(test)]

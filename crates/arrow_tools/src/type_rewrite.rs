@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, IntervalUnit, Schema};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 
 /// A rewrite rule applied by [`apply_rules`] to every [`DataType`] node in a schema.
 ///
@@ -59,6 +59,39 @@ impl TypeRewriteRule for IntervalToMonthDayNano {
             DataType::Interval(IntervalUnit::YearMonth | IntervalUnit::DayTime) => {
                 Some(DataType::Interval(IntervalUnit::MonthDayNano))
             }
+            _ => None,
+        }
+    }
+}
+
+/// Rewrites a timezone-aware `DataType::Timestamp(unit, Some(tz))` with a
+/// non-microsecond `unit` → `DataType::Timestamp(Microsecond, Some(tz))`,
+/// preserving the timezone. Timezone-naive timestamps (`tz = None`) are left
+/// unchanged.
+///
+/// `DuckDB`'s `TIMESTAMP WITH TIME ZONE` (`TIMESTAMPTZ`) type is always
+/// microsecond-precision — `DuckDB` has no nanosecond-with-timezone type. So a
+/// column registered as `Timestamp(Nanosecond, "UTC")` (e.g. a Postgres
+/// `timestamptz` source) is physically stored — and read back — as
+/// `Timestamp(Microsecond, "UTC")`. When the registered schema keeps the
+/// original non-µs unit, `DataFusion` plans against nanoseconds while `DuckDB`
+/// returns microseconds and queries that sort or range-join on the column panic
+/// with
+/// `RowConverter column schema mismatch, expected Timestamp(ns, "UTC") got Timestamp(µs, "UTC")`.
+/// Normalizing the unit to microsecond keeps the registered schema in lockstep
+/// with what `DuckDB` stores and returns.
+///
+/// Timezone-naive timestamps are deliberately excluded: `DuckDB` has a native
+/// nanosecond `TIMESTAMP_NS` type and preserves the precision of `TIMESTAMP`
+/// columns without a zone (the runtime's internal `_fetched_at` caching column
+/// relies on this), so normalizing them would instead *introduce* a mismatch.
+pub struct TimestampTzToMicrosecond;
+impl TypeRewriteRule for TimestampTzToMicrosecond {
+    fn rewrite(&self, dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Timestamp(unit, Some(tz)) if *unit != TimeUnit::Microsecond => Some(
+                DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::clone(tz))),
+            ),
             _ => None,
         }
     }
@@ -264,6 +297,128 @@ mod tests {
         assert_eq!(
             result.field(0).data_type(),
             &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+    }
+
+    #[test]
+    fn timestamp_nanosecond_with_tz_normalized_to_microsecond() {
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]);
+        let result = apply_rules(&schema, &[&TimestampTzToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "timezone must be preserved while the unit is normalized to microsecond"
+        );
+    }
+
+    #[test]
+    fn timestamp_nanosecond_without_tz_unchanged() {
+        // DuckDB has a native nanosecond TIMESTAMP_NS type and preserves the
+        // precision of timezone-naive timestamps, so the no-timezone case must
+        // NOT be normalized — doing so would introduce a mismatch.
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        let result = apply_rules(&schema, &[&TimestampTzToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None),
+            "timezone-naive timestamps must be left untouched"
+        );
+    }
+
+    #[test]
+    fn timestamp_tz_second_and_millisecond_normalized_to_microsecond() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "s",
+                DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ms",
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+05:00".into())),
+                true,
+            ),
+        ]);
+        let result = apply_rules(&schema, &[&TimestampTzToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            result.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+05:00".into()))
+        );
+    }
+
+    #[test]
+    fn timestamp_microsecond_with_tz_unchanged() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("id", DataType::Int64, false),
+        ]);
+        let result = apply_rules(&schema, &[&TimestampTzToMicrosecond]);
+        assert_eq!(result, schema, "already-microsecond schema must be a no-op");
+    }
+
+    #[test]
+    fn timestamp_nanosecond_nested_in_list_and_struct() {
+        // tz-aware nested timestamp normalizes; tz-naive nested timestamp does not.
+        let schema = Schema::new(vec![
+            Field::new(
+                "events",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    true,
+                ))),
+                false,
+            ),
+            Field::new(
+                "rec",
+                DataType::Struct(
+                    vec![Field::new(
+                        "at",
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        true,
+                    )]
+                    .into(),
+                ),
+                false,
+            ),
+        ]);
+        let result = apply_rules(&schema, &[&TimestampTzToMicrosecond]);
+        assert_eq!(
+            result.field(0).data_type(),
+            &DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ))),
+            "tz-aware nested timestamp must normalize to microsecond"
+        );
+        assert_eq!(
+            result.field(1).data_type(),
+            &DataType::Struct(
+                vec![Field::new(
+                    "at",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    true,
+                )]
+                .into(),
+            ),
+            "tz-naive nested timestamp must be left untouched"
         );
     }
 

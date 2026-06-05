@@ -37,6 +37,8 @@ use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
+use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -66,7 +68,7 @@ use vortex::session::VortexSession;
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
 use super::segment_cache::SharedSegmentCache;
-use super::sink::VortexSink;
+use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
@@ -224,12 +226,31 @@ impl ConfigField for ScanConcurrency {
     }
 }
 
+/// Programmatic write-time sharding configuration, set by the caller (e.g. the
+/// Cayenne accelerator) via [`VortexFormat::with_write_shard`].
+///
+/// Absent (or `write_concurrency <= 1`) ⇒ a single serial writer, i.e. the
+/// historical behavior. When present, `VortexSink` fans the write across
+/// `write_concurrency` concurrent shard writers (clamped to the session's
+/// `target_partitions`), routing rows round-robin or hashed by
+/// `shard_key_columns`.
+#[derive(Debug, Clone, Default)]
+pub struct WriteShardConfig {
+    /// Number of concurrent shard writers to fan a single write across.
+    pub write_concurrency: usize,
+    /// Optional key columns to hash-partition rows by (e.g. primary key or
+    /// partition value), resolved by name against the write schema. Empty ⇒
+    /// round-robin distribution.
+    pub shard_key_columns: Vec<String>,
+}
+
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
+    write_shard: Option<WriteShardConfig>,
 }
 
 impl Debug for VortexFormat {
@@ -381,13 +402,14 @@ impl VortexFormat {
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
 
         Self {
             session,
             opts,
             access_plan_provider: None,
             segment_cache,
+            write_shard: None,
         }
     }
 
@@ -409,7 +431,90 @@ impl VortexFormat {
             opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
             segment_cache: self.segment_cache.clone(),
+            write_shard: self.write_shard.clone(),
         }
+    }
+
+    /// Returns a format that fans writes across `config.write_concurrency`
+    /// concurrent shard writers (clamped to the session `target_partitions`),
+    /// routing rows hashed by `config.shard_key_columns` (or round-robin when
+    /// empty). Used by the Cayenne accelerator to parallelize the Vortex encode.
+    #[must_use]
+    pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache: self.segment_cache.clone(),
+            write_shard: Some(config),
+        }
+    }
+
+    /// Returns a format whose segment cache reports its right-sizing metrics
+    /// (hit rate, fill) under the given `dataset` label. Rebuilds the (empty)
+    /// segment cache to attach the label, so call once at construction before any
+    /// scans run. No-op label-wise when this format has no segment cache.
+    #[must_use]
+    pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let dataset = dataset.into();
+        let segment_cache = self
+            .opts
+            .segment_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache,
+            write_shard: self.write_shard.clone(),
+        }
+    }
+
+    /// The configured intra-write shard config, if write sharding is enabled for
+    /// this format (set via [`Self::with_write_shard`]). Read-only; primarily for
+    /// inspection and tests.
+    #[must_use]
+    pub fn write_shard(&self) -> Option<&WriteShardConfig> {
+        self.write_shard.as_ref()
+    }
+
+    /// Resolve the programmatic [`WriteShardConfig`] into a [`ShardSpec`] for
+    /// the write schema. `None` / `write_concurrency <= 1` ⇒ `Single`; an empty
+    /// key list ⇒ `RoundRobin`; otherwise `Hash` on the named columns. Unknown
+    /// column names fall back to `RoundRobin` rather than failing the write.
+    fn build_shard_spec(&self, schema: &SchemaRef, target_partitions: usize) -> ShardSpec {
+        let Some(write_shard) = self.write_shard.as_ref() else {
+            return ShardSpec::Single;
+        };
+        let partitions = write_shard
+            .write_concurrency
+            .clamp(1, target_partitions.max(1));
+        if partitions <= 1 {
+            return ShardSpec::Single;
+        }
+        if write_shard.shard_key_columns.is_empty() {
+            return ShardSpec::RoundRobin(partitions);
+        }
+        let mut exprs: Vec<PhysicalExprRef> =
+            Vec::with_capacity(write_shard.shard_key_columns.len());
+        for name in &write_shard.shard_key_columns {
+            if let Ok(idx) = schema.index_of(name) {
+                exprs.push(Arc::new(Column::new(name, idx)));
+            } else {
+                // Defensive: the configured key column is absent from the write
+                // schema. Degrade to round-robin rather than fail the write, but
+                // warn — files silently lose key-clustering.
+                tracing::warn!(
+                    column = name.as_str(),
+                    "Vortex write shard key column not found in output schema; \
+                     falling back to round-robin sharding (files will not be key-clustered)"
+                );
+                return ShardSpec::RoundRobin(partitions);
+            }
+        }
+        ShardSpec::Hash { exprs, partitions }
     }
 }
 
@@ -511,6 +616,15 @@ impl FileFormat for VortexFormat {
 
                     // Cache the metadata
                     let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
+                    // Footer-cache right-sizing telemetry: the accounted footer
+                    // size (what fills the FileMetadataCache budget) per file.
+                    tracing::debug!(
+                        target: "vortex::footer_cache",
+                        path = %object.location,
+                        footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached_metadata.as_ref()),
+                        src = "infer_schema",
+                        "footer cached",
+                    );
                     cache.put(&object, cached_metadata);
 
                     let inferred_schema = vxf.dtype().to_arrow_schema()?;
@@ -594,6 +708,14 @@ impl FileFormat for VortexFormat {
 
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
+                // Footer-cache right-sizing telemetry (see infer_schema above).
+                tracing::debug!(
+                    target: "vortex::footer_cache",
+                    path = %object.location,
+                    footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached.as_ref()),
+                    src = "infer_stats",
+                    "footer cached",
+                );
                 file_metadata_cache.put(&object, cached);
 
                 (
@@ -751,7 +873,7 @@ impl FileFormat for VortexFormat {
     async fn create_writer_physical_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        _state: &dyn Session,
+        state: &dyn Session,
         conf: FileSinkConfig,
         order_requirements: Option<LexRequirement>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -789,11 +911,14 @@ impl FileFormat for VortexFormat {
         };
 
         let schema = Arc::clone(conf.output_schema());
+        let target_partitions = state.config().target_partitions().max(1);
+        let shard_spec = self.build_shard_spec(&schema, target_partitions);
         let sink = Arc::new(VortexSink::new(
             conf,
             schema,
             self.session.clone(),
             target_file_size,
+            shard_spec,
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
@@ -872,6 +997,92 @@ mod tests {
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+    }
+
+    fn schema_with(cols: &[(&str, arrow_schema::DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, t)| arrow_schema::Field::new(*n, t.clone(), false))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn shard_format(write_concurrency: usize, keys: &[&str]) -> VortexFormat {
+        VortexFormat::new(VortexSession::default()).with_write_shard(WriteShardConfig {
+            write_concurrency,
+            shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    #[test]
+    fn build_shard_spec_without_write_shard_is_single() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        let format = VortexFormat::new(VortexSession::default());
+        assert!(matches!(
+            format.build_shard_spec(&schema, 8),
+            ShardSpec::Single
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_clamps_write_concurrency_to_target_partitions() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // Asking for 100 shards with target_partitions=4 must clamp to 4.
+        match shard_format(100, &["k"]).build_shard_spec(&schema, 4) {
+            ShardSpec::Hash { partitions, .. } => assert_eq!(partitions, 4),
+            _ => panic!("expected Hash with clamped partitions=4"),
+        }
+    }
+
+    #[test]
+    fn build_shard_spec_one_partition_is_single() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // write_concurrency 8 but target_partitions 1 → clamp to 1 → Single.
+        assert!(matches!(
+            shard_format(8, &["k"]).build_shard_spec(&schema, 1),
+            ShardSpec::Single
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_no_keys_is_round_robin() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        assert!(matches!(
+            shard_format(4, &[]).build_shard_spec(&schema, 8),
+            ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_unknown_key_falls_back_to_round_robin() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // "missing" is absent from the schema → degrade to round-robin (warns),
+        // never silently produce a Hash over a bogus column.
+        assert!(matches!(
+            shard_format(4, &["missing"]).build_shard_spec(&schema, 8),
+            ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_composite_keys_hash_all_columns() {
+        let schema = schema_with(&[
+            ("w_id", arrow_schema::DataType::Int64),
+            ("d_id", arrow_schema::DataType::Int64),
+            ("payload", arrow_schema::DataType::Utf8),
+        ]);
+        match shard_format(4, &["w_id", "d_id"]).build_shard_spec(&schema, 8) {
+            ShardSpec::Hash { exprs, partitions } => {
+                assert_eq!(partitions, 4);
+                assert_eq!(exprs.len(), 2, "composite key must hash both columns");
+                let names: String = exprs.iter().map(ToString::to_string).collect();
+                assert!(
+                    names.contains("w_id") && names.contains("d_id"),
+                    "hash exprs must reference both key columns, got: {names}"
+                );
+            }
+            _ => panic!("expected Hash over the composite key"),
+        }
     }
 
     #[test]

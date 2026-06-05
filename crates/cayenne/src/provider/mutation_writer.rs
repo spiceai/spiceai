@@ -151,6 +151,17 @@ impl InlineBatchBuffer {
         self.total_rows
     }
 
+    /// In-memory Arrow bytes buffered so far. When the buffer overflows and the
+    /// write falls back to a Vortex write, this is a *lower bound* on the
+    /// delta's total size (the un-buffered remainder of the stream is added on
+    /// top). It is used only to size the write shard count, where under-counting
+    /// is the safe direction: it can only keep the write on fewer (never more)
+    /// shards than the true size warrants.
+    #[must_use]
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
     #[must_use]
     pub(crate) fn batches(&self) -> &[RecordBatch] {
         &self.batches
@@ -177,7 +188,20 @@ enum InlineMutationOutcome {
         rows: u64,
         post_validation: PostValidationState,
     },
-    Fallback(SendableRecordBatchStream),
+    Fallback {
+        stream: SendableRecordBatchStream,
+        /// Lower bound on the delta's byte size: the bytes buffered before the
+        /// inline buffer overflowed. Threaded into the snapshot write as its
+        /// size estimate so small (but non-inlinable) deltas stay a single file.
+        buffered_bytes: u64,
+    },
+}
+
+struct PreparedStagedAppendTarget {
+    staging_snapshot_id: String,
+    target_snapshot_id: String,
+    target_kind: StagingWalTargetKind,
+    estimated_bytes: Option<u64>,
 }
 
 fn take_post_validation(
@@ -306,8 +330,12 @@ impl<'a> AppendMutationWriter<'a> {
                     rows,
                 ))
             }
-            InlineMutationOutcome::Fallback(re_stream) => {
-                prepared_stream = re_stream;
+            InlineMutationOutcome::Fallback {
+                stream,
+                buffered_bytes,
+            } => {
+                prepared_stream = stream;
+                let estimated_bytes = Some(buffered_bytes);
                 let stage_on_conflict = may_have_on_conflict_deletions;
                 let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
                     let (staging_snapshot_id, target_snapshot_id) =
@@ -340,9 +368,12 @@ impl<'a> AppendMutationWriter<'a> {
                         prepared_stream,
                         target_size_bytes,
                         write_guard_for_prepare,
-                        staging_snapshot_id,
-                        target_snapshot_id.clone(),
-                        target_kind,
+                        PreparedStagedAppendTarget {
+                            staging_snapshot_id,
+                            target_snapshot_id: target_snapshot_id.clone(),
+                            target_kind,
+                            estimated_bytes,
+                        },
                     )
                     .await?;
 
@@ -378,9 +409,16 @@ impl<'a> AppendMutationWriter<'a> {
                     // dir but stay invisible until the snapshot is published below.
                     prepared_append.apply_under_barrier().await?;
 
+                    // Publish the conflict deletes and the protected snapshot under
+                    // one scan fence so readers observe either the old row or the
+                    // replacement row, never a mixed generation.
+                    let _visibility = self.table.visibility_lock_arc().lock_owned().await;
+                    let _fence = self.table.lock_listing_fence_write_owned().await;
+
                     // Runs while the write guard is held, as the deletion sink
                     // expects. Rewrites inlined rows and tombstones file rows.
-                    self.table
+                    let update = self
+                        .table
                         .apply_on_conflict_deletions(on_conflict_deletions)
                         .await?;
 
@@ -390,11 +428,14 @@ impl<'a> AppendMutationWriter<'a> {
                         .increment_sequence_number(self.table.table_id())
                         .await?;
                     self.table
-                        .publish_written_snapshot_with_sequence(
-                            &target_snapshot_id,
-                            snapshot_sequence,
-                        )
+                        .record_written_snapshot_sequence(&target_snapshot_id, snapshot_sequence)
                         .await?;
+                    self.table
+                        .commit_on_conflict_publish(
+                            update,
+                            Some((&target_snapshot_id, snapshot_sequence)),
+                        )
+                        .await;
                     prepared_append.finish().await?;
                     drop(held_write_guard);
 
@@ -550,6 +591,12 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.has_retention_delete_filters(),
         ]);
 
+        // Lower-bound size estimate for the staged write. Populated from the
+        // inline buffer when we attempt to inline; left `None` when inlining is
+        // skipped (partition/retention tables) so the write keeps the prior
+        // full-fan-out behavior.
+        let mut estimated_bytes: Option<u64> = None;
+
         if inline_policy.can_inline() {
             match self
                 .try_inline_or_restream(prepared_stream, &post_validation)
@@ -563,8 +610,12 @@ impl<'a> AppendMutationWriter<'a> {
                         .record_inlined_pk_keys(&post_validation.validated_keys);
                     return Ok(rows);
                 }
-                InlineMutationOutcome::Fallback(re_stream) => {
-                    prepared_stream = re_stream;
+                InlineMutationOutcome::Fallback {
+                    stream,
+                    buffered_bytes,
+                } => {
+                    prepared_stream = stream;
+                    estimated_bytes = Some(buffered_bytes);
                 }
             }
         }
@@ -592,7 +643,7 @@ impl<'a> AppendMutationWriter<'a> {
             let target_size_bytes = self.context.target_file_size_bytes();
             let write_start = Instant::now();
             let (rows, writer_ops, stats_acc) = self
-                .write_staged_append(prepared_stream, target_size_bytes)
+                .write_staged_append(prepared_stream, target_size_bytes, estimated_bytes)
                 .await?;
 
             tracing::debug!(
@@ -609,9 +660,12 @@ impl<'a> AppendMutationWriter<'a> {
             } = take_post_validation(&post_validation);
 
             let superseded = on_conflict_deletions.total_superseded();
-            self.table
+            let update = self
+                .table
                 .apply_on_conflict_deletions(on_conflict_deletions)
                 .await?;
+            // Publish any deletion-cache update under the consistency lock. This path writes no protected snapshot
+            self.table.commit_on_conflict_publish(update, None).await;
 
             (rows, stats_acc, validated_keys, superseded)
         };
@@ -662,6 +716,11 @@ impl<'a> AppendMutationWriter<'a> {
                 target_size_bytes,
                 &new_snapshot_id,
                 self.task_context.session_config().target_partitions(),
+                // This pending-deletions / on-conflict new-snapshot path does not
+                // pre-buffer the delta, so its size is unknown here; keep the
+                // prior full-fan-out behavior. (Reached only when a write carries
+                // pending PK deletes or on-conflict upserts.)
+                None,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -681,7 +740,10 @@ impl<'a> AppendMutationWriter<'a> {
 
         let superseded = on_conflict_deletions.total_superseded();
         let deletion_start = Instant::now();
-        self.table
+        let _visibility = self.table.visibility_lock_arc().lock_owned().await;
+        let _fence = self.table.lock_listing_fence_write_owned().await;
+        let update = self
+            .table
             .apply_on_conflict_deletions(on_conflict_deletions)
             .await?;
         record_cayenne_write_phase(
@@ -697,9 +759,15 @@ impl<'a> AppendMutationWriter<'a> {
             .increment_sequence_number(self.table.table_id())
             .await?;
 
+        // Durably record the new snapshot's sequence before making it visible.
         self.table
-            .publish_written_snapshot_with_sequence(&new_snapshot_id, new_sequence)
+            .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
             .await?;
+        // Atomically publish the deletion-cache update and the protected snapshot
+        // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
+        self.table
+            .commit_on_conflict_publish(update, Some((&new_snapshot_id, new_sequence)))
+            .await;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
 
         Ok((rows, stats_acc, validated_keys, superseded))
@@ -775,14 +843,23 @@ impl<'a> AppendMutationWriter<'a> {
             restore_post_validation(post_validation, state);
         }
 
+        // Bytes seen while buffering — a lower bound on the delta size (the
+        // chained remainder of `prepared_stream` may add more). Used to size the
+        // write shard count: small deltas stay a single file. Captured before
+        // `into_chained_stream` consumes the buffer.
+        let buffered_bytes = buffer.total_bytes() as u64;
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
-        Ok(InlineMutationOutcome::Fallback(re_stream))
+        Ok(InlineMutationOutcome::Fallback {
+            stream: re_stream,
+            buffered_bytes,
+        })
     }
 
     async fn write_staged_append(
         &self,
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
+        estimated_bytes: Option<u64>,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         let staging_snapshot_id = CayenneTableProvider::new_staging_snapshot_id();
         self.table
@@ -805,6 +882,7 @@ impl<'a> AppendMutationWriter<'a> {
                 target_size_bytes,
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
+                estimated_bytes,
             )
             .await
         {
@@ -843,9 +921,7 @@ impl<'a> AppendMutationWriter<'a> {
         stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         write_guard: Option<OwnedMutexGuard<()>>,
-        staging_snapshot_id: String,
-        target_snapshot_id: String,
-        target_kind: StagingWalTargetKind,
+        target: PreparedStagedAppendTarget,
     ) -> Result<(
         u64,
         usize,
@@ -862,8 +938,9 @@ impl<'a> AppendMutationWriter<'a> {
             .write_to_snapshot(
                 stream,
                 target_size_bytes,
-                &staging_snapshot_id,
+                &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
+                target.estimated_bytes,
             )
             .await
         {
@@ -871,7 +948,7 @@ impl<'a> AppendMutationWriter<'a> {
             Err(e) => {
                 if let Err(cleanup_err) = self
                     .table
-                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .clear_staging_snapshot_dir(&target.staging_snapshot_id)
                     .await
                 {
                     tracing::warn!(
@@ -887,9 +964,9 @@ impl<'a> AppendMutationWriter<'a> {
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
             write_guard,
-            staging_snapshot_id.clone(),
-            target_snapshot_id,
-            target_kind,
+            target.staging_snapshot_id.clone(),
+            target.target_snapshot_id,
+            target.target_kind,
             rows,
         );
         let prepare_start = Instant::now();
@@ -898,7 +975,7 @@ impl<'a> AppendMutationWriter<'a> {
             Err(e) => {
                 if let Err(cleanup_err) = self
                     .table
-                    .clear_staging_snapshot_dir(&staging_snapshot_id)
+                    .clear_staging_snapshot_dir(&target.staging_snapshot_id)
                     .await
                 {
                     tracing::warn!(
