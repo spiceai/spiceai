@@ -129,17 +129,16 @@ impl DatabricksDelta {
         // Reuse the vending client when present: it carries the connector's
         // rate-control configuration and avoids rebuilding an HTTP client for
         // every table lookup.
-        let table_opt = match &self.credential_vending_client {
-            Some(client) => client.get_table(table_reference).await.boxed()?,
-            None => {
-                let uc_client = UnityCatalog::new(
-                    self.endpoint.clone(),
-                    Some(Arc::clone(&self.token_provider)),
-                    None,
-                )
-                .boxed()?;
-                uc_client.get_table(table_reference).await.boxed()?
-            }
+        let table_opt = if let Some(client) = &self.credential_vending_client {
+            client.get_table(table_reference).await.boxed()?
+        } else {
+            let uc_client = UnityCatalog::new(
+                self.endpoint.clone(),
+                Some(Arc::clone(&self.token_provider)),
+                None,
+            )
+            .boxed()?;
+            uc_client.get_table(table_reference).await.boxed()?
         };
 
         table_opt.ok_or_else(|| {
