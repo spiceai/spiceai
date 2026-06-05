@@ -93,9 +93,8 @@ fn build_deletion_cache(size: usize) -> Arc<DeletionIndex> {
 fn run_full_rebuild(cache: &Arc<DeletionIndex>, snapshot_count: usize, min_seq: i64) {
     for _ in 0..snapshot_count {
         let filtered: HashMap<i64, i64> = cache
-            .entries()
-            .iter()
-            .filter_map(|(&pk, entry)| {
+            .iter_entries()
+            .filter_map(|(pk, entry)| {
                 entry
                     .delete_sequence()
                     .filter(|seq| *seq > min_seq)

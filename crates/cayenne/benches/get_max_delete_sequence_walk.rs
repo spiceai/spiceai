@@ -96,9 +96,8 @@ fn build_index(size: usize) -> DeletionIndex {
 /// Mirror of the historical O(N) walk (pre-`max_sequence_number` cache).
 fn o_n_walk(index: &DeletionIndex) -> i64 {
     index
-        .entries()
-        .values()
-        .filter_map(cayenne::provider::deletion_index::TombstoneEntry::delete_sequence)
+        .iter_entries()
+        .filter_map(|(_, entry)| entry.delete_sequence())
         .max()
         .unwrap_or(0)
 }
