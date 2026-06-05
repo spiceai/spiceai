@@ -467,7 +467,7 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }      # branch: lukim/spiceai-58.3.0
 
-object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }
+object_store = { git = "https://github.com/spiceai/arrow-rs-object-store.git", rev = "046f6d838c8d7a1242e40778522176470324d452" }
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
