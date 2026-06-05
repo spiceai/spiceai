@@ -14,23 +14,4 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
-use datafusion_table_providers::mongodb::MongoDBTableFactory;
-use std::sync::Arc;
-
-use crate::Read;
-
 pub mod stream;
-
-#[async_trait]
-impl Read for MongoDBTableFactory {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        // table-providers 0.11.0 `MongoDBTableFactory::table_provider` takes only the table
-        // reference (the declared-schema / #657 overload is not in this release).
-        self.table_provider(table_reference).await
-    }
-}

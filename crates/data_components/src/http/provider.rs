@@ -6855,6 +6855,47 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_from_rows_nested_non_json_rows_are_preserved() {
+        // Regression for https://github.com/spiceai/spiceai/issues/11155.
+        // A `SELECT *` against an HTTP dataset that declares `columns:`
+        // used to crash with "Internal Error" when the endpoint returned a
+        // non-JSON body (e.g. fetching the base URL with no path). The
+        // batch builder must instead preserve the raw row and produce
+        // NULL static fields.
+        let (exec, nesting) = nested_exec(&["id", "details"], "details");
+        let rows = vec![
+            "<!DOCTYPE html><html>not json</html>".to_string(),
+            String::new(),                   // empty body (e.g. 5xx)
+            r#"{"id": "abc", "#.to_string(), // truncated/malformed JSON
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
+            .expect("non-JSON rows must not crash batch construction");
+        assert_eq!(batch.num_rows(), 3);
+        for v in string_col(&batch, "id") {
+            assert!(v.is_none(), "non-JSON rows must have NULL static fields");
+        }
+        let details = string_col(&batch, "details");
+        // Raw HTML preserved as a JSON string in the catch-all column.
+        assert_eq!(
+            details[0].as_deref(),
+            Some(r#""<!DOCTYPE html><html>not json</html>""#)
+        );
+        // Empty body => catch-all NULL.
+        assert!(details[1].is_none(), "empty body => catch-all NULL");
+        // Malformed JSON preserved verbatim as a JSON string.
+        assert_eq!(details[2].as_deref(), Some(r#""{\"id\": \"abc\", ""#));
+    }
+
+    #[test]
     fn create_batch_from_rows_nested_empty_catchall_is_null_when_all_keys_declared() {
         let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
         let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];

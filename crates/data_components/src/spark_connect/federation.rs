@@ -31,7 +31,7 @@ use futures::Stream;
 
 use crate::spark_connect::map_error_to_datafusion_err;
 
-use super::{SparkConnectTableProvider, acquire_rate_controller_permit};
+use super::{SparkConnect, SparkConnectTableProvider};
 
 impl SparkConnectTableProvider {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
@@ -84,11 +84,7 @@ impl SQLExecutor for SparkConnectTableProvider {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
-            spark_query_to_stream(
-                self.dataframe.clone().sparkSession(),
-                query.to_string(),
-                self.rate_controller.clone(),
-            ),
+            spark_query_to_stream(self.spark_connect.clone(), query.to_string()),
         )))
     }
 
@@ -99,46 +95,38 @@ impl SQLExecutor for SparkConnectTableProvider {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        let dataframe = self
-            .dataframe
-            .clone()
-            .sparkSession()
-            .table(table_name)
-            .map_err(map_error_to_datafusion_err)?
-            .limit(0);
-        let rate_controller_permit = acquire_rate_controller_permit(self.rate_controller.as_ref())
+        let table_name = table_name.to_string();
+        self.spark_connect
+            .with_session_retry(move |session| {
+                let table_name = table_name.clone();
+                async move {
+                    Ok(session
+                        .table(&table_name)?
+                        .limit(0)
+                        .collect()
+                        .await?
+                        .schema())
+                }
+            })
             .await
-            .map_err(DataFusionError::External)?;
-        let schema = dataframe
-            .collect()
-            .await
-            .map_err(map_error_to_datafusion_err)?
-            .schema();
-        drop(rate_controller_permit);
-        Ok(schema)
+            .map_err(map_error_to_datafusion_err)
     }
 }
 
-#[expect(clippy::needless_pass_by_value)]
+/// Builds a record-batch stream for a federated SQL query, rerunning the query
+/// against a freshly rebuilt session if the current one has gone stale/broken.
 fn spark_query_to_stream(
-    session: Arc<spark_connect_rs::SparkSession>,
+    spark_connect: SparkConnect,
     query: String,
-    rate_controller: Option<Arc<runtime_rate_control::RateController>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let session = Arc::clone(&session);
-
     stream! {
-        let rate_controller_permit = acquire_rate_controller_permit(rate_controller.as_ref())
-            .await
-            .map_err(DataFusionError::External)?;
-        let data = session
-            .sql(&query)
-            .await
-            .map_err(map_error_to_datafusion_err)?
-            .collect()
+        let data = spark_connect
+            .with_session_retry(|session| {
+                let query = query.clone();
+                async move { session.sql(&query).await?.collect().await }
+            })
             .await
             .map_err(map_error_to_datafusion_err)?;
-        drop(rate_controller_permit);
         yield (Ok(data))
     }
 }
