@@ -594,12 +594,6 @@ impl Runtime {
 
         let source_schema = provider.schema();
         let inferred = InferredSchema::from_metadata(source_schema.metadata());
-        eprintln!(
-            "DIAGTEMP apply_inferred_acceleration: ds={} inferred_empty={} pk={:?}",
-            ds.name,
-            inferred.is_empty(),
-            inferred.primary_key
-        );
         if inferred.is_empty() {
             return ds;
         }

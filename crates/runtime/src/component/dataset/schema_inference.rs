@@ -125,11 +125,6 @@ pub fn apply_inferred_schema(
     let is_changes = acceleration.refresh_mode == Some(RefreshMode::Changes);
     let applied_sort = !is_changes && apply_inferred_sort(acceleration, inferred, effective_schema);
 
-    eprintln!(
-        "DIAGTEMP apply_inferred_schema: ds={dataset_name} is_changes={is_changes} pk_set={} on_conflict={} indexes={applied_indexes} sort_applied={applied_sort}",
-        acceleration.primary_key.is_some(),
-        !acceleration.on_conflict.is_empty(),
-    );
     tracing::debug!(
         dataset = %dataset_name,
         indexes = applied_indexes,
