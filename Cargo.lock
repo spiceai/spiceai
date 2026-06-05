@@ -16548,7 +16548,7 @@ dependencies = [
  "fundu",
  "futures",
  "globset",
- "http 1.4.0",
+ "http 1.4.1",
  "itertools 0.14.0",
  "rmcp",
  "runtime-auth",
@@ -16568,7 +16568,7 @@ dependencies = [
  "url",
  "util",
  "utoipa",
- "uuid 1.21.0",
+ "uuid 1.23.2",
 ]
 
 [[package]]
