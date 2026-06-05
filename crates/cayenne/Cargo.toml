@@ -100,6 +100,10 @@ name = "deletion_index_probe"
 
 [[bench]]
 harness = false
+name = "deletion_index_probe_large"
+
+[[bench]]
+harness = false
 name = "position_vs_key_deletion_scan"
 
 [[bench]]
