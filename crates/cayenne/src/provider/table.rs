@@ -6173,18 +6173,24 @@ impl CayenneTableProvider {
     /// For `Int64Pk` tables, encodes each i64 as big-endian bytes.
     /// For `RowConverterBased` tables, passes through the already-encoded row keys.
     /// Position-based tables don't support upserts and return an empty vec.
-    fn build_pk_deletion_row_keys(
+    fn build_pk_deletion_row_keys<'keys>(
         &self,
         deleted_pk_i64: &[i64],
-        deleted_row_keys: Vec<Box<[u8]>>,
-    ) -> Vec<Box<[u8]>> {
+        deleted_row_keys: Cow<'keys, [Box<[u8]>]>,
+    ) -> Cow<'keys, [Box<[u8]>]> {
         match &self.pk_deletion_strategy {
-            PkDeletionStrategyWithCache::Int64Pk { .. } => deleted_pk_i64
-                .iter()
-                .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
-                .collect(),
+            // Int64 PK tables re-derive keys from the i64 PKs and ignore the
+            // encoded row keys, so this allocates only when it must.
+            PkDeletionStrategyWithCache::Int64Pk { .. } => Cow::Owned(
+                deleted_pk_i64
+                    .iter()
+                    .map(|&pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+                    .collect(),
+            ),
+            // RowConverter tables reuse the caller's keys verbatim: a borrowed
+            // slice stays borrowed (no clone), an owned Vec is moved through.
             PkDeletionStrategyWithCache::RowConverterBased { .. } => deleted_row_keys,
-            PkDeletionStrategyWithCache::PositionBased { .. } => vec![],
+            PkDeletionStrategyWithCache::PositionBased { .. } => Cow::Owned(Vec::new()),
         }
     }
 
@@ -6349,7 +6355,9 @@ impl CayenneTableProvider {
 
         let mut committed_deleted_row_keys = Vec::new();
         let insert_pk_bytes = if let Some(delete_sequence) = delete_sequence {
-            let row_keys = self.build_pk_deletion_row_keys(&deleted_pk_i64, deleted_row_keys);
+            let row_keys = self
+                .build_pk_deletion_row_keys(&deleted_pk_i64, Cow::Owned(deleted_row_keys))
+                .into_owned();
             let insert_pk_bytes: Vec<Vec<u8>> =
                 row_keys.iter().map(|key| key.as_ref().to_vec()).collect();
             if let Some(results) = self
@@ -6749,7 +6757,9 @@ impl CayenneTableProvider {
         }
 
         let phase_start = Instant::now();
-        let row_keys = self.build_pk_deletion_row_keys(&deleted_pk_i64, deleted_row_keys);
+        let row_keys = self
+            .build_pk_deletion_row_keys(&deleted_pk_i64, Cow::Owned(deleted_row_keys))
+            .into_owned();
         let insert_pk_bytes: Vec<Vec<u8>> =
             row_keys.iter().map(|key| key.as_ref().to_vec()).collect();
 
@@ -6897,8 +6907,10 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
-        let row_keys = self
-            .build_pk_deletion_row_keys(deleted_inlined_pk_i64, deleted_inlined_row_keys.to_vec());
+        let row_keys = self.build_pk_deletion_row_keys(
+            deleted_inlined_pk_i64,
+            Cow::Borrowed(deleted_inlined_row_keys),
+        );
         if row_keys.is_empty() {
             return Ok(false);
         }
@@ -7077,7 +7089,9 @@ impl CayenneTableProvider {
             return Ok(());
         }
 
-        let row_keys = self.build_pk_deletion_row_keys(deleted_pk_i64, deleted_row_keys.to_vec());
+        let row_keys = self
+            .build_pk_deletion_row_keys(deleted_pk_i64, Cow::Borrowed(deleted_row_keys))
+            .into_owned();
 
         // Commit delete files only — no insert records (inline data bypasses
         // the deletion filter, so no protected insert sequence is needed).
