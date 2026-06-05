@@ -143,7 +143,7 @@ pub fn hash_key_i64(key: i64) -> u64 {
 /// [`BuildHasher`](std::hash::BuildHasher) producing seeded XXH3-64 hashers
 /// that agree with [`hash_key`], for keyed containers (e.g.
 /// `HashMap`/`im::HashMap`) that should share this crate's hashing instead of
-/// the standard library's SipHash default.
+/// the standard library's `SipHash` default.
 ///
 /// The produced [`XxHash3Hasher`] buffers short inputs and hashes them with
 /// the **one-shot** XXH3-64 at `finish()`, skipping the streaming hasher's
@@ -186,11 +186,12 @@ pub struct XxHash3Hasher {
 
 impl std::fmt::Debug for XxHash3Hasher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `XxHash3_64` has no `Debug` impl; report the mode instead.
+        // `XxHash3_64` has no `Debug` impl; report the mode instead of the
+        // raw buffer/spill fields.
         f.debug_struct("XxHash3Hasher")
             .field("buffered_len", &self.len)
             .field("spilled", &self.spill.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

@@ -116,11 +116,16 @@ impl SplitBlockBloomFilter {
 
     /// Selects the block for `hash` via multiply-shift range reduction over
     /// the high 32 bits, leaving the low 32 bits independent for the in-block
-    /// bit positions. The double shift keeps the product within block range,
-    /// so the final cast cannot truncate.
+    /// bit positions. The multiply widens to `u128` so block counts beyond
+    /// `2^32` (a >128 GiB filter) cannot overflow the product; the double
+    /// shift keeps the result within block range, so the cast cannot truncate.
     #[inline]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "range reduction bounds the result to the block count"
+    )]
     fn block_index(&self, hash: u64) -> usize {
-        (((hash >> 32) * (self.blocks.len() as u64)) >> 32) as usize
+        ((u128::from(hash >> 32) * self.blocks.len() as u128) >> 32) as usize
     }
 
     /// Computes the eight per-word bit masks for `hash` from its low 32 bits.
