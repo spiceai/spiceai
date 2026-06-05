@@ -2130,12 +2130,8 @@ enum OnConflictDeletionUpdate {
 #[derive(Clone)]
 enum PkDeletionSnapshot {
     PositionBased,
-    Int64Pk {
-        tombstones: Arc<DeletionIndex>,
-    },
-    RowConverterBased {
-        tombstones: Arc<KeyDeletionIndex>,
-    },
+    Int64Pk { tombstones: Arc<DeletionIndex> },
+    RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
 impl PkDeletionSnapshot {

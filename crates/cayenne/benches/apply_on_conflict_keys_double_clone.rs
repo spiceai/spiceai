@@ -76,8 +76,8 @@ fn build_deleted_row_keys(n: usize) -> Vec<Box<[u8]>> {
 
 fn historical_two_indexes(written_keys: &[Box<[u8]>]) -> (KeyDeletionIndex, KeyDeletionIndex) {
     let empty_deleted = KeyDeletionIndex::empty();
-    let deleted_row_keys = empty_deleted
-        .extend_max_deletes(written_keys.iter().map(|key| (key, DELETE_SEQUENCE)));
+    let deleted_row_keys =
+        empty_deleted.extend_max_deletes(written_keys.iter().map(|key| (key, DELETE_SEQUENCE)));
 
     let empty_inserts = KeyDeletionIndex::empty();
     let insert_records =
@@ -97,16 +97,12 @@ fn bench_double_clone(c: &mut Criterion) {
         let written_keys = build_deleted_row_keys(n);
         group.throughput(Throughput::Elements(throughput_elements(n)));
 
-        group.bench_with_input(
-            BenchmarkId::new("historical_two_indexes", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let pair = historical_two_indexes(black_box(&written_keys));
-                    black_box(pair);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("historical_two_indexes", n), &n, |b, _| {
+            b.iter(|| {
+                let pair = historical_two_indexes(black_box(&written_keys));
+                black_box(pair);
+            });
+        });
 
         group.bench_with_input(
             BenchmarkId::new("current_fused_single_pass", n),

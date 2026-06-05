@@ -743,12 +743,8 @@ mod tests {
         // protected-snapshot paths ignore insert records (see
         // `InsertRecordHandling::Ignore`).
         for pk in -2..12_i64 {
-            let probe_time_filter = is_pk_visible_i64(
-                pk,
-                &full_index,
-                InsertRecordHandling::Ignore,
-                Some(min_seq),
-            );
+            let probe_time_filter =
+                is_pk_visible_i64(pk, &full_index, InsertRecordHandling::Ignore, Some(min_seq));
             let rebuilt_filter =
                 is_pk_visible_i64(pk, &filtered_index, InsertRecordHandling::Ignore, None);
             assert_eq!(

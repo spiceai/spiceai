@@ -202,11 +202,8 @@ fn bench_keep_mask(c: &mut Criterion) {
             shape_name,
             |b, _| {
                 b.iter(|| {
-                    let out = keep_mask_vec_bool(
-                        black_box(&batch),
-                        black_box(0),
-                        black_box(&index),
-                    );
+                    let out =
+                        keep_mask_vec_bool(black_box(&batch), black_box(0), black_box(&index));
                     black_box(out);
                 });
             },

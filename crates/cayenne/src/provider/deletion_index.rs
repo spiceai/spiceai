@@ -261,19 +261,18 @@ impl DeletionIndex {
         let delete_count = deleted.len();
         let insert_count = insert_records.len();
 
-        let mut entries: PersistentHashMap<i64, TombstoneEntry, DeletionIndexHasher> =
-            deleted
-                .into_iter()
-                .map(|(pk, delete_seq)| {
-                    (
-                        pk,
-                        TombstoneEntry {
-                            delete_seq,
-                            insert_seq: SEQUENCE_ABSENT,
-                        },
-                    )
-                })
-                .collect();
+        let mut entries: PersistentHashMap<i64, TombstoneEntry, DeletionIndexHasher> = deleted
+            .into_iter()
+            .map(|(pk, delete_seq)| {
+                (
+                    pk,
+                    TombstoneEntry {
+                        delete_seq,
+                        insert_seq: SEQUENCE_ABSENT,
+                    },
+                )
+            })
+            .collect();
         for (pk, insert_seq) in insert_records {
             merge_max(
                 entries.entry(pk).or_insert(TombstoneEntry {
@@ -416,9 +415,11 @@ impl DeletionIndex {
     /// regression that prompted this fix.
     #[must_use]
     pub fn extend_max_deletes(&self, additions: impl IntoIterator<Item = (i64, i64)>) -> Self {
-        self.extend_with(additions.into_iter().map(|(pk, delete_seq)| {
-            (pk, delete_seq, SEQUENCE_ABSENT)
-        }))
+        self.extend_with(
+            additions
+                .into_iter()
+                .map(|(pk, delete_seq)| (pk, delete_seq, SEQUENCE_ABSENT)),
+        )
     }
 
     /// Build a new index recording an upsert-conflict batch: every key in
@@ -450,7 +451,10 @@ impl DeletionIndex {
         // from the iterator's hint to skip Vec growth reallocations.
         let mut new_delete_keys: Vec<i64> = Vec::with_capacity(additions.size_hint().0);
         for (pk, delete_seq, insert_seq) in additions {
-            debug_assert_ne!(delete_seq, SEQUENCE_ABSENT, "real sequences are non-negative");
+            debug_assert_ne!(
+                delete_seq, SEQUENCE_ABSENT,
+                "real sequences are non-negative"
+            );
             let entry = entries.entry(pk).or_insert(TombstoneEntry {
                 delete_seq: SEQUENCE_ABSENT,
                 insert_seq: SEQUENCE_ABSENT,
@@ -608,21 +612,20 @@ impl KeyDeletionIndex {
         let delete_count = deleted.len();
         let insert_count = insert_records.len();
 
-        let mut entries: PersistentHashMap<u128, TombstoneEntry, PrehashedBuildHasher> =
-            deleted
-                .into_iter()
-                .map(|(key, delete_seq)| {
-                    let key_hash = hash_key_128(&key);
-                    bloom.insert(bloom_half(key_hash));
-                    (
-                        key_hash,
-                        TombstoneEntry {
-                            delete_seq,
-                            insert_seq: SEQUENCE_ABSENT,
-                        },
-                    )
-                })
-                .collect();
+        let mut entries: PersistentHashMap<u128, TombstoneEntry, PrehashedBuildHasher> = deleted
+            .into_iter()
+            .map(|(key, delete_seq)| {
+                let key_hash = hash_key_128(&key);
+                bloom.insert(bloom_half(key_hash));
+                (
+                    key_hash,
+                    TombstoneEntry {
+                        delete_seq,
+                        insert_seq: SEQUENCE_ABSENT,
+                    },
+                )
+            })
+            .collect();
         for (key, insert_seq) in insert_records {
             let key_hash = hash_key_128(&key);
             merge_max(
@@ -747,9 +750,11 @@ impl KeyDeletionIndex {
         &self,
         additions: impl IntoIterator<Item = (K, i64)>,
     ) -> Self {
-        self.extend_with(additions.into_iter().map(|(key, delete_seq)| {
-            (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)
-        }))
+        self.extend_with(
+            additions
+                .into_iter()
+                .map(|(key, delete_seq)| (hash_key_128(key.as_ref()), delete_seq, SEQUENCE_ABSENT)),
+        )
     }
 
     /// Build a new index recording an upsert-conflict batch; see
@@ -761,13 +766,10 @@ impl KeyDeletionIndex {
         delete_sequence: i64,
         insert_sequence: i64,
     ) -> Self {
-        self.extend_with(keys.into_iter().map(|key| {
-            (
-                hash_key_128(key.as_ref()),
-                delete_sequence,
-                insert_sequence,
-            )
-        }))
+        self.extend_with(
+            keys.into_iter()
+                .map(|key| (hash_key_128(key.as_ref()), delete_sequence, insert_sequence)),
+        )
     }
 
     /// Shared merge core for the extend methods, operating on pre-hashed key
@@ -783,7 +785,10 @@ impl KeyDeletionIndex {
         // from the iterator's hint to skip Vec growth reallocations.
         let mut new_delete_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key_hash, delete_seq, insert_seq) in additions {
-            debug_assert_ne!(delete_seq, SEQUENCE_ABSENT, "real sequences are non-negative");
+            debug_assert_ne!(
+                delete_seq, SEQUENCE_ABSENT,
+                "real sequences are non-negative"
+            );
             let entry = entries.entry(key_hash).or_insert(TombstoneEntry {
                 delete_seq: SEQUENCE_ABSENT,
                 insert_seq: SEQUENCE_ABSENT,
@@ -907,7 +912,11 @@ mod tests {
         assert_eq!(next.len(), 3);
         assert_eq!(next.delete_len(), 3);
         assert_eq!(next.insert_len(), 3);
-        assert_eq!(next.max_sequence_number(), Some(10), "insert seqs must not raise the delete max");
+        assert_eq!(
+            next.max_sequence_number(),
+            Some(10),
+            "insert seqs must not raise the delete max"
+        );
         for pk in [1, 2, 3] {
             let tombstone = next.get(pk).expect("conflict key must have a tombstone");
             assert_eq!(tombstone.delete_sequence, 10);
@@ -947,7 +956,11 @@ mod tests {
         assert!(!idx.has_deletions());
         assert_eq!(idx.max_sequence_number(), None);
         for pk in 0..10 {
-            assert_eq!(idx.get(pk), None, "insert-only pk={pk} must probe as absent");
+            assert_eq!(
+                idx.get(pk),
+                None,
+                "insert-only pk={pk} must probe as absent"
+            );
         }
     }
 
@@ -986,7 +999,11 @@ mod tests {
         assert_eq!(tombstone.delete_sequence, 80);
         assert_eq!(tombstone.insert_sequence, Some(70));
         assert_eq!(next.delete_len(), 1);
-        assert_eq!(next.len(), 1, "delete of an insert-only key must not add an entry");
+        assert_eq!(
+            next.len(),
+            1,
+            "delete of an insert-only key must not add an entry"
+        );
     }
 
     #[test]
@@ -1052,10 +1069,8 @@ mod tests {
         assert_eq!(tombstone.insert_sequence, Some(11));
 
         // Insert-only entries from the catalog load path probe as absent until deleted.
-        let loaded = KeyDeletionIndex::from_maps(
-            HashMap::new(),
-            HashMap::from([(byte_key(9), 90_i64)]),
-        );
+        let loaded =
+            KeyDeletionIndex::from_maps(HashMap::new(), HashMap::from([(byte_key(9), 90_i64)]));
         assert_eq!(loaded.get(&byte_key(9)), None);
         assert!(!loaded.has_deletions());
         let deleted = loaded.extend_max_deletes([(byte_key(9), 95)]);
@@ -1091,10 +1106,7 @@ mod tests {
             Some(0)
         );
         assert_eq!(key_delete_seq_of(&next, &0_u16.to_be_bytes()), Some(0));
-        assert_eq!(
-            key_delete_seq_of(&next, &999_u16.to_be_bytes()),
-            Some(999)
-        );
+        assert_eq!(key_delete_seq_of(&next, &999_u16.to_be_bytes()), Some(999));
     }
 
     #[test]
@@ -1193,7 +1205,11 @@ mod tests {
 
         // Every inserted key probes positive.
         for pk in 0..200 {
-            assert_eq!(delete_seq_of(&idx, pk), Some(1), "missing pk={pk} after rebuilds");
+            assert_eq!(
+                delete_seq_of(&idx, pk),
+                Some(1),
+                "missing pk={pk} after rebuilds"
+            );
         }
     }
 

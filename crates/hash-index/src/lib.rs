@@ -55,7 +55,6 @@ mod sbbf;
 mod tests;
 
 pub use bloom::{BatchBloomFilter, BloomFilter};
-pub use sbbf::SplitBlockBloomFilter;
 pub use extract::{
     KeyExtractor, PrimitiveKeyExtractor, RowConverterKeyExtractor, Utf8KeyExtractor,
 };
@@ -64,6 +63,7 @@ pub use index::{
     RowLocation, XxHash3BuildHasher, XxHash3Hasher, hash_key, hash_key_128, hash_key_bytes,
     hash_key_i64, index_threshold,
 };
+pub use sbbf::SplitBlockBloomFilter;
 
 use snafu::prelude::*;
 
