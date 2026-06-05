@@ -183,7 +183,7 @@ pub(crate) fn load_scenario(name: &str, base_path: Option<&str>) -> anyhow::Resu
         &raw_owned
     } else {
         match name {
-            "direct-ingest" => include_str!("../scenarios/direct-ingest.yaml"),
+            "cayenne" => include_str!("../scenarios/cayenne.yaml"),
             "postgres-wal" => include_str!("../scenarios/postgres-wal.yaml"),
             "postgres-debezium" => include_str!("../scenarios/postgres-debezium.yaml"),
             "dynamodb-streams" => include_str!("../scenarios/dynamodb-streams.yaml"),
