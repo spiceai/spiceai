@@ -423,7 +423,19 @@ impl BackgroundCompactor {
 
 /// How long the detached drain thread lets an in-flight compaction finish its
 /// current Vortex write before force-aborting. Bounded so shutdown can never hang.
-const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+///
+/// Sized to outlast a realistic compaction pass: a pass rewrites the whole
+/// current snapshot (see `run_one_compaction_pass` / `rewrite_current_snapshot_for_compaction`),
+/// so its duration scales with table size. At large scale factors that rewrite
+/// can take well over the original 5s, so the abort fired mid-write and vortex-io
+/// panicked ("Runtime dropped task without completing it"). 30s covers a realistic
+/// large-table pass and coincides with the runtime's connection-drain window.
+///
+/// This is a mitigation, not a cure: a pass that still exceeds the window aborts
+/// mid-write and panics on shutdown. The durable fix is incremental (tiered) merge
+/// of the picked candidate files instead of a full-snapshot rewrite, which keeps a
+/// pass short enough to always drain — see the picker's `CompactionCandidate`.
+const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
 
 fn drain_and_abort_compactor(handle: &JoinHandle<()>) {
     // Let an in-flight compaction finish its current write before the

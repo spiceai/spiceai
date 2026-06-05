@@ -174,7 +174,7 @@ impl DeltaTable {
         let mut storage_options: HashMap<String, String> = HashMap::new();
         for (key, value) in options {
             match key.as_ref() {
-                "token" | "endpoint" => {}
+                "token" | "endpoint" | "credential_vending" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
@@ -228,6 +228,28 @@ impl DeltaTable {
             )),
         };
 
+        Self::with_engine(table_url, engine)
+    }
+
+    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
+    /// the credential resolution in [`DeltaTable::from`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials.
+    pub fn from_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
+            .map_err(handle_delta_error)?;
+        let engine = Arc::new(DefaultEngine::new(object_store));
+        Self::with_engine(table_url, engine)
+    }
+
+    fn with_engine(
+        table_url: Url,
+        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    ) -> Result<Self> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())
             .map_err(handle_delta_error)?;
