@@ -91,9 +91,12 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
             port,
         })?
         .build()
-        .map_err(|_| Error::UnableToConnect {
-            host: host.to_string(),
-            port,
+        .map_err(|err| {
+            tracing::debug!("Failed to build DNS resolver: {err}");
+            Error::UnableToConnect {
+                host: host.to_string(),
+                port,
+            }
         })?;
     match resolver.lookup_ip(host).await {
         Ok(ips) => {
