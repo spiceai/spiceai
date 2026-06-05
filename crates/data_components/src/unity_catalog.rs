@@ -30,6 +30,7 @@ use crate::resilient_http::{
     RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
 };
 
+pub mod credential_vending;
 pub mod provider;
 
 #[derive(Debug, Snafu)]
@@ -80,6 +81,15 @@ pub enum Error {
 
     #[snafu(display("Failed to acquire Unity Catalog rate-control permit: {source}"))]
     RateControl { source: runtime_rate_control::Error },
+
+    #[snafu(display(
+        "Unity Catalog denied the temporary credentials request for table ID '{table_id}' (HTTP {status}). Verify credential vending is available: on Databricks, the metastore must have external data access enabled, the calling principal needs the EXTERNAL USE SCHEMA privilege, and the table must support reads by external engines. Response: {message}"
+    ))]
+    CredentialVendingDenied {
+        table_id: String,
+        status: reqwest::StatusCode,
+        message: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -371,6 +381,50 @@ impl UnityCatalog {
         .await
     }
 
+    /// Requests short-lived, downscoped storage credentials for a table from
+    /// the Unity Catalog credential vending API.
+    ///
+    /// On Databricks, credential vending requires the metastore to have
+    /// external data access enabled and the calling principal to hold the
+    /// `EXTERNAL USE SCHEMA` privilege on the table's schema.
+    pub async fn temporary_table_credentials(
+        &self,
+        table_id: &str,
+        operation: TableOperation,
+    ) -> Result<TemporaryTableCredentials> {
+        let path = "/api/2.1/unity-catalog/temporary-table-credentials";
+        let body = serde_json::json!({
+            "table_id": table_id,
+            "operation": operation.as_str(),
+        });
+        async {
+            let response = self
+                .send_post_with_retry("generate temporary table credentials", path, &body)
+                .await?;
+
+            let status = response.status();
+            if status.is_success() {
+                response.json().await.context(ConnectionSnafu)
+            } else if matches!(status.as_u16(), 400 | 401 | 403 | 404) {
+                let message = response.text().await.unwrap_or_default();
+                CredentialVendingDeniedSnafu {
+                    table_id: table_id.to_string(),
+                    status,
+                    message,
+                }
+                .fail()
+            } else {
+                UnexpectedStatusCodeSnafu { status }.fail()
+            }
+        }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_temporary_table_credentials",
+            input = table_id,
+        ))
+        .await
+    }
+
     fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
         let full_url = format!("{}{path}", self.endpoint);
         tracing::debug!("Sending request to {full_url}");
@@ -387,12 +441,49 @@ impl UnityCatalog {
         builder
     }
 
+    fn post_req(&self, path: &str) -> reqwest::RequestBuilder {
+        let full_url = format!("{}{path}", self.endpoint);
+        tracing::debug!("Sending POST request to {full_url}");
+        let mut builder = self.client.post(full_url);
+
+        if let Some(token_provider) = &self.token_provider {
+            builder = builder.bearer_auth(token_provider.get_token());
+        }
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header("User-Agent", user_agent);
+        }
+
+        builder
+    }
+
     async fn send_get_with_retry(&self, operation: &str, path: &str) -> Result<reqwest::Response> {
         let rate_controller_permit = self.acquire_rate_controller_permit().await?;
         let response = send_request_with_retry_and_concurrency_limit(
             "Unity Catalog",
             operation,
             || self.get_req(path),
+            &RetryConfig {
+                concurrency_limit: self.request_semaphore.as_deref(),
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .context(ConnectionSnafu)?;
+        drop(rate_controller_permit);
+        Ok(response)
+    }
+
+    async fn send_post_with_retry(
+        &self,
+        operation: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let rate_controller_permit = self.acquire_rate_controller_permit().await?;
+        let response = send_request_with_retry_and_concurrency_limit(
+            "Unity Catalog",
+            operation,
+            || self.post_req(path).json(body),
             &RetryConfig {
                 concurrency_limit: self.request_semaphore.as_deref(),
                 ..RetryConfig::default()
@@ -495,6 +586,9 @@ pub struct UCTable {
     pub columns: Vec<UCColumn>,
     #[serde(default)]
     pub storage_location: Option<String>,
+    /// Unique table identifier, used for credential vending.
+    #[serde(default)]
+    pub table_id: Option<String>,
 }
 
 impl UCTable {
@@ -607,6 +701,96 @@ pub struct UCSchema {
 }
 
 // ============================================================================
+// Credential vending
+// ============================================================================
+
+/// The operation that vended credentials will be used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableOperation {
+    Read,
+    ReadWrite,
+}
+
+impl TableOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "READ",
+            Self::ReadWrite => "READ_WRITE",
+        }
+    }
+}
+
+/// Response from `POST /api/2.1/unity-catalog/temporary-table-credentials`.
+///
+/// Exactly one of the cloud-specific credential fields is expected to be set,
+/// matching the table's storage location.
+#[derive(Clone, Deserialize)]
+pub struct TemporaryTableCredentials {
+    #[serde(default)]
+    pub aws_temp_credentials: Option<AwsTempCredentials>,
+    #[serde(default)]
+    pub azure_user_delegation_sas: Option<AzureUserDelegationSas>,
+    #[serde(default)]
+    pub gcp_oauth_token: Option<GcpOauthToken>,
+    #[serde(default)]
+    pub r2_temp_credentials: Option<R2TempCredentials>,
+    /// Expiration of the credentials as epoch milliseconds.
+    #[serde(default)]
+    pub expiration_time: i64,
+    /// The storage URL the credentials are scoped to.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+// Manual `Debug` so credential material can never leak into logs.
+impl std::fmt::Debug for TemporaryTableCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemporaryTableCredentials")
+            .field("aws_temp_credentials", &self.aws_temp_credentials.is_some())
+            .field(
+                "azure_user_delegation_sas",
+                &self.azure_user_delegation_sas.is_some(),
+            )
+            .field("gcp_oauth_token", &self.gcp_oauth_token.is_some())
+            .field("r2_temp_credentials", &self.r2_temp_credentials.is_some())
+            .field("expiration_time", &self.expiration_time)
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// Temporary AWS STS credentials vended by Unity Catalog.
+#[derive(Clone, Deserialize)]
+pub struct AwsTempCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+/// Azure user-delegation SAS token vended by Unity Catalog.
+#[derive(Clone, Deserialize)]
+pub struct AzureUserDelegationSas {
+    pub sas_token: String,
+}
+
+/// GCP OAuth token vended by Unity Catalog.
+#[derive(Clone, Deserialize)]
+pub struct GcpOauthToken {
+    pub oauth_token: String,
+}
+
+/// Temporary Cloudflare R2 credentials vended by Unity Catalog.
+#[derive(Clone, Deserialize)]
+pub struct R2TempCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+// ============================================================================
 // Permissions
 // ============================================================================
 
@@ -677,7 +861,8 @@ impl UCPermissionsEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{
-        UCColumn, UCPermissionsEnvelope, UCPrivilege, UCPrivilegeAssignment, UCTable, UCTableType,
+        TableOperation, TemporaryTableCredentials, UCColumn, UCPermissionsEnvelope, UCPrivilege,
+        UCPrivilegeAssignment, UCTable, UCTableType,
     };
 
     fn make_table(table_type: &str) -> UCTable {
@@ -689,6 +874,7 @@ mod tests {
             data_source_format: "DELTA".to_string(),
             columns: Vec::<UCColumn>::new(),
             storage_location: None,
+            table_id: None,
         }
     }
 
@@ -922,5 +1108,102 @@ mod tests {
             ],
         };
         assert_eq!(perms.all_privileges(), vec!["SELECT", "MODIFY", "CREATE"]);
+    }
+
+    // ----------------------------------------------------------------
+    // Credential vending
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_table_operation_as_str() {
+        assert_eq!(TableOperation::Read.as_str(), "READ");
+        assert_eq!(TableOperation::ReadWrite.as_str(), "READ_WRITE");
+    }
+
+    #[test]
+    fn test_uc_table_deserializes_table_id() {
+        let json = r#"{
+            "name": "my_table",
+            "catalog_name": "my_catalog",
+            "schema_name": "my_schema",
+            "table_type": "MANAGED",
+            "table_id": "1234-abcd"
+        }"#;
+        let table: UCTable = serde_json::from_str(json).expect("valid UCTable JSON");
+        assert_eq!(table.table_id.as_deref(), Some("1234-abcd"));
+    }
+
+    #[test]
+    fn test_temporary_table_credentials_deserialize_aws() {
+        let json = r#"{
+            "aws_temp_credentials": {
+                "access_key_id": "AKIA123",
+                "secret_access_key": "SECRET",
+                "session_token": "TOKEN"
+            },
+            "expiration_time": 1716397620000,
+            "url": "s3://bucket/path"
+        }"#;
+        let creds: TemporaryTableCredentials =
+            serde_json::from_str(json).expect("valid AWS credentials JSON");
+        let aws = creds.aws_temp_credentials.expect("aws credentials present");
+        assert_eq!(aws.access_key_id, "AKIA123");
+        assert_eq!(aws.secret_access_key, "SECRET");
+        assert_eq!(aws.session_token.as_deref(), Some("TOKEN"));
+        assert_eq!(creds.expiration_time, 1_716_397_620_000);
+        assert_eq!(creds.url.as_deref(), Some("s3://bucket/path"));
+        assert!(creds.azure_user_delegation_sas.is_none());
+        assert!(creds.gcp_oauth_token.is_none());
+        assert!(creds.r2_temp_credentials.is_none());
+    }
+
+    #[test]
+    fn test_temporary_table_credentials_deserialize_azure_and_gcp() {
+        let azure: TemporaryTableCredentials = serde_json::from_str(
+            r#"{"azure_user_delegation_sas": {"sas_token": "sv=2024&sig=abc"}, "expiration_time": 1}"#,
+        )
+        .expect("valid Azure credentials JSON");
+        assert_eq!(
+            azure
+                .azure_user_delegation_sas
+                .expect("sas present")
+                .sas_token,
+            "sv=2024&sig=abc"
+        );
+
+        let gcp: TemporaryTableCredentials = serde_json::from_str(
+            r#"{"gcp_oauth_token": {"oauth_token": "ya29.token"}, "expiration_time": 1}"#,
+        )
+        .expect("valid GCP credentials JSON");
+        assert_eq!(
+            gcp.gcp_oauth_token.expect("token present").oauth_token,
+            "ya29.token"
+        );
+    }
+
+    #[test]
+    fn test_temporary_table_credentials_debug_redacts_secrets() {
+        let creds: TemporaryTableCredentials = serde_json::from_str(
+            r#"{
+                "aws_temp_credentials": {
+                    "access_key_id": "AKIA123",
+                    "secret_access_key": "SUPERSECRET",
+                    "session_token": "SESSIONTOKEN"
+                },
+                "expiration_time": 1716397620000
+            }"#,
+        )
+        .expect("valid credentials JSON");
+        let debug = format!("{creds:?}");
+        assert!(!debug.contains("AKIA123"), "debug output leaked key id");
+        assert!(
+            !debug.contains("SUPERSECRET"),
+            "debug output leaked secret key"
+        );
+        assert!(
+            !debug.contains("SESSIONTOKEN"),
+            "debug output leaked session token"
+        );
+        assert!(debug.contains("1716397620000"), "expiration should appear");
     }
 }

@@ -15,12 +15,13 @@ limitations under the License.
 */
 
 use crate::Read;
-use crate::unity_catalog::UnityCatalog;
+use crate::unity_catalog::credential_vending::vended_delta_table;
+use crate::unity_catalog::{UCTable, UnityCatalog};
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::TokenProvider;
@@ -32,6 +33,7 @@ pub struct DatabricksDelta {
     token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
     io_runtime: Handle,
+    credential_vending_client: Option<Arc<UnityCatalog>>,
 }
 
 #[derive(Debug, Snafu)]
@@ -58,14 +60,49 @@ impl DatabricksDelta {
             token_provider,
             storage_options,
             io_runtime,
+            credential_vending_client: None,
         }
+    }
+
+    /// Enables Unity Catalog credential vending: each table's storage
+    /// credentials are vended through `client` instead of taken from the
+    /// configured storage options.
+    #[must_use]
+    pub fn with_credential_vending(mut self, client: Arc<UnityCatalog>) -> Self {
+        self.credential_vending_client = Some(client);
+        self
+    }
+
+    /// Returns `true` when Unity Catalog credential vending is enabled.
+    #[must_use]
+    pub fn credential_vending_enabled(&self) -> bool {
+        self.credential_vending_client.is_some()
     }
 
     async fn get_delta_table(
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_uri = self.resolve_table_uri(table_reference).await?;
+        let table = self.get_uc_table(&table_reference).await?;
+        let Some(table_uri) = table.storage_location.clone() else {
+            return Err(Error::TableDoesNotHaveStorageLocation { table_reference }.into());
+        };
+
+        if let Some(client) = &self.credential_vending_client {
+            let aws_region = self
+                .storage_options
+                .get("aws_region")
+                .map(|s| s.expose_secret().to_string());
+            match vended_delta_table(Arc::clone(client), &table, &table_uri, aws_region).await {
+                Ok(delta) => return Ok(Arc::new(delta) as Arc<dyn TableProvider>),
+                Err(err) => {
+                    tracing::warn!(
+                        table = %table.full_name(),
+                        "Unable to use Unity Catalog credential vending for table; falling back to configured storage credentials: {err}"
+                    );
+                }
+            }
+        }
 
         let mut storage_options = HashMap::new();
         for (key, value) in &self.storage_options {
@@ -85,10 +122,10 @@ impl DatabricksDelta {
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }
 
-    pub async fn resolve_table_uri(
+    async fn get_uc_table(
         &self,
-        table_reference: TableReference,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        table_reference: &TableReference,
+    ) -> Result<UCTable, Box<dyn std::error::Error + Send + Sync>> {
         let uc_client = UnityCatalog::new(
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
@@ -96,17 +133,24 @@ impl DatabricksDelta {
         )
         .boxed()?;
 
-        let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
+        let table_opt = uc_client.get_table(table_reference).await.boxed()?;
 
-        if let Some(table) = table_opt {
-            if let Some(storage_location) = table.storage_location {
-                Ok(storage_location)
-            } else {
-                Err(Error::TableDoesNotHaveStorageLocation { table_reference }.into())
+        table_opt.ok_or_else(|| {
+            Error::TableDoesNotExist {
+                table_reference: table_reference.clone(),
             }
-        } else {
-            Err(Error::TableDoesNotExist { table_reference }.into())
-        }
+            .into()
+        })
+    }
+
+    pub async fn resolve_table_uri(
+        &self,
+        table_reference: TableReference,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let table = self.get_uc_table(&table_reference).await?;
+        table
+            .storage_location
+            .ok_or_else(|| Error::TableDoesNotHaveStorageLocation { table_reference }.into())
     }
 }
 
