@@ -123,6 +123,13 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
+/// Default intra-write encode-shard count for an unsorted write when no per-table
+/// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
+/// core count: the value is sized per table in isolation, so a high default makes
+/// independent tables oversubscribe the box under concurrent CDC. Users raise
+/// `cayenne_write_concurrency` explicitly when a table needs more encode
+/// parallelism. See `snapshot_write_concurrency`.
+const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 // Approximate per-entry `HashMap` control/allocation overhead used for the
 // cache budget. The exact value is allocator-dependent, so keep this estimate
 // centralized with `approx_pk_keyset_entry_bytes`.
@@ -4067,6 +4074,26 @@ impl CayenneTableProvider {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
 
+        // Bound aggregate encode concurrency across all tables. Per-table
+        // `cayenne_write_concurrency` is sized in isolation (a conservative unset
+        // default of `DEFAULT_WRITE_CONCURRENCY`, but raisable per table), so
+        // simultaneous CDC writes across a fleet of tables would otherwise sum and
+        // oversubscribe the machine. Acquire this write's
+        // shard permits from the process-global budget before sharding the
+        // encode, held until the write completes. No-op (ungated) when no budget
+        // is installed (unit tests, embedders). See `write_budget`.
+        let shard_count =
+            self.snapshot_shard_count(target_partitions, target_size_bytes, estimated_bytes);
+        // `shard_count` is the *requested* fan-out; the Vortex sink clamps the
+        // actual encode to `target_partitions` (`VortexFormat::build_shard_spec`).
+        // Acquire permits for that clamped count so a `cayenne_write_concurrency`
+        // configured above `target_partitions` can't over-subscribe the global
+        // budget and throttle other tables. (`acquire_encode_permits` also caps to
+        // the budget total, but clamping here keeps the request honest even if the
+        // budget is ever sized below the core count, e.g. reserved query threads.)
+        let encode_shards = shard_count.min(target_partitions.max(1));
+        let _encode_permits = super::write_budget::acquire_encode_permits(encode_shards).await;
+
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -4330,8 +4357,17 @@ impl CayenneTableProvider {
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
-    /// write: the per-table `cayenne_write_concurrency` override if set, else the
-    /// caller's `session_target_partitions` fallback.
+    /// write: the per-table `cayenne_write_concurrency` override if set, else a
+    /// conservative default of [`DEFAULT_WRITE_CONCURRENCY`] (capped at the host
+    /// core count so tiny hosts don't over-shard).
+    ///
+    /// The default is deliberately NOT the host core count. `write_concurrency` is
+    /// sized per table in isolation, so a default of "all cores" makes independent
+    /// tables oversubscribe the box under concurrent CDC — the aggregate is the
+    /// sum across every writing table, not the per-table value. A small default
+    /// keeps that sum sane out of the box; users raise `cayenne_write_concurrency`
+    /// explicitly when a table needs more encode parallelism (and the process-wide
+    /// encode budget still bounds the aggregate — see `provider::write_budget`).
     ///
     /// This is the *requested* count. `VortexFormat::build_shard_spec` then clamps
     /// it to the write session's `target_partitions` — the host's logical-core
@@ -4340,10 +4376,8 @@ impl CayenneTableProvider {
     /// parallel encode is CPU-bound, so extra shards would only add files (read
     /// amplification) without speeding the write.
     fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
-        self.context
-            .write_concurrency()
-            .unwrap_or(session_target_partitions)
-            .max(1)
+        let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
+        self.context.write_concurrency().unwrap_or(default).max(1)
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -13067,15 +13101,19 @@ mod tests {
             provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10)),
             3
         );
-        // 12 files' worth, but write_concurrency is 8 ⇒ clamp to 8.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 8);
+        // 12 files' worth, but with no per-table override the default
+        // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 4);
     }
 
     #[tokio::test]
     async fn test_shard_count_unknown_size_preserves_full_concurrency() {
-        // estimated_bytes == None is the explicit "unknown size" fallback and
-        // must keep the pre-change behavior (full write concurrency), so opaque
-        // streams (compaction-less staged appends, overwrites) are unaffected.
+        // estimated_bytes == None is the explicit "unknown size" fallback: it
+        // takes the full write concurrency (not a size-derived count), so opaque
+        // streams (compaction-less staged appends, overwrites) shard at the
+        // configured write_concurrency. With no per-table override that is the
+        // default, DEFAULT_WRITE_CONCURRENCY (4), capped at the session's
+        // target_partitions.
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -13087,14 +13125,14 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        assert_eq!(provider.snapshot_shard_count(6, tsb, None), 6);
+        assert_eq!(provider.snapshot_shard_count(6, tsb, None), 4);
         assert_eq!(
             provider
                 .write_shard_format(6, tsb, None)
                 .write_shard()
                 .expect("unknown-size write keeps full fan-out")
                 .write_concurrency,
-            6
+            4
         );
     }
 

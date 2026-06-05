@@ -53,8 +53,39 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use std::any::Any;
 use std::sync::Arc;
+
+/// Per-partition metrics for a deletion-filter exec.
+///
+/// `EXPLAIN ANALYZE` shows nothing for an exec without metrics, which made the
+/// merge-on-read deletion read-tax invisible (its only signal was an OS-level
+/// CPU sample of `KeyDeletionIndex::get`). These surface, per partition:
+/// - `output_rows` / `elapsed_compute` (`DataFusion` baseline) — the per-row probe cost.
+/// - `rows_deleted` — rows removed by the filter; scanned rows can be inferred as
+///   `rows_deleted + output_rows`.
+///
+/// The deletion-set size is shown in the exec's `DisplayAs` label (`filtered_keys=`),
+/// not as a metric: it is a per-table constant, and `DataFusion` sums metric values
+/// across partitions, which would report `partitions × keys`.
+#[derive(Clone)]
+struct DeletionFilterMetrics {
+    baseline: BaselineMetrics,
+    /// Rows removed because their key was an applicable (visible) deletion.
+    rows_deleted: Count,
+}
+
+impl DeletionFilterMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline: BaselineMetrics::new(metrics, partition),
+            rows_deleted: MetricBuilder::new(metrics).counter("rows_deleted", partition),
+        }
+    }
+}
 
 // ============================================================================
 // PK Visibility Helpers
@@ -195,6 +226,8 @@ pub struct KeyBasedDeletionFilterExec {
     /// See [`Int64PkDeletionFilterExec::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     properties: datafusion_physical_plan::PlanProperties,
+    /// Execution metrics surfaced via `EXPLAIN ANALYZE` (see [`DeletionFilterMetrics`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl KeyBasedDeletionFilterExec {
@@ -224,6 +257,7 @@ impl KeyBasedDeletionFilterExec {
             row_converter,
             min_delete_seq_to_apply,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -251,6 +285,10 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
@@ -285,6 +323,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         partition: usize,
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
         let tombstones = Arc::clone(&self.tombstones);
         let insert_record_handling = self.insert_record_handling;
@@ -301,6 +340,7 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             row_converter,
             min_delete_seq_to_apply,
             schema,
+            metrics,
         }))
     }
 }
@@ -315,6 +355,7 @@ pub struct KeyBasedDeletionFilterStream {
     /// See [`Int64PkDeletionFilterStream::min_delete_seq_to_apply`].
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
+    metrics: DeletionFilterMetrics,
 }
 
 impl futures::Stream for KeyBasedDeletionFilterStream {
@@ -333,9 +374,14 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
+                    // Time the probe + filter kernel so the merge-on-read read-tax is
+                    // visible in EXPLAIN ANALYZE. Dropped on every return/continue below.
+                    let _timer = self.metrics.baseline.elapsed_compute().timer();
+
                     // Fast path: no deletions to apply (insert-only entries
                     // never affect visibility)
                     if !self.tombstones.has_deletions() {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -398,11 +444,13 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
 
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
+                        self.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
                     // If no rows are deleted, return the batch as-is (fast path)
                     if keep_count == batch_size {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -420,6 +468,12 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -468,6 +522,8 @@ pub struct Int64PkDeletionFilterExec {
     /// index. `None` means apply every deletion in the index.
     min_delete_seq_to_apply: Option<i64>,
     properties: datafusion_physical_plan::PlanProperties,
+    /// Execution metrics surfaced via `EXPLAIN ANALYZE` (see [`DeletionFilterMetrics`]).
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl Int64PkDeletionFilterExec {
@@ -494,6 +550,7 @@ impl Int64PkDeletionFilterExec {
             pk_column_index,
             min_delete_seq_to_apply,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -522,6 +579,10 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
@@ -555,6 +616,7 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
         partition: usize,
         context: Arc<datafusion_execution::TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let metrics = DeletionFilterMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
         let tombstones = Arc::clone(&self.tombstones);
         let insert_record_handling = self.insert_record_handling;
@@ -569,6 +631,7 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
             pk_column_index,
             min_delete_seq_to_apply,
             schema,
+            metrics,
         }))
     }
 }
@@ -584,6 +647,7 @@ struct Int64PkDeletionFilterStream {
     /// each snapshot owning a per-snapshot rebuilt copy.
     min_delete_seq_to_apply: Option<i64>,
     schema: arrow_schema::SchemaRef,
+    metrics: DeletionFilterMetrics,
 }
 
 impl futures::Stream for Int64PkDeletionFilterStream {
@@ -604,9 +668,14 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
+                    // Time the probe + filter kernel so the merge-on-read read-tax is
+                    // visible in EXPLAIN ANALYZE. Dropped on every return/continue below.
+                    let _timer = self.metrics.baseline.elapsed_compute().timer();
+
                     // Fast path: no deletions to apply (insert-only entries
                     // never affect visibility)
                     if !self.tombstones.has_deletions() {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -660,11 +729,13 @@ impl futures::Stream for Int64PkDeletionFilterStream {
 
                     // If all rows are deleted, skip this batch and continue to next
                     if keep_count == 0 {
+                        self.metrics.rows_deleted.add(batch_size);
                         continue;
                     }
 
                     // If no rows are deleted, return the batch as-is (fast path)
                     if keep_count == batch_size {
+                        self.metrics.baseline.record_output(batch_size);
                         return std::task::Poll::Ready(Some(Ok(batch)));
                     }
 
@@ -682,6 +753,12 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                                 )));
                             }
                         };
+
+                    let filtered_row_count = filtered_batch.num_rows();
+                    self.metrics
+                        .rows_deleted
+                        .add(batch_size - filtered_row_count);
+                    self.metrics.baseline.record_output(filtered_row_count);
 
                     return std::task::Poll::Ready(Some(Ok(filtered_batch)));
                 }
@@ -875,6 +952,7 @@ mod tests {
             row_converter,
             min_delete_seq_to_apply: None,
             schema,
+            metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
         };
 
         let Some(batch) = stream.next().await.transpose()? else {
