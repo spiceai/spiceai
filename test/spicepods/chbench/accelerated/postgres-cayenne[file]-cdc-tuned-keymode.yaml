@@ -14,6 +14,11 @@ runtime:
   query:
     memory_limit: 40GiB
     target_partitions: 32
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
 
 postgres_connection_params: &postgres_params
   pg_host: 127.0.0.1

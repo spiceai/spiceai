@@ -2,30 +2,31 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-cdc-tuned
 
+# Target: xlarger-runner — 64 vCPU / 256 GiB RAM, SSD storage.
+#
+# Key tuning:
+#   - cdc_max_coalesced_envelopes 4096 (runtime max): larger CDC batches cut metastore round-trips.
+#   - target_partitions 64: read-path parallelism matched to vCPU count.
+#   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
+#     upsert tables; reference tables use lighter settings.
 runtime:
   params:
     cdc_prefetch_buffer: '1024'
-    # 4096 = the runtime max (changes.rs:CDC_MAX_COALESCED_ENVELOPES_MAX). 8192
-    # was silently rejected and fell back to the default 256 — ~16x smaller CDC
-    # batches, multiplying the per-batch apply_on_conflict_deletions O(N)
-    # deletion-index clone and starving WAL drain under bursty OLTP.
     cdc_max_coalesced_envelopes: '4096'
     cdc_max_coalesced_bytes: '134217728' # 128 MB
     cdc_max_coalesce_age_ms: '4000'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
-    cayenne_footer_cache_mb: '256'
+    cayenne_footer_cache_mb: '1024'
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
   query:
-    # No memory_limit set on purpose — spiced auto-detects the budget from the
-    # cgroup/host memory cap and sizes the DataFusion pool to a safe fraction of
-    # it. Auto-detection is the right default here: it tracks the deployment's
-    # actual memory and inherently leaves headroom for the off-pool Vortex encode
-    # buffers + segment/footer caches that a fixed `memory_limit` would not count.
-    #
-    # Read-path scan/join parallelism = 2x the 16 logical cores. Does NOT raise the
-    # write/compaction shard count (parallel encode is CPU-bound and ceilings at
-    # the core count); per-table write fan-out is set via `cayenne_write_concurrency`.
-    target_partitions: 32
+    target_partitions: 64
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
 
 postgres_connection_params: &postgres_params
   pg_host: 127.0.0.1
@@ -58,14 +59,11 @@ datasets:
       params: &accel_high_volume
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/district
-        # 8-way parallel encode = half the 16 cores: leaves ~half for OLAP during
-        # an ingest burst (16-way encode would pin every core and cause the 80-90s
-        # single-query latency outliers). Compaction no longer competes here — it
-        # is now pinned to a single output shard. Raise toward the core count on
-        # larger hosts.
-        cayenne_write_concurrency: '8'
+        cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
+        # Pinned to 4 GiB: on a 256 GiB host the memory-aware auto-default reaches the 8 GiB ceiling, which over-sizes the exact keyset for high-update tables.
+        cayenne_pk_keyset_cache_mb: '4096'
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
         cayenne_compaction_background_interval_ms: '3000'
@@ -146,10 +144,7 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        # 8 to match the HTAP budget (was 32, which a 16-core host clamped to 16
-        # anyway). order_line is the heaviest compactor, so capping its fan-out
-        # matters most for query latency. See the accel_high_volume note.
-        cayenne_write_concurrency: '8'
+        cayenne_write_concurrency: '4'
         cayenne_target_file_size_mb: '256'
         cayenne_compaction_trigger_files: '8'
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
