@@ -75,6 +75,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod fsync_tier;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod overwrite;
