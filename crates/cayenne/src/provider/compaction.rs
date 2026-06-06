@@ -408,10 +408,23 @@ impl BackgroundCompactor {
                 // interleave fairly between merges.
                 for _ in 0..MAX_DRAIN_PASSES_PER_WAKE {
                     // Acquire a permit, gating concurrent background compactions
-                    // across all tables sharing the semaphore.
-                    let Ok(_permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                        // Semaphore closed — provider tree shutting down.
-                        break 'wake;
+                    // across all tables sharing the semaphore. Observe shutdown
+                    // *during* acquisition so a drop fired mid-drain stops the loop
+                    // promptly instead of running up to `MAX_DRAIN_PASSES_PER_WAKE`
+                    // more passes (each a multi-second full-snapshot rewrite at
+                    // scale) before the next outer tick notices. This only gates the
+                    // gap *between* passes: an already in-flight
+                    // `run_compaction_trigger` below is intentionally never
+                    // interrupted, so a pass still drains to completion on drop (see
+                    // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let _permit = tokio::select! {
+                        biased;
+                        () = shutdown_task.notified() => break 'wake,
+                        acquired = Arc::clone(&semaphore).acquire_owned() => match acquired {
+                            Ok(permit) => permit,
+                            // Semaphore closed — provider tree shutting down.
+                            Err(_) => break 'wake,
+                        },
                     };
 
                     match runner.run_compaction_trigger().await {

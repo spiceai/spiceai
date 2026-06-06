@@ -6683,7 +6683,6 @@ impl CayenneTableProvider {
                 message: format!("Failed to reserve sequence numbers for on-conflict: {err}"),
             })?;
         let delete_sequence = base;
-        let insert_sequence = base + 1;
 
         // --- Phase 1: inline-deletion handling -----------------------------
         // Durably write an inline tombstone for each PK whose prior copy is in
@@ -6758,14 +6757,26 @@ impl CayenneTableProvider {
         // Key-based deletions for unlocated / bloom-fallback FILE rows. A batch
         // with only inline and/or position deletes has no key lists, so skip the
         // key-vector path — but still report whether an inline tombstone (phase 1)
-        // was written so the publish step bumps the inline generation. The
-        // `delete_sequence`/`insert_sequence` reserved up front are already
-        // consumed by the inline tombstone (phase 1) in that case.
+        // was written so the publish step bumps the inline generation. The single
+        // `delete_sequence` reserved up front is already consumed by the inline
+        // tombstone (phase 1) in that case; no `insert_sequence` was reserved
+        // (`reserve_count` was 1), so it is computed only below where it is used.
         if !has_file_key_deletions {
             return Ok(
                 OnConflictUpdate::none().with_inlined_tombstone_written(inlined_tombstone_written)
             );
         }
+
+        // Reaching here means `has_file_key_deletions` is true, so `reserve_count`
+        // was 2 and the second reserved sequence (`base + 1`) is a real, allocated
+        // sequence number. Compute it only now (it is unused on the inline/position-
+        // only early-return above) and use `checked_add` to fail safely instead of
+        // overflow-panicking (debug) or wrapping (release) at the i64 ceiling.
+        let insert_sequence =
+            base.checked_add(1)
+                .ok_or_else(|| CatalogError::InvalidOperationNoSource {
+                    message: "sequence-number counter overflowed i64 reserving an on-conflict insert sequence".to_string(),
+                })?;
 
         let phase_start = Instant::now();
         let row_keys = self
