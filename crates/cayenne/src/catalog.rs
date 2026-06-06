@@ -522,7 +522,60 @@ pub trait MetadataCatalog: Send + Sync {
     }
 
     /// Add a small batch of delete identifiers inlined in the metastore.
+    ///
+    /// Returns the `inlined_id` of the written row so the caller can later flip
+    /// its activation flag with [`Self::mark_inlined_delete_published`]. A
+    /// staged inline-conflict tombstone is written with [`InlinedDelete::published`]
+    /// = `false` and stays inert (the read filter skips it) until its owning
+    /// snapshot publishes.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
+
+    /// Durably flip a single inline tombstone's activation flag to `published =
+    /// true`, identified by `(table_id, inlined_id)`.
+    ///
+    /// Called from the staged on-conflict finalize (under the listing fence,
+    /// before the replacement files are moved into the target snapshot) so the
+    /// tombstone becomes active exactly when — and never before — its
+    /// replacement rows become discoverable. Idempotent: flipping an
+    /// already-published row is a no-op.
+    async fn mark_inlined_delete_published(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Durably revert a single inline tombstone's activation flag back to
+    /// `published = false`, identified by `(table_id, inlined_id)`. The exact
+    /// inverse of [`Self::mark_inlined_delete_published`].
+    ///
+    /// Called from the staged on-conflict finalize ERROR path: if the file move
+    /// / publish fails AFTER the flag was flipped, the tombstone would otherwise
+    /// be left active (`published = true`) with its replacement still absent from
+    /// the listing, so a concurrent inline insert (which bumps
+    /// `inlined_generation` and rebuilds the cache) would apply the tombstone and
+    /// hide the old row while the replacement is unlisted — a transient vanish
+    /// that heals only on reopen. Reverting restores self-consistency
+    /// immediately. Re-published exactly-once on the next open by
+    /// [`Self::publish_orphan_inlined_deletes`] after the interrupted move is
+    /// recovered. Idempotent: reverting an already-unpublished row is a no-op.
+    async fn mark_inlined_delete_unpublished(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Durably flip EVERY currently-unpublished inline tombstone for a table to
+    /// `published = true`, returning how many rows were flipped.
+    ///
+    /// Called once at table open, AFTER `ensure_no_incomplete_write` has
+    /// recovered any interrupted staged append (which moves the replacement files
+    /// into their snapshot — completing the upsert without data loss). At that
+    /// point every `published = false` tombstone corresponds to staged work whose
+    /// replacement is now durable, so activating them makes the upsert apply
+    /// exactly once across the crash (replacement visible, old inline copy
+    /// hidden) rather than leaving a duplicate. There are no in-flight runtime
+    /// writers at open time, so this never races a live stage.
+    async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64>;
 
     /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
     /// and append new inline data rows.
@@ -547,6 +600,24 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
+
+    /// Get only the *published* inlined delete entries for a table.
+    ///
+    /// This is the hot read path's variant of [`get_inlined_deletes`]: it pushes
+    /// the `published = 1` predicate into SQL so the expensive `delete_ipc` blobs
+    /// of in-flight (`published = 0`) tombstones are never materialised or
+    /// shipped only to be discarded in memory. The `published = 1` SQL filter is
+    /// exactly equivalent to skipping `!delete.published` rows in Rust, so it
+    /// preserves the per-tombstone activation gate that
+    /// `load_inlined_deletion_maps` relies on for the no-transient-PK-vanish
+    /// invariant — it returns every published tombstone and no unpublished one.
+    ///
+    /// Diagnostic/test callers that must inspect unpublished rows continue to use
+    /// [`get_inlined_deletes`].
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>>;
 
     /// Remove all inlined deletes for a table (called after checkpoint).
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()>;

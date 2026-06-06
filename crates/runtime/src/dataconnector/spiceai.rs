@@ -42,6 +42,10 @@ use spice_cloud_client::endpoints::{
 };
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue, errors::InvalidMetadataValue};
 
+use super::client_identity::{
+    self as mtls_client_identity, ClientIdentityConfig, ClientIdentityConfigError,
+    TLS_CLIENT_CERTIFICATE, TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_KEY, TLS_CLIENT_KEY_FILE,
+};
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
@@ -112,7 +116,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "mTLS client identity is ambiguous: both file-based ('tls_client_certificate_file') and inline ('tls_client_certificate') params are set. Use one or the other, not both."
+        "mTLS client identity is ambiguous: file-based params ('spiceai_tls_client_certificate_file', 'spiceai_tls_client_key_file') cannot be mixed with inline params ('spiceai_tls_client_certificate', 'spiceai_tls_client_key'). Use either the file-based pair or the inline pair, not both."
     ))]
     AmbiguousClientIdentity,
 }
@@ -120,8 +124,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Resolves the client identity from the four possible params:
-/// `tls_client_certificate_file` / `tls_client_key_file` (file-based) and
-/// `tls_client_certificate` / `tls_client_key` (inline PEM).
+/// `spiceai_tls_client_certificate_file` / `spiceai_tls_client_key_file` (file-based) and
+/// `spiceai_tls_client_certificate` / `spiceai_tls_client_key` (inline PEM).
 ///
 /// Returns `Ok(None)` when no client identity is configured, `Ok(Some(...))`
 /// when a complete identity is found, or `Err` when the params are
@@ -131,55 +135,37 @@ fn resolve_client_identity_params(
     key_file: Option<PathBuf>,
     cert_inline: Option<Vec<u8>>,
     key_inline: Option<Vec<u8>>,
-) -> std::result::Result<Option<ClientIdentity>, Box<dyn std::error::Error + Send + Sync>> {
-    let has_file_cert = cert_file.is_some();
-    let has_file_key = key_file.is_some();
-    let has_inline_cert = cert_inline.is_some();
-    let has_inline_key = key_inline.is_some();
-
-    // Reject ambiguous: both file and inline cert set.
-    if (has_file_cert || has_file_key) && (has_inline_cert || has_inline_key) {
-        return Err(Box::new(Error::AmbiguousClientIdentity));
-    }
-
-    // File-based identity.
-    if has_file_cert || has_file_key {
-        return match (cert_file, key_file) {
-            (Some(cert_path), Some(key_path)) => Ok(Some(ClientIdentity::FromFiles {
+) -> Result<Option<ClientIdentity>> {
+    mtls_client_identity::resolve_client_identity_config(
+        cert_file,
+        key_file,
+        cert_inline,
+        key_inline,
+    )
+    .map_err(|error| match error {
+        ClientIdentityConfigError::Incomplete {
+            set_field,
+            missing_field,
+        } => Error::IncompleteClientIdentity {
+            set_field: format!("spiceai_{set_field}"),
+            missing_field: format!("spiceai_{missing_field}"),
+        },
+        ClientIdentityConfigError::Ambiguous => Error::AmbiguousClientIdentity,
+    })
+    .map(|config| {
+        config.map(|config| match config {
+            ClientIdentityConfig::FromFiles {
                 cert_path,
                 key_path,
-            })),
-            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
-                set_field: "tls_client_certificate_file".to_string(),
-                missing_field: "tls_client_key_file".to_string(),
-            })),
-            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
-                set_field: "tls_client_key_file".to_string(),
-                missing_field: "tls_client_certificate_file".to_string(),
-            })),
-            (None, None) => unreachable!(),
-        };
-    }
-
-    // Inline identity.
-    if has_inline_cert || has_inline_key {
-        return match (cert_inline, key_inline) {
-            (Some(cert_pem), Some(key_pem)) => {
-                Ok(Some(ClientIdentity::FromPem { cert_pem, key_pem }))
+            } => ClientIdentity::FromFiles {
+                cert_path,
+                key_path,
+            },
+            ClientIdentityConfig::FromPem { cert_pem, key_pem } => {
+                ClientIdentity::FromPem { cert_pem, key_pem }
             }
-            (Some(_), None) => Err(Box::new(Error::IncompleteClientIdentity {
-                set_field: "tls_client_certificate".to_string(),
-                missing_field: "tls_client_key".to_string(),
-            })),
-            (None, Some(_)) => Err(Box::new(Error::IncompleteClientIdentity {
-                set_field: "tls_client_key".to_string(),
-                missing_field: "tls_client_certificate".to_string(),
-            })),
-            (None, None) => unreachable!(),
-        };
-    }
-
-    Ok(None)
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -268,14 +254,14 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("tls_ca_certificate_file")
         .description("Path to a CA certificate file (PEM format) to use for TLS verification instead of system certificates."),
-    ParameterSpec::component("tls_client_certificate_file")
-        .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'."),
-    ParameterSpec::component("tls_client_key_file")
-        .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'."),
-    ParameterSpec::component("tls_client_certificate").secret()
-        .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'."),
-    ParameterSpec::component("tls_client_key").secret()
-        .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'."),
+    ParameterSpec::component(TLS_CLIENT_CERTIFICATE_FILE)
+        .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'."),
+    ParameterSpec::component(TLS_CLIENT_KEY_FILE)
+        .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'."),
+    ParameterSpec::component(TLS_CLIENT_CERTIFICATE).secret()
+        .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'."),
+    ParameterSpec::component(TLS_CLIENT_KEY).secret()
+        .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'."),
 ];
 
 const HEADER_ORG: &str = "spiceai-org";
@@ -428,25 +414,25 @@ impl DataConnectorFactory for SpiceAIFactory {
                 .map(PathBuf::from);
             let client_certificate_path: Option<PathBuf> = params
                 .parameters
-                .get("tls_client_certificate_file")
+                .get(TLS_CLIENT_CERTIFICATE_FILE)
                 .expose()
                 .ok()
                 .map(PathBuf::from);
             let client_key_path: Option<PathBuf> = params
                 .parameters
-                .get("tls_client_key_file")
+                .get(TLS_CLIENT_KEY_FILE)
                 .expose()
                 .ok()
                 .map(PathBuf::from);
             let client_certificate_inline: Option<Vec<u8>> = params
                 .parameters
-                .get("tls_client_certificate")
+                .get(TLS_CLIENT_CERTIFICATE)
                 .expose()
                 .ok()
                 .map(|s| s.as_bytes().to_vec());
             let client_key_inline: Option<Vec<u8>> = params
                 .parameters
-                .get("tls_client_key")
+                .get(TLS_CLIENT_KEY)
                 .expose()
                 .ok()
                 .map(|s| s.as_bytes().to_vec());

@@ -530,12 +530,22 @@ impl SqliteMetastore {
             delete_count BIGINT NOT NULL,
             sequence_number BIGINT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            published INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
     const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
     const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
+    /// Partial index over the unpublished tombstones (Option D). The only other
+    /// `cayenne_inlined_delete` index is `(table_id, sequence_number)`, which a
+    /// `WHERE table_id = ? AND published = 0` predicate cannot seek — it has to
+    /// scan every tombstone for the table. This partial index covers exactly the
+    /// in-flight `published = 0` rows (a tiny set; finalize flips them to 1), so
+    /// `publish_orphan_inlined_deletes`' COUNT/UPDATE seek straight to them. Its
+    /// complement also accelerates the hot read path's
+    /// `WHERE table_id = ? AND published = 1` (`get_published_inlined_deletes`).
+    const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -687,6 +697,27 @@ impl MetastoreBackend for SqliteMetastore {
                     [],
                 );
 
+                // Per-tombstone activation flag for `cayenne_inlined_delete`. The
+                // ALTER sets every existing row to the column default (0). Rows
+                // that predate this flag were ALWAYS active under the old
+                // semantics (no `published` gate), so when the ALTER actually
+                // adds the column (Ok), backfill those legacy rows to 1 — leaving
+                // them at 0 would make them inert and resurrect the old inline
+                // copies they hide. On a fresh DB the column already exists in the
+                // CREATE TABLE above, the ALTER errors (Err), and the backfill is
+                // skipped (the table is empty anyway). On every later startup the
+                // ALTER errors too, so the backfill never re-activates a
+                // legitimately in-flight `published = 0` tombstone.
+                if conn
+                    .execute(
+                        "ALTER TABLE cayenne_inlined_delete ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )
+                    .is_ok()
+                {
+                    conn.execute("UPDATE cayenne_inlined_delete SET published = 1", [])?;
+                }
+
                 Ok::<_, rusqlite::Error>(())
             })
             .await
@@ -701,6 +732,7 @@ impl MetastoreBackend for SqliteMetastore {
                 conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await
