@@ -530,6 +530,7 @@ impl SqliteMetastore {
             delete_count BIGINT NOT NULL,
             sequence_number BIGINT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            published INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -686,6 +687,27 @@ impl MetastoreBackend for SqliteMetastore {
                     "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
                     [],
                 );
+
+                // Per-tombstone activation flag for `cayenne_inlined_delete`. The
+                // ALTER sets every existing row to the column default (0). Rows
+                // that predate this flag were ALWAYS active under the old
+                // semantics (no `published` gate), so when the ALTER actually
+                // adds the column (Ok), backfill those legacy rows to 1 — leaving
+                // them at 0 would make them inert and resurrect the old inline
+                // copies they hide. On a fresh DB the column already exists in the
+                // CREATE TABLE above, the ALTER errors (Err), and the backfill is
+                // skipped (the table is empty anyway). On every later startup the
+                // ALTER errors too, so the backfill never re-activates a
+                // legitimately in-flight `published = 0` tombstone.
+                if conn
+                    .execute(
+                        "ALTER TABLE cayenne_inlined_delete ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )
+                    .is_ok()
+                {
+                    conn.execute("UPDATE cayenne_inlined_delete SET published = 1", [])?;
+                }
 
                 Ok::<_, rusqlite::Error>(())
             })

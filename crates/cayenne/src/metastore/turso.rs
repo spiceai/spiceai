@@ -328,6 +328,7 @@ impl TursoMetastore {
             delete_count BIGINT NOT NULL,
             sequence_number BIGINT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            published INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -530,6 +531,28 @@ impl MetastoreBackend for TursoMetastore {
                 (),
             )
             .await;
+
+        // Per-tombstone activation flag for `cayenne_inlined_delete`. When the
+        // ALTER actually adds the column (Ok), every existing row took the
+        // default (0); backfill legacy rows to 1 because they were always active
+        // under the pre-flag semantics (leaving them 0 would resurrect the old
+        // inline copies they hide). On a fresh DB / later startups the column
+        // already exists, the ALTER errors, and the backfill is skipped so a
+        // legitimately in-flight `published = 0` tombstone is never re-activated.
+        if conn
+            .execute(
+                "ALTER TABLE cayenne_inlined_delete ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .is_ok()
+        {
+            conn.execute("UPDATE cayenne_inlined_delete SET published = 1", ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to backfill inlined-delete published flag: {e}"),
+                })?;
+        }
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.

@@ -136,6 +136,15 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "delete_count",
             "sequence_number",
             "created_at",
+            // Per-tombstone durable activation flag. A staged inline-conflict
+            // upsert writes its tombstone with `published = 0` and the read
+            // filter (`load_inlined_deletion_maps`) applies the tombstone ONLY
+            // when this is `1`, so a tombstone observed by an inline-cache
+            // rebuild before its replacement snapshot publishes cannot hide the
+            // old inline row (no transient vanish). The owning snapshot's
+            // finalize flips it durably to `1`. MUST stay last so the
+            // ALTER TABLE backfill on existing DBs yields the same column order.
+            "published",
         ],
     },
 ];

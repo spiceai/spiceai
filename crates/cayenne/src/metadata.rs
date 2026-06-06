@@ -909,6 +909,20 @@ pub struct InlinedDelete {
     pub sequence_number: i64,
     /// ISO 8601 timestamp
     pub created_at: String,
+    /// Durable per-tombstone activation flag.
+    ///
+    /// A staged inline-conflict upsert writes its tombstone with `published =
+    /// false` at a `sequence_number` reserved below the staged snapshot's
+    /// `snapshot_sequence`. The read filter (`load_inlined_deletion_maps`)
+    /// applies the tombstone ONLY when this is `true`, so a durable-but-inactive
+    /// tombstone observed by an inline-cache rebuild (which a concurrent
+    /// same-table inline INSERT can trigger) before the owning snapshot
+    /// publishes cannot hide the old inline row — eliminating the transient
+    /// vanish that a global watermark could not (advance ⇒ HIDE polarity). The
+    /// owning snapshot's finalize flips this durably to `true`
+    /// (`MetadataCatalog::mark_inlined_delete_published`) before its replacement
+    /// rows become discoverable, and only the inline checkpoint clears it.
+    pub published: bool,
 }
 
 /// Configuration for an external object store (e.g., S3).
