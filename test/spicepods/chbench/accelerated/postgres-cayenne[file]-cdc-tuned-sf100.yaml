@@ -64,10 +64,11 @@ datasets:
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
-        # Pinned to 1 GiB (SF-1000 sweep): a small keyset budget keeps the heavy-update
-        # tables (stock, order_line) on the cheap bloom path and hits the <30s lag goal for
-        # all 22 queries. The memory-aware auto-default (total_mem/32 -> ~8 GiB on a 256 GiB
-        # host) is BACKWARDS — it over-sizes the exact keyset and hurts those tables. Pin 1024.
+        # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
+        # must sit just UNDER the heavy-update tables' (stock, order_line) PK keysets so
+        # they stay on the cheap bloom path — at SF-100 that is 256 (1024 would fit them
+        # on the expensive exact path; the SF-1000 venue pins 1024). The memory-aware
+        # auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) is BACKWARDS — pin it.
         cayenne_pk_keyset_cache_mb: '256'
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
@@ -200,7 +201,7 @@ datasets:
         cayenne_file_path: .spice/cayenne/warehouse
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '64'
-        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
 
   # ------------------------------------------------------------------
@@ -240,7 +241,7 @@ datasets:
         cayenne_file_path: .spice/cayenne/region
         cayenne_write_concurrency: '2'
         cayenne_segment_cache_mb: '16'
-        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
 
   - from: postgres:nation
