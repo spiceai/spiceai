@@ -345,7 +345,7 @@ impl TursoMetastore {
     /// `WHERE table_id = ? AND published = 1` (`get_published_inlined_deletes`).
     /// Turso/libSQL (`turso_core` 0.6.1) supports partial indexes: the index
     /// translator binds the `WHERE` predicate and skips non-matching rows during
-    /// index population, matching SQLite partial-index semantics.
+    /// index population, matching `SQLite` partial-index semantics.
     const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
 }
 
