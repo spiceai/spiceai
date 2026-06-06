@@ -252,6 +252,21 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_memory_budget"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan_under_compaction"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_cdc_multitable"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "compaction_picker"
 
 [[bench]]
