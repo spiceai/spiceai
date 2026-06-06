@@ -111,21 +111,17 @@ pub(crate) fn ordering_sync_dir_std(dir: &std::fs::File) -> io::Result<()> {
 pub(crate) async fn ordering_sync_tokio_file(file: &tokio::fs::File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::fd::AsRawFd;
-        let raw_fd = file.as_raw_fd();
-        // The borrow of `file` is held across the await below, so `raw_fd`
-        // stays valid until the blocking fsync completes.
-        tokio::task::spawn_blocking(move || {
-            // SAFETY: see `ordering_sync_std` — valid open fd, kept alive by
-            // the borrow held across the await.
-            if unsafe { libc::fsync(raw_fd) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        })
-        .await
-        .map_err(io::Error::other)?
+        // Cancellation safety: `spawn_blocking` tasks are detached — if this
+        // future is dropped at the `.await`, the blocking closure keeps
+        // running. A raw fd captured from `file` could then outlive the
+        // caller's `File` (closed/reused fd under a live `libc::fsync` —
+        // unsound). Move an OWNED duplicate of the fd into the closure
+        // instead: the dup stays open for exactly as long as the fsync needs
+        // it, regardless of caller cancellation. One `dup(2)` (~µs) per sync.
+        let owned_dup = file.try_clone().await?.into_std().await;
+        tokio::task::spawn_blocking(move || ordering_sync_std(&owned_dup))
+            .await
+            .map_err(io::Error::other)?
     }
     #[cfg(not(target_os = "macos"))]
     {

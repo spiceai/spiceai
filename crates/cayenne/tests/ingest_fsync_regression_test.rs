@@ -179,7 +179,7 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
 
     // Also assert there is exactly one file-level sync call on the deletion
     // vector file in this function. The parent directory fsync
-    // (`ordering_sync_std(&dir)`) is allowed and distinct.
+    // (`ordering_sync_dir_std(&dir)`) is allowed and distinct.
     let file_sync_count = body
         .lines()
         .filter(|line| {
