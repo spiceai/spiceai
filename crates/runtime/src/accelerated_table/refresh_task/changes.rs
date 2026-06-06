@@ -197,9 +197,17 @@ pub struct CdcConfig {
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
-const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
+// Prefetch depth is the REAL coalescing ceiling: the burst drain is a non-blocking
+// `try_recv` loop (no await), so a batch can only grow as large as what is already
+// buffered in this channel. With the old 1024 max the 4096 envelope cap never bound.
+// Raised 1024 -> 16384 so high-throughput tables form larger bursts, amortizing the
+// fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
+// over more rows. `max_coalesced_bytes` (128 MiB default) still bounds peak burst memory,
+// and the drain never waits, so low-load latency is unchanged (burst.len()==1).
+const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
-const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+// Raised 4096 -> 16384 to match the prefetch ceiling (otherwise it would re-clip the burst).
+const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 16384;
 const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
 const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
@@ -2080,6 +2088,82 @@ mod tests {
         )]));
 
         assert_eq!(config.max_coalesce_age_ms, 90_000);
+    }
+
+    /// Change D: the coalescing/prefetch ceilings were raised 4096/1024 -> 16384.
+    /// A burst configuration LARGER than the old 4096 cap (e.g. 8000-16384) must
+    /// now be accepted verbatim by `cdc_config_from_params` — proving the cap is
+    /// 16384, not the old 4096 (which would re-clip the burst) and not the 256
+    /// default (a silent fallback). Both `cdc_max_coalesced_envelopes` and the
+    /// prefetch buffer (the REAL coalescing ceiling, since the drain `try_recv`s
+    /// only what is already buffered) must accept the raised values.
+    #[test]
+    fn cdc_config_from_params_accepts_burst_above_old_4096_cap() {
+        // Sanity: the consts were actually raised to 16384.
+        assert_eq!(
+            CDC_MAX_COALESCED_ENVELOPES_MAX, 16_384,
+            "max coalesced envelopes ceiling must be raised to 16384"
+        );
+        assert_eq!(
+            CDC_PREFETCH_BUFFER_MAX, 16_384,
+            "prefetch-buffer ceiling must be raised to 16384"
+        );
+
+        for n in [8_000_usize, 12_000, 16_000, 16_384] {
+            let config = cdc_config_from_params(&std::collections::HashMap::from([
+                ("cdc_max_coalesced_envelopes".to_string(), n.to_string()),
+                ("cdc_prefetch_buffer".to_string(), n.to_string()),
+            ]));
+
+            assert_eq!(
+                config.max_coalesced_envelopes, n,
+                "cdc_max_coalesced_envelopes={n} (above the old 4096 cap, within the new 16384 ceiling) must be accepted verbatim, not clipped"
+            );
+            assert!(
+                config.max_coalesced_envelopes > 4_096,
+                "the configured burst {n} must NOT be silently clipped back to the old 4096 cap"
+            );
+            assert_ne!(
+                config.max_coalesced_envelopes, CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+                "an in-range burst {n} must NOT silently fall back to the 256 default"
+            );
+
+            assert_eq!(
+                config.prefetch_buffer, n,
+                "cdc_prefetch_buffer={n} (within the new 16384 ceiling) must be accepted verbatim"
+            );
+            assert!(
+                config.prefetch_buffer > 1_024,
+                "the configured prefetch {n} must NOT be silently clipped back to the old 1024 cap"
+            );
+        }
+    }
+
+    /// A burst configuration ABOVE the new 16384 ceiling is out of range and must
+    /// fall back to the default (256) — it must NOT be silently clamped to the new
+    /// max, nor to the old 4096 cap. (Guarded so a `SPICE_CDC_*` env override in
+    /// the test environment, which `resolve_cdc_param` consults on fallback,
+    /// doesn't make this flaky.)
+    #[test]
+    fn cdc_config_from_params_rejects_burst_above_new_16384_ceiling() {
+        let env_overridden = std::env::var("SPICE_CDC_MAX_COALESCED_ENVELOPES").is_ok();
+        if env_overridden {
+            return;
+        }
+        let over = CDC_MAX_COALESCED_ENVELOPES_MAX + 1;
+        let config = cdc_config_from_params(&std::collections::HashMap::from([(
+            "cdc_max_coalesced_envelopes".to_string(),
+            over.to_string(),
+        )]));
+
+        assert_eq!(
+            config.max_coalesced_envelopes, CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            "an out-of-range burst {over} must fall back to the default, not be clamped"
+        );
+        assert_ne!(
+            config.max_coalesced_envelopes, 4_096,
+            "out-of-range fallback must not resurrect the old 4096 cap"
+        );
     }
 
     #[test]
