@@ -342,10 +342,20 @@ pub(crate) trait CompactionRunner: Send + Sync {
     fn compaction_target_name(&self) -> &str;
 }
 
+/// Maximum protected-snapshot merge passes a single table runs per wake-up
+/// before yielding back to the interval cadence. Each pass merges one size-tier,
+/// so under backlog this drains up to `MAX_DRAIN_PASSES_PER_WAKE` tiers per tick
+/// (vs. exactly one before), while still bounding how long one table can hold
+/// the compaction runtime away from its peers. Passes stop early as soon as a
+/// table is caught up (`run_compaction_trigger` returns `Ok(false)`).
+const MAX_DRAIN_PASSES_PER_WAKE: usize = 64;
+
 /// Per-table background compactor.
 ///
-/// Owns a tokio task that wakes every `interval`, acquires a permit from the
-/// shared semaphore, and calls `runner.run_compaction_trigger()`. Cancellation
+/// Owns a tokio task that wakes every `interval`, then drains its
+/// protected-snapshot backlog by running up to [`MAX_DRAIN_PASSES_PER_WAKE`]
+/// merge passes — each acquiring a permit from the shared semaphore and calling
+/// `runner.run_compaction_trigger()` — until it is caught up. Cancellation
 /// happens via [`Drop`]: dropping the `BackgroundCompactor` fires the shutdown
 /// `Notify`, then moves bounded task draining to a detached OS thread so dropping
 /// the provider never blocks a Tokio worker thread.
@@ -376,7 +386,7 @@ impl BackgroundCompactor {
         // from the query and refresh runtimes) when one has been injected;
         // otherwise fall back to the ambient runtime.
         let handle = spawn_compaction(async move {
-            loop {
+            'wake: loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {}
                     () = shutdown_task.notified() => break,
@@ -387,28 +397,58 @@ impl BackgroundCompactor {
                     break;
                 };
 
-                // Acquire a permit, gating concurrent background compactions
-                // across all tables sharing the semaphore.
-                let Ok(_permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                    // Semaphore closed — provider tree shutting down.
-                    break;
-                };
+                // Drain the protected-snapshot backlog instead of doing a single
+                // tier-merge per tick. Each `run_compaction_trigger` merges only
+                // the lowest size-tier, so one pass per `interval` tops out at
+                // ~one tier every few seconds — far below the ingest rate at high
+                // tpmC, letting the protected set run away (5k+ files at SF-1000)
+                // and read-amp balloon. Keep running passes until one reports
+                // nothing left to merge (`Ok(false)`) or we hit the per-wake cap,
+                // re-acquiring the shared permit each pass so peer tables still
+                // interleave fairly between merges.
+                for _ in 0..MAX_DRAIN_PASSES_PER_WAKE {
+                    // Acquire a permit, gating concurrent background compactions
+                    // across all tables sharing the semaphore. Observe shutdown
+                    // *during* acquisition so a drop fired mid-drain stops the loop
+                    // promptly instead of running up to `MAX_DRAIN_PASSES_PER_WAKE`
+                    // more passes (each a multi-second full-snapshot rewrite at
+                    // scale) before the next outer tick notices. This only gates the
+                    // gap *between* passes: an already in-flight
+                    // `run_compaction_trigger` below is intentionally never
+                    // interrupted, so a pass still drains to completion on drop (see
+                    // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let _permit = tokio::select! {
+                        biased;
+                        () = shutdown_task.notified() => break 'wake,
+                        acquired = Arc::clone(&semaphore).acquire_owned() => match acquired {
+                            Ok(permit) => permit,
+                            // Semaphore closed — provider tree shutting down.
+                            Err(_) => break 'wake,
+                        },
+                    };
 
-                match runner.run_compaction_trigger().await {
-                    Ok(true) => {
-                        tracing::debug!(
-                            target: "cayenne::compaction",
-                            table = runner.compaction_target_name(),
-                            "Background compaction pass completed"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "cayenne::compaction",
-                            table = runner.compaction_target_name(),
-                            "Background compaction failed: {e}"
-                        );
+                    match runner.run_compaction_trigger().await {
+                        Ok(true) => {
+                            tracing::debug!(
+                                target: "cayenne::compaction",
+                                table = runner.compaction_target_name(),
+                                "Background compaction pass completed"
+                            );
+                            // Made progress — keep draining. The permit is
+                            // released at the end of this iteration so peers can
+                            // interleave before the next pass re-acquires it.
+                        }
+                        // Caught up (no tier qualifies) — stop draining and wait
+                        // for the next tick rather than spinning on empty passes.
+                        Ok(false) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "cayenne::compaction",
+                                table = runner.compaction_target_name(),
+                                "Background compaction failed: {e}"
+                            );
+                            break;
+                        }
                     }
                 }
             }
