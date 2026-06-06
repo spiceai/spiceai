@@ -178,12 +178,13 @@ mod tests {
 
     #[tokio::test]
     async fn ordering_sync_tokio_file_succeeds() {
+        use tokio::io::AsyncWriteExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join("probe_tokio.bin");
         let mut file = tokio::fs::File::create(&file_path)
             .await
             .expect("create probe file");
-        use tokio::io::AsyncWriteExt;
         file.write_all(b"ordering-tier probe").await.expect("write");
         ordering_sync_tokio_file(&file)
             .await
