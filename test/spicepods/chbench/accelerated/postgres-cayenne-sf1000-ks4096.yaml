@@ -1,0 +1,294 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-cdc-tuned
+
+runtime:
+  params:
+    cdc_prefetch_buffer: '1024'
+    # 4096 = the runtime max (changes.rs:CDC_MAX_COALESCED_ENVELOPES_MAX). 8192
+    # was silently rejected and fell back to the default 256 — ~16x smaller CDC
+    # batches, multiplying the per-batch apply_on_conflict_deletions O(N)
+    # deletion-index clone and starving WAL drain under bursty OLTP.
+    cdc_max_coalesced_envelopes: '4096'
+    cdc_max_coalesced_bytes: '134217728' # 128 MB
+    cdc_max_coalesce_age_ms: '4000'
+    cdc_commit_timeout_ms: '60000'
+    cayenne_sort_merge_min_rows: '50000000'
+    cayenne_footer_cache_mb: '1024'
+    # SF-1000 metastore tuning (configurable as of PR #11170). The high-update
+    # upsert tables (oorder/district/customer/new_order) accumulate hundreds of
+    # MiB of LIVE inline insert-records + their PK autoindexes; the busiest
+    # catalog DB grows past SF-500's ~100 MiB, so 1024 MiB cache covers it fully.
+    # cache_size is per-connection x pool(16) but bounded by the DB size, so this
+    # is the per-table ceiling, not a fixed reserve. dbstat at SF-200 showed
+    # oorder's 224 MiB was 94% live / 5.7% freelist — a vacuum reclaims almost
+    # nothing, so keep the hot index resident instead (auto_vacuum stays NONE).
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
+    # auto_vacuum stays NONE (default): the 200+ MiB is live, not reclaimable, and
+    # every vacuum mode taxes the write path. The real bound is the inline
+    # checkpoint cadence, not page reclamation.
+  query:
+    # No memory_limit set on purpose — spiced auto-detects the budget from the
+    # cgroup/host memory cap and sizes the DataFusion pool to a safe fraction of
+    # it. Auto-detection is the right default here: it tracks the deployment's
+    # actual memory and inherently leaves headroom for the off-pool Vortex encode
+    # buffers + segment/footer caches that a fixed `memory_limit` would not count.
+    #
+    # Read-path scan/join parallelism = 2x the 16 logical cores. Does NOT raise the
+    # write/compaction shard count (parallel encode is CPU-bound and ceilings at
+    # the core count); per-table write fan-out is set via `cayenne_write_concurrency`.
+    target_partitions: 32
+  results_cache:
+    enabled: false
+
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: '5432'
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+datasets:
+  # ------------------------------------------------------------------
+  # High-volume PK upsert tables.
+  # ------------------------------------------------------------------
+
+  - from: postgres:district
+    name: district
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+      params: &accel_high_volume
+        cayenne_metastore: sqlite
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/district
+        # 8-way parallel encode = half the 16 cores: leaves ~half for OLAP during
+        # an ingest burst (16-way encode would pin every core and cause the 80-90s
+        # single-query latency outliers). Compaction no longer competes here — it
+        # is now pinned to a single output shard. Raise toward the core count on
+        # larger hosts.
+        cayenne_write_concurrency: '8'
+        cayenne_segment_cache_mb: '1024'
+        # cayenne_pk_keyset_cache_mb: left at the auto default. An 8 GiB override
+        # backfired at SF-1000 (run 20260605T041048Z): it forced high-update big
+        # tables into an expensive EXACT keyset instead of the cheap bloom,
+        # ballooning CDC lag (order_line 11.7s->263s, stock 60s->91s) and dropping
+        # QPH 144->72. Auto default keeps big tables on the bloom; small tables
+        # still go positional. Per-table keyset tuning is a follow-up.
+        cayenne_compaction_trigger_protected_snapshots: '3'
+        cayenne_pk_keyset_cache_mb: "4096"
+        cayenne_compaction_trigger_snapshot_age_ms: '15000'
+        cayenne_compaction_max_files_per_pick: '64'
+        cayenne_compaction_background_interval_ms: '3000'
+
+  - from: postgres:customer
+    name: customer
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/customer
+        cayenne_target_file_size_mb: '256'
+
+  - from: postgres:new_order
+    name: new_order
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/new_order
+
+  - from: postgres:oorder
+    name: oorder
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/oorder
+
+  - from: postgres:order_line
+    name: order_line
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/order_line
+        # 8 to match the HTAP budget (was 32, which a 16-core host clamped to 16
+        # anyway). order_line is the heaviest compactor, so capping its fan-out
+        # matters most for query latency. See the accel_high_volume note.
+        cayenne_write_concurrency: '8'
+        cayenne_target_file_size_mb: '256'
+        cayenne_compaction_trigger_files: '8'
+        cayenne_compaction_trigger_snapshot_age_ms: '30000'
+        cayenne_compaction_max_files_per_pick: '128'
+        cayenne_segment_cache_mb: '2048'
+
+  - from: postgres:stock
+    name: stock
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+      params:
+        <<: *accel_high_volume
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/stock
+        cayenne_target_file_size_mb: '256'
+
+  # ------------------------------------------------------------------
+  # Low-volume reference tables.
+  # ------------------------------------------------------------------
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+      pg_replication_bootstrap_batch_size: '1048576'
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params: &accel_medium
+        cayenne_metastore: sqlite
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/warehouse
+        cayenne_write_concurrency: '4'
+        cayenne_segment_cache_mb: '64'
+
+  # ------------------------------------------------------------------
+  # Static reference tables (no OLTP mutations, full refresh).
+  # ------------------------------------------------------------------
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+      params:
+        <<: *accel_medium
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/item
+
+  - from: postgres:region
+    name: region
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      params: &accel_small
+        cayenne_metastore: sqlite
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/region
+        cayenne_write_concurrency: '2'
+        cayenne_segment_cache_mb: '16'
+
+  - from: postgres:nation
+    name: nation
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/nation
+
+  - from: postgres:supplier
+    name: supplier
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+      params:
+        <<: *accel_small
+        cayenne_file_path: /Users/lukim/dev/spiceai/.spice/cayenne/supplier
