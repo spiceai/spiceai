@@ -2353,8 +2353,8 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 /// serial single-writer shape `(1, None)`; otherwise it passes the session's
 /// `target_partitions` and the selected tier's total bytes so
 /// `snapshot_shard_count` sizes a parallel encoder fan-out
-/// (floor(bytes / target_file_size), min 1, capped by write concurrency and
-/// the global encode budget).
+/// (`floor(bytes / target_file_size)`, min 1, capped by write concurrency
+/// and the global encode budget).
 ///
 /// Note: output FILE COUNT is not a proxy for this decision — a single
 /// serial writer still rolls multiple files when the merged output exceeds
@@ -13235,7 +13235,7 @@ mod tests {
         // gate, with the count only bounded.
         let shard_files = count_vortex_files(&snapshot_dir).await;
         assert!(
-            shard_files >= 1 && shard_files <= DEFAULT_WRITE_CONCURRENCY,
+            (1..=DEFAULT_WRITE_CONCURRENCY).contains(&shard_files),
             "position-mode merge output file count out of bounds: {shard_files}"
         );
 
