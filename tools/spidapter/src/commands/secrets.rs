@@ -17,6 +17,7 @@ limitations under the License.
 use runtime_secrets::{ExposeSecret, Secrets};
 use spice_cloud_client::CloudClient;
 use spicepod::spec::SpicepodDefinition;
+use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 const ENV_STORE_NAME: &str = "env";
@@ -43,7 +44,17 @@ pub(crate) async fn set_spicepod_secrets(
     app_id: i64,
     spicepod_yaml: &str,
 ) -> anyhow::Result<()> {
-    let mut secret_refs = runtime_secrets::extract_secret_references(spicepod_yaml);
+    // Key → every store the key is referenced through. Built from the
+    // full reference iterator so that a key referenced via multiple stores
+    // (e.g. `${ env:K }` and `${ secrets:K }`) is attributed to all of them
+    // in the logs, not just the last occurrence.
+    let mut secret_refs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for reference in runtime_secrets::iter_secret_references(spicepod_yaml) {
+        secret_refs
+            .entry(reference.key)
+            .or_default()
+            .insert(reference.store);
+    }
     include_scheduler_state_location_aws_secrets(spicepod_yaml, &mut secret_refs);
 
     eprintln!(
@@ -59,20 +70,21 @@ pub(crate) async fn set_spicepod_secrets(
         .map_err(|e| anyhow::anyhow!("Failed to load secrets from environment: {e}"))?;
 
     // For each secret reference, get its value and upload to Spice Cloud
-    for (secret_key, store_name) in secret_refs {
+    for (secret_key, store_names) in secret_refs {
+        let stores = store_names.into_iter().collect::<Vec<_>>().join(", ");
         match secrets.get_secret(&secret_key).await {
             Ok(Some(secret_value)) => {
-                eprintln!("Setting secret: {secret_key} (from store: {store_name})");
+                eprintln!("Setting secret: {secret_key} (referenced via: {stores})");
                 set_secret(cloud, app_id, &secret_key, secret_value.expose_secret()).await?;
             }
             Ok(None) => {
                 eprintln!(
-                    "Warning: Secret '{secret_key}' (referenced from store: {store_name}) not found, skipping"
+                    "Warning: Secret '{secret_key}' (referenced via: {stores}) not found, skipping"
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: Failed to get secret '{secret_key}' (from store: {store_name}): {e}, skipping"
+                    "Warning: Failed to get secret '{secret_key}' (referenced via: {stores}): {e}, skipping"
                 );
             }
         }
@@ -83,21 +95,26 @@ pub(crate) async fn set_spicepod_secrets(
 
 fn include_scheduler_state_location_aws_secrets(
     spicepod_yaml: &str,
-    secret_refs: &mut std::collections::HashMap<String, String>,
+    secret_refs: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     if !scheduler_state_location_uses_s3(spicepod_yaml) {
         return;
     }
 
     for required_secret in [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY] {
+        // Only attribute `env` when the spicepod doesn't already reference
+        // the key through a store of its own.
         secret_refs
             .entry(required_secret.to_string())
-            .or_insert_with(|| ENV_STORE_NAME.to_string());
+            .or_insert_with(|| BTreeSet::from([ENV_STORE_NAME.to_string()]));
     }
 
     if !secret_refs.contains_key(AWS_SESSION_TOKEN) && std::env::var_os(AWS_SESSION_TOKEN).is_some()
     {
-        secret_refs.insert(AWS_SESSION_TOKEN.to_string(), ENV_STORE_NAME.to_string());
+        secret_refs.insert(
+            AWS_SESSION_TOKEN.to_string(),
+            BTreeSet::from([ENV_STORE_NAME.to_string()]),
+        );
     }
 }
 
@@ -147,25 +164,23 @@ runtime:
         state_location: file:///tmp/state
 ";
 
+    fn env_set() -> BTreeSet<String> {
+        BTreeSet::from([ENV_STORE_NAME.to_string()])
+    }
+
     #[test]
     fn includes_required_aws_secrets_when_scheduler_state_location_is_set() {
-        let mut secret_refs = std::collections::HashMap::new();
+        let mut secret_refs = BTreeMap::new();
 
         include_scheduler_state_location_aws_secrets(SCHEDULER_SPICEPOD_YAML, &mut secret_refs);
 
-        assert_eq!(
-            secret_refs.get(AWS_ACCESS_KEY_ID),
-            Some(&ENV_STORE_NAME.to_string())
-        );
-        assert_eq!(
-            secret_refs.get(AWS_SECRET_ACCESS_KEY),
-            Some(&ENV_STORE_NAME.to_string())
-        );
+        assert_eq!(secret_refs.get(AWS_ACCESS_KEY_ID), Some(&env_set()));
+        assert_eq!(secret_refs.get(AWS_SECRET_ACCESS_KEY), Some(&env_set()));
     }
 
     #[test]
     fn does_not_add_aws_secrets_when_scheduler_state_location_is_absent() {
-        let mut secret_refs = std::collections::HashMap::new();
+        let mut secret_refs = BTreeMap::new();
 
         include_scheduler_state_location_aws_secrets(BASIC_SPICEPOD_YAML, &mut secret_refs);
 
@@ -174,7 +189,7 @@ runtime:
 
     #[test]
     fn does_not_add_aws_secrets_for_non_s3_scheduler_state_location() {
-        let mut secret_refs = std::collections::HashMap::new();
+        let mut secret_refs = BTreeMap::new();
 
         include_scheduler_state_location_aws_secrets(
             FILE_SCHEDULER_SPICEPOD_YAML,
@@ -186,20 +201,17 @@ runtime:
 
     #[test]
     fn keeps_existing_store_mapping_for_required_secrets() {
-        let mut secret_refs = std::collections::HashMap::from([(
+        let mut secret_refs = BTreeMap::from([(
             AWS_ACCESS_KEY_ID.to_string(),
-            "custom-store".to_string(),
+            BTreeSet::from(["custom-store".to_string()]),
         )]);
 
         include_scheduler_state_location_aws_secrets(SCHEDULER_SPICEPOD_YAML, &mut secret_refs);
 
         assert_eq!(
             secret_refs.get(AWS_ACCESS_KEY_ID),
-            Some(&"custom-store".to_string())
+            Some(&BTreeSet::from(["custom-store".to_string()]))
         );
-        assert_eq!(
-            secret_refs.get(AWS_SECRET_ACCESS_KEY),
-            Some(&ENV_STORE_NAME.to_string())
-        );
+        assert_eq!(secret_refs.get(AWS_SECRET_ACCESS_KEY), Some(&env_set()));
     }
 }
