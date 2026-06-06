@@ -713,16 +713,15 @@ impl KafkaConsumer {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let watermarks = temp_consumer
-                .consumer
-                .fetch_watermarks(topic, partition_id, remaining);
+            let watermarks =
+                temp_consumer
+                    .consumer
+                    .fetch_watermarks(topic, partition_id, remaining);
 
             let (low, high) = match watermarks {
                 Ok(w) => w,
                 Err(e) => {
-                    tracing::debug!(
-                        "Failed to fetch watermarks for partition {partition_id}: {e}"
-                    );
+                    tracing::debug!("Failed to fetch watermarks for partition {partition_id}: {e}");
                     continue;
                 }
             };
@@ -746,11 +745,9 @@ impl KafkaConsumer {
 
                 // Assign consumer to the start of the current window.
                 let mut tpl = rdkafka::TopicPartitionList::new();
-                if let Err(e) = tpl.add_partition_offset(
-                    topic,
-                    partition_id,
-                    Offset::Offset(window_start),
-                ) {
+                if let Err(e) =
+                    tpl.add_partition_offset(topic, partition_id, Offset::Offset(window_start))
+                {
                     tracing::debug!(
                         "Failed to configure partition offset for partition {partition_id}: {e}"
                     );
