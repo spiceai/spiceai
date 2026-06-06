@@ -676,10 +676,8 @@ impl KafkaConsumer {
         // past tombstones. One network round-trip pulls this many records into
         // the local buffer, eliminating per-tombstone seek overhead.
         const TOMBSTONE_SCAN_WINDOW: usize = 100;
-        let scan_window_i64 =
-            i64::try_from(TOMBSTONE_SCAN_WINDOW).map_err(|_| Error::UnableToRestartTopicSnafu {
-                message: "TOMBSTONE_SCAN_WINDOW exceeds i64".to_string(),
-            })?;
+        let scan_window_i64 = i64::try_from(TOMBSTONE_SCAN_WINDOW)
+            .unwrap_or_else(|_| unreachable!("TOMBSTONE_SCAN_WINDOW is a small positive constant"));
 
         let deadline = Instant::now() + timeout;
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
