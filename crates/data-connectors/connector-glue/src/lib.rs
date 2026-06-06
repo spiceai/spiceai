@@ -282,7 +282,7 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use runtime::dataconnector::glue::ensure_s3_trailing_slash;
 
     #[test]
     fn test_ensure_s3_trailing_slash() {

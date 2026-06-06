@@ -407,7 +407,7 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-pub static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
+static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 

@@ -101,9 +101,9 @@ pub enum Error {
 }
 
 pub struct S3 {
-    pub params: Parameters,
-    pub runtime: Option<Runtime>,
-    pub tokio_io_runtime: tokio::runtime::Handle,
+    pub(crate) params: Parameters,
+    pub(crate) runtime: Option<Runtime>,
+    pub(crate) tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for S3 {

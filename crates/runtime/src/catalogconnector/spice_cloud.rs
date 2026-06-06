@@ -31,7 +31,12 @@ use iceberg::{CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
-use spice_cloud_client::endpoints::{data_endpoint as spice_cloud_data_endpoint, is_valid_region};
+use spice_cloud_client::endpoints::{
+    data_endpoint as spice_cloud_data_endpoint, flight_endpoint as spice_cloud_flight_endpoint,
+    flight_endpoint_region as spice_cloud_endpoint_region,
+    is_legacy_flight_endpoint as is_legacy_spice_cloud_endpoint,
+    is_spice_cloud_flight_endpoint as is_spice_cloud_endpoint, is_valid_region,
+};
 use spiceai_connector_types::{SpiceAI, SpiceAIDatasetPath};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
@@ -148,20 +153,8 @@ impl SpiceCloudPlatformCatalog {
         app: &str,
         catalog_name: &str,
     ) -> super::Result<Arc<dyn Read>> {
-        let endpoint = self
-            .flight_endpoint()
-            .map(ToString::to_string)
-            .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
-                connector: "spice.ai".into(),
-                message: "No Flight endpoint configured for Spice.ai catalog.".to_string(),
-                connector_component: ConnectorComponent::from(catalog),
-            })?;
-
-        let credentials = if let Some(api_key) = self.api_key() {
-            flight_client::Credentials::new("", secrecy::SecretString::new(api_key.into()))
-        } else {
-            flight_client::Credentials::anonymous()
-        };
+        let endpoint = self.resolve_flight_endpoint(catalog)?;
+        let credentials = self.flight_credentials(endpoint.as_str(), catalog)?;
 
         let tls_options = flight_client::tls::ClientTlsOptions::default();
 
@@ -197,6 +190,102 @@ impl SpiceCloudPlatformCatalog {
         }
 
         None
+    }
+
+    fn resolve_flight_endpoint(&self, catalog: &Catalog) -> super::Result<String> {
+        let region = self.region();
+
+        let Some(endpoint) = self.flight_endpoint() else {
+            let region = self.require_valid_region(region, catalog)?;
+            return Ok(spice_cloud_flight_endpoint(region));
+        };
+
+        self.ensure_supported_flight_endpoint_scheme(endpoint, catalog)?;
+
+        if is_legacy_spice_cloud_endpoint(endpoint) {
+            let region = self.require_valid_region(region, catalog)?;
+            return Ok(spice_cloud_flight_endpoint(region));
+        }
+
+        if let Some(endpoint_region) = spice_cloud_endpoint_region(endpoint) {
+            let region = self.require_valid_region(region, catalog)?;
+            if endpoint_region != region {
+                return Err(super::Error::InvalidConfigurationNoSource {
+                    connector: "spice.ai".into(),
+                    message: format!(
+                        "Spice.ai Flight endpoint '{endpoint}' does not match configured region '{region}'."
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                });
+            }
+        }
+
+        Ok(endpoint.to_string())
+    }
+
+    fn ensure_supported_flight_endpoint_scheme(
+        &self,
+        endpoint: &str,
+        catalog: &Catalog,
+    ) -> super::Result<()> {
+        if endpoint.starts_with("grpc://") {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "spice.ai".into(),
+                message: format!(
+                    "Unsupported endpoint scheme for Spice.ai Flight endpoint: '{endpoint}'. Use https:// or grpc+tls://."
+                ),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn require_valid_region<'a>(
+        &self,
+        region: Option<&'a str>,
+        catalog: &Catalog,
+    ) -> super::Result<&'a str> {
+        let region = region.ok_or_else(|| super::Error::InvalidConfigurationNoSource {
+            connector: "spice.ai".into(),
+            message: "Missing Spice Cloud region. Specify a valid region, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'".to_string(),
+            connector_component: ConnectorComponent::from(catalog),
+        })?;
+
+        if region.is_empty() || !is_valid_region(region) {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "spice.ai".into(),
+                message: format!(
+                    "Invalid Spice Cloud region: {region}. Specify a valid region, for example 'spiceai_region: us-east-1'. To list available regions, run: 'spice cloud regions'"
+                ),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
+
+        Ok(region)
+    }
+
+    fn flight_credentials(
+        &self,
+        endpoint: &str,
+        catalog: &Catalog,
+    ) -> super::Result<flight_client::Credentials> {
+        if let Some(api_key) = self.api_key() {
+            return Ok(flight_client::Credentials::new(
+                "",
+                secrecy::SecretString::new(api_key.into()),
+            ));
+        }
+
+        if is_spice_cloud_endpoint(endpoint) {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "spice.ai".into(),
+                message: "Missing required Spice.ai API key/token for Spice Cloud Flight endpoint. Set 'api_key' (or 'token').".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
+
+        Ok(flight_client::Credentials::anonymous())
     }
 
     fn http_endpoint(&self, catalog: &Catalog) -> super::Result<String> {

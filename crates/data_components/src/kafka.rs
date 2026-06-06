@@ -1211,6 +1211,10 @@ where
 ///
 /// Used by both `connector-kafka` and `connector-debezium` (still in runtime) to
 /// commit offsets to the spice_sys accelerator without depending on its concrete types.
+///
+/// Temporary bridge while Kafka and Debezium connectors live in different crates.
+/// Once Debezium is fully extracted from `runtime`, this abstraction should be
+/// re-evaluated and removed if no longer required.
 #[async_trait::async_trait]
 pub trait SidecarOffsetStore: Send + Sync {
     async fn upsert_offsets(
