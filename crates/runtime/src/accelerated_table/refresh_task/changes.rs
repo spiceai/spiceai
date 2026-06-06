@@ -458,13 +458,33 @@ impl RefreshTask {
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
+        self.start_changes_stream_with_config(
+            cdc_config(),
+            refresh,
+            changes_stream,
+            caching,
+            ready_sender,
+            initial_load_completed,
+        )
+        .await
+    }
+
+    /// Inner driver for [`Self::start_changes_stream`] with an explicit
+    /// [`CdcConfig`]. Split out to simplify testing.
+    async fn start_changes_stream_with_config(
+        &self,
+        cdc_cfg: CdcConfig,
+        refresh: Arc<RwLock<Refresh>>,
+        changes_stream: ChangesStream,
+        caching: Option<Weak<Caching>>,
+        ready_sender: Option<Arc<Notify>>,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.display_sql();
 
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
-
-        let cdc_cfg = cdc_config();
 
         // Pipeline source-stream reads with apply+commit by running the source
         // in its own task on the refresh runtime and feeding a bounded channel.
@@ -585,9 +605,7 @@ impl RefreshTask {
                 }
             }
 
-            if cdc_cfg.max_coalesce_age_ms > 0
-                && carried_item.is_none()
-                && burst.len() < max_burst
+            if cdc_cfg.max_coalesce_age_ms > 0 && carried_item.is_none() && burst.len() < max_burst
             {
                 let deadline =
                     last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
@@ -2761,10 +2779,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_reuses_cached_insert_plan_for_upserts() {
-        let insert_calls = Arc::new(AtomicUsize::new(0));
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(CountingInsertProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
-            insert_calls: Arc::clone(&insert_calls),
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
         });
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let ctx = SessionContext::new();
@@ -2791,9 +2811,14 @@ mod tests {
         );
 
         assert_eq!(
-            insert_calls.load(AtomicOrdering::SeqCst),
+            insert_plan_calls.load(AtomicOrdering::SeqCst),
             1,
             "CDC upserts should reuse the cached insert_into plan"
+        );
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "the cached plan should still be executed once per write"
         );
     }
 
@@ -3124,10 +3149,14 @@ mod tests {
     };
     use datafusion::catalog::Session;
     use datafusion::error::Result as DataFusionResult;
+    use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
-    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    };
     use datafusion::prelude::Expr;
     use futures::stream::{self as fstream};
+    use std::any::Any;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
@@ -3215,6 +3244,129 @@ mod tests {
         fstream::iter(items).boxed()
     }
 
+    /// Builds a `ChangesStream` that yields each item only after `delay`, so
+    /// item N arrives at roughly `N * delay`.
+    fn make_delayed_changes_stream(
+        items: Vec<Result<ChangeEnvelope, CdcStreamError>>,
+        delay: Duration,
+    ) -> ChangesStream {
+        fstream::iter(items)
+            .then(move |item| async move {
+                tokio::time::sleep(delay).await;
+                item
+            })
+            .boxed()
+    }
+
+    /// A baseline `CdcConfig` for tests with caps high enough that only the
+    /// `max_coalesce_age_ms` field under test governs flushing.
+    fn test_cdc_config(max_coalesce_age_ms: u64) -> CdcConfig {
+        CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            max_coalesced_bytes: 128 * 1024 * 1024,
+            max_coalesce_age_ms,
+            commit_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Run a changes stream with an explicit `CdcConfig`, bypassing the process-global `cdc_config()`
+    async fn run_changes_stream_with_config(
+        task: &RefreshTask,
+        cfg: CdcConfig,
+        stream: ChangesStream,
+    ) -> crate::accelerated_table::Result<()> {
+        let refresh = Arc::new(RwLock::new(
+            crate::accelerated_table::refresh::Refresh::default(),
+        ));
+        task.start_changes_stream_with_config(
+            cfg,
+            refresh,
+            stream,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// With a large `max_coalesce_age_ms`, the apply loop lingers and coalesces
+    /// several slowly-arriving envelopes into a single accelerator write rather
+    /// than one write per envelope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_linger_coalesces_delayed_items_into_one_write() {
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        // 4 envelopes ~40ms apart (~160ms total) — far inside the 5s window.
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
+
+        run_changes_stream_with_config(&task, test_cdc_config(5_000), stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // One plan execution == one accelerator write. The linger window must
+        // fold all four delayed envelopes into a single write. (`insert_plan_calls`
+        // would be 1 regardless, since the insert plan is built once and cached
+        // — see `CountingInsertProvider`.)
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a large linger window must coalesce all delayed envelopes into one write"
+        );
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2, 3, 4],
+            "all envelopes must still commit in arrival order"
+        );
+    }
+
+    /// With `max_coalesce_age_ms = 0` (default), the apply loop does NOT wait:
+    /// each slowly-arriving envelope is applied on its own, so the writes are
+    /// NOT all coalesced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_linger_applies_delayed_items_separately() {
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
+
+        run_changes_stream_with_config(&task, test_cdc_config(0), stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // Each delayed envelope arrives after the previous one has been applied,
+        // so without a linger window each is written on its own — one plan
+        // execution per envelope. `insert_plan_calls` can't see this: the insert
+        // plan is built once and cached (see `CountingInsertProvider`).
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            4,
+            "without a linger window, each delayed envelope must be written on its own"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
     /// Counts every poll on the inner stream, and lets us pull on demand via
     /// an inner channel. This makes pipeline overlap directly observable.
     async fn run_changes_stream(
@@ -3260,7 +3412,8 @@ mod tests {
     #[derive(Debug)]
     struct CountingInsertProvider {
         inner: Arc<dyn TableProvider>,
-        insert_calls: Arc<AtomicUsize>,
+        insert_plan_calls: Arc<AtomicUsize>,
+        insert_execution_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -3293,8 +3446,68 @@ mod tests {
             input: Arc<dyn ExecutionPlan>,
             insert_op: InsertOp,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.insert_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            self.inner.insert_into(state, input, insert_op).await
+            self.insert_plan_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let inner_plan = self.inner.insert_into(state, input, insert_op).await?;
+            Ok(Arc::new(CountingExec {
+                inner: inner_plan,
+                insert_execution_calls: Arc::clone(&self.insert_execution_calls),
+            }))
+        }
+    }
+
+    /// Delegating [`ExecutionPlan`] that bumps a counter every time it is
+    /// executed. Wrapping the plan returned by `insert_into` lets a test count
+    /// accelerator writes
+    #[derive(Debug)]
+    struct CountingExec {
+        inner: Arc<dyn ExecutionPlan>,
+        insert_execution_calls: Arc<AtomicUsize>,
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "CountingExec")
+        }
+    }
+
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn properties(&self) -> &PlanProperties {
+            self.inner.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let inner = children
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Arc::clone(&self.inner));
+            Ok(Arc::new(CountingExec {
+                inner,
+                insert_execution_calls: Arc::clone(&self.insert_execution_calls),
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.insert_execution_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.execute(partition, context)
         }
     }
 
