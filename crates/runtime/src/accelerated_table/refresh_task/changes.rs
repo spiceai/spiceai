@@ -605,12 +605,15 @@ impl RefreshTask {
                 }
             }
 
-            // Don't linger when the burst is already at/over the byte budget
-            if cdc_cfg.max_coalesce_age_ms > 0 && carried_item.is_none() && burst.len() < max_burst
+            // Don't linger when the burst is already at/over the byte budget:
+            if cdc_cfg.max_coalesce_age_ms > 0
+                && carried_item.is_none()
+                && burst.len() < max_burst
+                && burst_bytes < max_burst_bytes
             {
                 let deadline =
                     last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
-                while burst.len() < max_burst {
+                while burst.len() < max_burst && burst_bytes < max_burst_bytes {
                     // Flush immediately on shutdown rather than waiting out the
                     // window — teardown must not block on intentional linger.
                     if self.runtime_status.is_shutdown() {
@@ -3306,7 +3309,7 @@ mod tests {
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let log = CommitLog::new();
 
-        // 4 envelopes ~40ms apart (~160ms total) — far inside the 5s window.
+        // 4 envelopes ~100ms apart (~400ms total) — far inside the 5s window.
         let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
             .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
             .collect();
@@ -3578,7 +3581,7 @@ mod tests {
             let inner = children
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| Arc::clone(&self.inner));
+                .expect("CountingExec expects exactly one child ExecutionPlan");
             Ok(Arc::new(CountingExec {
                 inner,
                 insert_execution_calls: Arc::clone(&self.insert_execution_calls),
