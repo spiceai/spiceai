@@ -68,7 +68,7 @@ jobs:
           github.event.action == 'edited'
           && !github.event.release.draft
           && github.event.changes.make_latest
-          && github.event.changes.make_latest.to == 'true'
+          && github.event.changes.make_latest.to == true
         )
       }}
     runs-on: ubuntu-24.04
