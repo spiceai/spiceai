@@ -2343,6 +2343,34 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 /// bounds write amplification to O(log N) per byte (a run is rewritten only
 /// when it levels up), while the `min_runs` threshold bounds read amplification
 /// by keeping at most `min_runs - 1` un-merged runs per tier. The large
+/// Write shape — encoder fan-out cap and size estimate — for the
+/// subset-merge output (see `compact_protected_snapshots_subset`).
+///
+/// Pure so the position-vs-key parallel decision is unit-testable: when
+/// `keeps_positions_serial` (the table carries position-scoped deletes —
+/// either a PK table whose resolved `deletion_mode` is `position`, or a
+/// PK-less table on the legacy `PositionBased` strategy), the merge keeps the
+/// serial single-writer shape `(1, None)`; otherwise it passes the session's
+/// `target_partitions` and the selected tier's total bytes so
+/// `snapshot_shard_count` sizes a parallel encoder fan-out
+/// (floor(bytes / target_file_size), min 1, capped by write concurrency and
+/// the global encode budget).
+///
+/// Note: output FILE COUNT is not a proxy for this decision — a single
+/// serial writer still rolls multiple files when the merged output exceeds
+/// the target file size. This function is the authoritative, testable gate.
+const fn subset_merge_write_shape(
+    keeps_positions_serial: bool,
+    session_target_partitions: usize,
+    total_input_bytes: u64,
+) -> (usize, Option<u64>) {
+    if keeps_positions_serial {
+        (1, None)
+    } else {
+        (session_target_partitions, Some(total_input_bytes))
+    }
+}
+
 /// carried-forward run sits alone in a high tier and is rewritten rarely
 /// instead of on every pass.
 ///
@@ -8696,12 +8724,13 @@ impl CayenneTableProvider {
         let target_size_bytes = self.context.target_file_size_bytes();
         // Size-aware parallel merge encode (EFF-1 / Pattern 12). Passing the
         // selected inputs' total bytes lets `snapshot_shard_count` size the
-        // encoder fan-out as ceil(bytes / target_file_size), capped at the
+        // encoder fan-out as floor(bytes / target_file_size), min 1 — a
+        // second shard is earned at >= 2x the target size — capped at the
         // write concurrency and the process-global encode budget:
         //
-        // - a merge whose output fits one target file still floors to ONE
-        //   shard — exactly one output file, so the read fan-out this
-        //   compaction exists to collapse is unchanged for small merges;
+        // - a merge whose output fits one target file stays exactly ONE
+        //   shard / one output file, so the read fan-out this compaction
+        //   exists to collapse is unchanged for small merges;
         // - a merge spanning multiple target files was always going to emit
         //   multiple files; it now encodes them in parallel (PK-hash
         //   clustered, like the append path) instead of streaming the whole
@@ -8711,15 +8740,20 @@ impl CayenneTableProvider {
         // - sorted tables: `snapshot_shard_count` returns 1 when
         //   `has_sort_columns()` — sharding a globally sorted stream would
         //   scatter its order across files;
-        // - position-delete tables: their tombstones are file-path scoped and
-        //   the rewrite's position bake-in assumes a single output sequence,
-        //   so they keep the serial single-file shape explicitly.
-        let (target_partitions, estimated_bytes) = if self.pk_deletion_strategy.is_position_based()
-        {
-            (1, None)
-        } else {
-            (state.config().target_partitions(), Some(total_input_bytes))
-        };
+        // - position-delete tables — BOTH families: PK tables whose resolved
+        //   `deletion_mode` is `position` (`serialize_position_deletes`, the
+        //   same predicate this function's writer/visibility guards use
+        //   above) and PK-less tables on the legacy `PositionBased` strategy.
+        //   Their tombstones are file-path scoped and the rewrite's position
+        //   bake-in assumes a single output sequence, so they keep the serial
+        //   single-file shape explicitly.
+        let keeps_positions_serial =
+            serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            keeps_positions_serial,
+            state.config().target_partitions(),
+            total_input_bytes,
+        );
         let write_start = std::time::Instant::now();
         let write_result = self
             .write_to_snapshot(
@@ -12571,6 +12605,30 @@ mod tests {
     }
 
     #[test]
+    fn subset_merge_write_shape_serializes_position_tables_only() {
+        // The gate the parallel-compaction change rides on (review-caught:
+        // an earlier revision keyed on `is_position_based()` alone, which
+        // covers only PK-less tables and would have widened PK tables whose
+        // resolved deletion_mode is `position`).
+        const CORES: usize = 16;
+        const BYTES: u64 = 64 * 1024 * 1024;
+
+        // Position-scoped deletes (either family) => serial single writer.
+        assert_eq!(
+            subset_merge_write_shape(true, CORES, BYTES),
+            (1, None),
+            "position tables must keep the serial (1, None) merge shape"
+        );
+        // Key/no-delete tables => widened, size-estimated parallel shape.
+        assert_eq!(
+            subset_merge_write_shape(false, CORES, BYTES),
+            (CORES, Some(BYTES)),
+            "non-position tables must widen to the session partitions with \
+             the tier's byte estimate"
+        );
+    }
+
+    #[test]
     fn protected_snapshot_size_tier_classifies_by_geometric_ceilings() {
         let base = 8 * 1024 * 1024; // 8 MiB
         let growth = 8;
@@ -12907,7 +12965,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
         let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .expect("metadata dir created");
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
         let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
             as Arc<dyn MetadataCatalog>;
@@ -12934,6 +12994,13 @@ mod tests {
                 target_vortex_file_size_mb: 1,
                 compaction_trigger_protected_snapshots: TRIGGER,
                 compaction_background_interval_ms: 3_600_000,
+                // The parallel-merge path requires a NON-position deletion
+                // mode: the default (`auto`) resolves to `position` for PK
+                // tables, which the gate deliberately keeps single-writer
+                // (file-path-scoped tombstones). Pin `key` so this test
+                // exercises the widened path; the sibling test below pins
+                // that position-mode tables stay serial.
+                deletion_mode: crate::metadata::DeletionMode::Key,
                 ..VortexConfig::default()
             },
         };
@@ -12993,27 +13060,185 @@ mod tests {
         let snapshot_dir = std::path::Path::new(&data_dir)
             .join(&provider.table_metadata.table_id)
             .join(&new_snapshot);
+        // NOTE: >1 files alone does not prove PARALLEL encode (a serial
+        // writer also rolls files past the target size) — the widened-shape
+        // decision is pinned by the pure `subset_merge_write_shape` unit
+        // test. This bounds the fan-out and smoke-tests the multi-file merge
+        // output end-to-end.
+        let shard_files = count_vortex_files(&snapshot_dir).await;
+        assert!(
+            shard_files > 1,
+            "a merge spanning multiple target files must produce multiple \
+             output files (got {shard_files})"
+        );
+        assert!(
+            shard_files <= DEFAULT_WRITE_CONCURRENCY,
+            "output file count must stay bounded by the write concurrency \
+             (got {shard_files} > {DEFAULT_WRITE_CONCURRENCY})"
+        );
+
+        // Every row survives the parallel merge — content, not just count:
+        // collect the id column, sort, and compare against the exact expected
+        // id set (a pathological regression could drop some ids and duplicate
+        // others while keeping the total stable).
+        let scan_ctx = SessionContext::new();
+        let plan = provider
+            .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan");
+        let batches = datafusion::physical_plan::collect(plan, scan_ctx.task_ctx())
+            .await
+            .expect("collect rows");
+        let mut scanned_ids: Vec<i64> = Vec::with_capacity(expected_rows);
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column");
+            scanned_ids.extend(ids.values().iter().copied());
+        }
+        scanned_ids.sort_unstable();
+        let expected_ids: Vec<i64> = (0..snapshots * ROWS_PER_SNAPSHOT).collect();
+        assert_eq!(
+            scanned_ids, expected_ids,
+            "parallel merge must preserve exactly the inserted id set"
+        );
+    }
+
+    /// Count `.vortex` files in a snapshot directory (async fs — keeps the
+    /// tokio worker unblocked in async tests).
+    async fn count_vortex_files(snapshot_dir: &std::path::Path) -> usize {
         let mut shard_files = 0_usize;
-        for entry in std::fs::read_dir(&snapshot_dir).expect("read merged snapshot dir") {
-            let entry = entry.expect("dir entry");
+        let mut entries = tokio::fs::read_dir(snapshot_dir)
+            .await
+            .expect("read merged snapshot dir");
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
             if entry.path().extension().is_some_and(|ext| ext == "vortex") {
                 shard_files += 1;
             }
         }
+        shard_files
+    }
+
+    /// Sibling of the parallel-merge engagement test: a PK table left on the
+    /// DEFAULT deletion mode (`auto` resolves to `position`) must keep the
+    /// serial single-file merge shape even when the tier spans multiple
+    /// target files — position tombstones are file-path scoped and the
+    /// rewrite's bake-in assumes one output sequence. Pins the
+    /// `serialize_position_deletes || is_position_based()` gate.
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_keeps_position_mode_serial() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        const ROWS_PER_SNAPSHOT: i64 = 200;
+        const PAYLOAD_BYTES: usize = 2048;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_subset_position_serial".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                target_vortex_file_size_mb: 1,
+                compaction_trigger_protected_snapshots: TRIGGER,
+                compaction_background_interval_ms: 3_600_000,
+                // Deliberately NOT overridden: default `auto` resolves to
+                // `position` for this PK table — the case that must stay
+                // serial.
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
         assert!(
-            shard_files > 1,
-            "a merge spanning multiple target files must encode in parallel \
-             shards (got {shard_files} file; the size estimate or the \
-             target_partitions widening never reached write_to_snapshot)"
-        );
-        assert!(
-            shard_files <= DEFAULT_WRITE_CONCURRENCY,
-            "shard fan-out must stay bounded by the write concurrency \
-             (got {shard_files} > {DEFAULT_WRITE_CONCURRENCY})"
+            provider.should_capture_positions(),
+            "fixture must resolve to position mode or this test pins nothing"
         );
 
-        // Every row survives the parallel merge: scan through the provider
-        // directly (projection = id only) and sum the row counts.
+        let compaction_setup_guard = provider.compaction_lock.lock().await;
+        let snapshots = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
+        let mut expected_rows: usize = 0;
+        for snapshot in 0..snapshots {
+            let start = snapshot * ROWS_PER_SNAPSHOT;
+            let ids: Vec<i64> = (start..start + ROWS_PER_SNAPSHOT).collect();
+            let payloads: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{id:08}_{}", "p".repeat(PAYLOAD_BYTES)))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(payloads)),
+                ],
+            )
+            .expect("payload batch");
+            expected_rows += batch.num_rows();
+            insert_batch(&provider, batch).await;
+        }
+        let before: std::collections::HashSet<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        drop(compaction_setup_guard);
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(merged, "a tier with >= {TRIGGER} runs should have merged");
+
+        let after = provider.protected_snapshots.load_full();
+        let new_snapshot = after
+            .keys()
+            .find(|id| !before.contains(*id))
+            .expect("the merge must publish a new protected snapshot")
+            .clone();
+        let snapshot_dir = std::path::Path::new(&data_dir)
+            .join(&provider.table_metadata.table_id)
+            .join(&new_snapshot);
+        // File count is NOT asserted == 1: even the serial writer rolls
+        // multiple files when the merged output exceeds the target file size
+        // (this payload does). The serial-shape decision itself is pinned by
+        // the pure `subset_merge_write_shape` unit test; this test pins the
+        // end-to-end correctness of a position-mode merge under the corrected
+        // gate, with the count only bounded.
+        let shard_files = count_vortex_files(&snapshot_dir).await;
+        assert!(
+            shard_files >= 1 && shard_files <= DEFAULT_WRITE_CONCURRENCY,
+            "position-mode merge output file count out of bounds: {shard_files}"
+        );
+
         let scan_ctx = SessionContext::new();
         let plan = provider
             .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
@@ -13025,7 +13250,7 @@ mod tests {
         let scanned_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(
             scanned_rows, expected_rows,
-            "parallel merge must preserve every visible row"
+            "position-mode merge must preserve every visible row"
         );
     }
 
