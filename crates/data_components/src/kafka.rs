@@ -1210,7 +1210,7 @@ where
 /// Trait for a sidecar store that persists Kafka partition offsets.
 ///
 /// Used by both `connector-kafka` and `connector-debezium` (still in runtime) to
-/// commit offsets to the spice_sys accelerator without depending on its concrete types.
+/// commit offsets to the `spice_sys` accelerator without depending on its concrete types.
 ///
 /// Temporary bridge while Kafka and Debezium connectors live in different crates.
 /// Once Debezium is fully extracted from `runtime`, this abstraction should be

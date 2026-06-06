@@ -232,7 +232,7 @@ mod tests {
     use super::*;
     use app::AppBuilder;
     use datafusion_table_providers::util::secrets::to_secret_map;
-    use runtime::builder::RuntimeBuilder;
+    use runtime::RuntimeBuilder;
     use runtime::component::dataset::builder::DatasetBuilder;
     use runtime::dataconnector::ConnectorComponent;
     use runtime::parameters::{ParameterSpec, Parameters};

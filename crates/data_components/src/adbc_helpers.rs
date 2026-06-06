@@ -81,6 +81,7 @@ pub fn build_db_options(
 ///
 /// Hashes all identity-relevant parameters so secrets never appear in `EXPLAIN` plans,
 /// while still uniquely identifying a connection target for federation decisions.
+#[must_use]
 pub fn build_join_context(
     uri: &str,
     username: Option<&str>,
@@ -108,6 +109,7 @@ pub fn build_join_context(
 }
 
 /// Returns the SQL dialect for the given ADBC driver name, if one is known.
+#[must_use]
 pub fn dialect_for_driver(driver_name: &str) -> Option<Arc<dyn Dialect + Send + Sync>> {
     match driver_name {
         "bigquery" => Some(Arc::new(BigQueryDialect::new())),

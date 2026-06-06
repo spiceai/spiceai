@@ -87,6 +87,7 @@ use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_t
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+pub use builder::RuntimeBuilder;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
