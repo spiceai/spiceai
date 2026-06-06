@@ -84,6 +84,7 @@ hyper-util = { version = "0.1.20", features = ["service"] }
 iceberg.workspace = true
 
 iceberg-catalog-rest.workspace = true
+iceberg-catalog-glue.workspace = true
 iceberg-datafusion.workspace = true
 iceberg-storage-opendal.workspace = true
 indexmap.workspace = true
@@ -167,6 +168,7 @@ serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spice-cloud-client.workspace = true
+spiceai-connector-types = { path = "../spiceai-connector-types" }
 spicepod = { path = "../spicepod" }
 sysinfo.workspace = true
 telemetry = { path = "../telemetry" }

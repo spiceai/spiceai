@@ -18,7 +18,6 @@ limitations under the License.
 //!
 //! Connects to specific tables in a `DuckLake` catalog using `DuckDB` with the `ducklake` extension.
 
-use crate::{component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect};
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::ducklake::writer::DuckDbFederatedTableWriter;
@@ -30,6 +29,8 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
+use runtime::component::dataset::Dataset;
+use runtime_datafusion::dialect::new_duckdb_dialect;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -37,10 +38,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::{
+use runtime::dataconnector::{
     AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, ParameterSpec,
+    DataConnectorFactory,
 };
+use runtime::parameters::ParameterSpec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -259,7 +261,7 @@ impl DataConnectorFactory for DuckLakeFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let connection_string: String = params
                 .parameters
@@ -349,28 +351,30 @@ impl DataConnector for DuckLake {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_ref = self.resolve_table_reference(dataset);
 
-        Ok(Read::table_provider(&self.duckdb_factory, table_ref)
+        Read::table_provider(&self.duckdb_factory, table_ref)
             .await
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "ducklake",
+            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "ducklake".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-            })?)
+                source: e,
+            })
     }
 
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_ref = self.resolve_table_reference(dataset);
 
         let read_provider = match Read::table_provider(&self.duckdb_factory, table_ref.clone())
             .await
-            .context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "ducklake",
+            .map_err(|e| DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "ducklake".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
+                source: e,
             }) {
             Ok(provider) => provider,
             Err(e) => return Some(Err(e)),
@@ -385,4 +389,11 @@ impl DataConnector for DuckLake {
     }
 }
 
-register_data_connector!("ducklake", DuckLakeFactory);
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "ducklake";
+
+/// Returns a new instance of the DuckLake connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    DuckLakeFactory::new_arc()
+}

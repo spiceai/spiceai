@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use snafu::prelude::*;
 use async_trait::async_trait;
+use snafu::prelude::*;
 
 use runtime::dataconnector::parameters::{ConnectorParams, Validator};
 

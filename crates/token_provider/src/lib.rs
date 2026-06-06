@@ -91,3 +91,5 @@ impl TokenProvider for StaticTokenProvider {
         hasher.finish().to_string()
     }
 }
+
+pub mod github_app_token;

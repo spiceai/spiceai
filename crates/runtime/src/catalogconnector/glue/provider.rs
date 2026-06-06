@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::DatabaseName;
+use crate::dataconnector::glue::{create_iceberg_provider, create_s3_provider};
+use crate::dataconnector::parameters;
 use crate::dataconnector::parameters::aws::initiate_config_with_credentials;
-use crate::dataconnector::{DataConnector, parameters};
-use crate::parameters::Parameters;
 use crate::{
     Runtime,
     component::{catalog::Catalog, dataset::builder::DatasetBuilder},
@@ -83,15 +83,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Factory function type for creating a Glue data connector.
-/// Injected at construction time to avoid a circular dependency between this
-/// crate and the `connector-glue` crate (which itself depends on `runtime`).
-pub type GlueDataConnectorFactory =
-    Arc<dyn Fn(Parameters, tokio::runtime::Handle) -> Arc<dyn DataConnector> + Send + Sync>;
-
 /// A catalog provider for AWS Glue, managing databases and tables.
 pub struct GlueCatalogProvider {
     client: Client,
+    config: aws_config::SdkConfig,
     include: Option<GlobSet>,
     orig_include: Vec<String>,
     runtime: Arc<Runtime>,
@@ -99,8 +94,6 @@ pub struct GlueCatalogProvider {
     parameters: ConnectorParams,
     catalog_id: Option<String>,
     databases: RwLock<HashMap<DatabaseName, Arc<dyn SchemaProvider>>>,
-    /// Factory for creating the Glue data connector to read individual tables.
-    data_connector_factory: GlueDataConnectorFactory,
 }
 
 impl fmt::Debug for GlueCatalogProvider {
@@ -124,7 +117,6 @@ impl GlueCatalogProvider {
         catalog: &Catalog,
         runtime: Arc<Runtime>,
         app: Arc<App>,
-        data_connector_factory: GlueDataConnectorFactory,
     ) -> Result<Self> {
         Self::validate_parameters(&mut parameters).await?;
 
@@ -148,6 +140,7 @@ impl GlueCatalogProvider {
 
         Ok(Self {
             client,
+            config,
             include: catalog.include.clone(),
             orig_include: catalog.orig_include.clone(),
             runtime,
@@ -155,7 +148,6 @@ impl GlueCatalogProvider {
             databases,
             catalog_id: catalog.catalog_id.clone(),
             parameters,
-            data_connector_factory,
         })
     }
 
@@ -185,13 +177,11 @@ impl GlueCatalogProvider {
                 .collect::<Vec<_>>();
 
             for table in some_tables {
-                let mut parameters = self.parameters.parameters.clone();
+                let mut table_params = self.parameters.parameters.clone();
                 if let Some(catalog_id) = &self.catalog_id {
-                    parameters.insert("catalog_id".to_string(), catalog_id.clone().into());
+                    table_params.insert("catalog_id".to_string(), catalog_id.clone().into());
                 }
 
-                let connector =
-                    (self.data_connector_factory)(parameters, self.parameters.io_runtime.clone());
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
@@ -206,11 +196,35 @@ impl GlueCatalogProvider {
                     .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
                     })?;
-                let table_provider = connector.read_provider(&dataset).await.boxed().context(
-                    CreatingDatasetSnafu {
-                        dataset: table.name().to_string(),
-                    },
-                )?;
+
+                let input_format =
+                    InputFormat::try_from(&table)
+                        .boxed()
+                        .context(CreatingDatasetSnafu {
+                            dataset: table.name().to_string(),
+                        })?;
+
+                let table_provider = match input_format {
+                    InputFormat::Parquet | InputFormat::Csv => {
+                        create_s3_provider(
+                            input_format,
+                            dataset.clone(),
+                            table_params,
+                            &table,
+                            self.parameters.io_runtime.clone(),
+                        )
+                        .await
+                    }
+                    InputFormat::Iceberg => {
+                        create_iceberg_provider(&dataset, &self.config, database.clone(), &table)
+                            .await
+                    }
+                }
+                .boxed()
+                .context(CreatingDatasetSnafu {
+                    dataset: table.name().to_string(),
+                })?;
+
                 tables.insert(table.name, table_provider);
             }
         }

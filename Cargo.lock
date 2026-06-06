@@ -4043,6 +4043,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-ducklake"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "duckdb",
+ "runtime",
+ "runtime-datafusion",
+ "snafu",
+ "tokio",
+]
+
+[[package]]
 name = "connector-elasticsearch"
 version = "2.0.0-unstable"
 dependencies = [
@@ -4116,6 +4131,39 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "connector-github"
+version = "2.0.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-schema",
+ "arrow_tools",
+ "async-trait",
+ "chrono",
+ "data_components",
+ "datafusion",
+ "futures",
+ "globset",
+ "governor",
+ "graphql-parser",
+ "http 1.4.1",
+ "opentelemetry",
+ "reqwest 0.12.24",
+ "runtime",
+ "runtime-datafusion",
+ "runtime-parameters",
+ "runtime-rate-control",
+ "secrecy",
+ "serde_json",
+ "snafu",
+ "token_provider",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -4395,6 +4443,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-snowflake-native"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-table-providers",
+ "db_connection_pool",
+ "runtime",
+ "snafu",
+ "snowflake-api",
+]
+
+[[package]]
 name = "connector-spark"
 version = "2.0.0-unstable"
 dependencies = [
@@ -4406,6 +4468,30 @@ dependencies = [
  "runtime",
  "runtime-parameters",
  "snafu",
+]
+
+[[package]]
+name = "connector-spiceai"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow-flight",
+ "async-stream",
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "datafusion-federation",
+ "flight_client",
+ "futures",
+ "linkme",
+ "ns_lookup",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "spice-cloud-client",
+ "spiceai-connector-types",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -15898,6 +15984,7 @@ dependencies = [
  "hyper 1.10.1",
  "hyper-util",
  "iceberg",
+ "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
@@ -15976,6 +16063,7 @@ dependencies = [
  "spice-cloud",
  "spice-cloud-client",
  "spiceai",
+ "spiceai-connector-types",
  "spicepod",
  "sysinfo 0.38.4",
  "tar",
@@ -18063,6 +18151,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spiceai-connector-types"
+version = "2.0.0-unstable"
+dependencies = [
+ "data_components",
+ "datafusion",
+ "flight_client",
+ "snafu",
+ "tonic",
+]
+
+[[package]]
 name = "spiced"
 version = "2.0.0-unstable"
 dependencies = [
@@ -18076,11 +18175,13 @@ dependencies = [
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-ducklake",
  "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
  "connector-gcs",
  "connector-git",
+ "connector-github",
  "connector-glue",
  "connector-graphql",
  "connector-imap",
@@ -18097,7 +18198,9 @@ dependencies = [
  "connector-sharepoint",
  "connector-smb",
  "connector-snowflake",
+ "connector-snowflake-native",
  "connector-spark",
+ "connector-spiceai",
  "event_stream",
  "futures",
  "mimalloc",
@@ -19565,10 +19668,15 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "token_provider"
 version = "2.0.0-unstable"
 dependencies = [
+ "chrono",
+ "jsonwebtoken 10.4.0",
+ "reqwest 0.12.24",
  "secrecy",
+ "serde",
  "snafu",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]

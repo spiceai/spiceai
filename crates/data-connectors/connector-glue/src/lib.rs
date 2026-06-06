@@ -17,33 +17,22 @@ limitations under the License.
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
-use aws_sdk_glue::{Client, types::Table};
-use aws_sdk_s3::config::ProvideCredentials;
+use aws_sdk_glue::Client;
 use datafusion::catalog::TableProvider;
-use iceberg::{
-    CatalogBuilder, NamespaceIdent, TableIdent,
-    io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
-};
-use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-    GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
-};
-use iceberg_datafusion::IcebergTableProvider;
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::sync::LazyLock;
-use std::{any::Any, collections::HashMap, future::Future, path::Path, pin::Pin, sync::Arc};
+use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 
 use data_components::glue::InputFormat;
 use runtime::component::dataset::Dataset;
+use runtime::dataconnector::glue::{create_iceberg_provider, create_s3_provider};
 use runtime::dataconnector::{
     DataConnector, DataConnectorFactory,
     parameters::{
         ConnectorParams,
         aws::{self, initiate_config_with_credentials},
     },
-    s3::S3,
 };
 use runtime::parameters::{ParameterSpec, Parameters};
 
@@ -279,247 +268,6 @@ impl DataConnector for GlueDataConnector {
     ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         // Iceberg supports read and write operations through the same TableProvider interface.
         Some(self.create_table_provider(dataset).await)
-    }
-}
-
-async fn create_iceberg_provider(
-    dataset: &Dataset,
-    config: &SdkConfig,
-    database: String,
-    table: &Table,
-) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
-    let region = config.region().ok_or_else(|| {
-        let e = Error::MissingRegion;
-        runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: e.to_string(),
-            source: Box::new(e),
-        }
-    })?;
-
-    let credentials = config
-        .credentials_provider()
-        .ok_or_else(|| {
-            let e = Error::MissingCredentials;
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-                dataconnector: PREFIX.to_string(),
-                connector_component: dataset.into(),
-                message: e.to_string(),
-                source: Box::new(e),
-            }
-        })?
-        .provide_credentials()
-        .await
-        .map_err(|e| {
-            let e = Error::InvalidCredentials { source: e };
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-                dataconnector: PREFIX.to_string(),
-                connector_component: dataset.into(),
-                message: e.to_string(),
-                source: Box::new(e),
-            }
-        })?;
-
-    let metadata_location = get_metadata_location(table).map_err(|e| {
-        runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: e.to_string(),
-            source: Box::new(e),
-        }
-    })?;
-
-    let mut props = HashMap::from([
-        (
-            AWS_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            AWS_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
-        (AWS_REGION_NAME.to_string(), region.to_string()),
-        (
-            S3_ACCESS_KEY_ID.to_string(),
-            credentials.access_key_id().to_string(),
-        ),
-        (
-            S3_SECRET_ACCESS_KEY.to_string(),
-            credentials.secret_access_key().to_string(),
-        ),
-        (S3_REGION.to_string(), region.to_string()),
-    ]);
-
-    if let Some(session_token) = credentials.session_token() {
-        props.insert(AWS_SESSION_TOKEN.to_string(), session_token.to_string());
-        props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
-    }
-
-    // Disable OpenDAL's automatic credential loading from environment variables and config files.
-    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
-    // or other credentials from the environment that may not be valid for this specific connection.
-    props.insert("s3.disable-config-load".to_string(), "true".to_string());
-
-    props.insert(
-        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-        metadata_location.clone(),
-    );
-
-    if let Some(catalog_id) = table.catalog_id.clone() {
-        props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
-    }
-
-    // Derive the S3 scheme from the metadata location (e.g. "s3://" or "s3a://").
-    // The Glue catalog's default StorageFactory uses "s3a" as the configured scheme,
-    // but AWS Glue metadata locations typically use "s3://", causing a scheme mismatch.
-    let s3_scheme = metadata_location
-        .split("://")
-        .next()
-        .unwrap_or("s3")
-        .to_string();
-
-    let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-        Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: s3_scheme,
-            customized_credential_load: None,
-        });
-
-    let catalog = GlueCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load("glue", props)
-        .await
-        .map_err(|e| {
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-                dataconnector: PREFIX.to_string(),
-                connector_component: dataset.into(),
-                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
-                source: e.into(),
-            }
-    })?;
-
-    let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
-
-    let table_provider = IcebergTableProvider::try_new(
-        Arc::new(catalog),
-        identifier.namespace().clone(),
-        identifier.name().to_string(),
-    )
-    .await
-    .map_err(|e| runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-        dataconnector: PREFIX.to_string(),
-        connector_component: dataset.into(),
-        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-        source: e.into(),
-    })?;
-
-    Ok(Arc::new(table_provider))
-}
-
-async fn create_s3_provider(
-    input_format: InputFormat,
-    mut dataset: Dataset,
-    mut params: Parameters,
-    table: &Table,
-    tokio_io_runtime: tokio::runtime::Handle,
-) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
-    let Some(storage_descriptor) = table.storage_descriptor() else {
-        let e = Error::MissingStorageDescriptor {
-            table: table.name().to_string(),
-        };
-        return Err(
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-                dataconnector: PREFIX.to_string(),
-                connector_component: (&dataset).into(),
-                message: e.to_string(),
-                source: Box::new(e),
-            },
-        );
-    };
-
-    let Some(from) = storage_descriptor.location().map(String::from) else {
-        let e = Error::MissingStorageLocation {
-            table: table.name().to_string(),
-        };
-        return Err(
-            runtime::dataconnector::DataConnectorError::InvalidConfiguration {
-                dataconnector: PREFIX.to_string(),
-                connector_component: (&dataset).into(),
-                message: e.to_string(),
-                source: Box::new(e),
-            },
-        );
-    };
-
-    let from = ensure_s3_trailing_slash(&from);
-
-    match input_format {
-        InputFormat::Csv => {
-            // If the table specifies a delimiter, pass it down to the data connector
-            // as a parameter
-            if let Some(delimiter) = table
-                .parameters()
-                .and_then(|params| params.get("delimiter"))
-            {
-                params.insert("csv_delimiter".to_string(), delimiter.as_str().into());
-            }
-        }
-        InputFormat::Parquet => {
-            dataset
-                .params
-                .insert("hive_partitioning_enabled".to_string(), "true".to_string());
-        }
-        InputFormat::Iceberg => {}
-    }
-
-    // Add required file_format parameter for S3
-    params.insert("file_format".into(), input_format.file_format().into());
-    let s3 = S3 {
-        params,
-        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
-        tokio_io_runtime,
-    };
-
-    dataset.from = from;
-
-    s3.read_provider(&dataset).await
-}
-
-fn ensure_s3_trailing_slash(s3_location: &str) -> String {
-    static PREFIX: &str = "s3://";
-
-    if !s3_location.starts_with(PREFIX) {
-        return s3_location.to_string();
-    }
-
-    let path_part = &s3_location[PREFIX.len()..];
-
-    if path_part.ends_with('/') {
-        return s3_location.to_string();
-    }
-
-    let path = Path::new(path_part);
-    if path.extension().is_some() {
-        return s3_location.to_string();
-    }
-
-    format!("{s3_location}/")
-}
-
-fn get_metadata_location(table: &Table) -> Result<String, Error> {
-    const METADATA_LOCATION: &str = "metadata_location";
-    match &table.parameters {
-        Some(properties) => match properties.get(METADATA_LOCATION) {
-            Some(location) => Ok(location.clone()),
-            None => Err(Error::MissingMetadataLocation {
-                table: table.name().to_string(),
-                message: format!("No property '{METADATA_LOCATION}' found"),
-            }),
-        },
-        None => Err(Error::MissingMetadataLocation {
-            table: table.name().to_string(),
-            message: "No parameters found".to_string(),
-        }),
     }
 }
 

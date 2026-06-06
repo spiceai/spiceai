@@ -9,7 +9,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono.workspace = true
+jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+reqwest.workspace = true
 secrecy.workspace = true
+serde.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+util = { path = "../util" }

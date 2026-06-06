@@ -12,6 +12,10 @@ version.workspace = true
 app = { path = "../../crates/app" }
 clap = { workspace = true, features = ["derive"] }
 connector-abfs = { path = "../../crates/data-connectors/connector-abfs" }
+connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake", optional = true }
+connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-snowflake-native = { path = "../../crates/data-connectors/connector-snowflake-native", optional = true }
+connector-spiceai = { path = "../../crates/data-connectors/connector-spiceai" }
 connector-adbc = { path = "../../crates/data-connectors/connector-adbc", optional = true }
 connector-clickhouse = { path = "../../crates/data-connectors/connector-clickhouse", optional = true }
 connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb", optional = true }
@@ -130,7 +134,7 @@ delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
 elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
-duckdb = ["connector-duckdb", "runtime/duckdb"]
+duckdb = ["connector-duckdb", "dep:connector-ducklake", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
@@ -164,7 +168,7 @@ sharepoint = ["connector-sharepoint", "runtime/sharepoint"]
 smb = ["connector-smb"]
 snapshots = ["runtime/snapshots"]
 client_tls = ["runtime/client_tls"]
-snowflake = ["connector-snowflake", "runtime/snowflake"]
+snowflake = ["connector-snowflake", "dep:connector-snowflake-native", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
 spicebench = ["runtime/spicebench"]
 sqlite = ["runtime/sqlite"]

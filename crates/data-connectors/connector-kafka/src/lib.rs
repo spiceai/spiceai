@@ -19,10 +19,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use data_components::{
     cdc::ChangesStream,
-    kafka::{
-        KafkaConfig, KafkaConsumer, KafkaMetadata, KafkaMetrics, KafkaOffset,
-        SidecarOffsetCommitHook, SidecarOffsetStore,
-    },
+    kafka::{KafkaConfig, KafkaConsumer, KafkaMetadata, KafkaMetrics, SidecarOffsetCommitHook},
 };
 use dataformat_json::{SpiceJsonOptions, unnest_struct_schema};
 use datafusion::catalog::TableProvider;
@@ -631,13 +628,15 @@ async fn bootstrap_new_kafka_consumer(
     };
 
     if let Some(kafka_sys) = kafka_sys {
-        kafka_sys.upsert(&metadata).await.map_err(|e: runtime::dataaccelerator::spice_sys::Error| {
-            runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
-                source: Box::new(e),
-                dataconnector: "kafka".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-            }
-        })?;
+        kafka_sys.upsert(&metadata).await.map_err(
+            |e: runtime::dataaccelerator::spice_sys::Error| {
+                runtime::dataconnector::DataConnectorError::UnableToGetReadProvider {
+                    source: Box::new(e),
+                    dataconnector: "kafka".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                }
+            },
+        )?;
     }
 
     // Restart the stream from the beginning

@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+use runtime::dataconnector::ConnectorComponent;
+use runtime_datafusion::error::find_datafusion_root;
 
-use super::{
+use crate::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };
@@ -552,12 +553,12 @@ fn gql_schema(comments_type: &PullRequestCommentType) -> SchemaRef {
 
 #[cfg(test)]
 mod tests {
-    use super::{PullRequestCommentType, PullRequestTableArgs};
+    use crate::GitHubQueryMode;
     use crate::builder::RuntimeBuilder;
     use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::ConnectorComponent;
-    use crate::dataconnector::github::GitHubQueryMode;
     use app::AppBuilder;
+    use runtime::dataconnector::ConnectorComponent;
+    use runtime::dataconnector::{PullRequestCommentType, PullRequestTableArgs};
     use std::sync::{Arc, OnceLock};
 
     /// Building a `ConnectorComponent` requires a full runtime + app

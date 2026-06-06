@@ -87,16 +87,33 @@ pub async fn register_external_connectors() {
 
     register_connector_factory(connector_git::CONNECTOR_NAME, connector_git::factory()).await;
 
+    register_connector_factory(
+        connector_github::CONNECTOR_NAME,
+        connector_github::factory(),
+    )
+    .await;
+
     register_connector_factory(connector_glue::CONNECTOR_NAME, connector_glue::factory()).await;
 
-    // Register the Glue data connector factory with the catalog connector so the
-    // Glue catalog connector can create data connectors without a circular dep.
-    runtime::catalogconnector::glue::register_glue_data_connector_factory(std::sync::Arc::new(
-        |params, io_runtime| {
-            std::sync::Arc::new(connector_glue::GlueDataConnector::new(params, io_runtime))
-                as std::sync::Arc<dyn runtime::dataconnector::DataConnector>
-        },
-    ));
+    register_connector_factory(
+        connector_spiceai::CONNECTOR_NAME,
+        connector_spiceai::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "duckdb")]
+    register_connector_factory(
+        connector_ducklake::CONNECTOR_NAME,
+        connector_ducklake::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "snowflake")]
+    register_connector_factory(
+        connector_snowflake_native::CONNECTOR_NAME,
+        connector_snowflake_native::factory(),
+    )
+    .await;
 
     // Feature-gated connectors
     #[cfg(feature = "adbc")]

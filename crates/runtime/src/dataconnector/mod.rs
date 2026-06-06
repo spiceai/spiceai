@@ -153,8 +153,8 @@ pub mod debezium;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod file;
+pub mod glue;
 
-pub mod github;
 pub mod https;
 
 pub mod localpod;
@@ -162,13 +162,10 @@ pub mod memory;
 
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 pub mod deferred;
-#[cfg(feature = "duckdb")]
-pub mod ducklake;
 pub mod iceberg;
 pub mod parameters;
 pub mod s3;
 pub mod sink;
-pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
@@ -410,7 +407,7 @@ pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 pub type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
-static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
+pub static DATA_CONNECTOR_FACTORY_REGISTRY: LazyLock<
     Mutex<HashMap<String, Arc<dyn DataConnectorFactory>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 

@@ -18,17 +18,10 @@ use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::catalogconnector::iceberg::{
     UnableToBuildCatalogClientSnafu, UnableToBuildCatalogSnafu,
 };
-use crate::component::dataset::builder::DatasetBuilder;
-use crate::{
-    App, Runtime,
-    component::{catalog::Catalog, dataset::Dataset},
-    dataconnector::{
-        DataConnector, DataConnectorFactory,
-        parameters::{ConnectorParams, ConnectorParamsBuilder},
-        spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
-    },
-    parameters::ExposedParamLookup,
-};
+
+use crate::component::catalog::Catalog;
+use crate::dataconnector::ConnectorParams;
+use crate::{Runtime, parameters::ExposedParamLookup};
 use async_trait::async_trait;
 use data_components::{
     Read, RefreshableCatalogProvider, iceberg::catalog::rest::RestCatalog,
@@ -39,6 +32,7 @@ use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
 use spice_cloud_client::endpoints::{data_endpoint as spice_cloud_data_endpoint, is_valid_region};
+use spiceai_connector_types::{SpiceAI, SpiceAIDatasetPath};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
 
@@ -148,73 +142,47 @@ impl SpiceCloudPlatformCatalog {
 
     async fn create_read_provider(
         &self,
-        runtime: Arc<Runtime>,
+        _runtime: Arc<Runtime>,
         catalog: &Catalog,
         org: &str,
         app: &str,
         catalog_name: &str,
     ) -> super::Result<Arc<dyn Read>> {
-        let app_ref = runtime.app();
-        let app_lock = app_ref.read().await;
-        let runtime_app = match app_lock.as_ref() {
-            Some(app) => Arc::clone(app),
-            None => {
-                return Err(super::Error::FailedToGetAppFromRuntime {});
-            }
+        let endpoint = self
+            .flight_endpoint()
+            .map(ToString::to_string)
+            .ok_or_else(|| super::Error::InvalidConfigurationNoSource {
+                connector: "spice.ai".into(),
+                message: "No Flight endpoint configured for Spice.ai catalog.".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
+
+        let credentials = if let Some(api_key) = self.api_key() {
+            flight_client::Credentials::new("", secrecy::SecretString::new(api_key.into()))
+        } else {
+            flight_client::Credentials::anonymous()
         };
 
-        let connector_factory = self
-            .create_data_connector(
-                Arc::clone(&runtime),
-                catalog,
-                self.create_template_dataset(runtime, runtime_app),
-            )
-            .await?;
+        let tls_options = flight_client::tls::ClientTlsOptions::default();
 
-        let Some(data_connector) = connector_factory.as_any().downcast_ref::<SpiceAI>() else {
-            unreachable!("Spice.ai is the only valid DataConnector");
-        };
+        let spiceai = SpiceAI::from_raw(endpoint, credentials, tls_options, None)
+            .await
+            .map_err(|e| super::Error::UnableToGetCatalogProvider {
+                connector: "spice.ai".into(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(e),
+            })?;
 
         let org_metadata = Self::create_metadata_value(org, catalog)?;
         let app_metadata = Self::create_metadata_value(app, catalog)?;
 
-        let (flight_factory, _) = data_connector.flight_factory(SpiceAIDatasetPath::OrgAppPath {
+        let (flight_factory, _) = spiceai.flight_factory(SpiceAIDatasetPath::OrgAppPath {
             org: org_metadata,
             app: app_metadata,
             path: catalog_name.into(),
         });
 
         Ok(Arc::new(flight_factory))
-    }
-
-    fn create_template_dataset(&self, runtime: Arc<Runtime>, app: Arc<App>) -> Dataset {
-        let Ok(template_dataset_builder) = DatasetBuilder::try_new("spice.ai".into(), "template")
-        else {
-            unreachable!("'template' is a valid dataset name");
-        };
-
-        let Ok(template_dataset) = template_dataset_builder
-            .with_app(app)
-            .with_runtime(runtime)
-            .build()
-        else {
-            unreachable!("'template' is a valid dataset name");
-        };
-
-        let mut params = HashMap::new();
-        if let Some(flight_endpoint) = self.flight_endpoint() {
-            params.insert("spiceai_endpoint".to_string(), flight_endpoint.to_string());
-        }
-
-        if let Some(region) = self.region() {
-            params.insert("spiceai_region".to_string(), region.to_string());
-        }
-
-        if let Some(api_key) = self.api_key() {
-            params.insert("spiceai_api_key".to_string(), api_key.to_string());
-        }
-
-        template_dataset.with_params(params)
     }
 
     fn flight_endpoint(&self) -> Option<&str> {
@@ -275,35 +243,6 @@ impl SpiceCloudPlatformCatalog {
         }
 
         None
-    }
-
-    async fn create_data_connector(
-        &self,
-        runtime: Arc<Runtime>,
-        catalog: &Catalog,
-        template_dataset: Dataset,
-    ) -> super::Result<Arc<dyn DataConnector>> {
-        SpiceAIFactory::new()
-            .create(
-                ConnectorParamsBuilder::new(
-                    "spice.ai".into(),
-                    ConnectorComponent::Dataset(Arc::new(template_dataset)),
-                )
-                .build(runtime.secrets(), runtime.tokio_io_runtime())
-                .await
-                .map_err(|e| super::Error::InvalidConfiguration {
-                    connector: "spice.ai".into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                    message: e.to_string(),
-                    source: e,
-                })?,
-            )
-            .await
-            .map_err(|e| super::Error::UnableToGetCatalogProvider {
-                connector: "spice.ai".into(),
-                connector_component: ConnectorComponent::from(catalog),
-                source: e,
-            })
     }
 
     fn create_metadata_value(

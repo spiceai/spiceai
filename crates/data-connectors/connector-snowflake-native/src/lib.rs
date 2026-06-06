@@ -14,20 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::ConnectorComponent;
-use super::ConnectorParams;
-use super::DataConnector;
-use super::DataConnectorFactory;
-use super::ParameterSpec;
 use async_trait::async_trait;
 use data_components::snowflake::{SnowflakeTableFactory, quote_snowflake_table_path};
 use data_components::{Read, ReadWrite};
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+use runtime::dataconnector::{
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+};
+use runtime::parameters::ParameterSpec;
 
-use crate::component::dataset::Dataset;
-use crate::datafusion::udf::deny_spice_specific_functions;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
+use runtime::component::dataset::Dataset;
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
 use std::any::Any;
@@ -130,7 +129,7 @@ impl DataConnectorFactory for SnowflakeFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync,
@@ -160,6 +159,48 @@ impl DataConnectorFactory for SnowflakeFactory {
     }
 }
 
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to get read-write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: &'static str,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+            ReadProviderError::UnableToGetReadWriteProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadWriteProvider {
+                dataconnector: dataconnector.to_string(),
+                connector_component,
+                source,
+            },
+        }
+    }
+}
+
 #[async_trait]
 impl DataConnector for Snowflake {
     fn as_any(&self) -> &dyn Any {
@@ -169,9 +210,9 @@ impl DataConnector for Snowflake {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = quote_snowflake_table_path(dataset.path()).map_err(|source| {
-            super::DataConnectorError::InvalidConfiguration {
+            DataConnectorError::InvalidConfiguration {
                 dataconnector: "snowflake".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
@@ -184,7 +225,7 @@ impl DataConnector for Snowflake {
 
         Ok(Read::table_provider(&self.table_factory, path.into())
             .await
-            .context(super::UnableToGetReadProviderSnafu {
+            .context(UnableToGetReadProviderSnafu {
                 dataconnector: "snowflake",
                 connector_component: ConnectorComponent::from(dataset),
             })?)
@@ -193,11 +234,11 @@ impl DataConnector for Snowflake {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>>> {
         let path = match quote_snowflake_table_path(dataset.path()) {
             Ok(path) => path,
             Err(source) => {
-                return Some(Err(super::DataConnectorError::InvalidConfiguration {
+                return Some(Err(DataConnectorError::InvalidConfiguration {
                     dataconnector: "snowflake".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
@@ -212,12 +253,22 @@ impl DataConnector for Snowflake {
         Some(
             ReadWrite::table_provider(&self.table_factory, path.into())
                 .await
-                .context(super::UnableToGetReadWriteProviderSnafu {
+                .context(UnableToGetReadWriteProviderSnafu {
                     dataconnector: "snowflake",
                     connector_component: ConnectorComponent::from(dataset),
-                }),
+                })
+                .map_err(DataConnectorError::from),
         )
     }
 }
 
-register_data_connector!("snowflake", SnowflakeFactory);
+/// The name used to identify this connector in configuration.
+/// Note: this is the "native" Snowflake connector backed by snowflake-api,
+/// distinct from `connector-snowflake` which uses the FlightSQL/ADBC backend.
+pub const CONNECTOR_NAME: &str = "snowflake";
+
+/// Returns a new instance of the Snowflake-native connector factory.
+#[must_use]
+pub fn factory() -> Arc<dyn DataConnectorFactory> {
+    SnowflakeFactory::new_arc()
+}

@@ -39,6 +39,7 @@ use super::{
 };
 use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption};
 use data_components::kafka::{KafkaMetadata, KafkaOffset, SidecarOffsetStore};
+use snafu::ResultExt;
 
 const KAFKA_TABLE_NAME: &str = "spice_sys_kafka";
 const KAFKA_OFFSETS_TABLE_NAME: &str = "spice_sys_kafka_offsets";

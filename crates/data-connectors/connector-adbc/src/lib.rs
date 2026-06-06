@@ -31,7 +31,6 @@ use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use runtime::component::dataset::Dataset;
-use runtime::register_data_connector;
 use runtime::secrets::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;

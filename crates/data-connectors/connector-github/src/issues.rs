@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+use runtime::dataconnector::ConnectorComponent;
+use runtime_datafusion::error::find_datafusion_root;
 
-use super::{
+use crate::{
     GitHubQueryMode, GitHubTableArgs, GitHubTableGraphQLParams, filter_pushdown, inject_parameters,
     search_inject_parameters,
 };

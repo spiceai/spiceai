@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dataconnector::github::pull_requests::PullRequestCommentType;
-use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
+use crate::members::MembersTableArgs;
+use crate::pull_requests::PullRequestCommentType;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -50,22 +49,50 @@ use issues::IssuesTableArgs;
 use projects::ProjectsTableArgs;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
+use runtime::component::dataset::Dataset;
+use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_rate_control::{JitterConfig, RateController, RateControllerBuilder};
 use secrecy::ExposeSecret;
-use snafu::ResultExt;
+use snafu::{ResultExt, Snafu};
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use token_provider::github_app_token::GitHubAppTokenProvider;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use url::Url;
 
-use super::{
+use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters,
 };
+
+#[derive(Debug, Snafu)]
+enum ReadProviderError {
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl From<ReadProviderError> for DataConnectorError {
+    fn from(err: ReadProviderError) -> Self {
+        match err {
+            ReadProviderError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            } => DataConnectorError::UnableToGetReadProvider {
+                dataconnector,
+                connector_component,
+                source,
+            },
+        }
+    }
+}
 
 mod commits;
 mod issues;
@@ -445,7 +472,7 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         self.build_gql_table_provider(table_args, context, health_check_query_string)
             .await
             .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
@@ -456,11 +483,11 @@ impl Github {
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
-    ) -> super::DataConnectorResult<GraphQLTableProvider> {
+    ) -> runtime::dataconnector::DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
-            super::UnableToGetReadProviderSnafu {
+            UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: table_args.get_component(),
             },
@@ -502,7 +529,7 @@ impl Github {
             );
 
             let fallback_client = self.create_graphql_client(&table_args).await.context(
-                super::UnableToGetReadProviderSnafu {
+                UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
                 },
@@ -569,10 +596,10 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self
             .create_rest_client()
-            .context(super::UnableToGetReadProviderSnafu {
+            .context(UnableToGetReadProviderSnafu {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
             })?;
@@ -622,7 +649,7 @@ impl Github {
         repo: &str,
         requested_ref: Option<&str>,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_args = Arc::new(CommitsTableArgs {
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -643,12 +670,12 @@ impl Github {
         let client = delegate_provider.client();
         let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
 
-        let rest_client =
-            self.create_rest_client()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "github".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+        let rest_client = self
+            .create_rest_client()
+            .context(UnableToGetReadProviderSnafu {
+                dataconnector: "github".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
 
         Ok(Arc::new(CommitsTableProvider::new(
             delegate,
@@ -788,7 +815,7 @@ impl DataConnectorFactory for GithubFactory {
     fn create(
         &self,
         params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = runtime::dataconnector::NewDataConnectorResult> + Send>> {
         let token = params.parameters.get("token").ok().cloned();
         let client_id = params
             .parameters
@@ -932,8 +959,6 @@ impl DataConnectorFactory for GithubFactory {
         PARAMETERS
     }
 }
-
-register_data_connector!("github", GithubFactory);
 
 fn resolve_runtime_github_concurrent_connections_limit(
     app: Option<&app::App>,
@@ -1100,7 +1125,7 @@ impl DataConnector for Github {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+    ) -> runtime::dataconnector::DataConnectorResult<Arc<dyn TableProvider>> {
         let path = dataset.path().to_string();
 
         // Parse owner, repo, and resource type from the path for validation
@@ -1267,7 +1292,7 @@ impl DataConnector for Github {
             ("workflows", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "workflows", &component);
 
-                let client = self.create_rest_client().context(super::UnableToGetReadProviderSnafu {
+                let client = self.create_rest_client().context(UnableToGetReadProviderSnafu {
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
                 })?;
@@ -1392,28 +1417,32 @@ impl DataConnector for Github {
 pub fn parse_globs(
     component: &ConnectorComponent,
     input: &str,
-) -> super::DataConnectorResult<Arc<GlobSet>> {
+) -> runtime::dataconnector::DataConnectorResult<Arc<GlobSet>> {
     let patterns: Vec<&str> = input.split(&[',', ';'][..]).collect();
     let mut builder = GlobSetBuilder::new();
 
     for pattern in patterns {
         let trimmed_pattern = pattern.trim();
         if !trimmed_pattern.is_empty() {
-            builder.add(
-                Glob::new(trimmed_pattern).context(super::InvalidGlobPatternSnafu {
-                    pattern,
+            builder.add(Glob::new(trimmed_pattern).map_err(|source| {
+                DataConnectorError::InvalidGlobPattern {
+                    pattern: pattern.to_string(),
                     dataconnector: "github".to_string(),
                     connector_component: component.clone(),
-                })?,
-            );
+                    source,
+                }
+            })?);
         }
     }
 
-    let glob_set = builder.build().context(super::InvalidGlobPatternSnafu {
-        pattern: input,
-        dataconnector: "github".to_string(),
-        connector_component: component.clone(),
-    })?;
+    let glob_set = builder
+        .build()
+        .map_err(|source| DataConnectorError::InvalidGlobPattern {
+            pattern: input.to_string(),
+            dataconnector: "github".to_string(),
+            connector_component: component.clone(),
+            source,
+        })?;
     Ok(Arc::new(glob_set))
 }
 
@@ -1885,298 +1914,11 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        Github, GithubFactory, PARAMETERS, parse_github_path, sanitize_github_validation_body,
-    };
-    use crate::Runtime;
-    use crate::component::dataset::builder::DatasetBuilder;
-    use crate::dataconnector::{
-        ConnectorComponent, ConnectorParams, DataConnectorError, DataConnectorFactory,
-    };
-    use crate::parameters::Parameters;
-    use runtime_secrets::Secrets;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+/// The name used to identify this connector in configuration.
+pub const CONNECTOR_NAME: &str = "github";
 
-    async fn github_connector_params(
-        dataset_name: &str,
-        token: &str,
-        extra: &[(&str, &str)],
-    ) -> ConnectorParams {
-        github_connector_params_with_runtime(
-            dataset_name,
-            token,
-            extra,
-            spicepod::component::runtime::Runtime::default(),
-        )
-        .await
-    }
-
-    async fn github_connector_params_with_runtime(
-        dataset_name: &str,
-        token: &str,
-        extra: &[(&str, &str)],
-        app_runtime: spicepod::component::runtime::Runtime,
-    ) -> ConnectorParams {
-        let mut params = vec![("github_token".to_string(), token.to_string().into())];
-        params.extend(
-            extra
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string().into())),
-        );
-
-        let parameters = Parameters::try_new(
-            "connector github",
-            params,
-            "github",
-            Arc::new(RwLock::new(Secrets::default())),
-            PARAMETERS,
-        )
-        .await
-        .expect("test GitHub parameters should be valid");
-
-        let app = app::AppBuilder::new(dataset_name.to_string())
-            .with_runtime(app_runtime)
-            .build();
-        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
-        let app = Arc::new(app);
-        let dataset = DatasetBuilder::try_new(
-            "github:github.com/spiceai/spiceai/issues".to_string(),
-            dataset_name,
-        )
-        .expect("test GitHub dataset should be valid")
-        .with_app(Arc::clone(&app))
-        .with_runtime(Arc::clone(&runtime))
-        .build()
-        .expect("test GitHub dataset should build");
-
-        ConnectorParams {
-            parameters,
-            unsupported_type_action: None,
-            component: ConnectorComponent::from(&dataset),
-            app: Some(app),
-            runtime: Some(runtime),
-            io_runtime: tokio::runtime::Handle::current(),
-        }
-    }
-
-    fn github_available_permits(connector: &Arc<dyn crate::dataconnector::DataConnector>) -> usize {
-        connector
-            .as_any()
-            .downcast_ref::<Github>()
-            .expect("connector should be GitHub")
-            .semaphore
-            .available_permits()
-    }
-
-    fn expect_invalid_configuration_message(
-        error: Box<dyn std::error::Error + Send + Sync>,
-    ) -> String {
-        let error = error
-            .downcast::<DataConnectorError>()
-            .expect("error should be a DataConnectorError");
-
-        match *error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. }
-            | DataConnectorError::InvalidConfiguration { message, .. } => message,
-            other => panic!("expected GitHub invalid configuration error, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn test_sanitize_github_validation_body_normalizes_crlf() {
-        assert_eq!(
-            sanitize_github_validation_body("first line\r\nsecond\nthird\tfourth"),
-            "first line second third fourth"
-        );
-    }
-
-    #[test]
-    fn test_parse_github_path_preserves_commits_ref_suffix() {
-        let parsed = parse_github_path("github.com/spiceai/spiceai/commits/feature/ref-test")
-            .expect("path should parse");
-
-        assert_eq!(parsed.owner, "spiceai");
-        assert_eq!(parsed.repo, Some("spiceai"));
-        assert_eq!(parsed.resource_type, "commits");
-        assert_eq!(parsed.remaining.as_deref(), Some("feature/ref-test"));
-    }
-
-    #[test]
-    fn test_parse_github_path_allows_files_without_explicit_ref() {
-        let parsed =
-            parse_github_path("github.com/spiceai/spiceai/files").expect("path should parse");
-
-        assert_eq!(parsed.owner, "spiceai");
-        assert_eq!(parsed.repo, Some("spiceai"));
-        assert_eq!(parsed.resource_type, "files");
-        assert!(parsed.remaining.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_github_rejects_invalid_max_concurrent_requests() {
-        let params = github_connector_params(
-            "github_invalid_concurrency",
-            "github-invalid-concurrency-token",
-            &[("max_concurrent_requests", "0")],
-        )
-        .await;
-
-        let Err(error) = GithubFactory::new().create(params).await else {
-            panic!("zero GitHub max_concurrent_requests should be rejected");
-        };
-        let message = expect_invalid_configuration_message(error);
-
-        assert!(
-            message.contains("must be greater than 0"),
-            "expected zero-limit validation error, got: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_github_uses_source_rate_control_concurrency_limit() {
-        let factory = GithubFactory::new();
-        let app_runtime = spicepod::component::runtime::Runtime {
-            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
-                github_concurrent_connections_limit: Some(2),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let params = github_connector_params_with_runtime(
-            "github_source_rate_control_concurrency",
-            "github-source-rate-control-token",
-            &[],
-            app_runtime,
-        )
-        .await;
-
-        let connector = factory
-            .create(params)
-            .await
-            .expect("GitHub connector should be created");
-
-        assert_eq!(github_available_permits(&connector), 2);
-    }
-
-    #[tokio::test]
-    async fn test_github_source_rate_control_overrides_legacy_runtime_param() {
-        let factory = GithubFactory::new();
-        let mut app_runtime = spicepod::component::runtime::Runtime {
-            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
-                github_concurrent_connections_limit: Some(2),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        app_runtime.params.insert(
-            "github_max_concurrent_connections".to_string(),
-            "3".to_string(),
-        );
-
-        let params = github_connector_params_with_runtime(
-            "github_source_rate_control_overrides_legacy",
-            "github-source-rate-control-overrides-legacy-token",
-            &[],
-            app_runtime,
-        )
-        .await;
-
-        let connector = factory
-            .create(params)
-            .await
-            .expect("GitHub connector should be created");
-
-        assert_eq!(github_available_permits(&connector), 2);
-    }
-
-    #[tokio::test]
-    async fn test_github_keeps_legacy_runtime_concurrency_param() {
-        let factory = GithubFactory::new();
-        let mut app_runtime = spicepod::component::runtime::Runtime::default();
-        app_runtime.params.insert(
-            "github_max_concurrent_connections".to_string(),
-            "3".to_string(),
-        );
-
-        let params = github_connector_params_with_runtime(
-            "github_legacy_runtime_concurrency",
-            "github-legacy-runtime-concurrency-token",
-            &[],
-            app_runtime,
-        )
-        .await;
-
-        let connector = factory
-            .create(params)
-            .await
-            .expect("GitHub connector should be created");
-
-        assert_eq!(github_available_permits(&connector), 3);
-    }
-
-    #[tokio::test]
-    async fn test_github_rejects_zero_source_rate_control_concurrency_limit() {
-        let app_runtime = spicepod::component::runtime::Runtime {
-            source_rate_control: Some(spicepod::component::runtime::SourceRateControl {
-                github_concurrent_connections_limit: Some(0),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let params = github_connector_params_with_runtime(
-            "github_zero_source_rate_control_concurrency",
-            "github-zero-source-rate-control-token",
-            &[],
-            app_runtime,
-        )
-        .await;
-
-        let Err(error) = GithubFactory::new().create(params).await else {
-            panic!("zero source_rate_control GitHub limit should be rejected");
-        };
-        let message = expect_invalid_configuration_message(error);
-
-        assert!(
-            message.contains("must be greater than 0"),
-            "expected zero-limit validation error, got: {message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_github_rejects_conflicting_shared_auth_concurrency_limits() {
-        let factory = GithubFactory::new();
-        let token = "github-conflicting-concurrency-token";
-
-        let first = github_connector_params(
-            "github_conflicting_concurrency_first",
-            token,
-            &[("max_concurrent_requests", "2")],
-        )
-        .await;
-        factory
-            .create(first)
-            .await
-            .expect("first GitHub connector should be created");
-
-        let second = github_connector_params(
-            "github_conflicting_concurrency_second",
-            token,
-            &[("max_concurrent_requests", "3")],
-        )
-        .await;
-        let Err(error) = factory.create(second).await else {
-            panic!("conflicting GitHub concurrency limits should be rejected");
-        };
-        let message = expect_invalid_configuration_message(error);
-
-        assert!(
-            message.contains("different concurrency limits"),
-            "expected shared auth concurrency conflict, got: {message}"
-        );
-    }
+/// Returns a new instance of the GitHub connector factory.
+#[must_use]
+pub fn factory() -> std::sync::Arc<dyn runtime::dataconnector::DataConnectorFactory> {
+    GithubFactory::new_arc()
 }

@@ -53,6 +53,7 @@ members = [
     "crates/s3_vectors_metadata_filter",
     "crates/search",
     "crates/spice_cloud",
+    "crates/spiceai-connector-types",
     "crates/spice-cloud-client",
     "crates/spicepod",
     "crates/telemetry",

@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
 use async_trait::async_trait;
+use runtime::dataconnector::ConnectorComponent;
+use runtime_datafusion::error::find_datafusion_root;
 
-use super::{
+use crate::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
     filter_pushdown, inject_parameters, scalar_utf8_value,
 };
