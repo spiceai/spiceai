@@ -136,6 +136,17 @@ pub fn build_authenticate_message(
     domain: &str,
     workstation: &str,
 ) -> (Bytes, [u8; 16]) {
+    // Only retain flags the client actually advertised in the Negotiate message.
+    // Echoing all challenge flags verbatim would include KEY_EXCH (0x4000_0000)
+    // without a valid EncryptedRandomSessionKey. Servers interpret that as
+    // ExportedSessionKey = all-zeros while the client uses SessionBaseKey —
+    // a mismatch that produces different signing keys on each side.
+    const SUPPORTED: u32 = NTLMSSP_NEGOTIATE_UNICODE
+        | NTLMSSP_REQUEST_TARGET
+        | NTLMSSP_NEGOTIATE_NTLM
+        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
+        | NTLMSSP_NEGOTIATE_VERSION;
+
     let ntlmv2_hash = ntlmv2_hash(username, password, domain);
 
     let client_challenge = generate_client_challenge();
@@ -169,16 +180,7 @@ pub fn build_authenticate_message(
     let user_offset = domain_offset + u32::try_from(domain_bytes.len()).unwrap_or(u32::MAX);
     let ws_offset = user_offset + u32::try_from(user_bytes.len()).unwrap_or(u32::MAX);
 
-    // Only retain flags the client actually advertised in the Negotiate message.
-    // Echoing all challenge flags verbatim would include KEY_EXCH (0x4000_0000)
-    // without a valid EncryptedRandomSessionKey. Servers interpret that as
-    // ExportedSessionKey = all-zeros while the client uses SessionBaseKey —
-    // a mismatch that produces different signing keys on each side.
-    const SUPPORTED: u32 = NTLMSSP_NEGOTIATE_UNICODE
-        | NTLMSSP_REQUEST_TARGET
-        | NTLMSSP_NEGOTIATE_NTLM
-        | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
-        | NTLMSSP_NEGOTIATE_VERSION;
+    // Mask down to only the flags the client advertised (see `SUPPORTED` above).
     let flags = challenge.negotiate_flags & SUPPORTED;
 
     let mut buf = BytesMut::with_capacity(ws_offset as usize + ws_bytes.len());
