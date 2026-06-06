@@ -29,7 +29,7 @@ use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
     consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
-    message::BorrowedMessage,
+    message::{BorrowedMessage, Timestamp},
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
 };
@@ -38,7 +38,7 @@ use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{any::Any, sync::Arc};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
@@ -660,25 +660,28 @@ impl KafkaConsumer {
         })
     }
 
-    /// Fetch the latest message from a Kafka topic without affecting any existing
-    /// consumer group state.
+    /// Fetch the latest non-tombstone message from a Kafka topic without affecting
+    /// any existing consumer group state.
     ///
-    /// Creates a temporary consumer, seeks to the latest available message across
-    /// all partitions, reads it, and returns the owned key/value pair.
+    /// Creates a temporary consumer, inspects the latest available message on each
+    /// partition (skipping tombstones by seeking backward), and returns the message
+    /// with the newest record timestamp across all partitions.
     pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
         topic: &str,
         kafka_config: &KafkaConfig,
         timeout: Duration,
     ) -> Result<Option<(Option<K>, V)>> {
+        let deadline = Instant::now() + timeout;
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
         let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
 
+        let remaining = deadline.saturating_duration_since(Instant::now());
         // Fetch topic metadata to discover partitions
         let metadata = temp_consumer
             .consumer
-            .fetch_metadata(Some(topic), timeout)
+            .fetch_metadata(Some(topic), remaining)
             .context(UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             })?;
@@ -691,51 +694,169 @@ impl KafkaConsumer {
                 topic: topic.to_string(),
             })?;
 
-        // Find the partition with the highest watermark (most recent data)
-        let mut best_partition: Option<(i32, i64)> = None;
-        for partition in topic_metadata.partitions() {
-            let (low, high) = temp_consumer
-                .consumer
-                .fetch_watermarks(topic, partition.id(), timeout)
-                .context(UnableToRestartTopicSnafu {
-                    message: format!(
-                        "Failed to fetch watermarks for partition {}",
-                        partition.id()
-                    ),
-                })?;
+        // Number of messages to fetch in a single burst when scanning backward
+        // past tombstones. One network round-trip pulls this many records into
+        // the local buffer, eliminating per-tombstone seek overhead.
+        const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
-            if high > low {
-                match &best_partition {
-                    Some((_, best_high)) if high <= *best_high => {}
-                    _ => best_partition = Some((partition.id(), high)),
+        // Inspect the latest non-tombstone message on each partition and
+        // keep the one with the newest timestamp.
+        let mut best_message: Option<(Option<K>, V, i64)> = None;
+
+        // Collect partition IDs up-front so the `MetadataPartition` iterator
+        // (which is not `Send` because it contains `*mut i32`) is dropped before
+        // any await points inside the loop body.
+        let partition_ids: Vec<i32> = topic_metadata.partitions().iter().map(|p| p.id()).collect();
+        for partition_id in partition_ids {
+            if Instant::now() >= deadline {
+                tracing::debug!("Schema peek timeout budget exhausted");
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let watermarks = temp_consumer
+                .consumer
+                .fetch_watermarks(topic, partition_id, remaining);
+
+            let (low, high) = match watermarks {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::debug!(
+                        "Failed to fetch watermarks for partition {partition_id}: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if high <= low {
+                continue; // Empty partition
+            }
+
+            let mut window_end = high - 1;
+            let mut found_in_partition = false;
+
+            while window_end >= low && !found_in_partition {
+                if Instant::now() >= deadline {
+                    tracing::debug!(
+                        "Schema peek timeout budget exhausted for partition {partition_id}"
+                    );
+                    break;
+                }
+
+                let window_start = std::cmp::max(low, window_end - TOMBSTONE_SCAN_WINDOW + 1);
+
+                // Assign consumer to the start of the current window.
+                let mut tpl = rdkafka::TopicPartitionList::new();
+                if let Err(e) = tpl.add_partition_offset(
+                    topic,
+                    partition_id,
+                    Offset::Offset(window_start),
+                ) {
+                    tracing::debug!(
+                        "Failed to configure partition offset for partition {partition_id}: {e}"
+                    );
+                    break;
+                }
+                if let Err(e) = temp_consumer.consumer.assign(&tpl) {
+                    tracing::debug!("Failed to assign partition {partition_id}: {e}");
+                    break;
+                }
+
+                // Collect a burst of messages from the window in one fetch.
+                // The first `next()` triggers a network round-trip; subsequent
+                // messages are served from the local buffer. We rely on the
+                // short per-poll timeout for non-first polls to naturally stop
+                // when the buffer is exhausted.
+                let mut stream = Box::pin(temp_consumer.consumer.stream());
+                let mut burst = Vec::new();
+                let mut is_first_poll = true;
+
+                while burst.len() < TOMBSTONE_SCAN_WINDOW as usize {
+                    let poll_timeout = if is_first_poll {
+                        std::cmp::min(
+                            Duration::from_secs(5),
+                            deadline.saturating_duration_since(Instant::now()),
+                        )
+                    } else {
+                        Duration::from_millis(100)
+                    };
+
+                    match tokio::time::timeout(poll_timeout, stream.next()).await {
+                        Ok(Some(Ok(msg))) => {
+                            is_first_poll = false;
+                            if msg.offset() > window_end {
+                                break; // Past the window
+                            }
+                            burst.push(msg);
+                        }
+                        Ok(Some(Err(e))) => {
+                            tracing::debug!(
+                                "Error receiving message from partition {partition_id}: {e}"
+                            );
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                // Search backward through the burst for a non-tombstone.
+                for msg in burst.iter().rev() {
+                    let Some(payload) = msg.payload() else {
+                        continue; // Tombstone — keep scanning backward within burst
+                    };
+
+                    let timestamp = match msg.timestamp() {
+                        Timestamp::CreateTime(ts) => ts,
+                        Timestamp::LogAppendTime(ts) => ts,
+                        _ => 0,
+                    };
+
+                    let key = match msg.key() {
+                        Some(key_bytes) => match serde_json::from_slice(key_bytes) {
+                            Ok(k) => Some(k),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to deserialize key for partition {partition_id} at offset {}: {e}",
+                                    msg.offset()
+                                );
+                                found_in_partition = true;
+                                break;
+                            }
+                        },
+                        None => None,
+                    };
+
+                    let value = match serde_json::from_slice(payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to deserialize value for partition {partition_id} at offset {}: {e}",
+                                msg.offset()
+                            );
+                            found_in_partition = true;
+                            break;
+                        }
+                    };
+
+                    match &best_message {
+                        Some((_, _, best_ts)) if timestamp <= *best_ts => {}
+                        _ => best_message = Some((key, value, timestamp)),
+                    }
+                    found_in_partition = true;
+                    break;
+                }
+
+                // Shift the window backward if nothing usable was found.
+                if !found_in_partition {
+                    if window_start <= low {
+                        break;
+                    }
+                    window_end = window_start - 1;
                 }
             }
         }
 
-        let Some((partition_id, high_watermark)) = best_partition else {
-            return Ok(None); // No messages available
-        };
-
-        // Manually assign the consumer to read from the latest offset
-        let mut tpl = rdkafka::TopicPartitionList::new();
-        tpl.add_partition_offset(topic, partition_id, Offset::Offset(high_watermark - 1))
-            .context(UnableToRestartTopicSnafu {
-                message: "Failed to configure partition offset".to_string(),
-            })?;
-
-        temp_consumer
-            .consumer
-            .assign(&tpl)
-            .context(UnableToRestartTopicSnafu {
-                message: "Failed to assign partition".to_string(),
-            })?;
-
-        // Read the message with a timeout
-        match tokio::time::timeout(timeout, temp_consumer.next_json::<K, V>()).await {
-            Ok(Ok(Some(msg))) => Ok(Some(msg.into_key_value())),
-            Ok(Ok(None)) | Err(_) => Ok(None),
-            Ok(Err(e)) => Err(e),
-        }
+        Ok(best_message.map(|(k, v, _)| (k, v)))
     }
 
     fn generate_group_id(dataset: &str) -> String {
