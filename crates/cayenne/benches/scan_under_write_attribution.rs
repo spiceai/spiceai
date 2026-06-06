@@ -115,7 +115,9 @@ async fn insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
 async fn setup() -> Fixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).expect("create data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("create data dir");
     let db_path = temp_dir.path().join("catalog.db");
     let catalog = Arc::new(
         CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
@@ -191,7 +193,11 @@ async fn staged_scan(
         datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).expect("execute stream");
     let first = stream.next().await;
     let first_us = u64::try_from(t2.elapsed().as_micros()).unwrap_or(u64::MAX);
-    assert!(first.is_some(), "scan must yield at least one batch");
+    // Unwrap the Result so a failed query surfaces immediately instead of the
+    // harness silently timing error paths.
+    first
+        .expect("scan must yield at least one batch")
+        .expect("first scan batch must be Ok");
 
     let t3 = Instant::now();
     while let Some(batch) = stream.next().await {
@@ -282,8 +288,21 @@ fn main() {
                 }
             })
         };
-        // Let the writer reach steady state before measuring.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Let the writer reach steady state before measuring: wait until it
+        // has completed a fixed number of inserts (bounded), rather than a
+        // fixed sleep that is machine-speed-dependent.
+        const WARMUP_WRITES: u64 = 20;
+        const WARMUP_POLL: Duration = Duration::from_millis(10);
+        const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
+        let warmup_started = std::time::Instant::now();
+        while writes_done.load(Ordering::Relaxed) < WARMUP_WRITES {
+            assert!(
+                warmup_started.elapsed() < WARMUP_TIMEOUT,
+                "background writer failed to complete {WARMUP_WRITES} inserts \
+                 within {WARMUP_TIMEOUT:?} — cannot measure scans under write"
+            );
+            tokio::time::sleep(WARMUP_POLL).await;
+        }
 
         let mut active_cold = Vec::with_capacity(SCANS_PER_MODE);
         let mut active_warm = Vec::with_capacity(SCANS_PER_MODE);
@@ -293,7 +312,7 @@ fn main() {
         }
 
         stop.store(true, Ordering::Relaxed);
-        let _ = writer.await;
+        writer.await.expect("background writer task must not panic");
         let writes = writes_done.load(Ordering::Relaxed);
         // Validity gate: the writer must actually have been writing during
         // the active window, or the "active" numbers are idle numbers.
