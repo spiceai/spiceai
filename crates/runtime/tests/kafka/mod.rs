@@ -248,7 +248,7 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
             )
             .await?;
 
-            // Send tombstone to partition 1 with timestamp 3000.
+            // Send tombstone to partition 1 (timestamp uses the default broker/producer time).
             send_tombstone_to_kafka(
                 &producer,
                 "fetch_latest_multi_partition_test",
