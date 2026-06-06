@@ -59,7 +59,8 @@ fn test_schema() -> SchemaRef {
 }
 
 fn compressible_batch(rows: usize) -> RecordBatch {
-    let ids: Vec<i64> = (0..rows as i64).collect();
+    let row_count = i64::try_from(rows).expect("row count fits i64");
+    let ids: Vec<i64> = (0..row_count).collect();
     let names: Vec<String> = (0..rows)
         .map(|i| format!("repeated_delta_encoding_value_{:02}", i % DISTINCT_NAMES))
         .collect();
@@ -104,9 +105,8 @@ async fn create_table_with_encoding(
 /// Sum the sizes of all `.vortex` data files under a table's data directory.
 fn vortex_bytes_under(dir: &Path) -> u64 {
     let mut total = 0;
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return 0,
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -154,11 +154,9 @@ async fn delta_encoding_levels_are_correct_and_actually_engage() {
     let written_full = insert_batch(&full_table, batch)
         .await
         .expect("insert level 9");
-    assert_eq!(
-        written_level0 as usize, ROW_COUNT,
-        "level-0 insert row count"
-    );
-    assert_eq!(written_full as usize, ROW_COUNT, "level-9 insert row count");
+    let expected_rows = u64::try_from(ROW_COUNT).expect("row count fits u64");
+    assert_eq!(written_level0, expected_rows, "level-0 insert row count");
+    assert_eq!(written_full, expected_rows, "level-9 insert row count");
 
     // Correctness: both tables return exactly the inserted rows.
     let level0_rows = scan_all_rows(&uncompressed_table, "delta_enc_level0").await;
@@ -196,15 +194,26 @@ async fn delta_encoding_levels_are_correct_and_actually_engage() {
         .await
         .expect("get level-9 table")
         .table_id;
-    let level0_bytes = vortex_bytes_under(&fixture.data_path.join(&level0_table_id));
-    let full_bytes = vortex_bytes_under(&fixture.data_path.join(&full_table_id));
+    // Blocking std::fs walk — run on the blocking pool so it can't stall a
+    // tokio worker under contention.
+    let level0_dir = fixture.data_path.join(&level0_table_id);
+    let full_dir = fixture.data_path.join(&full_table_id);
+    let (level0_bytes, full_bytes) = tokio::task::spawn_blocking(move || {
+        (
+            vortex_bytes_under(&level0_dir),
+            vortex_bytes_under(&full_dir),
+        )
+    })
+    .await
+    .expect("size walk task");
     assert!(
         level0_bytes > 0 && full_bytes > 0,
         "both tables must have produced vortex data files \
          (level0={level0_bytes} B, full={full_bytes} B)"
     );
+    // Integer form of `level0 > full * 1.3` (avoids u64→f64 precision lints).
     assert!(
-        level0_bytes as f64 > full_bytes as f64 * 1.3,
+        level0_bytes.saturating_mul(10) > full_bytes.saturating_mul(13),
         "level-0 (uncompressed) files must be substantially larger than \
          full-level files on compressible data — got level0={level0_bytes} B \
          vs full={full_bytes} B. If these are equal, the delta-encoding \

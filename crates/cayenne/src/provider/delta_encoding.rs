@@ -244,9 +244,13 @@ mod tests {
         assert_eq!("AUTO".parse::<DeltaEncoding>(), Ok(DeltaEncoding::Auto));
         assert_eq!("0".parse::<DeltaEncoding>(), Ok(DeltaEncoding::Level(0)));
         assert_eq!("10".parse::<DeltaEncoding>(), Ok(DeltaEncoding::Level(10)));
-        assert!("11".parse::<DeltaEncoding>().is_err());
-        assert!("fast".parse::<DeltaEncoding>().is_err());
-        assert!("-1".parse::<DeltaEncoding>().is_err());
+        "11".parse::<DeltaEncoding>()
+            .expect_err("level 11 must be rejected (max is 10)");
+        "fast"
+            .parse::<DeltaEncoding>()
+            .expect_err("non-numeric, non-auto values must be rejected");
+        "-1".parse::<DeltaEncoding>()
+            .expect_err("negative levels must be rejected");
     }
 
     #[test]

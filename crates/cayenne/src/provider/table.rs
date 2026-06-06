@@ -4478,8 +4478,8 @@ impl CayenneTableProvider {
     /// The intra-write shard configuration this write earns, or `None` for a
     /// single serial writer. Shared by [`Self::write_shard_format`] (default
     /// encoding) and the delta-encoding strategy-override path
-    /// (`CayenneContext::write_format_with_strategy`) so both shard
-    /// identically.
+    /// (`CayenneContext::write_format_with_strategy`) so the two write paths
+    /// produce identically-sharded output formats.
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
