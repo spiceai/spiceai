@@ -2343,34 +2343,6 @@ fn protected_snapshot_size_tier(bytes: u64, base_bytes: u64, growth: u64) -> u32
 /// bounds write amplification to O(log N) per byte (a run is rewritten only
 /// when it levels up), while the `min_runs` threshold bounds read amplification
 /// by keeping at most `min_runs - 1` un-merged runs per tier. The large
-/// Write shape — encoder fan-out cap and size estimate — for the
-/// subset-merge output (see `compact_protected_snapshots_subset`).
-///
-/// Pure so the position-vs-key parallel decision is unit-testable: when
-/// `keeps_positions_serial` (the table carries position-scoped deletes —
-/// either a PK table whose resolved `deletion_mode` is `position`, or a
-/// PK-less table on the legacy `PositionBased` strategy), the merge keeps the
-/// serial single-writer shape `(1, None)`; otherwise it passes the session's
-/// `target_partitions` and the selected tier's total bytes so
-/// `snapshot_shard_count` sizes a parallel encoder fan-out
-/// (`floor(bytes / target_file_size)`, min 1, capped by write concurrency
-/// and the global encode budget).
-///
-/// Note: output FILE COUNT is not a proxy for this decision — a single
-/// serial writer still rolls multiple files when the merged output exceeds
-/// the target file size. This function is the authoritative, testable gate.
-const fn subset_merge_write_shape(
-    keeps_positions_serial: bool,
-    session_target_partitions: usize,
-    total_input_bytes: u64,
-) -> (usize, Option<u64>) {
-    if keeps_positions_serial {
-        (1, None)
-    } else {
-        (session_target_partitions, Some(total_input_bytes))
-    }
-}
-
 /// carried-forward run sits alone in a high tier and is rewritten rarely
 /// instead of on every pass.
 ///
@@ -2413,6 +2385,34 @@ fn select_protected_snapshot_merge_tier(
     }
 
     Vec::new()
+}
+
+/// Write shape — encoder fan-out cap and size estimate — for the
+/// subset-merge output (see `compact_protected_snapshots_subset`).
+///
+/// Pure so the position-vs-key parallel decision is unit-testable: when
+/// `keeps_positions_serial` (the table carries position-scoped deletes —
+/// either a PK table whose resolved `deletion_mode` is `position`, or a
+/// PK-less table on the legacy `PositionBased` strategy), the merge keeps the
+/// serial single-writer shape `(1, None)`; otherwise it passes the session's
+/// `target_partitions` and the selected tier's total bytes so
+/// `snapshot_shard_count` sizes a parallel encoder fan-out
+/// (`floor(bytes / target_file_size)`, min 1, capped by write concurrency
+/// and the global encode budget).
+///
+/// Note: output FILE COUNT is not a proxy for this decision — a single
+/// serial writer still rolls multiple files when the merged output exceeds
+/// the target file size. This function is the authoritative, testable gate.
+const fn subset_merge_write_shape(
+    keeps_positions_serial: bool,
+    session_target_partitions: usize,
+    total_input_bytes: u64,
+) -> (usize, Option<u64>) {
+    if keeps_positions_serial {
+        (1, None)
+    } else {
+        (session_target_partitions, Some(total_input_bytes))
+    }
 }
 
 #[derive(Default)]
@@ -12955,11 +12955,21 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         const TRIGGER: usize = 4;
-        /// Rows per snapshot × ~2 KiB payload ≈ 400 KiB per snapshot; six
-        /// snapshots ≈ 2.4 MiB total — more than two 1 MiB target files, so
-        /// the merge earns >1 encoder shard.
+        /// Rows per snapshot × ~4 KiB payload ≈ 800 KiB raw per snapshot; six
+        /// snapshots ≈ 4.8 MiB raw. The shard gate sizes the fan-out from
+        /// ON-DISK bytes (`list_snapshot_files_with_sizes`), so the payload is
+        /// pseudo-random (near-incompressible — see [`entropy_payload`]) to
+        /// keep on-disk ≈ raw, and the test still does not *assume* a
+        /// compression ratio: it measures the merged inputs' on-disk total
+        /// and asserts it clears two 1 MiB target files before relying on the
+        /// widened path. (A repetitive payload compresses ~6:1 here, leaving
+        /// the gate at one shard — the multi-file output would then come from
+        /// serial file rolling and the test would pass without exercising the
+        /// parallel path at all.)
         const ROWS_PER_SNAPSHOT: i64 = 200;
-        const PAYLOAD_BYTES: usize = 2048;
+        const PAYLOAD_BYTES: usize = 4096;
+        // Mirrors `target_vortex_file_size_mb: 1` in the fixture config.
+        const TARGET_FILE_SIZE_BYTES: u64 = 1024 * 1024;
 
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -13018,7 +13028,7 @@ mod tests {
             let ids: Vec<i64> = (start..start + ROWS_PER_SNAPSHOT).collect();
             let payloads: Vec<String> = ids
                 .iter()
-                .map(|id| format!("{id:08}_{}", "p".repeat(PAYLOAD_BYTES)))
+                .map(|id| format!("{id:08}_{}", entropy_payload(*id, PAYLOAD_BYTES)))
                 .collect();
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -13042,6 +13052,18 @@ mod tests {
             before.len() >= TRIGGER,
             "expected >= {TRIGGER} protected snapshots before compaction"
         );
+        // Record each input snapshot's ON-DISK size before compaction (the
+        // inputs may be cleaned up after the merge). The shard gate sizes the
+        // fan-out from these on-disk bytes, so the engagement precondition
+        // below must be pinned against them — not the raw payload bytes.
+        let mut on_disk_bytes: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::with_capacity(before.len());
+        for id in &before {
+            let dir = std::path::Path::new(&data_dir)
+                .join(&provider.table_metadata.table_id)
+                .join(id);
+            on_disk_bytes.insert(id.clone(), sum_vortex_file_bytes(&dir).await);
+        }
         drop(compaction_setup_guard);
 
         let merged = provider
@@ -13057,6 +13079,26 @@ mod tests {
             .find(|id| !before.contains(*id))
             .expect("the merge must publish a new protected snapshot")
             .clone();
+
+        // Engagement precondition: the snapshots this merge consumed must
+        // exceed two target files ON DISK, or `snapshot_shard_count`
+        // (`floor(bytes / target_file_size)`, min 1) never earns a second
+        // shard and the `shard_files > 1` assertion below tests nothing. If
+        // a future encoding change compresses this fixture below the bar,
+        // fail HERE with the cause instead of as a mysterious single-file
+        // merge.
+        let merged_input_bytes: u64 = before
+            .iter()
+            .filter(|id| !after.contains_key(id.as_str()))
+            .map(|id| on_disk_bytes[id])
+            .sum();
+        assert!(
+            merged_input_bytes > 2 * TARGET_FILE_SIZE_BYTES,
+            "fixture precondition: merged inputs must exceed two 1 MiB target \
+             files on disk to earn >1 encoder shard (got {merged_input_bytes} \
+             bytes) — grow ROWS_PER_SNAPSHOT/PAYLOAD_BYTES or make the \
+             payload less compressible"
+        );
         let snapshot_dir = std::path::Path::new(&data_dir)
             .join(&provider.table_metadata.table_id)
             .join(&new_snapshot);
@@ -13071,10 +13113,18 @@ mod tests {
             "a merge spanning multiple target files must produce multiple \
              output files (got {shard_files})"
         );
+        // Upper bound: at most DEFAULT_WRITE_CONCURRENCY shard writers, each
+        // of which may additionally roll its stream at the target file size —
+        // so the ceiling is shards + (input bytes ÷ target size) roll-overs.
+        // Generous on purpose: it catches pathological per-batch/per-row file
+        // explosion without re-deriving the writer's exact roll math.
+        let max_expected_files = DEFAULT_WRITE_CONCURRENCY
+            + usize::try_from(merged_input_bytes / TARGET_FILE_SIZE_BYTES)
+                .expect("file-count bound fits usize");
         assert!(
-            shard_files <= DEFAULT_WRITE_CONCURRENCY,
-            "output file count must stay bounded by the write concurrency \
-             (got {shard_files} > {DEFAULT_WRITE_CONCURRENCY})"
+            shard_files <= max_expected_files,
+            "output file count must stay bounded by write concurrency plus \
+             target-size roll-overs (got {shard_files} > {max_expected_files})"
         );
 
         // Every row survives the parallel merge — content, not just count:
@@ -13119,6 +13169,50 @@ mod tests {
             }
         }
         shard_files
+    }
+
+    /// Deterministic pseudo-random payload (xorshift64 over a 64-symbol
+    /// alphabet), near-incompressible so on-disk size tracks raw size — the
+    /// subset-merge shard gate reads ON-DISK bytes, and a repetitive payload
+    /// compresses far below the target-file threshold the tests must cross.
+    /// Seeded per row id so payloads are unique and reproducible.
+    fn entropy_payload(seed: i64, len: usize) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        // Bit-preserving i64 -> u64; the splitmix-style multiply spreads
+        // small sequential ids across the state space, `| 1` avoids the
+        // xorshift zero fixed point.
+        let mut state =
+            u64::from_le_bytes(seed.to_le_bytes()).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = String::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            for byte in state.to_le_bytes() {
+                if out.len() >= len {
+                    break;
+                }
+                out.push(char::from(ALPHABET[usize::from(byte & 63)]));
+            }
+        }
+        out
+    }
+
+    /// Sum the on-disk bytes of `.vortex` files in a snapshot directory —
+    /// the same quantity `list_snapshot_files_with_sizes` feeds the shard
+    /// gate as `total_input_bytes`.
+    async fn sum_vortex_file_bytes(snapshot_dir: &std::path::Path) -> u64 {
+        let mut total = 0_u64;
+        let mut entries = tokio::fs::read_dir(snapshot_dir)
+            .await
+            .expect("read snapshot dir");
+        while let Some(entry) = entries.next_entry().await.expect("dir entry") {
+            if entry.path().extension().is_some_and(|ext| ext == "vortex") {
+                total += entry.metadata().await.expect("file metadata").len();
+            }
+        }
+        total
     }
 
     /// Sibling of the parallel-merge engagement test: a PK table left on the
