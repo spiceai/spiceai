@@ -537,6 +537,15 @@ impl SqliteMetastore {
 
     const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
     const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
+    /// Partial index over the unpublished tombstones (Option D). The only other
+    /// `cayenne_inlined_delete` index is `(table_id, sequence_number)`, which a
+    /// `WHERE table_id = ? AND published = 0` predicate cannot seek — it has to
+    /// scan every tombstone for the table. This partial index covers exactly the
+    /// in-flight `published = 0` rows (a tiny set; finalize flips them to 1), so
+    /// `publish_orphan_inlined_deletes`' COUNT/UPDATE seek straight to them. Its
+    /// complement also accelerates the hot read path's
+    /// `WHERE table_id = ? AND published = 1` (`get_published_inlined_deletes`).
+    const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -723,6 +732,7 @@ impl MetastoreBackend for SqliteMetastore {
                 conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
                 conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await

@@ -9850,23 +9850,34 @@ impl CayenneTableProvider {
             return Ok(InlinedDeletionMaps::default());
         }
 
+        // Per-tombstone activation gate (Option D). A tombstone is applied ONLY
+        // when its own durable `published` flag is true — NEVER from a global
+        // watermark or protected-snapshot membership. A staged inline-conflict
+        // upsert writes its tombstone with `published = false`; an inline-cache
+        // rebuild (which a concurrent same-table inline INSERT can trigger)
+        // running before the owning snapshot finalizes therefore does NOT hide
+        // the old inline row, so the PK cannot transiently vanish. The owning
+        // snapshot's finalize flips this to true under the listing fence, before
+        // its replacement rows become discoverable; only the inline checkpoint
+        // clears it.
+        //
+        // The gate is pushed into SQL (`get_published_inlined_deletes` filters
+        // `published = 1`), which is exactly equivalent to the previous in-memory
+        // `if !delete.published { continue; }` skip, and avoids materialising and
+        // shipping the expensive `delete_ipc` blobs of in-flight tombstones only
+        // to discard them here. The in-memory check below is retained as a cheap
+        // belt-and-suspenders assert that the SQL filter held.
         let inlined_deletes = self
             .catalog
-            .get_inlined_deletes(&self.table_metadata.table_id)
+            .get_published_inlined_deletes(&self.table_metadata.table_id)
             .await?;
 
         let mut maps = InlinedDeletionMaps::default();
         for delete in inlined_deletes {
-            // Per-tombstone activation gate (Option D). A tombstone is applied
-            // ONLY when its own durable `published` flag is true — NEVER from a
-            // global watermark or protected-snapshot membership. A staged
-            // inline-conflict upsert writes its tombstone with `published =
-            // false`; an inline-cache rebuild (which a concurrent same-table
-            // inline INSERT can trigger) running before the owning snapshot
-            // finalizes therefore does NOT hide the old inline row, so the PK
-            // cannot transiently vanish. The owning snapshot's finalize flips
-            // this to true under the listing fence, before its replacement rows
-            // become discoverable; only the inline checkpoint clears it.
+            debug_assert!(
+                delete.published,
+                "get_published_inlined_deletes must only return published tombstones"
+            );
             if !delete.published {
                 continue;
             }

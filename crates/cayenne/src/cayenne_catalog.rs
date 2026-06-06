@@ -2253,7 +2253,10 @@ impl MetadataCatalog for CayenneCatalog {
 
     async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64> {
         // Count the unpublished tombstones first (the execute helper returns no
-        // affected-row count); this is a cheap indexed read on (table_id).
+        // affected-row count). The `published = 0` partial index
+        // (`idx_cayenne_inlined_delete_unpublished`) lets both the COUNT and the
+        // UPDATE seek straight to the in-flight rows instead of scanning every
+        // tombstone for the table under the `(table_id, sequence_number)` index.
         let pending: i64 = self
             .metastore
             .query_row_helper(
@@ -2690,6 +2693,43 @@ impl MetadataCatalog for CayenneCatalog {
                     SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at, published
                     FROM cayenne_inlined_delete
                     WHERE table_id = ?1
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDelete {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        delete_ipc: row.get_blob(2)?,
+                        delete_count: row.get_i64(3)?,
+                        sequence_number: row.get_i64(4)?,
+                        created_at: row.get_string(5)?,
+                        published: row.get_bool(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>> {
+        // Hot read path: same shape as `get_inlined_deletes` but pushes the
+        // `published = 1` gate into SQL so unpublished tombstones' expensive
+        // `delete_ipc` blobs are never materialised/shipped only to be skipped in
+        // memory. `published = 1` is exactly the complement of the Rust
+        // `!delete.published` skip, so the no-transient-PK-vanish gate is
+        // preserved. Seeks via the complement of the
+        // `idx_cayenne_inlined_delete_unpublished` partial index.
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at, published
+                    FROM cayenne_inlined_delete
+                    WHERE table_id = ?1 AND published = 1
                     ORDER BY sequence_number
                     ",
                     params: vec![MetastoreValue::Text(table_id.to_string())],

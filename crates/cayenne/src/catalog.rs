@@ -601,6 +601,24 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
 
+    /// Get only the *published* inlined delete entries for a table.
+    ///
+    /// This is the hot read path's variant of [`get_inlined_deletes`]: it pushes
+    /// the `published = 1` predicate into SQL so the expensive `delete_ipc` blobs
+    /// of in-flight (`published = 0`) tombstones are never materialised or
+    /// shipped only to be discarded in memory. The `published = 1` SQL filter is
+    /// exactly equivalent to skipping `!delete.published` rows in Rust, so it
+    /// preserves the per-tombstone activation gate that
+    /// `load_inlined_deletion_maps` relies on for the no-transient-PK-vanish
+    /// invariant — it returns every published tombstone and no unpublished one.
+    ///
+    /// Diagnostic/test callers that must inspect unpublished rows continue to use
+    /// [`get_inlined_deletes`].
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>>;
+
     /// Remove all inlined deletes for a table (called after checkpoint).
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()>;
 
