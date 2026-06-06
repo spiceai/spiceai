@@ -146,9 +146,9 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         .expect("write_deletion_file function not found in delete/vector_io.rs");
 
     // The deletion-vector writer must sync the FileWriter's inner fd
-    // (`inner.sync_data()?`) — this is the cheap path that uses the open fd
-    // we already have. A previous revision additionally re-opened the file
-    // with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
+    // (`ordering_sync_std(&inner)`) — this is the cheap path that uses the
+    // open fd we already have. A previous revision additionally re-opened the
+    // file with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
     // which doubled the per-deletion fsync cost. The reopen must NOT come
     // back without a documented reason.
     //
@@ -173,8 +173,8 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         !body.contains(reopened_fsync_pattern),
         "write_deletion_file must NOT re-open the deletion vector file and \
          fsync it a second time. That reopen+fsync pattern is redundant work \
-         after `inner.sync_all()` on the writer's inner fd and was previously \
-         a per-deletion regression."
+         after `ordering_sync_std(&inner)` on the writer's inner fd and was \
+         previously a per-deletion regression."
     );
 
     // Also assert there is exactly one file-level sync call on the deletion
@@ -192,7 +192,7 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         "write_deletion_file must sync the deletion vector file exactly once \
          (the writer's inner fd, via `ordering_sync_std(&inner)`). Found \
          {file_sync_count} occurrence(s). Parent-directory fsync via \
-         `ordering_sync_std(&dir)` is distinct and not counted here."
+         `ordering_sync_dir_std(&dir)` is distinct and not counted here."
     );
 
     // Tier guard: no full-tier `sync_all` — and no direct `sync_data`, which

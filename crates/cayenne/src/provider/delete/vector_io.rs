@@ -239,8 +239,8 @@ impl<'a> DeletionVectorWriter<'a> {
             };
             if sync_snapshot_parent {
                 let table = self.table.path.clone();
-                // Ordering tier (plain fsync on macOS, fdatasync on Linux) —
-                // see `provider/fsync_tier.rs`.
+                // Directory ordering tier (plain fsync on macOS, full fsync
+                // on other platforms) — see `provider/fsync_tier.rs`.
                 tokio::task::spawn_blocking(move || {
                     let dir = std::fs::File::open(&snapshot_dir)?;
                     crate::provider::fsync_tier::ordering_sync_dir_std(&dir)

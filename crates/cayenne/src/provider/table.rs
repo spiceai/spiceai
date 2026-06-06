@@ -3201,9 +3201,10 @@ impl CayenneTableProvider {
             // from the filesystem even though we later write files into it and
             // commit the catalog to point at it. This is the same requirement
             // we enforce for file creation, renames, and WAL marker removal
-            // elsewhere in the code. Ordering tier (plain fsync on macOS,
-            // fdatasync on Linux — see `fsync_tier`): this runs once per
-            // staged batch, and the full-tier flush bought nothing — see
+            // elsewhere in the code. Directory ordering tier (plain fsync on
+            // macOS, full fsync on other platforms — see
+            // `fsync_tier::ordering_sync_dir_std`): this runs once per staged
+            // batch, and the macOS full-drive-flush tier bought nothing — see
             // `sync_snapshot_dir`.
             if let Some(parent) = parent {
                 tokio::task::spawn_blocking(move || {
@@ -3573,17 +3574,19 @@ impl CayenneTableProvider {
         let snapshot_dir = snapshot_dir.to_path_buf();
         let dir_display = snapshot_dir.display().to_string();
         tokio::task::spawn_blocking(move || {
-            // Open the directory and flush its entries with the ORDERING tier
-            // (`fsync_tier::ordering_sync_std`), not full-tier `sync_all`.
+            // Open the directory and flush its entries with the directory
+            // ORDERING tier (`fsync_tier::ordering_sync_dir_std`), not
+            // full-tier `sync_all`.
             //
             // Durability-tier rationale (matters on macOS): Rust's `sync_all`
             // AND `sync_data` both map to `fcntl(F_FULLFSYNC)` on Apple
             // targets — a full drive-cache flush measured at ~4-5 ms per call
             // — while plain `fsync(2)` is ~66 µs. Plain fsync is the macOS
             // durability tier SQLite (synchronous=NORMAL), DuckDB, and
-            // PostgreSQL all default to. On Linux the helper is `fdatasync`,
-            // which still issues a device flush; dirents are the directory's
-            // data, so they are flushed — behavior is effectively unchanged
+            // PostgreSQL all default to. On non-macOS platforms the directory
+            // helper issues a full `fsync` (dirent flushing under plain
+            // `fdatasync` is implementation-defined; on Linux the two are
+            // equivalent for directories) — behavior is effectively unchanged
             // there.
             //
             // F_FULLFSYNC here would be strictly stronger than the visibility

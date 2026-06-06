@@ -141,8 +141,8 @@ impl PartitionedWal {
                 let table = table_root.display().to_string();
 
                 // Sync the table root so the _partitioned_wal/ subdir entry is
-                // written through (ordering tier: plain fsync on macOS,
-                // fdatasync on Linux — see `provider/fsync_tier.rs`).
+                // written through (directory ordering tier: plain fsync on
+                // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
                 tokio::task::spawn_blocking(move || {
                     let dir = std::fs::File::open(&parent)?;
                     crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
