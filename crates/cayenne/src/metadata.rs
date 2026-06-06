@@ -248,6 +248,87 @@ pub enum CompressionStrategy {
     Zstd,
 }
 
+/// Encoding effort for *delta* writes — fresh CDC/append snapshot files that
+/// the tiered compactor later folds into properly-encoded files.
+///
+/// zstd-style level scale (`cayenne_delta_encoding` param):
+///
+/// - `auto` (default) — size-gated: a write smaller than a quarter of the
+///   target file size encodes at a light level (the file is transient by
+///   definition — compaction exists to fold it); larger writes use the full
+///   default encoding.
+/// - `0` — no compression (canonical arrays; cheapest encode).
+/// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
+///   per-file encoder-strategy search and FSST symbol-table training that
+///   dominate small-write encode cost.
+/// - `7`–`10` — the full default `BtrBlocks` cascade (today's behavior; the
+///   upper levels are reserved for future heavier-effort search).
+///
+/// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
+/// NOT affected by this setting — they always use the full default encoding,
+/// because their output is the long-lived artifact whose encoding quality
+/// pays for scan throughput and storage footprint.
+///
+/// The exact level → scheme-set mapping lives in
+/// `provider::delta_encoding::strategy_builder_for_level`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum DeltaEncoding {
+    /// Size-gated: light for small deltas, full for large writes.
+    #[default]
+    Auto,
+    /// Fixed encoding level `0..=10` applied to every delta write.
+    Level(u8),
+}
+
+/// Maximum supported [`DeltaEncoding`] level.
+pub const DELTA_ENCODING_MAX_LEVEL: u8 = 10;
+
+impl std::fmt::Display for DeltaEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Level(level) => write!(f, "{level}"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeltaEncoding {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let level: u8 = trimmed.parse().map_err(|_| {
+            format!(
+                "invalid delta encoding '{value}': expected 'auto' or a level 0..={DELTA_ENCODING_MAX_LEVEL}"
+            )
+        })?;
+        if level > DELTA_ENCODING_MAX_LEVEL {
+            return Err(format!(
+                "invalid delta encoding level {level}: maximum is {DELTA_ENCODING_MAX_LEVEL}"
+            ));
+        }
+        Ok(Self::Level(level))
+    }
+}
+
+impl TryFrom<String> for DeltaEncoding {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<DeltaEncoding> for String {
+    fn from(value: DeltaEncoding) -> Self {
+        value.to_string()
+    }
+}
+
 /// Primary-key conflict detection behavior for Cayenne inserts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -391,6 +472,13 @@ pub struct VortexConfig {
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
+    /// Encoding effort for delta writes (fresh CDC/append snapshot files).
+    /// `auto` (default) size-gates: small deltas encode light and are folded
+    /// into properly-encoded files by compaction; explicit `0..=10` pins the
+    /// level. Maintenance writes (compaction, rewrites) always use the full
+    /// default encoding. See [`DeltaEncoding`].
+    #[serde(default)]
+    pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
     /// Each file uses multipart uploads internally via `object_store`.
     /// Defaults to the available CPU parallelism.
@@ -638,6 +726,7 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
+            delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),

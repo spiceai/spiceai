@@ -21,10 +21,11 @@ use std::sync::Arc;
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
+use vortex::file::WriteStrategyBuilder;
+use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
 use vortex_session::VortexSession;
 
-use crate::metadata::{DeletionMode, PkConflictDetection, VortexConfig};
+use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -43,6 +44,10 @@ pub struct CayenneContext {
     vortex_format: Arc<VortexFormat>,
     /// Configuration for encoding, compression, and file sizing.
     config: VortexConfig,
+    /// Dataset label the formats are tagged with (metrics attribution).
+    /// Retained so per-write format variants (e.g. delta-encoding strategy
+    /// overrides) carry the same label as the shared base format.
+    dataset: String,
     /// Session configuration for `DataFusion` listing options.
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
@@ -79,10 +84,43 @@ impl CayenneContext {
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
+            dataset: dataset.to_string(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
         })
+    }
+
+    /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
+    #[must_use]
+    pub fn delta_encoding(&self) -> DeltaEncoding {
+        self.config.delta_encoding
+    }
+
+    /// Build a write-only `VortexFormat` whose session carries a
+    /// [`WriteStrategyBuilder`] override — used by light delta-encoding levels
+    /// (see `provider::delta_encoding`). The format mirrors the shared base
+    /// format's table options and dataset label; `shard` optionally enables
+    /// intra-write sharding exactly like
+    /// `CayenneTableProvider::write_shard_format` does on the default path.
+    ///
+    /// Scans never observe these formats: the scan path keeps using
+    /// [`Self::file_format`], so the strategy override affects only the files
+    /// this write produces.
+    #[must_use]
+    pub(crate) fn write_format_with_strategy(
+        &self,
+        strategy: WriteStrategyBuilder,
+        shard: Option<WriteShardConfig>,
+    ) -> Arc<VortexFormat> {
+        let session = VortexSession::default().set(strategy);
+        let format = VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
+            .with_dataset_label(self.dataset.as_str());
+        let format = match shard {
+            Some(config) => format.with_write_shard(config),
+            None => format,
+        };
+        Arc::new(format)
     }
 
     /// Get the Vortex file format for creating listing tables.
@@ -268,12 +306,22 @@ impl CayenneContext {
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings
-        // Note: Write strategy configuration (e.g., compression) is applied at write time via
-        // `session.write_options().with_strategy(...)`, not at the VortexFormat level
+        // Create a Vortex session with default encodings. The session's
+        // default write strategy is the full BtrBlocks cascade; light
+        // delta-encoding levels override it per write via
+        // `write_format_with_strategy` (see `provider::delta_encoding`).
         let vortex_session = VortexSession::default();
 
-        // Configure VortexFormat.
+        Arc::new(
+            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
+                .with_dataset_label(dataset),
+        )
+    }
+
+    /// Table options shared by the base format and any per-write format
+    /// variants (delta-encoding strategy overrides) so write-only formats
+    /// behave identically apart from the encoding strategy.
+    fn vortex_table_options(config: &VortexConfig) -> VortexTableOptions {
         let segment_cache_size_bytes =
             config
                 .segment_cache_mb
@@ -286,16 +334,12 @@ impl CayenneContext {
                     None
                 });
 
-        let vortex_opts = VortexTableOptions {
+        VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
-        };
-
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, vortex_opts).with_dataset_label(dataset),
-        )
+        }
     }
 }
 

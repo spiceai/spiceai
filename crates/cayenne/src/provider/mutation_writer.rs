@@ -671,6 +671,7 @@ impl<'a> AppendMutationWriter<'a> {
                 // prior full-fan-out behavior. (Reached only when a write carries
                 // pending PK deletes or on-conflict upserts.)
                 None,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -848,6 +849,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {
@@ -906,6 +908,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {
