@@ -524,4 +524,40 @@ mod tests {
         let expected = "array_distance([0.1, 0.2]::FLOAT[2], [0.3, 0.4]::FLOAT[2])";
         assert_eq!(result.to_string(), expected);
     }
+
+    #[test]
+    fn test_rand_to_random() {
+        // `rand` is a deny-listed Spice function that the federation deny-list
+        // nonetheless lets push down to DuckDB *because* this dialect rewrites it
+        // into DuckDB's native `random()`. This test backs that pushdown claim:
+        // if the rewrite ever broke, pushing `rand` to DuckDB would emit invalid
+        // SQL.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let result = rand_to_random(&unparser, &[])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(result.to_string(), "random()");
+    }
+
+    #[test]
+    fn duckdb_native_function_names_advertises_denylisted_pushables() {
+        // The federation deny-list relies on these names to let `cosine_distance`
+        // and `rand` push down to DuckDB, so the dialect must advertise them.
+        let names = crate::dialect::duckdb_native_function_names();
+        assert!(
+            names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
+            "duckdb_native_function_names() missing cosine_distance; got {names:?}"
+        );
+        assert!(
+            names.contains(&"rand"),
+            "duckdb_native_function_names() missing rand; got {names:?}"
+        );
+        // Derived from the same override list, so they cannot drift.
+        assert_eq!(
+            names.len(),
+            crate::dialect::duckdb_scalar_overrides().len(),
+            "name list and scalar-override list must have the same length"
+        );
+    }
 }

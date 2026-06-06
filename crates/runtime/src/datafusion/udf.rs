@@ -1132,11 +1132,13 @@ mod tests {
     }
 
     #[test]
-    fn default_deny_list_denies_dialect_native_functions() {
-        // With no backend carve-out the generic deny-list blocks everything,
-        // including functions a specific dialect could push down.
+    fn default_deny_list_denies_every_builtin() {
+        // Exhaustive "cannot push down" coverage: with no backend carve-out, the
+        // generic deny-list must block EVERY Spice-specific built-in (including
+        // functions a specific dialect could otherwise push down, e.g.
+        // cosine_distance / rand).
         let support = deny_spice_specific_functions();
-        for name in [COSINE_DISTANCE_UDF_NAME, "rand"] {
+        for name in BUILTIN_DENIED_SPICE_FUNCTION_NAMES.iter() {
             assert!(
                 !support.supports(&make_named_expr(name)),
                 "{name} must be denied by the default (backend-agnostic) deny-list"
@@ -1177,5 +1179,25 @@ mod tests {
                 "{denied}: DuckDB allow-state must match dialect native support"
             );
         }
+    }
+
+    #[test]
+    fn duckdb_pushable_set_is_exactly_cosine_distance_and_rand() {
+        // Pin the exact set of deny-listed Spice functions that CAN be pushed
+        // down to DuckDB. Everything else in the deny-list CANNOT. This makes the
+        // can/can't partition explicit: if a dialect change makes another Spice
+        // function pushable (or stops one), this test must be updated on purpose.
+        use std::collections::BTreeSet;
+        let support = deny_spice_functions_for_duckdb();
+        let pushable: BTreeSet<&str> = BUILTIN_DENIED_SPICE_FUNCTION_NAMES
+            .iter()
+            .filter(|name| support.supports(&make_named_expr(name)))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            pushable,
+            BTreeSet::from([COSINE_DISTANCE_UDF_NAME, "rand"]),
+            "unexpected change to the set of Spice functions pushable to DuckDB"
+        );
     }
 }
