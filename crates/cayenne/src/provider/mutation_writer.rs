@@ -259,11 +259,21 @@ impl<'a> AppendMutationWriter<'a> {
         // configured tables — the bg scheduler picks up the retention request
         // after publish (see `CayenneCdcWrite::finish`).
         //
-        // On-conflict upserts can stage even when the table holds inlined data:
-        // the staged on-conflict commit now represents an inline deletion as a
-        // small inline TOMBSTONE (`add_inlined_delete`) rather than rewriting the
-        // inline corpus, which IS stageable. Whether a given batch replaces inlined
-        // rows is only known after validation, so we stage optimistically.
+        // On-conflict upserts always *attempt* to stage: the Vortex files are
+        // written into a staging snapshot and whether a batch actually replaces
+        // inlined rows is only known after validation, so we stage optimistically.
+        // A batch that turns out to replace inlined rows still cannot be PUBLISHED
+        // from the background — the staged inline tombstone could be read by a
+        // concurrent inline-cache rebuild before the backgrounded publish makes the
+        // replacement rows visible (a transient vanish). Such a batch therefore
+        // takes a synchronous publish fallback (`cdc_path_inline_fallback` below;
+        // `prepare_on_conflict_deletions_for_staged_snapshot` rejects inline-bearing
+        // batches as defense-in-depth). What changed is the COST of that fallback,
+        // not its synchronicity: `apply_on_conflict_deletions` now hides the prior
+        // inline copy with a small inline TOMBSTONE (`add_inlined_delete`, Lever C)
+        // instead of rewriting the inline corpus, so the fallback is O(deleted keys)
+        // rather than O(corpus) — but it still publishes synchronously, reusing the
+        // already-staged files.
         //
         // A table that already holds pending PK deletions (`pending_pk_deletions`)
         // no longer forces the blocking synchronous path. Such a batch stages into
