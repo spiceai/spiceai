@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
 use duckdb::Connection;
 use tokio::runtime::Runtime;
 
@@ -59,6 +59,18 @@ const TABLE_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 /// `vs_duckdb_scaling`'s WRITE_BATCH_ROWS so the N=1 lane of this bench is
 /// directly comparable to that bench's concurrency=1 CDC lane.
 const WRITE_BATCH_ROWS: usize = 1_024;
+
+/// Batches pre-written into every table (both engines) before its lane is
+/// timed. A fresh table's per-batch cost is not stationary — snapshots and
+/// metadata accumulate as batches land, so lanes with cheaper iterations
+/// would silently run MORE iterations and age their tables further than
+/// expensive lanes, corrupting the cross-N comparison (a first cut of this
+/// bench produced a non-monotonic garbage curve exactly this way). The
+/// preload parks every table well past the steep start of that cost curve
+/// so marginal aging during the (bounded, flat-sampled) measurement is
+/// small and comparable across lanes. Preload ids are negative so timed
+/// writes (cursor 0..) never overlap them.
+const PRELOAD_BATCHES: usize = 64;
 
 /// Per-completion wait bound: a stalled writer surfaces as a labeled panic
 /// instead of a hung bench (same rationale as `vs_duckdb_scaling`).
@@ -126,7 +138,13 @@ impl DuckDbTableWriter {
 fn bench_cdc_multitable(c: &mut Criterion) {
     let rt = Runtime::new().expect("runtime");
     let mut group = c.benchmark_group("vs_duckdb_cdc_multitable");
+    // Flat sampling + bounded measurement: every sample runs the same
+    // iteration count and the lane stops aging its tables after a few
+    // hundred batches — see PRELOAD_BATCHES for why this matters.
+    group.sampling_mode(SamplingMode::Flat);
     group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(4));
 
     for &lane in CAYENNE_LANES {
         let lane_label = format!("{}_cdc", lane.lane());
@@ -144,6 +162,23 @@ fn bench_cdc_multitable(c: &mut Criterion) {
                     )))
                 })
                 .collect();
+
+            // Preload: park every table past the steep start of the
+            // per-batch cost curve (negative id range; timed writes use
+            // cursor 0.. and never overlap).
+            rt.block_on(async {
+                let preload_ctx = datafusion::prelude::SessionContext::new();
+                let task_ctx = preload_ctx.task_ctx();
+                let preload_start = -((PRELOAD_BATCHES * WRITE_BATCH_ROWS) as i64);
+                for fixture in &fixtures {
+                    for batch_idx in 0..PRELOAD_BATCHES {
+                        let start = preload_start + (batch_idx * WRITE_BATCH_ROWS) as i64;
+                        let batch = make_batch(schema(), start, WRITE_BATCH_ROWS);
+                        let rows = cayenne_cdc_write(&fixture.table, &task_ctx, batch).await;
+                        assert!(rows > 0, "preload cdc write acknowledged zero rows");
+                    }
+                }
+            });
 
             let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let mut go_txs: Vec<tokio::sync::mpsc::UnboundedSender<()>> =
@@ -216,6 +251,19 @@ fn bench_cdc_multitable(c: &mut Criterion) {
                      value BIGINT NOT NULL);"
                 ))
                 .expect("duckdb create table");
+        }
+
+        // Preload to the same per-table batch count as the Cayenne lanes.
+        {
+            let preload_start = -((PRELOAD_BATCHES * WRITE_BATCH_ROWS) as i64);
+            for i in 0..tables {
+                let table_name = format!("cdc_multi_{i}");
+                for batch_idx in 0..PRELOAD_BATCHES {
+                    let start = preload_start + (batch_idx * WRITE_BATCH_ROWS) as i64;
+                    let batch = make_batch(schema(), start, WRITE_BATCH_ROWS);
+                    duckdb_insert_rows(&fixture.conn, &table_name, &batch);
+                }
+            }
         }
 
         let (done_tx, done_rx) = mpsc::channel::<()>();

@@ -41,6 +41,12 @@
 //! operator's budget — the known "ingest caches sized off total RAM" class
 //! of findings. For process-level peak RSS, wrap the bench invocation in
 //! `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux).
+//!
+//! READING THE NUMBERS: budgets run sequentially (256MiB → 2GiB → 16GiB), so
+//! slow systemic drift (thermal, page cache) accumulates toward the later
+//! budgets — compare ENGINES WITHIN a budget, not one engine across budgets.
+//! The high-water lines are order-robust; the wall-clock lanes are the
+//! within-budget pairing.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::cast_possible_wrap)]

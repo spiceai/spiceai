@@ -18,7 +18,9 @@
 //! Lane shape (RAII background worker, foreground timed scans — the
 //! `vs_duckdb_concurrent` pattern):
 //!
-//! - **Cayenne**: the fixture pins `inline_max_rows: 0` and a small
+//! - **Cayenne**: a PK upsert fixture (protected snapshots — the
+//!   compactor's input — are a conflict-resolution construct; an append-only
+//!   table never produces any) pinning `inline_max_rows: 0` and a small
 //!   compaction trigger so every insert lands as a protected snapshot. The
 //!   background task loops: append a burst (creates a fresh snapshot), then
 //!   drive `compact_protected_snapshots_subset(usize::MAX)` — the same
@@ -53,7 +55,10 @@ use tokio::runtime::Runtime;
 use common::{
     CAYENNE_LANES, CayenneFixture, DuckDbFixture, Metastore, cayenne_insert, cayenne_query,
     duckdb_insert_parquet, duckdb_insert_rows, duckdb_query_scalar, make_batch, schema,
-    setup_cayenne_custom, setup_duckdb, write_parquet,
+    setup_cayenne_custom, setup_duckdb_pk, write_parquet,
+};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, on_conflict::OnConflict,
 };
 
 /// Total preloaded rows, written as PRELOAD_SNAPSHOTS separate inserts so the
@@ -84,11 +89,18 @@ async fn load_cayenne(lane: Metastore) -> CayenneFixture {
         compaction_background_interval_ms: 3_600_000,
         ..cayenne::metadata::VortexConfig::default()
     };
+    // PK + upsert table: protected snapshots — the compactor's input — are
+    // a conflict-resolution construct, so a plain append-only table never
+    // produces any and `compact_protected_snapshots_subset` is a no-op
+    // (the validity gate below caught exactly that on a non-PK draft of
+    // this bench: merges = 0).
     let fixture = setup_cayenne_custom(
         "compaction_bench",
         lane,
-        vec![],
-        None,
+        vec!["id".to_string()],
+        Some(OnConflict::Upsert(ColumnReference::new(vec![
+            "id".to_string(),
+        ]))),
         schema(),
         vortex_config,
         Arc::new(RuntimeEnv::default()),
@@ -251,7 +263,8 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
         );
     }
 
-    let duckdb_fixture = setup_duckdb("compaction_bench");
+    // PK table for parity with the Cayenne upsert fixture.
+    let duckdb_fixture = setup_duckdb_pk("compaction_bench");
     duckdb_insert_parquet(&duckdb_fixture.conn, "compaction_bench", &parquet_path);
     let bg = DuckDbBgCheckpointer::spawn(&duckdb_fixture);
     group.bench_function(BenchmarkId::new("duckdb", "scan_under_compaction"), |b| {
