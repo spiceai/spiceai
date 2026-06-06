@@ -1,9 +1,10 @@
 tests:
   htap:
-    spicepod_path: accelerated/postgres-cayenne[file]-cdc-tuned.yaml
+    spicepod_path: accelerated/postgres-cayenne[file]-cdc-tuned-sf1000.yaml
     runner_type: spiceai-dev-xlarge-runners
     scale_factor: 1000
     terminals: 100
     duration: 600
     ready_wait: 600
-    rate: 5000
+    # Target 10,000 OLTP txns/s ~= 10,000 CDC changes/s for the m7a (64-core/256 GiB) SF-1000 venue.
+    rate: 10000
