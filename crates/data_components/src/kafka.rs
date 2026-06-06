@@ -713,18 +713,12 @@ impl KafkaConsumer {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let watermarks =
-                temp_consumer
-                    .consumer
-                    .fetch_watermarks(topic, partition_id, remaining);
-
-            let (low, high) = match watermarks {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::debug!("Failed to fetch watermarks for partition {partition_id}: {e}");
-                    continue;
-                }
-            };
+            let (low, high) = temp_consumer
+                .consumer
+                .fetch_watermarks(topic, partition_id, remaining)
+                .context(UnableToRestartTopicSnafu {
+                    message: format!("Failed to fetch watermarks for partition {partition_id}"),
+                })?;
 
             if high <= low {
                 continue; // Empty partition
@@ -745,18 +739,18 @@ impl KafkaConsumer {
 
                 // Assign consumer to the start of the current window.
                 let mut tpl = rdkafka::TopicPartitionList::new();
-                if let Err(e) =
-                    tpl.add_partition_offset(topic, partition_id, Offset::Offset(window_start))
-                {
-                    tracing::debug!(
-                        "Failed to configure partition offset for partition {partition_id}: {e}"
-                    );
-                    break;
-                }
-                if let Err(e) = temp_consumer.consumer.assign(&tpl) {
-                    tracing::debug!("Failed to assign partition {partition_id}: {e}");
-                    break;
-                }
+                tpl.add_partition_offset(topic, partition_id, Offset::Offset(window_start))
+                    .context(UnableToRestartTopicSnafu {
+                        message: format!(
+                            "Failed to configure partition offset for partition {partition_id}"
+                        ),
+                    })?;
+                temp_consumer
+                    .consumer
+                    .assign(&tpl)
+                    .context(UnableToRestartTopicSnafu {
+                        message: format!("Failed to assign partition {partition_id}"),
+                    })?;
 
                 // Collect a burst of messages from the window in one fetch.
                 // The first `next()` triggers a network round-trip; subsequent
@@ -786,10 +780,7 @@ impl KafkaConsumer {
                             burst.push(msg);
                         }
                         Ok(Some(Err(e))) => {
-                            tracing::debug!(
-                                "Error receiving message from partition {partition_id}: {e}"
-                            );
-                            break;
+                            return Err(Error::UnableToReceiveMessage { source: e });
                         }
                         Ok(None) => break,
                         Err(_) => break,
@@ -812,12 +803,7 @@ impl KafkaConsumer {
                         Some(key_bytes) => match serde_json::from_slice(key_bytes) {
                             Ok(k) => Some(k),
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to deserialize key for partition {partition_id} at offset {}: {e}",
-                                    msg.offset()
-                                );
-                                found_in_partition = true;
-                                break;
+                                return Err(Error::UnableToDeserializeJsonMessage { source: e });
                             }
                         },
                         None => None,
@@ -826,12 +812,7 @@ impl KafkaConsumer {
                     let value = match serde_json::from_slice(payload) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(
-                                "Failed to deserialize value for partition {partition_id} at offset {}: {e}",
-                                msg.offset()
-                            );
-                            found_in_partition = true;
-                            break;
+                            return Err(Error::UnableToDeserializeJsonMessage { source: e });
                         }
                     };
 
