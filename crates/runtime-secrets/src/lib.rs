@@ -83,24 +83,14 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Secret store types this binary was compiled with. Must match the cases in
-/// `spicepod_secret_store_type` so unknown-store errors don't lie about what's
-/// available in the current build (e.g. `keyring` is only present with the
+/// Secret store types this binary was compiled with, derived from
+/// `store_registry` — the single source of truth for per-store metadata —
+/// so unknown-store errors can't drift from what's actually available in the
+/// current build (e.g. `keyring` is only present with the
 /// `keyring-secret-store` feature).
 #[must_use]
 pub fn known_secret_stores() -> Vec<&'static str> {
-    let mut stores = vec!["env"];
-    #[cfg(feature = "keyring-secret-store")]
-    stores.push("keyring");
-    stores.push("kubernetes");
-    #[cfg(feature = "aws-secrets-manager")]
-    stores.push("aws_secrets_manager");
-    #[cfg(feature = "azure-keyvault")]
-    stores.push("azure_keyvault");
-    #[cfg(feature = "hashicorp_vault")]
-    stores.push("hashicorp_vault");
-    stores.push("scheduler_rpc");
-    stores
+    store_registry().iter().map(|r| r.name).collect()
 }
 
 pub const SECRETS: &str = "secrets";
@@ -449,7 +439,11 @@ pub fn extract_secret_references(content: &str) -> std::collections::HashMap<Str
     references
 }
 
-pub enum SecretStoreType {
+/// Typed hand-off between configuration validation
+/// (`spicepod_secret_store_type`) and store construction
+/// (`load_secret_store`). Internal: external callers interact with stores
+/// only through [`Secrets`].
+enum SecretStoreType {
     Env(stores::env::EnvConfig),
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
@@ -461,6 +455,139 @@ pub enum SecretStoreType {
     #[cfg(feature = "hashicorp_vault")]
     HashicorpVault(stores::hashicorp_vault::HashicorpVaultConfig),
     SchedulerRPC,
+}
+
+/// Whether a store's `from: <name>[:<selector>]` requires or forbids the
+/// selector segment.
+enum SelectorPolicy {
+    /// `from: <name>:<selector>` — the selector names the secret, vault, or
+    /// path the store serves.
+    Required,
+    /// `from: <name>` — a selector is invalid.
+    Forbidden,
+}
+
+/// Everything the crate knows about one secret store type, in one place: the
+/// spicepod-facing name, the selector shape, the `params:` it accepts, and
+/// how to turn validated configuration into a [`SecretStoreType`].
+///
+/// [`known_secret_stores`] and `spicepod_secret_store_type` are both derived
+/// from this table. Previously that knowledge was spread across three
+/// hand-maintained sites (the name list and two per-store `match`es) that
+/// had to agree by discipline alone; adding a store now means one registry
+/// entry, one [`SecretStoreType`] variant, and one (compiler-enforced,
+/// exhaustively matched) `load_secret_store` arm.
+struct SecretStoreRegistration {
+    name: &'static str,
+    selector: SelectorPolicy,
+    /// `params:` accepted by this store, validated before `configure` runs.
+    /// `None` skips validation entirely (`scheduler_rpc`, whose params have
+    /// historically been ignored rather than rejected).
+    parameters: Option<&'static [ParameterSpec]>,
+    /// Builds the typed config from the policy-checked selector and the
+    /// validated params. The selector is `Some` iff the policy is
+    /// [`SelectorPolicy::Required`].
+    configure: fn(Option<String>, &HashMap<String, String>) -> Result<SecretStoreType>,
+}
+
+/// The secret store registry: one entry per store type compiled into this
+/// binary. Entry order defines the order reported by
+/// [`known_secret_stores`].
+fn store_registry() -> &'static [SecretStoreRegistration] {
+    static REGISTRY: std::sync::OnceLock<Vec<SecretStoreRegistration>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = vec![SecretStoreRegistration {
+            name: "env",
+            selector: SelectorPolicy::Forbidden,
+            parameters: Some(stores::env::PARAMETERS),
+            configure: |_, params| {
+                Ok(SecretStoreType::Env(stores::env::EnvConfig::from_params(
+                    params,
+                )))
+            },
+        }];
+        #[cfg(feature = "keyring-secret-store")]
+        registry.push(SecretStoreRegistration {
+            name: "keyring",
+            selector: SelectorPolicy::Forbidden,
+            parameters: Some(stores::keyring::PARAMETERS),
+            configure: |_, _| Ok(SecretStoreType::Keyring),
+        });
+        registry.push(SecretStoreRegistration {
+            name: "kubernetes",
+            selector: SelectorPolicy::Required,
+            parameters: Some(stores::kubernetes::PARAMETERS),
+            configure: |selector, params| {
+                let secret_name = required_selector("kubernetes", selector)?;
+                Ok(SecretStoreType::Kubernetes(
+                    stores::kubernetes::KubernetesConfig::from_params(secret_name, params),
+                ))
+            },
+        });
+        #[cfg(feature = "aws-secrets-manager")]
+        registry.push(SecretStoreRegistration {
+            name: "aws_secrets_manager",
+            selector: SelectorPolicy::Required,
+            parameters: Some(stores::aws_secrets_manager::PARAMETERS),
+            configure: |selector, params| {
+                let secret_name = required_selector("aws_secrets_manager", selector)?;
+                Ok(SecretStoreType::AwsSecretsManager(
+                    stores::aws_secrets_manager::AwsSecretsManagerConfig::from_params(
+                        secret_name,
+                        params,
+                    ),
+                ))
+            },
+        });
+        #[cfg(feature = "azure-keyvault")]
+        registry.push(SecretStoreRegistration {
+            name: "azure_keyvault",
+            selector: SelectorPolicy::Required,
+            parameters: Some(stores::azure_keyvault::PARAMETERS),
+            configure: |selector, params| {
+                let vault = required_selector("azure_keyvault", selector)?;
+                Ok(SecretStoreType::AzureKeyVault(
+                    stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, params),
+                ))
+            },
+        });
+        #[cfg(feature = "hashicorp_vault")]
+        registry.push(SecretStoreRegistration {
+            name: "hashicorp_vault",
+            selector: SelectorPolicy::Required,
+            parameters: Some(stores::hashicorp_vault::PARAMETERS),
+            configure: |selector, params| {
+                let path = required_selector("hashicorp_vault", selector)?;
+                let cfg = stores::hashicorp_vault::HashicorpVaultConfig::from_params(path, params)
+                    .map_err(|e| Error::UnableToInitializeHashicorpVault {
+                        source: Box::new(e),
+                    })?;
+                Ok(SecretStoreType::HashicorpVault(cfg))
+            },
+        });
+        registry.push(SecretStoreRegistration {
+            name: "scheduler_rpc",
+            selector: SelectorPolicy::Forbidden,
+            parameters: None,
+            configure: |_, _| Ok(SecretStoreType::SchedulerRPC),
+        });
+        registry
+    })
+}
+
+/// Unwraps the selector for a [`SelectorPolicy::Required`] store. The
+/// pipeline guarantees `Some`; the error branch keeps `configure` callbacks
+/// total without panicking.
+fn required_selector(store: &str, selector: Option<String>) -> Result<String> {
+    selector.map_or_else(
+        || {
+            SecretStoreRequiresSecretSelectorSnafu {
+                store: store.to_string(),
+            }
+            .fail()
+        },
+        Ok,
+    )
 }
 
 #[expect(clippy::implicit_hasher)]
@@ -506,76 +633,39 @@ async fn spicepod_secret_store_type(
             source: Box::new(source),
         })?;
 
+    // Shared pipeline driven by the store registry: lookup → selector policy
+    // → param validation → typed config. Per-store knowledge lives in the
+    // registry entries, not here.
+    let Some(registration) = store_registry().iter().find(|r| r.name == provider) else {
+        return UnknownSecretStoreSnafu {
+            store: provider.to_string(),
+        }
+        .fail();
+    };
+
+    // Selector errors take precedence over param errors, matching the
+    // per-store check order this pipeline replaced.
+    let selector = match registration.selector {
+        SelectorPolicy::Required => Some(require_selector(provider, selector)?),
+        SelectorPolicy::Forbidden => {
+            require_no_selector(provider, selector)?;
+            None
+        }
+    };
+
     // Validates user-provided params against the store's static
     // `ParameterSpec` list. Unknown params return an error rather than being
     // silently dropped.
-    let validate = |spec: &'static [ParameterSpec]| {
-        validate_params(provider, user_params.clone(), spec).map_err(|source| {
+    let params = match registration.parameters {
+        Some(spec) => validate_params(provider, user_params, spec).map_err(|source| {
             Error::InvalidSecretStoreParams {
                 source: Box::new(source),
             }
-        })
+        })?,
+        None => user_params,
     };
 
-    match provider {
-        "env" => {
-            require_no_selector(provider, selector)?;
-            let params = validate(stores::env::PARAMETERS)?;
-            Ok(SecretStoreType::Env(stores::env::EnvConfig::from_params(
-                &params,
-            )))
-        }
-        #[cfg(feature = "keyring-secret-store")]
-        "keyring" => {
-            require_no_selector(provider, selector)?;
-            let _ = validate(stores::keyring::PARAMETERS)?;
-            Ok(SecretStoreType::Keyring)
-        }
-        "kubernetes" => {
-            let secret_name = require_selector(provider, selector)?;
-            let params = validate(stores::kubernetes::PARAMETERS)?;
-            Ok(SecretStoreType::Kubernetes(
-                stores::kubernetes::KubernetesConfig::from_params(secret_name, &params),
-            ))
-        }
-        #[cfg(feature = "aws-secrets-manager")]
-        "aws_secrets_manager" => {
-            let secret_name = require_selector(provider, selector)?;
-            let params = validate(stores::aws_secrets_manager::PARAMETERS)?;
-            Ok(SecretStoreType::AwsSecretsManager(
-                stores::aws_secrets_manager::AwsSecretsManagerConfig::from_params(
-                    secret_name,
-                    &params,
-                ),
-            ))
-        }
-        #[cfg(feature = "azure-keyvault")]
-        "azure_keyvault" => {
-            let vault = require_selector(provider, selector)?;
-            let params = validate(stores::azure_keyvault::PARAMETERS)?;
-            Ok(SecretStoreType::AzureKeyVault(
-                stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, &params),
-            ))
-        }
-        #[cfg(feature = "hashicorp_vault")]
-        "hashicorp_vault" => {
-            let path = require_selector(provider, selector)?;
-            let params = validate(stores::hashicorp_vault::PARAMETERS)?;
-            let cfg = stores::hashicorp_vault::HashicorpVaultConfig::from_params(path, &params)
-                .map_err(|e| Error::UnableToInitializeHashicorpVault {
-                    source: Box::new(e),
-                })?;
-            Ok(SecretStoreType::HashicorpVault(cfg))
-        }
-        "scheduler_rpc" => {
-            require_no_selector(provider, selector)?;
-            Ok(SecretStoreType::SchedulerRPC)
-        }
-        other => UnknownSecretStoreSnafu {
-            store: other.to_string(),
-        }
-        .fail(),
-    }
+    (registration.configure)(selector, &params)
 }
 
 fn require_selector(provider: &str, selector: Option<&str>) -> Result<String> {

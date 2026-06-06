@@ -58,14 +58,19 @@ limitations under the License.
 //! Pure CPU shape — no metastore, no Cayenne setup. Models the
 //! per-upsert decode + double-filter cost under both shapes.
 //!
-//! Two lanes per inline data size:
+//! Three lanes per inline data size:
 //!
 //! - `decode_and_filter_per_upsert_baseline/<rows>` — mirrors the older
 //!   `build_inlined_data_rewrite_for_pk_keys`: deserialize the IPC payload,
-//!   build a deletion-mask, and apply a PK-set filter.
-//! - `cached_filter_per_upsert/<rows>` — current behavior: start from
+//!   build a deletion-mask, and apply a PK-set filter. Linear in `rows`.
+//! - `cached_filter_per_upsert/<rows>` — interim behavior: start from
 //!   pre-decoded `Vec<RecordBatch>` (reusing the scan cache), apply only
-//!   the new PK filter.
+//!   the new PK filter. Still touches the whole corpus.
+//! - `tombstone_per_upsert/<rows>` — the NEW inline-tombstone deletion path
+//!   (`add_inlined_tombstone`): serialize ONLY the batch's delete keys into the
+//!   tombstone IPC blob, never reading the corpus. O(deleted keys), so it stays
+//!   ~flat as `rows` grows — the headroom the tombstone fix delivers over the
+//!   linear baseline.
 //!
 //! Inline sizes mirror `inline_memtable_read_overhead`:
 //!
@@ -88,7 +93,7 @@ use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
@@ -108,6 +113,14 @@ const INLINE_ROW_COUNTS: &[usize] = &[64, 4_096, 32_768];
 /// linear in this fraction, but the IPC decode is paid in full
 /// regardless.
 const UPSERT_HIT_FRACTION: f64 = 0.10;
+
+/// Number of PKs an individual upsert batch re-keys (and therefore tombstones).
+/// The inline-tombstone path is O(deleted keys) in the SIZE OF THIS BATCH, NOT in
+/// the inline corpus, so this is deliberately fixed and small (a handful of
+/// conflicting PKs per coalesced burst). Holding it constant while `rows` (the
+/// corpus) grows is what makes the tombstone arm flat versus the linear
+/// `decode_and_filter_per_upsert_baseline`.
+const TOMBSTONE_KEYS_PER_UPSERT: usize = 16;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -208,6 +221,33 @@ fn cached_filter_per_upsert(cached: &Arc<Vec<RecordBatch>>, deleted: &HashSet<i6
     total_rows
 }
 
+/// The big-endian i64 delete-key encoding the on-conflict tombstone path uses for
+/// `Int64Pk` tables (mirrors `build_pk_deletion_row_keys` + `row_key_to_i64`).
+fn tombstone_keys(count: usize) -> Vec<Box<[u8]>> {
+    (0..count as i64)
+        .map(|pk| pk.to_be_bytes().to_vec().into_boxed_slice())
+        .collect()
+}
+
+/// Lane C: the NEW inline-tombstone deletion path. Per upsert it serializes ONLY
+/// the batch's delete keys into the single-column `BinaryArray` (`row_key`) IPC
+/// blob that `add_inlined_tombstone` writes (mirrors `serialize_delete_keys_to_ipc`,
+/// `table.rs`). Crucially it NEVER reads or decodes the inline corpus, so its cost
+/// is O(deleted keys) and independent of `rows` — the headroom the tombstone fix
+/// delivers over the linear `decode_and_filter_per_upsert_baseline`.
+fn tombstone_per_upsert(keys: &[Box<[u8]>]) -> usize {
+    let array = BinaryArray::from_iter_values(keys.iter().map(std::convert::AsRef::as_ref));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "row_key",
+        DataType::Binary,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("tombstone batch");
+    let blob = serialize_ipc(&batch);
+    black_box(&blob);
+    blob.len()
+}
+
 fn bench_inline_upsert_rewrite(c: &mut Criterion) {
     let mut group = c.benchmark_group("inline_upsert_rewrite_overhead");
     for &rows in INLINE_ROW_COUNTS {
@@ -215,6 +255,9 @@ fn bench_inline_upsert_rewrite(c: &mut Criterion) {
         let blob = serialize_ipc(&batch);
         let cached = Arc::new(vec![batch.clone()]);
         let deleted = upsert_pk_set(rows);
+        // The tombstone path's per-upsert work is bounded by the BATCH's re-keyed
+        // PK count, not the corpus, so this stays fixed as `rows` grows.
+        let tombstone_keys = tombstone_keys(TOMBSTONE_KEYS_PER_UPSERT);
 
         group.throughput(Throughput::Elements(
             u64::try_from(rows).unwrap_or(u64::MAX),
@@ -233,6 +276,14 @@ fn bench_inline_upsert_rewrite(c: &mut Criterion) {
             &(Arc::clone(&cached), deleted),
             |b, (cached, deleted)| {
                 b.iter(|| cached_filter_per_upsert(black_box(cached), deleted));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("tombstone_per_upsert", rows),
+            &tombstone_keys,
+            |b, keys| {
+                b.iter(|| tombstone_per_upsert(black_box(keys)));
             },
         );
     }
