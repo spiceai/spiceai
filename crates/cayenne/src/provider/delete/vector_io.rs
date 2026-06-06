@@ -239,9 +239,14 @@ impl<'a> DeletionVectorWriter<'a> {
             };
             if sync_snapshot_parent {
                 let table = self.table.path.clone();
-                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
-                    .await
-                    .map_err(|source| Error::TaskPanicked { table, source })??;
+                // Ordering tier (plain fsync on macOS, fdatasync on Linux) —
+                // see `provider/fsync_tier.rs`.
+                tokio::task::spawn_blocking(move || {
+                    let dir = std::fs::File::open(&snapshot_dir)?;
+                    crate::provider::fsync_tier::ordering_sync_std(&dir)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked { table, source })??;
             }
 
             let file_path = Self::deletion_file_path(&deletion_dir);
@@ -559,32 +564,38 @@ async fn write_deletion_file(
         //
         // 1. Stream Arrow IPC into the file.
         // 2. Recover the underlying std::fs::File from the writer and fsync
-        //    its data (sync_all flushes data + metadata). A previous revision
-        //    also re-opened the file to fsync it a second time — that
-        //    reopen+fsync was redundant work on every delete and has been
-        //    removed.
-        // 3. fsync the parent directory so the new directory entry is durable
-        //    across a power-loss restart — without this, the catalog can
-        //    record a delete file path that fails to resolve after a crash
-        //    because the file's inode is on disk but the dirent isn't.
+        //    its data with the ordering tier (`fsync_tier::ordering_sync_std`:
+        //    plain fsync on macOS, fdatasync on Linux — on macOS both std
+        //    `sync_all` AND `sync_data` are F_FULLFSYNC ~4-5 ms, while the
+        //    catalog commit referencing this file is SQLite
+        //    synchronous=NORMAL, so a full drive-cache flush here cannot
+        //    raise end-to-end durability; see `provider/fsync_tier.rs`). A
+        //    previous revision also re-opened the file to fsync it a second
+        //    time — that reopen+fsync was redundant work on every delete and
+        //    has been removed.
+        // 3. fsync the parent directory so the new directory entry is written
+        //    through before the catalog records the path — without this, the
+        //    catalog can record a delete file path that fails to resolve
+        //    after a crash because the file's inode is on disk but the dirent
+        //    isn't.
         let file = std::fs::File::create(&output_path)?;
         let mut writer = FileWriter::try_new(file, &schema)?;
         writer.write(&batch)?;
         writer.finish()?;
         let inner = writer.into_inner()?;
-        inner.sync_all()?;
+        crate::provider::fsync_tier::ordering_sync_std(&inner)?;
         drop(inner);
 
         let metadata = std::fs::metadata(&output_path)?;
 
-        // Best-effort parent-dir fsync. Matches the partitioned_wal /
-        // staging_wal write patterns: a failure here is unusual and logged
-        // by the caller; the deletion file's content is already durable
-        // regardless.
+        // Best-effort parent-dir fsync (ordering tier). Matches the
+        // partitioned_wal / staging_wal write patterns: a failure here is
+        // unusual and logged by the caller; the deletion file's content is
+        // already durable regardless.
         if let Some(parent) = output_path.parent()
             && let Ok(dir) = std::fs::File::open(parent)
         {
-            let _ = dir.sync_all();
+            let _ = crate::provider::fsync_tier::ordering_sync_std(&dir);
         }
 
         Ok(metadata.len())

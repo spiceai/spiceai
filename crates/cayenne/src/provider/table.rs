@@ -3194,17 +3194,21 @@ impl CayenneTableProvider {
             let parent = snapshot_dir.parent().map(std::path::Path::to_path_buf);
             tokio::fs::create_dir_all(snapshot_dir).await?;
 
-            // Make the *creation of the new snapshot directory itself* durable.
-            // On POSIX, creating a subdirectory updates the parent's directory
-            // metadata. Without syncing the parent, a crash can make the new
-            // snapshot directory "disappear" from the filesystem even though
-            // we later write files into it and commit the catalog to point at it.
-            // This is the same durability requirement we enforce for file
-            // creation, renames, and WAL marker removal elsewhere in the code.
+            // Write the *creation of the new snapshot directory itself* through
+            // to the device (ordering tier). On POSIX, creating a subdirectory
+            // updates the parent's directory metadata. Without syncing the
+            // parent, a crash can make the new snapshot directory "disappear"
+            // from the filesystem even though we later write files into it and
+            // commit the catalog to point at it. This is the same requirement
+            // we enforce for file creation, renames, and WAL marker removal
+            // elsewhere in the code. Ordering tier (plain fsync on macOS,
+            // fdatasync on Linux — see `fsync_tier`): this runs once per
+            // staged batch, and the full-tier flush bought nothing — see
+            // `sync_snapshot_dir`.
             if let Some(parent) = parent {
                 tokio::task::spawn_blocking(move || {
                     let f = std::fs::File::open(&parent)?;
-                    f.sync_all()
+                    super::fsync_tier::ordering_sync_std(&f)
                 })
                 .await
                 .map_err(std::io::Error::other)??;
@@ -3569,10 +3573,35 @@ impl CayenneTableProvider {
         let snapshot_dir = snapshot_dir.to_path_buf();
         let dir_display = snapshot_dir.display().to_string();
         tokio::task::spawn_blocking(move || {
-            // Open the directory and call sync_all to flush metadata
+            // Open the directory and flush its entries with the ORDERING tier
+            // (`fsync_tier::ordering_sync_std`), not full-tier `sync_all`.
+            //
+            // Durability-tier rationale (matters on macOS): Rust's `sync_all`
+            // AND `sync_data` both map to `fcntl(F_FULLFSYNC)` on Apple
+            // targets — a full drive-cache flush measured at ~4-5 ms per call
+            // — while plain `fsync(2)` is ~66 µs. Plain fsync is the macOS
+            // durability tier SQLite (synchronous=NORMAL), DuckDB, and
+            // PostgreSQL all default to. On Linux the helper is `fdatasync`,
+            // which still issues a device flush; dirents are the directory's
+            // data, so they are flushed — behavior is effectively unchanged
+            // there.
+            //
+            // F_FULLFSYNC here would be strictly stronger than the visibility
+            // commit it protects: the metastore runs SQLite with
+            // `journal_mode=WAL, synchronous=NORMAL` and no `fullfsync`
+            // pragma, so the catalog transaction that makes these files
+            // visible is itself only plain-fsync durable on macOS (NORMAL
+            // doesn't even fsync at every commit). A power-loss window that
+            // loses ordering-tier data files necessarily also loses the
+            // catalog rows referencing them — there is no inconsistent state
+            // a full flush here would prevent. Paying 5-7 F_FULLFSYNCs per
+            // staged CDC batch (~25 ms of pure barrier latency) bought no
+            // additional end-to-end durability; it was the dominant fixed
+            // cost of small staged upserts. Full details + measurements in
+            // `provider/fsync_tier.rs`.
             let dir = std::fs::File::open(&snapshot_dir)
                 .map_err(|source| CatalogError::IoError { source })?;
-            dir.sync_all()
+            super::fsync_tier::ordering_sync_std(&dir)
                 .map_err(|source| CatalogError::IoError { source })?;
             Ok::<(), CatalogError>(())
         })
