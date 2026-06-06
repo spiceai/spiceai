@@ -1266,12 +1266,23 @@ impl Runtime {
                             Vec::new()
                         };
                     let table_name = resolved_name.to_string();
+                    // Statistics flow via the periodic ExecutorStatistics reporter,
+                    // not this readiness ack.
                     let sent = b
                         .broadcast_partitions_loaded(table_name.clone(), bytes)
                         .await;
-                    tracing::info!(
-                        "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
-                    );
+                    if sent == 0 {
+                        // Fast initial loads can finish before any scheduler
+                        // control stream is connected; the broadcaster caches
+                        // the ack and replays it on scheduler connect.
+                        tracing::info!(
+                            "Initial PartitionsLoaded for {table_name} cached; no scheduler connected yet, will replay on connect"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Broadcast initial PartitionsLoaded for {table_name} to {sent} scheduler(s)"
+                        );
+                    }
                 }
                 if let Err(e) = runtime.create_dataset_or_view_schedule(ds).await {
                     tracing::error!("Failed to create dataset schedule for '{dataset_name}': {e}");
@@ -1522,12 +1533,12 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
         Ok(caching_sys) => {
             if let Err(e) = caching_sys.update_fetched_at() {
                 tracing::warn!(
-                    "Failed to update fetched_at for cached dataset {}: {e}",
+                    "Failed to update _fetched_at for cached dataset {}: {e}",
                     dataset.name
                 );
             } else {
                 tracing::info!(
-                    "Updated fetched_at for all records in cached dataset {}",
+                    "Updated _fetched_at for all records in cached dataset {}",
                     dataset.name
                 );
             }

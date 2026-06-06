@@ -21,29 +21,46 @@ on:
         description: 'Override OLTP terminal count (default: scale_factor * 10)'
         required: false
         type: string
+      rate:
+        description: 'Target OLTP transaction rate (txns/sec); empty = unlimited'
+        required: false
+        type: string
       duration:
         description: 'Duration of the HTAP workload in seconds'
         required: false
         type: string
-        default: '300'
+        default: '600'
+      concurrency:
+        description: 'Number of concurrent analytical query clients'
+        required: false
+        type: string
+        default: '4'
+      query_overrides:
+        description: 'Query overrides'
+        required: false
+        type: choice
+        default: ''
+        options:
+          - ''
+          - 'duckdb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
-        default: '60'
+        default: '300'
         type: string
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-runners'
+        default: 'spiceai-dev-xlarge-runners'
         type: choice
         options:
-          - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
+          - 'spiceai-dev-xlarge-runners'
 jobs:
   run-htap:
     name: Run CH-BenCHmark
     runs-on: ${{ github.event.inputs.runner_type }}
-    timeout-minutes: 600
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -112,7 +129,10 @@ jobs:
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
             ${{ github.event.inputs.terminals && format('--terminals {0}', github.event.inputs.terminals) || '' }} \
+            ${{ github.event.inputs.rate && format('--rate {0}', github.event.inputs.rate) || '' }} \
             --duration ${{ github.event.inputs.duration }} \
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.query_overrides != '' && format('--query-overrides {0}', github.event.inputs.query_overrides) || '' }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --disable-progress-bars \
             --metrics

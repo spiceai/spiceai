@@ -275,6 +275,16 @@ pub async fn register_all() {
         ),
     );
 
+    #[cfg(all(not(windows), feature = "spicebench"))]
+    registry.insert(
+        cayenne::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            cayenne::CayenneCatalogConnector::new_connector,
+            cayenne::PREFIX,
+            cayenne::PARAMETERS,
+        ),
+    );
+
     #[cfg(feature = "adbc")]
     registry.insert(
         adbc::PREFIX.to_string(),
@@ -541,6 +551,18 @@ mod tests {
             assert!(
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
+            );
+            #[cfg(all(not(windows), feature = "spicebench"))]
+            assert!(
+                guard.contains_key(cayenne::PREFIX),
+                "cayenne should be registered"
+            );
+            // Guard against accidental re-registration: by default (without the
+            // `spicebench` feature) the Cayenne catalog connector must NOT be registered.
+            #[cfg(all(not(windows), not(feature = "spicebench")))]
+            assert!(
+                !guard.contains_key(cayenne::PREFIX),
+                "cayenne should not be registered without the spicebench feature"
             );
         }
 

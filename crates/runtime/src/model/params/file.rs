@@ -27,11 +27,15 @@ pub const PARAMETERS: &[ParameterSpec] =
         { FILE_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
     >(FILE_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const FILE_PARAM_LEN: usize = 1;
+const FILE_PARAM_LEN: usize = 2;
 
-pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [ParameterSpec::runtime(
-    "chat_template",
-)
-.description(
-    "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
-)];
+pub(crate) const FILE_PARAMETERS: [ParameterSpec; FILE_PARAM_LEN] = [
+    ParameterSpec::runtime("chat_template").description(
+        "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
+    ),
+    ParameterSpec::runtime("trust_pickle").description(
+        "Allow loading pickle-based weight files (.pt / .pth / .ckpt / .bin). \
+        These formats execute arbitrary code on load and are disabled by default. \
+        Set to 'true' only when the model weights come from a fully trusted source.",
+    ).one_of(&["true", "false"]),
+];

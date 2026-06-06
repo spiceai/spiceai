@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,7 +26,6 @@ use tracing_futures::Instrument;
 
 use crate::{
     Runtime,
-    dataupdate::{DataUpdate, UpdateType},
     tools::{SpiceModelTool, utils::parameters},
 };
 

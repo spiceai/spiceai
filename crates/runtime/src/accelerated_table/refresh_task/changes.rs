@@ -205,6 +205,32 @@ const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
 const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
+const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
+
+#[cfg(any(test, not(windows)))]
+#[derive(Debug, Default)]
+struct BoundedWarningKeys {
+    seen: std::collections::HashSet<String>,
+    insertion_order: std::collections::VecDeque<String>,
+}
+
+#[cfg(any(test, not(windows)))]
+impl BoundedWarningKeys {
+    fn insert_new(&mut self, key: String, limit: usize) -> bool {
+        if limit == 0 || self.seen.contains(&key) {
+            return false;
+        }
+
+        if self.seen.len() >= limit
+            && let Some(oldest_key) = self.insertion_order.pop_front()
+        {
+            self.seen.remove(&oldest_key);
+        }
+
+        self.insertion_order.push_back(key.clone());
+        self.seen.insert(key)
+    }
+}
 
 impl Default for CdcConfig {
     fn default() -> Self {
@@ -224,6 +250,11 @@ impl Default for CdcConfig {
 /// ignored with a warning because active CDC streams may already be using the
 /// first config.
 static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
+
+#[cfg(not(windows))]
+static CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS: std::sync::LazyLock<
+    parking_lot::Mutex<BoundedWarningKeys>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
 
 /// Install the CDC configuration resolved from spicepod
 /// `runtime.params.cdc_*`. Should be called exactly once during runtime
@@ -482,11 +513,24 @@ impl RefreshTask {
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
+        let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
 
-        while let Some(first) = match carried_item.take() {
-            Some(item) => Some(item),
-            None => rx.recv().await,
-        } {
+        loop {
+            // Time how long the apply loop blocks waiting for the next batch
+            // from the source-reader channel. Large => source-bound (slot read /
+            // WAL decode can't keep up); near-zero => apply-bound (the
+            // accelerator write is the bottleneck). Carried-item iterations
+            // record ~0, which is correct — no wait occurred. Pairs with
+            // CDC_APPLY_BURST_DURATION_MS for full per-batch attribution.
+            let recv_start = Instant::now();
+            let next_item = match carried_item.take() {
+                Some(item) => Some(item),
+                None => rx.recv().await,
+            };
+            metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), &recv_wait_labels);
+            let Some(first) = next_item else {
+                break;
+            };
             // Drain whatever is already buffered in the prefetch channel
             // (no `await` between try_recv calls). Under low load the buffer
             // is empty after the initial recv and `burst.len() == 1` — that
@@ -905,14 +949,30 @@ impl RefreshTask {
 
             match op_type {
                 ChangeOperationType::Delete => {
+                    let op_start = Instant::now();
                     self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "delete",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Upsert => {
+                    let op_start = Instant::now();
                     pending_finalize = self
                         .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    tracing::trace!(
+                        dataset = %dataset_name,
+                        op = "upsert",
+                        rows = row_indices.len(),
+                        duration_ms = elapsed_ms(op_start),
+                        "Append/change stream batch sub-batch processed"
+                    );
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
@@ -948,16 +1008,7 @@ impl RefreshTask {
         ctx: &SessionContext,
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
-        let dataset_name = &self.dataset_name;
-
         let data_batch = change_batch.data_batch();
-
-        if !row_indices.is_empty() {
-            tracing::trace!(
-                "Processing upsert batch for {dataset_name} with {} rows",
-                row_indices.len()
-            );
-        }
 
         let target_schema = self.accelerator.schema();
 
@@ -1004,6 +1055,9 @@ impl RefreshTask {
 
             return Ok(None);
         }
+
+        #[cfg(not(windows))]
+        self.warn_if_cayenne_cdc_synchronous_fallback();
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
 
@@ -1059,11 +1113,82 @@ impl RefreshTask {
         Ok(None)
     }
 
+    /// Resolve the inner [`CayenneTableProvider`] from the accelerator, peeling
+    /// the wrappers it is created behind. Non-partitioned Cayenne tables are
+    /// wrapped in `PolyTableProvider` (read/write split), optionally
+    /// `UpsertDedupTableProvider` (when `remove_duplicates`/`last_write_wins` is
+    /// set), and `IndexedTableProvider` (vector indexes). A direct downcast to
+    /// `CayenneTableProvider` misses through any of these, so without peeling the
+    /// CDC apply silently falls back to the synchronous `insert_into` path and
+    /// loses pipelined finalization (backgrounded publish, no blocking
+    /// `apply_on_conflict_deletions`). Mirrors the wrapper-peeling done by
+    /// `search::util::find_concrete_table_provider`.
     #[cfg(not(windows))]
     fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        self.accelerator
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        let mut current: &Arc<dyn TableProvider> = &self.accelerator;
+        loop {
+            if let Some(cayenne) = current.as_any().downcast_ref::<CayenneTableProvider>() {
+                return Some(cayenne);
+            }
+            if let Some(poly) = current
+                .as_any()
+                .downcast_ref::<data_components::poly::PolyTableProvider>()
+            {
+                current = poly.writer_ref();
+                continue;
+            }
+            // NOTE: `UpsertDedupTableProvider` is intentionally NOT peeled. Unlike
+            // `PolyTableProvider` (delegates writes) and `IndexedTableProvider`
+            // (`insert_into` is a pass-through), it *rewrites* the write on insert
+            // (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to
+            // the inner provider would bypass that transform, so a dedup-configured
+            // table instead stays on the synchronous path (through the wrapper,
+            // preserving its semantics) and emits the fallback warning below. Only
+            // write-transparent wrappers are peeled here.
+            if let Some(indexed) = current
+                .as_any()
+                .downcast_ref::<runtime_datafusion_index::IndexedTableProvider>()
+            {
+                current = indexed.get_underlying_ref();
+                continue;
+            }
+            return None;
+        }
+    }
+
+    /// Warn once per table when the CDC apply takes the synchronous fallback for
+    /// a Cayenne-engine dataset — i.e. [`Self::cayenne_accelerator`] could not
+    /// unwrap the inner provider through its wrappers, so pipelined finalization
+    /// is silently disabled. For non-Cayenne accelerators the synchronous path is
+    /// expected, so this stays quiet.
+    #[cfg(not(windows))]
+    fn warn_if_cayenne_cdc_synchronous_fallback(&self) {
+        // Mirrors the per-engine-module `SPICE_ACCELERATOR_METADATA_KEY` (defined
+        // privately in each accelerator module); the accelerator's schema
+        // metadata carries the engine name.
+        const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
+        let is_cayenne = self
+            .accelerator
+            .schema()
+            .metadata()
+            .get(ACCELERATOR_METADATA_KEY)
+            .map(String::as_str)
+            == Some("cayenne");
+        if !is_cayenne {
+            return;
+        }
+        let first_for_table = CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS
+            .lock()
+            .insert_new(
+                self.dataset_name.to_string(),
+                CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT,
+            );
+        if first_for_table {
+            tracing::warn!(
+                dataset = %self.dataset_name,
+                "Cayenne CDC fell back to the synchronous write path: cayenne_accelerator() could not unwrap the inner CayenneTableProvider through its provider wrappers. Pipelined finalization (backgrounded publish, no blocking apply_on_conflict_deletions) is DISABLED for this table — an unrecognized provider wrapper likely needs peeling in cayenne_accelerator()."
+            );
+        }
     }
 
     async fn process_truncate(
@@ -1104,11 +1229,6 @@ impl RefreshTask {
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
-
-        tracing::trace!(
-            "Processing delete batch for {dataset_name} with {} rows",
-            row_indices.len()
-        );
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
@@ -1960,6 +2080,20 @@ mod tests {
         )]));
 
         assert_eq!(config.max_coalesce_age_ms, 90_000);
+    }
+
+    #[test]
+    fn bounded_warning_keys_eviction_allows_rewarning_old_keys() {
+        let mut warning_keys = BoundedWarningKeys::default();
+
+        assert!(warning_keys.insert_new("dataset_a".to_string(), 2));
+        assert!(!warning_keys.insert_new("dataset_a".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_b".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_c".to_string(), 2));
+
+        assert_eq!(warning_keys.seen.len(), 2);
+        assert!(!warning_keys.insert_new("dataset_c".to_string(), 2));
+        assert!(warning_keys.insert_new("dataset_a".to_string(), 2));
     }
 
     fn create_test_data_schema() -> Schema {

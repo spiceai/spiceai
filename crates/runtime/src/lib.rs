@@ -312,8 +312,15 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
+    #[cfg(feature = "postgres-accel")]
     #[snafu(display(
         "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
+    ))]
+    AcceleratorEngineNotAvailable { name: String },
+
+    #[cfg(not(feature = "postgres-accel"))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -498,6 +505,10 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
+const CACHE_MAINTENANCE: &str = "cache_maintenance";
+
+/// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -914,6 +925,8 @@ impl Runtime {
                 if let Some(n) = notifier {
                     n.notified().await;
                 }
+                // Statistics flow via the periodic ExecutorStatistics reporter, not
+                // this readiness ack.
                 let sent = broadcaster
                     .broadcast_partitions_loaded(table_name.clone(), partition_expr_bytes)
                     .await;
@@ -924,6 +937,90 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Periodically drives moka housekeeping so invalidation predicates and
+    /// expired entries are reclaimed even on caches with no `get`/`insert`
+    /// traffic. Returns immediately when no cache is configured; otherwise loops
+    /// until the task is cancelled at shutdown.
+    pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
+        let caching = self.datafusion().caching();
+        if caching.results.is_none()
+            && caching.plans.is_none()
+            && caching.search.is_none()
+            && caching.embeddings.is_none()
+        {
+            return Ok(());
+        }
+
+        let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            caching.run_pending_maintenance().await;
+        }
+    }
+
+    /// Periodically recompute and rebroadcast this executor's per-table row-count
+    /// statistics to all schedulers. `PartitionsLoaded` is otherwise only sent on
+    /// initial load / assignment change, so during streaming ETL the coordinator's
+    /// in-memory stats would reflect only the first snapshot (or nothing if the
+    /// table had no data at initial-load time). A periodic rebroadcast keeps the
+    /// coordinator's join-sizing statistics fresh as the executor's local data grows.
+    pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The statistics source (`local_executor_table_statistics`) reads the
+        // Cayenne metastore aggregate, which is maintained incrementally on the
+        // write path: always-fresh, O(1), and never degrades to a row-count-only
+        // result mid-ingest. So there is no non-degrading cache here — each tick
+        // simply broadcasts the current aggregate.
+        loop {
+            interval.tick().await;
+            let Some(broadcaster) = self.executor_outbound_broadcaster() else {
+                continue;
+            };
+            let df = self.datafusion();
+
+            // Enumerate the tables this executor serves locally. The q18 tables
+            // are cayenne *catalog* tables (not spice.public datasets), so the
+            // dataset partition-assignment map doesn't cover them; enumerate the
+            // cayenne catalog directly. Also include any dataset assignments.
+            let mut tables: Vec<TableReference> = Vec::new();
+            #[cfg(not(windows))]
+            {
+                tables.extend(crate::cluster::discover_cayenne_tables(&df).await);
+            }
+            if let Some(assignments_lock) = self.partition_assignments() {
+                for resolved in assignments_lock.read().await.keys() {
+                    tables.push(TableReference::full(
+                        Arc::<str>::clone(&resolved.catalog),
+                        Arc::<str>::clone(&resolved.schema),
+                        Arc::<str>::clone(&resolved.table),
+                    ));
+                }
+            }
+            tables.sort_by_key(ToString::to_string);
+            tables.dedup_by_key(|t| t.to_string());
+            if tables.is_empty() {
+                continue;
+            }
+            tracing::debug!(
+                count = tables.len(),
+                "Reporting per-executor table statistics to schedulers"
+            );
+            for table in tables {
+                let table_key = table.to_string();
+                if let Some((stats, column_names)) =
+                    crate::cluster::partition::local_executor_table_statistics(&df, &table).await
+                {
+                    let encoded = runtime_cluster::encode_statistics(&stats);
+                    broadcaster
+                        .broadcast_executor_statistics(table_key, encoded, column_names)
+                        .await;
+                }
+            }
+        }
     }
 
     /// Returns the partition store for accelerated table partition metadata (scheduler only).
@@ -1186,6 +1283,17 @@ impl Runtime {
         };
 
         // Start Flight server
+        // On executors, periodically rebroadcast per-table row-count statistics so
+        // the coordinator's join-sizing stats stay fresh as streaming ETL grows
+        // local data (PartitionsLoaded is otherwise sent only on initial load /
+        // assignment change).
+        if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+            let reporter_self = Arc::clone(&self);
+            tokio::spawn(async move {
+                reporter_self.run_executor_statistics_reporter().await;
+            });
+        }
+
         let flight_shutdown = CancellationToken::new();
         let self_ref = Arc::clone(&self);
         let cloned_tls_config = tls_config.clone();
@@ -1337,6 +1445,16 @@ impl Runtime {
             })
             .await;
 
+        // `None` cancellation token: the loop is aborted at shutdown.
+        let maintenance_self = Arc::clone(&self);
+        let cache_maintenance_future = self
+            .start_runtime_task(
+                CACHE_MAINTENANCE,
+                None,
+                maintenance_self.run_cache_maintenance(),
+            )
+            .await;
+
         // wait for all servers to shut down or if any of the servers fail to start
         if let Some(cluster_future) = maybe_cluster_future {
             return match tokio::try_join!(
@@ -1344,6 +1462,7 @@ impl Runtime {
                 flight_future,
                 metrics_future,
                 pods_watcher_future,
+                cache_maintenance_future,
                 cluster_future,
                 shutdown_signal_future
             ) {
@@ -1357,6 +1476,7 @@ impl Runtime {
             flight_future,
             metrics_future,
             pods_watcher_future,
+            cache_maintenance_future,
             shutdown_signal_future
         ) {
             Err(err) => Err(err),

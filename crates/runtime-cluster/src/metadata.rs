@@ -19,10 +19,15 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use datafusion::{
-    common::DFSchema, error::DataFusionError, prelude::SessionContext, sql::TableReference,
+    common::{DFSchema, Statistics},
+    error::DataFusionError,
+    prelude::SessionContext,
+    sql::TableReference,
 };
 use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
+use datafusion_proto_common::protobuf_common::Statistics as ProtoStatistics;
+use prost::Message;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +45,26 @@ use crate::context::PartitionExprResolver;
 /// {"date": "2024-01-02", "region": "us-east"}
 /// ```
 pub type PartitionValue = HashMap<String, Option<String>>;
+
+/// Encodes `DataFusion` [`Statistics`] to the `datafusion-proto` prost bytes
+/// carried on the `PartitionsLoaded` wire. This is the executor → scheduler
+/// encoding for the per-executor table statistics the scheduler then holds in
+/// memory (see `ExecutorRegistry`).
+#[must_use]
+pub fn encode_statistics(stats: &Statistics) -> Vec<u8> {
+    ProtoStatistics::from(stats).encode_to_vec()
+}
+
+/// Decodes statistics produced by [`encode_statistics`]. Returns `None` if the
+/// bytes are malformed or cannot be converted back into [`Statistics`], so a
+/// corrupt/forward-incompatible report degrades to "no statistics" rather than
+/// failing the ack.
+#[must_use]
+pub fn decode_statistics(bytes: &[u8]) -> Option<Statistics> {
+    ProtoStatistics::decode(bytes)
+        .ok()
+        .and_then(|proto| Statistics::try_from(&proto).ok())
+}
 
 /// Metadata for a single partition of an accelerated table
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,4 +288,37 @@ pub fn encode_partition_exprs(exprs: &[Expr], context: &str) -> Vec<Vec<u8>> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::{ColumnStatistics, stats::Precision};
+
+    #[test]
+    fn statistics_round_trip_through_wire_encoding() {
+        // The executor → scheduler wire encoding must round-trip full statistics
+        // losslessly (per-column min/max and distinct counts included), even
+        // though today only `num_rows` is populated.
+        let stats = Statistics {
+            num_rows: Precision::Inexact(59_986_052),
+            total_byte_size: Precision::Exact(1_234_567),
+            column_statistics: vec![
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    distinct_count: Precision::Inexact(15_000_000),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        let decoded = decode_statistics(&encode_statistics(&stats)).expect("decode");
+        assert_eq!(decoded, stats);
+    }
+
+    #[test]
+    fn decode_statistics_rejects_garbage() {
+        assert!(decode_statistics(&[0xff, 0x00, 0x13, 0x37]).is_none());
+    }
 }

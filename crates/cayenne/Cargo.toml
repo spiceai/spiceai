@@ -35,6 +35,7 @@ datafusion-physical-plan = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
+im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
@@ -96,6 +97,14 @@ name = "deletion_strategies"
 [[bench]]
 harness = false
 name = "deletion_index_probe"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe_large"
+
+[[bench]]
+harness = false
+name = "position_vs_key_deletion_scan"
 
 [[bench]]
 harness = false

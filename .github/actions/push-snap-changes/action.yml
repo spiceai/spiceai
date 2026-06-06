@@ -66,6 +66,8 @@ runs:
 
         git config --global user.name 'Spice Snapshot Update Bot'
         git config --global user.email 'spiceaibot@spice.ai'
+        AUTHENTICATED_REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+        git remote set-url origin "${AUTHENTICATED_REMOTE_URL}"
         git checkout -b "${BRANCH_NAME}"
         git add '*.snap'
         if git diff --cached --quiet; then

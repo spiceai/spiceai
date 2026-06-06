@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
+use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 
 use crate::metadata::PartitionValue;
@@ -51,6 +52,33 @@ pub trait PartitionDiscoverer: Send + Sync {
     ) -> Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
+#[derive(Debug, Snafu)]
+pub enum DiscoveryJobError {
+    #[snafu(display("Discovery job executor is not initialized"))]
+    JobExecutorNotInitialized,
+
+    #[snafu(display("Failed to submit discovery job for table {table}: {source}"))]
+    SubmitDiscoveryJob {
+        table: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to poll discovery job {job_id}: {source}"))]
+    PollDiscoveryJob {
+        job_id: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Discovery job {job_id} completed without a result payload"))]
+    MissingJobResult { job_id: String },
+
+    #[snafu(display("Failed to decode discovery results for job {job_id}: {source}"))]
+    DecodeDiscoveryResults {
+        job_id: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
 /// Result of polling a partition discovery job.
 #[derive(Debug)]
 pub enum DiscoveryJobPollResult {
@@ -72,7 +100,7 @@ pub trait PartitionDiscoverySubmitter: Send + Sync {
         &self,
         table: &TableReference,
         partition_by: &[PartitionedBy],
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<String, DiscoveryJobError>;
 
     /// Poll the status of a previously submitted discovery job.
     /// `partition_expressions` are the raw SQL expression strings so that
@@ -81,7 +109,7 @@ pub trait PartitionDiscoverySubmitter: Send + Sync {
         &self,
         job_id: &str,
         partition_expressions: &[String],
-    ) -> Result<DiscoveryJobPollResult, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<DiscoveryJobPollResult, DiscoveryJobError>;
 }
 
 /// Combined bound for partition-management operations that need expression

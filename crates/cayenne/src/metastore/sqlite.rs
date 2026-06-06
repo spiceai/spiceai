@@ -33,6 +33,100 @@ use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
+/// `auto_vacuum` mode for the metastore DB.
+///
+/// A high-update upsert table (e.g. `district`) frees pages as it supersedes
+/// rows; with the default `None` those pages stay on the freelist and are reused,
+/// so the file plateaus at its high-water mark rather than growing unboundedly.
+/// The page cache already keeps the *live* working set resident, so the freelist
+/// pages are never read and reclaiming them is a disk-footprint concern, not a
+/// latency one — and every reclaiming mode taxes the write path (see the
+/// variants), so reclamation is opt-in and `None` is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqliteAutoVacuum {
+    /// `SQLite` default: freed pages stay on the freelist and are reused for new
+    /// inserts; the file plateaus. No write-path overhead. Recommended.
+    #[default]
+    None,
+    /// Freed pages are tracked for reclamation by an explicit
+    /// `PRAGMA incremental_vacuum`, which holds the write lock while it relocates
+    /// and truncates — so reclamation must be driven off the hot path, never
+    /// inside a CDC burst.
+    Incremental,
+    /// Reclaim each commit's freed pages as part of that commit: the file stays
+    /// small continuously, at the cost of page-relocation work on *every*
+    /// metastore write (trades write latency for disk footprint).
+    Full,
+}
+
+impl SqliteAutoVacuum {
+    /// Pragma argument, or `None` for the `SQLite` default (skip the redundant set).
+    fn pragma_value(self) -> Option<&'static str> {
+        match self {
+            SqliteAutoVacuum::None => None,
+            SqliteAutoVacuum::Incremental => Some("INCREMENTAL"),
+            SqliteAutoVacuum::Full => Some("FULL"),
+        }
+    }
+}
+
+/// Tunable `SQLite` pragmas for the Cayenne metastore.
+///
+/// The defaults match what was previously hardcoded. The runtime overrides them
+/// once at startup from `runtime.params` (`cayenne_metastore_*`) via
+/// [`set_sqlite_metastore_config`], so a deployment sizes the page cache and
+/// memory map to its host instead of inheriting a fixed large-host assumption.
+/// Sized for the host because the cache is per-connection × pool size: a 256 MiB
+/// cache on a 32-slot pool can reserve gigabytes for a single hot table's DB.
+#[derive(Debug, Clone, Copy)]
+pub struct SqliteMetastoreConfig {
+    /// `cache_size` page cache in MiB (applied as `-<KiB>`).
+    pub cache_size_mb: usize,
+    /// `mmap_size` in bytes.
+    pub mmap_size_bytes: i64,
+    /// `busy_timeout` in milliseconds.
+    pub busy_timeout_ms: u64,
+    /// `wal_autocheckpoint` threshold in pages.
+    pub wal_autocheckpoint_pages: u32,
+    /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
+    /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
+    pub auto_vacuum: SqliteAutoVacuum,
+}
+
+impl Default for SqliteMetastoreConfig {
+    fn default() -> Self {
+        Self {
+            cache_size_mb: 256,
+            mmap_size_bytes: 1_073_741_824, // 1 GiB
+            busy_timeout_ms: 30_000,
+            wal_autocheckpoint_pages: 10_000,
+            auto_vacuum: SqliteAutoVacuum::None,
+        }
+    }
+}
+
+/// Process-wide `SQLite` metastore pragma config. Connections opened after a call
+/// to [`set_sqlite_metastore_config`] use the new values; unset → the defaults.
+static SQLITE_METASTORE_CONFIG: std::sync::LazyLock<std::sync::RwLock<SqliteMetastoreConfig>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(SqliteMetastoreConfig::default()));
+
+/// Install the process-wide `SQLite` metastore pragma config. Called once at
+/// startup by the runtime; later calls replace it (tests). A poisoned lock is
+/// ignored — a metastore that keeps its prior/default pragmas is far better than
+/// a panic on the catalog setup path.
+pub fn set_sqlite_metastore_config(config: SqliteMetastoreConfig) {
+    if let Ok(mut guard) = SQLITE_METASTORE_CONFIG.write() {
+        *guard = config;
+    }
+}
+
+fn sqlite_metastore_config() -> SqliteMetastoreConfig {
+    SQLITE_METASTORE_CONFIG
+        .read()
+        .map(|cfg| *cfg)
+        .unwrap_or_default()
+}
+
 fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool {
     matches!(
         error,
@@ -47,16 +141,29 @@ fn is_sqlite_lock_error(error: &tokio_rusqlite::Error<rusqlite::Error>) -> bool 
 async fn configure_sqlite_connection(
     conn: &tokio_rusqlite::Connection,
 ) -> Result<(), tokio_rusqlite::Error<rusqlite::Error>> {
+    // Resolve the tunable pragmas once. Defaults and rationale live on
+    // `SqliteMetastoreConfig`; the runtime overrides them via
+    // `set_sqlite_metastore_config` from `runtime.params`.
+    let cfg = sqlite_metastore_config();
+    let cache_size_kib = i64::try_from(cfg.cache_size_mb.saturating_mul(1024)).unwrap_or(262_144);
     let mut retry_delays = SQLITE_PRAGMA_RETRY_DELAYS_MS.iter();
     loop {
         let result = conn
-            .call(|conn| {
-                conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            .call(move |conn| {
+                conn.busy_timeout(std::time::Duration::from_millis(cfg.busy_timeout_ms))?;
+                // auto_vacuum must be set before the first table is created (it is
+                // a no-op on an existing DB without a full VACUUM). NONE is the
+                // SQLite default, so skip the pragma entirely for it.
+                if let Some(mode) = cfg.auto_vacuum.pragma_value() {
+                    conn.pragma_update(None, "auto_vacuum", mode)?;
+                }
                 conn.pragma_update(None, "journal_mode", "WAL")?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
-                conn.pragma_update(None, "cache_size", -32000)?;
+                conn.pragma_update(None, "cache_size", -cache_size_kib)?;
                 conn.pragma_update(None, "foreign_keys", true)?;
                 conn.pragma_update(None, "temp_store", "memory")?;
+                conn.pragma_update(None, "mmap_size", cfg.mmap_size_bytes)?;
+                conn.pragma_update(None, "wal_autocheckpoint", cfg.wal_autocheckpoint_pages)?;
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -363,16 +470,31 @@ impl SqliteMetastore {
     /// Schema for the `cayenne_table_statistics` table.
     ///
     /// Stores a single row per table holding a serialized Vortex `FileStatistics`
-    /// flatbuffer blob. The row is upserted on every write and currently reflects
-    /// the accumulator from the most recent write (min, max, null count) — a
-    /// last-write-wins snapshot, not an aggregate across every file. Consumers
-    /// must treat these values as optimization hints until cross-write merging
-    /// lands.
+    /// flatbuffer blob (min, max, null count), a live `num_rows` count, and an
+    /// optional `ndv_sketches` blob of per-column `HyperLogLog` sketches. The row is
+    /// upserted on every write and merged into the running per-table aggregate.
+    /// Consumers must treat these values as optimization hints.
     const TABLE_STATISTICS_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
             table_id TEXT NOT NULL PRIMARY KEY,
             statistics_blob BLOB NOT NULL,
             num_rows BIGINT NOT NULL DEFAULT 0,
+            ndv_sketches BLOB,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_pk_index` table.
+    ///
+    /// One row per table holding the serialized primary-key existence bloom
+    /// checkpoint (see `provider::table`), tagged with the snapshot id it covers.
+    /// Lets restart / snapshot-bootstrap skip the full-table keyset rebuild;
+    /// captured in metastore snapshots via `EXPECTED_TABLES`.
+    const PK_INDEX_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_pk_index (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            index_blob BLOB NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -490,6 +612,16 @@ impl MetastoreRow for SqliteRow {
             })?;
         Option::<String>::from_value(value)
     }
+
+    fn get_optional_blob(&self, index: usize) -> CatalogResult<Option<Vec<u8>>> {
+        let value = self
+            .values
+            .get(index)
+            .ok_or_else(|| CatalogError::Database {
+                message: format!("Column index {index} out of bounds"),
+            })?;
+        Option::<Vec<u8>>::from_value(value)
+    }
 }
 
 /// Convert `rusqlite::Value` to `MetastoreValue`.
@@ -531,7 +663,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -540,13 +672,18 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
                     Self::TABLE_STATISTICS_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
-                    Self::INLINED_DELETE_TABLE_DDL
+                    Self::INLINED_DELETE_TABLE_DDL,
+                    Self::PK_INDEX_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
                 // Ignore errors when the column already exists to keep init idempotent.
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                    [],
+                );
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
                     [],
                 );
 

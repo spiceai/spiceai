@@ -697,68 +697,73 @@ fn partitioned_wal_local_writer_uses_single_open_for_tmp_file() {
 // DeletionIndex incremental-bloom regression tests
 // -----------------------------------------------------------------------------
 //
-// `DeletionIndex::extend_max` is called on every PK-aware upsert/delete to
-// merge new (pk → delete_seq) entries into the cached deletion snapshot.
+// The layered deletion index's shared `extend` core is called on every
+// PK-aware upsert/delete (via `extend_max_deletes` / `extend_max_conflicts`)
+// to merge new (pk → tombstone) entries into the cached deletion snapshot.
 // A previous revision rebuilt the bloom filter from scratch on every call,
 // turning each per-row update into O(N) work where N is the cumulative
 // cache size. The cumulative cost across M writes was O(M·N), the root
 // cause of the ~200% ingestion regression on upsert-heavy workloads with
-// growing deletion sets (fix landed in commit e8abb4cac4).
+// growing deletion sets (fix landed in commit e8abb4cac4; the layered
+// rewrite preserves the same amortization invariants in `extend`).
 
 const DELETION_INDEX_SRC: &str = include_str!("../src/provider/deletion_index.rs");
 
 #[test]
-fn deletion_index_extend_max_tracks_new_keys_for_incremental_bloom() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+fn deletion_index_extend_tracks_new_keys_for_incremental_bloom() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
     assert!(
-        body.contains("new_keys"),
-        "DeletionIndex::extend_max must track newly-inserted keys (typical \
-         pattern: `let mut new_keys: Vec<_> = Vec::new();`) so the bloom \
-         can be updated incrementally for the K new keys instead of being \
-         rebuilt from scratch over all N entries. This turns the per-call \
-         cost from O(N) to O(K) amortized."
+        body.contains("new_delete_hashes"),
+        "the layered index's `extend` must track newly-deleted keys \
+         (`new_delete_hashes`) so the bloom can be updated incrementally \
+         for the K new keys instead of being rebuilt from scratch over all \
+         N entries. This keeps the per-call cost O(K) amortized."
     );
 
     assert!(
-        body.contains("Vacant") && body.contains("Occupied"),
-        "DeletionIndex::extend_max must use explicit `Entry::Occupied` / \
-         `Entry::Vacant` matching so only newly-inserted keys are recorded \
-         for incremental bloom insertion."
+        body.contains("outcome.new_delete"),
+        "`extend` must record a bloom hash only for keys gaining their \
+         first deletion (`outcome.new_delete`) so repeat-deletes of the \
+         same key do not inflate the incremental insert set."
     );
 }
 
 #[test]
-fn deletion_index_extend_max_has_amortized_rebuild_trigger() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+fn deletion_index_extend_has_amortized_rebuild_trigger() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
     assert!(
-        body.contains("bloom_capacity.saturating_mul(2)") || body.contains("bloom_capacity * 2"),
-        "DeletionIndex::extend_max must compare the new entry count against \
-         `2 * bloom_capacity` to decide when to rebuild. The doubling \
-         threshold amortizes the rebuild cost to O(K) per call (geometric \
-         series). A tighter threshold would re-introduce the regression; a \
-         looser threshold would leak false-positive budget."
+        body.contains("delete_count > self.bloom_capacity"),
+        "`extend` must rebuild the bloom only when deletion growth has \
+         outpaced the sized capacity (`delete_count > self.bloom_capacity`). \
+         Rebuilding more eagerly re-introduces the O(M·N) regression."
+    );
+
+    assert!(
+        body.contains("bloom_capacity_for"),
+        "`extend` must size the rebuilt bloom via `bloom_capacity_for` \
+         (2x headroom) so the rebuild cadence stays geometric and the \
+         filter never spends long windows saturated."
     );
 }
 
 #[test]
 fn deletion_index_does_not_unconditionally_rebuild_bloom() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
-    // The pre-fix implementation ended every extend_max call with
-    // `Self::from_map(entries)`, which unconditionally walks every entry
-    // to rebuild the bloom. Forbid the bare trailing-rebuild pattern.
-    let regressed_tail = "        Self::from_map(entries)\n    }";
+    // The pre-fix implementation rebuilt the bloom over every entry on every
+    // call. The layered `extend` must keep the full rebuild behind the
+    // capacity guard and otherwise insert only the new hashes in place.
     assert!(
-        !body.contains(regressed_tail),
-        "DeletionIndex::extend_max must NOT end with `Self::from_map(entries)` \
-         as its unconditional tail. That pattern walks every entry to rebuild \
-         the bloom on every call, producing O(N²) cumulative work on upsert \
-         workloads."
+        body.contains("for hash in new_delete_hashes"),
+        "`extend` must have an incremental branch that inserts only the new \
+         deletion hashes into the shared bloom (O(K) work), instead of \
+         walking every entry on every call (O(N²) cumulative on upsert \
+         workloads)."
     );
 }
 
