@@ -1111,11 +1111,12 @@ mod tests {
     #[test]
     fn duckdb_deny_list_allows_dialect_native_functions() {
         // The DuckDB unparser dialect rewrites these into native DuckDB SQL
-        // (cosine_distance -> array_cosine_distance, rand -> random()), so they
-        // must federate rather than be denied. Note `rand` is allowed purely by
-        // virtue of being in the dialect — no manual carve-out.
+        // (cosine_distance -> array_cosine_distance, inner_product ->
+        // array_inner_product, rand -> random()), so they must federate rather
+        // than be denied. Note `rand` is allowed purely by virtue of being in the
+        // dialect — no manual carve-out.
         let support = deny_spice_functions_for_duckdb();
-        for name in [COSINE_DISTANCE_UDF_NAME, "rand"] {
+        for name in [COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"] {
             assert!(
                 support.supports(&make_named_expr(name)),
                 "{name} has a native DuckDB equivalent and should be pushed down"
@@ -1182,11 +1183,16 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_pushable_set_is_exactly_cosine_distance_and_rand() {
+    fn duckdb_pushable_set_is_exactly_the_dialect_natives() {
         // Pin the exact set of deny-listed Spice functions that CAN be pushed
         // down to DuckDB. Everything else in the deny-list CANNOT. This makes the
         // can/can't partition explicit: if a dialect change makes another Spice
         // function pushable (or stops one), this test must be updated on purpose.
+        //
+        // `cosine_distance` -> array_cosine_distance, `inner_product` ->
+        // array_inner_product, `rand` -> random(). (Note: l2 distance federates
+        // via the non-deny-listed `array_distance` UDF, so it isn't part of this
+        // deny-list carve-out.)
         use std::collections::BTreeSet;
         let support = deny_spice_functions_for_duckdb();
         let pushable: BTreeSet<&str> = BUILTIN_DENIED_SPICE_FUNCTION_NAMES
@@ -1196,7 +1202,7 @@ mod tests {
             .collect();
         assert_eq!(
             pushable,
-            BTreeSet::from([COSINE_DISTANCE_UDF_NAME, "rand"]),
+            BTreeSet::from([COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"]),
             "unexpected change to the set of Spice functions pushable to DuckDB"
         );
     }

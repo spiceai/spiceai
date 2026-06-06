@@ -19,6 +19,7 @@ use std::sync::Arc;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
+use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod duckdb;
 
@@ -45,6 +46,10 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
         (
             COSINE_DISTANCE_UDF_NAME,
             Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
+        ),
+        (
+            INNER_PRODUCT_UDF_NAME,
+            Box::new(duckdb::inner_product_to_sql) as ScalarFnToSqlHandler,
         ),
         (
             "array_distance",
