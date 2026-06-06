@@ -4,10 +4,14 @@ on:
   schedule:
     # daily-main, 0900 UTC / 0200 PDT  — full bench suite + HTAP CH-benCHmark SF1
     - cron: '0 9 * * *'
-    # htap-sf10, 1200 UTC / 0500 PDT  — HTAP CH-benCHmark SF10
-    - cron: '0 12 * * *'
-    # htap-sf100, 1600 UTC / 0900 PDT  — HTAP CH-benCHmark SF100
-    - cron: '0 16 * * *'
+    # htap-sf1, 0100/1700 UTC — extra HTAP CH-benCHmark SF1 runs so SF1 fires
+    # every 8 hours (0100, 0900 via daily-main, 1700) without re-running the
+    # full daily-main suite three times a day.
+    - cron: '0 1,17 * * *'
+    # htap-sf10, every 8h anchored on the original 1200 UTC — HTAP CH-benCHmark SF10
+    - cron: '0 4,12,20 * * *'
+    # htap-sf100, every 8h anchored on the original 1600 UTC — HTAP CH-benCHmark SF100
+    - cron: '0 0,8,16 * * *'
 
   workflow_dispatch:
     inputs:
@@ -102,10 +106,11 @@ jobs:
         id: sched
         run: |
           case "${{ github.event.schedule }}" in
-            '0 9 * * *')  NAME=daily-main ;;
-            '0 12 * * *') NAME=htap-sf10   ;;
-            '0 16 * * *') NAME=htap-sf100  ;;
-            *)            NAME=            ;;   # manual / unrecognized cron — match nothing
+            '0 9 * * *')        NAME=daily-main ;;
+            '0 1,17 * * *')     NAME=htap-sf1   ;;
+            '0 4,12,20 * * *')  NAME=htap-sf10  ;;
+            '0 0,8,16 * * *')   NAME=htap-sf100 ;;
+            *)                  NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
@@ -235,10 +240,11 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # HTAP CH-benCHmark — one SF per schedule. SF1 rides with daily-main;
-      # SF10 / SF100 each fire on their own cron.
+      # HTAP CH-benCHmark — every SF runs 3x/day (every 8 hours). SF1 rides
+      # with daily-main at 0900 plus the htap-sf1 extras at 0100/1700;
+      # SF10 / SF100 each fire on their own every-8h cron.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        if: ${{ steps.sched.outputs.name == 'daily-main' || steps.sched.outputs.name == 'htap-sf1' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 --workflow htap
         env:
