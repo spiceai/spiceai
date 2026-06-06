@@ -307,11 +307,20 @@ impl CayenneContext {
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings. The session's
-        // default write strategy is the full BtrBlocks cascade; light
+        // Create a Vortex session with default encodings. The session's write
+        // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
+        // default, optionally extended with the Zstd string scheme when
+        // `cayenne_compression_strategy=zstd` (this wiring is what makes that
+        // param real — see `delta_encoding::full_strategy_builder_for`).
+        // Maintenance writes and full-level delta writes inherit it; light
         // delta-encoding levels override it per write via
         // `write_format_with_strategy` (see `provider::delta_encoding`).
-        let vortex_session = VortexSession::default();
+        let mut vortex_session = VortexSession::default();
+        if let Some(full_strategy) =
+            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
+        {
+            vortex_session = vortex_session.set(full_strategy);
+        }
 
         Arc::new(
             VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))

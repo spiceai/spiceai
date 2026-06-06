@@ -238,13 +238,22 @@ impl PartitionMetadata {
     }
 }
 
-/// Which compression strategy to use for the Vortex layout.
+/// Which compression strategy the table's FULL encoding tier uses — i.e.
+/// maintenance writes (compaction outputs, rewrites, overwrites) and delta
+/// writes that resolve to a full level (`7..=10`, or `auto` on large /
+/// unknown-size writes). Light delta levels (`0..=6`) are a fixed
+/// `BtrBlocks`-subset effort ladder and are not affected by this choice.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionStrategy {
-    /// Uses the default Vortex Btrblocks compression.
+    /// The default Vortex `BtrBlocks` cascading scheme search.
     #[default]
     Btrblocks,
-    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    /// The default cascade PLUS the Zstd string schemes
+    /// (`StringCode::Zstd` / `ZstdBuffers`) in the search — the encoder picks
+    /// them when they beat FSST/dict on a column. Integer/float columns are
+    /// unchanged (Vortex has no zstd schemes for them at this revision).
+    /// Trades encode CPU and string-decode speed for better ratios on
+    /// long/high-entropy strings.
     Zstd,
 }
 
@@ -253,16 +262,16 @@ pub enum CompressionStrategy {
 ///
 /// zstd-style level scale (`cayenne_delta_encoding` param):
 ///
-/// - `7` (default) — the full default `BtrBlocks` cascade: byte-for-byte
-///   today's write behavior. Levels `8`–`10` are reserved for future
-///   heavier-effort search.
-/// - `auto` (opt-in) — size-gated: a write smaller than a quarter of the
+/// - `auto` (default) — size-gated: a write smaller than a quarter of the
 ///   target file size encodes at a light level (the file is transient by
-///   definition — compaction exists to fold it); larger writes use the full
-///   default encoding.
+///   definition — compaction exists to fold it); larger or unknown-size
+///   writes use the full default encoding.
 /// - `0` — no compression (canonical arrays; cheapest encode).
 /// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
 ///   per-file encoder-strategy search and FSST symbol-table training.
+/// - `7`–`10` — the full default `BtrBlocks` cascade: byte-for-byte the
+///   pre-feature write behavior (`7` is the explicit opt-out of `auto`;
+///   `8`–`10` are reserved for future heavier-effort search).
 ///
 /// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
 /// NOT affected by this setting — they always use the full default encoding,
@@ -281,12 +290,15 @@ pub enum DeltaEncoding {
 }
 
 impl Default for DeltaEncoding {
-    /// `Level(7)` — the full default cascade, i.e. unchanged write behavior.
-    /// This is also what pre-feature stored table configs deserialize to via
-    /// `#[serde(default)]`, so enabling the feature in a new build cannot
-    /// silently change how existing tables encode their deltas.
+    /// `Auto` — size-gated light encoding for small deltas. This is also what
+    /// pre-feature stored table configs deserialize to via
+    /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
+    /// (write-time only; existing data files are unaffected and a level
+    /// change never forces a table re-create). Set the
+    /// `cayenne_delta_encoding` param to `7` to opt out (the full default
+    /// cascade, byte-for-byte the pre-feature behavior).
     fn default() -> Self {
-        Self::Level(DELTA_ENCODING_FULL_LEVEL)
+        Self::Auto
     }
 }
 
@@ -487,11 +499,11 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Encoding effort for delta writes (fresh CDC/append snapshot files).
-    /// `7` (default) is the full default cascade — unchanged write behavior.
-    /// `auto` (opt-in) size-gates: small deltas encode light and are folded
+    /// `auto` (default) size-gates: small deltas encode light and are folded
     /// into properly-encoded files by compaction; explicit `0..=10` pins the
-    /// level. Maintenance writes (compaction, rewrites) always use the full
-    /// default encoding. See [`DeltaEncoding`].
+    /// level (`7` = the full default cascade, the pre-feature behavior).
+    /// Maintenance writes (compaction, rewrites) always use the full default
+    /// encoding. See [`DeltaEncoding`].
     #[serde(default)]
     pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
@@ -741,12 +753,11 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
-            // Level(7) = full default cascade, i.e. unchanged write behavior.
-            // `auto` is deliberately opt-in until validated at CDC scale:
-            // local micro A/B (2026-06-06) was neutral on upsert/bulk lanes
-            // and showed light deltas making in-window compaction passes work
-            // harder (incremental_append +10%); the `auto` thesis (CPU per
-            // delta on the pipelined CDC route) needs a production-scale run.
+            // `auto`: size-gated light encoding for small deltas (re-encoded
+            // by compaction). Local micro A/B (2026-06-06) was neutral on the
+            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+            // production-scale CDC and is to be validated there. Set the
+            // param to `7` to opt out (pre-feature behavior).
             delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,

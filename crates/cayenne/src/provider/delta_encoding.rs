@@ -49,16 +49,43 @@ limitations under the License.
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
-//! `auto` (opt-in; the config default is level `7` = unchanged behavior)
-//! size-gates: a delta smaller than a quarter of the target file size encodes
-//! at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size writes use the full
-//! default. Maintenance writes ([`WriteClass::Maintenance`]) always use the
-//! full default regardless of the configured level.
+//! `auto` (the default) size-gates: a delta smaller than a quarter of the
+//! target file size encodes at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size
+//! writes use the full default. Level `7` is the explicit opt-out
+//! (byte-for-byte the pre-feature behavior). Maintenance writes
+//! ([`WriteClass::Maintenance`]) always use the full default regardless of
+//! the configured level.
 
 use vortex::compressor::{BtrBlocksCompressorBuilder, FloatCode, IntCode, StringCode};
 use vortex::file::WriteStrategyBuilder;
 
-use crate::metadata::{DELTA_ENCODING_FULL_LEVEL, DELTA_ENCODING_MAX_LEVEL, DeltaEncoding};
+use crate::metadata::{
+    CompressionStrategy, DELTA_ENCODING_FULL_LEVEL, DELTA_ENCODING_MAX_LEVEL, DeltaEncoding,
+};
+
+/// Map the table's [`CompressionStrategy`] to the FULL-tier write strategy —
+/// the session-level strategy the base `VortexFormat` carries, used by
+/// maintenance writes and by delta writes that resolve to a full level.
+///
+/// `Btrblocks` returns `None`: the Vortex session default IS the `BtrBlocks`
+/// cascade, so no override is registered (byte-for-byte the pre-feature
+/// behavior). `Zstd` extends the default search with the Zstd string schemes
+/// (which the default deliberately excludes); the cascade then picks them per
+/// column when they win. This is what makes the previously-dormant
+/// `cayenne_compression_strategy=zstd` param real.
+pub(crate) fn full_strategy_builder_for(
+    strategy: &CompressionStrategy,
+) -> Option<WriteStrategyBuilder> {
+    match strategy {
+        CompressionStrategy::Btrblocks => None,
+        CompressionStrategy::Zstd => {
+            let compressor = BtrBlocksCompressorBuilder::default()
+                .include_string([StringCode::Zstd, StringCode::ZstdBuffers])
+                .build();
+            Some(WriteStrategyBuilder::default().with_compressor(compressor))
+        }
+    }
+}
 
 /// Classifies a snapshot write for encoding-policy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,13 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn default_is_full_level_unchanged_behavior() {
-        // The config default must be the full cascade (unchanged write
-        // behavior) — `auto` is opt-in until validated at CDC scale. This is
-        // also the `#[serde(default)]` value pre-feature stored table configs
-        // deserialize to, so a new build cannot silently change how existing
-        // tables encode their deltas.
-        assert_eq!(DeltaEncoding::default(), DeltaEncoding::Level(FULL_LEVEL));
+    fn default_is_auto_with_light_small_deltas_and_full_opt_out() {
+        // Product decision: `auto` ships as the default — small known-size
+        // deltas encode light; large/unknown writes and maintenance stay on
+        // the full cascade. Level 7 is the explicit opt-out.
+        assert_eq!(DeltaEncoding::default(), DeltaEncoding::Auto);
         assert!(
             strategy_builder_for_level(effective_level(
                 DeltaEncoding::default(),
@@ -237,8 +262,28 @@ mod tests {
                 Some(1),
                 TARGET
             ))
+            .is_some(),
+            "default auto must light-encode a small known-size delta"
+        );
+        assert!(
+            strategy_builder_for_level(effective_level(
+                DeltaEncoding::default(),
+                WriteClass::Delta,
+                None,
+                TARGET
+            ))
             .is_none(),
-            "the default encoding must resolve to the session-default (full) strategy"
+            "default auto must keep unknown-size writes on the full strategy"
+        );
+        assert!(
+            strategy_builder_for_level(effective_level(
+                DeltaEncoding::Level(FULL_LEVEL),
+                WriteClass::Delta,
+                Some(1),
+                TARGET
+            ))
+            .is_none(),
+            "level 7 must be the explicit opt-out (full strategy) even for tiny deltas"
         );
     }
 
@@ -298,6 +343,50 @@ mod tests {
         assert_eq!(
             effective_level(DeltaEncoding::Level(9), WriteClass::Delta, None, TARGET),
             9
+        );
+    }
+
+    #[test]
+    fn zstd_full_strategy_includes_zstd_string_schemes() {
+        // Engagement at the mapping level: `zstd` must actually add the Zstd
+        // string schemes to the search (the default set excludes them), and
+        // `btrblocks` must register no override (session default = the
+        // pre-feature cascade). Build the compressors directly to verify.
+        assert!(
+            full_strategy_builder_for(&CompressionStrategy::Btrblocks).is_none(),
+            "btrblocks must use the session-default strategy (no override)"
+        );
+        assert!(
+            full_strategy_builder_for(&CompressionStrategy::Zstd).is_some(),
+            "zstd must register a full-tier strategy override"
+        );
+        let zstd_compressor = BtrBlocksCompressorBuilder::default()
+            .include_string([StringCode::Zstd, StringCode::ZstdBuffers])
+            .build();
+        let codes: Vec<StringCode> = zstd_compressor
+            .string_schemes
+            .iter()
+            .map(|scheme| scheme.code())
+            .collect();
+        // Note: only `Zstd` is registrable at the pinned Vortex revision —
+        // `ZstdBuffers` has a code but its scheme object is not in
+        // `ALL_STRING_SCHEMES`, so `include_string` is a forward-compat no-op
+        // for it until the fork advances.
+        assert!(
+            codes.contains(&StringCode::Zstd),
+            "the zstd full-tier compressor must include the Zstd string \
+             scheme in the search; got {codes:?}"
+        );
+        let default_compressor = BtrBlocksCompressorBuilder::default().build();
+        let default_codes: Vec<StringCode> = default_compressor
+            .string_schemes
+            .iter()
+            .map(|scheme| scheme.code())
+            .collect();
+        assert!(
+            !default_codes.contains(&StringCode::Zstd),
+            "the default cascade must NOT include Zstd (it is the zstd \
+             param's distinguishing addition); got {default_codes:?}"
         );
     }
 

@@ -296,3 +296,7 @@ name = "get_max_delete_sequence_walk"
 [[bench]]
 harness = false
 name = "apply_on_conflict_keys_double_clone"
+
+[[bench]]
+harness = false
+name = "delta_encoding_sweep"

@@ -1272,8 +1272,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
         ParameterSpec::component("delta_encoding")
-            .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. '7' (default) is the full default BtrBlocks cascade — unchanged write behavior. 'auto' size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7..=10 = full default cascade). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
-            .default("7"),
+            .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
+            .default("auto"),
         ParameterSpec::component("pk_conflict_detection")
             .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
             .one_of(&["auto", "none"])
