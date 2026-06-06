@@ -109,8 +109,11 @@ async fn load_cayenne(lane: Metastore) -> CayenneFixture {
     let rows_per_snapshot = BASE_ROWS / PRELOAD_SNAPSHOTS;
     for snapshot in 0..PRELOAD_SNAPSHOTS {
         let start = (snapshot * rows_per_snapshot) as i64;
-        let _ = cayenne_insert(&fixture.table, make_batch(schema(), start, rows_per_snapshot))
-            .await;
+        let _ = cayenne_insert(
+            &fixture.table,
+            make_batch(schema(), start, rows_per_snapshot),
+        )
+        .await;
     }
     fixture
 }
@@ -253,9 +256,7 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
         let merges = bg.merge_count();
         drop(bg);
         drop(fixture);
-        eprintln!(
-            "scan_under_compaction: {lane_label} background subset merges = {merges}"
-        );
+        eprintln!("scan_under_compaction: {lane_label} background subset merges = {merges}");
         assert!(
             merges > 0,
             "{lane_label}: background compactor never merged — the bench did not \

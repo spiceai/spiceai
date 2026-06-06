@@ -264,11 +264,7 @@ fn bench_memory_budget(c: &mut Criterion) {
     for &(budget_label, budget_bytes) in MEMORY_BUDGETS {
         // --- Cayenne read lanes (scan + groupby) on one budgeted fixture.
         {
-            let lane = rt.block_on(setup_budgeted_cayenne(
-                "memory_budget",
-                budget_bytes,
-                false,
-            ));
+            let lane = rt.block_on(setup_budgeted_cayenne("memory_budget", budget_bytes, false));
             let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
             assert!(preload > 0, "cayenne preload must insert rows");
             lane.pool.reset_high_water();
@@ -277,9 +273,7 @@ fn bench_memory_budget(c: &mut Criterion) {
                 // Pre-flight once: a budget the workload cannot fit is a
                 // finding to report, not a panic.
                 if let Err(e) = rt.block_on(try_query(&lane.warm_ctx, sql)) {
-                    eprintln!(
-                        "memory_budget: cayenne/{workload}@{budget_label} SKIPPED — {e}"
-                    );
+                    eprintln!("memory_budget: cayenne/{workload}@{budget_label} SKIPPED — {e}");
                     continue;
                 }
                 lane.pool.reset_high_water();
@@ -320,8 +314,7 @@ fn bench_memory_budget(c: &mut Criterion) {
                 b.iter(|| {
                     rt.block_on(async {
                         let rows =
-                            cayenne_insert_from_parquet(&lane.fixture.table, &upsert_parquet)
-                                .await;
+                            cayenne_insert_from_parquet(&lane.fixture.table, &upsert_parquet).await;
                         black_box(rows);
                     });
                 });

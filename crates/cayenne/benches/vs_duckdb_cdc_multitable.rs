@@ -42,7 +42,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, SamplingMode, Throughput, criterion_group, criterion_main,
+};
 use duckdb::Connection;
 use tokio::runtime::Runtime;
 
@@ -155,12 +157,7 @@ fn bench_cdc_multitable(c: &mut Criterion) {
             // N independent fixtures: own metastore + data dir each, the
             // per-dataset topology spiced creates for a CDC fleet.
             let fixtures: Vec<Arc<CayenneFixture>> = (0..tables)
-                .map(|i| {
-                    Arc::new(rt.block_on(setup_cayenne_for(
-                        &format!("cdc_multi_{i}"),
-                        lane,
-                    )))
-                })
+                .map(|i| Arc::new(rt.block_on(setup_cayenne_for(&format!("cdc_multi_{i}"), lane))))
                 .collect();
 
             // Preload: park every table past the steep start of the
@@ -197,36 +194,30 @@ fn bench_cdc_multitable(c: &mut Criterion) {
             drop(done_tx);
 
             let bench_ctx = format!("vs_duckdb_cdc_multitable/{lane_label}");
-            group.bench_with_input(
-                BenchmarkId::new(&lane_label, tables),
-                &tables,
-                |b, &n| {
-                    b.iter(|| {
-                        rt.block_on(async {
-                            for tx in &go_txs {
-                                tx.send(()).expect("cayenne cdc go-tx (worker exited?)");
-                            }
-                            for i in 0..n {
-                                match tokio::time::timeout(COMPLETION_TIMEOUT, done_rx.recv())
-                                    .await
-                                {
-                                    Ok(Some(())) => {}
-                                    Ok(None) => panic!(
-                                        "{bench_ctx}: done channel closed at completion {}/{n} \
+            group.bench_with_input(BenchmarkId::new(&lane_label, tables), &tables, |b, &n| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        for tx in &go_txs {
+                            tx.send(()).expect("cayenne cdc go-tx (worker exited?)");
+                        }
+                        for i in 0..n {
+                            match tokio::time::timeout(COMPLETION_TIMEOUT, done_rx.recv()).await {
+                                Ok(Some(())) => {}
+                                Ok(None) => panic!(
+                                    "{bench_ctx}: done channel closed at completion {}/{n} \
                                          (worker exited?)",
-                                        i + 1
-                                    ),
-                                    Err(_) => panic!(
-                                        "{bench_ctx}: stalled waiting for writer completion \
+                                    i + 1
+                                ),
+                                Err(_) => panic!(
+                                    "{bench_ctx}: stalled waiting for writer completion \
                                          {}/{n} after {COMPLETION_TIMEOUT:?}",
-                                        i + 1
-                                    ),
-                                }
+                                    i + 1
+                                ),
                             }
-                        });
+                        }
                     });
-                },
-            );
+                });
+            });
 
             // Teardown: dropping the go senders ends each worker loop; join
             // them before the fixtures are torn down.
@@ -288,13 +279,15 @@ fn bench_cdc_multitable(c: &mut Criterion) {
                     tx.send(()).expect("duckdb go-tx (worker exited?)");
                 }
                 for i in 0..n {
-                    done_rx.recv_timeout(COMPLETION_TIMEOUT).unwrap_or_else(|err| {
-                        panic!(
-                            "{bench_ctx}: stalled waiting for writer completion {}/{n} \
+                    done_rx
+                        .recv_timeout(COMPLETION_TIMEOUT)
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "{bench_ctx}: stalled waiting for writer completion {}/{n} \
                              after {COMPLETION_TIMEOUT:?} ({err})",
-                            i + 1
-                        )
-                    });
+                                i + 1
+                            )
+                        });
                 }
             });
         });
