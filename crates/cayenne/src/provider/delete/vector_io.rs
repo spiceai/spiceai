@@ -243,7 +243,7 @@ impl<'a> DeletionVectorWriter<'a> {
                 // see `provider/fsync_tier.rs`.
                 tokio::task::spawn_blocking(move || {
                     let dir = std::fs::File::open(&snapshot_dir)?;
-                    crate::provider::fsync_tier::ordering_sync_std(&dir)
+                    crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
                 })
                 .await
                 .map_err(|source| Error::TaskPanicked { table, source })??;
@@ -595,7 +595,7 @@ async fn write_deletion_file(
         if let Some(parent) = output_path.parent()
             && let Ok(dir) = std::fs::File::open(parent)
         {
-            let _ = crate::provider::fsync_tier::ordering_sync_std(&dir);
+            let _ = crate::provider::fsync_tier::ordering_sync_dir_std(&dir);
         }
 
         Ok(metadata.len())

@@ -219,9 +219,9 @@ fn write_deletion_file_still_fsyncs_parent_dir() {
         .expect("write_deletion_file function not found in delete/vector_io.rs");
 
     assert!(
-        body.contains("ordering_sync_std(&dir)"),
+        body.contains("ordering_sync_dir_std(&dir)"),
         "write_deletion_file must still fsync (ordering tier, \
-         `ordering_sync_std(&dir)`) the parent directory of the deletion \
+         `ordering_sync_dir_std(&dir)`) the parent directory of the deletion \
          vector file. Without this, a crash after the catalog records the \
          path can leave the directory entry unwritten — the catalog now \
          references a file that does not exist on restart."
@@ -311,9 +311,9 @@ fn staged_commit_hot_path_uses_ordering_tier_syncs() {
     let body = extract_fn_body(TABLE_SRC, "sync_snapshot_dir")
         .expect("sync_snapshot_dir function not found in table.rs");
     assert!(
-        body.contains("ordering_sync_std(&dir)"),
+        body.contains("ordering_sync_dir_std(&dir)"),
         "sync_snapshot_dir must flush directory entries with the ordering \
-         tier (`fsync_tier::ordering_sync_std(&dir)`), not `sync_all` or \
+         tier (`fsync_tier::ordering_sync_dir_std(&dir)`), not `sync_all` or \
          `sync_data` (both F_FULLFSYNC on macOS). See the durability-tier \
          rationale in the function body and provider/fsync_tier.rs."
     );

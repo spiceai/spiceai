@@ -3208,7 +3208,7 @@ impl CayenneTableProvider {
             if let Some(parent) = parent {
                 tokio::task::spawn_blocking(move || {
                     let f = std::fs::File::open(&parent)?;
-                    super::fsync_tier::ordering_sync_std(&f)
+                    super::fsync_tier::ordering_sync_dir_std(&f)
                 })
                 .await
                 .map_err(std::io::Error::other)??;
@@ -3601,7 +3601,7 @@ impl CayenneTableProvider {
             // `provider/fsync_tier.rs`.
             let dir = std::fs::File::open(&snapshot_dir)
                 .map_err(|source| CatalogError::IoError { source })?;
-            super::fsync_tier::ordering_sync_std(&dir)
+            super::fsync_tier::ordering_sync_dir_std(&dir)
                 .map_err(|source| CatalogError::IoError { source })?;
             Ok::<(), CatalogError>(())
         })

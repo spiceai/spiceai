@@ -30,12 +30,12 @@ limitations under the License.
 //! ## Why plain `fsync(2)` is the right tier on macOS
 //!
 //! Durability here can't exceed the weakest link, and the weakest link is the
-//! metastore: SQLite runs `journal_mode=WAL, synchronous=NORMAL` with no
+//! metastore: `SQLite` runs `journal_mode=WAL, synchronous=NORMAL` with no
 //! `fullfsync` pragma, so the catalog transaction that makes staged files
 //! *visible* uses plain `fsync(2)` semantics on macOS (NORMAL does not even
 //! fsync on every commit). A power-loss window that loses fsync-tier data
 //! necessarily also loses the catalog rows referencing it. Plain `fsync(2)`
-//! is likewise the macOS default for DuckDB and PostgreSQL — it is the
+//! is likewise the macOS default for `DuckDB` and `PostgreSQL` — it is the
 //! durability bar the rest of the storage industry sets on this platform.
 //! Crash-consistency (process crash, not power loss) is unaffected: the page
 //! cache survives a process crash, and the staging-WAL recovery protocol
@@ -50,7 +50,12 @@ limitations under the License.
 
 use std::io;
 
-/// Ordering-tier sync for a [`std::fs::File`] (file or directory handle).
+/// Ordering-tier sync for a regular-file [`std::fs::File`].
+///
+/// For directory handles use [`ordering_sync_dir_std`] — on non-macOS
+/// platforms `sync_data` is only guaranteed to flush "metadata required to
+/// retrieve the data", and whether that wording covers directory entries is
+/// implementation-defined.
 ///
 /// Call from a blocking context (`spawn_blocking`) — on macOS this issues a
 /// blocking `fsync(2)` (~tens of µs); elsewhere `sync_data` may block on a
@@ -73,7 +78,32 @@ pub(crate) fn ordering_sync_std(file: &std::fs::File) -> io::Result<()> {
     }
 }
 
-/// Ordering-tier sync for a [`tokio::fs::File`].
+/// Ordering-tier sync for a **directory** handle.
+///
+/// Directories get full `fsync` on non-macOS: POSIX only guarantees
+/// `fdatasync` flushes "metadata required to retrieve the data", and whether
+/// that covers directory entries is implementation-defined (Linux treats
+/// them as the directory's data; other platforms may not). `PostgreSQL` and
+/// `SQLite` both use full `fsync` on directories for the same reason. On
+/// Linux `fsync` and `fdatasync` are equivalent for directories (same
+/// journal commit + device flush), so this costs nothing. On macOS the
+/// ordering tier is plain `fsync(2)` either way.
+pub(crate) fn ordering_sync_dir_std(dir: &std::fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ordering_sync_std(dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dir.sync_all()
+    }
+}
+
+/// Ordering-tier sync for a regular-file [`tokio::fs::File`].
+///
+/// For directory handles use [`ordering_sync_dir_tokio_file`] (see
+/// [`ordering_sync_dir_std`] for why directories need full `fsync` on
+/// non-macOS platforms).
 ///
 /// On macOS the `fsync(2)` runs on the blocking pool (mirroring what tokio's
 /// own `sync_data` does internally); elsewhere this delegates to
@@ -103,6 +133,21 @@ pub(crate) async fn ordering_sync_tokio_file(file: &tokio::fs::File) -> io::Resu
     }
 }
 
+/// Ordering-tier sync for a **directory** [`tokio::fs::File`] handle.
+///
+/// See [`ordering_sync_dir_std`] for why directories use full `fsync` on
+/// non-macOS platforms.
+pub(crate) async fn ordering_sync_dir_tokio_file(dir: &tokio::fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ordering_sync_tokio_file(dir).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dir.sync_all().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +162,18 @@ mod tests {
         ordering_sync_std(&file).expect("file ordering sync");
 
         let dir_handle = std::fs::File::open(dir.path()).expect("open dir");
-        ordering_sync_std(&dir_handle).expect("dir ordering sync");
+        ordering_sync_dir_std(&dir_handle).expect("dir ordering sync");
+    }
+
+    #[tokio::test]
+    async fn ordering_sync_dir_tokio_file_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_handle = tokio::fs::File::open(dir.path())
+            .await
+            .expect("open dir handle");
+        ordering_sync_dir_tokio_file(&dir_handle)
+            .await
+            .expect("tokio dir ordering sync");
     }
 
     #[tokio::test]
@@ -129,6 +185,8 @@ mod tests {
             .expect("create probe file");
         use tokio::io::AsyncWriteExt;
         file.write_all(b"ordering-tier probe").await.expect("write");
-        ordering_sync_tokio_file(&file).await.expect("tokio ordering sync");
+        ordering_sync_tokio_file(&file)
+            .await
+            .expect("tokio ordering sync");
     }
 }
