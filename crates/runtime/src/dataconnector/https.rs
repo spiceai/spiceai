@@ -1832,7 +1832,7 @@ mod tests {
         // Using RSA (instead of rcgen default EC) ensures reqwest::Identity::from_pem succeeds
         // reliably on all CI runners (linux + macOS native-tls/rustls backends) for the
         // file-based and inline mTLS client identity coverage tests.
-        const CERT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+        const CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
 MIIDIzCCAgugAwIBAgIUSb5DSV5Kh+Rx2CH3fTGYEPXpgNAwDQYJKoZIhvcNAQEL
 BQAwITEfMB0GA1UEAwwWc3BpY2UtaHR0cC10ZXN0LWNsaWVudDAeFw0yNjA2MDMw
 MzI3NTZaFw0yNjA2MDUwMzI3NTZaMCExHzAdBgNVBAMMFnNwaWNlLWh0dHAtdGVz
@@ -1851,8 +1851,8 @@ CmOcr/NE5DhpJMfg5oTRXQO1qOWobqhoB/6z26LpT6LOkkbU7NYTqgeHC+wQU5Ve
 y9JLAntUo6x4XB+dL/Ec6DCWZn0B+LB8MJkM/Sy2rj1KAb6rJoZpFAwHllGepqbI
 azFN2bb89uBcm6Xy+Xg2TX/bH6XEdHLx2AFlaaFMxYO+siI2IvNz
 -----END CERTIFICATE-----
-"#;
-        const KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+";
+        const KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDSPWF1GXtpetJ8
 2kiVbJioCQw5AbFgVkn7KV6kQo+rrple26ZzVRy3gXPJlVF0735qT/YCGpGUVO6I
 scOtnWHOwy+3pEAZio51W7SnTa6uzJVjForrqmjhvwuO5BZH3vEBp1ZC+VQ2Udyp
@@ -1880,7 +1880,7 @@ LimqRMVJsrPIIYJGEZjCVUCExqxKvhBt1ueVxomk+n6J+U8DYwMH4m4GF6YjTW6F
 BK4GgbAupmwJeJht3XVuLKbxPOj3F/Ubz/vBFScFa7o/mgLpfFOFY5509vOoEcki
 uGgYIHbi/F+GaiUPzDyqe5p9
 -----END PRIVATE KEY-----
-"#;
+";
         (CERT_PEM.to_string(), KEY_PEM.to_string())
     }
 
@@ -2398,7 +2398,9 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 assert_eq!(cert_path, PathBuf::from("/certs/client.pem"));
                 assert_eq!(key_path, PathBuf::from("/certs/client.key"));
             }
-            other => panic!("expected file-based identity config, got {other:?}"),
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected file-based identity config, got {config:?}")
+            }
         }
     }
 
@@ -2427,7 +2429,9 @@ uGgYIHbi/F+GaiUPzDyqe5p9
                 assert!(cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
                 assert!(key_pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
             }
-            other => panic!("expected inline identity config, got {other:?}"),
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected inline identity config, got {config:?}")
+            }
         }
     }
 
@@ -2591,9 +2595,12 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         let connector = test_connector_with(&[
             (
                 "http_tls_client_certificate_file",
-                cert_path.to_str().unwrap(),
+                cert_path.to_str().expect("temp cert path is valid UTF-8"),
             ),
-            ("http_tls_client_key_file", key_path.to_str().unwrap()),
+            (
+                "http_tls_client_key_file",
+                key_path.to_str().expect("temp key path is valid UTF-8"),
+            ),
         ])
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
