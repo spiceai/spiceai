@@ -90,6 +90,12 @@ impl SpiceAI {
     /// This is the shared constructor used by both the data connector factory
     /// (`SpiceAIFactory::create`) and the Spice Cloud catalog connector, so
     /// neither needs to go through the `DataConnector` trait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnableToCreateFlightClient`] when the Flight client
+    /// cannot be constructed from the provided URL, credentials, TLS options,
+    /// or message-size configuration.
     pub async fn from_raw(
         url: String,
         credentials: Credentials,
@@ -147,6 +153,12 @@ impl SpiceAI {
     ///
     /// Spice AI datasets have the following format for `dataset.path()`:
     /// `<org>/<app>/datasets/<dataset_name>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidMetadataValue`] when the parsed `<org>` or
+    /// `<app>` contains non-ASCII characters and therefore cannot be encoded
+    /// as gRPC metadata.
     pub fn spice_dataset_path(name: &TableReference, path: &str) -> Result<SpiceAIDatasetPath> {
         if is_flight_endpoint_path(path) {
             return Ok(SpiceAIDatasetPath::Path(name.clone()));

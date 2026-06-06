@@ -51,7 +51,6 @@ use datafusion_proto::bytes::Serializeable;
 
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
-use builder::RuntimeBuilder;
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
