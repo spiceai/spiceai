@@ -753,27 +753,21 @@ impl KafkaConsumer {
                     })?;
 
                 // Collect a burst of messages from the window in one fetch.
-                // The first `next()` triggers a network round-trip; subsequent
-                // messages are served from the local buffer. We rely on the
-                // short per-poll timeout for non-first polls to naturally stop
-                // when the buffer is exhausted.
+                // After a seek, the consumer may need one or more broker
+                // round-trips to fill the local buffer, so every poll uses the
+                // same timeout rather than assuming messages are already
+                // buffered after the first poll.
                 let mut stream = Box::pin(temp_consumer.consumer.stream());
                 let mut burst = Vec::new();
-                let mut is_first_poll = true;
 
                 while burst.len() < TOMBSTONE_SCAN_WINDOW as usize {
-                    let poll_timeout = if is_first_poll {
-                        std::cmp::min(
-                            Duration::from_secs(5),
-                            deadline.saturating_duration_since(Instant::now()),
-                        )
-                    } else {
-                        Duration::from_millis(100)
-                    };
+                    let poll_timeout = std::cmp::min(
+                        Duration::from_secs(5),
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
 
                     match tokio::time::timeout(poll_timeout, stream.next()).await {
                         Ok(Some(Ok(msg))) => {
-                            is_first_poll = false;
                             if msg.offset() > window_end {
                                 break; // Past the window
                             }

@@ -249,6 +249,57 @@ where
     Ok(())
 }
 
+/// Send a tombstone (null payload) message to a Kafka topic.
+pub async fn send_tombstone_to_kafka(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: i32,
+    key: &str,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 5;
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let key_owned = key.to_string();
+    let mut last_error = None;
+    for attempt in 0..=MAX_RETRIES {
+        let record = FutureRecord::to(topic)
+            .partition(partition)
+            .key(&key_owned)
+            .payload(&None::<String>);
+
+        match producer.send(record, QUEUE_TIMEOUT).await {
+            Ok(_) => {
+                if attempt > 0 {
+                    tracing::debug!("Tombstone sent successfully after {attempt} retries");
+                }
+                last_error = None;
+                break;
+            }
+            Err((e, _)) if attempt < MAX_RETRIES => {
+                tracing::debug!(
+                    "Kafka tombstone send failed (attempt {}/{}): {e}. Retrying in {DELAY_S} seconds",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                );
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_secs(DELAY_S)).await;
+            }
+            Err((e, _)) => {
+                last_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(e) = last_error {
+        return Err(anyhow::Error::msg(format!(
+            "Kafka tombstone delivery failed after {} attempts: {e}",
+            MAX_RETRIES + 1,
+        )));
+    }
+    Ok(())
+}
+
 pub fn make_kafka_dataset(
     path: &str,
     name: &str,
