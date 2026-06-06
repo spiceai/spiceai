@@ -6048,6 +6048,17 @@ impl CayenneTableProvider {
             }
         }
 
+        // This is the O(corpus) inline-rewrite fallback (still live on the
+        // inline-insert path). Count it only when it actually removed superseded
+        // inline rows, so the tombstone-vs-rewrite ratio (paired with
+        // `track_cayenne_inline_tombstone_write`) reflects real rewrite work.
+        if rewrite.removed_rows > 0 {
+            telemetry::track_cayenne_inline_rewrite_fallback(&[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )]);
+        }
+
         Ok(rewrite)
     }
 
@@ -6941,6 +6952,19 @@ impl CayenneTableProvider {
             keys = delete_count,
             delete_sequence,
             "Wrote inline tombstone for upserted PK(s)"
+        );
+
+        // Confirm the cheap tombstone path was taken (vs the O(corpus) inline
+        // rewrite fallback below). Counts one tombstone write plus the number of
+        // keys hidden, dimensioned by table; pair with the rewrite-fallback
+        // counter in `build_inlined_data_rewrite_for_pk_keys` to observe the
+        // tombstone-vs-rewrite ratio.
+        telemetry::track_cayenne_inline_tombstone_write(
+            u64::try_from(delete_count).unwrap_or(u64::MAX),
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )],
         );
 
         Ok(true)
@@ -15336,6 +15360,468 @@ mod tests {
         assert!(
             !pairs.contains(&(3, 30)),
             "old inline hidden, got {pairs:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Composite-PK (RowConverterBased) inline-tombstone coverage. The helpers
+    // above all build a single Int64 PK -> `Int64Pk` strategy. The hot CDC
+    // tables are composite-PK -> `RowConverterBased`, which is ALSO the branch
+    // the `build_pk_deletion_row_keys` Cow fix optimizes (it reuses the caller's
+    // already-encoded keys verbatim instead of cloning). These helpers build a
+    // 2-column PK `(region, id)` so the strategy resolves to `RowConverterBased`.
+    // ------------------------------------------------------------------------
+
+    /// Inline-enabled upsert table with a COMPOSITE primary key `(region, id)`.
+    /// Two PK columns (and a non-Int64 leading column) force the
+    /// `RowConverterBased` deletion strategy (see the `Int64Pk` gate in
+    /// `CayenneTableProvider::create`, which requires a single Int64 PK column).
+    async fn create_composite_pk_inline_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["region".to_string(), "id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "region".to_string(),
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Keep the default inline admission window so small batches inline.
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                ..VortexConfig::default()
+            },
+        };
+
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("composite-PK table created");
+        (provider, catalog, temp_dir)
+    }
+
+    fn region_id_value_batch(
+        schema: SchemaRef,
+        regions: &[&str],
+        ids: &[i64],
+        values: &[i64],
+    ) -> RecordBatch {
+        use arrow::array::Int64Array;
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(regions.to_vec())),
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .expect("region/id/value batch is valid")
+    }
+
+    /// Large composite-PK batch (exceeds `INLINE_MAX_ROWS`) containing one
+    /// conflict row `(conflict_region, conflict_id) -> conflict_value` plus unique
+    /// filler rows, so the write takes the staged-file path and on-conflict
+    /// resolution writes an inline tombstone for the prior inline copy.
+    fn large_composite_upsert_batch_with_conflict(
+        schema: SchemaRef,
+        conflict_region: &str,
+        conflict_id: i64,
+        conflict_value: i64,
+        filler_start: i64,
+    ) -> RecordBatch {
+        let filler_rows = INLINE_MAX_ROWS + 8;
+        let mut regions: Vec<&str> = Vec::with_capacity(filler_rows + 1);
+        let mut ids = Vec::with_capacity(filler_rows + 1);
+        let mut values = Vec::with_capacity(filler_rows + 1);
+        regions.push(conflict_region);
+        ids.push(conflict_id);
+        values.push(conflict_value);
+        for offset in 0..filler_rows {
+            let pk = filler_start + i64::try_from(offset).expect("filler offset fits in i64");
+            // "filler" region keeps these PKs disjoint from the conflict key.
+            regions.push("filler");
+            ids.push(pk);
+            values.push(pk * 10);
+        }
+        region_id_value_batch(schema, &regions, &ids, &values)
+    }
+
+    /// Read back all `(region, id, value)` triples, sorted, for assertion.
+    async fn collect_region_id_value_rows(
+        ctx: &SessionContext,
+        provider: &CayenneTableProvider,
+        table_name: &str,
+    ) -> Vec<(String, i64, i64)> {
+        use arrow::array::Int64Array;
+        let batches = read_all(ctx, provider, table_name).await;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let region_idx = batch.schema().index_of("region").expect("region column");
+            let id_idx = batch.schema().index_of("id").expect("id column");
+            let value_idx = batch.schema().index_of("value").expect("value column");
+            let regions = batch
+                .column(region_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("region is Utf8");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let values = batch
+                .column(value_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value is Int64");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    regions.value(row).to_string(),
+                    ids.value(row),
+                    values.value(row),
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Composite-PK (`RowConverterBased`) inline-tombstone upsert: seed a small
+    /// inline row at composite PK `("us", 1)`, then upsert the SAME composite PK
+    /// via a large (file-path) batch. The prior inline copy must be HIDDEN by an
+    /// inline tombstone, only the new value visible, exactly one row for that PK —
+    /// asserted through a real `SELECT *` scan. This is the branch the Cow fix
+    /// optimizes (it forwards the caller's encoded keys without cloning), so the
+    /// test first asserts the strategy really is `RowConverterBased` (it must not
+    /// silently pass as `Int64Pk`).
+    #[tokio::test]
+    async fn test_inline_tombstone_composite_pk_hides_old_inline_row() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_composite_pk_inline_table("inline_tombstone_composite", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Guard: the table MUST use the composite/general strategy, not the
+        // Int64 fast path — otherwise this would not exercise the Cow branch.
+        assert!(
+            matches!(
+                provider.pk_deletion_strategy(),
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "composite PK must resolve to the RowConverterBased deletion strategy"
+        );
+
+        // Seed composite PK ("us", 1) -> 10 inline (small batch).
+        insert_batch(
+            &provider,
+            region_id_value_batch(Arc::clone(&schema), &["us"], &[1], &[10]),
+        )
+        .await;
+        assert!(
+            provider.cached_inlined_row_count() > 0,
+            "precondition: first small batch must land in the inline memtable"
+        );
+
+        // Large upsert containing the SAME composite PK ("us", 1) -> 999. The old
+        // inline copy is hidden by an inline tombstone; the replacement is a file
+        // row at a higher sequence.
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(large_composite_upsert_batch_with_conflict(
+                    Arc::clone(&schema),
+                    "us",
+                    1,
+                    999,
+                    1_000,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("composite-PK cdc upsert over inline row should succeed");
+        if write.has_pending_finalize() {
+            write.finish().await.expect("finalize staged upsert");
+        }
+
+        // An inline tombstone was written (this is the path under test).
+        assert!(
+            !catalog
+                .get_inlined_deletes(&provider.table_metadata.table_id)
+                .await
+                .expect("read inline tombstones")
+                .is_empty(),
+            "the composite-PK inline-conflicting upsert must write an inline tombstone"
+        );
+
+        let rows =
+            collect_region_id_value_rows(&ctx, &provider, "inline_tombstone_composite").await;
+        assert!(
+            rows.contains(&("us".to_string(), 1, 999)),
+            "replacement value for composite PK (\"us\", 1) must be visible, got {rows:?}"
+        );
+        assert!(
+            !rows.contains(&("us".to_string(), 1, 10)),
+            "old inline value for composite PK (\"us\", 1) must be hidden by the tombstone, got {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(region, id, _)| region == "us" && *id == 1)
+                .count(),
+            1,
+            "exactly one visible row for composite PK (\"us\", 1), got {rows:?}"
+        );
+    }
+
+    /// One `apply_on_conflict_deletions` batch where BOTH an inline conflict and a
+    /// file-backed key conflict are present. Seed PK=1 INLINE (small batch) and
+    /// PK=2 in a FILE (large batch), then upsert BOTH 1 and 2 in a single large
+    /// batch. That single on-conflict resolution has `has_inlined_deletions` (for
+    /// PK=1) AND file-backed key deletions (for PK=2), both sharing the reserved
+    /// `delete_sequence`. Assert the inline tombstone AND a file `DeleteFile` were
+    /// both written at that shared sequence, and the scan shows only the latest
+    /// value for each PK (no resurrect of either old copy).
+    #[tokio::test]
+    async fn test_on_conflict_mixed_inline_and_file_delete_in_one_batch() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_inline_enabled_upsert_table("mixed_inline_file_delete", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Seed PK=1 INLINE via a small batch.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        assert!(
+            provider.cached_inlined_row_count() > 0,
+            "precondition: PK=1 must be inline"
+        );
+
+        // Seed PK=2 into a FILE via a large batch (exceeds the inline window). It
+        // carries no conflict (PK=2 is new), so no deletions yet.
+        let seed_file = provider
+            .write_cdc_append_stream(
+                single_batch_stream(large_upsert_batch_with_conflict(
+                    Arc::clone(&schema),
+                    2,
+                    20,
+                    500_000,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seeding PK=2 into a file should succeed");
+        if seed_file.has_pending_finalize() {
+            seed_file.finish().await.expect("finalize file seed");
+        }
+        assert!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("read inline tombstones")
+                .is_empty(),
+            "no inline tombstone should exist before the mixed-conflict upsert"
+        );
+
+        // Single large batch upserting BOTH PK=1 (inline conflict -> tombstone) and
+        // PK=2 (file conflict -> file DeleteFile). The conflict row is PK=1; PK=2
+        // is added as an extra explicit conflict row so the same batch supersedes
+        // the file-backed PK=2 as well.
+        let mixed = large_upsert_batch_with_conflict(Arc::clone(&schema), 1, 111, 600_000);
+        let mixed = {
+            // Append the PK=2 -> 222 conflict row to the large batch.
+            use arrow::array::Int64Array;
+            let ids = mixed
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let values = mixed
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value is Int64");
+            let mut id_vec: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
+            let mut value_vec: Vec<i64> = (0..values.len()).map(|i| values.value(i)).collect();
+            id_vec.push(2);
+            value_vec.push(222);
+            id_value_batch(Arc::clone(&schema), &id_vec, &value_vec)
+        };
+
+        let write = provider
+            .write_cdc_append_stream(single_batch_stream(mixed), &ctx.task_ctx())
+            .await
+            .expect("mixed inline+file conflict upsert should succeed");
+        if write.has_pending_finalize() {
+            write.finish().await.expect("finalize mixed upsert");
+        }
+
+        // The inline tombstone (for PK=1) must be durably written.
+        let tombstones = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("read inline tombstones");
+        assert!(
+            !tombstones.is_empty(),
+            "an inline tombstone must be written for the inline-conflicting PK=1"
+        );
+        let tombstone_seq = tombstones
+            .iter()
+            .map(|t| t.sequence_number)
+            .max()
+            .expect("at least one tombstone");
+
+        // The file `DeleteFile` (for PK=2) must be durably written.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("read delete files");
+        assert!(
+            !delete_files.is_empty(),
+            "a file DeleteFile must be written for the file-conflicting PK=2"
+        );
+
+        // Both express the same "hide the prior version" intent at the SHARED
+        // reserved `delete_sequence`: the tombstone sequence must equal the
+        // DeleteFile sequence written by the same on-conflict batch.
+        assert!(
+            delete_files
+                .iter()
+                .any(|df| df.sequence_number == tombstone_seq),
+            "the inline tombstone (seq {tombstone_seq}) and a file DeleteFile must share the on-conflict delete_sequence; delete files: {:?}",
+            delete_files
+                .iter()
+                .map(|df| df.sequence_number)
+                .collect::<Vec<_>>()
+        );
+
+        // Observable result: only the latest value for each PK, no resurrected copy.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "mixed_inline_file_delete").await;
+        assert!(
+            pairs.contains(&(1, 111)),
+            "PK=1 replacement (inline-superseded) visible, got {pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&(1, 10)),
+            "old inline PK=1 must be hidden, got {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(2, 222)),
+            "PK=2 replacement (file-superseded) visible, got {pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&(2, 20)),
+            "old file PK=2 must be hidden, got {pairs:?}"
+        );
+        assert_eq!(
+            pairs.iter().filter(|(id, _)| *id == 1).count(),
+            1,
+            "exactly one visible row for PK=1, got {pairs:?}"
+        );
+        assert_eq!(
+            pairs.iter().filter(|(id, _)| *id == 2).count(),
+            1,
+            "exactly one visible row for PK=2, got {pairs:?}"
+        );
+    }
+
+    /// Position-based (PK-less) upsert-less table. An empty `primary_key` resolves
+    /// to the `PositionBased` deletion strategy (see `CayenneTableProvider::create`).
+    async fn create_position_based_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        };
+
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("position-based table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// Position-based tables have no PK and never apply inline deletion filtering,
+    /// so `add_inlined_tombstone` must early-return `Ok(false)` and write NOTHING
+    /// (the `is_position_based()` guard). Drives the real metastore: asserts the
+    /// return value is `false` and no inline tombstone row was persisted.
+    #[tokio::test]
+    async fn test_add_inlined_tombstone_position_based_is_noop() {
+        let ctx = SessionContext::new();
+        // A table with NO primary key resolves to the position-based strategy.
+        let (provider, catalog, _tmp) =
+            create_position_based_table("position_tombstone_noop", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        assert!(
+            provider.pk_deletion_strategy().is_position_based(),
+            "precondition: table must use the position-based deletion strategy"
+        );
+
+        // Call the tombstone writer directly with non-empty key inputs; the
+        // position-based guard must short-circuit before any durable write.
+        let row_key: Box<[u8]> = vec![0_u8, 0, 0, 1].into_boxed_slice();
+        let written = provider
+            .add_inlined_tombstone(&[1, 2, 3], std::slice::from_ref(&row_key), 7)
+            .await
+            .expect("add_inlined_tombstone must not error for a position-based table");
+
+        assert!(
+            !written,
+            "add_inlined_tombstone must return Ok(false) for a position-based table"
+        );
+        assert!(
+            catalog
+                .get_inlined_deletes(&table_id)
+                .await
+                .expect("read inline tombstones")
+                .is_empty(),
+            "a position-based table must persist no inline tombstone"
         );
     }
 
