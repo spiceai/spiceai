@@ -114,8 +114,9 @@ impl CayenneContext {
         shard: Option<WriteShardConfig>,
     ) -> Arc<VortexFormat> {
         let session = VortexSession::default().set(strategy);
-        let format = VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
-            .with_dataset_label(self.dataset.as_str());
+        let format =
+            VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
+                .with_dataset_label(self.dataset.as_str());
         let format = match shard {
             Some(config) => format.with_write_shard(config),
             None => format,

@@ -4238,16 +4238,13 @@ impl CayenneTableProvider {
             estimated_bytes,
             target_size_bytes,
         );
-        let write_format =
-            match super::delta_encoding::strategy_builder_for_level(encoding_level) {
-                Some(strategy) => self.context.write_format_with_strategy(
-                    strategy,
-                    self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
-                ),
-                None => {
-                    self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes)
-                }
-            };
+        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
+            Some(strategy) => self.context.write_format_with_strategy(
+                strategy,
+                self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
+            ),
+            None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+        };
 
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
@@ -4468,8 +4465,11 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
-        match self.write_shard_config(session_target_partitions, target_size_bytes, estimated_bytes)
-        {
+        match self.write_shard_config(
+            session_target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+        ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
             None => Arc::clone(base),
         }

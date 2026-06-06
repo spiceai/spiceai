@@ -253,16 +253,16 @@ pub enum CompressionStrategy {
 ///
 /// zstd-style level scale (`cayenne_delta_encoding` param):
 ///
-/// - `auto` (default) — size-gated: a write smaller than a quarter of the
+/// - `7` (default) — the full default `BtrBlocks` cascade: byte-for-byte
+///   today's write behavior. Levels `8`–`10` are reserved for future
+///   heavier-effort search.
+/// - `auto` (opt-in) — size-gated: a write smaller than a quarter of the
 ///   target file size encodes at a light level (the file is transient by
 ///   definition — compaction exists to fold it); larger writes use the full
 ///   default encoding.
 /// - `0` — no compression (canonical arrays; cheapest encode).
 /// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
-///   per-file encoder-strategy search and FSST symbol-table training that
-///   dominate small-write encode cost.
-/// - `7`–`10` — the full default `BtrBlocks` cascade (today's behavior; the
-///   upper levels are reserved for future heavier-effort search).
+///   per-file encoder-strategy search and FSST symbol-table training.
 ///
 /// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
 /// NOT affected by this setting — they always use the full default encoding,
@@ -271,18 +271,32 @@ pub enum CompressionStrategy {
 ///
 /// The exact level → scheme-set mapping lives in
 /// `provider::delta_encoding::strategy_builder_for_level`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum DeltaEncoding {
     /// Size-gated: light for small deltas, full for large writes.
-    #[default]
     Auto,
     /// Fixed encoding level `0..=10` applied to every delta write.
     Level(u8),
 }
 
+impl Default for DeltaEncoding {
+    /// `Level(7)` — the full default cascade, i.e. unchanged write behavior.
+    /// This is also what pre-feature stored table configs deserialize to via
+    /// `#[serde(default)]`, so enabling the feature in a new build cannot
+    /// silently change how existing tables encode their deltas.
+    fn default() -> Self {
+        Self::Level(DELTA_ENCODING_FULL_LEVEL)
+    }
+}
+
 /// Maximum supported [`DeltaEncoding`] level.
 pub const DELTA_ENCODING_MAX_LEVEL: u8 = 10;
+
+/// First level that maps to the full default `BtrBlocks` cascade (levels
+/// `7..=10` are all "full" today). Shared with
+/// `provider::delta_encoding::FULL_LEVEL` so the two can't drift.
+pub const DELTA_ENCODING_FULL_LEVEL: u8 = 7;
 
 impl std::fmt::Display for DeltaEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -473,7 +487,8 @@ pub struct VortexConfig {
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
     /// Encoding effort for delta writes (fresh CDC/append snapshot files).
-    /// `auto` (default) size-gates: small deltas encode light and are folded
+    /// `7` (default) is the full default cascade — unchanged write behavior.
+    /// `auto` (opt-in) size-gates: small deltas encode light and are folded
     /// into properly-encoded files by compaction; explicit `0..=10` pins the
     /// level. Maintenance writes (compaction, rewrites) always use the full
     /// default encoding. See [`DeltaEncoding`].
@@ -726,6 +741,12 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
+            // Level(7) = full default cascade, i.e. unchanged write behavior.
+            // `auto` is deliberately opt-in until validated at CDC scale:
+            // local micro A/B (2026-06-06) was neutral on upsert/bulk lanes
+            // and showed light deltas making in-window compaction passes work
+            // harder (incremental_append +10%); the `auto` thesis (CPU per
+            // delta on the pipelined CDC route) needs a production-scale run.
             delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,

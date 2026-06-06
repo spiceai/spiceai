@@ -91,7 +91,8 @@ async fn create_table_with_encoding(
         partition_column: None,
         vortex_config,
     };
-    let catalog: Arc<dyn MetadataCatalog> = Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
     let ctx = SessionContext::new();
     Arc::new(
         CayenneTableProvider::create_table(catalog, options, ctx.runtime_env())
@@ -153,13 +154,20 @@ async fn delta_encoding_levels_are_correct_and_actually_engage() {
     let written_full = insert_batch(&full_table, batch)
         .await
         .expect("insert level 9");
-    assert_eq!(written_level0 as usize, ROW_COUNT, "level-0 insert row count");
+    assert_eq!(
+        written_level0 as usize, ROW_COUNT,
+        "level-0 insert row count"
+    );
     assert_eq!(written_full as usize, ROW_COUNT, "level-9 insert row count");
 
     // Correctness: both tables return exactly the inserted rows.
     let level0_rows = scan_all_rows(&uncompressed_table, "delta_enc_level0").await;
     let full_rows = scan_all_rows(&full_table, "delta_enc_level9").await;
-    assert_eq!(total_rows(&level0_rows), ROW_COUNT, "level-0 scan row count");
+    assert_eq!(
+        total_rows(&level0_rows),
+        ROW_COUNT,
+        "level-0 scan row count"
+    );
     assert_eq!(total_rows(&full_rows), ROW_COUNT, "level-9 scan row count");
     let level0_pretty =
         arrow::util::pretty::pretty_format_batches(&level0_rows).expect("format level-0");

@@ -25,14 +25,16 @@ limitations under the License.
 //! almost nothing. A compaction output is the long-lived artifact whose
 //! encoding pays for scan throughput, storage footprint, and (on S3) egress.
 //!
-//! Profiling a 2,000-row staged upsert showed the dominant fixed cost was the
-//! Vortex `BtrBlocks` per-file encoder-strategy search plus FSST symbol-table
-//! training (~10-12 ms per file regardless of row count) — big-file
-//! compression machinery paid on every small delta and then discarded at the
-//! next compaction pass. This is the storage-engine-universal per-level
-//! pattern: `RocksDB` flushes L0 with no/light compression and re-compresses
-//! at deeper levels, `ClickHouse` re-compresses on merge, and lakehouse
-//! `OPTIMIZE`/compaction rewrites small commits with proper encoding.
+//! Every delta write pays the Vortex `BtrBlocks` per-file encoder-strategy
+//! search (per column, with FSST symbol-table training for strings) for an
+//! encoding that is discarded at the next compaction pass. Local micro-benches
+//! showed this cost to be small per 2k-row delta on a laptop; the per-level
+//! design exists for the aggregate CPU spent across millions of CDC deltas at
+//! production scale, and as an explicit A/B knob for measuring exactly that.
+//! This is the storage-engine-universal per-level pattern: `RocksDB` flushes
+//! L0 with no/light compression and re-compresses at deeper levels,
+//! `ClickHouse` re-compresses on merge, and lakehouse `OPTIMIZE`/compaction
+//! rewrites small commits with proper encoding.
 //!
 //! ## The level scale
 //!
@@ -47,15 +49,16 @@ limitations under the License.
 //! | 4–6 | full default **minus FSST** (skips symbol-table training, keeps the rest) |
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
-//! `auto` (the default) size-gates: a delta smaller than a quarter of the
-//! target file size encodes at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size
-//! writes use the full default. Maintenance writes ([`WriteClass::Maintenance`])
-//! always use the full default regardless of the configured level.
+//! `auto` (opt-in; the config default is level `7` = unchanged behavior)
+//! size-gates: a delta smaller than a quarter of the target file size encodes
+//! at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size writes use the full
+//! default. Maintenance writes ([`WriteClass::Maintenance`]) always use the
+//! full default regardless of the configured level.
 
 use vortex::compressor::{BtrBlocksCompressorBuilder, FloatCode, IntCode, StringCode};
 use vortex::file::WriteStrategyBuilder;
 
-use crate::metadata::{DELTA_ENCODING_MAX_LEVEL, DeltaEncoding};
+use crate::metadata::{DELTA_ENCODING_FULL_LEVEL, DELTA_ENCODING_MAX_LEVEL, DeltaEncoding};
 
 /// Classifies a snapshot write for encoding-policy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +74,9 @@ pub(crate) enum WriteClass {
 
 /// Level used for every [`WriteClass::Maintenance`] write and for large /
 /// unknown-size deltas under `auto`: the full default `BtrBlocks` cascade.
-pub(crate) const FULL_LEVEL: u8 = 7;
+/// Aliases the metadata constant so the config default and the mapping
+/// boundary can't drift apart.
+pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
 
 /// Level chosen by `auto` for small deltas. `Constant + Sparse + Dict` keeps
 /// the big repetitive-CDC wins (often 3-5×) while skipping the per-file
@@ -215,6 +220,26 @@ mod tests {
         assert!("11".parse::<DeltaEncoding>().is_err());
         assert!("fast".parse::<DeltaEncoding>().is_err());
         assert!("-1".parse::<DeltaEncoding>().is_err());
+    }
+
+    #[test]
+    fn default_is_full_level_unchanged_behavior() {
+        // The config default must be the full cascade (unchanged write
+        // behavior) — `auto` is opt-in until validated at CDC scale. This is
+        // also the `#[serde(default)]` value pre-feature stored table configs
+        // deserialize to, so a new build cannot silently change how existing
+        // tables encode their deltas.
+        assert_eq!(DeltaEncoding::default(), DeltaEncoding::Level(FULL_LEVEL));
+        assert!(
+            strategy_builder_for_level(effective_level(
+                DeltaEncoding::default(),
+                WriteClass::Delta,
+                Some(1),
+                TARGET
+            ))
+            .is_none(),
+            "the default encoding must resolve to the session-default (full) strategy"
+        );
     }
 
     #[test]
