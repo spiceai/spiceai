@@ -8694,9 +8694,32 @@ impl CayenneTableProvider {
         }
 
         let target_size_bytes = self.context.target_file_size_bytes();
-        // Protected-snapshot compaction exists to collapse read fan-out, so do
-        // not use the append-time write shard fan-out for the merged output.
-        let target_partitions = 1;
+        // Size-aware parallel merge encode (EFF-1 / Pattern 12). Passing the
+        // selected inputs' total bytes lets `snapshot_shard_count` size the
+        // encoder fan-out as ceil(bytes / target_file_size), capped at the
+        // write concurrency and the process-global encode budget:
+        //
+        // - a merge whose output fits one target file still floors to ONE
+        //   shard — exactly one output file, so the read fan-out this
+        //   compaction exists to collapse is unchanged for small merges;
+        // - a merge spanning multiple target files was always going to emit
+        //   multiple files; it now encodes them in parallel (PK-hash
+        //   clustered, like the append path) instead of streaming the whole
+        //   tier through one core.
+        //
+        // Two single-writer safety cases are preserved:
+        // - sorted tables: `snapshot_shard_count` returns 1 when
+        //   `has_sort_columns()` — sharding a globally sorted stream would
+        //   scatter its order across files;
+        // - position-delete tables: their tombstones are file-path scoped and
+        //   the rewrite's position bake-in assumes a single output sequence,
+        //   so they keep the serial single-file shape explicitly.
+        let (target_partitions, estimated_bytes) = if self.pk_deletion_strategy.is_position_based()
+        {
+            (1, None)
+        } else {
+            (state.config().target_partitions(), Some(total_input_bytes))
+        };
         let write_start = std::time::Instant::now();
         let write_result = self
             .write_to_snapshot(
@@ -8704,10 +8727,10 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 &new_snapshot_id,
                 target_partitions,
-                // Protected-snapshot compaction pins `target_partitions = 1` to
-                // collapse read fan-out, so the shard count is forced to 1; no
-                // size estimate needed.
-                None,
+                // Total bytes of the selected tier inputs — the size estimate
+                // that drives the shard-count floor above. `None` (single
+                // serial writer) for position-delete tables.
+                estimated_bytes,
             )
             .await;
 
@@ -12860,6 +12883,150 @@ mod tests {
                 persisted.get(id),
             );
         }
+    }
+
+    /// Engagement test for the size-aware PARALLEL merge encode: a subset
+    /// merge whose selected inputs exceed one target file must shard its
+    /// output across multiple concurrently-encoded files (bounded by the
+    /// write concurrency), while preserving every visible row. The sibling
+    /// test above covers the floor: a merge smaller than one target file
+    /// stays a single output file (read fan-out unchanged).
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_parallelizes_large_merges() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        const TRIGGER: usize = 4;
+        /// Rows per snapshot × ~2 KiB payload ≈ 400 KiB per snapshot; six
+        /// snapshots ≈ 2.4 MiB total — more than two 1 MiB target files, so
+        /// the merge earns >1 encoder shard.
+        const ROWS_PER_SNAPSHOT: i64 = 200;
+        const PAYLOAD_BYTES: usize = 2048;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_subset_parallel".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                // 1 MiB target files so the merged tier spans several of them.
+                target_vortex_file_size_mb: 1,
+                compaction_trigger_protected_snapshots: TRIGGER,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        let compaction_setup_guard = provider.compaction_lock.lock().await;
+
+        let snapshots = i64::try_from(TRIGGER).expect("TRIGGER fits in i64") + 2;
+        let mut expected_rows: usize = 0;
+        for snapshot in 0..snapshots {
+            let start = snapshot * ROWS_PER_SNAPSHOT;
+            let ids: Vec<i64> = (start..start + ROWS_PER_SNAPSHOT).collect();
+            let payloads: Vec<String> = ids
+                .iter()
+                .map(|id| format!("{id:08}_{}", "p".repeat(PAYLOAD_BYTES)))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(payloads)),
+                ],
+            )
+            .expect("payload batch");
+            expected_rows += batch.num_rows();
+            insert_batch(&provider, batch).await;
+        }
+
+        let before: std::collections::HashSet<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            before.len() >= TRIGGER,
+            "expected >= {TRIGGER} protected snapshots before compaction"
+        );
+        drop(compaction_setup_guard);
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(merged, "a tier with >= {TRIGGER} runs should have merged");
+
+        // Find the NEW merged snapshot and count its vortex shard files.
+        let after = provider.protected_snapshots.load_full();
+        let new_snapshot = after
+            .keys()
+            .find(|id| !before.contains(*id))
+            .expect("the merge must publish a new protected snapshot")
+            .clone();
+        let snapshot_dir = std::path::Path::new(&data_dir)
+            .join(&provider.table_metadata.table_id)
+            .join(&new_snapshot);
+        let mut shard_files = 0_usize;
+        for entry in std::fs::read_dir(&snapshot_dir).expect("read merged snapshot dir") {
+            let entry = entry.expect("dir entry");
+            if entry.path().extension().is_some_and(|ext| ext == "vortex") {
+                shard_files += 1;
+            }
+        }
+        assert!(
+            shard_files > 1,
+            "a merge spanning multiple target files must encode in parallel \
+             shards (got {shard_files} file; the size estimate or the \
+             target_partitions widening never reached write_to_snapshot)"
+        );
+        assert!(
+            shard_files <= DEFAULT_WRITE_CONCURRENCY,
+            "shard fan-out must stay bounded by the write concurrency \
+             (got {shard_files} > {DEFAULT_WRITE_CONCURRENCY})"
+        );
+
+        // Every row survives the parallel merge: scan through the provider
+        // directly (projection = id only) and sum the row counts.
+        let scan_ctx = SessionContext::new();
+        let plan = provider
+            .scan(&scan_ctx.state(), Some(&vec![0]), &[], None)
+            .await
+            .expect("scan plan");
+        let batches = datafusion::physical_plan::collect(plan, scan_ctx.task_ctx())
+            .await
+            .expect("collect rows");
+        let scanned_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            scanned_rows, expected_rows,
+            "parallel merge must preserve every visible row"
+        );
     }
 
     #[test]
