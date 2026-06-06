@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      image_tag:
+        description: 'Docker image tag to apply in addition to the commit SHA (e.g. a branch name). Defaults to latest.'
+        required: false
+        type: string
+        default: latest
 
 permissions:
   contents: read
@@ -91,8 +96,10 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Copy Dockerfile to build context
-        run: cp tools/spidapter/Dockerfile ./build/Dockerfile
+      - name: Copy Dockerfile and scenarios to build context
+        run: |
+          cp tools/spidapter/Dockerfile ./build/Dockerfile
+          cp -r tools/spidapter/scenarios ./build/scenarios
 
       - name: Build image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -103,6 +110,6 @@ jobs:
           push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true') }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/spidapter:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/spidapter:latest
+            ghcr.io/${{ github.repository_owner }}/spidapter:${{ github.event_name == 'workflow_dispatch' && github.event.inputs.image_tag || 'latest' }}
           cache-from: type=gha,scope=spidapter
           cache-to: type=gha,scope=spidapter,mode=max
