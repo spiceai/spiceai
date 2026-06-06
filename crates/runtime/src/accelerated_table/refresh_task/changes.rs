@@ -188,8 +188,17 @@ pub struct CdcConfig {
     /// exceed this on its own; otherwise the next envelope is carried into the
     /// next burst before we allocate a concatenated batch.
     pub max_coalesced_bytes: usize,
-    /// Maximum CDC coalesce age in milliseconds. A value of 0 leaves
-    /// accelerator-specific age defaults unchanged.
+    /// CDC apply-loop linger window in milliseconds. When `> 0`, the drain
+    /// keeps accumulating envelopes into a single coalesced write until
+    /// `max_coalesced_envelopes` / `max_coalesced_bytes` is reached, or this
+    /// window elapses — whichever comes first. The window is measured from the
+    /// START of the previous apply, so time spent applying the previous burst
+    /// counts toward the budget: when apply already takes longer than the
+    /// window, no extra latency is added (the deadline is already in the past)
+    /// and the drain just coalesces what backpressure buffered. The effective
+    /// minimum time between apply-starts is `max(apply_duration, this)`. `0`
+    /// (default) disables lingering: the drain only coalesces what is already
+    /// buffered (non-blocking `try_recv`), preserving real-time latency.
     pub max_coalesce_age_ms: u64,
     /// Maximum time to wait for the previous source-side commit before
     /// surfacing ingestion as stalled.
@@ -519,6 +528,11 @@ impl RefreshTask {
         let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        // Start of the most recent burst's processing (apply) cycle. The linger
+        // deadline is measured from here so time spent applying the previous
+        // burst counts toward the next burst's accumulation age — see the drain
+        // below. Initialized to "now" so the first burst gets a full window.
+        let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
         let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
@@ -539,20 +553,41 @@ impl RefreshTask {
             let Some(first) = next_item else {
                 break;
             };
-            // Drain whatever is already buffered in the prefetch channel
-            // (no `await` between try_recv calls). Under low load the buffer
-            // is empty after the initial recv and `burst.len() == 1` — that
-            // path matches the pre-pipelining serial cost exactly. Under
-            // high load (PG WAL bulk insert, Debezium catch-up, Kafka
-            // backlog) we collect a contiguous run and apply it in one shot,
-            // amortizing the per-envelope `SessionContext` + `insert_into`
-            // planning cost over the whole burst.
+            // Coalesce a contiguous run of buffered envelopes into one
+            // accelerator write, in two phases.
+            //
+            // Phase 1 (always): a non-blocking `try_recv` loop with no `await`,
+            // draining whatever is already buffered. With `max_coalesce_age_ms
+            // == 0` (default) this is the entire drain, so low load applies a
+            // single envelope immediately (matching the pre-pipelining serial
+            // cost) and high load (PG WAL bulk insert, Debezium catch-up, Kafka
+            // backlog) coalesces the buffered run, amortizing the per-envelope
+            // `SessionContext` + `insert_into` planning cost over the burst.
+            //
+            // Phase 2 (linger, only when `max_coalesce_age_ms > 0`): keep
+            // awaiting more envelopes until the envelope cap, the byte budget, or
+            // a deadline anchored at the START of the previous apply
+            // (`last_cycle_start`) is reached. Anchoring there means time spent
+            // applying the previous burst counts against this burst's
+            // accumulation budget: when apply is the bottleneck the deadline is
+            // already in the past, so we add no latency — we just coalesce what
+            // backpressure piled up during the apply. Only when caught up (fast
+            // apply, idle channel) do we actually wait, trading up to
+            // `max_coalesce_age_ms` of latency for one publish + one EBS
+            // `sync_all()` per window instead of per tiny batch. Net effect: the
+            // minimum time between apply-starts for a table is
+            // `max(apply_duration, max_coalesce_age_ms)`.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
             let mut burst_bytes = cdc_item_memory_size(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
             let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
+            // Set when the source-reader channel closes mid-linger: apply the
+            // buffered burst, then exit the outer loop (the `rx.recv()` at the
+            // top would otherwise observe the same end-of-stream next iteration).
+            let mut channel_closed = false;
+
             while burst.len() < max_burst {
                 match rx.try_recv() {
                     Ok(item) => {
@@ -571,6 +606,50 @@ impl RefreshTask {
                 }
             }
 
+            if cdc_cfg.max_coalesce_age_ms > 0
+                && carried_item.is_none()
+                && burst.len() < max_burst
+            {
+                let deadline =
+                    last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
+                while burst.len() < max_burst {
+                    // Flush immediately on shutdown rather than waiting out the
+                    // window — teardown must not block on intentional linger.
+                    if self.runtime_status.is_shutdown() {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Some(item)) => {
+                            let item_bytes = cdc_item_memory_size(&item);
+                            if burst_bytes > 0
+                                && item_bytes > 0
+                                && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                            {
+                                carried_item = Some(item);
+                                break;
+                            }
+                            burst_bytes = burst_bytes.saturating_add(item_bytes);
+                            burst.push(item);
+                        }
+                        Ok(None) => {
+                            channel_closed = true;
+                            break;
+                        }
+                        Err(_elapsed) => break,
+                    }
+                }
+            }
+
+            // Mark the start of this burst's processing cycle: the next burst's
+            // linger deadline is measured from here, so the apply below counts as
+            // accumulation age.
+            last_cycle_start = Instant::now();
+
             let mut apply_context = ApplyContext {
                 refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
@@ -586,6 +665,9 @@ impl RefreshTask {
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
                 reader_handle.abort();
+                break;
+            }
+            if channel_closed {
                 break;
             }
         }
