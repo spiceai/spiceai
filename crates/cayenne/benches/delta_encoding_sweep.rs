@@ -117,7 +117,9 @@ async fn setup_lane(
 ) -> SweepFixture {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let data_path = temp_dir.path().join("data");
-    std::fs::create_dir_all(&data_path).expect("create data dir");
+    tokio::fs::create_dir_all(&data_path)
+        .await
+        .expect("create data dir");
     let db_path = temp_dir.path().join("catalog.db");
     let catalog = Arc::new(
         CayenneCatalog::new(format!("sqlite://{}", db_path.to_string_lossy())).expect("catalog"),
