@@ -605,6 +605,7 @@ impl RefreshTask {
                 }
             }
 
+            // Don't linger when the burst is already at/over the byte budget
             if cdc_cfg.max_coalesce_age_ms > 0 && carried_item.is_none() && burst.len() < max_burst
             {
                 let deadline =
@@ -3365,6 +3366,89 @@ mod tests {
             "without a linger window, each delayed envelope must be written on its own"
         );
         assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
+    /// When the buffered burst already meets/exceeds the byte budget, the linger
+    /// phase must NOT wait: no further envelope could be admitted (any would trip
+    /// the byte cap and be carried), so waiting only delays an already-full
+    /// write. Here the first envelope alone exceeds a 1-byte budget, the linger
+    /// window is huge (60s), and the source then parks open — so a buggy linger
+    /// would block the write for the full 60s. The write must instead land
+    /// promptly, well inside the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_over_byte_budget_burst_does_not_linger() {
+        // Stream yields one envelope, then parks forever (keeps the channel open
+        // so a buggy linger blocks on `rx.recv()` rather than seeing EOF).
+        struct YieldOnceThenParkStream {
+            yielded: bool,
+            log: Arc<CommitLog>,
+        }
+        impl futures::Stream for YieldOnceThenParkStream {
+            type Item = Result<ChangeEnvelope, CdcStreamError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if self.yielded {
+                    Poll::Pending
+                } else {
+                    self.yielded = true;
+                    Poll::Ready(Some(Ok(make_tracked_envelope(
+                        1,
+                        Arc::clone(&self.log),
+                        false,
+                    ))))
+                }
+            }
+        }
+
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::new(AtomicUsize::new(0)),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        // 1-byte budget so a single real envelope is already over budget, paired
+        // with a 60s linger window the fix must refuse to wait out.
+        let cfg = CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            max_coalesced_bytes: 1,
+            max_coalesce_age_ms: 60_000,
+            commit_timeout: Duration::from_secs(30),
+        };
+
+        let stream: ChangesStream = YieldOnceThenParkStream {
+            yielded: false,
+            log: Arc::clone(&log),
+        }
+        .boxed();
+
+        let join =
+            tokio::spawn(async move { run_changes_stream_with_config(&task, cfg, stream).await });
+
+        // The write must land far inside the 60s linger window. A 5s deadline is
+        // generous for the immediate write yet nowhere near the buggy 60s wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "over-budget burst was held by the linger window instead of writing immediately",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the over-budget envelope must be written exactly once, on its own"
+        );
+        assert_eq!(log.ids().await, vec![1]);
+
+        // Source parks forever; tear the apply task down.
+        join.abort();
     }
 
     /// Counts every poll on the inner stream, and lets us pull on demand via
