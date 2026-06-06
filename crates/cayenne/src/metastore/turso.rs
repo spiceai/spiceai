@@ -528,12 +528,6 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to create inlined_delete index: {e}"),
             })?;
-        conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to create inlined_delete unpublished index: {e}"),
-            })?;
-
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored
         // because the column may already exist (libSQL doesn't support IF NOT EXISTS for ALTER).
         let _ = conn
@@ -570,6 +564,15 @@ impl MetastoreBackend for TursoMetastore {
                     message: format!("Failed to backfill inlined-delete published flag: {e}"),
                 })?;
         }
+
+        // Must run AFTER the `published` column migration above: the partial index
+        // predicate (`WHERE published = 0`) references the column, so creating it
+        // first on a pre-flag metastore would fail and abort `init_schema`.
+        conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to create inlined_delete unpublished index: {e}"),
+            })?;
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
