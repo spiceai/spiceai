@@ -11,10 +11,12 @@ name: postgres-cayenne[file]-cdc-tuned
 #     upsert tables; reference tables use lighter settings.
 runtime:
   params:
-    cdc_prefetch_buffer: '1024'
-    cdc_max_coalesced_envelopes: '4096'
-    cdc_max_coalesced_bytes: '134217728' # 128 MB
-    cdc_max_coalesce_age_ms: '4000'
+    cdc_max_coalesced_bytes: '536870912'   # 128MB → 512MB
+    cdc_max_coalesced_envelopes: '8192'    # 4096 → 8192  (128MB already needs 1459;
+                                           #   512MB needs ~5800, so 4096 would cap at ~360MB)
+    cdc_prefetch_buffer: '8192'            # keep phase-1 fed for the larger burst
+    cdc_max_coalesce_age_ms: '4000'        # unchanged — still bounds latency
+
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
     cayenne_footer_cache_mb: '1024'
