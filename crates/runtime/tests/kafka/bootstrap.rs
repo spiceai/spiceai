@@ -263,9 +263,7 @@ pub async fn send_tombstone_to_kafka(
     let key_owned = key.to_string();
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
-        let record = FutureRecord::to(topic)
-            .partition(partition)
-            .key(&key_owned);
+        let record = FutureRecord::to(topic).partition(partition).key(&key_owned);
         match producer.send(record, QUEUE_TIMEOUT).await {
             Ok(_) => {
                 if attempt > 0 {
@@ -295,6 +293,80 @@ pub async fn send_tombstone_to_kafka(
             MAX_RETRIES + 1,
         )));
     }
+    Ok(())
+}
+
+/// Send a single JSON message to a specific Kafka partition with a custom timestamp.
+pub async fn send_message_to_kafka_partition(
+    producer: &FutureProducer,
+    topic: &str,
+    partition: i32,
+    timestamp: i64,
+    message: &serde_json::Value,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 5;
+    const DELAY_S: u64 = 2;
+    const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let message_str = serde_json::to_string(message)?;
+    let mut last_error = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        let record = FutureRecord::to(topic)
+            .partition(partition)
+            .payload(&message_str)
+            .timestamp(timestamp);
+
+        match producer.send(record, QUEUE_TIMEOUT).await {
+            Ok(_) => {
+                if attempt > 0 {
+                    tracing::debug!("Message sent successfully after {attempt} retries");
+                }
+                last_error = None;
+                break;
+            }
+            Err((e, _)) if attempt < MAX_RETRIES => {
+                tracing::debug!(
+                    "Kafka send failed (attempt {}/{}): {e}. Retrying in {DELAY_S} seconds",
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                );
+                last_error = Some(e);
+                tokio::time::sleep(Duration::from_secs(DELAY_S)).await;
+            }
+            Err((e, _)) => {
+                last_error = Some(e);
+            }
+        }
+    }
+
+    if let Some(e) = last_error {
+        return Err(anyhow::Error::msg(format!(
+            "Kafka message delivery failed after {} attempts: {e}",
+            MAX_RETRIES + 1,
+        )));
+    }
+    Ok(())
+}
+
+/// Create a Kafka topic with a specific number of partitions.
+pub async fn create_kafka_topic_with_partitions(
+    running_container: &crate::docker::RunningContainer<'static>,
+    port: u16,
+    topic: &str,
+    partitions: i32,
+) -> Result<(), anyhow::Error> {
+    let output = running_container
+        .exec_cmd(&format!(
+            "rpk topic create {topic} \
+            --partitions {partitions} \
+            --brokers localhost:{port} \
+            --user {KAFKA_SASL_USERNAME} \
+            --password {KAFKA_SASL_PASSWORD} \
+            --sasl-mechanism {KAFKA_SASL_MECHANISM}"
+        ))
+        .await?;
+    tracing::debug!("Created topic '{topic}' with {partitions} partitions: {output}");
     Ok(())
 }
 
