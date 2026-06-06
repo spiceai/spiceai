@@ -1821,6 +1821,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ec2"
+version = "1.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "604bfc560c5ce54ebdfded25e75da00163df080ade22db7afe8a05d5b14034d0"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-glue"
 version = "1.147.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18673,19 +18699,27 @@ dependencies = [
  "arrow 58.3.0",
  "arrow-flight",
  "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-ec2",
+ "base64 0.22.1",
  "clap",
  "dirs",
+ "regex",
  "reqwest 0.12.24",
  "runtime-secrets",
  "rustls 0.23.36",
+ "serde",
  "serde_json",
  "spice-cloud-client",
  "spicepod",
  "system-adapter-protocol",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "tonic",
  "url",
+ "urlencoding",
  "uuid 1.23.1",
  "yaml",
 ]
@@ -19245,7 +19279,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=421f85556ce55d20aa13240c9e3e82cc9e934ec7#421f85556ce55d20aa13240c9e3e82cc9e934ec7"
+source = "git+https://github.com/spiceai/spicebench.git?rev=ce245ecfc78229f6f21f45ca5b28d8ad44e1089a#ce245ecfc78229f6f21f45ca5b28d8ad44e1089a"
 dependencies = [
  "arrow-schema 58.3.0",
  "async-trait",
