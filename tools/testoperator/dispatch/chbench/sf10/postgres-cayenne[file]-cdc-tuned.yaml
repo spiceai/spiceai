@@ -5,4 +5,4 @@ tests:
     scale_factor: 10
     duration: 600
     ready_wait: 300
-    rate: 5000
+    rate: 10000
