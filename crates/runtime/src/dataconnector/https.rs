@@ -799,7 +799,12 @@ impl Https {
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
         if let Some(identity) = self.resolve_client_identity(dataset).await? {
-            builder = builder.identity(identity);
+            // `Identity::from_pem` yields a rustls identity, but the workspace transitively
+            // enables reqwest's `default-tls` (native-tls) feature, which makes native-tls the
+            // default backend. Building a native-tls client with a PEM identity fails with
+            // "incompatible TLS identity type", so pin this client to rustls to match the
+            // identity type and load the mTLS client certificate.
+            builder = builder.use_rustls_tls().identity(identity);
         }
 
         builder
