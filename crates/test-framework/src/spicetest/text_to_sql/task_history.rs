@@ -324,7 +324,12 @@ async fn retry_query_until_llm_found(
                         false
                     }
                 }
-                Err(_) => false,
+                // Back off on transient query errors so we don't hot-loop at the
+                // `wait_until_true` poll interval (matches the empty-result backoff above).
+                Err(_) => {
+                    sleep(Duration::from_secs(1)).await;
+                    false
+                }
             }
         }
     })
@@ -356,7 +361,12 @@ async fn retry_query_expecting_results(
                         true
                     }
                 }
-                Err(_) => false,
+                // Back off on transient query errors so we don't hot-loop at the
+                // `wait_until_true` poll interval (matches the empty-result backoff above).
+                Err(_) => {
+                    sleep(Duration::from_secs(1)).await;
+                    false
+                }
             }
         }
     })

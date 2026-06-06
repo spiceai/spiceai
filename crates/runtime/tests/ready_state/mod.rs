@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![expect(clippy::expect_used, reason = "integration-test helper")]
-#![allow(clippy::expect_used)]
 
 use std::{
     any::Any,

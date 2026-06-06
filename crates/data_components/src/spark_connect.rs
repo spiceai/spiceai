@@ -40,7 +40,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     sql::{
         TableReference,
-        unparser::{Unparser, dialect::DefaultDialect},
+        unparser::{Unparser, dialect::CustomDialectBuilder},
     },
 };
 use futures::Stream;
@@ -536,7 +536,13 @@ impl SparkConnectExecutionPlan {
 }
 
 fn expr_to_sql(expr: &Expr) -> DataFusionResult<String> {
-    Unparser::new(&DefaultDialect {})
+    // Spark Connect parses pushed-down filters as Spark SQL (see `DataFrame::filter` below), which
+    // quotes identifiers with backticks. `DefaultDialect` would emit double-quoted identifiers,
+    // which Spark interprets as string literals, breaking case-sensitive or keyword column refs.
+    let dialect = CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build();
+    Unparser::new(&dialect)
         .expr_to_sql(expr)
         .map(|expr| expr.to_string())
 }

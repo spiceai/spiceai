@@ -1100,11 +1100,6 @@ impl AnalyzerRulesBuilder {
     }
 
     #[must_use]
-    pub fn include_federation(self, _include: bool) -> Self {
-        self
-    }
-
-    #[must_use]
     pub fn with_extra_rules(
         mut self,
         extra_rules: impl IntoIterator<Item = Arc<dyn AnalyzerRule + Send + Sync>>,

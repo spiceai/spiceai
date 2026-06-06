@@ -42,9 +42,12 @@ impl CachingEngineSys {
             }
         };
 
-        // Update fetched_at for the table
+        // Update fetched_at for the table. Escape embedded double-quotes by doubling them so the
+        // quoted identifier stays well-formed (and can't break out of the identifier) even if the
+        // dataset/table name contains a `"`.
+        let escaped_table_name = table_name.replace('"', "\"\"");
         let update_query = format!(
-            "UPDATE \"{table_name}\" SET _fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS"
+            "UPDATE \"{escaped_table_name}\" SET _fetched_at = (now() AT TIME ZONE 'UTC')::TIMESTAMP_NS"
         );
         tx.execute(&update_query, []).map_err(Error::external)?;
 
@@ -65,9 +68,16 @@ fn list_internal_tables(
     tx: &spiceai_duckdb::Transaction<'_>,
     table_name: &str,
 ) -> Result<Vec<(String, u64)>> {
-    let pattern = format!("__data_{table_name}%");
+    // Escape LIKE metacharacters (`%`, `_`, and the escape char itself) in the dataset name so
+    // they are matched literally. Dataset names frequently contain `_`, which is a single-char
+    // wildcard in LIKE and would otherwise match unrelated internal tables.
+    let escaped = table_name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("__data_{escaped}%");
     let mut stmt = tx
-        .prepare("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ?")
+        .prepare("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ? ESCAPE '\\'")
         .map_err(Error::external)?;
     let mut rows = stmt.query([pattern]).map_err(Error::external)?;
 
