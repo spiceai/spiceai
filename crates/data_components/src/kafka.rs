@@ -30,6 +30,7 @@ use rdkafka::{
     config::RDKafkaLogLevel,
     consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
     message::{BorrowedMessage, Timestamp},
+    metadata::MetadataPartition,
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
 };
@@ -671,6 +672,15 @@ impl KafkaConsumer {
         kafka_config: &KafkaConfig,
         timeout: Duration,
     ) -> Result<Option<(Option<K>, V)>> {
+        // Number of messages to fetch in a single burst when scanning backward
+        // past tombstones. One network round-trip pulls this many records into
+        // the local buffer, eliminating per-tombstone seek overhead.
+        const TOMBSTONE_SCAN_WINDOW: usize = 100;
+        let scan_window_i64 =
+            i64::try_from(TOMBSTONE_SCAN_WINDOW).map_err(|_| Error::UnableToRestartTopicSnafu {
+                message: "TOMBSTONE_SCAN_WINDOW exceeds i64".to_string(),
+            })?;
+
         let deadline = Instant::now() + timeout;
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
@@ -694,11 +704,6 @@ impl KafkaConsumer {
                 topic: topic.to_string(),
             })?;
 
-        // Number of messages to fetch in a single burst when scanning backward
-        // past tombstones. One network round-trip pulls this many records into
-        // the local buffer, eliminating per-tombstone seek overhead.
-        const TOMBSTONE_SCAN_WINDOW: i64 = 100;
-
         // Inspect the latest non-tombstone message on each partition and
         // keep the one with the newest timestamp.
         let mut best_message: Option<(Option<K>, V, i64)> = None;
@@ -706,7 +711,11 @@ impl KafkaConsumer {
         // Collect partition IDs up-front so the `MetadataPartition` iterator
         // (which is not `Send` because it contains `*mut i32`) is dropped before
         // any await points inside the loop body.
-        let partition_ids: Vec<i32> = topic_metadata.partitions().iter().map(|p| p.id()).collect();
+        let partition_ids: Vec<i32> = topic_metadata
+            .partitions()
+            .iter()
+            .map(MetadataPartition::id)
+            .collect();
         for partition_id in partition_ids {
             if Instant::now() >= deadline {
                 tracing::debug!("Schema peek timeout budget exhausted");
@@ -735,7 +744,7 @@ impl KafkaConsumer {
                     break;
                 }
 
-                let window_start = std::cmp::max(low, window_end - TOMBSTONE_SCAN_WINDOW + 1);
+                let window_start = std::cmp::max(low, window_end - scan_window_i64 + 1);
 
                 // Assign consumer to the start of the current window.
                 let mut tpl = rdkafka::TopicPartitionList::new();
@@ -760,7 +769,7 @@ impl KafkaConsumer {
                 let mut stream = Box::pin(temp_consumer.consumer.stream());
                 let mut burst = Vec::new();
 
-                while burst.len() < TOMBSTONE_SCAN_WINDOW as usize {
+                while burst.len() < TOMBSTONE_SCAN_WINDOW {
                     let poll_timeout = std::cmp::min(
                         Duration::from_secs(5),
                         deadline.saturating_duration_since(Instant::now()),
@@ -776,8 +785,7 @@ impl KafkaConsumer {
                         Ok(Some(Err(e))) => {
                             return Err(Error::UnableToReceiveMessage { source: e });
                         }
-                        Ok(None) => break,
-                        Err(_) => break,
+                        Ok(None) | Err(_) => break,
                     }
                 }
 
@@ -788,9 +796,8 @@ impl KafkaConsumer {
                     };
 
                     let timestamp = match msg.timestamp() {
-                        Timestamp::CreateTime(ts) => ts,
-                        Timestamp::LogAppendTime(ts) => ts,
-                        _ => 0,
+                        Timestamp::CreateTime(ts) | Timestamp::LogAppendTime(ts) => ts,
+                        Timestamp::NotAvailable => 0,
                     };
 
                     let key = match msg.key() {
