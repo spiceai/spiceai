@@ -288,8 +288,11 @@ jobs:
           # and works even if the branch doesn't exist on the upstream repo. (Also avoids any CRLF issues from Windows checkout in the WSL mount.)
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The runtime runs inside WSL, which does not inherit Windows-side env vars by default.
+          # WSLENV lists which vars to forward across the interop boundary so the script below can read them.
+          WSLENV: INSTALL_SCRIPT_BRANCH:HEAD_REPO:HEAD_SHA
         run: |
-          if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
+          if [ -n "${INSTALL_SCRIPT_BRANCH:-}" ]; then
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
           else
             curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
