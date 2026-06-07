@@ -6,5 +6,4 @@ tests:
     terminals: 100
     duration: 600
     ready_wait: 600
-    # Target 10,000 OLTP txns/s ~= 10,000 CDC changes/s for the m7a (64-core/256 GiB) SF-1000 venue.
     rate: 10000
