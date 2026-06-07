@@ -643,6 +643,105 @@ mod tests {
         );
     }
 
+    /// Regression test for the DF53 / table-providers v0.11 SQLite Decimal
+    /// round-trip. A `Decimal128`/`Decimal256` column accelerated into SQLite
+    /// must read back as a decimal, not fail with
+    /// `Invalid column type Text ... name: col_Decimal`.
+    ///
+    /// The values intentionally include integer-valued decimals (`0.00`,
+    /// `2.00`) alongside fractional ones (`1.11`, `99.99`) and a NULL so that
+    /// SQLite's per-cell storage class (NUMERIC affinity stores `0.00` as
+    /// INTEGER, `1.11` as REAL, high-precision values as TEXT) is exercised
+    /// across a heterogeneous column.
+    #[tokio::test]
+    #[expect(clippy::unreadable_literal)]
+    async fn test_sqlite_decimal_round_trip() {
+        use arrow::array::{Decimal128Array, Decimal256Array};
+        use arrow::datatypes::i256;
+
+        // Mirrors the MySQL/Postgres quickstart `col_Decimal DECIMAL(10, 2)`
+        // (precision 10) that the E2E "acceleration: sqlite" jobs exercise,
+        // plus a `Decimal256(40, 4)` column whose precision (40) exceeds the
+        // 16-digit ceiling that upstream sea-query's SQLite backend panics on.
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("col_Decimal", DataType::Decimal128(10, 2), true),
+            arrow::datatypes::Field::new("col_Decimal_hp", DataType::Decimal256(40, 4), true),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("decimal_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // Decimal128(10, 2): 1.11, NULL, 99.99, 0.00, 2.00 -- the integer-valued
+        // entries (0.00, 2.00) and fractional ones land in different SQLite
+        // storage classes, so a column-wide decode type locked from row 0 must
+        // not reject a later row.
+        let dec128 = Decimal128Array::from(vec![Some(111), None, Some(9999), Some(0), Some(200)])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal128 array");
+        // Decimal256(40, 4): a value that cannot round-trip losslessly through
+        // f64, plus an integer-valued one and a NULL.
+        let dec256 = Decimal256Array::from(vec![
+            Some(i256::from_i128(12345678901234567890_i128)),
+            None,
+            Some(i256::from_i128(0)),
+            Some(i256::from_i128(20000)),
+            Some(i256::from_i128(98765)),
+        ])
+        .with_precision_and_scale(40, 4)
+        .expect("decimal256 array");
+        let ids = Int64Array::from(vec![1, 2, 3, 4, 5]);
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(ids), Arc::new(dec128), Arc::new(dec256)],
+        )
+        .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Read everything back -- this is where the regression manifests as
+        // "Invalid column type Text at index ... name: col_Decimal".
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back decimal data without a Text conversion error");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 5, "should round-trip all 5 decimal rows");
+    }
+
     #[tokio::test]
     async fn test_sqlite_file_initialization() {
         let app = app::AppBuilder::new("test").build();
