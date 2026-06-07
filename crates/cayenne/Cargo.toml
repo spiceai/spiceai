@@ -71,6 +71,13 @@ aegis = { version = "0.9.3", default-features = false, features = [
     "pure-rust",
 ] }
 
+# Ordering-tier fsync on the staged-commit hot path (provider/fsync_tier.rs):
+# on macOS both std `sync_all` AND `sync_data` are fcntl(F_FULLFSYNC) (~4-5 ms
+# per call, measured), so the plain-fsync ordering tier needs a direct
+# libc::fsync. See the module docs for the durability rationale.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 turso = ["dep:turso"]
@@ -300,3 +307,7 @@ name = "apply_on_conflict_keys_double_clone"
 [[bench]]
 harness = false
 name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "scan_under_write_attribution"
