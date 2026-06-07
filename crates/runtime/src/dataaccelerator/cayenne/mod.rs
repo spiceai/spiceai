@@ -738,6 +738,22 @@ impl CayenneAccelerator {
                 }
             }
 
+            // Parse delta-write encoding level ('auto' or 0..=10, zstd-style).
+            // Applies only to fresh delta writes; compaction outputs always use
+            // the full default encoding. See `cayenne::metadata::DeltaEncoding`.
+            if let Some(encoding_str) = acceleration.params.get("cayenne_delta_encoding") {
+                match encoding_str.parse::<cayenne::metadata::DeltaEncoding>() {
+                    Ok(encoding) => {
+                        config.delta_encoding = encoding;
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            "Dataset '{table_name}' contains an invalid `cayenne_delta_encoding` - {reason}. Defaulting to 'auto'.",
+                        );
+                    }
+                }
+            }
+
             if let Some((key, value)) = ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
                 .iter()
                 .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
@@ -815,21 +831,12 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            let age = crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &source.app().runtime.params,
-            )
-            .max_coalesce_age_ms;
-
-            if age > 0 {
-                config.compaction_trigger_snapshot_age_ms = age;
-            } else {
-                config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
-                    acceleration,
-                    "cayenne_compaction_trigger_snapshot_age_ms",
-                    config.compaction_trigger_snapshot_age_ms,
-                    "; 0 disables the age trigger",
-                );
-            }
+            config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
+                acceleration,
+                "cayenne_compaction_trigger_snapshot_age_ms",
+                config.compaction_trigger_snapshot_age_ms,
+                "; 0 disables the age trigger",
+            );
             config.compaction_max_levels = parse_usize(
                 acceleration,
                 "cayenne_compaction_max_levels",
@@ -907,13 +914,14 @@ impl CayenneAccelerator {
 
             tracing::debug!(
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
-                "Cayenne Vortex config: segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne Vortex config: segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.segment_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
                 config.write_concurrency,
                 config.sort_columns,
                 config.compression_strategy,
+                config.delta_encoding,
                 config.pk_conflict_detection.as_str(),
                 config.compaction_trigger_files,
                 config.compaction_trigger_protected_snapshots,
@@ -1222,8 +1230,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    26,
-    { S3_PARAMS_LEN + 26 },
+    27,
+    { S3_PARAMS_LEN + 27 },
 >(
     S3_PARAMETERS,
     [
@@ -1254,6 +1262,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
+        ParameterSpec::component("delta_encoding")
+            .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
+            .default("auto"),
         ParameterSpec::component("pk_conflict_detection")
             .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
             .one_of(&["auto", "none"])
