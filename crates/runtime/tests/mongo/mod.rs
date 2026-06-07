@@ -297,9 +297,9 @@ async fn mongodb_integration_test() -> Result<(), String> {
         .await
 }
 
-/// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a DuckDB
+/// Non-CDC counterpart to `mongodb_change_streams_infer_primary_key`: a `DuckDB`
 /// full-refresh dataset with `schema_inference: extended` loads end-to-end against a
-/// real MongoDB. The catalog query (`listIndexes`/`collStats`) runs on the server and
+/// real `MongoDB`. The catalog query (`listIndexes`/`collStats`) runs on the server and
 /// the inferred `_id` primary key, secondary indexes, and `_id` sort order are all
 /// accepted by the accelerator — a correct row count proves none of those steps
 /// errored. (Precise value-level mapping is covered by unit tests.)

@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for extended schema inference on the PostgreSQL connector.
+//! Integration tests for extended schema inference on the `PostgreSQL` connector.
 //!
-//! A real PostgreSQL table is seeded with a composite primary key and a variety of
+//! A real `PostgreSQL` table is seeded with a composite primary key and a variety of
 //! secondary indexes — unique, non-unique, partial, expression, and a clustered
-//! (DESC) index. The dataset is then accelerated with DuckDB under
+//! (DESC) index. The dataset is then accelerated with `DuckDB` under
 //! `schema_inference: extended`, exercising the full pipeline end-to-end: the
 //! `pg_catalog` query (the riskiest new SQL) must run on the real server, and the
 //! inferred primary key / indexes / sort order must be accepted by the accelerator
@@ -45,7 +45,7 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 
-/// Build an `inventory` dataset accelerated with DuckDB (full refresh) at the
+/// Build an `inventory` dataset accelerated with `DuckDB` (full refresh) at the
 /// given schema-inference level.
 fn inventory_dataset(port: usize, schema_inference: SchemaInference) -> Dataset {
     let mut ds = Dataset::new("postgres:inventory".to_string(), "inventory".to_string());
@@ -161,7 +161,7 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
 
 /// With `schema_inference: extended`, the rich-index table loads end-to-end and
 /// returns correct data — proving the `pg_catalog` query runs on the real server
-/// and the inferred primary key, indexes, and sort order are accepted by DuckDB.
+/// and the inferred primary key, indexes, and sort order are accepted by `DuckDB`.
 #[tokio::test]
 async fn test_extended_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
