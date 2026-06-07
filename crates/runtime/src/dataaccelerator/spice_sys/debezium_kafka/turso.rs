@@ -40,9 +40,13 @@ impl DebeziumKafkaSys {
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
-        ensure_debezium_kafka_tables(&conn).await?;
-        self.mark_schema_ensured();
+        {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
+            ensure_debezium_kafka_tables(&conn).await?;
+            self.mark_schema_ensured();
+        }
 
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let upsert = format!(
             "INSERT INTO {DEBEZIUM_KAFKA_TABLE_NAME}
              (dataset_name, consumer_group_id, topic, primary_keys, schema_fields, updated_at)
@@ -79,6 +83,7 @@ impl DebeziumKafkaSys {
         let dataset_name = self.dataset_name.clone();
         let conn = pool.connect().await.map_err(Error::external)?;
         if self.schema_needs_ensure() {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_debezium_kafka_tables(&conn).await?;
             self.mark_schema_ensured();
         }
@@ -120,9 +125,12 @@ impl DebeziumKafkaSys {
     ) -> Result<()> {
         let conn = pool.connect().await.map_err(Error::external)?;
         if self.schema_needs_ensure() {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
             ensure_debezium_kafka_tables(&conn).await?;
             self.mark_schema_ensured();
         }
+
+        let _schema_guard = pool.acquire_schema_read_lock().await;
 
         // Diagnostic-only: surface a warn log when an offset regresses.
         if let Ok(prior) = load_offsets(&conn, &self.dataset_name).await {
