@@ -86,9 +86,11 @@ use super::table::{
 };
 
 /// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
-/// prepared CDC batch at the staged/inlined write entry, labeled by table. Both
-/// values are already computed by the inline buffer at the call sites; this just
-/// forwards them so the two histograms always move together.
+/// prepared CDC batch at the staged/inlined write entry, labeled by table. The
+/// values come from the inline buffer at the call sites; on the inline-overflow
+/// FALLBACK path they are therefore the buffered LOWER BOUND (the unbuffered
+/// stream remainder is not counted — see `InlineBatchBuffer::total_bytes`).
+/// Forwarding both together keeps the two histograms paired per batch.
 fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
     let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
     telemetry::track_cayenne_cdc_burst_rows(rows, &dims);

@@ -1091,8 +1091,14 @@ mod tests {
         let exec =
             Int64PkDeletionFilterExec::new(child, tombstones, InsertRecordHandling::Apply, 0, None);
 
-        // A predicate on a child column ("val") must be reported pushable.
-        let parent_filter: Arc<dyn PhysicalExpr> = col("val", &schema)?;
+        // A real boolean predicate on a child column ("val" > 0) must be
+        // reported pushable (a bare column reference is not a valid predicate).
+        let parent_filter: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                col("val", &schema)?,
+                datafusion::logical_expr::Operator::Gt,
+                datafusion_physical_expr::expressions::lit(0_i64),
+            ));
         let description = exec.gather_filters_for_pushdown(
             FilterPushdownPhase::Pre,
             vec![Arc::clone(&parent_filter)],

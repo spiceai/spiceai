@@ -1417,17 +1417,21 @@ impl MetastoreTransaction for SqliteTransaction {
             })
             .await;
 
-        // METRIC 1 (writer held): record AFTER COMMIT. The BEGIN IMMEDIATE write
-        // lock is held through COMMIT's fsync, so a contending writer blocks until
-        // it returns — timing here captures the full lock-hold window the next
-        // writer queues behind (recording before COMMIT under-reported it; PR #11206).
-        telemetry::track_cayenne_metastore_writer_held(
-            self.held_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
-
+        // METRIC 1 (writer held): record AFTER the write lock is actually
+        // released. On success that is when COMMIT returns (the BEGIN IMMEDIATE
+        // lock is held through COMMIT's fsync, so a contending writer blocks
+        // until then). On a failed COMMIT the lock persists until the
+        // best-effort ROLLBACK below completes, so that path records after the
+        // rollback instead — recording any earlier under-reports the hold
+        // window the next writer queues behind (PR #11206 review).
         match commit_result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                telemetry::track_cayenne_metastore_writer_held(
+                    self.held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                Ok(())
+            }
             Err(e) => {
                 // Best-effort rollback to leave the connection in a clean state.
                 let _ = conn
@@ -1436,6 +1440,11 @@ impl MetastoreTransaction for SqliteTransaction {
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
+
+                telemetry::track_cayenne_metastore_writer_held(
+                    self.held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
 
                 Err(CatalogError::Database {
                     message: format!("Failed to commit transaction: {e}"),

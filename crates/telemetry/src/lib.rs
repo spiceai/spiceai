@@ -920,7 +920,7 @@ pub fn track_cayenne_cdc_burst_rows(rows: u64, dimensions: &[KeyValue]) {
             cayenne_operational_meter()
                 .u64_histogram("cayenne_cdc_burst_rows")
                 .with_description(
-                    "Row count of a prepared CDC batch at the Cayenne staged/inlined write entry.",
+                    "Row count of a prepared CDC batch at the Cayenne staged/inlined write entry. On the inline-overflow fallback path this is the BUFFERED row count — a lower bound, since the unbuffered stream remainder is not counted.",
                 )
                 .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
                 .with_unit("rows")
@@ -932,13 +932,15 @@ pub fn track_cayenne_cdc_burst_rows(rows: u64, dimensions: &[KeyValue]) {
 static CAYENNE_CDC_BURST_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
 
 /// Records the Arrow in-memory byte size of a prepared CDC batch at the Cayenne
-/// write entry. `dimensions` should carry `table`.
+/// write entry. On the inline-overflow fallback path the value is the buffered
+/// lower bound (the unbuffered stream remainder is not counted). `dimensions`
+/// should carry `table`.
 pub fn track_cayenne_cdc_burst_bytes(bytes: u64, dimensions: &[KeyValue]) {
     CAYENNE_CDC_BURST_BYTES
         .get_or_init(|| {
             cayenne_operational_meter()
                 .u64_histogram("cayenne_cdc_burst_bytes")
-                .with_description("Arrow in-memory byte size of a prepared CDC batch at the Cayenne staged/inlined write entry.")
+                .with_description("Arrow in-memory byte size of a prepared CDC batch at the Cayenne staged/inlined write entry. On the inline-overflow fallback path this is the BUFFERED byte size — a lower bound, since the unbuffered stream remainder is not counted.")
                 .with_boundaries(BYTES_HISTOGRAM_BUCKETS.to_vec())
                 .with_unit("By")
                 .build()
