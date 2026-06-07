@@ -509,6 +509,117 @@ async fn duckdb_json_functions() -> Result<(), String> {
         .await
 }
 
+/// Regression test for <https://github.com/spiceai/spiceai/issues/10703>.
+///
+/// The `DuckDB` *connector* (federation to `DuckDB`, no Spice acceleration) must
+/// not push Spice-only UDFs such as `json_get_str` into the SQL it sends to
+/// `DuckDB` — those functions don't exist in `DuckDB`, so the query fails with an
+/// "unknown function" error. Before the fix, `connector-duckdb` built its
+/// `DuckDBTableFactory` without the Spice function deny-list, so `DuckDB`'s
+/// `can_execute_plan` allowed the whole plan to federate and `json_get_str` was
+/// unparsed into the `DuckDB` SQL. With the deny-list installed, the projection
+/// is evaluated locally by `DataFusion` and only the bare scan is pushed down.
+#[tokio::test]
+async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/json_data.csv");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
+                .expect("failed to write sample file");
+
+            // No `.acceleration` — this exercises the connector federation path.
+            let app = AppBuilder::new("duckdb_connector_json_test")
+                .with_dataset(make_duckdb_dataset(
+                    "json_test",
+                    "csv",
+                    &format!("'{}'", temp_file.path().display()),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let query = "SELECT json_get_str(data, 'name') AS name FROM json_test ORDER BY id";
+
+            // 1. The query must execute end-to-end. Before the fix this errored
+            //    because `json_get_str` was pushed to DuckDB, which rejects it.
+            let result: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("connector query `{query}` failed: {e}"))?
+                .data
+                .try_collect()
+                .await
+                .map_err(|e| format!("connector query `{query}` collect failed: {e}"))?;
+            assert_batches_eq!(
+                [
+                    "+---------+",
+                    "| name    |",
+                    "+---------+",
+                    "| alice   |",
+                    "| bob     |",
+                    "| charlie |",
+                    "+---------+",
+                ],
+                &result
+            );
+
+            // 2. The pushed-down DuckDB SQL must not contain `json_get_str`. Assert
+            //    on the `DuckSqlExec sql=` text directly so the test pins the actual
+            //    failure mode (federated SQL) rather than incidental formatting.
+            let explain_plan = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+            let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                .map_err(|e| anyhow::Error::msg(e.to_string()))
+                .expect("Should format batches");
+            let plan = pretty.to_string();
+
+            assert!(
+                plan.contains("DuckSqlExec"),
+                "expected the connector plan to push a scan down to DuckDB; plan was:\n{plan}"
+            );
+            for line in plan.lines().filter(|l| l.contains("DuckSqlExec sql=")) {
+                assert!(
+                    !line.contains("json_get_str"),
+                    "json_get_str was pushed into DuckDB SQL (deny-list not applied):\n{line}"
+                );
+            }
+            assert!(
+                plan.contains("json_get_str"),
+                "json_get_str must still appear in the plan, evaluated locally:\n{plan}"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
 #[tokio::test]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
     use spicepod::param::Params;

@@ -23,6 +23,7 @@ use arrow::{
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
@@ -134,6 +135,7 @@ pub struct FlightSQLFactory {
     client: FlightSqlClient,
     endpoint: String,
     cookie_store: Arc<CookieStore>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl FlightSQLFactory {
@@ -143,7 +145,16 @@ impl FlightSQLFactory {
             client,
             endpoint,
             cookie_store,
+            function_support: None,
         }
+    }
+
+    /// Install the federation function deny-list so Spice-only UDFs are evaluated
+    /// locally instead of pushed into the Flight SQL server (#10703).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 }
 
@@ -161,7 +172,8 @@ impl Read for FlightSQLFactory {
                 table_reference,
                 Arc::clone(&self.cookie_store),
             )
-            .await?,
+            .await?
+            .with_function_support(self.function_support.clone()),
         );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
@@ -180,6 +192,10 @@ pub struct FlightSQLTable {
     cookie_store: Arc<CookieStore>,
     /// Optional statistics to attach to the scan this provider produces.
     statistics: Option<Statistics>,
+    /// Federation function deny-list. Functions on the list (Spice-only UDFs such
+    /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
+    /// sent to the Flight SQL server. See issue #10703.
+    function_support: Option<FunctionSupport>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -201,6 +217,7 @@ impl FlightSQLTable {
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
             statistics: None,
+            function_support: None,
         })
     }
 
@@ -221,6 +238,7 @@ impl FlightSQLTable {
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
             statistics: None,
+            function_support: None,
         }
     }
 
@@ -228,6 +246,13 @@ impl FlightSQLTable {
     #[must_use]
     pub fn with_statistics(mut self, statistics: Option<Statistics>) -> Self {
         self.statistics = statistics;
+        self
+    }
+
+    /// Install the federation function deny-list (see [`FunctionSupport`]).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
         self
     }
 

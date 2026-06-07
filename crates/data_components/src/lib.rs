@@ -88,6 +88,8 @@ pub mod ducklake;
 pub mod dynamodb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "federation")]
+pub mod federation;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
