@@ -243,6 +243,22 @@ These forks may not require changes for every DataFusion upgrade but should be v
 - [ ] Build the branch version and test with test operator, updating snapshots if needed.
 - [ ] Merge PR. 🎉
 
+## Post-Merge Verification
+
+After each fork's version-branch PR merges, double-check that no Spice patch was lost in the port:
+
+- [ ] Diff the newly merged version branch against the previous one (e.g. `spiceai-53` vs `spiceai-52.5`, `spiceai-58` vs `spiceai-57`). Enumerate the old line's Spice patches and verify each is accounted for in the merged branch — **PRESENT** (commit or equivalent), **UPSTREAMED** (cite the upstream code), or **consciously dropped** (document the rationale):
+
+  ```bash
+  # enumerate the previous line's Spice patches
+  git log --oneline <upstream-base>..spiceai-<prev>-patches
+  # verify each patch in the new branch by key symbol
+  git log -S<key-symbol> spiceai-<new>   # and/or grep the code
+  ```
+
+- [ ] Re-pin the Spice root `Cargo.toml` to the **final merged commit** on the canonical `spiceai-*` branch (never a personal or pre-merge branch).
+- [ ] Update the upgrade PR description's dependency table with the merged commit SHAs.
+
 ## Forked Dependency Test Coverage
 
 This section documents which tests in the Spice test suite verify the functionality of each forked dependency. **If a fork's patches are missing or incompatible after an upgrade, these tests should fail.**
