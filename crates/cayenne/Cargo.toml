@@ -300,3 +300,7 @@ name = "apply_on_conflict_keys_double_clone"
 [[bench]]
 harness = false
 name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "scan_under_write_attribution"
