@@ -653,7 +653,7 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 cayenne_operational_meter()
                     .f64_gauge("cayenne_ingest_bytes_per_sec")
                     .with_description("Measured CDC ingest rate (bytes/sec, EWMA).")
-                    .with_unit("By")
+                    .with_unit("By/s")
                     .build()
             })
             .record(state.bytes_per_sec, dimensions);
@@ -730,7 +730,7 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .with_description(
                     "Configured target Vortex file size — the reference compacted files should trend toward (compare cayenne_compaction_merged_bytes).",
                 )
-                .with_unit("MiBy")
+                .with_unit("MiB")
                 .build()
         })
         .record(state.target_file_size_mb, dimensions);

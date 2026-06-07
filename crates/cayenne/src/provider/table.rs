@@ -8988,11 +8988,29 @@ impl CayenneTableProvider {
             "Fast protected-snapshot subset compaction completed"
         );
 
-        // Record the merged output size so operators (and the adaptive tuner's
+        // Record the merged *output* size so operators (and the adaptive tuner's
         // observability) can see whether compaction is trending toward the target
         // file size or stalling below it. Compare to cayenne_autotune_target_file_size_mb.
+        // The new snapshot's actual on-disk Vortex bytes are the meaningful figure:
+        // deletions + re-encoding/compression make the output materially smaller
+        // than the summed inputs, so reporting the input sum would overstate it.
+        // Best-effort — fall back to the input sum only if sizing the output fails.
+        let merged_output_bytes = match self.list_snapshot_files_with_sizes(&new_snapshot_id).await
+        {
+            Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+            Err(e) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to size compaction output snapshot for the merged-bytes \
+                     metric; falling back to total input bytes: {e}"
+                );
+                total_input_bytes
+            }
+        };
         telemetry::track_cayenne_compaction_merged_bytes(
-            total_input_bytes,
+            merged_output_bytes,
             &[telemetry::KeyValue::new(
                 "table",
                 self.table_metadata.table_name.clone(),
