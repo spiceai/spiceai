@@ -781,10 +781,12 @@ impl KafkaConsumer {
                             burst.push(msg);
                         }
                         Ok(Some(Err(e))) => {
+                        Ok(Some(Err(e))) => {
                             return Err(Error::UnableToReceiveMessage { source: e });
                         }
-                        Ok(None) | Err(_) => break,
-                    }
+                        Ok(None) => break,
+                        Err(_) if Instant::now() < deadline => continue,
+                        Err(_) => break,
                 }
 
                 // Search backward through the burst for a non-tombstone.
