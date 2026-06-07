@@ -179,7 +179,7 @@ pub async fn verify_analytical_results(
             }
         };
 
-        // Several benchmark queries have non-determenistic row order. Sort both sides by every column so comparison is set-based.
+        // Several benchmark queries have non-deterministic row order. Sort both sides by every column so comparison is set-based.
         let (expected_sorted, actual_sorted) = match sort_for_comparison(&expected, &actual) {
             Ok(pair) => pair,
             Err(e) => {
