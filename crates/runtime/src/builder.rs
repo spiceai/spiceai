@@ -902,9 +902,12 @@ fn parse_cayenne_optimizer_rules(
             "anti_join_sort_merge" | "anti_sort_merge" => {
                 rules.set_anti_join_sort_merge(true);
             }
-            "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
-                rules.set_exact_join_filter(true);
-            }
+            // The former Cayenne `ExactLeftAccumulator` rewrite is now handled by
+            // DataFusion 53's native inner-join hash-join dynamic-filter pushdown
+            // (min/max bounds + InList/hash-table membership), which is always on.
+            // Accept the historical rule tokens as a no-op so existing spicepods
+            // that list them keep working without an "unknown rule" warning.
+            "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {}
             _ => {
                 // Don't discard the rest of an explicit list because of one bad
                 // token; collect the unknown ones, keep the recognized rules,
@@ -1096,10 +1099,12 @@ mod test {
             CayenneOptimizerRules::all_enabled()
         );
 
+        // `join_rewriter` is accepted as a recognized no-op (the native
+        // DataFusion inner-join dynamic-filter pushdown replaced it), so it does
+        // not enable any rule but also does not trigger the unknown-rule path.
         let mut selected_rules = CayenneOptimizerRules::none();
         selected_rules.set_filter_propagation(true);
         selected_rules.set_cross_join_reassociation(true);
-        selected_rules.set_exact_join_filter(true);
         assert_eq!(
             parse_cayenne_optimizer_rules(
                 &HashMap::from([(

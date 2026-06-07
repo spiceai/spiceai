@@ -661,19 +661,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 }
 
-pub(crate) trait IsCayenneAccelerationExec {
-    /// Returns true if the execution plan is a `CayenneAccelerationExec`
-    fn is_cayenne_acceleration_exec(&self) -> bool;
-}
-
-impl IsCayenneAccelerationExec for Arc<dyn ExecutionPlan> {
-    fn is_cayenne_acceleration_exec(&self) -> bool {
-        self.as_any()
-            .downcast_ref::<CayenneAccelerationExec>()
-            .is_some()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
