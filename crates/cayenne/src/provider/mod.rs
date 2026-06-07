@@ -77,6 +77,8 @@ pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
 pub(crate) mod fsync_tier;
+pub(crate) mod mem_tier;
+pub(crate) mod mem_tier_budget;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod overwrite;
@@ -94,6 +96,8 @@ pub(crate) mod write_budget;
 // Re-export the main type at the module level for convenience
 pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
 pub use context::CayenneContext;
+pub use mem_tier::SlotAdvancer;
+pub use mem_tier_budget::set_global_mem_tier_bytes;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
 pub use retention::TimeRetentionFilterBuilder;

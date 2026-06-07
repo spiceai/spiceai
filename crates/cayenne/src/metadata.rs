@@ -477,6 +477,61 @@ impl DeletionMode {
     }
 }
 
+/// Durability mode for the inline CDC write path (`refresh_mode: changes`).
+///
+/// In [`Self::File`] (the default — byte-identical to the pre-feature behavior)
+/// every CDC batch persists a durable metastore entry / staged Vortex write
+/// before the source slot ack advances. In [`Self::Memory`] the inline path
+/// appends each batch to an in-RAM tier and DEFERS the source slot ack until a
+/// periodic/cap-triggered checkpoint flushes the tier to a durable Vortex file —
+/// collapsing per-batch durability cost at the price of replaying the
+/// un-checkpointed tail from the source slot on crash (the apply is
+/// PK-idempotent, so this is exactly-once). Memory mode is bounded by a
+/// per-table byte cap AND a process-global byte budget so it can never OOM; on
+/// cap breach it spills (checkpoints) and, under sustained overload, falls back
+/// to the durable path for the breaching batch.
+///
+/// Memory mode only applies to the small-write CDC profile; it is forced to
+/// [`Self::File`] for full/snapshot/append-without-fast-refresh profiles (no
+/// inline write path to invert) and for partitioned tables (their visibility
+/// flip cannot be deferred).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CdcDurability {
+    /// Per-batch durable metastore/Vortex persist before the slot ack (today).
+    #[default]
+    File,
+    /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
+    Memory,
+}
+
+impl CdcDurability {
+    /// Parse a spicepod parameter value (`file` | `memory`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Memory => "memory",
+        }
+    }
+
+    /// Whether this is the in-memory deferred-ack mode.
+    #[must_use]
+    pub const fn is_memory(self) -> bool {
+        matches!(self, Self::Memory)
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -618,6 +673,25 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Durability mode for the inline CDC write path. [`CdcDurability::File`]
+    /// (default) persists each batch durably before advancing the source slot;
+    /// [`CdcDurability::Memory`] appends to an in-RAM tier and defers the slot
+    /// ack to a periodic/cap-triggered checkpoint. Default is byte-identical to
+    /// the pre-feature behavior (zero regression when not opted in).
+    #[serde(default)]
+    pub cdc_durability: CdcDurability,
+    /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
+    /// advance, in `cdc_durability: memory` mode only. `0` uses the
+    /// memory/storage-aware default. Composes WITH the process-global byte
+    /// budget — whichever is breached first triggers the spill.
+    #[serde(default)]
+    pub cdc_mem_tier_max_bytes: i64,
+    /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
+    /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
+    /// window for cold/low-traffic tables (whose byte cap would otherwise never
+    /// trip). `0` uses the default.
+    #[serde(default)]
+    pub cdc_mem_tier_max_age_ms: u64,
 }
 
 fn default_concurrency() -> usize {
@@ -777,6 +851,9 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            cdc_durability: CdcDurability::default(),
+            cdc_mem_tier_max_bytes: 0,
+            cdc_mem_tier_max_age_ms: 0,
         }
     }
 }

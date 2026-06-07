@@ -28,20 +28,25 @@ limitations under the License.
 //! global byte budget is the non-optional aggregate guard that makes memory
 //! mode OOM-safe.
 //!
-//! A RAM append `try_reserve(incoming_bytes)` BEFORE growing the tier. On
-//! success it holds a reservation whose bytes are released when the covering
-//! epoch is checkpointed (spilled to durable Vortex) or the batch falls back to
-//! the durable path. On failure (the aggregate would exceed the budget) the
-//! caller MUST NOT grow the tier — it spills the current epoch and/or falls
-//! back to the durable path. The budget therefore bounds the total resident RAM
-//! across every memory-mode table to `total` bytes; there is no unbounded-growth
-//! path.
+//! A RAM append [`try_reserve_bytes`]`(incoming_bytes)` BEFORE growing the tier.
+//! The reserved bytes are tracked in a single global atomic and are released via
+//! [`release_bytes`] when the covering epoch is checkpointed (spilled to durable
+//! Vortex). On failure (the aggregate would exceed the budget) the caller MUST
+//! NOT grow the tier — it spills the current epoch and/or falls back to the
+//! durable path. The budget therefore bounds the total resident RAM across every
+//! memory-mode table to `total` bytes; there is no unbounded-growth path.
+//!
+//! Accounting is keyed on the tier's own byte total (the same dimension the
+//! per-table cap uses): an append reserves `incoming_bytes`, and the checkpoint
+//! that flushes the tier releases the flushed tier's `bytes`. A spill-then-retry
+//! that frees this table's bytes is exactly a `release` followed by a fresh
+//! `try_reserve`, so the global `used` always tracks the live aggregate RAM.
 //!
 //! When unset (the default — file mode, unit tests, embedders that don't wire it
-//! up) `try_reserve` always succeeds with a no-op reservation, so memory mode
-//! (if explicitly opted into without the budget installed) is gated only by the
-//! per-table cap. The binary installs the budget once at startup, sized to a
-//! fraction of `runtime.query.memory_limit`.
+//! up) [`try_reserve_bytes`] always succeeds, so memory mode (if explicitly
+//! opted into without the budget installed) is gated only by the per-table cap.
+//! The binary installs the budget once at startup, sized to a fraction of
+//! `runtime.query.memory_limit`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -135,55 +140,26 @@ pub fn set_global_mem_tier_bytes(bytes: u64) {
     });
 }
 
-/// A held reservation of `bytes` against the global budget. Releasing is
-/// explicit (call [`MemTierReservation::release`] when the covering epoch is
-/// checkpointed or the batch falls back) rather than on drop, so an append that
-/// succeeds and lands in the tier keeps the bytes reserved across the await
-/// points of the write — only the checkpoint/fallback that actually frees the
-/// RAM releases them.
-#[derive(Debug)]
-pub(crate) struct MemTierReservation {
-    bytes: u64,
-    budget: Option<MemTierBudget>,
-}
-
-impl MemTierReservation {
-    /// Release the reserved bytes back to the global budget. Idempotent: a
-    /// reservation releases at most once (the bytes are zeroed after the first
-    /// call) so a double-release is a no-op.
-    pub(crate) fn release(&mut self) {
-        if let Some(budget) = self.budget.take()
-            && self.bytes > 0
-        {
-            budget.release(self.bytes);
-        }
-        self.bytes = 0;
+/// Attempt to reserve `bytes` from the global in-memory tier budget.
+///
+/// Returns `true` when the bytes fit (or when no budget is installed — an
+/// ungated success) and records the reservation; returns `false` (recording
+/// nothing) when the aggregate would exceed the budget. A `false` result means
+/// the caller MUST NOT grow the RAM tier: spill the current epoch and/or fall
+/// back to the durable path. The caller releases via [`release_bytes`] when the
+/// covering epoch is checkpointed.
+pub(crate) fn try_reserve_bytes(bytes: u64) -> bool {
+    match GLOBAL_MEM_TIER_BUDGET.read().as_ref() {
+        None => true,
+        Some(budget) => budget.try_reserve(bytes),
     }
 }
 
-/// Attempt to reserve `bytes` from the global in-memory tier budget.
-///
-/// Returns `Some(reservation)` when the bytes fit (or when no budget is
-/// installed — an ungated no-op reservation), and `None` when the aggregate
-/// would exceed the budget. A `None` result means the caller MUST NOT grow the
-/// RAM tier: spill the current epoch and/or fall back to the durable path.
-pub(crate) fn try_reserve(bytes: u64) -> Option<MemTierReservation> {
-    let budget = GLOBAL_MEM_TIER_BUDGET.read().clone();
-    match budget {
-        None => Some(MemTierReservation {
-            bytes: 0,
-            budget: None,
-        }),
-        Some(budget) => {
-            if budget.try_reserve(bytes) {
-                Some(MemTierReservation {
-                    bytes,
-                    budget: Some(budget),
-                })
-            } else {
-                None
-            }
-        }
+/// Release `bytes` previously reserved via [`try_reserve_bytes`]. Saturating and
+/// a no-op when no budget is installed.
+pub(crate) fn release_bytes(bytes: u64) {
+    if let Some(budget) = GLOBAL_MEM_TIER_BUDGET.read().as_ref() {
+        budget.release(bytes);
     }
 }
 
@@ -245,13 +221,13 @@ mod tests {
         assert_eq!(b.used.load(Ordering::Acquire), 0);
     }
 
-    /// With no global budget installed, `try_reserve` is an ungated no-op
-    /// reservation (memory mode then relies on per-table caps only). No test
-    /// mutates the global, so it is always unset here.
+    /// With no global budget installed, `try_reserve_bytes` is an ungated
+    /// success (memory mode then relies on per-table caps only) and
+    /// `release_bytes` is a harmless no-op. No test mutates the global, so it is
+    /// always unset here.
     #[test]
-    fn try_reserve_is_noop_when_unset() {
-        let mut r = try_reserve(1_000_000).expect("unset budget grants ungated reservation");
-        // A no-op reservation releases harmlessly.
-        r.release();
+    fn try_reserve_bytes_is_noop_when_unset() {
+        assert!(try_reserve_bytes(1_000_000));
+        release_bytes(1_000_000);
     }
 }

@@ -1302,7 +1302,13 @@ impl Drop for SqliteTransaction {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             // A drop without an explicit commit/rollback still held the write
-            // lock for this long (it rolls back below).
+            // lock for this long. Recording the held duration HERE (before the
+            // rollback) is correct on this path — unlike the commit/rollback
+            // paths where the metric was moved AFTER the awaited rollback — because
+            // the rollback below is SPAWNED detached (fire-and-forget on the
+            // bg connection thread): this Drop returns immediately and the
+            // synchronous writer-held window genuinely ends now, not when the
+            // detached rollback later completes.
             telemetry::track_cayenne_metastore_writer_held(
                 self.held_start.elapsed(),
                 &[telemetry::KeyValue::new("txn", "other")],
@@ -1492,10 +1498,14 @@ mod tests {
     /// `SQLITE_METASTORE_CONFIG` is process-wide and read at connection-open
     /// time (and, for the truncate threshold, at `checkpoint_wal` time). The
     /// cycle-8 TASK A2 tests below mutate it, so they serialize through this lock
-    /// and each sets the exact config it needs while holding it — preventing a
-    /// parallel test from observing another's override. A `tokio` Mutex (not
-    /// `std`) so the guard can be held across the `.await`s in the test body
-    /// (the writes are tiny) without the held-guard-across-await lint.
+    /// and each sets the exact config it needs while holding it. NOTE: this only
+    /// serializes the tests WITHIN this module — it does NOT prevent a cayenne
+    /// test in another module of the same test binary from observing the global
+    /// override while one of these holds the lock. That is acceptable because the
+    /// other suites don't assert on this config; if one ever did, it would need
+    /// its own coordination. A `tokio` Mutex (not `std`) so the guard can be held
+    /// across the `.await`s in the test body (the writes are tiny) without the
+    /// held-guard-across-await lint.
     static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn temp_metastore() -> (tempfile::TempDir, SqliteMetastore) {
@@ -1620,9 +1630,10 @@ mod tests {
     }
 
     /// TASK A2: the default PASSIVE background checkpoint (WAL well under the
-    /// 512 MiB cap) drains the accumulated frames into the main DB without
-    /// requiring TRUNCATE. After it runs, an independent TRUNCATE finds nothing
-    /// left to copy and reclaims the file — proving PASSIVE fully checkpointed.
+    /// 160 MiB cap, `DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES`) drains the accumulated
+    /// frames into the main DB without requiring TRUNCATE. After it runs, an
+    /// independent TRUNCATE finds nothing left to copy and reclaims the file —
+    /// proving PASSIVE fully checkpointed.
     #[tokio::test]
     async fn test_background_passive_checkpoint_drains_into_main_db() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -1635,7 +1646,7 @@ mod tests {
         let wal_before = metastore.read_wal_bytes().await;
         assert!(wal_before > 0, "WAL should hold frames before the drain");
 
-        // Default threshold (512 MiB) ⇒ PASSIVE (our ~2 MiB WAL is far below it).
+        // Default threshold (160 MiB) ⇒ PASSIVE (our ~2 MiB WAL is far below it).
         metastore
             .checkpoint_wal()
             .await

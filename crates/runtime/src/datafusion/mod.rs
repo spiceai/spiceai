@@ -1391,6 +1391,24 @@ impl DataFusion {
             encode_budget,
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
         );
+
+        // Install the process-global in-memory CDC tier byte budget: the hard
+        // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
+        // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
+        // isolation; without this global cap a fleet of memory-mode tables would
+        // sum their per-table caps and blow the box (the no-global-cap lesson,
+        // applied to memory). Sized to one eighth of total system memory — a
+        // conservative slice that leaves ample headroom under the query memory
+        // limit; an over-budget append spills to durable Vortex (and, under
+        // sustained overload, falls back to the durable path) rather than
+        // growing the tier, so memory mode can never OOM. File-mode tables never
+        // touch this budget.
+        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 8;
+        cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+        tracing::info!(
+            mem_tier_budget_bytes,
+            "Cayenne global in-memory CDC tier byte budget active (caps aggregate RAM for cdc_durability: memory across all tables)"
+        );
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }

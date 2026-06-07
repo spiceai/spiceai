@@ -780,6 +780,41 @@ impl CayenneAccelerator {
                 }
             }
 
+            // CDC durability mode (file | memory). Memory mode appends CDC
+            // batches to an in-RAM tier and defers the source slot ack to a
+            // checkpoint; it is only meaningful for the small-write/CDC profile,
+            // so it is forced back to `file` for other profiles below. Default
+            // `file` is byte-identical to the pre-feature behavior.
+            if let Some((key, value)) = ["cayenne_cdc_durability", "cdc_durability"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::CdcDurability::parse(value) {
+                    config.cdc_durability = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: file, memory. Defaulting to file."
+                    );
+                }
+            }
+            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration) {
+                tracing::warn!(
+                    "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; defaulting to `file`."
+                );
+                config.cdc_durability = cayenne::metadata::CdcDurability::File;
+            }
+            config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &["cayenne_cdc_mem_tier_max_bytes"],
+                config.cdc_mem_tier_max_bytes,
+            );
+            config.cdc_mem_tier_max_age_ms = parse_u64_with_hint(
+                acceleration,
+                "cayenne_cdc_mem_tier_max_age_ms",
+                config.cdc_mem_tier_max_age_ms,
+                " (milliseconds)",
+            );
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -1230,8 +1265,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    27,
-    { S3_PARAMS_LEN + 27 },
+    30,
+    { S3_PARAMS_LEN + 30 },
 >(
     S3_PARAMETERS,
     [
@@ -1303,6 +1338,14 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
+        ParameterSpec::component("cdc_durability")
+            .description("Durability mode for the inline CDC write path (refresh_mode: changes). 'file' (default) persists each CDC batch durably before advancing the source slot — byte-identical to the prior behavior. 'memory' appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. Only applies to the small-write/CDC profile and non-partitioned tables.")
+            .one_of(&["file", "memory"])
+            .default("file"),
+        ParameterSpec::component("cdc_mem_tier_max_bytes")
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) uses a memory-aware default and relies on the process-global byte budget. Composes with the global budget — whichever is breached first triggers the spill."),
+        ParameterSpec::component("cdc_mem_tier_max_age_ms")
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
     ],
 );
 

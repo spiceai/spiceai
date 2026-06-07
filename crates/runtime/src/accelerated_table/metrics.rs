@@ -19,7 +19,7 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 use std::sync::LazyLock;
-use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
+use telemetry::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_before_refresh_ms";
@@ -215,6 +215,11 @@ pub(crate) static CDC_LINGER_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|
             "Duration in milliseconds the CDC apply loop spent in the Phase-2 linger window accumulating envelopes before applying the coalesced burst (cdc_max_coalesce_age_ms).",
         )
         .with_unit("ms")
-        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        // Linger waits are typically sub-100ms (the default cdc_max_coalesce_age_ms
+        // is small), so the shared `DURATION_MS_HISTOGRAM_BUCKETS` — which jumps
+        // straight from 0 to 100ms — would collapse almost every observation into
+        // bucket 0. Use the finer sub-ms→100ms contention buckets, which resolve
+        // the 0.1–50ms band while still reaching the multi-second stall tail.
+        .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });

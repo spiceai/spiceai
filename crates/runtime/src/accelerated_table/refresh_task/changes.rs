@@ -65,6 +65,73 @@ use tokio::sync::{Notify, RwLock};
 
 type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated_table::Result<()>>;
 
+/// Source committers deferred by the in-memory CDC durability mode
+/// (`cdc_durability: memory`), tagged with the mem-tier epoch they belong to.
+///
+/// In memory mode the source slot ack is NOT advanced per-batch. Instead each
+/// applied batch's committers are pushed here tagged with the batch's mem-tier
+/// epoch, and they run (advancing the slot) only when a Cayenne checkpoint
+/// reports that epoch durable via [`CayenneSlotAdvancer::on_checkpoint_durable`].
+/// This upholds the load-bearing invariant — the slot advances ONLY after the
+/// covering checkpoint's Vortex+metastore writes are durable — so a crash that
+/// discards the RAM tier always leaves the slot at or below the last durable
+/// epoch and the source re-streams the un-checkpointed tail (exactly-once via
+/// the PK-idempotent apply). Shared (`Arc`) between the apply loop (which pushes)
+/// and the slot advancer installed on the provider (which drains).
+type DeferredCommitQueue = Arc<
+    tokio::sync::Mutex<std::collections::VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>>,
+>;
+
+/// The runtime's [`cayenne::SlotAdvancer`] implementation. Installed on a
+/// memory-mode Cayenne provider; when a checkpoint reports an epoch durable it
+/// drains every deferred committer with `epoch <= durable_epoch` from the shared
+/// [`DeferredCommitQueue`] and runs each `commit()` in order, advancing the
+/// source slot — exactly as the per-batch committer would have, only gated
+/// behind the durable fence.
+struct CayenneSlotAdvancer {
+    queue: DeferredCommitQueue,
+    dataset_name: TableReference,
+    runtime_status: Arc<status::RuntimeStatus>,
+}
+
+#[async_trait::async_trait]
+impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
+    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+        // Pull out every committer whose epoch is now durable, preserving FIFO
+        // order. Hold the lock only to splice out the ready prefix, not across
+        // the (network) commits.
+        let ready: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = {
+            let mut queue = self.queue.lock().await;
+            let mut ready = Vec::new();
+            while let Some((epoch, _)) = queue.front() {
+                if *epoch <= durable_epoch {
+                    let (_, committers) = queue.pop_front().unwrap_or_else(|| unreachable!());
+                    ready.extend(committers);
+                } else {
+                    break;
+                }
+            }
+            ready
+        };
+
+        for committer in ready {
+            if let Err(e) = committer.commit().await {
+                // A failed source ack is logged but not fatal here: the slot
+                // simply does not advance for this committer, so the source
+                // re-streams its batch (already durable in Vortex) on reconnect
+                // and the idempotent apply converges. Surfacing it as a hard
+                // error would tear down a stream whose data IS durable.
+                if !self.runtime_status.is_shutdown() {
+                    tracing::warn!(
+                        "Deferred CDC commit failed for {} (source slot will re-advance on the next durable checkpoint): {e}",
+                        self.dataset_name
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(super) struct CdcInsertPlanCache {
     target_schema: SchemaRef,
     streaming_plan: Arc<StreamingDataUpdateExecutionPlan>,
@@ -113,11 +180,24 @@ struct ApplyContext<'a> {
     commit_timeout: Duration,
     pending_finalize: &'a mut Option<PendingApplyFinalize>,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
+    /// Shared queue of source committers DEFERRED by in-memory CDC durability
+    /// (`cdc_durability: memory`). When a write returns a mem-tier epoch, its
+    /// committers are pushed here (tagged with the epoch) instead of committed
+    /// now; the [`CayenneSlotAdvancer`] drains them after the covering
+    /// checkpoint is durable. `None` for file-mode streams (committers spawn
+    /// immediately, as before).
+    deferred_commits: Option<&'a DeferredCommitQueue>,
 }
 
 struct WriteChangeOutcome {
     result: WriteChangeResult,
     pending_finalize: Option<PendingApplyFinalize>,
+    /// Highest Cayenne in-memory CDC tier epoch this write landed in
+    /// (`cdc_durability: memory`), or `None` for every durable-path write. When
+    /// set, [`RefreshTask::apply_envelope_run`] DEFERS the source commit: instead
+    /// of advancing the slot now, it queues this batch's committers tagged with
+    /// the epoch, and runs them only when a checkpoint reports the epoch durable.
+    in_memory_epoch: Option<u64>,
 }
 
 impl WriteChangeOutcome {
@@ -125,8 +205,21 @@ impl WriteChangeOutcome {
         Self {
             result,
             pending_finalize,
+            in_memory_epoch: None,
         }
     }
+
+    fn with_in_memory_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.in_memory_epoch = epoch;
+        self
+    }
+}
+
+/// Per-upsert-sub-batch outcome: the optional backgrounded finalize plus the
+/// optional in-memory CDC tier epoch the batch landed in.
+struct UpsertOutcome {
+    pending_finalize: Option<PendingApplyFinalize>,
+    in_memory_epoch: Option<u64>,
 }
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
@@ -562,6 +655,34 @@ impl RefreshTask {
         let write_session_state = write_ctx.state();
         let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
 
+        // In-memory CDC durability (`cdc_durability: memory`): if this stream's
+        // Cayenne provider is in memory mode, set up the deferred-commit queue and
+        // install the slot advancer that drains it after each durable checkpoint.
+        // `None` (and never populated) for file-mode streams, so the commit path
+        // is byte-identical there.
+        let deferred_commits: Option<DeferredCommitQueue> = {
+            #[cfg(not(windows))]
+            {
+                self.cayenne_accelerator()
+                    .filter(|cayenne| cayenne.is_cdc_memory_mode())
+                    .map(|cayenne| {
+                        let queue: DeferredCommitQueue = Arc::new(tokio::sync::Mutex::new(
+                            std::collections::VecDeque::new(),
+                        ));
+                        cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
+                            queue: Arc::clone(&queue),
+                            dataset_name: dataset_name.clone(),
+                            runtime_status: Arc::clone(&self.runtime_status),
+                        }));
+                        queue
+                    })
+            }
+            #[cfg(windows)]
+            {
+                None
+            }
+        };
+
         loop {
             // Time how long the apply loop blocks waiting for the next batch
             // from the source-reader channel. Large => source-bound (slot read /
@@ -683,6 +804,7 @@ impl RefreshTask {
                 commit_timeout: cdc_cfg.commit_timeout,
                 pending_finalize: &mut pending_finalize,
                 pending_commit: &mut pending_commit,
+                deferred_commits: deferred_commits.as_ref(),
             };
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
@@ -990,11 +1112,26 @@ impl RefreshTask {
                     record_cdc_fixed_cost(context.dataset_name, "commit_wait", commit_wait_start);
                 }
 
-                *context.pending_commit = Some(spawn_ordered_commit_task(
-                    committers,
-                    Arc::clone(&self.runtime_status),
-                    context.dataset_name.clone(),
-                ));
+                // In-memory CDC durability: DEFER this batch's committers behind
+                // the covering checkpoint rather than advancing the slot now. The
+                // batch's data is in RAM only; the slot must not advance until a
+                // checkpoint reports its epoch durable, or a crash would lose the
+                // un-acked-but-slot-advanced tail. Push the committers tagged with
+                // the epoch onto the shared queue; the `CayenneSlotAdvancer`
+                // drains and runs them after the durable checkpoint fence.
+                if let (Some(epoch), Some(queue)) =
+                    (write_outcome.in_memory_epoch, context.deferred_commits)
+                {
+                    if !committers.is_empty() {
+                        queue.lock().await.push_back((epoch, committers));
+                    }
+                } else {
+                    *context.pending_commit = Some(spawn_ordered_commit_task(
+                        committers,
+                        Arc::clone(&self.runtime_status),
+                        context.dataset_name.clone(),
+                    ));
+                }
             }
             Err(e) => {
                 let error_message = format_datafusion_error(&e);
@@ -1045,6 +1182,11 @@ impl RefreshTask {
 
         let mut had_change = false;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
+        // Highest in-memory CDC tier epoch across this coalesced write's upsert
+        // sub-batches (`cdc_durability: memory`). The slot deferral keys on the
+        // max: draining committers up to the highest epoch covers every earlier
+        // one (epochs are monotone). `None` if no sub-batch took the RAM path.
+        let mut max_in_memory_epoch: Option<u64> = None;
         for (op_type, row_indices) in sub_batches {
             if let Some(finalize) = pending_finalize.take()
                 && let Some(error_message) = join_pending_finalize(
@@ -1075,9 +1217,14 @@ impl RefreshTask {
                 }
                 ChangeOperationType::Upsert => {
                     let op_start = Instant::now();
-                    pending_finalize = self
+                    let outcome = self
                         .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    pending_finalize = outcome.pending_finalize;
+                    if let Some(epoch) = outcome.in_memory_epoch {
+                        max_in_memory_epoch =
+                            Some(max_in_memory_epoch.map_or(epoch, |cur| cur.max(epoch)));
+                    }
                     tracing::trace!(
                         dataset = %dataset_name,
                         op = "upsert",
@@ -1104,10 +1251,10 @@ impl RefreshTask {
         }
 
         if had_change {
-            Ok(WriteChangeOutcome::new(
-                WriteChangeResult::DataWritten,
-                pending_finalize,
-            ))
+            Ok(
+                WriteChangeOutcome::new(WriteChangeResult::DataWritten, pending_finalize)
+                    .with_in_memory_epoch(max_in_memory_epoch),
+            )
         } else {
             Ok(WriteChangeOutcome::new(WriteChangeResult::NoChange, None))
         }
@@ -1119,7 +1266,7 @@ impl RefreshTask {
         row_indices: &[usize],
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<Option<PendingApplyFinalize>> {
+    ) -> crate::accelerated_table::Result<UpsertOutcome> {
         let data_batch = change_batch.data_batch();
 
         let target_schema = self.accelerator.schema();
@@ -1154,8 +1301,18 @@ impl RefreshTask {
 
             self.update_last_updated_at();
 
+            // In-memory CDC tier epoch (`cdc_durability: memory`), captured before
+            // `cayenne_write` is consumed. `None` for durable-path writes.
+            let in_memory_epoch = cayenne_write.in_memory_epoch();
+
             if cayenne_write.has_pending_finalize() {
-                return Ok(Some(spawn_cayenne_finalize(cayenne_write)));
+                // A pending finalize is the durable Stage-B path — never memory
+                // mode (an in-memory-staged write has nothing to finalize), so no
+                // epoch to defer here.
+                return Ok(UpsertOutcome {
+                    pending_finalize: Some(spawn_cayenne_finalize(cayenne_write)),
+                    in_memory_epoch: None,
+                });
             }
 
             cayenne_write
@@ -1165,7 +1322,10 @@ impl RefreshTask {
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
-            return Ok(None);
+            return Ok(UpsertOutcome {
+                pending_finalize: None,
+                in_memory_epoch,
+            });
         }
 
         #[cfg(not(windows))]
@@ -1222,7 +1382,10 @@ impl RefreshTask {
 
         self.update_last_updated_at();
 
-        Ok(None)
+        Ok(UpsertOutcome {
+            pending_finalize: None,
+            in_memory_epoch: None,
+        })
     }
 
     /// Resolve the inner [`CayenneTableProvider`] from the accelerator, peeling
@@ -3837,6 +4000,7 @@ mod tests {
             commit_timeout: Duration::from_secs(5),
             pending_finalize: &mut pending_finalize,
             pending_commit: &mut pending_commit,
+            deferred_commits: None,
         };
 
         assert!(
