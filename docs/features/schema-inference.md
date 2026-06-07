@@ -26,7 +26,11 @@ datasets:
 Inference is strictly **gap-filling**: a value you configure explicitly always
 wins. It applies to **all refresh modes** (`full`, `append`, `changes`,
 `snapshot`, `caching`), and is applied before registration so change-data-capture
-(`refresh_mode: changes`) sees the inferred primary key too.
+(`refresh_mode: changes`) sees the inferred primary key too. The one exception is
+inferred **sort** order, which is *not* applied for `refresh_mode: changes`: CDC is
+driven by the upsert (primary) key rather than a refresh-time sort, and applying a
+sort can perturb the initial snapshot. Primary key, `on_conflict`, and indexes are
+still inferred for CDC.
 
 ## Supported connectors
 
@@ -102,6 +106,9 @@ set one yourself:
   column and ignores direction).
 - **SQLite / Turso / PostgreSQL accelerators** have no sort parameter, so sort
   inference is skipped.
+- **`refresh_mode: changes` (CDC)** — sort inference is skipped regardless of
+  engine; the change-stream accelerator is driven by the upsert key, not a
+  refresh-time sort.
 
 ## Notes & limitations
 

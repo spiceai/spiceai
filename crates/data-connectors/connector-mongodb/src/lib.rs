@@ -500,8 +500,9 @@ async fn mongodb_catalog_details(
         .map_err(|e| format!("failed to connect to MongoDB: {e}"))?;
     let db = connection.client.database(&connection.db_name);
 
-    // Secondary indexes via the `listIndexes` command (indexes are few and fit in
-    // the first cursor batch, so there is no need to exhaust the cursor).
+    // Secondary indexes via the `listIndexes` command. A collection has at most 64
+    // indexes (a MongoDB hard limit) — far under the cursor's first-batch size — so
+    // `firstBatch` always holds them all and the cursor never needs `getMore`.
     let mut indexes: Vec<InferredIndex> = Vec::new();
     let index_response = db
         .run_command(doc! { "listIndexes": collection_name })
