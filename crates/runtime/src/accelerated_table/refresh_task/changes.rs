@@ -366,6 +366,20 @@ fn resolve_cdc_param_u64(
     parse_env_u64(env_var, default)
 }
 
+/// Every `cdc_*` key [`cdc_config_from_params`] reads from `runtime.params`.
+/// Exposed as the authoritative list for this family; the startup unknown-param
+/// check merges it into the full `runtime.params` vocabulary
+/// (`known_runtime_params`) used to recognize keys and scope "did you mean"
+/// suggestions across the whole section. Keep in sync with the keys read in
+/// [`cdc_config_from_params`].
+pub(crate) const CDC_RUNTIME_PARAMS: &[&str] = &[
+    "cdc_prefetch_buffer",
+    "cdc_max_coalesced_envelopes",
+    "cdc_max_coalesced_bytes",
+    "cdc_max_coalesce_age_ms",
+    "cdc_commit_timeout_ms",
+];
+
 /// Build a [`CdcConfig`] from the spicepod `runtime.params` map, reading
 /// the `cdc_prefetch_buffer`, `cdc_max_coalesced_envelopes`,
 /// `cdc_max_coalesced_bytes`, `cdc_max_coalesce_age_ms`, and

@@ -71,6 +71,13 @@ aegis = { version = "0.9.3", default-features = false, features = [
     "pure-rust",
 ] }
 
+# Ordering-tier fsync on the staged-commit hot path (provider/fsync_tier.rs):
+# on macOS both std `sync_all` AND `sync_data` are fcntl(F_FULLFSYNC) (~4-5 ms
+# per call, measured), so the plain-fsync ordering tier needs a direct
+# libc::fsync. See the module docs for the durability rationale.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 turso = ["dep:turso"]
@@ -252,6 +259,21 @@ required-features = ["duckdb-bench"]
 [[bench]]
 harness = false
 name = "vs_duckdb_scaling"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_memory_budget"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan_under_compaction"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_cdc_multitable"
 required-features = ["duckdb-bench"]
 
 [[bench]]
