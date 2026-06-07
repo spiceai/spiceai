@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "51c56f8a5aaad9fe46dfb020f3b46a9377b7681f" } # lukim/tp-53-patches-df53-seam (DF53 + Spice patches: with_function_support seam, Engine model, sqlite between)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "6d01d73d109f31026999ae8df4457b32723de10e" } # spiceai-53 (PR #6 merged: DF53 + with_function_support seam on both DuckDB factories, Engine model, sqlite between, sqlite decimal(p,s) NUMERIC affinity)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -295,7 +295,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 spice-cloud-client = { path = "crates/spice-cloud-client" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "946bdbc7887c3c90093ad8935d254d894f4bad3b" } # branch: lukim/snowflake-objectstore-013 (arrow58 + object_store 0.13)
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "d51510795b062a807e3967ab6e133a3806e314cf" } # spiceai-58 (PR #8 merged: arrow58 + object_store 0.13)
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
@@ -439,7 +439,10 @@ datafusion-federation = { git = "https://github.com/spiceai/datafusion-federatio
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-# Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
+# Single duckdb across the whole graph (direct deps + datafusion-table-providers):
+# the spiceai duckdb-rs fork on DuckDB 1.5.2 + arrow 58. The former second binding
+# (spiceai_duckdb_fork 1.4.4) was retired so runtime and table-providers share one
+# duckdb type set (AccessMode/Error/Connection/Transaction).
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
 

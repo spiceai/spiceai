@@ -31,7 +31,7 @@ use data_components::ducklake::provider::DuckLakeCatalogProvider;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use snafu::prelude::*;
-use spiceai_duckdb::{self as duckdb, AccessMode};
+use duckdb::AccessMode;
 use std::any::Any;
 use std::sync::Arc;
 

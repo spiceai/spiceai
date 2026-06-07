@@ -56,7 +56,7 @@ impl CachingEngineSys {
     }
 }
 
-fn table_exists(tx: &spiceai_duckdb::Transaction<'_>, table_name: &str) -> Result<bool> {
+fn table_exists(tx: &duckdb::Transaction<'_>, table_name: &str) -> Result<bool> {
     let mut stmt = tx
         .prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = ?")
         .map_err(Error::external)?;
@@ -65,7 +65,7 @@ fn table_exists(tx: &spiceai_duckdb::Transaction<'_>, table_name: &str) -> Resul
 }
 
 fn list_internal_tables(
-    tx: &spiceai_duckdb::Transaction<'_>,
+    tx: &duckdb::Transaction<'_>,
     table_name: &str,
 ) -> Result<Vec<(String, u64)>> {
     // Escape LIKE metacharacters (`%`, `_`, and the escape char itself) in the dataset name so

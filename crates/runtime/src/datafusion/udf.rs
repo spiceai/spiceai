@@ -34,6 +34,9 @@ use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
 use data_components::function_support::{FunctionRestriction, FunctionSupport};
+use datafusion_table_providers::util::supported_functions::{
+    FunctionRestriction as TpFunctionRestriction, FunctionSupport as TpFunctionSupport,
+};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
@@ -770,6 +773,44 @@ pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionS
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
     deny_spice_specific_functions_excluding(
         &crate::datafusion::dialect::duckdb_native_function_names(),
+    )
+}
+
+/// The list of Spice function names denied to `DuckDB`: every built-in Spice UDF
+/// the `DuckDB` dialect can't rewrite into native SQL, plus all user-registered
+/// functions. Shared source of truth for both the local
+/// [`deny_spice_functions_for_duckdb`] ([`FunctionSupport`]) and the
+/// table-providers-typed [`deny_spice_functions_for_duckdb_table_providers`].
+fn denied_function_names_for_duckdb() -> Vec<String> {
+    let builtins = deny_list_excluding_native(
+        BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
+        &crate::datafusion::dialect::duckdb_native_function_names(),
+    );
+    let user = USER_FUNCTION_NAMES.read().clone();
+    let mut denied = Vec::with_capacity(builtins.len() + user.len());
+    denied.extend(builtins);
+    denied.extend(user);
+    denied
+}
+
+/// Same deny-list as [`deny_spice_functions_for_duckdb`], but expressed in the
+/// `datafusion-table-providers` [`TpFunctionSupport`] type that the fork's
+/// `DuckDBTableFactory::with_function_support` seam expects.
+///
+/// The runtime maintains its deny-list in the local
+/// [`data_components::function_support::FunctionSupport`] type, which is a
+/// distinct (private-field) reimplementation of the table-providers type. The
+/// `DuckDB` factory lives in the fork and takes the fork's type, so we build it
+/// here from the shared [`denied_function_names_for_duckdb`] name list rather
+/// than trying to convert between the two opaque structs. See issue #10703.
+#[must_use]
+pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
+    TpFunctionSupport::new(
+        Some(TpFunctionRestriction::Deny(
+            denied_function_names_for_duckdb(),
+        )),
+        None,
+        None,
     )
 }
 

@@ -32,7 +32,7 @@ use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConne
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
-use spiceai_duckdb::AccessMode;
+use duckdb::AccessMode;
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::embeddings::Embeddings;

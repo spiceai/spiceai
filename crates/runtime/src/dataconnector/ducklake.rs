@@ -30,7 +30,7 @@ use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use snafu::prelude::*;
-use spiceai_duckdb::{self as duckdb, AccessMode};
+use duckdb::AccessMode;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;

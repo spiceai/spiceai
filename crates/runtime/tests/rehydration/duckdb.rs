@@ -19,7 +19,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion_table_providers::sql::db_connection_pool::{
     DbConnectionPool, duckdbpool::DuckDbConnectionPool,
 };
-use spiceai_duckdb::AccessMode;
+use duckdb::AccessMode;
 
 pub(crate) async fn query_local_db(
     db_file_path: &str,

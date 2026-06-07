@@ -22,7 +22,6 @@ use super::{
 use data_components::debezium::change_event;
 use data_components::kafka::KafkaOffset;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use spiceai_duckdb as duckdb;
 use std::sync::Arc;
 
 impl DebeziumKafkaSys {

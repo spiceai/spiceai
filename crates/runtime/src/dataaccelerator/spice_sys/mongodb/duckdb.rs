@@ -17,7 +17,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use spiceai_duckdb as duckdb;
 
 use super::{Error, MONGODB_TABLE_NAME, MongoCheckpointMetadata, MongoSys, Result};
 

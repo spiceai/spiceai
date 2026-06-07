@@ -2125,7 +2125,7 @@ mod tests {
     #[cfg(feature = "duckdb")]
     use datafusion_table_providers::duckdb::DuckDBTableProviderFactory;
     #[cfg(feature = "duckdb")]
-    use spiceai_duckdb::AccessMode;
+    use duckdb::AccessMode;
 
     use super::*;
     use arrow::array::{

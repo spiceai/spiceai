@@ -421,8 +421,14 @@ impl PartitionCreator for DuckDBPartitionCreator {
         let schema = DFSchema::try_from(Arc::clone(&self.schema))
             .map_err(|e| creator::Error::InferringPartitions { source: e.into() })?;
 
-        let duckdb_table_factory =
-            DuckDBTableFactory::new(Arc::clone(&self.pool)).with_dialect(new_duckdb_dialect());
+        let duckdb_table_factory = DuckDBTableFactory::new(Arc::clone(&self.pool))
+            .with_dialect(new_duckdb_dialect())
+            // Keep Spice-only UDFs (e.g. `json_get_str`) out of the SQL federated
+            // into DuckDB partition tables; without the deny-list they fail with
+            // `Catalog Error: ... does not exist`. Mirrors `create_factory()`.
+            .with_function_support(
+                crate::datafusion::udf::deny_spice_functions_for_duckdb_table_providers(),
+            );
 
         let mut partitions = Vec::with_capacity(partitioned_tables.len());
         for table in partitioned_tables {

@@ -99,8 +99,6 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-source-arrow = { package = "arrow", version = "57", optional = true }
-source-arrow-ipc = { package = "arrow-ipc", version = "57", optional = true }
 spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
     "tls",
 ], optional = true } # branch: spiceai-58
@@ -187,8 +185,7 @@ sharepoint = ["dep:graph-rs-sdk"]
 sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
 snowflake = [
     "dep:snowflake-api",
-    "dep:source-arrow",
-    "dep:source-arrow-ipc",
+    "federation",
     "datafusion-table-providers/federation",
     "db_connection_pool/snowflake",
 ]

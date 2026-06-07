@@ -31,12 +31,10 @@ linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["duckdb"] }
 snafu.workspace = true
-spiceai_duckdb = { package = "spiceai_duckdb_fork", version = "=1.4.4", features = [
+duckdb = { workspace = true, features = [
 	"bundled",
 	"r2d2",
-	"vtab",
-	"vtab-arrow",
-	"appender-arrow",
+	"extensions-full",
 ] }
 
 [features]

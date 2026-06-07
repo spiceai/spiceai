@@ -31,6 +31,11 @@ serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
+# Aliased Arrow 57 IPC, used by the ODBC path to bridge `arrow-odbc`'s Arrow 57
+# RecordBatches to the workspace Arrow 58 via an IPC round-trip: the writer side
+# must match `arrow-odbc`'s Arrow 57 schema, the reader side is the workspace
+# Arrow 58. Once `arrow-odbc` is on Arrow 58 this alias (and `odbcconn`'s IPC
+# bridge) can be removed.
 source-arrow-ipc = { package = "arrow-ipc", version = "57", optional = true }
 tokio = { workspace = true, optional = true, features = ["rt"] }
 tokio-util = { workspace = true }
@@ -69,7 +74,6 @@ postgres = [
 scylladb = ["dep:scylla", "dep:async-stream"]
 snowflake = [
   "dep:snowflake-api",
-  "dep:source-arrow-ipc",
   "dep:pkcs8",
   "dep:serde_json",
 ]

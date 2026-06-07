@@ -119,8 +119,6 @@ pub mod s3_vectors;
 pub mod schema_discovery;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
-#[cfg(feature = "snowflake")]
-pub(crate) mod source_arrow_compat;
 pub mod sql_expr;
 
 #[cfg(feature = "sharepoint")]

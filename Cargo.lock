@@ -481,10 +481,7 @@ dependencies = [
  "arrow-array 57.3.1",
  "arrow-buffer 57.3.1",
  "arrow-cast 57.3.1",
- "arrow-csv 57.3.1",
  "arrow-data 57.3.1",
- "arrow-ipc 57.3.1",
- "arrow-json 57.3.1",
  "arrow-ord 57.3.1",
  "arrow-row 57.3.1",
  "arrow-schema 57.3.1",
@@ -501,10 +498,10 @@ dependencies = [
  "arrow-array 58.3.0",
  "arrow-buffer 58.3.0",
  "arrow-cast 58.3.0",
- "arrow-csv 58.3.0",
+ "arrow-csv",
  "arrow-data 58.3.0",
  "arrow-ipc 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-ord 58.3.0",
  "arrow-row 58.3.0",
  "arrow-schema 58.3.0",
@@ -643,21 +640,6 @@ dependencies = [
 
 [[package]]
 name = "arrow-csv"
-version = "57.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ddb80a4848e03b1655af496d5ac2563a779e5742fcb48f2ca2e089c9cd2197"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-cast 57.3.1",
- "arrow-schema 57.3.1",
- "chrono",
- "csv",
- "csv-core",
- "regex",
-]
-
-[[package]]
-name = "arrow-csv"
 version = "58.3.0"
 source = "git+https://github.com/spiceai/arrow-rs.git?rev=18a40370d014a0f8eed12ee0d5a914e8cb2070d8#18a40370d014a0f8eed12ee0d5a914e8cb2070d8"
 dependencies = [
@@ -749,30 +731,6 @@ dependencies = [
  "flatbuffers",
  "lz4_flex 0.13.0",
  "zstd",
-]
-
-[[package]]
-name = "arrow-json"
-version = "57.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a84a905f41fedfcd7679813c89a61dc369c0f932b27aa8dcc6aa051cc781a97d"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-buffer 57.3.1",
- "arrow-cast 57.3.1",
- "arrow-data 57.3.1",
- "arrow-schema 57.3.1",
- "chrono",
- "half",
- "indexmap 2.14.0",
- "itoa",
- "lexical-core",
- "memchr",
- "num-traits",
- "ryu",
- "serde_core",
- "serde_json",
- "simdutf8",
 ]
 
 [[package]]
@@ -959,7 +917,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "arrow 58.3.0",
  "arrow-cast 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-schema 58.3.0",
  "base64 0.22.1",
  "criterion 0.7.0",
@@ -4291,11 +4249,11 @@ dependencies = [
  "data_components",
  "datafusion",
  "datafusion-table-providers",
+ "duckdb",
  "linkme",
  "paste",
  "runtime",
  "snafu 0.8.9",
- "spiceai_duckdb_fork",
 ]
 
 [[package]]
@@ -5594,12 +5552,10 @@ name = "data_components"
 version = "2.0.0-unstable"
 dependencies = [
  "ahash 0.8.12",
- "arrow 57.3.1",
  "arrow 58.3.0",
  "arrow-array 58.3.0",
  "arrow-buffer 58.3.0",
  "arrow-flight",
- "arrow-ipc 57.3.1",
  "arrow-row 58.3.0",
  "arrow_tools",
  "async-stream",
@@ -6076,7 +6032,7 @@ name = "datafusion-federation"
 version = "0.5.3"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=6433df67b1154c8c3c4779732b1b04c73714ce83#6433df67b1154c8c3c4779732b1b04c73714ce83"
 dependencies = [
- "arrow-json 58.3.0",
+ "arrow-json",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -6550,12 +6506,12 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.11.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=51c56f8a5aaad9fe46dfb020f3b46a9377b7681f#51c56f8a5aaad9fe46dfb020f3b46a9377b7681f"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=6d01d73d109f31026999ae8df4457b32723de10e#6d01d73d109f31026999ae8df4457b32723de10e"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
  "arrow 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-schema 58.3.0",
  "async-stream",
  "async-trait",
@@ -7161,7 +7117,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink 0.10.0",
- "libduckdb-sys 1.10502.0",
+ "libduckdb-sys",
  "num",
  "num-integer",
  "r2d2",
@@ -8480,8 +8436,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9661,7 +9617,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -10770,23 +10726,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "libduckdb-sys"
-version = "1.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78bacb8933586cee3b550c39b610d314f9b7a48701ac7a914a046165a4ad8da"
-dependencies = [
- "cc",
- "flate2",
- "pkg-config",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "tar",
- "vcpkg",
- "zip 6.0.0",
-]
 
 [[package]]
 name = "libduckdb-sys"
@@ -15728,7 +15667,7 @@ dependencies = [
  "ansi_colors",
  "arrow 58.3.0",
  "arrow-flight",
- "arrow-json 58.3.0",
+ "arrow-json",
  "clap",
  "dialoguer",
  "dirs",
@@ -16218,10 +16157,10 @@ dependencies = [
  "app",
  "arc-swap",
  "arrow 58.3.0",
- "arrow-csv 58.3.0",
+ "arrow-csv",
  "arrow-flight",
  "arrow-ipc 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-row 58.3.0",
  "arrow-schema 58.3.0",
  "arrow_tools",
@@ -16395,7 +16334,6 @@ dependencies = [
  "spice-cloud",
  "spice-cloud-client",
  "spiceai",
- "spiceai_duckdb_fork",
  "spicepod",
  "sysinfo 0.38.4",
  "tar",
@@ -16621,7 +16559,7 @@ dependencies = [
  "ahash 0.8.12",
  "arrow 58.3.0",
  "arrow-ipc 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-schema 58.3.0",
  "async-openai",
  "async-stream",
@@ -17525,7 +17463,7 @@ name = "search"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-schema 58.3.0",
  "async-stream",
  "async-trait",
@@ -18275,7 +18213,7 @@ dependencies = [
 [[package]]
 name = "snowflake-api"
 version = "0.14.0"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=946bdbc7887c3c90093ad8935d254d894f4bad3b#946bdbc7887c3c90093ad8935d254d894f4bad3b"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=d51510795b062a807e3967ab6e133a3806e314cf#d51510795b062a807e3967ab6e133a3806e314cf"
 dependencies = [
  "arrow-array 58.3.0",
  "arrow-ipc 58.3.0",
@@ -18400,7 +18338,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "ansi_colors",
  "arrow 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "assert_cmd",
  "chrono",
  "clap",
@@ -18481,7 +18419,7 @@ source = "git+https://github.com/spiceai/spice-rs.git?rev=7bc9e455d47aa8899acc5c
 dependencies = [
  "arrow 58.3.0",
  "arrow-flight",
- "arrow-json 58.3.0",
+ "arrow-json",
  "backoff",
  "base64 0.22.1",
  "bytes",
@@ -18502,25 +18440,6 @@ dependencies = [
  "tonic",
  "tracing",
  "winver",
-]
-
-[[package]]
-name = "spiceai_duckdb_fork"
-version = "1.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6ca1d977d7999f72cbaa9246256e3b0e01e3ae17bd7be70935d1848b335adfa"
-dependencies = [
- "arrow 58.3.0",
- "cast",
- "fallible-iterator 0.3.0",
- "fallible-streaming-iterator",
- "hashlink 0.10.0",
- "libduckdb-sys 1.4.4",
- "num",
- "num-integer",
- "r2d2",
- "rust_decimal",
- "strum 0.27.2",
 ]
 
 [[package]]
@@ -19585,7 +19504,7 @@ dependencies = [
  "anyhow",
  "app",
  "arrow 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "arrow-schema 58.3.0",
  "arrow_tools",
  "async-channel 2.5.0",
@@ -19657,7 +19576,7 @@ name = "testoperator"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow 58.3.0",
- "arrow-json 58.3.0",
+ "arrow-json",
  "async-trait",
  "aws-config",
  "aws-credential-types",

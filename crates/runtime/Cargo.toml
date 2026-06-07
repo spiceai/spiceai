@@ -66,13 +66,6 @@ duckdb = { workspace = true, features = [
     "r2d2",
     "extensions-full",
 ], optional = true }
-spiceai_duckdb = { package = "spiceai_duckdb_fork", version = "=1.4.4", features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-    "appender-arrow",
-], optional = true }
 dynamodb-streams = { path = "../dynamodb-streams", optional = true }
 event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
@@ -299,7 +292,6 @@ elasticsearch = [
 ]
 duckdb = [
     "dep:duckdb",
-    "dep:spiceai_duckdb",
     "db_connection_pool/duckdb",
     "data_components/duckdb",
     "datafusion-optimizer-rules/duckdb",

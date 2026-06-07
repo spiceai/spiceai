@@ -63,7 +63,7 @@ use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
-use spiceai_duckdb::AccessMode;
+use duckdb::AccessMode;
 use std::collections::HashMap;
 use std::{
     any::Any,
@@ -82,6 +82,16 @@ pub(crate) mod settings;
 pub(crate) fn create_factory() -> DuckDBTableProviderFactory {
     DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
         .with_dialect(new_duckdb_dialect())
+        // Install the DuckDB-aware function deny-list so Spice-only UDFs the
+        // DuckDB dialect can't rewrite (e.g. `json_get_str`) are evaluated
+        // locally in DataFusion instead of being federated into the accelerated
+        // DuckDB store, where they don't exist (`Catalog Error: ... does not
+        // exist`). The fork's federation only un-federates unsupported functions
+        // when a FunctionSupport is set; without this the deny-list never runs.
+        // Mirrors the connector wiring (`DuckDB::with_spice_deny_list`). See #10703.
+        .with_function_support(
+            crate::datafusion::udf::deny_spice_functions_for_duckdb_table_providers(),
+        )
         .with_settings_registry(
             DuckDBSettingsRegistry::new()
                 .with_setting(Box::new(OrderByNonIntegerLiteral))

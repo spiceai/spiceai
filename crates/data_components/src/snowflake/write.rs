@@ -753,14 +753,6 @@ fn extract_dml_count(table_name: &str, result: QueryResult) -> Result<u64> {
             .build()
         }),
         QueryResult::Arrow(batches) => {
-            let batches =
-                crate::source_arrow_compat::batches_to_arrow(&batches).map_err(|error| {
-                    UnexpectedDmlResponseSnafu {
-                        table: table_name.to_string(),
-                        reason: format!("failed to convert Arrow response: {error}"),
-                    }
-                    .build()
-                })?;
             for batch in batches {
                 if batch.num_rows() == 0 || batch.num_columns() == 0 {
                     continue;

@@ -211,10 +211,6 @@ async fn probe_snowflake_information_schema(
             }
         }
         Ok(snowflake_api::QueryResult::Arrow(batches)) => {
-            let batches = match crate::source_arrow_compat::batches_to_arrow(&batches) {
-                Ok(batches) => batches,
-                Err(e) => return SchemaProbeResult::Failed(e.into()),
-            };
             match parse_information_schema_arrow(&batches, &table_reference.to_string()) {
                 Ok(schema) => SchemaProbeResult::Ok(schema),
                 Err(e) => SchemaProbeResult::Failed(e.into()),

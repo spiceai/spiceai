@@ -37,7 +37,7 @@ use datafusion_table_providers::util::retriable_error::{
 };
 use futures::StreamExt;
 use snafu::prelude::*;
-use spiceai_duckdb::Transaction;
+use duckdb::Transaction;
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
@@ -86,33 +86,33 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to commit transaction: {source}"))]
-    UnableToCommitTransaction { source: spiceai_duckdb::Error },
+    UnableToCommitTransaction { source: duckdb::Error },
 
     #[snafu(display("Unable to begin duckdb transaction: {source}"))]
-    UnableToBeginTransaction { source: spiceai_duckdb::Error },
+    UnableToBeginTransaction { source: duckdb::Error },
 
     #[snafu(display("Failed to register Arrow scan view for DuckDB ingestion: {source}"))]
-    UnableToRegisterArrowScanView { source: spiceai_duckdb::Error },
+    UnableToRegisterArrowScanView { source: duckdb::Error },
 
     #[snafu(display(
         "Failed to register Arrow scan view to build DuckDB table creation statement: {source}"
     ))]
-    UnableToRegisterArrowScanViewForTableCreation { source: spiceai_duckdb::Error },
+    UnableToRegisterArrowScanViewForTableCreation { source: duckdb::Error },
 
     #[snafu(display("Unable to create duckdb table: {source}"))]
-    UnableToCreateDuckDBTable { source: spiceai_duckdb::Error },
+    UnableToCreateDuckDBTable { source: duckdb::Error },
 
     #[snafu(display("Unable to drop duckdb table: {source}"))]
-    UnableToDropDuckDBTable { source: spiceai_duckdb::Error },
+    UnableToDropDuckDBTable { source: duckdb::Error },
 
     #[snafu(display("Unable to query data from the duckdb table: {source}"))]
-    UnableToQueryData { source: spiceai_duckdb::Error },
+    UnableToQueryData { source: duckdb::Error },
 
     #[snafu(display("Unable to create index on duckdb table: {source}"))]
-    UnableToCreateIndexOnDuckDBTable { source: spiceai_duckdb::Error },
+    UnableToCreateIndexOnDuckDBTable { source: duckdb::Error },
 
     #[snafu(display("Unable to rollback transaction: {source}"))]
-    UnableToRollbackTransaction { source: spiceai_duckdb::Error },
+    UnableToRollbackTransaction { source: duckdb::Error },
 
     #[snafu(display("Failed to get system time since epoch: {source}"))]
     UnableToGetSystemTime { source: std::time::SystemTimeError },
