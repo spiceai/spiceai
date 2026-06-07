@@ -132,6 +132,12 @@ pub async fn verify_analytical_results(
     query_overrides: Option<QueryOverrides>,
 ) -> anyhow::Result<AnalyticalReport> {
     let queries = get_chbench_test_queries(query_overrides);
+    // q15 compares `total_revenue = (SELECT MAX(total_revenue) ...)` over a SUM
+    // of DOUBLE PRECISION values might return 0 rows: https://github.com/spiceai/spiceai/issues/11212
+    let queries: Vec<_> = queries
+        .into_iter()
+        .filter(|q| q.name.as_ref() != "chbench_q15")
+        .collect();
     println!(
         "\nRunning analytical-query gate over {} queries",
         queries.len()
