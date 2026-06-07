@@ -611,6 +611,12 @@ impl RefreshTask {
                 && burst.len() < max_burst
                 && burst_bytes < max_burst_bytes
             {
+                // METRIC 4 (`cdc_linger_wait_ms`): wall-clock spent in the Phase-2
+                // linger window accumulating envelopes before applying the burst.
+                // Recorded only on this branch — when linger is disabled
+                // (`max_coalesce_age_ms == 0`, the default) there is no wait to
+                // attribute and the histogram stays empty.
+                let linger_start = Instant::now();
                 let deadline =
                     last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
                 while burst.len() < max_burst && burst_bytes < max_burst_bytes {
@@ -644,6 +650,7 @@ impl RefreshTask {
                         Err(_elapsed) => break,
                     }
                 }
+                metrics::CDC_LINGER_WAIT_MS.record(elapsed_ms(linger_start), &recv_wait_labels);
             }
 
             // Mark the start of this burst's processing cycle: the next burst's

@@ -85,6 +85,16 @@ use super::table::{
     record_cayenne_write_phase,
 };
 
+/// Record METRIC 4 (`cayenne_cdc_burst_rows` / `cayenne_cdc_burst_bytes`) for one
+/// prepared CDC batch at the staged/inlined write entry, labeled by table. Both
+/// values are already computed by the inline buffer at the call sites; this just
+/// forwards them so the two histograms always move together.
+fn record_cayenne_cdc_burst(table_name: &str, rows: u64, bytes: u64) {
+    let dims = [telemetry::KeyValue::new("table", table_name.to_string())];
+    telemetry::track_cayenne_cdc_burst_rows(rows, &dims);
+    telemetry::track_cayenne_cdc_burst_bytes(bytes, &dims);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InlineMutationPolicy {
     Inline,
@@ -144,6 +154,22 @@ impl InlineBatchBuffer {
     #[must_use]
     pub(crate) fn should_continue_buffering(&self) -> bool {
         !self.exceeded
+    }
+
+    /// The cap that tripped the inline-admission fallback, as the METRIC 3
+    /// `reason` label. Checks rows first (the order `push` evaluates them), so a
+    /// burst that blew both caps reports `rows_cap`. Returns `None` when neither
+    /// cap is exceeded (the buffer still fits — the caller inlines or the stream
+    /// simply ended).
+    #[must_use]
+    pub(crate) fn overflow_reason(&self) -> Option<&'static str> {
+        if self.total_rows > self.max_rows {
+            Some("rows_cap")
+        } else if self.total_bytes > self.max_buffer_bytes {
+            Some("bytes_cap")
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -573,6 +599,16 @@ impl<'a> AppendMutationWriter<'a> {
                     estimated_bytes = fallback_estimate;
                 }
             }
+        } else {
+            // METRIC 3 (inline admission flip): the table's shape bars the inline
+            // memtable outright (partition column or retention delete filters), so
+            // this write goes straight to a staged Vortex write without ever
+            // buffering. `try_inline_or_restream` (which records rows_cap/bytes_cap
+            // and the burst shape) is skipped, so attribute the flip here.
+            telemetry::track_cayenne_inline_fallback(&[
+                telemetry::KeyValue::new("table", self.table.table_name().to_string()),
+                telemetry::KeyValue::new("reason", "blocking_config"),
+            ]);
         }
 
         let needs_new_snapshot = pending_pk_deletions || may_have_on_conflict_deletions;
@@ -812,6 +848,14 @@ impl<'a> AppendMutationWriter<'a> {
                 self.table
                     .schedule_inline_checkpoint_if_memtable_pressure_exceeded();
 
+                // METRIC 4 (burst shape): rows + Arrow bytes of this inlined CDC
+                // batch. Both are exact here — the whole delta fit in the buffer.
+                record_cayenne_cdc_burst(
+                    self.table.table_name(),
+                    buffer.total_rows() as u64,
+                    buffer.total_bytes() as u64,
+                );
+
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
                     post_validation: state,
@@ -835,6 +879,27 @@ impl<'a> AppendMutationWriter<'a> {
         // `snapshot_shard_count`. Captured before `into_chained_stream`
         // consumes the buffer.
         let estimated_bytes = Some(buffer.total_bytes() as u64);
+        // METRIC 3 (inline admission flip): record the flip when a cap tripped,
+        // attributed to which one (`rows_cap` / `bytes_cap`). The other way to
+        // reach here is the buffer fitting but `try_inline_batches_with_inlined_deletions`
+        // returning false (a rare deletions-couldn't-apply-inline case) — that is
+        // not an admission-cap event, so it is deliberately left uncounted rather
+        // than mislabeled as a cap.
+        if let Some(reason) = buffer.overflow_reason() {
+            telemetry::track_cayenne_inline_fallback(&[
+                telemetry::KeyValue::new("table", self.table.table_name().to_string()),
+                telemetry::KeyValue::new("reason", reason),
+            ]);
+        }
+        // METRIC 4 (burst shape): rows + Arrow bytes of this CDC batch, captured
+        // before `into_chained_stream` consumes the buffer. On the fallback path
+        // the byte count is a lower bound (the un-buffered stream remainder is not
+        // yet counted), but the row count is exact for what was buffered.
+        record_cayenne_cdc_burst(
+            self.table.table_name(),
+            buffer.total_rows() as u64,
+            buffer.total_bytes() as u64,
+        );
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
@@ -1035,6 +1100,8 @@ mod tests {
 
         assert_eq!(buffer.total_rows(), INLINE_MAX_ROWS + 1);
         assert!(!buffer.should_continue_buffering());
+        // METRIC 3: a row-cap overflow attributes to `rows_cap`.
+        assert_eq!(buffer.overflow_reason(), Some("rows_cap"));
     }
 
     #[test]
@@ -1055,5 +1122,26 @@ mod tests {
         buffer.push(batch);
 
         assert!(!buffer.should_continue_buffering());
+        // METRIC 3: a byte-cap overflow (within the row cap) attributes to
+        // `bytes_cap`.
+        assert_eq!(buffer.overflow_reason(), Some("bytes_cap"));
+    }
+
+    #[test]
+    fn inline_buffer_overflow_reason_none_when_within_caps() {
+        // METRIC 3: a buffer that fits both caps reports no fallback reason, so the
+        // inline-admission counter is not incremented for a write that inlines.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..8))],
+        )
+        .expect("batch should be valid");
+
+        let mut buffer = InlineBatchBuffer::new(schema, INLINE_MAX_ROWS, INLINE_MAX_BUFFER_BYTES);
+        buffer.push(batch);
+
+        assert!(buffer.should_continue_buffering());
+        assert_eq!(buffer.overflow_reason(), None);
     }
 }

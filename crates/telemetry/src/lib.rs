@@ -43,6 +43,40 @@ pub const DURATION_MS_HISTOGRAM_BUCKETS: [f64; 15] = [
     100_000.0, 250_000.0, 500_000.0,
 ];
 
+// Buckets for byte-sized payload histograms (Cayenne CDC burst / WAL telemetry).
+// Spans a single small inline write (~1 KiB) through a coalesced burst at the
+// default 128 MiB coalesce budget up to a multi-hundred-MiB WAL backlog, so both
+// the hot-path burst shape and a stalled-checkpoint WAL stay on-scale.
+pub const BYTES_HISTOGRAM_BUCKETS: [f64; 16] = [
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+    134_217_728.0,
+    268_435_456.0,
+    536_870_912.0,
+    1_073_741_824.0,
+    2_147_483_648.0,
+    4_294_967_296.0,
+    8_589_934_592.0,
+];
+
+// Finer-grained millisecond buckets for sub-second contention timings (metastore
+// writer wait/hold, WAL checkpoint, CDC linger). The shared
+// `DURATION_MS_HISTOGRAM_BUCKETS` jumps straight from 0 to 100ms, which is too
+// coarse for lock/checkpoint latencies that live in the 0.1–50ms band; this set
+// resolves that band while still reaching into the multi-second tail that signals
+// a stall.
+pub const CONTENTION_MS_HISTOGRAM_BUCKETS: [f64; 17] = [
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    10000.0, 30000.0,
+];
+
 static QUERY_COUNT: OnceLock<Counter<u64>> = OnceLock::new();
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
@@ -740,4 +774,166 @@ pub fn record_snapshot_skipped(dimensions: &[KeyValue]) {
                 .build()
         })
         .add(1, dimensions);
+}
+
+// ───────────────────────── Cayenne CDC observability (cycle-6) ─────────────────
+//
+// METRIC 1 — metastore writer wait/hold. The per-dataset metastore is a single
+// SQLite DB with WAL-serialized writers, so a hot CDC table can queue behind its
+// own Stage-A fold / sequence-reserve / publish-flip writes. These two histograms
+// split that into (a) time spent waiting to acquire the write transaction and (b)
+// time the write transaction (or a bare write statement) is held. A `txn` label
+// names the stage where the call site can pass it cheaply; otherwise it is
+// `"other"`. No `table` label: the metastore connection is shared across all
+// tables in a dataset's catalog (the DB filename is always `cayenne.db`), so a
+// table label is not cheaply available at this layer.
+
+static CAYENNE_METASTORE_WRITER_WAIT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records the time a metastore writer spent waiting to acquire the write
+/// transaction (pool-slot acquire + `BEGIN IMMEDIATE`) or a bare write statement.
+/// `dimensions` should carry a `txn` stage label (`stage_a_fold` / `seq_reserve`
+/// / `flip` / `checkpoint` / `other`).
+pub fn track_cayenne_metastore_writer_wait(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WRITER_WAIT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_writer_wait_ms")
+                .with_description(
+                    "Time a Cayenne metastore writer spent waiting to acquire the write transaction (pool-slot acquire + BEGIN IMMEDIATE) or a bare write statement.",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+static CAYENNE_METASTORE_WRITER_HELD_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records how long a metastore write transaction (or a bare write statement) was
+/// held, from acquisition through commit/rollback (or statement completion).
+/// `dimensions` should carry a `txn` stage label (see
+/// [`track_cayenne_metastore_writer_wait`]).
+pub fn track_cayenne_metastore_writer_held(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WRITER_HELD_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_writer_held_ms")
+                .with_description(
+                    "Time a Cayenne metastore write transaction (or bare write statement) was held, from acquisition through commit/rollback.",
+                )
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+// METRIC 2 — metastore WAL telemetry. The WAL gauge is sampled (cheap `stat()`)
+// on each background maintenance checkpoint tick and after the inline-backstop
+// checkpoint; the checkpoint histogram times the PASSIVE checkpoint itself with a
+// `mode` label (`passive_background` / `inline_backstop`).
+
+static CAYENNE_METASTORE_WAL_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Records the current size in bytes of the metastore `-wal` file, sampled on the
+/// background maintenance checkpoint tick (and after the inline backstop). A WAL
+/// that keeps growing means the passive checkpoint cannot keep pace with the CDC
+/// commit rate. `dimensions` may carry `table` (the maintenance tick that sampled
+/// it) — the WAL file itself is shared across the catalog's tables.
+pub fn track_cayenne_metastore_wal_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_WAL_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_metastore_wal_bytes")
+                .with_description(
+                    "Current size in bytes of the Cayenne metastore SQLite -wal file, sampled at checkpoint time.",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
+static CAYENNE_METASTORE_CHECKPOINT_MS: OnceLock<Histogram<f64>> = OnceLock::new();
+
+/// Records the wall-clock duration of a metastore WAL checkpoint. `dimensions`
+/// should carry a `mode` label: `passive_background` (the off-hot-path
+/// maintenance-tick PASSIVE checkpoint) or `inline_backstop` (a checkpoint driven
+/// to bound a WAL the background tick let grow).
+pub fn track_cayenne_metastore_checkpoint(duration: Duration, dimensions: &[KeyValue]) {
+    CAYENNE_METASTORE_CHECKPOINT_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_histogram("cayenne_metastore_checkpoint_ms")
+                .with_description("Wall-clock time of a Cayenne metastore WAL checkpoint.")
+                .with_unit("ms")
+                .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
+                .build()
+        })
+        .record(duration.as_secs_f64() * 1000.0, dimensions);
+}
+
+// METRIC 3 — inline admission flips. One increment each time a CDC batch that
+// could have updated the inline memtable instead fell back to a Vortex staged
+// write, labeled by `table` and the `reason` it could not inline:
+// `rows_cap` / `bytes_cap` (the inline buffer overflowed its row or byte cap) or
+// `blocking_config` (the table's shape — partition column or retention delete
+// filters — bars inlining outright).
+
+static CAYENNE_INLINE_FALLBACKS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts inline-admission fallbacks: a CDC batch that could not update the inline
+/// memtable and fell back to a staged Vortex write. `dimensions` should carry
+/// `table` and `reason` (`rows_cap` | `bytes_cap` | `blocking_config`).
+pub fn track_cayenne_inline_fallback(dimensions: &[KeyValue]) {
+    CAYENNE_INLINE_FALLBACKS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_inline_fallback_total")
+                .with_description(
+                    "CDC batches that fell back from the inline memtable to a staged Vortex write, by reason (rows_cap | bytes_cap | blocking_config).",
+                )
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+// METRIC 4 — CDC burst shape. Rows and Arrow in-memory bytes of each prepared CDC
+// batch at the Cayenne staged/inlined write entry, per `table`. Pairs with the
+// runtime-side coalesced-burst histograms to attribute size to a specific table.
+
+static CAYENNE_CDC_BURST_ROWS: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the row count of a prepared CDC batch at the Cayenne write entry.
+/// `dimensions` should carry `table`.
+pub fn track_cayenne_cdc_burst_rows(rows: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_BURST_ROWS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_cdc_burst_rows")
+                .with_description("Row count of a prepared CDC batch at the Cayenne staged/inlined write entry.")
+                .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+                .with_unit("rows")
+                .build()
+        })
+        .record(rows, dimensions);
+}
+
+static CAYENNE_CDC_BURST_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the Arrow in-memory byte size of a prepared CDC batch at the Cayenne
+/// write entry. `dimensions` should carry `table`.
+pub fn track_cayenne_cdc_burst_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_BURST_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_cdc_burst_bytes")
+                .with_description("Arrow in-memory byte size of a prepared CDC batch at the Cayenne staged/inlined write entry.")
+                .with_boundaries(BYTES_HISTOGRAM_BUCKETS.to_vec())
+                .with_unit("By")
+                .build()
+        })
+        .record(bytes, dimensions);
 }

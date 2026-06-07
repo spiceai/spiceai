@@ -111,9 +111,14 @@ impl Default for SqliteMetastoreConfig {
             cache_size_mb: 256,
             mmap_size_bytes: 1_073_741_824, // 1 GiB
             busy_timeout_ms: 30_000,
-            // cycle-5 TASK 2b: ~400 MB backstop (see field doc). The background
-            // maintenance-tick PASSIVE checkpoint is the primary WAL drain.
-            wal_autocheckpoint_pages: 100_000,
+            // cycle-5 TASK 2b set this to 100_000 (~400 MB backstop) to keep the
+            // inline checkpoint off the hot path; cycle-6 MEASURED a uniform
+            // ~+350-430ms tax on every writer acquisition at that size (the
+            // wal-index walk grows with the WAL), hitting even bare-autocommit
+            // statements (stage_seq_reserve 178→554ms). 32_000 (~128 MB) keeps
+            // the off-hot-path design — the background maintenance-tick PASSIVE
+            // checkpoint remains the primary drain — while bounding the walk.
+            wal_autocheckpoint_pages: 32_000,
             auto_vacuum: SqliteAutoVacuum::None,
         }
     }
@@ -786,11 +791,21 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+        // METRIC 1: a bare autocommit write statement. Wait = pool-slot acquire
+        // (the WAL writer lock is taken implicitly by the statement itself); held
+        // = the statement's run. Labeled `txn="other"` — this generic path cannot
+        // cheaply know the originating catalog stage.
+        let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
+        telemetry::track_cayenne_metastore_writer_wait(
+            wait_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
+        let held_start = std::time::Instant::now();
         guard
             .call(move |conn| {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
@@ -802,6 +817,10 @@ impl MetastoreBackend for SqliteMetastore {
             })
             .await
             .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+        telemetry::track_cayenne_metastore_writer_held(
+            held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
         Ok(())
     }
@@ -945,6 +964,14 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
+        // METRIC 1 (writer wait): wall-clock from the start of acquisition through
+        // a held BEGIN IMMEDIATE. This is the WAL-serialized writer queueing cost —
+        // the pool-slot lock plus SQLite's reserved-lock acquire (the busy-timeout
+        // wait when another writer holds the lock). No `txn` stage label here: the
+        // generic backend `begin_transaction` cannot cheaply know which catalog
+        // stage opened it without threading a parameter through every call site,
+        // so it records `"other"`.
+        let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
 
         // Defensively clear any leftover transaction state before BEGIN. A
@@ -972,8 +999,18 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to begin transaction: {e}"),
                 },
             )?;
+        telemetry::track_cayenne_metastore_writer_wait(
+            wait_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
-        Ok(Box::new(SqliteTransaction { conn: Some(guard) }))
+        // METRIC 1 (writer held): the reserved write lock is held from this BEGIN
+        // until commit/rollback/drop. Stamp the start so `SqliteTransaction` can
+        // record the hold duration when it releases the guard.
+        Ok(Box::new(SqliteTransaction {
+            conn: Some(guard),
+            held_start: std::time::Instant::now(),
+        }))
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
@@ -1039,6 +1076,9 @@ impl MetastoreBackend for SqliteMetastore {
             return Ok(());
         };
         let guard = conn.lock().await;
+        // METRIC 2 (checkpoint duration): time the PASSIVE checkpoint with
+        // mode=passive_background (this IS the off-hot-path background drain).
+        let checkpoint_start = std::time::Instant::now();
         guard
             .call(|conn| {
                 let journal_mode: String =
@@ -1058,7 +1098,26 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to checkpoint catalog WAL: {e}"),
                 },
             )?;
+        telemetry::track_cayenne_metastore_checkpoint(
+            checkpoint_start.elapsed(),
+            &[telemetry::KeyValue::new("mode", "passive_background")],
+        );
+        // METRIC 2 (WAL bytes): sample the -wal file size right after the
+        // checkpoint copied as many frames as it could. A cheap stat(); a missing
+        // file (just truncated) reports 0.
+        self.sample_wal_bytes();
         Ok(())
+    }
+}
+
+impl SqliteMetastore {
+    /// Sample the current `-wal` file size (cheap `stat()`) and publish it to the
+    /// METRIC 2 `cayenne_metastore_wal_bytes` gauge. Best-effort: a missing or
+    /// unreadable file reports 0 (the WAL was truncated or not yet created).
+    fn sample_wal_bytes(&self) {
+        let wal_path = format!("{}-wal", self.db_path());
+        let bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+        telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
     }
 }
 
@@ -1074,11 +1133,21 @@ impl MetastoreBackend for SqliteMetastore {
 pub struct SqliteTransaction {
     /// Exclusive lock on the connection. `None` after commit/rollback.
     conn: Option<OwnedMutexGuard<tokio_rusqlite::Connection>>,
+    /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned), used
+    /// to record METRIC 1 `cayenne_metastore_writer_held_ms` on
+    /// commit/rollback/drop.
+    held_start: std::time::Instant,
 }
 
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // A drop without an explicit commit/rollback still held the write
+            // lock for this long (it rolls back below).
+            telemetry::track_cayenne_metastore_writer_held(
+                self.held_start.elapsed(),
+                &[telemetry::KeyValue::new("txn", "other")],
+            );
             // Best-effort rollback — fire and forget since we're in drop.
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
@@ -1184,6 +1253,14 @@ impl MetastoreTransaction for SqliteTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
+        // METRIC 1 (writer held): record before COMMIT so the held window reflects
+        // exactly the reserved-lock lifetime the next contending writer queued
+        // behind. (The COMMIT's own fsync is its statement cost, not lock-hold.)
+        telemetry::track_cayenne_metastore_writer_held(
+            self.held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
+
         let commit_result = conn
             .call(|conn| {
                 conn.execute_batch("COMMIT")?;
@@ -1213,6 +1290,12 @@ impl MetastoreTransaction for SqliteTransaction {
         let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })?;
+
+        // METRIC 1 (writer held): the reserved write lock was held this long.
+        telemetry::track_cayenne_metastore_writer_held(
+            self.held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
         conn.call(|conn| {
             conn.execute_batch("ROLLBACK")?;
