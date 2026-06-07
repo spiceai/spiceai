@@ -223,7 +223,9 @@ impl DeltaTable {
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
-        let engine = Arc::new(DefaultEngine::new(Arc::clone(&object_store)));
+        // delta-kernel 0.23 removed `DefaultEngine::new`; construct via the
+        // builder (mirrors the `DefaultEngine::builder(..).build()` call above).
+        let engine = Arc::new(DefaultEngine::builder(Arc::clone(&object_store)).build());
         Self::with_engine(table_url, engine, object_store)
     }
 
