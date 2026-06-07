@@ -606,10 +606,18 @@ pub struct CayenneAutotuneState {
     pub read_amp: u64,
     /// cgroup-aware memory usage fraction of the budget; `< 0` ⇒ unknown.
     pub mem_pressure: f64,
+    /// Per-batch apply wall time (EWMA, ms) — the latency the controller weighs
+    /// against the offered-load interval.
+    pub apply_ms: f64,
     /// Live inline-memtable flush byte budget.
     pub inline_flush_max_bytes: u64,
     /// Live background compaction interval (ms).
     pub compaction_interval_ms: u64,
+    /// Live small-file compaction trigger (file count).
+    pub compaction_trigger_files: u64,
+    /// Configured target Vortex file size (MB) — the reference compacted files
+    /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
+    pub target_file_size_mb: u64,
     /// Live write/encode concurrency (0 = session default).
     pub write_concurrency: u64,
 }
@@ -619,8 +627,11 @@ static CAYENNE_AT_BYTES_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_APPLY_VS_ARRIVAL: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_READ_AMP: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_MEM_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_APPLY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
 
 /// Emit the auto-tuner state gauges for one table. `dimensions` should carry
@@ -695,6 +706,34 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.compaction_interval_ms, dimensions);
+    CAYENNE_AT_APPLY_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_apply_ms")
+                .with_description("Per-batch CDC apply wall time (EWMA).")
+                .with_unit("ms")
+                .build()
+        })
+        .record(state.apply_ms, dimensions);
+    CAYENNE_AT_COMPACTION_TRIGGER_FILES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_compaction_trigger_files")
+                .with_description("Current (live) small-file compaction trigger (file count).")
+                .build()
+        })
+        .record(state.compaction_trigger_files, dimensions);
+    CAYENNE_AT_TARGET_FILE_SIZE_MB
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_target_file_size_mb")
+                .with_description(
+                    "Configured target Vortex file size — the reference compacted files should trend toward (compare cayenne_compaction_merged_bytes).",
+                )
+                .with_unit("MiBy")
+                .build()
+        })
+        .record(state.target_file_size_mb, dimensions);
     CAYENNE_AT_WRITE_CONCURRENCY
         .get_or_init(|| {
             cayenne_operational_meter()
@@ -719,6 +758,39 @@ pub fn track_cayenne_autotune_adjustment(dimensions: &[KeyValue]) {
                 .build()
         })
         .add(1, dimensions);
+}
+
+static CAYENNE_COMPACTION_MERGED_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the bytes a protected-snapshot subset compaction merged into one
+/// output (≈ the resulting compacted file size). Compare its distribution
+/// against `cayenne_autotune_target_file_size_mb` to see whether compaction is
+/// trending to the target file size or stalling below it (a read-amplification
+/// signal the adaptive tuner cares about). `dimensions` should carry `table`.
+pub fn track_cayenne_compaction_merged_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    CAYENNE_COMPACTION_MERGED_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_compaction_merged_bytes")
+                .with_description(
+                    "Bytes merged into one output by a protected-snapshot subset compaction (≈ compacted file size); compare to the target file size.",
+                )
+                .with_unit("By")
+                .with_boundaries(vec![
+                    MIB,
+                    4.0 * MIB,
+                    16.0 * MIB,
+                    32.0 * MIB,
+                    64.0 * MIB,
+                    128.0 * MIB,
+                    256.0 * MIB,
+                    512.0 * MIB,
+                    1024.0 * MIB,
+                ])
+                .build()
+        })
+        .record(bytes, dimensions);
 }
 
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();

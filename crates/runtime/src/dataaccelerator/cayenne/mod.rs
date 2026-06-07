@@ -807,6 +807,15 @@ impl CayenneAccelerator {
                 );
                 config.dynamic_tuning = false;
             }
+            // The closed-loop controller rides the per-table background compaction
+            // task's tick; with that task disabled (interval == 0) it would never
+            // run (nor emit the autotune gauges), so adaptive falls back to auto.
+            if config.dynamic_tuning && config.compaction_background_interval_ms == 0 {
+                tracing::warn!(
+                    "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
+                );
+                config.dynamic_tuning = false;
+            }
             config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
                 inline_flush: autotune::is_pinned(
                     acceleration,

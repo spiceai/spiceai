@@ -604,11 +604,18 @@ pub(crate) fn decide(
         }
 
         // (2) Ingest throughput, only when ingest is actually behind. Diagnose
-        // from where the per-batch wall time goes.
+        // from where the per-batch wall time goes. The encode-vs-publish split is
+        // only meaningful when at least one phase is actually timed; when both are
+        // 0 (the split is unmeasured) we deliberately take the publish-bound path
+        // — enlarging the memtable is the safest, most generally-helpful lever for
+        // a behind table (fewer files + amortized commits) — rather than letting a
+        // degenerate `0 >= 0` arbitrarily choose it. The encode-bound branch
+        // (raising write concurrency) only fires on a real, measured split.
         if behind {
-            if s.publish_ms >= s.encode_ms {
-                // Metastore-publish-bound → batch more per flush to amortize the
-                // per-commit cost (also yields fewer, larger files: a query win).
+            let split_measured = s.publish_ms > 0.0 || s.encode_ms > 0.0;
+            if !split_measured || s.publish_ms >= s.encode_ms {
+                // Publish-bound (or unmeasured split) → batch more per flush to
+                // amortize the per-commit cost (also yields fewer, larger files).
                 if mem_ok
                     && let Some(v) = clamp_move_i64(
                         cur.inline_flush_max_bytes,
@@ -1009,6 +1016,21 @@ mod tests {
         assert_eq!(adj.knob, Knob::WriteConcurrency);
         assert!(adj.new_value > knobs().write_concurrency as u64);
         assert!(adj.new_value <= bounds().write_concurrency.1 as u64);
+    }
+
+    #[test]
+    fn unmeasured_phase_split_defaults_to_memtable_not_concurrency() {
+        // When publish/encode timings are unmeasured (both 0), a behind table must
+        // deterministically take the safe memtable lever, not let the degenerate
+        // `0 >= 0` arbitrarily pick it — and must NOT raise write concurrency
+        // without a real, measured encode-bound signal.
+        let stats = IngestStats::new();
+        warm(&stats, sample(1000, 150, 0, 0, 100), 20); // behind; split unmeasured
+        stats.set_read_amp(1);
+        let s = stats.snapshot();
+        let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
+        assert_eq!(adj.knob, Knob::InlineFlushBytes);
+        assert_ne!(adj.knob, Knob::WriteConcurrency);
     }
 
     #[test]

@@ -8983,6 +8983,17 @@ impl CayenneTableProvider {
             "Fast protected-snapshot subset compaction completed"
         );
 
+        // Record the merged output size so operators (and the adaptive tuner's
+        // observability) can see whether compaction is trending toward the target
+        // file size or stalling below it. Compare to cayenne_autotune_target_file_size_mb.
+        telemetry::track_cayenne_compaction_merged_bytes(
+            total_input_bytes,
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
+
         Ok(true)
     }
 
@@ -12671,9 +12682,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 apply_vs_arrival: snap.apply_vs_arrival,
                 read_amp: u64::try_from(read_amp).unwrap_or(0),
                 mem_pressure: snap.mem_pressure.unwrap_or(-1.0),
+                apply_ms: snap.apply_ms,
                 inline_flush_max_bytes: u64::try_from(knobs.inline_flush_max_bytes.max(0))
                     .unwrap_or(0),
                 compaction_interval_ms: knobs.compaction_background_interval_ms,
+                compaction_trigger_files: u64::try_from(knobs.compaction_trigger_files)
+                    .unwrap_or(0),
+                target_file_size_mb: u64::try_from(
+                    self.context.target_file_size_bytes() / (1024 * 1024),
+                )
+                .unwrap_or(0),
                 write_concurrency: u64::try_from(knobs.write_concurrency).unwrap_or(0),
             },
             &[telemetry::KeyValue::new("table", table.clone())],
