@@ -56,7 +56,7 @@ use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
 use snafu::ResultExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -86,7 +86,7 @@ struct PendingFinalizeCommit {
 /// and the slot advancer installed on the provider (which drains).
 type DeferredCommitQueue = Arc<
     tokio::sync::Mutex<
-        std::collections::VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
+        VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
     >,
 >;
 
@@ -108,13 +108,13 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
         // Pull out every committer whose epoch is now durable, preserving FIFO
         // order. Hold the lock only to splice out the ready prefix, not across
         // the (network) commits.
-        let ready: Vec<Box<dyn cdc::CommitChange + Send + Sync>> = {
+        let mut ready: VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)> = {
             let mut queue = self.queue.lock().await;
-            let mut ready = Vec::new();
+            let mut ready = VecDeque::new();
             while let Some((epoch, _)) = queue.front() {
                 if *epoch <= durable_epoch {
-                    let (_, committers) = queue.pop_front().unwrap_or_else(|| unreachable!());
-                    ready.extend(committers);
+                    let ready_item = queue.pop_front().unwrap_or_else(|| unreachable!());
+                    ready.push_back(ready_item);
                 } else {
                     break;
                 }
@@ -122,19 +122,102 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
             ready
         };
 
-        for committer in ready {
-            if let Err(e) = committer.commit().await {
-                // A failed source ack is logged but not fatal here: the slot
-                // simply does not advance for this committer, so the source
-                // re-streams its batch (already durable in Vortex) on reconnect
-                // and the idempotent apply converges. Surfacing it as a hard
-                // error would tear down a stream whose data IS durable.
-                if !self.runtime_status.is_shutdown() {
-                    tracing::warn!(
-                        "Deferred CDC commit failed for {} (source slot will re-advance on the next durable checkpoint): {e}",
-                        self.dataset_name
-                    );
+        while let Some((epoch, committers)) = ready.pop_front() {
+            let mut committers = committers.into_iter();
+            while let Some(committer) = committers.next() {
+                if let Err(e) = committer.commit().await {
+                    let mut uncommitted = vec![committer];
+                    uncommitted.extend(committers);
+                    let mut to_requeue = VecDeque::new();
+                    to_requeue.push_back((epoch, uncommitted));
+                    to_requeue.append(&mut ready);
+
+                    let mut queue = self.queue.lock().await;
+                    while let Some(item) = to_requeue.pop_back() {
+                        queue.push_front(item);
+                    }
+
+                    // A failed source ack must remain queued. A later immediate
+                    // commit is required to observe the non-empty queue and stop
+                    // rather than advancing the source past this durable-but-not-
+                    // acked checkpoint.
+                    if !self.runtime_status.is_shutdown() {
+                        tracing::warn!(
+                            "Deferred CDC commit failed for {} (source slot will retry before any later immediate commit): {e}",
+                            self.dataset_name
+                        );
+                    }
+                    return;
                 }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn deferred_commit_queue_is_empty(queue: &DeferredCommitQueue) -> bool {
+    queue.lock().await.is_empty()
+}
+
+#[cfg(not(windows))]
+fn committers_all_support_deferral(
+    committers: &[Box<dyn cdc::CommitChange + Send + Sync>],
+) -> bool {
+    !committers.is_empty() && committers.iter().all(|committer| committer.supports_deferral())
+}
+
+#[cfg(not(windows))]
+fn change_batch_requires_durable_cdc_path(change_batch: &ChangeBatch) -> bool {
+    (0..change_batch.record.num_rows()).any(|row| {
+        matches!(
+            ChangeOperationType::from_operation(&change_batch.op(row)),
+            ChangeOperationType::Delete
+                | ChangeOperationType::Truncate
+                | ChangeOperationType::Unknown
+        )
+    })
+}
+
+#[cfg(not(windows))]
+async fn checkpoint_pending_memory_cdc_commits(
+    cayenne: &CayenneTableProvider,
+    queue: &DeferredCommitQueue,
+    dataset_name: &TableReference,
+    runtime_status: &status::RuntimeStatus,
+) -> Option<String> {
+    if deferred_commit_queue_is_empty(queue).await {
+        return None;
+    }
+
+    match cayenne.checkpoint_mem_tier().await {
+        Ok(_) => {
+            if deferred_commit_queue_is_empty(queue).await {
+                None
+            } else if runtime_status.is_shutdown() {
+                tracing::debug!(
+                    "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
+                );
+                None
+            } else {
+                let error_message = format!(
+                    "Failed to checkpoint in-memory CDC tier for {dataset_name}: deferred source commits remain after durable checkpoint"
+                );
+                tracing::error!("{error_message}");
+                Some(error_message)
+            }
+        }
+        Err(e) => {
+            if runtime_status.is_shutdown() {
+                tracing::debug!(
+                    "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
+                );
+                None
+            } else {
+                let error_message = format!(
+                    "Failed to checkpoint in-memory CDC tier for {dataset_name} before advancing source commit: {e}"
+                );
+                tracing::error!("{error_message}");
+                Some(error_message)
             }
         }
     }
@@ -656,7 +739,7 @@ impl RefreshTask {
         // are returned through `join_pending_commit` so source offsets cannot
         // silently stop advancing.
         let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
-        let mut pending_finalize: Option<PendingApplyFinalize> = None;
+        let mut pending_finalize: Option<PendingFinalizeCommit> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
         let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
@@ -664,22 +747,17 @@ impl RefreshTask {
         let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
 
         // In-memory CDC durability (`cdc_durability: memory`): if this stream's
-        // Cayenne provider is in memory mode, set up the deferred-commit queue. The
-        // slot advancer is NOT installed here — it is armed LAZILY on the first
-        // batch whose committer reports `supports_deferral()` (a replayable source,
-        // e.g. the Postgres replication slot). Until armed, the provider keeps the
-        // durable write path (`has_slot_advancer()` gates engagement), so a
-        // non-replayable changes source never buffers un-acked rows in RAM. `None`
-        // (and never populated) for file-mode streams, so the commit path is
-        // byte-identical there.
+        // Cayenne provider is memory-capable, set up the deferred-commit queue.
+        // The slot advancer is installed per all-deferrable upsert-only burst and
+        // cleared for durable-only bursts, so non-replayable sources and deletes
+        // never buffer un-acked rows in RAM.
         let deferred_commits: Option<DeferredCommitQueue> = {
             #[cfg(not(windows))]
             {
                 self.cayenne_accelerator()
                     .filter(|cayenne| cayenne.is_cdc_memory_mode())
                     .map(|_cayenne| {
-                        Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()))
-                            as DeferredCommitQueue
+                        Arc::new(tokio::sync::Mutex::new(VecDeque::new())) as DeferredCommitQueue
                     })
             }
             #[cfg(windows)]
@@ -871,6 +949,27 @@ impl RefreshTask {
                         )
                         .await;
                         previous_commit_failed = true;
+                    }
+
+                    if !previous_commit_failed {
+                        #[cfg(not(windows))]
+                        if let Some(queue) = deferred_commits.as_ref()
+                            && let Some(cayenne) = self.cayenne_accelerator()
+                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
+                                cayenne,
+                                queue,
+                                &dataset_name,
+                                &self.runtime_status,
+                            )
+                            .await
+                        {
+                            self.set_refresh_status(
+                                sql.as_deref(),
+                                status::ComponentStatus::error_with_message(error_message),
+                            )
+                            .await;
+                            previous_commit_failed = true;
+                        }
                     }
 
                     if !previous_commit_failed {
@@ -1066,6 +1165,42 @@ impl RefreshTask {
         };
         record_cdc_fixed_cost(context.dataset_name, "coalesce", coalesce_start);
 
+        #[cfg(not(windows))]
+        let can_defer_current_burst = committers_all_support_deferral(&committers);
+        #[cfg(not(windows))]
+        let requires_durable_cdc_path = !can_defer_current_burst
+            || change_batch_requires_durable_cdc_path(&coalesced_batch);
+
+        #[cfg(not(windows))]
+        if let Some(queue) = context.deferred_commits
+            && let Some(cayenne) = self.cayenne_accelerator()
+        {
+            if requires_durable_cdc_path {
+                if let Some(error_message) = checkpoint_pending_memory_cdc_commits(
+                    cayenne,
+                    queue,
+                    context.dataset_name,
+                    &self.runtime_status,
+                )
+                .await
+                {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+                cayenne.clear_slot_advancer();
+            } else {
+                cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
+                    queue: Arc::clone(queue),
+                    dataset_name: context.dataset_name.clone(),
+                    runtime_status: Arc::clone(&self.runtime_status),
+                }));
+            }
+        }
+
         let write_start = Instant::now();
         match self
             .write_change_with_context(
@@ -1120,6 +1255,25 @@ impl RefreshTask {
                     }
 
                     if !previous_pending.committers.is_empty() {
+                        #[cfg(not(windows))]
+                        if let Some(queue) = context.deferred_commits
+                            && let Some(cayenne) = self.cayenne_accelerator()
+                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
+                                cayenne,
+                                queue,
+                                context.dataset_name,
+                                &self.runtime_status,
+                            )
+                            .await
+                        {
+                            self.set_refresh_status(
+                                context.refresh_sql,
+                                status::ComponentStatus::error_with_message(error_message),
+                            )
+                            .await;
+                            return false;
+                        }
+
                         if let Some(previous_commit) = context.pending_commit.take() {
                             let commit_wait_start = Instant::now();
                             if let Some(error_message) = join_pending_commit(
@@ -1179,27 +1333,6 @@ impl RefreshTask {
 
                 let mut committers = Some(committers);
 
-                // Arm in-memory deferral lazily: install the slot advancer only once
-                // a committer that supports deferral (a replayable source — e.g. the
-                // Postgres replication slot) appears. Until armed, `has_slot_advancer`
-                // gates the provider write path to durable, so a non-replayable
-                // changes source never buffers un-acked rows in RAM. Idempotent —
-                // installs at most once per stream (no-op once already armed).
-                #[cfg(not(windows))]
-                if let Some(queue) = context.deferred_commits
-                    && committers
-                        .as_ref()
-                        .is_some_and(|cs| cs.iter().any(|c| c.supports_deferral()))
-                    && let Some(cayenne) = self.cayenne_accelerator()
-                    && !cayenne.has_slot_advancer()
-                {
-                    cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
-                        queue: Arc::clone(queue),
-                        dataset_name: context.dataset_name.clone(),
-                        runtime_status: Arc::clone(&self.runtime_status),
-                    }));
-                }
-
                 if let Some(finalize) = write_outcome.pending_finalize {
                     *context.pending_finalize = Some(PendingFinalizeCommit {
                         finalize,
@@ -1247,6 +1380,25 @@ impl RefreshTask {
                             queue.lock().await.push_back((epoch, committers));
                         }
                     } else {
+                        #[cfg(not(windows))]
+                        if let Some(queue) = context.deferred_commits
+                            && let Some(cayenne) = self.cayenne_accelerator()
+                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
+                                cayenne,
+                                queue,
+                                context.dataset_name,
+                                &self.runtime_status,
+                            )
+                            .await
+                        {
+                            self.set_refresh_status(
+                                context.refresh_sql,
+                                status::ComponentStatus::error_with_message(error_message),
+                            )
+                            .await;
+                            return false;
+                        }
+
                         *context.pending_commit = Some(spawn_ordered_commit_task(
                             committers,
                             Arc::clone(&self.runtime_status),
@@ -3513,6 +3665,147 @@ mod tests {
                 }),
             }
         }
+    }
+
+    struct DeferrableTrackingCommitter {
+        id: i32,
+        log: Arc<CommitLog>,
+        outcome: Result<(), String>,
+    }
+
+    #[async_trait]
+    impl CommitChange for DeferrableTrackingCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            self.log
+                .events
+                .lock()
+                .await
+                .push((self.id, self.outcome.clone()));
+            match &self.outcome {
+                Ok(()) => Ok(()),
+                Err(msg) => Err(CommitError::UnableToCommitChange {
+                    source: msg.clone().into(),
+                }),
+            }
+        }
+
+        fn supports_deferral(&self) -> bool {
+            true
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_memory_cdc_durable_path_required_for_delete_truncate_and_unknown() {
+        let upsert = create_test_change_batch(
+            vec!["c", "u", "r"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("create"), Some("update"), Some("read")],
+        );
+        assert!(
+            !change_batch_requires_durable_cdc_path(&upsert),
+            "upsert-only bursts may use memory CDC durability"
+        );
+
+        for op in ["d", "t", "x"] {
+            let batch = create_test_change_batch(
+                vec![op],
+                &[vec!["id"]],
+                vec![1],
+                vec![Some("row")],
+            );
+            assert!(
+                change_batch_requires_durable_cdc_path(&batch),
+                "operation {op} must force the durable CDC path"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_memory_cdc_deferral_requires_every_committer_to_support_deferral() {
+        let log = CommitLog::new();
+        let deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(
+            DeferrableTrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            },
+        );
+        assert!(committers_all_support_deferral(&[deferrable]));
+
+        let log = CommitLog::new();
+        let deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(
+            DeferrableTrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            },
+        );
+        let non_deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(TrackingCommitter {
+            id: 2,
+            log,
+            outcome: Ok(()),
+        });
+        assert!(
+            !committers_all_support_deferral(&[deferrable, non_deferrable]),
+            "one non-deferrable committer forces the durable CDC path"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_slot_advancer_requeues_failed_deferred_committers() {
+        let log = CommitLog::new();
+        let queue: DeferredCommitQueue = Arc::new(TokioMutex::new(VecDeque::new()));
+        queue.lock().await.push_back((
+            5,
+            vec![
+                Box::new(DeferrableTrackingCommitter {
+                    id: 1,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                }),
+                Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&log),
+                    outcome: Err("commit failed".to_string()),
+                }),
+                Box::new(DeferrableTrackingCommitter {
+                    id: 3,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                }),
+            ],
+        ));
+        queue.lock().await.push_back((
+            6,
+            vec![Box::new(DeferrableTrackingCommitter {
+                id: 4,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            })],
+        ));
+
+        let advancer = CayenneSlotAdvancer {
+            queue: Arc::clone(&queue),
+            dataset_name: TableReference::bare("test"),
+            runtime_status: crate::status::RuntimeStatus::new(),
+        };
+        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 5)
+            .await;
+
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2],
+            "advancer stops at the failed committer"
+        );
+        let queue = queue.lock().await;
+        assert_eq!(queue.len(), 2, "failed and future epochs remain queued");
+        assert_eq!(queue[0].0, 5);
+        assert_eq!(queue[0].1.len(), 2, "failed plus untried committers requeue");
+        assert_eq!(queue[1].0, 6);
     }
 
     fn make_tracked_envelope(id: i32, log: Arc<CommitLog>, is_ready: bool) -> ChangeEnvelope {

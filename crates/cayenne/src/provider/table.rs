@@ -5043,6 +5043,13 @@ impl CayenneTableProvider {
         *self.slot_advancer.lock() = Some(advancer);
     }
 
+    /// Clear the installed [`SlotAdvancer`], forcing subsequent CDC appends onto
+    /// the durable path until the runtime re-arms memory-mode deferral for an
+    /// all-deferrable upsert burst.
+    pub fn clear_slot_advancer(&self) {
+        *self.slot_advancer.lock() = None;
+    }
+
     /// Whether the runtime has installed a [`SlotAdvancer`] — i.e. armed in-memory
     /// deferral after confirming a replayable source committer. The write path
     /// gates mem-mode engagement on this (in addition to [`Self::is_cdc_memory_mode`])
