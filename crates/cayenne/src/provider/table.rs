@@ -14380,7 +14380,7 @@ mod tests {
     }
 
     /// cycle-5 TASK 2a: a LEGACY (pre-cycle-5) blob — a bare uncompressed Arrow
-    /// IPC stream of the `row_key` BinaryArray, with NO format-tag prefix — must
+    /// IPC stream of the `row_key` `BinaryArray`, with NO format-tag prefix — must
     /// still decode after an in-place upgrade. Its first byte is the IPC
     /// continuation marker `0xFF`, which the deserializer routes to the legacy
     /// reader (never colliding with the `0x00`/`0x01` tags).
@@ -14398,7 +14398,8 @@ mod tests {
             DataType::Binary,
             false,
         )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("build legacy batch");
         let legacy_blob = serialize_batches_to_ipc(&[batch]).expect("legacy ipc");
         assert_eq!(
             legacy_blob.first().copied(),
