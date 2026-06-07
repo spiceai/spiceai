@@ -3837,11 +3837,15 @@ dependencies = [
 name = "chbench-driver"
 version = "2.0.0-unstable"
 dependencies = [
+ "arrow",
  "async-trait",
  "chrono",
+ "datafusion-table-providers",
+ "futures",
  "governor",
  "rand 0.10.1",
  "snafu 0.8.9",
+ "secrecy",
  "tokio",
  "tokio-postgres",
  "tokio-util",
@@ -19693,6 +19697,8 @@ version = "2.0.0-unstable"
 dependencies = [
  "arrow 58.3.0",
  "arrow-json 58.3.0",
+ "arrow-json",
+ "arrow_tools",
  "async-trait",
  "aws-config",
  "aws-credential-types",
