@@ -395,14 +395,7 @@ impl CayenneContext {
     /// the dynamic controller and observability. The inter-batch arrival interval
     /// (offered-load signal) is derived here from the previous write's timestamp,
     /// so callers pass only what the write path already measures.
-    pub(crate) fn record_ingest(
-        &self,
-        rows: u64,
-        bytes: u64,
-        apply: std::time::Duration,
-        publish: std::time::Duration,
-        encode: std::time::Duration,
-    ) {
+    pub(crate) fn record_ingest(&self, rows: u64, bytes: u64, apply: std::time::Duration) {
         let now = std::time::Instant::now();
         let arrival_gap = {
             let mut last = self.last_write.lock();
@@ -414,8 +407,6 @@ impl CayenneContext {
             rows,
             bytes,
             apply,
-            publish,
-            encode,
             arrival_gap,
         });
     }

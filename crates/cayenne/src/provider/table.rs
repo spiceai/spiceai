@@ -2767,11 +2767,20 @@ impl CayenneTableProvider {
         task_context: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<CayenneCdcWrite> {
         let target_schema = Arc::clone(&self.table_metadata.schema);
+        // Tally the in-memory Arrow size of every batch as it streams through, so
+        // the auto-tuner sees the real ingest *volume* (bytes/s), not just rows/s.
+        // Costs one relaxed add per batch on a path that already touches each batch.
+        let ingest_bytes = Arc::new(AtomicU64::new(0));
+        let ingest_bytes_tally = Arc::clone(&ingest_bytes);
         let normalized = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&target_schema),
             data.map(move |batch_result| {
                 batch_result.and_then(|batch| {
                     arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                        .inspect(|cast| {
+                            ingest_bytes_tally
+                                .fetch_add(cast.get_array_memory_size() as u64, Ordering::Relaxed);
+                        })
                         .map_err(Into::into)
                 })
             }),
@@ -2791,20 +2800,16 @@ impl CayenneTableProvider {
         let result = AppendMutationWriter::new(self, &self.context, task_context)
             .write_cdc_pipelined(normalized, write_guard)
             .await;
-        // Feed the dynamic auto-tuner's rolling ingest accounting: the batch's
-        // row count and the full per-batch apply wall (lock-wait + write), which
-        // is the "am I keeping up with the offered load?" response signal. Cheap
-        // and recorded regardless of whether dynamic tuning is enabled (it also
-        // backs the always-on observability gauges). The publish/encode split is
-        // left at zero for now (a future refinement to sharpen the diagnosis);
-        // byte accounting is not tallied on this path.
+        // Feed the dynamic auto-tuner's rolling ingest accounting: the batch's row
+        // count, the real ingested bytes (tallied above), and the full per-batch
+        // apply wall (lock-wait + write) — the "am I keeping up with the offered
+        // load?" response signal. Cheap and recorded regardless of whether dynamic
+        // tuning is enabled (it also backs the always-on observability gauges).
         if let Ok(cdc_write) = &result {
             self.context.record_ingest(
                 cdc_write.rows,
-                0,
+                ingest_bytes.load(Ordering::Relaxed),
                 lock_wait_start.elapsed(),
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
             );
         }
         result

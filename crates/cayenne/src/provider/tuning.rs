@@ -24,9 +24,8 @@ limitations under the License.
 //!
 //! It is a **feedback** controller, not feed-forward: it watches not just the
 //! ingest rate (the input) but how the runtime is *responding* to it — whether
-//! apply latency is keeping up with the offered load, read amplification, where
-//! the per-batch wall time goes (encode vs metastore publish), and memory
-//! headroom — and acts on the gap to the objective.
+//! apply latency is keeping up with the offered load, read amplification, and
+//! memory headroom — and acts on the gap to the objective.
 //!
 //! ## Objective hierarchy (highest priority first)
 //! 1. Stay within the memory budget — *hard* (enforced by the actuator bounds).
@@ -161,15 +160,11 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 pub(crate) struct WriteSample {
     /// Rows applied in this batch.
     pub rows: u64,
-    /// Serialized bytes applied in this batch.
+    /// In-memory Arrow bytes applied in this batch.
     pub bytes: u64,
     /// Total apply wall time for the batch (the runtime's response: how long
     /// *we* took to absorb it).
     pub apply: Duration,
-    /// Metastore publish/commit wall time within `apply`.
-    pub publish: Duration,
-    /// Encode wall time within `apply`.
-    pub encode: Duration,
     /// Wall time since the previous batch (the offered-load interval). `None`
     /// for the first batch.
     pub arrival_gap: Option<Duration>,
@@ -180,8 +175,6 @@ struct EwmaInner {
     rows_per_sec: f64,
     bytes_per_sec: f64,
     apply_ms: f64,
-    publish_ms: f64,
-    encode_ms: f64,
     arrival_gap_ms: f64,
     samples: u64,
 }
@@ -231,8 +224,6 @@ impl IngestStats {
         self.total_batches.fetch_add(1, Ordering::Relaxed);
 
         let apply_ms = duration_ms(s.apply);
-        let publish_ms = duration_ms(s.publish);
-        let encode_ms = duration_ms(s.encode);
         // Offered rate = rows / inter-batch interval. Fall back to the apply
         // window for the first batch (no gap yet) so a single batch still yields
         // a finite rate.
@@ -249,8 +240,6 @@ impl IngestStats {
         ewma(&mut inner.rows_per_sec, inst_rows_per_sec, prior);
         ewma(&mut inner.bytes_per_sec, inst_bytes_per_sec, prior);
         ewma(&mut inner.apply_ms, apply_ms, prior);
-        ewma(&mut inner.publish_ms, publish_ms, prior);
-        ewma(&mut inner.encode_ms, encode_ms, prior);
         ewma(&mut inner.arrival_gap_ms, arrival_gap_ms, prior);
         inner.samples = prior.saturating_add(1);
     }
@@ -294,17 +283,14 @@ impl IngestStats {
         };
         IngestSnapshot {
             rows_per_sec: inner.rows_per_sec,
-            // Report bytes/sec only when real byte accounting has been recorded;
-            // otherwise -1.0 (unknown) so the gauge is suppressed rather than
-            // reporting a misleading 0 under load.
+            // Real bytes/sec once the first write has been recorded; -1.0 before
+            // then (cold start) so the gauge is suppressed rather than emitting 0.
             bytes_per_sec: if self.total_bytes.load(Ordering::Relaxed) > 0 {
                 inner.bytes_per_sec
             } else {
                 -1.0
             },
             apply_ms: inner.apply_ms,
-            publish_ms: inner.publish_ms,
-            encode_ms: inner.encode_ms,
             arrival_gap_ms: inner.arrival_gap_ms,
             apply_vs_arrival,
             read_amp: self.read_amp.load(Ordering::Relaxed),
@@ -318,12 +304,10 @@ impl IngestStats {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct IngestSnapshot {
     pub rows_per_sec: f64,
-    /// Bytes/sec (EWMA). `-1.0` when byte accounting is unavailable for the write
-    /// path (the gauge is then suppressed rather than reporting a misleading 0).
+    /// Bytes/sec (EWMA). `-1.0` before the first write (cold start), when the
+    /// gauge is suppressed rather than reporting a 0.
     pub bytes_per_sec: f64,
     pub apply_ms: f64,
-    pub publish_ms: f64,
-    pub encode_ms: f64,
     pub arrival_gap_ms: f64,
     /// `apply_ms / arrival_gap_ms`: > 1 ⇒ falling behind the offered load.
     pub apply_vs_arrival: f64,
@@ -603,49 +587,44 @@ pub(crate) fn decide(
             }
         }
 
-        // (2) Ingest throughput, only when ingest is actually behind. Diagnose
-        // from where the per-batch wall time goes. The encode-vs-publish split is
-        // only meaningful when at least one phase is actually timed; when both are
-        // 0 (the split is unmeasured) we deliberately take the publish-bound path
-        // — enlarging the memtable is the safest, most generally-helpful lever for
-        // a behind table (fewer files + amortized commits) — rather than letting a
-        // degenerate `0 >= 0` arbitrarily choose it. The encode-bound branch
-        // (raising write concurrency) only fires on a real, measured split.
+        // (2) Ingest throughput, only when ingest is actually behind. The levers
+        // are tried in a robust, observable order rather than from per-write phase
+        // timings (which aren't reliable on the staged CDC path, where publish is
+        // backgrounded):
         if behind {
-            let split_measured = s.publish_ms > 0.0 || s.encode_ms > 0.0;
-            if !split_measured || s.publish_ms >= s.encode_ms {
-                // Publish-bound (or unmeasured split) → batch more per flush to
-                // amortize the per-commit cost (also yields fewer, larger files).
-                if mem_ok
-                    && let Some(v) = clamp_move_i64(
-                        cur.inline_flush_max_bytes,
-                        grow_i64(cur.inline_flush_max_bytes),
-                        b.inline_flush_max_bytes,
-                    )
-                {
-                    return Some(Adjustment {
-                        knob: Knob::InlineFlushBytes,
-                        new_value: u64::try_from(v).unwrap_or(0),
-                        reason: "falling behind, publish-bound: enlarge memtable to amortize commits",
-                    });
-                }
-            } else if s.read_amp <= READ_AMP_LOW {
-                // Encode-bound → more encode shards, but ONLY when files aren't
-                // already a query problem (more shards mean more files): never
-                // speed ingest at the cost of query latency.
-                if let Some(v) = clamp_move_usize(
+            // 1. Enlarge the memtable first — the safest, most generally-helpful
+            //    lever for a behind table: fewer, larger files AND amortized
+            //    metastore commits (the common bottleneck). Only while memory ok.
+            if mem_ok
+                && let Some(v) = clamp_move_i64(
+                    cur.inline_flush_max_bytes,
+                    grow_i64(cur.inline_flush_max_bytes),
+                    b.inline_flush_max_bytes,
+                )
+            {
+                return Some(Adjustment {
+                    knob: Knob::InlineFlushBytes,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "falling behind: enlarge memtable (fewer files + amortized commits)",
+                });
+            }
+            // 2. Memtable maxed (or memory tight) and queries are NOT read-amp-
+            //    bound → add encode parallelism. Gated on low read-amp because more
+            //    shards mean more files: never speed ingest at the cost of queries.
+            if s.read_amp <= READ_AMP_LOW
+                && let Some(v) = clamp_move_usize(
                     cur.write_concurrency.max(1),
                     grow_usize(cur.write_concurrency.max(1)),
                     b.write_concurrency,
-                ) {
-                    return Some(Adjustment {
-                        knob: Knob::WriteConcurrency,
-                        new_value: u64::try_from(v).unwrap_or(0),
-                        reason: "falling behind, encode-bound: raise write concurrency",
-                    });
-                }
+                )
+            {
+                return Some(Adjustment {
+                    knob: Knob::WriteConcurrency,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "falling behind, memtable maxed: raise write concurrency",
+                });
             }
-            // Last resort while behind: compact more to keep the snapshot lean.
+            // 3. Last resort: compact more to keep the snapshot lean.
             if let Some(v) = clamp_move_u64(
                 cur.compaction_background_interval_ms,
                 shrink_u64(cur.compaction_background_interval_ms),
@@ -763,19 +742,11 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    fn sample(
-        rows: u64,
-        apply_ms: u64,
-        publish_ms: u64,
-        encode_ms: u64,
-        gap_ms: u64,
-    ) -> WriteSample {
+    fn sample(rows: u64, apply_ms: u64, gap_ms: u64) -> WriteSample {
         WriteSample {
             rows,
             bytes: rows * 256,
             apply: ms(apply_ms),
-            publish: ms(publish_ms),
-            encode: ms(encode_ms),
             arrival_gap: Some(ms(gap_ms)),
         }
     }
@@ -813,7 +784,7 @@ mod tests {
     fn record_and_snapshot_basic_rates() {
         let stats = IngestStats::new();
         // 1000 rows every 100 ms ⇒ ~10k rows/s; apply 20 ms ≪ 100 ms gap.
-        warm(&stats, sample(1000, 20, 5, 10, 100), 20);
+        warm(&stats, sample(1000, 20, 100), 20);
         let s = stats.snapshot();
         assert_eq!(s.samples, 20);
         assert!(
@@ -833,7 +804,7 @@ mod tests {
     fn apply_vs_arrival_detects_falling_behind() {
         let stats = IngestStats::new();
         // apply 150 ms but batches arrive every 100 ms → ratio 1.5 > 1.
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         let s = stats.snapshot();
         assert!(
             s.apply_vs_arrival > BEHIND_RATIO,
@@ -849,8 +820,6 @@ mod tests {
             rows: 500,
             bytes: 500 * 256,
             apply: ms(50),
-            publish: ms(10),
-            encode: ms(20),
             arrival_gap: None,
         });
         let s = stats.snapshot();
@@ -862,7 +831,7 @@ mod tests {
     #[test]
     fn no_action_before_warmup() {
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), WARMUP_BATCHES - 1);
+        warm(&stats, sample(1000, 150, 100), WARMUP_BATCHES - 1);
         let s = stats.snapshot();
         assert!(decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).is_none());
     }
@@ -870,7 +839,7 @@ mod tests {
     #[test]
     fn no_action_within_dwell() {
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         let s = stats.snapshot();
         // since_last < min_dwell ⇒ hold even though falling behind.
         assert!(decide(&s, &knobs(), &bounds(), ms(5_000), ms(30_000)).is_none());
@@ -881,7 +850,7 @@ mod tests {
     #[test]
     fn high_read_amp_enlarges_memtable_then_compacts() {
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         stats.set_read_amp(READ_AMP_HIGH + 5);
         let s = stats.snapshot();
         // Ingest↔query coupling: fix at the source first — a bigger memtable
@@ -904,7 +873,7 @@ mod tests {
         // The user's scenario: ingest keeps up (apply ≪ gap) but is creating too
         // many small files, so QUERIES are slow. The controller must still act.
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 20, 5, 10, 100), 20); // apply 20 ≪ 100 gap
+        warm(&stats, sample(1000, 20, 100), 20); // apply 20 ≪ 100 gap
         stats.set_read_amp(READ_AMP_HIGH + 10);
         let s = stats.snapshot();
         assert!(s.apply_vs_arrival < HEALTHY_RATIO, "ingest is caught up");
@@ -914,11 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_bound_with_high_read_amp_does_not_add_shards() {
+    fn behind_with_high_read_amp_does_not_add_shards() {
         // Ecosystem balance: never raise write concurrency (more files) while
         // queries are already read-amp-bound. The read-amp rule wins.
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 10, 120, 100), 20); // encode-bound
+        warm(&stats, sample(1000, 150, 100), 20); // falling behind
         stats.set_read_amp(READ_AMP_HIGH + 5);
         let s = stats.snapshot();
         let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
@@ -931,11 +900,11 @@ mod tests {
 
     #[test]
     fn memory_pressure_shrinks_memtable_and_overrides_growth() {
-        // Even falling behind + publish-bound (which would normally GROW the
-        // memtable), high memory pressure forces a SHRINK — memory is the hard
-        // constraint and runs first.
+        // Even falling behind (which would normally GROW the memtable), high
+        // memory pressure forces a SHRINK — memory is the hard constraint and
+        // runs first.
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20); // behind, publish-bound
+        warm(&stats, sample(1000, 150, 100), 20); // falling behind
         stats.set_mem_pressure(0.95); // over MEM_PRESSURE_HIGH
         let s = stats.snapshot();
         let bigger = KnobValues {
@@ -956,7 +925,7 @@ mod tests {
         // read-amp is high → relieve queries via compaction (CPU, not memory),
         // not by enlarging the memtable.
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 20, 5, 10, 100), 20);
+        warm(&stats, sample(1000, 20, 100), 20);
         stats.set_read_amp(READ_AMP_HIGH + 5);
         stats.set_mem_pressure(0.80); // between OK (0.75) and HIGH (0.85)
         let s = stats.snapshot();
@@ -971,11 +940,11 @@ mod tests {
     #[test]
     fn pinned_knob_via_collapsed_bounds_is_skipped() {
         // An operator-pinned knob (in `adaptive` mode) has its bounds collapsed to
-        // a single point. A publish-bound "falling behind" signal that would
-        // normally GROW the memtable must instead fall through to another lever —
-        // the explicit override is respected, never overwritten by the loop.
+        // a single point. A "falling behind" signal that would normally GROW the
+        // memtable must instead fall through to another lever — the explicit
+        // override is respected, never overwritten by the loop.
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20); // behind, publish-bound
+        warm(&stats, sample(1000, 150, 100), 20); // falling behind
         stats.set_read_amp(1);
         let s = stats.snapshot();
         let mut b = bounds();
@@ -989,14 +958,17 @@ mod tests {
             Knob::InlineFlushBytes,
             "a pinned memtable must never be moved by the controller"
         );
-        assert_eq!(adj.knob, Knob::CompactionIntervalMs);
+        // Pinned memtable can't grow → falls through to the next behind lever.
+        // Read-amp is low, so that's write concurrency (not compaction).
+        assert_eq!(adj.knob, Knob::WriteConcurrency);
     }
 
     #[test]
-    fn behind_and_publish_bound_enlarges_memtable() {
+    fn behind_enlarges_memtable_first() {
+        // Falling behind, read-amp healthy ⇒ grow the memtable first: the safest,
+        // most generally-helpful lever (fewer, larger files + amortized commits).
         let stats = IngestStats::new();
-        // publish (100) >> encode (20); read-amp healthy ⇒ publish-bound path.
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         stats.set_read_amp(1);
         let s = stats.snapshot();
         let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
@@ -1006,38 +978,29 @@ mod tests {
     }
 
     #[test]
-    fn behind_and_encode_bound_raises_write_concurrency() {
+    fn behind_with_maxed_memtable_raises_write_concurrency() {
+        // Falling behind with the memtable already at its ceiling and read-amp
+        // healthy ⇒ the next lever is encode parallelism (more write shards). The
+        // read-amp gate (low here) is what makes adding files acceptable.
         let stats = IngestStats::new();
-        // encode (120) > publish (10); read-amp healthy ⇒ encode-bound path.
-        warm(&stats, sample(1000, 150, 10, 120, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         stats.set_read_amp(1);
         let s = stats.snapshot();
-        let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
+        let maxed = KnobValues {
+            inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
+            ..knobs()
+        };
+        let adj = decide(&s, &maxed, &bounds(), ms(60_000), ms(30_000)).expect("acts");
         assert_eq!(adj.knob, Knob::WriteConcurrency);
         assert!(adj.new_value > knobs().write_concurrency as u64);
         assert!(adj.new_value <= bounds().write_concurrency.1 as u64);
     }
 
     #[test]
-    fn unmeasured_phase_split_defaults_to_memtable_not_concurrency() {
-        // When publish/encode timings are unmeasured (both 0), a behind table must
-        // deterministically take the safe memtable lever, not let the degenerate
-        // `0 >= 0` arbitrarily pick it — and must NOT raise write concurrency
-        // without a real, measured encode-bound signal.
-        let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 0, 0, 100), 20); // behind; split unmeasured
-        stats.set_read_amp(1);
-        let s = stats.snapshot();
-        let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
-        assert_eq!(adj.knob, Knob::InlineFlushBytes);
-        assert_ne!(adj.knob, Knob::WriteConcurrency);
-    }
-
-    #[test]
     fn healthy_and_low_read_amp_backs_off_compaction() {
         let stats = IngestStats::new();
         // apply 20 ms ≪ 100 ms gap ⇒ healthy; low read-amp.
-        warm(&stats, sample(1000, 20, 5, 10, 100), 20);
+        warm(&stats, sample(1000, 20, 100), 20);
         stats.set_read_amp(1);
         let s = stats.snapshot();
         let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
@@ -1053,7 +1016,7 @@ mod tests {
         let stats = IngestStats::new();
         // Keeping up but not idle (ratio ~0.8, between HEALTHY and BEHIND), mid
         // read-amp ⇒ no rule fires.
-        warm(&stats, sample(1000, 80, 20, 30, 100), 20);
+        warm(&stats, sample(1000, 80, 100), 20);
         stats.set_read_amp(5);
         let s = stats.snapshot();
         assert!(decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).is_none());
@@ -1064,7 +1027,7 @@ mod tests {
     #[test]
     fn adjustments_never_exceed_bounds() {
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20); // behind
+        warm(&stats, sample(1000, 150, 100), 20); // behind
         stats.set_read_amp(READ_AMP_HIGH + 5); // and read-amp high
         let s = stats.snapshot();
         let b = bounds();
@@ -1107,12 +1070,12 @@ mod tests {
 
     #[test]
     fn convergence_does_not_oscillate() {
-        // Repeatedly applying decisions for a fixed "falling behind, publish-
-        // bound" signal must monotonically increase the memtable toward the
-        // ceiling and then STOP (no flip-flop).
+        // Repeatedly applying decisions for a fixed "falling behind" signal must
+        // monotonically increase the memtable toward the ceiling and then STOP
+        // (no flip-flop).
         let live = LiveKnobs::new(knobs());
         let stats = IngestStats::new();
-        warm(&stats, sample(1000, 150, 100, 20, 100), 20);
+        warm(&stats, sample(1000, 150, 100), 20);
         stats.set_read_amp(1);
         let s = stats.snapshot();
         let mut last = live.values().inline_flush_max_bytes;
