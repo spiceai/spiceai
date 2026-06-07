@@ -299,6 +299,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 None,
+                crate::provider::delta_encoding::WriteClass::Maintenance,
             )
             .await?;
 
