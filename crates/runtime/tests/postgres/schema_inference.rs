@@ -192,6 +192,20 @@ async fn test_extended_schema_inference_loads_and_queries() -> Result<(), anyhow
                 &results
             );
 
+            // A filtered query over the accelerated table also confirms the seed
+            // loaded with the expected values (exactly one active row).
+            let active = run_query(&rt, "SELECT COUNT(*) AS n FROM inventory WHERE active").await?;
+            assert_batches_eq!(
+                &[
+                    "+---+", //
+                    "| n |", //
+                    "+---+", //
+                    "| 1 |", //
+                    "+---+", //
+                ],
+                &active
+            );
+
             Ok(())
         })
         .await
