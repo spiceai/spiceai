@@ -547,55 +547,39 @@ async fn mongodb_catalog_details(
 /// since the change-stream path requires `primary_key: _id` plus a matching
 /// `on_conflict` upsert.
 ///
-/// The remaining details require catalog commands, which run on a **separate
-/// spawned task** bounded by [`MONGODB_CATALOG_TIMEOUT`]. A connection or command
-/// that blocks *without yielding* (e.g. `MongoDB` server selection on a
-/// `directConnection=true&replicaSet=…` URI) stalls its worker thread, so an inline
-/// `timeout` around the future cannot preempt it — the timer can never re-poll a
-/// future whose own `poll` is blocking. Isolating the work in a task and timing out
-/// its `JoinHandle` *can* be preempted, so the constant `_id` primary key is always
-/// emitted and dataset load / change streams never stall on catalog enrichment.
+/// The remaining details require catalog commands, bounded by
+/// [`MONGODB_CATALOG_TIMEOUT`]: a slow or unavailable catalog degrades to "primary
+/// key only" rather than delaying dataset load. The `MongoDB` driver is async, so
+/// the timeout preempts the request at its I/O await points; the constant `_id`
+/// primary key is emitted regardless.
 async fn mongodb_inferred_schema_metadata(
     pool: &Arc<MongoDBConnectionPool>,
     collection_name: &str,
 ) -> InferredSchema {
     let primary_key = vec!["_id".to_string()];
 
-    let details = {
-        let pool = Arc::clone(pool);
-        let collection = collection_name.to_string();
-        let task_primary_key = primary_key.clone();
-        let handle = tokio::spawn(async move {
-            mongodb_catalog_details(&pool, &collection, &task_primary_key).await
-        });
-        let abort = handle.abort_handle();
-        match tokio::time::timeout(MONGODB_CATALOG_TIMEOUT, handle).await {
-            Ok(Ok(Ok(details))) => details,
-            Ok(Ok(Err(error))) => {
-                tracing::debug!(
-                    collection = collection_name,
-                    %error,
-                    "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
-                );
-                MongoCatalogDetails::primary_key_only(&primary_key)
-            }
-            Ok(Err(join_error)) => {
-                tracing::debug!(
-                    collection = collection_name,
-                    %join_error,
-                    "MongoDB catalog enrichment task failed; inferring the `_id` primary key only"
-                );
-                MongoCatalogDetails::primary_key_only(&primary_key)
-            }
-            Err(_elapsed) => {
-                abort.abort();
-                tracing::debug!(
-                    collection = collection_name,
-                    timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
-                    "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
-                );
-                MongoCatalogDetails::primary_key_only(&primary_key)
-            }
+    let details = match tokio::time::timeout(
+        MONGODB_CATALOG_TIMEOUT,
+        mongodb_catalog_details(pool, collection_name, &primary_key),
+    )
+    .await
+    {
+        Ok(Ok(details)) => details,
+        Ok(Err(error)) => {
+            tracing::debug!(
+                collection = collection_name,
+                %error,
+                "MongoDB catalog enrichment failed; inferring the `_id` primary key only"
+            );
+            MongoCatalogDetails::primary_key_only(&primary_key)
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                collection = collection_name,
+                timeout_secs = MONGODB_CATALOG_TIMEOUT.as_secs(),
+                "MongoDB catalog enrichment timed out; inferring the `_id` primary key only"
+            );
+            MongoCatalogDetails::primary_key_only(&primary_key)
         }
     };
 

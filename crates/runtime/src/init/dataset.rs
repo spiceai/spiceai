@@ -639,12 +639,7 @@ impl Runtime {
 
         let mut new_ds = (*ds).clone();
         if let Some(acceleration) = new_ds.acceleration.as_mut() {
-            apply_inferred_schema(
-                acceleration,
-                &inferred,
-                &effective_schema,
-                &ds.name.to_string(),
-            );
+            apply_inferred_schema(acceleration, &inferred, &effective_schema, ds.name.table());
         }
         Arc::new(new_ds)
     }
