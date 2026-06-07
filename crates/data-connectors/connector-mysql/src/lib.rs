@@ -32,6 +32,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -260,7 +261,13 @@ impl DataConnectorFactory for MySQLFactory {
                     }
                 },
             };
-            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool));
+            // Install the Spice function deny-list so federation evaluates
+            // Spice-only UDFs (`json_get_str`, the embedding/distance UDFs, etc.)
+            // locally instead of pushing them into the SQL sent to MySQL, where
+            // those functions don't exist and the query would fail with an
+            // "unknown function" error. See issue #10703.
+            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_specific_functions().as_ref().clone());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,
