@@ -792,12 +792,26 @@ impl CayenneTableProvider {
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
 
-        // Single open + write + fsync, keeping the fd through to `sync_all`.
+        // Single open + write + fsync, keeping the fd through to the sync.
         // The previous revision called `tokio::fs::write` (which opens,
         // writes, drops the fd) and then re-opened the file to call
         // `sync_all` — paying an extra `open(2)` per WAL write on every
         // staged append. Replacing the two opens with one is a small but
         // real per-ingestion saving on the local-FS hot path.
+        //
+        // Ordering tier (`fsync_tier::ordering_sync_tokio_file`), not
+        // `sync_all`: on macOS BOTH std `sync_all` and `sync_data` are
+        // `fcntl(F_FULLFSYNC)` (~4-5 ms full drive-cache flush, measured),
+        // while plain `fsync(2)` is ~66 µs — and plain fsync is the macOS
+        // tier SQLite/DuckDB/Postgres default to. On Linux the helper is
+        // `fdatasync`, which flushes the WAL bytes + the size metadata needed
+        // to read them. Full-platter durability is not load-bearing here:
+        // losing this WAL record in a power-loss window only orphans staging
+        // files that recovery (`ensure_no_incomplete_write`) audits and
+        // discards — and the metastore's own visibility commits are SQLite
+        // `synchronous=NORMAL` (no fullfsync), so a stronger barrier on this
+        // marker file could not raise end-to-end durability anyway. See
+        // `provider/fsync_tier.rs` for the measurements and rationale.
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -805,7 +819,7 @@ impl CayenneTableProvider {
             .open(&tmp_path)
             .await?;
         file.write_all(content.as_bytes()).await?;
-        file.sync_all().await?;
+        super::fsync_tier::ordering_sync_tokio_file(&file).await?;
         drop(file);
 
         if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {

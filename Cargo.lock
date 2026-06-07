@@ -3685,6 +3685,7 @@ dependencies = [
  "hash-index",
  "im",
  "insta",
+ "libc",
  "object_store 0.13.2",
  "parking_lot 0.12.5",
  "paste",
