@@ -3707,6 +3707,7 @@ dependencies = [
  "util",
  "uuid 1.23.1",
  "vortex",
+ "vortex-btrblocks",
  "vortex-datafusion",
  "vortex-scan",
  "vortex-session",
@@ -6068,7 +6069,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.5.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=3c051ecedc8fb71220b89337dba02fa21ce3528a#3c051ecedc8fb71220b89337dba02fa21ce3528a"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=6433df67b1154c8c3c4779732b1b04c73714ce83#6433df67b1154c8c3c4779732b1b04c73714ce83"
 dependencies = [
  "arrow-json 58.3.0",
  "async-stream",
@@ -8474,8 +8475,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9620,7 +9621,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -9655,7 +9656,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -15103,7 +15104,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -15141,7 +15142,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -17716,7 +17717,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -19774,7 +19775,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -22855,7 +22856,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
