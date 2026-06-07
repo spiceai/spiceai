@@ -588,7 +588,12 @@ impl Runtime {
         use crate::component::dataset::schema_inference::apply_inferred_schema;
         use data_components::inferred_schema::InferredSchema;
 
-        if !ds.schema_inference.is_extended() || ds.acceleration.is_none() {
+        // Skip when extended inference is off, or the dataset is not accelerated —
+        // including an `acceleration` block that is present but `enabled: false`,
+        // which the rest of the runtime treats as non-accelerated.
+        if !ds.schema_inference.is_extended()
+            || !ds.acceleration.as_ref().is_some_and(|a| a.enabled)
+        {
             return ds;
         }
 
