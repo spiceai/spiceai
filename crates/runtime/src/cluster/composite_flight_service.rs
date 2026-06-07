@@ -53,9 +53,9 @@ pub struct CompositeFlightService {
 impl CompositeFlightService {
     /// Creates a new composite Flight service.
     #[must_use]
-    pub fn new(spice: SpiceFlightService, ballista_work_dir: String) -> Self {
+    pub fn new(spice: SpiceFlightService) -> Self {
         Self {
-            ballista: BallistaFlightService::new(ballista_work_dir),
+            ballista: BallistaFlightService::new(),
             spice,
         }
     }

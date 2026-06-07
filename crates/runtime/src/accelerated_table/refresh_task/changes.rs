@@ -3568,7 +3568,7 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

@@ -34,14 +34,8 @@ pub trait DataFusionSchedulerExtensions<T: 'static + AsLogicalPlan, U: 'static +
         if let Some(scheduler_state) = self.scheduler_state() {
             scheduler_state
                 .executor_manager
-                .get_executors_state()
+                .get_executor_state()
                 .await
-                .map(|executors| {
-                    executors
-                        .into_iter()
-                        .map(|(metadata, heartbeat, _metrics)| (metadata, heartbeat))
-                        .collect()
-                })
                 .map_err(|e| DataFusionError::External(Box::new(e)))
         } else {
             Ok(vec![])
