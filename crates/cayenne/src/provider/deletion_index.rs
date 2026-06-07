@@ -1052,6 +1052,42 @@ mod tests {
         assert_eq!(idx.get(400), None);
     }
 
+    // [b3 sub-lever 1] The deleted-key min/max range is the plan-time gate that
+    // lets a PK-disjoint branch skip the deletion filter. It must (a) track the
+    // true min/max over the delete side, (b) never include insert-only keys,
+    // and (c) be `None` when there are no deletions.
+    #[test]
+    fn deleted_key_range_tracks_min_max_int64() {
+        let idx = DeletionIndex::from_map(HashMap::from([(100, 1), (300, 3), (50, 2)]));
+        assert_eq!(idx.deleted_key_range(), Some((50, 300)));
+
+        // Extending with deletes outside the range widens it monotonically.
+        let grown = idx.extend_max_deletes([(10, 4), (400, 5)]);
+        assert_eq!(grown.deleted_key_range(), Some((10, 400)));
+
+        // Empty index has no range.
+        assert_eq!(DeletionIndex::empty().deleted_key_range(), None);
+    }
+
+    #[test]
+    fn deleted_key_range_ignores_insert_only() {
+        // Insert-only key (no deletion) must NOT enter the deleted-key range,
+        // mirroring `delete_len() == 0`.
+        let idx = DeletionIndex::from_maps(HashMap::new(), HashMap::from([(7_i64, 70_i64)]));
+        assert_eq!(idx.delete_len(), 0);
+        assert_eq!(idx.deleted_key_range(), None);
+    }
+
+    #[test]
+    fn deleted_key_range_after_delete_of_insert_only() {
+        // An insert-only key gains a range entry only once it is actually
+        // deleted.
+        let idx = DeletionIndex::from_maps(HashMap::new(), HashMap::from([(7_i64, 70_i64)]));
+        assert_eq!(idx.deleted_key_range(), None);
+        let after = idx.extend_max_deletes([(7_i64, 80_i64)]);
+        assert_eq!(after.deleted_key_range(), Some((7, 7)));
+    }
+
     #[test]
     fn empty_index_probes_to_none() {
         let idx = DeletionIndex::empty();

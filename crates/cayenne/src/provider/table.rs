@@ -19790,4 +19790,214 @@ mod tests {
             "no partial listing may be seeded on a cold-cache miss"
         );
     }
+
+    // ========================================================================
+    // [b3 sub-lever 1] Plan-time branch-skip decision tests.
+    //
+    // These exercise `int64_branch_disjoint_from_deletions` /
+    // `branch_int64_pk_range` — the predicate the three `apply_deletion_filter*`
+    // sites use to decide whether to interpose the filter exec. The invariant:
+    // a branch may skip the filter ONLY when its EXACT Int64 PK scan window is
+    // provably disjoint from the deleted-key range. Any uncertainty
+    // (Inexact/Absent stats, composite PK, non-Int64 PK) must keep the filter.
+    // `MemorySourceConfig` does not synthesize Exact min/max, so a tiny
+    // stats-override wrapper supplies the column statistics under test.
+    // ========================================================================
+
+    /// Wraps an inner plan and reports caller-supplied `Statistics`, delegating
+    /// everything else. Lets a test feed Exact/Inexact/Absent PK bounds into
+    /// `branch_int64_pk_range` without a real file scan.
+    #[derive(Debug)]
+    struct StatsOverrideExec {
+        inner: Arc<dyn ExecutionPlan>,
+        stats: Statistics,
+        properties: datafusion_physical_plan::PlanProperties,
+    }
+
+    impl StatsOverrideExec {
+        fn new(inner: Arc<dyn ExecutionPlan>, stats: Statistics) -> Self {
+            let properties = inner.properties().clone();
+            Self {
+                inner,
+                stats,
+                properties,
+            }
+        }
+    }
+
+    impl datafusion_physical_plan::DisplayAs for StatsOverrideExec {
+        fn fmt_as(
+            &self,
+            _t: datafusion_physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "StatsOverrideExec")
+        }
+    }
+
+    impl ExecutionPlan for StatsOverrideExec {
+        fn name(&self) -> &'static str {
+            "StatsOverrideExec"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(StatsOverrideExec::new(
+                Arc::clone(&children[0]),
+                self.stats.clone(),
+            )))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<datafusion_execution::TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            self.inner.execute(partition, context)
+        }
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> datafusion_common::Result<Statistics> {
+            Ok(self.stats.clone())
+        }
+    }
+
+    /// One-column Int64 child plan whose PK stats carry the given precision.
+    fn int64_child_with_pk_stats(
+        min_value: DFPrecision<ScalarValue>,
+        max_value: DFPrecision<ScalarValue>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                0_i64,
+            ]))],
+        )
+        .expect("batch");
+        let mem = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+            .expect("mem exec");
+        let stats = Statistics {
+            num_rows: DFPrecision::Absent,
+            total_byte_size: DFPrecision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: DFPrecision::Absent,
+                min_value,
+                max_value,
+                sum_value: DFPrecision::Absent,
+                distinct_count: DFPrecision::Absent,
+                byte_size: DFPrecision::Absent,
+            }],
+        };
+        Arc::new(StatsOverrideExec::new(mem, stats))
+    }
+
+    fn exact_i64(v: i64) -> DFPrecision<ScalarValue> {
+        DFPrecision::Exact(ScalarValue::Int64(Some(v)))
+    }
+
+    #[test]
+    fn branch_int64_pk_range_reads_exact_bounds() {
+        let plan = int64_child_with_pk_stats(exact_i64(1000), exact_i64(2000));
+        assert_eq!(
+            CayenneTableProvider::branch_int64_pk_range(&plan, &[0]),
+            Some((1000, 2000)),
+            "Exact Int64 PK bounds must be read off the plan stats"
+        );
+    }
+
+    #[test]
+    fn disjoint_branch_skips_filter_int64() {
+        // Child PK window [1000,2000]; deletes {1,2,3} (range [1,3]) → disjoint.
+        let plan = int64_child_with_pk_stats(exact_i64(1000), exact_i64(2000));
+        let index = DeletionIndex::from_map(HashMap::from([(1, 1), (2, 1), (3, 1)]));
+        assert!(
+            CayenneTableProvider::int64_branch_disjoint_from_deletions(&plan, &[0], &index),
+            "a PK-disjoint branch must be eligible to skip the deletion filter"
+        );
+    }
+
+    #[test]
+    fn overlapping_branch_keeps_filter_int64() {
+        // Child PK window [1,5]; deletes {3} (range [3,3]) → overlapping.
+        let plan = int64_child_with_pk_stats(exact_i64(1), exact_i64(5));
+        let index = DeletionIndex::from_map(HashMap::from([(3, 1)]));
+        assert!(
+            !CayenneTableProvider::int64_branch_disjoint_from_deletions(&plan, &[0], &index),
+            "an overlapping branch must keep the deletion filter"
+        );
+    }
+
+    #[test]
+    fn inexact_stats_keep_filter() {
+        // Inexact bounds → branch_int64_pk_range returns None → never skip, even
+        // though [1000,2000] would be numerically disjoint from {1,2,3}. This is
+        // the critical conservative-bias regression: uncertainty never skips.
+        let plan = int64_child_with_pk_stats(
+            DFPrecision::Inexact(ScalarValue::Int64(Some(1000))),
+            DFPrecision::Inexact(ScalarValue::Int64(Some(2000))),
+        );
+        assert_eq!(
+            CayenneTableProvider::branch_int64_pk_range(&plan, &[0]),
+            None,
+            "Inexact PK bounds must yield no range"
+        );
+        let index = DeletionIndex::from_map(HashMap::from([(1, 1), (2, 1), (3, 1)]));
+        assert!(
+            !CayenneTableProvider::int64_branch_disjoint_from_deletions(&plan, &[0], &index),
+            "Inexact stats must keep the filter (no skip on uncertainty)"
+        );
+    }
+
+    #[test]
+    fn absent_stats_keep_filter() {
+        // Absent bounds (e.g. a plain MemorySourceConfig / mode=file with no
+        // footer stats) → None → never skip → byte-identical to today.
+        let plan = int64_child_with_pk_stats(DFPrecision::Absent, DFPrecision::Absent);
+        assert_eq!(
+            CayenneTableProvider::branch_int64_pk_range(&plan, &[0]),
+            None
+        );
+        let index = DeletionIndex::from_map(HashMap::from([(1, 1)]));
+        assert!(!CayenneTableProvider::int64_branch_disjoint_from_deletions(
+            &plan, &[0], &index
+        ));
+    }
+
+    #[test]
+    fn zero_delete_branch_skips_filter_via_no_range() {
+        // An index with no deletions has no deleted_key_range → the disjoint
+        // gate returns false (the existing has_deletions() guard already sheds
+        // the filter; this locks that the range gate does not misfire).
+        let plan = int64_child_with_pk_stats(exact_i64(1000), exact_i64(2000));
+        let index = DeletionIndex::empty();
+        assert_eq!(index.deleted_key_range(), None);
+        assert!(
+            !CayenneTableProvider::int64_branch_disjoint_from_deletions(&plan, &[0], &index),
+            "no-deletion index yields no range → gate returns false (filter shed by has_deletions guard upstream)"
+        );
+    }
+
+    #[test]
+    fn multi_column_pk_never_skips_at_plan_time() {
+        // Composite PK (>1 index) → branch_int64_pk_range returns None → the
+        // plan-time gate is INERT for composite keys (the documented no-op; the
+        // composite win is the per-batch bloom sweep in sub-lever 2).
+        let plan = int64_child_with_pk_stats(exact_i64(1000), exact_i64(2000));
+        assert_eq!(
+            CayenneTableProvider::branch_int64_pk_range(&plan, &[0, 1]),
+            None,
+            "multi-column PK must never be skipped at plan time"
+        );
+    }
 }
