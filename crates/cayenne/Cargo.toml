@@ -55,7 +55,11 @@ url = { workspace = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }
 flatbuffers = { workspace = true }
-vortex = { workspace = true }
+# `files` exposes `vortex::file::WriteStrategyBuilder` for the delta-encoding
+# write-strategy overrides (provider/delta_encoding.rs). The feature is already
+# enabled transitively by vortex-datafusion; naming it here keeps cayenne
+# building if that ever changes.
+vortex = { workspace = true, features = ["files"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
@@ -292,6 +296,10 @@ name = "get_max_delete_sequence_walk"
 [[bench]]
 harness = false
 name = "apply_on_conflict_keys_double_clone"
+
+[[bench]]
+harness = false
+name = "delta_encoding_sweep"
 
 [[bench]]
 harness = false
