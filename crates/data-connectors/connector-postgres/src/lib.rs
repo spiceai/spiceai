@@ -23,19 +23,24 @@ limitations under the License.
 //! change-by-change replication into the local accelerator without Debezium.
 
 use async_trait::async_trait;
+use data_components::federation::create_spice_federated_table_provider;
 use datafusion::datasource::TableProvider;
-use datafusion_table_providers::postgres::PostgresTableFactory;
+use datafusion::sql::TableReference;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
+use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;
 use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError,
     postgrespool::{self, PostgresConnectionPool},
 };
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use runtime::component::dataset::Dataset;
 use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::ParameterSpec;
 use secrecy::SecretBox;
 use snafu::prelude::*;
@@ -291,6 +296,36 @@ async fn postgres_comment_metadata(
     Ok(data_components::postgres::provider::postgres_metadata_from_rows(rows))
 }
 
+/// Build a federated `PostgreSQL` read provider with the Spice function deny-list
+/// installed, so Spice-only UDFs (`json_get_str`, etc.) are evaluated locally
+/// instead of being unparsed into the SQL sent to `PostgreSQL`, which would
+/// reject them. This mirrors the upstream `PostgresTableFactory::table_provider`
+/// internals but routes pushdown decisions through
+/// [`create_spice_federated_table_provider`] (the upstream `SqlTable`'s
+/// `can_execute_plan` defaults to always-federate and ignores the deny-list). See
+/// issue #10703.
+async fn federated_postgres_table_provider(
+    pool: Arc<PostgresConnectionPool>,
+    table_reference: TableReference,
+) -> std::result::Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+    let sql_table = Arc::new(
+        SqlTable::new("postgres", &dyn_pool, table_reference.clone())
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+        .with_dialect(Arc::new(PostgreSqlDialect {})),
+    );
+
+    let schema = sql_table.schema();
+    Ok(Arc::new(create_spice_federated_table_provider(
+        sql_table,
+        schema,
+        table_reference,
+        Some(deny_spice_specific_functions().as_ref().clone()),
+    )))
+}
+
 async fn enrich_with_postgres_comments(
     pool: &Arc<PostgresConnectionPool>,
     dataset: &Dataset,
@@ -380,7 +415,8 @@ impl DataConnector for Postgres {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        match self.factory.table_provider(dataset.path().into()).await {
+        match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
+        {
             Ok(provider) => Ok(enrich_with_postgres_comments(&self.pool, dataset, provider).await),
             Err(e) => {
                 if let Some(err_source) = e.source() {

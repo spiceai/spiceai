@@ -263,6 +263,12 @@ impl DataConnectorFactory for MySQLFactory {
                     }
                 },
             };
+            // TODO(#10703): table-providers v0.11 removed the upstream
+            // `function_support` deny-list seam, so the Spice-only-UDF
+            // deny-list (json_get_str, embedding/distance UDFs) cannot be
+            // installed on the MySQL factory yet. Restore once the fork
+            // carries a v0.11 deny-list seam or the connector routes through
+            // the shared DenyFunctionsSqlExecutor wrapper.
             let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool));
 
             Ok(Arc::new(MySQL {

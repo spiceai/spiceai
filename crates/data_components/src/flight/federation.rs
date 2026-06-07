@@ -1,8 +1,11 @@
 use async_trait::async_trait;
-use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+use datafusion_federation::sql::{
+    LogicalOptimizer, SQLExecutor, SQLFederationProvider, SQLTableSource,
+};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use std::sync::Arc;
 
+use crate::function_support::unfederate_plan_with_unsupported_functions;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
@@ -46,6 +49,18 @@ impl SQLExecutor for FlightTable {
 
     fn dialect(&self) -> Arc<dyn Dialect> {
         Arc::clone(&self.dialect)
+    }
+
+    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
+        // Don't federate plans referencing a deny-listed Spice-only function
+        // (e.g. json_get_str); the Flight server has no such function, so
+        // evaluate those locally instead. v0.5.3 federation has no
+        // `can_execute_plan` veto, so unwrap such plans in a logical
+        // optimizer instead. See issue #10703.
+        let function_support = self.function_support.clone()?;
+        Some(Box::new(move |plan| {
+            unfederate_plan_with_unsupported_functions(plan, &function_support)
+        }))
     }
 
     fn execute(

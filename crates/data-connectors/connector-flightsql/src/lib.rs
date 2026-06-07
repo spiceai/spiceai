@@ -29,6 +29,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_specific_functions;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -263,7 +264,8 @@ impl DataConnectorFactory for FlightSQLFactory {
                     .context(UnableToPerformHandshakeSnafu)?;
             }
             let flightsql_factory =
-                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store);
+                DataComponentFlightSQLFactory::new(client, endpoint, cookie_store)
+                    .with_function_support(deny_spice_specific_functions().as_ref().clone());
             Ok(Arc::new(FlightSQL { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }

@@ -88,6 +88,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
+use object_store::ObjectStoreExt;
 use object_store::ObjectStore;
 use object_store::PutPayload;
 use object_store::memory::InMemory;
