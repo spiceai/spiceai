@@ -1105,7 +1105,7 @@ impl MetastoreBackend for SqliteMetastore {
         // METRIC 2 (WAL bytes): sample the -wal file size right after the
         // checkpoint copied as many frames as it could. A cheap stat(); a missing
         // file (just truncated) reports 0.
-        self.sample_wal_bytes();
+        self.sample_wal_bytes().await;
         Ok(())
     }
 }
@@ -1114,9 +1114,13 @@ impl SqliteMetastore {
     /// Sample the current `-wal` file size (cheap `stat()`) and publish it to the
     /// METRIC 2 `cayenne_metastore_wal_bytes` gauge. Best-effort: a missing or
     /// unreadable file reports 0 (the WAL was truncated or not yet created).
-    fn sample_wal_bytes(&self) {
+    async fn sample_wal_bytes(&self) {
         let wal_path = format!("{}-wal", self.db_path());
-        let bytes = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+        // `tokio::fs::metadata` (not `std::fs`): this runs on the async maintenance
+        // tick, so a blocking stat would stall a Tokio worker thread (PR #11206 review).
+        let bytes = tokio::fs::metadata(&wal_path)
+            .await
+            .map_or(0, |m| m.len());
         telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
     }
 }
@@ -1253,20 +1257,21 @@ impl MetastoreTransaction for SqliteTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
-        // METRIC 1 (writer held): record before COMMIT so the held window reflects
-        // exactly the reserved-lock lifetime the next contending writer queued
-        // behind. (The COMMIT's own fsync is its statement cost, not lock-hold.)
-        telemetry::track_cayenne_metastore_writer_held(
-            self.held_start.elapsed(),
-            &[telemetry::KeyValue::new("txn", "other")],
-        );
-
         let commit_result = conn
             .call(|conn| {
                 conn.execute_batch("COMMIT")?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await;
+
+        // METRIC 1 (writer held): record AFTER COMMIT. The BEGIN IMMEDIATE write
+        // lock is held through COMMIT's fsync, so a contending writer blocks until
+        // it returns — timing here captures the full lock-hold window the next
+        // writer queues behind (recording before COMMIT under-reported it; PR #11206).
+        telemetry::track_cayenne_metastore_writer_held(
+            self.held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
         match commit_result {
             Ok(()) => Ok(()),
@@ -1291,18 +1296,21 @@ impl MetastoreTransaction for SqliteTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
-        // METRIC 1 (writer held): the reserved write lock was held this long.
+        let rollback_result = conn
+            .call(|conn| {
+                conn.execute_batch("ROLLBACK")?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await;
+
+        // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
+        // through the rollback statement, so include its duration (PR #11206).
         telemetry::track_cayenne_metastore_writer_held(
             self.held_start.elapsed(),
             &[telemetry::KeyValue::new("txn", "other")],
         );
 
-        conn.call(|conn| {
-            conn.execute_batch("ROLLBACK")?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
+        rollback_result.map_err(
             |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
                 message: format!("Failed to rollback transaction: {e}"),
             },
