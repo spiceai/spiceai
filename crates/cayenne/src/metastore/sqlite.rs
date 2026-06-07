@@ -36,7 +36,15 @@ const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 /// Default WAL-size cap (bytes) for [`SqliteMetastoreConfig::wal_truncate_threshold_bytes`]
 /// — the size above which the background maintenance-tick checkpoint escalates
 /// from PASSIVE to TRUNCATE (cycle-8 TASK A2). See that field for the rationale.
-const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+///
+/// 48 MiB, not 512 MiB (cycle-9, MEASURED): at 512 MiB the WAL reached ~370 MB
+/// between drains under SF-100 @10K txn/s, and every writer acquisition paid the
+/// large-WAL overhead (`writer_held` stayed ~219 ms with `wait` 323 ms ⇒ writers
+/// saturated), while each eventual TRUNCATE took ~1.9 s — expensive precisely
+/// because it drained half a gigabyte. A small cap keeps both costs low: frequent
+/// background TRUNCATEs of a small WAL are cheap, acquisitions stay fast, and the
+/// hot COMMIT path still never checkpoints (the A2 invariant).
+const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 48 * 1024 * 1024;
 
 /// `auto_vacuum` mode for the metastore DB.
 ///
