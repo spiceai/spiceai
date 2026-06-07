@@ -276,10 +276,19 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
-        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+        // Register the in-flight append BEFORE its WAL becomes discoverable on
+        // disk. Recovery treats any committed WAL whose id is not in the
+        // in-flight set as a crash leftover; writing the WAL first opened a
+        // window where a concurrent recovery pass could "recover" — move and
+        // delete — an append that was still being prepared. Registration is
+        // reverted if the WAL write fails, so a failed prepare leaves no
+        // permanent in-flight entry masking genuine recovery.
+        self.table
+            .register_inflight_staging_append(&self.staging_snapshot_id);
+        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .write_staging_wal_for(&self.staging_snapshot_id)
-                .await?;
+                .await
         } else {
             self.table
                 .write_staging_wal_for_target(
@@ -287,10 +296,13 @@ impl CayenneStagedAppend {
                     &self.target_snapshot_id,
                     self.target_kind,
                 )
-                .await?;
+                .await
+        };
+        if let Err(e) = wal_write {
+            self.table
+                .unregister_inflight_staging_append(&self.staging_snapshot_id);
+            return Err(e);
         }
-        self.table
-            .register_inflight_staging_append(&self.staging_snapshot_id);
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
@@ -1030,6 +1042,21 @@ impl CayenneTableProvider {
             }
         }
 
+        // Exclude the pipelined staged-commit finalize while recovering. The
+        // Stage-B finalize (`apply_under_held_barrier`) moves staged files out
+        // of `_staging/` under `visibility_lock` WITHOUT `write_lock`, while
+        // this recovery runs under `write_lock` only — with no shared lock,
+        // recovery can read a WAL written milliseconds ago by a still-running
+        // finalize and "recover" (move + delete) the staging entries out from
+        // under it (observed live: ENOENT mid-finalize → the changes stream
+        // died permanently with "manual intervention required"). Taking the
+        // visibility lock makes recovery and finalize mutually exclusive.
+        // Lock order is safe: every caller of this function holds `write_lock`
+        // (or runs single-threaded at provider open), matching the staged
+        // publish order `write_lock → visibility_lock`; the finalize task
+        // never takes `write_lock`, so no inversion exists.
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+
         let mut located_wals = self.read_staging_wals().await?;
         // Sort by the staging snapshot id rather than `wal.created_at`. The
         // staging snapshot id is derived from `Uuid::now_v7()` (see
@@ -1313,9 +1340,14 @@ impl CayenneTableProvider {
         // in-flight append is known, clear any orphan pre-WAL staging files
         // and correct the flags so future writes take the fast path. Unparseable
         // committed WALs are errors above; only uncommitted tmp WALs are ignored.
+        //
+        // Cleanup is per-entry (`clear_orphan_staging_dirs`), never a whole-root
+        // delete: an append registering concurrently with this pass must not
+        // lose its staged files (the whole-root variant destroyed a pipelined
+        // finalize's staging dir mid-move — observed live as a permanent
+        // changes-stream failure).
         if !self.has_inflight_staging_appends() {
-            self.staging_may_have_files().store(true, Ordering::Release);
-            self.clear_staging_dir().await?;
+            self.clear_orphan_staging_dirs().await?;
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())

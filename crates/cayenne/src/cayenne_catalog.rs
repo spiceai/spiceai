@@ -137,6 +137,15 @@ impl MetastoreImpl {
         }
     }
 
+    /// Run a non-blocking WAL checkpoint off the hot path (cycle-5 TASK 2b).
+    pub(crate) async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.checkpoint_wal().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.checkpoint_wal().await,
+        }
+    }
+
     /// Begin a transaction on the underlying metastore.
     ///
     /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
@@ -762,6 +771,12 @@ impl MetadataCatalog for CayenneCatalog {
         Ok(())
     }
 
+    /// cycle-5 TASK 2b: drain the WAL off the hot path with a non-blocking
+    /// PASSIVE checkpoint (delegated to the backend).
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        self.metastore.checkpoint_wal().await
+    }
+
     async fn list_table_names(&self) -> CatalogResult<Vec<String>> {
         self.metastore
             .query_helper(
@@ -1237,43 +1252,50 @@ impl MetadataCatalog for CayenneCatalog {
         let delta = i64::from(count);
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
 
+        // De-`BEGIN IMMEDIATE` the reservation (cycle-4 lever (e)). The reservation
+        // is a SINGLE read-modify-write statement that touches only the table's
+        // control row:
+        //   `UPDATE cayenne_table SET current_sequence_number =
+        //        current_sequence_number + ?2 WHERE table_id = ?1
+        //    RETURNING current_sequence_number`
+        // Previously this ran inside an explicit `begin_transaction()` whose
+        // `BEGIN IMMEDIATE` (sqlite.rs:952) grabs the per-table WAL *reserved write
+        // lock* and HOLDS it across BEGIN → UPDATE → COMMIT. On a heavy-upsert
+        // table that lock is contended by the same table's spawned Stage-B
+        // finalize and by the next batch's Stage-A folded transaction, so the
+        // reservation busy-waits for the whole alternation window (measured 74 ms
+        // as `stage_seq_reserve`).
+        //
+        // SQLite executes a bare AUTOCOMMIT `UPDATE … RETURNING` as one atomic
+        // statement: it takes the write lock, performs the read-modify-write, and
+        // RELEASES the lock the instant the statement completes — no held
+        // transaction window. Two concurrent autocommit reservations are still
+        // serialized by the single WAL writer and each observes the other's
+        // committed increment (the read-modify-write is atomic WITHIN the
+        // statement, identical isolation to wrapping it in `BEGIN IMMEDIATE`).
+        // So this is PROVABLY EQUIVALENT under concurrency while removing one full
+        // reserved-lock acquire/hold cycle per staged batch. The same retry-on-
+        // `SQLITE_BUSY` loop is preserved (a single autocommit statement can still
+        // return `SQLITE_BUSY` if it cannot acquire the writer within
+        // `busy_timeout`). Turso routes `query_row` the same single-statement way.
         for attempt in 1..=max_attempts {
-            let tx = match self.metastore.begin_transaction().await {
-                Ok(tx) => tx,
-                Err(e) => {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "begin sequence reservation transaction",
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(CatalogError::InvalidOperation {
-                        message: format!(
-                            "Failed to begin transaction reserving {count} sequence numbers"
-                        ),
-                        source: Box::new(e),
-                    });
-                }
-            };
-
-            let row_values = match tx
-                .query_row_values(QueryRowParams {
-                    sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1 RETURNING current_sequence_number",
-                    params: vec![
-                        MetastoreValue::Text(table_id.to_string()),
-                        MetastoreValue::Integer(delta),
-                    ],
-                })
+            let new_high = match self
+                .metastore
+                .query_row_helper(
+                    QueryRowParams {
+                        sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?2 WHERE table_id = ?1 RETURNING current_sequence_number",
+                        params: vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Integer(delta),
+                        ],
+                    },
+                    |row| row.get_i64(0),
+                )
                 .await
             {
-                Ok(row_values) => row_values,
+                Ok(new_high) => new_high,
                 Err(e) => {
                     if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
                         sleep_before_metastore_write_retry(
                             attempt,
                             max_attempts,
@@ -1295,42 +1317,9 @@ impl MetadataCatalog for CayenneCatalog {
                     });
                 }
             };
-            let Some(new_high_value) = row_values.first() else {
-                return Err(CatalogError::InvalidOperationNoSource {
-                    message: "Failed to read reserved sequence high-water mark: query returned no columns"
-                        .to_string(),
-                });
-            };
-            let new_high =
-                i64::from_value(new_high_value).map_err(|e| CatalogError::InvalidOperation {
-                    message: "Failed to parse reserved sequence high-water mark".to_string(),
-                    source: Box::new(e),
-                })?;
 
-            match tx.commit().await {
-                Ok(()) => {
-                    // The reserved block is [new_high - delta + 1, new_high]
-                    return Ok(new_high - delta + 1);
-                }
-                Err(e) => {
-                    if retry_on_metastore_write_conflict(
-                        &e,
-                        attempt,
-                        max_attempts,
-                        "commit sequence reservation transaction",
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(CatalogError::InvalidOperation {
-                        message: format!(
-                            "Failed to commit reservation of {count} sequence numbers"
-                        ),
-                        source: Box::new(e),
-                    });
-                }
-            }
+            // The reserved block is [new_high - delta + 1, new_high].
+            return Ok(new_high - delta + 1);
         }
 
         Err(CatalogError::InvalidOperationNoSource {
@@ -2099,6 +2088,45 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn get_inlined_data_above_sequence(
+        &self,
+        table_id: &str,
+        after_sequence: i64,
+    ) -> CatalogResult<Vec<InlinedData>> {
+        // Incremental inline-cache read path: same projection/order as
+        // `get_inlined_data` but pushes the `sequence_number > ?2` predicate into
+        // SQL so an append-only cache refresh ships ONLY the freshly committed
+        // rows, never the whole corpus's `data_ipc` blobs. Exactly equivalent to
+        // `get_inlined_data` filtered to `sequence_number > after_sequence`.
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number, created_at
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1 AND sequence_number > ?2
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Integer(after_sequence),
+                    ],
+                },
+                |row| {
+                    Ok(InlinedData {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        partition_key: row.get_optional_string(2)?,
+                        data_ipc: row.get_blob(3)?,
+                        record_count: row.get_i64(4)?,
+                        sequence_number: row.get_i64(5)?,
+                        created_at: row.get_string(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
     async fn get_inlined_data_for_partition(
         &self,
         table_id: &str,
@@ -2681,6 +2709,333 @@ impl MetadataCatalog for CayenneCatalog {
         Err(CatalogError::InvalidOperationNoSource {
             message: format!(
                 "commit_on_conflict_deletions exhausted {max_attempts} retry attempts after retryable write conflicts"
+            ),
+        })
+    }
+
+    async fn commit_on_conflict_deletions_with_tombstone(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+        inline_tombstone: Option<InlinedDelete>,
+        pending_durable_flips: &[String],
+    ) -> CatalogResult<Option<String>> {
+        // Single-transaction Stage-A fold (cycle-3 metastore lever): identical
+        // statement set + order to `commit_on_conflict_deletions`, with the
+        // inline tombstone INSERT (Option D, `published = false`) appended as the
+        // last statement BEFORE commit. The two writes previously acquired the
+        // process-wide SQLite writer twice (one txn for the deletion metadata,
+        // one for the tombstone); folding them into one BEGIN..COMMIT removes a
+        // full writer round-trip per staged upsert batch on heavy-upsert tables.
+        //
+        // The retry-on-conflict control flow (`drop(tx); sleep; continue
+        // 'attempts`) is preserved verbatim from `commit_on_conflict_deletions`
+        // because a `SQLITE_BUSY`/`SQLITE_LOCKED` mid-transaction requires
+        // re-opening a fresh transaction — it cannot be factored out without
+        // losing the re-`begin_transaction` semantics.
+
+        // SQLite param limit chunking (mirrors commit_on_conflict_deletions).
+        const PARAMS_PER_ROW: usize = 4;
+        const MAX_PARAMS: usize = 32_000;
+        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
+
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
+
+        // Fast path: nothing to commit AND no tombstone AND no deferred flips —
+        // identical short-circuit to `commit_on_conflict_deletions`. A batch with
+        // ONLY deferred flips (b1★ drain riding an otherwise-empty staged commit)
+        // still falls through so the flip UPDATEs run.
+        if delete_files.is_empty()
+            && insert_pk_bytes_list.is_empty()
+            && snapshot_sequence.is_none()
+            && inline_tombstone.is_none()
+            && pending_durable_flips.is_empty()
+        {
+            return Ok(None);
+        }
+
+        // Generate the tombstone id up front (outside the retry loop) so a retry
+        // re-INSERTs the SAME id rather than minting a new one each attempt —
+        // the whole transaction rolls back on conflict, so only the committed
+        // attempt's id ever lands, and the caller gets a stable id to flip.
+        let tombstone_with_id = inline_tombstone.map(|mut tombstone| {
+            if tombstone.inlined_id.is_empty() {
+                tombstone.inlined_id = uuid::Uuid::now_v7().to_string();
+            }
+            tombstone
+        });
+        let inlined_id = tombstone_with_id
+            .as_ref()
+            .map(|tombstone| tombstone.inlined_id.clone());
+
+        // Same up-front validation as `commit_on_conflict_deletions`.
+        for delete_file in &delete_files {
+            if delete_file.table_id != table_id {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Delete-file table_id '{}' does not match commit table_id '{table_id}'",
+                        delete_file.table_id
+                    ),
+                });
+            }
+            if !insert_pk_bytes_list.is_empty() && insert_sequence <= delete_file.sequence_number {
+                return Err(CatalogError::InvalidOperationNoSource {
+                    message: format!(
+                        "Insert sequence {insert_sequence} must be greater than delete-file sequence {} for on-conflict replacement rows",
+                        delete_file.sequence_number
+                    ),
+                });
+            }
+        }
+
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
+
+        'attempts: for attempt in 1..=max_attempts {
+            let tx = match self.metastore.begin_transaction().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "begin on-conflict deletion (with tombstone) transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to begin on-conflict deletion (with tombstone) transaction"
+                            .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
+
+            for chunk in delete_files.chunks(MAX_DELETE_FILE_ROWS_PER_CHUNK) {
+                let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                if let Err(e) = res {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert delete file chunk inside on-conflict (with tombstone) transaction",
+                        )
+                        .await;
+                        continue 'attempts;
+                    }
+
+                    for delete_file in chunk {
+                        let (sql, params) = Self::build_insert_delete_files_chunk_sql(
+                            std::slice::from_ref(delete_file),
+                        );
+                        let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
+                        if let Err(e) = res {
+                            if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                                drop(tx);
+                                sleep_before_metastore_write_retry(
+                                    attempt,
+                                    max_attempts,
+                                    "insert delete file inside on-conflict (with tombstone) transaction",
+                                )
+                                .await;
+                                continue 'attempts;
+                            }
+                            let validation_result =
+                                Self::validate_existing_delete_file_if_present_in_transaction(
+                                    tx.as_ref(),
+                                    delete_file,
+                                )
+                                .await;
+                            drop(tx);
+                            if let Err(validation_error) = validation_result {
+                                return Err(CatalogError::InvalidOperation {
+                                    message:
+                                        "Delete-file metadata conflicts with an existing row inside on-conflict (with tombstone) transaction"
+                                            .to_string(),
+                                    source: Box::new(validation_error),
+                                });
+                            }
+                            return Err(CatalogError::InvalidOperation {
+                                message:
+                                    "Failed to insert delete file inside on-conflict (with tombstone) transaction"
+                                        .to_string(),
+                                source: Box::new(e),
+                            });
+                        }
+                    }
+                }
+            }
+
+            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
+                let (sql, params) =
+                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
+                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        drop(tx);
+                        sleep_before_metastore_write_retry(
+                            attempt,
+                            max_attempts,
+                            "insert insert-record chunk inside on-conflict (with tombstone) transaction",
+                        )
+                        .await;
+                        continue 'attempts;
+                    }
+                    drop(tx);
+                    return Err(CatalogError::InvalidOperation {
+                        message:
+                            "Failed to insert insert-record chunk inside on-conflict (with tombstone) transaction"
+                                .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+
+            if let Some(snapshot_sequence) = &snapshot_sequence
+                && let Err(e) = tx
+                    .execute(ExecuteParams {
+                        sql: "INSERT OR REPLACE INTO cayenne_snapshot_sequence (table_id, snapshot_id, sequence_number) VALUES (?1, ?2, ?3)",
+                        params: vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Text(snapshot_sequence.snapshot_id.clone()),
+                            MetastoreValue::Integer(snapshot_sequence.sequence_number),
+                        ],
+                    })
+                    .await
+            {
+                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                    drop(tx);
+                    sleep_before_metastore_write_retry(
+                        attempt,
+                        max_attempts,
+                        "insert snapshot sequence inside on-conflict (with tombstone) transaction",
+                    )
+                    .await;
+                    continue 'attempts;
+                }
+                drop(tx);
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to insert snapshot sequence inside on-conflict (with tombstone) transaction"
+                        .to_string(),
+                    source: Box::new(e),
+                });
+            }
+
+            // Append the inline tombstone INSERT as the LAST statement before
+            // commit — same SQL/params as `add_inlined_delete`, with the id
+            // pre-generated above so retries are idempotent. Preserves the
+            // pre-fold ordering (the tombstone was written immediately after
+            // `commit_on_conflict_deletions` returned) while making the two
+            // writes one atomic, single-writer-acquisition transaction.
+            if let Some(tombstone) = &tombstone_with_id
+                && let Err(e) = tx
+                    .execute(ExecuteParams {
+                        sql: r"
+                        INSERT INTO cayenne_inlined_delete
+                            (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        ",
+                        params: vec![
+                            MetastoreValue::Text(tombstone.inlined_id.clone()),
+                            MetastoreValue::Text(tombstone.table_id.clone()),
+                            MetastoreValue::Blob(tombstone.delete_ipc.clone()),
+                            MetastoreValue::Integer(tombstone.delete_count),
+                            MetastoreValue::Integer(tombstone.sequence_number),
+                            MetastoreValue::Integer(i64::from(tombstone.published)),
+                        ],
+                    })
+                    .await
+            {
+                if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                    drop(tx);
+                    sleep_before_metastore_write_retry(
+                        attempt,
+                        max_attempts,
+                        "insert inline tombstone inside on-conflict (with tombstone) transaction",
+                    )
+                    .await;
+                    continue 'attempts;
+                }
+                drop(tx);
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to insert inline tombstone inside on-conflict (with tombstone) transaction"
+                        .to_string(),
+                    source: Box::new(e),
+                });
+            }
+
+            // b1★: apply any DEFERRED durable `published = 1` flips from previously-
+            // finalized tombstones as the LAST statements before commit, so they
+            // ride THIS batch's single `BEGIN IMMEDIATE` acquisition (no extra
+            // writer round-trip). Each is an idempotent single-row UPDATE — a
+            // no-op if the row was already flipped or cleared by a checkpoint.
+            let mut flip_retry = false;
+            for inlined_id in pending_durable_flips {
+                let res = tx
+                    .execute(ExecuteParams {
+                        sql: "UPDATE cayenne_inlined_delete SET published = 1 \
+                              WHERE table_id = ?1 AND inlined_id = ?2",
+                        params: vec![
+                            MetastoreValue::Text(table_id.to_string()),
+                            MetastoreValue::Text(inlined_id.clone()),
+                        ],
+                    })
+                    .await;
+                if let Err(e) = res {
+                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
+                        flip_retry = true;
+                        break;
+                    }
+                    drop(tx);
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to apply deferred tombstone flip inside on-conflict (with tombstone) transaction"
+                            .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+            if flip_retry {
+                drop(tx);
+                sleep_before_metastore_write_retry(
+                    attempt,
+                    max_attempts,
+                    "apply deferred tombstone flip inside on-conflict (with tombstone) transaction",
+                )
+                .await;
+                continue 'attempts;
+            }
+
+            match tx.commit().await {
+                Ok(()) => return Ok(inlined_id),
+                Err(e) => {
+                    if retry_on_metastore_write_conflict(
+                        &e,
+                        attempt,
+                        max_attempts,
+                        "commit on-conflict deletion (with tombstone) transaction",
+                    )
+                    .await
+                    {
+                        continue 'attempts;
+                    }
+                    return Err(CatalogError::InvalidOperation {
+                        message: "Failed to commit on-conflict deletion (with tombstone) transaction"
+                            .to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            }
+        }
+
+        Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "commit_on_conflict_deletions_with_tombstone exhausted {max_attempts} retry attempts after retryable write conflicts"
             ),
         })
     }
@@ -3951,6 +4306,214 @@ mod tests {
             .await
             .expect("Failed to get delete files after replay");
         assert_eq!(stored.len(), 5);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_with_tombstone_folds_one_txn() {
+        // The cycle-3 Stage-A fold: delete files + insert records + the
+        // protected-snapshot sequence + the Option-D inline tombstone must all be
+        // committed by a single call, and the tombstone must land
+        // `published = false` (inert) with the returned id.
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_with_tombstone_fold_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_with_tombstone_fold".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some("/tmp/source_fold.parquet".to_string()),
+            path: "/tmp/on_conflict_with_tombstone_fold.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 4,
+            file_size_bytes: 256,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        let tombstone = InlinedDelete {
+            inlined_id: String::new(),
+            table_id: table_id.clone(),
+            delete_ipc: vec![7_u8, 8, 9],
+            delete_count: 2,
+            sequence_number: 1,
+            created_at: String::new(),
+            published: false,
+        };
+
+        let returned_id = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![delete_file],
+                &table_id,
+                vec![vec![0_u8]],
+                2,
+                Some(SnapshotSequenceCommit {
+                    snapshot_id: snapshot_id.clone(),
+                    sequence_number: 3,
+                }),
+                Some(tombstone),
+                &[],
+            )
+            .await
+            .expect("folded on-conflict commit should succeed")
+            .expect("a tombstone was supplied, so an inlined_id must be returned");
+
+        // Deletion metadata landed.
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("get delete files");
+        assert_eq!(stored.len(), 1, "delete file should be committed by the fold");
+
+        // Protected-snapshot sequence landed in the SAME call.
+        let seq = catalog
+            .get_snapshot_sequence(&table_id, &snapshot_id)
+            .await
+            .expect("get snapshot sequence");
+        assert_eq!(
+            seq,
+            Some(3),
+            "snapshot sequence should be committed by the fold"
+        );
+
+        // The tombstone landed `published = false` (inert): visible to the
+        // unfiltered read, hidden from the published-only hot read path.
+        let all = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("get inlined deletes");
+        assert_eq!(all.len(), 1, "the tombstone must be persisted by the fold");
+        assert_eq!(all[0].inlined_id, returned_id, "returned id must match row");
+        assert!(
+            !all[0].published,
+            "the staged tombstone must be inert (published = false)"
+        );
+        let published = catalog
+            .get_published_inlined_deletes(&table_id)
+            .await
+            .expect("get published inlined deletes");
+        assert!(
+            published.is_empty(),
+            "an unpublished tombstone must not appear on the published-only read path"
+        );
+
+        // The returned id is exactly the row a Stage-B flip would target.
+        catalog
+            .mark_inlined_delete_published(&table_id, &returned_id)
+            .await
+            .expect("flip should target the returned id");
+        let published = catalog
+            .get_published_inlined_deletes(&table_id)
+            .await
+            .expect("get published inlined deletes after flip");
+        assert_eq!(
+            published.len(),
+            1,
+            "after the flip the tombstone becomes visible on the published path"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_with_tombstone_none_returns_none() {
+        // With no tombstone, the fold behaves exactly like
+        // `commit_on_conflict_deletions` and returns `Ok(None)`.
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_with_tombstone_none_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_options = CreateTableOptions {
+            table_name: "test_table_with_tombstone_none".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id = catalog
+            .create_table(table_options)
+            .await
+            .expect("Failed to create table");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: table_id.clone(),
+            source_data_file_path: Some("/tmp/source_none.parquet".to_string()),
+            path: "/tmp/on_conflict_with_tombstone_none.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 1,
+            file_size_bytes: 128,
+            deletion_type: DeletionType::default(),
+            sequence_number: 1,
+        };
+
+        let returned = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![delete_file],
+                &table_id,
+                vec![vec![0_u8]],
+                2,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect("folded commit without a tombstone should succeed");
+        assert!(
+            returned.is_none(),
+            "no tombstone supplied => no inlined_id returned"
+        );
+        let stored = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("get delete files");
+        assert_eq!(stored.len(), 1, "delete file should still be committed");
+        let all = catalog
+            .get_inlined_deletes(&table_id)
+            .await
+            .expect("get inlined deletes");
+        assert!(all.is_empty(), "no tombstone should have been written");
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

@@ -586,6 +586,86 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
         .add(1, dimensions);
 }
 
+static CAYENNE_INLINE_CACHE_DELTA_POPULATES: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_INLINE_CACHE_FULL_REBUILDS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts how the inline-memtable read cache was materialized on a miss: one
+/// increment to the delta counter when the incremental fast path was taken
+/// (the rows committed since the last view were fetched + decoded AND/OR a
+/// published tombstone's removal was applied to the reused base entries —
+/// cycle-5 TASK 1), or to the full-rebuild counter when the whole
+/// `cayenne_inlined_data` corpus had to be re-read and re-decoded (sentinel/first
+/// touch, or a structural change — inline rewrite, checkpoint, overwrite,
+/// recovery, or the over-cap tombstone-delta release). Under sustained CDC the
+/// delta counter should dominate even on heavy-upsert tables: a published
+/// tombstone is now a delta (removal-only), so it no longer forces a full
+/// rebuild on every upsert batch. A high full-rebuild rate now means inline
+/// rewrites (inline-vs-inline conflicts), frequent checkpoints, or the
+/// tombstone-delta queue repeatedly hitting its cap. `dimensions` should carry
+/// `table`.
+pub fn track_cayenne_inline_cache_populate(delta: bool, dimensions: &[KeyValue]) {
+    if delta {
+        CAYENNE_INLINE_CACHE_DELTA_POPULATES
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_inline_cache_delta_populates_total")
+                    .with_description(
+                        "Inline-memtable cache misses satisfied by the append-only delta path (only newly committed rows fetched + decoded), avoiding the O(corpus) re-read.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    } else {
+        CAYENNE_INLINE_CACHE_FULL_REBUILDS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_inline_cache_full_rebuilds_total")
+                    .with_description(
+                        "Inline-memtable cache misses that required a full corpus re-read + re-decode (sentinel/first touch or a structural change: rewrite, tombstone, checkpoint, overwrite, recovery).",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+}
+
+static CAYENNE_LIST_FILES_CACHE_DELTA_APPLIES: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_LIST_FILES_CACHE_EVICTIONS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts how a current-snapshot publish updated DataFusion's list-files cache:
+/// a delta-apply (the moved files were merged onto the cached directory listing,
+/// avoiding a full re-LIST) or an eviction (the whole directory entry was
+/// dropped, forcing the next scan to re-LIST — the fallback for compaction,
+/// retention, a cold cache, or a standalone publish). Under sustained append CDC
+/// the delta-apply counter should dominate; a high eviction rate means most
+/// publishes lack recorded additions or the listing keeps getting evicted out
+/// from under the writer. `dimensions` should carry `table`.
+pub fn track_cayenne_list_files_cache_publish(delta: bool, dimensions: &[KeyValue]) {
+    if delta {
+        CAYENNE_LIST_FILES_CACHE_DELTA_APPLIES
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_list_files_cache_delta_applies_total")
+                    .with_description(
+                        "Current-snapshot publishes that merged the moved files onto the cached directory listing (avoiding a full re-LIST).",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    } else {
+        CAYENNE_LIST_FILES_CACHE_EVICTIONS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_list_files_cache_evictions_total")
+                    .with_description(
+                        "Current-snapshot publishes that evicted the whole directory listing (forcing the next scan to re-LIST): compaction, retention, cold cache, or standalone publish.",
+                    )
+                    .build()
+            })
+            .add(1, dimensions);
+    }
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 

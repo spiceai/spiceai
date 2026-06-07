@@ -1369,14 +1369,23 @@ impl DataFusion {
         // (this runtime's threads) and memory (the carved pool).
         cayenne::set_compaction_runtime_handle(tokio_handle);
         // Install the process-global encode-concurrency budget: cap the aggregate
-        // number of concurrent Vortex encode shards across ALL Cayenne tables at
-        // the host core count. Per-table `cayenne_write_concurrency` is sized in
-        // isolation — its unset default is conservative, but it can be raised per
-        // table — so without this a fleet of tables receiving CDC at once would
-        // sum their per-table shard counts and oversubscribe the machine. CPU-bound encode past the core count buys no
-        // throughput, only contention — so the core count is the natural ceiling.
-        let encode_budget =
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // number of concurrent Vortex encode shards across ALL Cayenne tables.
+        // Per-table `cayenne_write_concurrency` is sized in isolation — its unset
+        // default is conservative, but it can be raised per table — so without
+        // this a fleet of tables receiving CDC at once would sum their per-table
+        // shard counts and oversubscribe the machine. CPU-bound encode past the
+        // core count buys no throughput, only contention.
+        //
+        // The ceiling is the core count MINUS a query reserve (a quarter of the
+        // cores, at least 2, never reducing the budget below 1): encode shards
+        // run on the same runtime as OLAP query threads, and an HTAP burst that
+        // takes every core measurably starves concurrent scans (the validated
+        // #11170 mechanism — lowering write fan-out yielded 3-11x OLAP latency
+        // wins from CPU-contention relief alone). Compaction is unaffected: it
+        // has its own dedicated runtime and memory carve-out.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let query_reserve = (cores / 4).max(2);
+        let encode_budget = cores.saturating_sub(query_reserve).max(1);
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,

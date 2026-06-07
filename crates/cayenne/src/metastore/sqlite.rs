@@ -87,6 +87,18 @@ pub struct SqliteMetastoreConfig {
     /// `busy_timeout` in milliseconds.
     pub busy_timeout_ms: u64,
     /// `wal_autocheckpoint` threshold in pages.
+    ///
+    /// cycle-5 TASK 2b: raised from the SQLite default (10_000 pages ≈ 40 MB) so
+    /// the inline auto-checkpoint — which fires a PASSIVE checkpoint (and its
+    /// main-DB fsync) on whichever COMMIT/UPDATE trips the threshold — almost
+    /// never lands inside the WAL-write-locked Stage-A/Stage-B window on a
+    /// heavy-upsert table. The WAL is instead drained off the hot path by the
+    /// background maintenance tick (`MetadataCatalog::checkpoint_wal`, a
+    /// non-blocking PASSIVE checkpoint every debounce). This raised value stays a
+    /// bounded backstop: if the background tick ever stalls, the inline
+    /// checkpoint still caps the WAL here. Combined with the compacted
+    /// `delete_ipc` payload (TASK 2a) the WAL grows far slower, so even the
+    /// backstop rarely fires.
     pub wal_autocheckpoint_pages: u32,
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
     /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
@@ -99,7 +111,9 @@ impl Default for SqliteMetastoreConfig {
             cache_size_mb: 256,
             mmap_size_bytes: 1_073_741_824, // 1 GiB
             busy_timeout_ms: 30_000,
-            wal_autocheckpoint_pages: 10_000,
+            // cycle-5 TASK 2b: ~400 MB backstop (see field doc). The background
+            // maintenance-tick PASSIVE checkpoint is the primary WAL drain.
+            wal_autocheckpoint_pages: 100_000,
             auto_vacuum: SqliteAutoVacuum::None,
         }
     }
@@ -1007,6 +1021,43 @@ impl MetastoreBackend for SqliteMetastore {
             // the background connections when the metastore is dropped.
         }
 
+        Ok(())
+    }
+
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        // cycle-5 TASK 2b: PASSIVE WAL checkpoint on the first pool connection
+        // (one checkpoint covers the shared WAL; concurrent checkpoints would
+        // conflict). PASSIVE never blocks writers and never waits for readers —
+        // it copies as many committed frames into the main DB as it safely can
+        // and returns. A busy WAL just leaves frames for the next tick. This is
+        // the background drain that lets `wal_autocheckpoint` be raised so a
+        // passive checkpoint no longer fires inline on a hot CDC commit.
+        let Some(pool) = self.pool.get() else {
+            return Ok(());
+        };
+        let Some(conn) = pool.conns.first() else {
+            return Ok(());
+        };
+        let guard = conn.lock().await;
+        guard
+            .call(|conn| {
+                let journal_mode: String =
+                    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                if journal_mode.eq_ignore_ascii_case("wal") {
+                    // wal_checkpoint returns (busy, log, checkpointed).
+                    let _: (i32, i32, i32) =
+                        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to checkpoint catalog WAL: {e}"),
+                },
+            )?;
         Ok(())
     }
 }

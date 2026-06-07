@@ -45,14 +45,32 @@ limitations under the License.
 //! 1. Build a `BooleanArray` keep-mask by probing the deletion index per row, with a
 //!    bloom-filter prefilter that early-rejects keys that are definitely not deleted.
 //! 2. Apply the mask in one shot via [`arrow::compute::filter_record_batch`].
+//!
+//! # Pushdown transparency
+//!
+//! Both filter execs forward parent predicates to the child Vortex scan via
+//! `gather_filters_for_pushdown`, so the query's predicate prunes pages/files
+//! *below* the deletion mask even when key-deletes are pending. This is sound
+//! because a deletion filter only **removes** rows (never changes column values,
+//! never adds rows): any predicate true of the filter's output is sound to
+//! evaluate on the child, and `[min,max]` zone-map pruning of that predicate
+//! stays valid post-delete (the true post-delete range is a subset of the stored
+//! bounds). The deletion mask is applied positionally on the surviving rows and
+//! is never folded into pruning. Projections and limits are deliberately not
+//! pushed through (the execs need their PK columns, and being row-reducing a
+//! child limit could under-produce). See the OLAP-under-load audit, finding R1,
+//! and the SOTA scan (ClickHouse PREWHERE / Iceberg-V3 deletion-vector layering).
 
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use arrow_row::RowConverter;
+use datafusion::config::ConfigOptions;
 use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -211,6 +229,20 @@ pub(crate) fn is_pk_visible_row_key(
 /// - Its `insert_sequence < delete_sequence` for that key
 ///
 /// This allows upsert semantics without full table compaction.
+///
+/// # Pushdown Transparency Contract
+///
+/// This exec is **filter-pushdown-transparent**: it forwards parent predicates
+/// through to the child Vortex scan (`gather_filters_for_pushdown`) so zone-map
+/// / page pruning runs *below* the deletion mask even while key-deletes are
+/// pending. This is sound because the exec only **removes** rows — it never
+/// changes a surviving row's column values and never adds rows — so any
+/// predicate true of its output is sound to evaluate on the child, and a
+/// granule the child prunes by `[min,max]` could only have contained
+/// non-matching rows (deleted or not). The deletion mask composes positionally
+/// and is never folded into pruning. Projections and limits are **not** pushed
+/// through: the exec needs its PK columns, and because it can reduce row count a
+/// child limit could under-produce. See audit finding R1.
 pub struct KeyBasedDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
     /// Fused tombstone index of PK bytes -> (delete, insert) sequence numbers.
@@ -316,6 +348,39 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
             Arc::clone(&self.row_converter),
             self.min_delete_seq_to_apply,
         )))
+    }
+
+    /// Forward parent filters to the child scan (filter-pushdown transparency).
+    ///
+    /// This exec only *removes* rows (deleted PKs); it never changes a surviving
+    /// row's column values and never adds rows. Therefore any predicate that is
+    /// true of this exec's output is sound to evaluate on the child *below* it:
+    /// a granule/file the child prunes (because its `[min,max]` cannot match the
+    /// predicate) could only have held non-matching rows, deleted or not. So
+    /// pushing the query predicate through to the Vortex scan restores
+    /// zone-map / page pruning while the positional deletion mask is still
+    /// applied here, on top, against the (already-pruned) surviving rows.
+    ///
+    /// Without this override the default bars all parent filters, stranding the
+    /// query predicate above the scan whenever key-deletes are pending — every
+    /// prunable scan degrades to a full-column decode under CDC load (see
+    /// audit finding R1). Mirrors `CayenneAccelerationExec::gather_filters_for_pushdown`.
+    ///
+    /// Filters are not folded into the deletion mask (the mask composes
+    /// positionally, never as a min/max constraint), so pruning stays correct.
+    /// `from_children` routes each parent filter to the child by column analysis;
+    /// the child's output schema and this exec's `pk_column_indices` are
+    /// unchanged by late-materialization pushdown. Limits are intentionally NOT
+    /// forwarded (this exec can reduce row count, so a child limit could
+    /// under-produce); the default `handle_child_pushdown_result` (`if_all`)
+    /// marks a parent filter supported only if the child fully absorbed it.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> datafusion_common::Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
     }
 
     fn execute(
@@ -506,6 +571,12 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 /// Optimised for the common case of tables with a single-column Int64 primary key.
 /// Avoids `RowConverter` overhead and probes a [`DeletionIndex`] (bloom filter +
 /// `HashMap<i64, i64>`) directly with native i64 comparisons.
+///
+/// Like [`KeyBasedDeletionFilterExec`], this exec is **filter-pushdown-transparent**
+/// (forwards parent predicates to the child Vortex scan so zone-map pruning runs
+/// below the deletion mask). Sound because deletes only remove rows; see that
+/// type's "Pushdown Transparency Contract" and audit finding R1. Projections and
+/// limits are not pushed through.
 pub struct Int64PkDeletionFilterExec {
     input: Arc<dyn ExecutionPlan>,
     /// Bloom-prefiltered fused index of PK -> (delete, insert) sequence numbers.
@@ -609,6 +680,25 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
             self.pk_column_index,
             self.min_delete_seq_to_apply,
         )))
+    }
+
+    /// Forward parent filters to the child scan (filter-pushdown transparency).
+    ///
+    /// Same contract as [`KeyBasedDeletionFilterExec::gather_filters_for_pushdown`]:
+    /// this exec only removes rows (deleted Int64 PKs) and never changes a
+    /// surviving row's values, so the query predicate is sound to evaluate on
+    /// the child below it and `[min,max]` zone-map pruning of that predicate
+    /// stays valid. Forwarding it restores Vortex page/file pruning while the
+    /// per-row deletion probe is still applied here on the survivors. Limits are
+    /// not forwarded (row-reducing exec); `if_all` keeps a parent filter
+    /// "supported" only when the child fully absorbed it.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> datafusion_common::Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
     }
 
     fn execute(
@@ -962,6 +1052,71 @@ mod tests {
         };
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 0);
+
+        Ok(())
+    }
+
+    /// Regression for the R1 pushdown-barrier fix: `gather_filters_for_pushdown`
+    /// on `Int64PkDeletionFilterExec` must forward a parent predicate to the
+    /// child scan (marked `PushedDown::Yes`) rather than bar it. The default
+    /// `ExecutionPlan` impl returns `all_unsupported`, which would strand the
+    /// query predicate above the scan and disable zone-map pruning while
+    /// key-deletes are pending. Soundness: a deletion filter only removes rows,
+    /// so any predicate true of its output is sound to evaluate on the child
+    /// below it.
+    #[test]
+    fn int64_deletion_filter_forwards_parent_filter_to_child()
+    -> datafusion_common::Result<()> {
+        use arrow::array::Int64Array;
+        use arrow_schema::{Field, Schema};
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_plan::expressions::col;
+        use datafusion_physical_plan::filter_pushdown::PushedDown;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )?;
+        let child: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+
+        // PK column "id" is at index 0; one deletion present.
+        let tombstones = Arc::new(DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)])));
+        let exec = Int64PkDeletionFilterExec::new(
+            child,
+            tombstones,
+            InsertRecordHandling::Apply,
+            0,
+            None,
+        );
+
+        // A predicate on a child column ("val") must be reported pushable.
+        let parent_filter: Arc<dyn PhysicalExpr> = col("val", &schema)?;
+        let description = exec.gather_filters_for_pushdown(
+            FilterPushdownPhase::Pre,
+            vec![Arc::clone(&parent_filter)],
+            &ConfigOptions::default(),
+        )?;
+
+        let per_child = description.parent_filters();
+        assert_eq!(per_child.len(), 1, "exec has exactly one child");
+        assert_eq!(
+            per_child[0].len(),
+            1,
+            "the single parent filter is tracked for the child"
+        );
+        assert!(
+            matches!(per_child[0][0].discriminant, PushedDown::Yes),
+            "deletion filter must forward the parent predicate to the child scan (pushdown transparency), got {:?}",
+            per_child[0][0].discriminant
+        );
 
         Ok(())
     }

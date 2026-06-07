@@ -190,10 +190,15 @@ enum InlineMutationOutcome {
     },
     Fallback {
         stream: SendableRecordBatchStream,
-        /// Lower bound on the delta's byte size: the bytes buffered before the
-        /// inline buffer overflowed. Threaded into the snapshot write as its
-        /// size estimate so small (but non-inlinable) deltas stay a single file.
-        buffered_bytes: u64,
+        /// Size estimate for the staged write: the bytes buffered before
+        /// falling back (exact when the stream ended inside the caps; a lower
+        /// bound when it overflowed). The lower bound is used AS the size on
+        /// purpose: it floors overflowing CDC bursts to a single encode shard.
+        /// Fanning such bursts out to full write-concurrency was measured as a
+        /// strict regression (file flood → slower encode, fatter publish,
+        /// 2-4x OLAP read-amp; 2026-06-06 run) — see the comment at the
+        /// construction site.
+        estimated_bytes: Option<u64>,
     },
 }
 
@@ -351,10 +356,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
             InlineMutationOutcome::Fallback {
                 stream,
-                buffered_bytes,
+                estimated_bytes,
             } => {
                 prepared_stream = stream;
-                let estimated_bytes = Some(buffered_bytes);
                 // Stage into a ProtectedSnapshot whenever the batch may carry
                 // on-conflict deletions OR the table already holds pending PK
                 // deletions. The latter case may produce no new delete payload
@@ -541,10 +545,11 @@ impl<'a> AppendMutationWriter<'a> {
             self.table.has_retention_delete_filters(),
         ]);
 
-        // Lower-bound size estimate for the staged write. Populated from the
-        // inline buffer when we attempt to inline; left `None` when inlining is
-        // skipped (partition/retention tables) so the write keeps the prior
-        // full-fan-out behavior.
+        // Size estimate for the staged write. Populated from the inline buffer
+        // when we attempt to inline AND the buffer captured the whole delta
+        // (exact size — small deltas stay a single file); `None` when inlining
+        // is skipped (partition/retention tables) or the buffer overflowed
+        // (unsized remainder), so the write takes the full-fan-out path.
         let mut estimated_bytes: Option<u64> = None;
 
         if inline_policy.can_inline() {
@@ -562,10 +567,10 @@ impl<'a> AppendMutationWriter<'a> {
                 }
                 InlineMutationOutcome::Fallback {
                     stream,
-                    buffered_bytes,
+                    estimated_bytes: fallback_estimate,
                 } => {
                     prepared_stream = stream;
-                    estimated_bytes = Some(buffered_bytes);
+                    estimated_bytes = fallback_estimate;
                 }
             }
         }
@@ -808,15 +813,24 @@ impl<'a> AppendMutationWriter<'a> {
             restore_post_validation(post_validation, state);
         }
 
-        // Bytes seen while buffering — a lower bound on the delta size (the
-        // chained remainder of `prepared_stream` may add more). Used to size the
-        // write shard count: small deltas stay a single file. Captured before
-        // `into_chained_stream` consumes the buffer.
-        let buffered_bytes = buffer.total_bytes() as u64;
+        // Size the staged write with the buffered byte count — DELIBERATELY,
+        // even though on overflow it is only a lower bound on the delta size.
+        // Treating an overflowed (unsized) burst as unknown and fanning out to
+        // full write-concurrency was tried and MEASURED AS A REGRESSION
+        // (2026-06-06, SF-100 @10K txn/s): 8 shards x every hot burst produced
+        // ~10K vortex files/table in one run, per-file fixed costs made encode
+        // 2.5x SLOWER per batch, publish grew with the per-file metastore rows,
+        // and scan read-amp regressed every OLAP query 2-4x. Hot CDC bursts
+        // must stay a single file (the SOTA shape: parallelize ACROSS flushes,
+        // never within small ones); large EXACT-sized writes (inline
+        // checkpoints) still fan out via the encode-shard unit in
+        // `snapshot_shard_count`. Captured before `into_chained_stream`
+        // consumes the buffer.
+        let estimated_bytes = Some(buffer.total_bytes() as u64);
         let re_stream = buffer.into_chained_stream(prepared_stream, self.task_context)?;
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
-            buffered_bytes,
+            estimated_bytes,
         })
     }
 

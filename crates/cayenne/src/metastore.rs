@@ -553,6 +553,21 @@ pub trait MetastoreBackend: Send + Sync {
     ///
     /// Returns an error if cleanup fails.
     async fn shutdown(&self) -> CatalogResult<()>;
+
+    /// Run a NON-BLOCKING WAL checkpoint off the hot path (cycle-5 TASK 2b).
+    ///
+    /// Drains the WAL into the main DB without blocking writers or waiting for
+    /// readers, so it can run on the background maintenance tick instead of an
+    /// inline `wal_autocheckpoint` firing on a hot CDC commit. Default
+    /// implementation does nothing (backends without a WAL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint statement fails. A busy WAL is NOT an
+    /// error (the checkpoint simply does partial work).
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
