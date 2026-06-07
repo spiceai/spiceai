@@ -217,9 +217,24 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
+    // Calculate analytical throughput — QPH (queries per hour).
+    let completed_queries: usize = metrics.metrics.iter().map(|q| q.iterations).sum();
+    #[expect(clippy::cast_precision_loss)]
+    let elapsed_secs = metrics.finished_at.saturating_sub(metrics.started_at) as f64 / 1000.0;
+    #[expect(clippy::cast_precision_loss)]
+    let qph = if elapsed_secs > 0.0 {
+        completed_queries as f64 / elapsed_secs * 3600.0
+    } else {
+        0.0
+    };
+    crate::metrics::QPH.record(qph, &[]);
+
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
+    println!(
+        "  QPH (analytical queries/hour): {qph:.1} ({completed_queries} queries in {elapsed_secs:.1}s)"
+    );
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
