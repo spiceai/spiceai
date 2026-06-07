@@ -313,9 +313,18 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
             // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
             if row_count_message.is_none() {
+                let query_overrides = test_args
+                    .query_overrides
+                    .clone()
+                    .map(test_framework::queries::QueryOverrides::from);
                 let analytical_result = {
                     let spice_client = spiced_instance.spice_client(None, true).await?;
-                    correctness::verify_analytical_results(Arc::clone(&driver), &spice_client).await
+                    correctness::verify_analytical_results(
+                        Arc::clone(&driver),
+                        &spice_client,
+                        query_overrides,
+                    )
+                    .await
                 };
 
                 match analytical_result {

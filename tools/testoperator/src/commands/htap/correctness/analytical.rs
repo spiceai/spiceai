@@ -31,8 +31,8 @@ use arrow_tools::record_batch::try_cast_to;
 use chbench_driver::ChBenchDriver;
 use futures::TryStreamExt;
 use test_framework::anyhow;
-use test_framework::queries::get_chbench_test_queries;
 use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
+use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
 
 /// Outcome for a single analytical query.
 #[derive(Debug)]
@@ -129,8 +129,9 @@ impl AnalyticalReport {
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
     spice_client: &spiceai::Client,
+    query_overrides: Option<QueryOverrides>,
 ) -> anyhow::Result<AnalyticalReport> {
-    let queries = get_chbench_test_queries(None);
+    let queries = get_chbench_test_queries(query_overrides);
     println!(
         "\nRunning analytical-query gate over {} queries",
         queries.len()
