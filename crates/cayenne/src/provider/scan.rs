@@ -747,6 +747,31 @@ mod tests {
         assert!(exec.scan_identity().is_none());
     }
 
+    /// Frozen/clean partition: a scan with no deletion filter (the wrapper is
+    /// applied directly over the file scan) must surface the inner plan's
+    /// `Exact` per-partition statistics unchanged — this is the join-side
+    /// selection / pruning signal that the deletion-filter path deliberately
+    /// relaxes to `Inexact` only when deletions are present.
+    #[test]
+    fn cayenne_exec_passes_through_exact_partition_statistics() {
+        use datafusion_common::stats::Precision;
+
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics should be available");
+        assert_eq!(
+            stats.num_rows,
+            Precision::Exact(3),
+            "clean scan must keep the inner plan's exact row count"
+        );
+        // Aggregate over all partitions must likewise stay exact.
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics should be available");
+        assert_eq!(agg.num_rows, Precision::Exact(3));
+    }
+
     #[test]
     fn scan_identity_returns_none_when_inner_wraps_unknown_multi_child_plan() {
         // A plan with multiple children (e.g. a join) cannot have a single

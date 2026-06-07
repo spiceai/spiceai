@@ -184,6 +184,29 @@ pub(crate) fn is_pk_visible_row_key(
     }
 }
 
+/// Demote child scan statistics to `Inexact` because a deletion filter removes
+/// (and, under `InsertRecordHandling::Apply`, may also re-add) an unknown subset
+/// of input rows.
+///
+/// The child here is a Cayenne Vortex scan whose per-partition statistics — row
+/// counts and column min/max — are derived exactly from file-level metadata
+/// Cayenne already holds (no extra metastore reads on the query path). Returning
+/// those values marked `Inexact` is strictly more useful for join-side
+/// selection, range pruning, and limit pushdown than the `ExecutionPlan` default
+/// (`Statistics::new_unknown`), while never asserting a wrong *exact* row count:
+///
+/// - **Row / null counts** become upper bounds — correct as `Inexact`.
+/// - **Column min/max** stay valid: deleting rows can only shrink a column's
+///   value range, never widen it, so the bounds remain conservative for pruning.
+/// - **Absent** statistics (e.g. the scan ran with `collect_stat = false`, so no
+///   file metadata was materialized) stay `Absent` through `to_inexact()` — i.e.
+///   the unknown-input case degrades to unknown output, not a fabricated value.
+fn deletion_filtered_statistics(
+    input_statistics: datafusion_common::Statistics,
+) -> datafusion_common::Statistics {
+    input_statistics.to_inexact()
+}
+
 // ============================================================================
 // Key-based deletion filter (for tables WITH primary key)
 // ============================================================================
@@ -293,6 +316,15 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
 
     fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<datafusion_common::Statistics> {
+        Ok(deletion_filtered_statistics(
+            self.input.partition_statistics(partition)?,
+        ))
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -587,6 +619,15 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 
     fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
+    }
+
+    fn partition_statistics(
+        &self,
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<datafusion_common::Statistics> {
+        Ok(deletion_filtered_statistics(
+            self.input.partition_statistics(partition)?,
+        ))
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -964,5 +1005,123 @@ mod tests {
         assert_eq!(batch.num_columns(), 0);
 
         Ok(())
+    }
+
+    use arrow::array::Int64Array;
+    use arrow_schema::{Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion_common::{ColumnStatistics, ScalarValue, Statistics, stats::Precision};
+
+    /// A 3-row, single-Int64-column scan whose per-partition statistics are
+    /// `Exact` (row count + column min/max) — the shape Cayenne's Vortex scan
+    /// produces for a frozen/clean partition from file metadata.
+    fn exact_int64_scan() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("test batch should be valid");
+        MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("memory exec should be created")
+    }
+
+    fn int64_tombstones() -> Arc<DeletionIndex> {
+        Arc::new(DeletionIndex::from_map(HashMap::from([(2_i64, 10_i64)])))
+    }
+
+    fn key_tombstones() -> Arc<KeyDeletionIndex> {
+        Arc::new(KeyDeletionIndex::from_map(HashMap::from([(
+            Box::<[u8]>::from(2_i64.to_be_bytes().as_slice()),
+            10_i64,
+        )])))
+    }
+
+    /// Frozen/clean partition: the base Cayenne scan is wrapped only when
+    /// deletions exist, so a clean scan keeps its `Exact` per-partition stats.
+    /// This asserts the precondition the deletion-filter downgrade relaxes from.
+    #[test]
+    fn clean_scan_reports_exact_partition_statistics() {
+        let scan = exact_int64_scan();
+        let stats = scan
+            .partition_statistics(Some(0))
+            .expect("partition statistics");
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+    }
+
+    /// Deletion vectors present (Int64 PK): row count must downgrade to
+    /// `Inexact` (an upper bound) while preserving the informative value, so
+    /// join-side selection / pruning still has a number to work with instead of
+    /// the `Unknown` the `ExecutionPlan` default would return.
+    #[test]
+    fn int64_deletion_filter_downgrades_partition_statistics_to_inexact() {
+        let exec = Int64PkDeletionFilterExec::new(
+            exact_int64_scan(),
+            int64_tombstones(),
+            InsertRecordHandling::Ignore,
+            0,
+            None,
+        );
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics");
+        assert_eq!(stats.num_rows, Precision::Inexact(3));
+        // Aggregate (partition = None) must also be inexact, not unknown.
+        let agg = exec.partition_statistics(None).expect("aggregate statistics");
+        assert_eq!(agg.num_rows, Precision::Inexact(3));
+    }
+
+    /// Same downgrade for the byte-keyed (composite/non-integer PK) filter.
+    #[test]
+    fn key_based_deletion_filter_downgrades_partition_statistics_to_inexact() {
+        let exec = KeyBasedDeletionFilterExec::new(
+            exact_int64_scan(),
+            key_tombstones(),
+            InsertRecordHandling::Apply,
+            vec![0],
+            Arc::new(RowConverter::new(vec![arrow_row::SortField::new(DataType::Int64)]).unwrap()),
+            None,
+        );
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics");
+        assert_eq!(stats.num_rows, Precision::Inexact(3));
+    }
+
+    /// Column min/max bounds survive the downgrade (still useful for range
+    /// pruning) — deleting rows can only shrink a range, so the bounds stay
+    /// conservative; only their precision relaxes to `Inexact`.
+    #[test]
+    fn deletion_filter_preserves_inexact_column_bounds() {
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Exact(24),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(3))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(1))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let out = deletion_filtered_statistics(input_stats);
+        let col = &out.column_statistics[0];
+        assert_eq!(col.min_value, Precision::Inexact(ScalarValue::Int64(Some(1))));
+        assert_eq!(col.max_value, Precision::Inexact(ScalarValue::Int64(Some(3))));
+        assert_eq!(col.null_count, Precision::Inexact(0));
+    }
+
+    /// Metadata absent (e.g. the scan ran with `collect_stat = false`): the
+    /// child reports `Unknown`, and the deletion-filter downgrade must keep it
+    /// `Unknown` (`Absent` stays `Absent` through `to_inexact`) rather than
+    /// fabricating a value.
+    #[test]
+    fn deletion_filter_keeps_unknown_when_metadata_absent() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let unknown = Statistics::new_unknown(&schema);
+        let out = deletion_filtered_statistics(unknown);
+        assert_eq!(out.num_rows, Precision::Absent);
+        assert_eq!(out.total_byte_size, Precision::Absent);
     }
 }
