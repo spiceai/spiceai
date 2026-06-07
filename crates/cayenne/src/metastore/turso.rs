@@ -260,13 +260,18 @@ impl TursoMetastore {
     /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     ///
-    /// Keyed directly on `(table_id, pk_bytes)` as a `WITHOUT ROWID`
-    /// composite primary key. The only access paths are `WHERE table_id = ?`
-    /// (leading-prefix scan) and the `INSERT OR REPLACE` upsert on
-    /// `(table_id, pk_bytes)`; both are served by the composite PK. The
-    /// previous never-read `insert_record_id` UUID `TEXT PRIMARY KEY` (plus a
-    /// redundant `UNIQUE(table_id, pk_bytes)`) is dropped (see `init_schema`
-    /// for the legacy-schema migration).
+    /// Keyed directly on `(table_id, pk_bytes)` as a composite primary key. The
+    /// only access paths are `WHERE table_id = ?` (leading-prefix scan) and the
+    /// `INSERT OR REPLACE` upsert on `(table_id, pk_bytes)`; both are served by
+    /// the composite PK. The previous never-read `insert_record_id` UUID
+    /// `TEXT PRIMARY KEY` (plus a redundant `UNIQUE(table_id, pk_bytes)`) is
+    /// dropped (see `init_schema` for the legacy-schema migration).
+    ///
+    /// Unlike the SQLite backend, this table is NOT declared `WITHOUT ROWID`.
+    /// `WITHOUT ROWID` is not currently supported by Turso under the `mvcc`
+    /// journal mode that the metastore relies on for `BEGIN CONCURRENT`
+    /// parallel writers (Turso rejects it with "WITHOUT ROWID tables are not
+    /// supported in MVCC mode").
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
             table_id TEXT NOT NULL,
@@ -274,7 +279,7 @@ impl TursoMetastore {
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, pk_bytes)
-        ) WITHOUT ROWID
+        )
     ";
 
     /// Schema for the `cayenne_snapshot_sequence` table.
@@ -573,11 +578,11 @@ impl MetastoreBackend for TursoMetastore {
         }
 
         // Migrate a legacy `cayenne_insert_record` (UUID `insert_record_id` TEXT
-        // PRIMARY KEY + redundant `UNIQUE(table_id, pk_bytes)`) to the `WITHOUT
-        // ROWID` composite-PK schema. The `CREATE TABLE IF NOT EXISTS` above
-        // leaves a pre-existing table untouched, so detect the old layout here and
-        // copy its rows forward. The table is ephemeral (cleared at every
-        // checkpoint and recoverable from the snapshot), but we copy the
+        // PRIMARY KEY + redundant `UNIQUE(table_id, pk_bytes)`) to the composite-PK
+        // schema. The `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing
+        // table untouched, so detect the old layout here and copy its rows
+        // forward. The table is ephemeral (cleared at every checkpoint and
+        // recoverable from the snapshot), but we copy the
         // (table_id, pk_bytes, sequence_number) rows forward to preserve any
         // in-flight pre-checkpoint re-insert sequences across the upgrade.
         let mut ir_cols = conn
@@ -609,6 +614,10 @@ impl MetastoreBackend for TursoMetastore {
         }
         drop(ir_cols);
         if has_legacy_uuid_column {
+            // NOTE: not `WITHOUT ROWID` here, intentionally. Turso does not
+            // currently support `WITHOUT ROWID` tables under the `mvcc` journal
+            // mode this metastore uses for `BEGIN CONCURRENT` (see
+            // `INSERT_RECORD_TABLE_DDL`).
             conn.execute_batch(
                 "CREATE TABLE cayenne_insert_record_new (
                     table_id TEXT NOT NULL,
@@ -616,7 +625,7 @@ impl MetastoreBackend for TursoMetastore {
                     sequence_number BIGINT NOT NULL,
                     FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
                     PRIMARY KEY (table_id, pk_bytes)
-                ) WITHOUT ROWID;
+                );
                 INSERT OR REPLACE INTO cayenne_insert_record_new (table_id, pk_bytes, sequence_number)
                     SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record;
                 DROP TABLE cayenne_insert_record;
@@ -624,7 +633,7 @@ impl MetastoreBackend for TursoMetastore {
             )
             .await
             .map_err(|e| CatalogError::Database {
-                message: format!("Failed to migrate cayenne_insert_record to WITHOUT ROWID: {e}"),
+                message: format!("Failed to migrate cayenne_insert_record to composite PK: {e}"),
             })?;
         }
 

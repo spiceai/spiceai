@@ -96,8 +96,10 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_insert_record",
-        // WITHOUT ROWID composite-PK table keyed on (table_id, pk_bytes); the
-        // former `insert_record_id` UUID column was never read and is dropped.
+        // Composite-PK table keyed on (table_id, pk_bytes); the former
+        // `insert_record_id` UUID column was never read and is dropped. SQLite
+        // declares it `WITHOUT ROWID`; Turso uses a plain rowid table because it
+        // does not support `WITHOUT ROWID` under its `mvcc` journal mode.
         columns: &["table_id", "pk_bytes", "sequence_number"],
     },
     ExpectedTable {
