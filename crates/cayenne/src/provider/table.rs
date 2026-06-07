@@ -18232,6 +18232,17 @@ mod tests {
             "precondition: one old row is disk-backed and one is metastore-inline"
         );
 
+        // Arm the RAM tier: the runtime installs the slot advancer on the first
+        // replayable committer; a direct provider test must arm it explicitly, or
+        // the engagement gate (`is_cdc_memory_mode() && has_slot_advancer()`) keeps
+        // the durable path and the mem-tier tombstone logic under test never runs.
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+
         let write = provider
             .write_cdc_append_stream(
                 single_batch_stream(id_value_batch(
