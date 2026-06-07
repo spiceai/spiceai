@@ -597,7 +597,8 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
 pub struct CayenneAutotuneState {
     /// Measured CDC ingest rate, rows/sec (EWMA).
     pub rows_per_sec: f64,
-    /// Measured CDC ingest rate, bytes/sec (EWMA).
+    /// Measured CDC ingest rate, bytes/sec (EWMA); `< 0` ⇒ unavailable (the
+    /// gauge is then suppressed rather than emitting a misleading 0).
     pub bytes_per_sec: f64,
     /// Apply latency / offered-load interval; `> 1` ⇒ ingest falling behind.
     pub apply_vs_arrival: f64,
@@ -633,15 +634,19 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.rows_per_sec, dimensions);
-    CAYENNE_AT_BYTES_PER_SEC
-        .get_or_init(|| {
-            cayenne_operational_meter()
-                .f64_gauge("cayenne_ingest_bytes_per_sec")
-                .with_description("Measured CDC ingest rate (bytes/sec, EWMA).")
-                .with_unit("By")
-                .build()
-        })
-        .record(state.bytes_per_sec, dimensions);
+    // Suppress the bytes/sec gauge when byte accounting is unavailable
+    // (`bytes_per_sec < 0`) rather than reporting a misleading 0 under load.
+    if state.bytes_per_sec >= 0.0 {
+        CAYENNE_AT_BYTES_PER_SEC
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_bytes_per_sec")
+                    .with_description("Measured CDC ingest rate (bytes/sec, EWMA).")
+                    .with_unit("By")
+                    .build()
+            })
+            .record(state.bytes_per_sec, dimensions);
+    }
     CAYENNE_AT_APPLY_VS_ARRIVAL
         .get_or_init(|| {
             cayenne_operational_meter()

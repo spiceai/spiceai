@@ -294,7 +294,14 @@ impl IngestStats {
         };
         IngestSnapshot {
             rows_per_sec: inner.rows_per_sec,
-            bytes_per_sec: inner.bytes_per_sec,
+            // Report bytes/sec only when real byte accounting has been recorded;
+            // otherwise -1.0 (unknown) so the gauge is suppressed rather than
+            // reporting a misleading 0 under load.
+            bytes_per_sec: if self.total_bytes.load(Ordering::Relaxed) > 0 {
+                inner.bytes_per_sec
+            } else {
+                -1.0
+            },
             apply_ms: inner.apply_ms,
             publish_ms: inner.publish_ms,
             encode_ms: inner.encode_ms,
@@ -311,6 +318,8 @@ impl IngestStats {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct IngestSnapshot {
     pub rows_per_sec: f64,
+    /// Bytes/sec (EWMA). `-1.0` when byte accounting is unavailable for the write
+    /// path (the gauge is then suppressed rather than reporting a misleading 0).
     pub bytes_per_sec: f64,
     pub apply_ms: f64,
     pub publish_ms: f64,
@@ -344,6 +353,14 @@ pub(crate) struct LiveKnobs {
     compaction_trigger_files: AtomicUsize,
     /// 0 means "unset" (use the session/default write concurrency).
     write_concurrency: AtomicUsize,
+    /// Static bytes-per-row / bytes-per-segment ratios from the initial
+    /// (schema-aware) config. Preserved so that when `apply` changes the byte
+    /// budget it keeps the row/segment caps the static tier derived — instead of
+    /// snapping the row cap back to the ~1 KiB/row fallback, which would make a
+    /// narrow-row table (inferred at e.g. ~256 B/row) flush by rows far too early
+    /// and increase small-file churn. Immutable, so plain ints (not atomics).
+    bytes_per_row: i64,
+    bytes_per_segment: i64,
 }
 
 impl LiveKnobs {
@@ -358,6 +375,10 @@ impl LiveKnobs {
             ),
             compaction_trigger_files: AtomicUsize::new(init.compaction_trigger_files),
             write_concurrency: AtomicUsize::new(init.write_concurrency),
+            bytes_per_row: (init.inline_flush_max_bytes / init.inline_flush_max_rows.max(1)).max(1),
+            bytes_per_segment: (init.inline_flush_max_bytes
+                / init.inline_flush_max_segments.max(1))
+            .max(1),
         }
     }
 
@@ -402,11 +423,12 @@ impl LiveKnobs {
             Knob::InlineFlushBytes => {
                 let bytes = i64::try_from(adj.new_value).unwrap_or(i64::MAX);
                 self.inline_flush_max_bytes.store(bytes, Ordering::Relaxed);
-                // Keep rows/segments coherent with the byte budget (same ratios
-                // the static derivation uses: ~1 KiB/row, ~128 KiB/segment).
-                let rows = i64::try_from((adj.new_value / 1024).max(64)).unwrap_or(i64::MAX);
-                let segs =
-                    i64::try_from((adj.new_value / (128 * 1024)).clamp(16, 256)).unwrap_or(256);
+                // Recompute rows/segments preserving the STATIC (schema-aware)
+                // bytes-per-row and bytes-per-segment ratios, so growing the byte
+                // budget doesn't reset the row cap to the ~1 KiB/row fallback and
+                // prematurely flush a narrow-row table by rows.
+                let rows = (bytes / self.bytes_per_row).max(64);
+                let segs = (bytes / self.bytes_per_segment).clamp(16, 256);
                 self.inline_flush_max_rows.store(rows, Ordering::Relaxed);
                 self.inline_flush_max_segments
                     .store(segs, Ordering::Relaxed);
@@ -1111,5 +1133,29 @@ mod tests {
             v.inline_flush_max_segments,
             (64 * 1024 * 1024 / (128 * 1024)).clamp(16, 256)
         );
+    }
+
+    #[test]
+    fn apply_preserves_schema_aware_row_width_ratio() {
+        // A narrow-row table (static tier inferred ~256 B/row): growing the byte
+        // budget must keep flushing by that width, not snap the row cap back to
+        // the ~1 KiB/row fallback (which would flush ~4× too early → small files).
+        let narrow = KnobValues {
+            inline_flush_max_bytes: 8 * 1024 * 1024,
+            inline_flush_max_rows: 8 * 1024 * 1024 / 256, // 256 B/row
+            inline_flush_max_segments: 64,
+            ..knobs()
+        };
+        let live = LiveKnobs::new(narrow);
+        live.apply(&Adjustment {
+            knob: Knob::InlineFlushBytes,
+            new_value: 16 * 1024 * 1024,
+            reason: "t",
+        });
+        let v = live.values();
+        assert_eq!(v.inline_flush_max_bytes, 16 * 1024 * 1024);
+        // Rows track the inferred 256 B/row ratio (65536), NOT the 1 KiB fallback.
+        assert_eq!(v.inline_flush_max_rows, 16 * 1024 * 1024 / 256);
+        assert_ne!(v.inline_flush_max_rows, 16 * 1024 * 1024 / 1024);
     }
 }
