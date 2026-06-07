@@ -498,16 +498,20 @@ impl DeletionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CdcDurability {
-    /// Per-batch durable metastore/Vortex persist before the slot ack. Explicit
-    /// opt-out from the in-memory default for strict per-batch durability.
+    /// Per-batch durable metastore/Vortex persist before the slot ack. The DEFAULT:
+    /// the proven path that holds CDC replication lag at zero across all tables
+    /// under sustained load.
+    #[default]
     File,
     /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
-    /// Default: engages only for the changes/small-write refresh profile AND a
-    /// replayable source committer (the runtime arms it lazily on the first batch
-    /// whose committer reports `supports_deferral()`); every other profile/source
-    /// falls back to `File`, so the default never defers where a crash would lose
-    /// un-replayable data.
-    #[default]
+    /// OPT-IN (experimental). Engages only for the changes/small-write refresh
+    /// profile AND a replayable source committer (the runtime arms it lazily on the
+    /// first batch whose committer reports `supports_deferral()`); every other
+    /// profile/source falls back to `File`. KNOWN LIMITATION: without a periodic
+    /// background checkpoint the deferred slot ack lets replication lag grow
+    /// unbounded under sustained ingest (the RAM tier never checkpoints mid-run) —
+    /// prefer `File` until that follow-up lands. Correctness is unaffected (the
+    /// source re-streams on restart; convergence verified).
     Memory,
 }
 
