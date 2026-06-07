@@ -760,11 +760,7 @@ mod tests {
         let item_field = arrow::datatypes::Field::new("item", DataType::Utf8, true);
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
-            arrow::datatypes::Field::new(
-                "tags",
-                DataType::List(Arc::new(item_field)),
-                true,
-            ),
+            arrow::datatypes::Field::new("tags", DataType::List(Arc::new(item_field)), true),
         ]));
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
         let external_table = CreateExternalTable {
@@ -801,9 +797,8 @@ mod tests {
         let tags = list_builder.finish();
         let ids = Int64Array::from(vec![1, 2]);
 
-        let data =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(tags)])
-                .expect("data should be created");
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(tags)])
+            .expect("data should be created");
 
         let exec = MockExec::new(vec![Ok(data)], schema);
 
