@@ -27,10 +27,10 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 
-#[path = "vs_duckdb_helpers/common.rs"]
-mod common;
 #[path = "vs_chdb_helpers/chdb_common.rs"]
 mod chdb_common;
+#[path = "vs_duckdb_helpers/common.rs"]
+mod common;
 
 use std::hint::black_box;
 use std::path::Path;
@@ -81,9 +81,7 @@ fn load_chdb(fact_parquet: &Path, dim_parquet: &Path) -> ChdbFixture {
     fixture
         .session
         .execute(
-            &format!(
-                "INSERT INTO join_dim_bench SELECT * FROM file('{dim_display}', 'Parquet')"
-            ),
+            &format!("INSERT INTO join_dim_bench SELECT * FROM file('{dim_display}', 'Parquet')"),
             None,
         )
         .expect("chdb insert dim parquet");

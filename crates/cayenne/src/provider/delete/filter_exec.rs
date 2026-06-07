@@ -483,6 +483,32 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         }
                     };
 
+                    // [b3 sub-lever 2] Batch-level bloom sweep. The composite
+                    // index is hash-keyed (no value range), but the bloom is a
+                    // batch-level filter: a tight first pass counts rows whose
+                    // key MIGHT be deleted. If none are even bloom candidates,
+                    // then `get(key) == None` for every row (the bloom has no
+                    // false negatives — module contract), so
+                    // `is_pk_visible_row_key` would return true for all rows.
+                    // Returning the batch unfiltered is what the full per-row
+                    // visibility walk would produce, and skips the map walk +
+                    // mask build + filter kernel entirely on bloom-sparse
+                    // batches. A bloom false positive only forces a row into the
+                    // normal walk below (which then keeps it), so `maybe`
+                    // over-counts at worst — never under-counts. Honors the
+                    // seq-cutoff / insert records trivially (only fires when
+                    // there is nothing to apply in the batch).
+                    let mut maybe = 0usize;
+                    for row in &rows {
+                        if self.tombstones.might_contain(row.as_ref()) {
+                            maybe += 1;
+                        }
+                    }
+                    if maybe == 0 {
+                        self.metrics.baseline.record_output(batch_size);
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
                     // Use `BooleanBufferBuilder` so the mask lives as a packed bitmap
                     // (1 bit per row instead of 1 byte) and skips the `Vec<bool>` →
@@ -798,6 +824,30 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     // `Vec<bool>` to save 8× the per-batch heap footprint and skip the
                     // `BooleanArray` re-pack pass.
                     let pk_slice = pk_array.values();
+
+                    // [b3 sub-lever 2] Per-batch range fast path. The batch's
+                    // EXACT [bmin,bmax] is computed from the actual PK values
+                    // (not statistics, so no Inexact concern); if it is disjoint
+                    // from the deleted-key range, no row's PK can be a tombstone,
+                    // so `is_pk_visible_i64` would return true for every row.
+                    // Returning the batch unfiltered is exactly what the per-row
+                    // probe loop would produce — an observational identity — and
+                    // skips both the probe and the keep-mask/filter-kernel work.
+                    // Honors `min_delete_seq_to_apply`/insert records trivially
+                    // because it only fires when there is nothing to apply.
+                    if let Some((del_lo, del_hi)) = self.tombstones.deleted_key_range() {
+                        let mut bmin = i64::MAX;
+                        let mut bmax = i64::MIN;
+                        for &v in pk_slice {
+                            bmin = bmin.min(v);
+                            bmax = bmax.max(v);
+                        }
+                        if bmax < del_lo || bmin > del_hi {
+                            self.metrics.baseline.record_output(batch_size);
+                            return std::task::Poll::Ready(Some(Ok(batch)));
+                        }
+                    }
+
                     let mut keep_mask = BooleanBufferBuilder::new(batch_size);
                     let mut keep_count: usize = 0;
                     for &pk_value in pk_slice {
@@ -1118,6 +1168,232 @@ mod tests {
             per_child[0][0].discriminant
         );
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // [b3 sub-lever 2] Per-batch fast-path tests (stream-level).
+    //
+    // Each drives the filter STREAM directly over a single batch and collects
+    // the surviving PK values. The invariant under test: the per-batch
+    // disjoint/bloom-miss early-out is an observational identity — it produces
+    // exactly the rows the per-row probe loop would, and it never leaks a
+    // deleted row when the batch is NOT disjoint / the bloom hits.
+    // ========================================================================
+
+    use arrow::array::Int64Array;
+
+    /// Build a single-column Int64 batch and run it through an
+    /// `Int64PkDeletionFilterStream`; return the surviving PK values in order.
+    async fn run_int64_filter(
+        pks: Vec<i64>,
+        index: DeletionIndex,
+        handling: InsertRecordHandling,
+        min_delete_seq_to_apply: Option<i64>,
+    ) -> Vec<i64> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(pks)) as ArrayRef],
+        )
+        .expect("batch");
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let mut stream = Int64PkDeletionFilterStream {
+            input,
+            tombstones: Arc::new(index),
+            insert_record_handling: handling,
+            pk_column_index: 0,
+            min_delete_seq_to_apply,
+            schema,
+            metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+        };
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("ok batch");
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64");
+            out.extend(col.values().iter().copied());
+        }
+        out
+    }
+
+    /// Build a single-column Int64 batch (key bytes = be_bytes) and run it
+    /// through a `KeyBasedDeletionFilterStream`; return the surviving PK values.
+    async fn run_keybased_filter(
+        pks: Vec<i64>,
+        index: KeyDeletionIndex,
+        handling: InsertRecordHandling,
+    ) -> datafusion_common::Result<Vec<i64>> {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(pks)) as ArrayRef],
+        )
+        .expect("batch");
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let row_converter = Arc::new(RowConverter::new(vec![SortField::new(DataType::Int64)])?);
+        let mut stream = KeyBasedDeletionFilterStream {
+            input,
+            tombstones: Arc::new(index),
+            insert_record_handling: handling,
+            pk_column_indices: vec![0],
+            row_converter,
+            min_delete_seq_to_apply: None,
+            schema,
+            metrics: DeletionFilterMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+        };
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64");
+            out.extend(col.values().iter().copied());
+        }
+        Ok(out)
+    }
+
+    /// A KeyDeletionIndex keyed by the be_bytes of the given i64 PKs.
+    fn keyindex_from_i64(deleted: &[(i64, i64)]) -> KeyDeletionIndex {
+        let map: HashMap<Box<[u8]>, i64> = deleted
+            .iter()
+            .map(|(pk, seq)| (Box::<[u8]>::from(pk.to_be_bytes().as_slice()), *seq))
+            .collect();
+        KeyDeletionIndex::from_map(map)
+    }
+
+    #[tokio::test]
+    async fn int64_batch_disjoint_range_keeps_all_without_probe() {
+        // Deletions {1,2,3}; batch PKs all far above the deleted range → the
+        // per-batch range gate keeps the whole batch. Output must equal input.
+        let index = DeletionIndex::from_map(HashMap::from([(1, 1), (2, 1), (3, 1)]));
+        let out = run_int64_filter(
+            vec![100, 101, 102],
+            index,
+            InsertRecordHandling::Apply,
+            None,
+        )
+        .await;
+        assert_eq!(out, vec![100, 101, 102], "disjoint batch must be kept whole");
+    }
+
+    #[tokio::test]
+    async fn int64_batch_overlapping_range_filters_correctly() {
+        // Deletions {2}; batch PKs [1,2,3] overlap the deleted range → the gate
+        // must NOT short-circuit; the deleted row is removed.
+        let index = DeletionIndex::from_map(HashMap::from([(2, 1)]));
+        let out =
+            run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
+        assert_eq!(out, vec![1, 3], "overlapping batch must drop the deleted pk");
+    }
+
+    /// Correctness oracle: the filtered output is byte-identical with vs without
+    /// the fast path, on both disjoint and overlapping data. We can't toggle the
+    /// fast path off, so we compare the stream output to an independent oracle
+    /// (probe each PK against the index) over both windows.
+    #[tokio::test]
+    async fn int64_batch_fast_path_matches_oracle() {
+        let index = DeletionIndex::from_map(HashMap::from([(50, 5), (200, 6), (201, 7)]));
+        for pks in [
+            vec![1000, 1001, 1002, 1003],     // disjoint above
+            vec![0, 1, 2, 3],                 // disjoint below
+            vec![49, 50, 51, 200, 201, 202],  // overlapping
+        ] {
+            let oracle: Vec<i64> = pks
+                .iter()
+                .copied()
+                .filter(|&pk| is_pk_visible_i64(pk, &index, InsertRecordHandling::Apply, None))
+                .collect();
+            let out =
+                run_int64_filter(pks.clone(), index.clone(), InsertRecordHandling::Apply, None)
+                    .await;
+            assert_eq!(out, oracle, "stream output must equal the probe oracle for {pks:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_delete_index_keeps_all_int64() {
+        // has_deletions()==false → existing guard returns the batch untouched;
+        // the new per-batch gate (after that guard) must not run. Lock it.
+        let index = DeletionIndex::empty();
+        assert!(!index.has_deletions());
+        let out =
+            run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
+        assert_eq!(out, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn keybased_batch_bloom_miss_keeps_all() -> datafusion_common::Result<()> {
+        // KeyDeletionIndex with keys disjoint from the batch's PKs → maybe==0
+        // whole-batch early-out; output equals input.
+        let index = keyindex_from_i64(&[(1, 1), (2, 1), (3, 1)]);
+        let out =
+            run_keybased_filter(vec![100, 101, 102], index, InsertRecordHandling::Apply).await?;
+        assert_eq!(out, vec![100, 101, 102], "bloom-miss batch must be kept whole");
+        Ok(())
+    }
+
+    /// The critical "keeps deleted rows out when NOT disjoint" test: a batch
+    /// containing one genuinely-deleted PK plus non-deleted PKs. The bloom hits
+    /// (maybe>0), so the fast path must fall through to the per-row walk and the
+    /// deleted row must be removed.
+    #[tokio::test]
+    async fn keybased_batch_bloom_hit_still_filters_deleted_rows() -> datafusion_common::Result<()>
+    {
+        let index = keyindex_from_i64(&[(2, 1)]); // pk=2 deleted
+        let out = run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
+        assert_eq!(
+            out,
+            vec![1, 3],
+            "bloom-hit batch must still drop the genuinely-deleted pk"
+        );
+        Ok(())
+    }
+
+    /// A re-inserted (upserted) PK is in the deleted set but visible under
+    /// `Apply` (insert_seq > delete_seq). The bloom hits, the walk keeps it.
+    /// Proves the fast path does not interfere with insert-record visibility.
+    #[tokio::test]
+    async fn keybased_batch_bloom_hit_keeps_reinserted_row() -> datafusion_common::Result<()> {
+        let mut deleted: HashMap<Box<[u8]>, i64> = HashMap::new();
+        let mut inserts: HashMap<Box<[u8]>, i64> = HashMap::new();
+        let k2 = Box::<[u8]>::from(2_i64.to_be_bytes().as_slice());
+        deleted.insert(k2.clone(), 10); // pk=2 deleted at seq 10
+        inserts.insert(k2, 11); // re-inserted at seq 11 (> delete) → visible under Apply
+        let index = KeyDeletionIndex::from_maps(deleted, inserts);
+        let out = run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
+        assert_eq!(out, vec![1, 2, 3], "re-inserted pk must survive under Apply");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_delete_index_keeps_all_keybased() -> datafusion_common::Result<()> {
+        // has_deletions()==false → existing guard returns the batch before the
+        // new bloom-sweep pre-pass; lock the interaction.
+        let index = KeyDeletionIndex::empty();
+        assert!(!index.has_deletions());
+        let out =
+            run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
+        assert_eq!(out, vec![1, 2, 3]);
         Ok(())
     }
 }

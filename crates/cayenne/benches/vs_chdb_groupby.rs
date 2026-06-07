@@ -25,10 +25,10 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 
-#[path = "vs_duckdb_helpers/common.rs"]
-mod common;
 #[path = "vs_chdb_helpers/chdb_common.rs"]
 mod chdb_common;
+#[path = "vs_duckdb_helpers/common.rs"]
+mod common;
 
 use std::hint::black_box;
 use std::sync::Arc;
