@@ -1293,7 +1293,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(out, vec![100, 101, 102], "disjoint batch must be kept whole");
+        assert_eq!(
+            out,
+            vec![100, 101, 102],
+            "disjoint batch must be kept whole"
+        );
     }
 
     #[tokio::test]
@@ -1301,9 +1305,12 @@ mod tests {
         // Deletions {2}; batch PKs [1,2,3] overlap the deleted range → the gate
         // must NOT short-circuit; the deleted row is removed.
         let index = DeletionIndex::from_map(HashMap::from([(2, 1)]));
-        let out =
-            run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
-        assert_eq!(out, vec![1, 3], "overlapping batch must drop the deleted pk");
+        let out = run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
+        assert_eq!(
+            out,
+            vec![1, 3],
+            "overlapping batch must drop the deleted pk"
+        );
     }
 
     /// Correctness oracle: the filtered output is byte-identical with vs without
@@ -1314,19 +1321,26 @@ mod tests {
     async fn int64_batch_fast_path_matches_oracle() {
         let index = DeletionIndex::from_map(HashMap::from([(50, 5), (200, 6), (201, 7)]));
         for pks in [
-            vec![1000, 1001, 1002, 1003],     // disjoint above
-            vec![0, 1, 2, 3],                 // disjoint below
-            vec![49, 50, 51, 200, 201, 202],  // overlapping
+            vec![1000, 1001, 1002, 1003],    // disjoint above
+            vec![0, 1, 2, 3],                // disjoint below
+            vec![49, 50, 51, 200, 201, 202], // overlapping
         ] {
             let oracle: Vec<i64> = pks
                 .iter()
                 .copied()
                 .filter(|&pk| is_pk_visible_i64(pk, &index, InsertRecordHandling::Apply, None))
                 .collect();
-            let out =
-                run_int64_filter(pks.clone(), index.clone(), InsertRecordHandling::Apply, None)
-                    .await;
-            assert_eq!(out, oracle, "stream output must equal the probe oracle for {pks:?}");
+            let out = run_int64_filter(
+                pks.clone(),
+                index.clone(),
+                InsertRecordHandling::Apply,
+                None,
+            )
+            .await;
+            assert_eq!(
+                out, oracle,
+                "stream output must equal the probe oracle for {pks:?}"
+            );
         }
     }
 
@@ -1336,8 +1350,7 @@ mod tests {
         // the new per-batch gate (after that guard) must not run. Lock it.
         let index = DeletionIndex::empty();
         assert!(!index.has_deletions());
-        let out =
-            run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
+        let out = run_int64_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply, None).await;
         assert_eq!(out, vec![1, 2, 3]);
     }
 
@@ -1348,7 +1361,11 @@ mod tests {
         let index = keyindex_from_i64(&[(1, 1), (2, 1), (3, 1)]);
         let out =
             run_keybased_filter(vec![100, 101, 102], index, InsertRecordHandling::Apply).await?;
-        assert_eq!(out, vec![100, 101, 102], "bloom-miss batch must be kept whole");
+        assert_eq!(
+            out,
+            vec![100, 101, 102],
+            "bloom-miss batch must be kept whole"
+        );
         Ok(())
     }
 
@@ -1381,7 +1398,11 @@ mod tests {
         inserts.insert(k2, 11); // re-inserted at seq 11 (> delete) → visible under Apply
         let index = KeyDeletionIndex::from_maps(deleted, inserts);
         let out = run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
-        assert_eq!(out, vec![1, 2, 3], "re-inserted pk must survive under Apply");
+        assert_eq!(
+            out,
+            vec![1, 2, 3],
+            "re-inserted pk must survive under Apply"
+        );
         Ok(())
     }
 
@@ -1391,8 +1412,7 @@ mod tests {
         // new bloom-sweep pre-pass; lock the interaction.
         let index = KeyDeletionIndex::empty();
         assert!(!index.has_deletions());
-        let out =
-            run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
+        let out = run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
         assert_eq!(out, vec![1, 2, 3]);
         Ok(())
     }

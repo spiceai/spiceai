@@ -19970,7 +19970,9 @@ mod tests {
         );
         let index = DeletionIndex::from_map(HashMap::from([(1, 1)]));
         assert!(!CayenneTableProvider::int64_branch_disjoint_from_deletions(
-            &plan, &[0], &index
+            &plan,
+            &[0],
+            &index
         ));
     }
 
