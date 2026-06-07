@@ -1065,8 +1065,7 @@ mod tests {
     /// so any predicate true of its output is sound to evaluate on the child
     /// below it.
     #[test]
-    fn int64_deletion_filter_forwards_parent_filter_to_child()
-    -> datafusion_common::Result<()> {
+    fn int64_deletion_filter_forwards_parent_filter_to_child() -> datafusion_common::Result<()> {
         use arrow::array::Int64Array;
         use arrow_schema::{Field, Schema};
         use datafusion::datasource::memory::MemorySourceConfig;
@@ -1089,13 +1088,8 @@ mod tests {
 
         // PK column "id" is at index 0; one deletion present.
         let tombstones = Arc::new(DeletionIndex::from_map(HashMap::from([(2_i64, 1_i64)])));
-        let exec = Int64PkDeletionFilterExec::new(
-            child,
-            tombstones,
-            InsertRecordHandling::Apply,
-            0,
-            None,
-        );
+        let exec =
+            Int64PkDeletionFilterExec::new(child, tombstones, InsertRecordHandling::Apply, 0, None);
 
         // A predicate on a child column ("val") must be reported pushable.
         let parent_filter: Arc<dyn PhysicalExpr> = col("val", &schema)?;

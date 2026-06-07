@@ -1463,11 +1463,11 @@ impl MetastoreTransaction for SqliteTransaction {
             &[telemetry::KeyValue::new("txn", "other")],
         );
 
-        rollback_result.map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+        rollback_result.map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| {
+            CatalogError::Database {
                 message: format!("Failed to rollback transaction: {e}"),
-            },
-        )?;
+            }
+        })?;
 
         Ok(())
     }
@@ -1704,9 +1704,11 @@ mod tests {
         let has_rowid = g
             .call(|conn| {
                 Ok::<bool, rusqlite::Error>(
-                    conn.query_row("SELECT rowid FROM cayenne_insert_record LIMIT 1", [], |_| {
-                        Ok(())
-                    })
+                    conn.query_row(
+                        "SELECT rowid FROM cayenne_insert_record LIMIT 1",
+                        [],
+                        |_| Ok(()),
+                    )
                     .is_ok(),
                 )
             })
@@ -1767,7 +1769,10 @@ mod tests {
             .await
             .expect("read back")
         };
-        assert_eq!(count, 1, "duplicate (table_id, pk_bytes) must collapse to one row");
+        assert_eq!(
+            count, 1,
+            "duplicate (table_id, pk_bytes) must collapse to one row"
+        );
         assert_eq!(seq, 42, "the later upsert's sequence must win");
     }
 
@@ -1810,7 +1815,10 @@ mod tests {
             )
             .await
             .expect("count after clear");
-        assert_eq!(remaining, 0, "checkpoint clear must empty the table's insert records");
+        assert_eq!(
+            remaining, 0,
+            "checkpoint clear must empty the table's insert records"
+        );
     }
 
     /// A DB created with the legacy schema (UUID `insert_record_id` TEXT PRIMARY

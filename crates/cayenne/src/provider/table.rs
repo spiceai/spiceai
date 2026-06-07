@@ -4762,7 +4762,9 @@ impl CayenneTableProvider {
             seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
             pending_durable_tombstone_flips: Arc::new(ParkingMutex::new(Vec::new())),
-            pending_tombstone_deltas: Arc::new(ParkingMutex::new(PendingTombstoneDeltas::default())),
+            pending_tombstone_deltas: Arc::new(
+                ParkingMutex::new(PendingTombstoneDeltas::default()),
+            ),
             inlined_cache: Arc::new(ArcSwap::new(Arc::new(InlinedCache {
                 // Sentinel: first `read_inlined_batches` / `cached_inlined_view` call always misses.
                 // The `u64::MAX` structural epoch can never match the live counter, so the first
@@ -7625,7 +7627,8 @@ impl CayenneTableProvider {
         // returned id (which is `Some` exactly when a tombstone row was written),
         // identical to the pre-fold `if id.is_some()` guard.
         if let (Some(_), Some(delete_count)) = (&inlined_delete_id, tombstone_delete_count) {
-            self.pending_inline_tombstones.fetch_add(1, Ordering::AcqRel);
+            self.pending_inline_tombstones
+                .fetch_add(1, Ordering::AcqRel);
             self.record_inline_tombstone_written(
                 delete_count,
                 delete_sequence.unwrap_or(snapshot_sequence),
@@ -10365,9 +10368,7 @@ impl CayenneTableProvider {
         // bump below fences off any concurrent delta cache built against the old
         // base (it carries the old epoch and is rejected on the next read), so a
         // racing delta that already snapshotted the queue cannot mis-store.
-        self.pending_tombstone_deltas
-            .lock()
-            .drain_through(u64::MAX);
+        self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
         self.bump_inlined_structural_epoch();
     }
 
@@ -10721,8 +10722,7 @@ impl CayenneTableProvider {
         };
 
         let mut files: Vec<ObjectMeta> = (*existing).clone();
-        let mut seen: HashSet<ObjectStorePath> =
-            files.iter().map(|m| m.location.clone()).collect();
+        let mut seen: HashSet<ObjectStorePath> = files.iter().map(|m| m.location.clone()).collect();
         for meta in additions {
             if seen.insert(meta.location.clone()) {
                 files.push(meta.clone());
@@ -11426,7 +11426,8 @@ impl CayenneTableProvider {
             .pending_tombstone_deltas
             .lock()
             .removal_above(base.tombstone_delta_seq);
-        let has_tombstone_delta = !removal_map.int64_pk.is_empty() || !removal_map.row_keys.is_empty();
+        let has_tombstone_delta =
+            !removal_map.int64_pk.is_empty() || !removal_map.row_keys.is_empty();
 
         // Capture the new watermark first; the new boundary stored on the cache
         // is exactly this value (the entries materialized below). Capturing
@@ -11540,8 +11541,8 @@ impl CayenneTableProvider {
         entry: InlinedData,
         inlined_deletions: &InlinedDeletionMaps,
     ) -> Result<InlinedViewEntry> {
-        let entry_batches =
-            deserialize_ipc_to_batch(&entry.data_ipc).map_err(|e| super::Error::Arrow { source: e })?;
+        let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
+            .map_err(|e| super::Error::Arrow { source: e })?;
         let mut filtered_batches = Vec::with_capacity(entry_batches.len());
         for batch in entry_batches {
             if let Some(filtered) = self.filter_inlined_batch_for_deletions(
@@ -11928,9 +11929,7 @@ impl CayenneTableProvider {
         // stay globally ordered). Runs under the same held listing fence as the
         // structural bump below, so no scan can be mid-delta against the
         // about-to-be-cleared queue.
-        self.pending_tombstone_deltas
-            .lock()
-            .drain_through(u64::MAX);
+        self.pending_tombstone_deltas.lock().drain_through(u64::MAX);
         // Invalidate the inlined-batch cache so subsequent scans see the now-empty
         // metastore immediately rather than serving the pre-checkpoint batches.
         // STRUCTURAL: the corpus was cleared (flushed to a Vortex file), so the
@@ -14369,7 +14368,10 @@ mod tests {
             .collect();
         let blob = serialize_delete_keys_to_ipc(&keys, /* is_int64_pk */ false)
             .expect("serialize compressed ipc");
-        assert_eq!(blob.first().copied(), Some(tombstone_format::COMPRESSED_IPC));
+        assert_eq!(
+            blob.first().copied(),
+            Some(tombstone_format::COMPRESSED_IPC)
+        );
         let decoded = deserialize_delete_keys_from_ipc(&blob).expect("decode compressed ipc");
         assert_eq!(decoded, keys);
     }
@@ -14418,7 +14420,10 @@ mod tests {
         assert_eq!(seq, 3, "reports the queue's current seq");
         assert_eq!(map.int64_pk.get(&3), Some(&200));
         assert_eq!(map.int64_pk.get(&4), Some(&300));
-        assert!(!map.int64_pk.contains_key(&1), "delta at/below base excluded");
+        assert!(
+            !map.int64_pk.contains_key(&1),
+            "delta at/below base excluded"
+        );
         assert!(!map.int64_pk.contains_key(&2));
 
         // Above the current seq => empty (no work).
@@ -19408,7 +19413,8 @@ mod tests {
     async fn test_inline_cache_append_only_keeps_structural_epoch_and_stays_correct() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) =
-            create_inline_enabled_upsert_table("inline_cache_append_delta", ctx.runtime_env()).await;
+            create_inline_enabled_upsert_table("inline_cache_append_delta", ctx.runtime_env())
+                .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         // First small append + a scan to warm the cache from the sentinel (a full
@@ -19425,7 +19431,11 @@ mod tests {
         // cache (generation bumped) via the DELTA path — never structurally.
         for (id, value) in [(2, 20), (3, 30), (4, 40)] {
             let gen_before = provider.inlined_generation();
-            insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[id], &[value])).await;
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[value]),
+            )
+            .await;
             assert!(
                 provider.inlined_generation() > gen_before,
                 "a pure append must bump the generation (force a cache refresh)"
@@ -19551,8 +19561,7 @@ mod tests {
 
         // Correctness: the old inline copy is hidden by the delta, the replacement
         // is visible — exactly once, no transient duplicate.
-        let pairs =
-            collect_id_value_pairs(&ctx, &provider, "inline_cache_tombstone_struct").await;
+        let pairs = collect_id_value_pairs(&ctx, &provider, "inline_cache_tombstone_struct").await;
         assert_eq!(
             pairs.iter().filter(|(id, _)| *id == 1).collect::<Vec<_>>(),
             vec![&(1, 999)],
@@ -19632,7 +19641,10 @@ mod tests {
     fn test_list_files_cache_delta_apply_merges_onto_existing() {
         let runtime_env = runtime_env_with_list_files_cache();
         let url = "file:///tmp/cayenne_list_delta/snap0/";
-        let prefix = ListingTableUrl::parse(url).expect("url parses").prefix().clone();
+        let prefix = ListingTableUrl::parse(url)
+            .expect("url parses")
+            .prefix()
+            .clone();
         let key = TableScopedPath {
             table: None,
             path: prefix.clone(),
@@ -19657,11 +19669,15 @@ mod tests {
         ];
         let applied =
             CayenneTableProvider::apply_list_files_cache_additions(&runtime_env, url, &additions);
-        assert!(applied, "delta-apply must succeed when an entry already exists");
+        assert!(
+            applied,
+            "delta-apply must succeed when an entry already exists"
+        );
 
-        let merged = cache.get(&key).expect("entry still present after delta-apply");
-        let mut locations: Vec<String> =
-            merged.iter().map(|m| m.location.to_string()).collect();
+        let merged = cache
+            .get(&key)
+            .expect("entry still present after delta-apply");
+        let mut locations: Vec<String> = merged.iter().map(|m| m.location.to_string()).collect();
         locations.sort();
         assert_eq!(
             locations,
@@ -19677,7 +19693,10 @@ mod tests {
     fn test_list_files_cache_delta_apply_cold_cache_falls_back() {
         let runtime_env = runtime_env_with_list_files_cache();
         let url = "file:///tmp/cayenne_list_cold/snap0/";
-        let prefix = ListingTableUrl::parse(url).expect("url parses").prefix().clone();
+        let prefix = ListingTableUrl::parse(url)
+            .expect("url parses")
+            .prefix()
+            .clone();
         let key = TableScopedPath {
             table: None,
             path: prefix.clone(),

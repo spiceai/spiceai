@@ -2823,8 +2823,9 @@ impl MetadataCatalog for CayenneCatalog {
                         continue 'attempts;
                     }
                     return Err(CatalogError::InvalidOperation {
-                        message: "Failed to begin on-conflict deletion (with tombstone) transaction"
-                            .to_string(),
+                        message:
+                            "Failed to begin on-conflict deletion (with tombstone) transaction"
+                                .to_string(),
                         source: Box::new(e),
                     });
                 }
@@ -3035,8 +3036,9 @@ impl MetadataCatalog for CayenneCatalog {
                         continue 'attempts;
                     }
                     return Err(CatalogError::InvalidOperation {
-                        message: "Failed to commit on-conflict deletion (with tombstone) transaction"
-                            .to_string(),
+                        message:
+                            "Failed to commit on-conflict deletion (with tombstone) transaction"
+                                .to_string(),
                         source: Box::new(e),
                     });
                 }
@@ -4411,7 +4413,11 @@ mod tests {
             .get_table_delete_files(&table_id)
             .await
             .expect("get delete files");
-        assert_eq!(stored.len(), 1, "delete file should be committed by the fold");
+        assert_eq!(
+            stored.len(),
+            1,
+            "delete file should be committed by the fold"
+        );
 
         // Protected-snapshot sequence landed in the SAME call.
         let seq = catalog

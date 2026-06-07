@@ -90,7 +90,11 @@ fn build_chunk_sql(
     with_uuid: bool,
     or_replace: bool,
 ) -> (String, Vec<MetastoreValue>) {
-    let verb = if or_replace { "INSERT OR REPLACE" } else { "INSERT" };
+    let verb = if or_replace {
+        "INSERT OR REPLACE"
+    } else {
+        "INSERT"
+    };
     let (prefix, params_per_row) = if with_uuid {
         (
             format!(
@@ -113,7 +117,14 @@ fn build_chunk_sql(
             sql.push_str(", ");
         }
         if with_uuid {
-            let _ = write!(sql, "(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3);
+            let _ = write!(
+                sql,
+                "(?{}, ?{}, ?{}, ?{})",
+                base,
+                base + 1,
+                base + 2,
+                base + 3
+            );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(TABLE_ID.to_string()));
             params.push(MetastoreValue::Blob(key.clone()));
@@ -149,7 +160,10 @@ async fn fresh(with_uuid: bool) -> (SqliteMetastore, TempDir) {
             sequence_number BIGINT NOT NULL, \
             PRIMARY KEY (table_id, pk_bytes)) WITHOUT ROWID"
     };
-    metastore.execute_batch(ddl).await.expect("create variant table");
+    metastore
+        .execute_batch(ddl)
+        .await
+        .expect("create variant table");
     (metastore, temp_dir)
 }
 

@@ -919,7 +919,9 @@ pub fn track_cayenne_cdc_burst_rows(rows: u64, dimensions: &[KeyValue]) {
         .get_or_init(|| {
             cayenne_operational_meter()
                 .u64_histogram("cayenne_cdc_burst_rows")
-                .with_description("Row count of a prepared CDC batch at the Cayenne staged/inlined write entry.")
+                .with_description(
+                    "Row count of a prepared CDC batch at the Cayenne staged/inlined write entry.",
+                )
                 .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
                 .with_unit("rows")
                 .build()

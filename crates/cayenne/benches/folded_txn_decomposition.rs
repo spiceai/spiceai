@@ -65,7 +65,9 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::Duration;
 
-use cayenne::metastore::sqlite::{SqliteMetastore, SqliteMetastoreConfig, set_sqlite_metastore_config};
+use cayenne::metastore::sqlite::{
+    SqliteMetastore, SqliteMetastoreConfig, set_sqlite_metastore_config,
+};
 use cayenne::metastore::{ExecuteParams, MetastoreBackend, MetastoreValue};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tempfile::TempDir;
@@ -192,7 +194,8 @@ fn build_insert_delete_files_chunk_sql(count: usize, seq: i64) -> (String, Vec<M
              delete_file_id, table_id, path, path_is_relative, \
              format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
          ) VALUES ";
-    const SUFFIX: &str = " ON CONFLICT(table_id, path) DO UPDATE SET path = cayenne_delete_file.path";
+    const SUFFIX: &str =
+        " ON CONFLICT(table_id, path) DO UPDATE SET path = cayenne_delete_file.path";
     let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + count * 64);
     sql.push_str(PREFIX);
     let mut params = Vec::with_capacity(count * PARAMS_PER_ROW);
@@ -413,7 +416,12 @@ fn bench_folded_vs_closure(c: &mut Criterion) {
                     let metastore = &metastore;
                     async move {
                         run_folded_per_statement(
-                            metastore, keys, tombstone_ipc, DELETE_FILES, seq + 2, seq + 3,
+                            metastore,
+                            keys,
+                            tombstone_ipc,
+                            DELETE_FILES,
+                            seq + 2,
+                            seq + 3,
                         )
                         .await;
                         clear_table(metastore).await;
@@ -437,7 +445,12 @@ fn bench_folded_vs_closure(c: &mut Criterion) {
                     let metastore = &metastore;
                     async move {
                         run_one_closure_batch(
-                            metastore, keys, tombstone_ipc, DELETE_FILES, seq + 2, seq + 3,
+                            metastore,
+                            keys,
+                            tombstone_ipc,
+                            DELETE_FILES,
+                            seq + 2,
+                            seq + 3,
                         )
                         .await;
                         clear_table(metastore).await;
