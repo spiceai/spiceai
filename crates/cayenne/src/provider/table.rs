@@ -13154,6 +13154,20 @@ impl CayenneTableProvider {
                     return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
                 }
 
+                // [b3 sub-lever 1] Orthogonal to the sequence cutoff above: if
+                // this branch's Exact Int64 PK scan window is disjoint from the
+                // deleted-key range, no scanned PK is deletable, so the filter
+                // would remove zero rows. The range is a superset of the
+                // applicable-by-sequence keys, so a disjoint verdict is sound
+                // even under the protected `min_delete_seq_to_apply` cutoff.
+                if Self::int64_branch_disjoint_from_deletions(
+                    &plan,
+                    pk_indices_in_projection,
+                    tombstones,
+                ) {
+                    return Ok(Arc::new(CayenneAccelerationExec::new(plan)));
+                }
+
                 let pk_column_index =
                     pk_indices_in_projection.first().copied().ok_or_else(|| {
                         datafusion_common::DataFusionError::Internal(
@@ -13208,7 +13222,16 @@ impl CayenneTableProvider {
             PkDeletionSnapshot::Int64Pk { tombstones } => {
                 // Protected snapshots already handle new data without filtering,
                 // so insert records are ignored here.
-                if tombstones.has_deletions() {
+                if tombstones.has_deletions()
+                    // [b3 sub-lever 1] Skip the filter when this branch's Exact
+                    // Int64 PK window is disjoint from the deleted-key range
+                    // (zero rows would be removed); fall through to `Ok(plan)`.
+                    && !Self::int64_branch_disjoint_from_deletions(
+                        &plan,
+                        pk_indices_in_projection,
+                        tombstones,
+                    )
+                {
                     let pk_column_index =
                         pk_indices_in_projection.first().copied().ok_or_else(|| {
                             datafusion_common::DataFusionError::Internal(
@@ -13260,7 +13283,20 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         match deletion_snapshot {
             PkDeletionSnapshot::Int64Pk { tombstones } => {
-                if tombstones.has_deletions() {
+                // [b3 sub-lever 1] Skip the filter when this branch's Exact
+                // Int64 PK window is disjoint from the deleted-key range. The
+                // gate is keyed on the deleted-key range, which already includes
+                // every re-inserted PK (a re-insert carries a delete_sequence),
+                // so an upserted PK in range keeps the filter and its visibility
+                // is resolved by the unchanged `tombstone_visible` probe; the
+                // skip only decides whether the probe runs, never how it decides.
+                if tombstones.has_deletions()
+                    && !Self::int64_branch_disjoint_from_deletions(
+                        &plan,
+                        pk_indices_in_projection,
+                        tombstones,
+                    )
+                {
                     tracing::debug!(
                         "Applying Int64 PK deletion filter ({} deleted keys, {} insert records) to scan of table {}",
                         tombstones.delete_len(),
