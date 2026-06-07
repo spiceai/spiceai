@@ -217,9 +217,26 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
     crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
 
+    // Calculate analytical throughput — QPH (queries per hour).
+    let completed_queries: usize = metrics.metrics.iter().map(|q| q.iterations).sum();
+    let elapsed = Duration::from_millis(
+        u64::try_from(metrics.finished_at.saturating_sub(metrics.started_at)).unwrap_or(0),
+    );
+    let elapsed_secs = elapsed.as_secs_f64();
+    #[expect(clippy::cast_precision_loss)]
+    let qph = if elapsed_secs > 0.0 {
+        completed_queries as f64 / elapsed_secs * 3600.0
+    } else {
+        0.0
+    };
+    crate::metrics::QPH.record(qph, &[]);
+
     let records = metrics.with_memory_usage(max_memory).build_records()?;
     println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
+    println!(
+        "  QPH (analytical queries/hour): {qph:.1} ({completed_queries} queries in {elapsed_secs:.1}s)"
+    );
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
@@ -288,8 +305,41 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            if let Some(message) = report.failure_message() {
+            let row_count_message = report.failure_message();
+            if let Some(message) = row_count_message.clone() {
                 error_messages.push(message);
+            }
+
+            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
+            if row_count_message.is_none() {
+                let query_overrides = test_args
+                    .query_overrides
+                    .clone()
+                    .map(test_framework::queries::QueryOverrides::from);
+                let analytical_result = {
+                    let spice_client = spiced_instance.spice_client(None, true).await?;
+                    correctness::verify_analytical_results(
+                        Arc::clone(&driver),
+                        &spice_client,
+                        query_overrides,
+                    )
+                    .await
+                };
+
+                match analytical_result {
+                    Ok(analytical) => {
+                        analytical.emit();
+                        if let Some(message) = analytical.failure_message() {
+                            error_messages.push(message);
+                        }
+                    }
+                    Err(e) => {
+                        error_messages.push(format!("HTAP analytical-query error: {e}"));
+                    }
+                }
+            } else {
+                println!("\nSkipping analytical-query gate — row-count gate did not pass");
             }
         }
         Err(e) => {

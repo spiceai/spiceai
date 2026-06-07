@@ -15,7 +15,7 @@ runtime:
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
-    cdc_max_coalesced_bytes: '134217728' # 128 MB
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
     cdc_max_coalesce_age_ms: '4000'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
