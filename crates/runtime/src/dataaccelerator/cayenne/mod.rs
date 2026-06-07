@@ -276,6 +276,26 @@ fn parse_u64_with_hint(
     })
 }
 
+fn parse_u64_aliases_with_hint(
+    acceleration: &Acceleration,
+    keys: &[&str],
+    default: u64,
+    semantic_hint: &str,
+) -> u64 {
+    keys.iter()
+        .find_map(|&key| {
+            acceleration.params.get(key).map(|v| {
+                v.parse::<u64>().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                    );
+                    default
+                })
+            })
+        })
+        .unwrap_or(default)
+}
+
 fn parse_optional_usize<'a>(
     acceleration: &Acceleration,
     keys: &'a [&'a str],
@@ -806,12 +826,12 @@ impl CayenneAccelerator {
             }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
                 acceleration,
-                &["cayenne_cdc_mem_tier_max_bytes"],
+                &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
                 config.cdc_mem_tier_max_bytes,
             );
-            config.cdc_mem_tier_max_age_ms = parse_u64_with_hint(
+            config.cdc_mem_tier_max_age_ms = parse_u64_aliases_with_hint(
                 acceleration,
-                "cayenne_cdc_mem_tier_max_age_ms",
+                &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
                 config.cdc_mem_tier_max_age_ms,
                 " (milliseconds)",
             );
@@ -1344,7 +1364,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["file", "memory"])
             .default("file"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) uses a memory-aware default and relies on the process-global byte budget. Composes with the global budget — whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) disables the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
             .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
     ],
@@ -3152,6 +3172,36 @@ mod tests {
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
         );
+    }
+
+    #[tokio::test]
+    async fn test_documented_cdc_mem_tier_params_are_resolved() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: [
+                ("cdc_mem_tier_max_bytes".to_string(), "123456".to_string()),
+                ("cdc_mem_tier_max_age_ms".to_string(), "7890".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+
+        assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
+        assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
     }
 
     #[tokio::test]

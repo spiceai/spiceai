@@ -1397,10 +1397,10 @@ impl DataFusion {
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
         // isolation; without this global cap a fleet of memory-mode tables would
         // sum their per-table caps and blow the box (the no-global-cap lesson,
-        // applied to memory). Sized to one eighth of total system memory — a
-        // conservative slice that leaves ample headroom under the query memory
-        // limit; an over-budget append spills to durable Vortex (and, under
-        // sustained overload, falls back to the durable path) rather than
+        // applied to memory). Sized to one eighth of total system/container
+        // memory, independent of DataFusion's query memory pool; an
+        // over-budget append spills to durable Vortex (and, under sustained
+        // overload, falls back to the durable path) rather than
         // growing the tier, so memory mode can never OOM. File-mode tables never
         // touch this budget.
         let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 8;

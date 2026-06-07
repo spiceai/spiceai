@@ -681,15 +681,16 @@ pub struct VortexConfig {
     #[serde(default)]
     pub cdc_durability: CdcDurability,
     /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
-    /// advance, in `cdc_durability: memory` mode only. `0` uses the
-    /// memory/storage-aware default. Composes WITH the process-global byte
-    /// budget — whichever is breached first triggers the spill.
+    /// advance, in `cdc_durability: memory` mode only. `0` disables the
+    /// per-table cap; the process-global byte budget still bounds aggregate
+    /// resident memory. When both are set, whichever is breached first triggers
+    /// the spill.
     #[serde(default)]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
-    /// trip). `0` uses the default.
+    /// trip). `0` disables the age trigger.
     #[serde(default)]
     pub cdc_mem_tier_max_age_ms: u64,
 }

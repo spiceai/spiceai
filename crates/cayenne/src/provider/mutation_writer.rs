@@ -181,10 +181,10 @@ impl InlineBatchBuffer {
 
     /// In-memory Arrow bytes buffered so far. When the buffer overflows and the
     /// write falls back to a Vortex write, this is a *lower bound* on the
-    /// delta's total size (the un-buffered remainder of the stream is added on
-    /// top). It is used only to size the write shard count, where under-counting
-    /// is the safe direction: it can only keep the write on fewer (never more)
-    /// shards than the true size warrants.
+    /// delta's total size because the un-buffered remainder has not been
+    /// measured. The fallback path still passes this lower bound as
+    /// `estimated_bytes`, deliberately keeping hot CDC bursts on fewer write
+    /// shards than their true size might warrant.
     #[must_use]
     pub(crate) fn total_bytes(&self) -> usize {
         self.total_bytes
