@@ -483,6 +483,32 @@ impl futures::Stream for KeyBasedDeletionFilterStream {
                         }
                     };
 
+                    // [b3 sub-lever 2] Batch-level bloom sweep. The composite
+                    // index is hash-keyed (no value range), but the bloom is a
+                    // batch-level filter: a tight first pass counts rows whose
+                    // key MIGHT be deleted. If none are even bloom candidates,
+                    // then `get(key) == None` for every row (the bloom has no
+                    // false negatives — module contract), so
+                    // `is_pk_visible_row_key` would return true for all rows.
+                    // Returning the batch unfiltered is what the full per-row
+                    // visibility walk would produce, and skips the map walk +
+                    // mask build + filter kernel entirely on bloom-sparse
+                    // batches. A bloom false positive only forces a row into the
+                    // normal walk below (which then keeps it), so `maybe`
+                    // over-counts at worst — never under-counts. Honors the
+                    // seq-cutoff / insert records trivially (only fires when
+                    // there is nothing to apply in the batch).
+                    let mut maybe = 0usize;
+                    for row in &rows {
+                        if self.tombstones.might_contain(row.as_ref()) {
+                            maybe += 1;
+                        }
+                    }
+                    if maybe == 0 {
+                        self.metrics.baseline.record_output(batch_size);
+                        return std::task::Poll::Ready(Some(Ok(batch)));
+                    }
+
                     // Build keep mask: bloom-prefiltered probe per row + visibility check.
                     // Use `BooleanBufferBuilder` so the mask lives as a packed bitmap
                     // (1 bit per row instead of 1 byte) and skips the `Vec<bool>` →
@@ -798,6 +824,30 @@ impl futures::Stream for Int64PkDeletionFilterStream {
                     // `Vec<bool>` to save 8× the per-batch heap footprint and skip the
                     // `BooleanArray` re-pack pass.
                     let pk_slice = pk_array.values();
+
+                    // [b3 sub-lever 2] Per-batch range fast path. The batch's
+                    // EXACT [bmin,bmax] is computed from the actual PK values
+                    // (not statistics, so no Inexact concern); if it is disjoint
+                    // from the deleted-key range, no row's PK can be a tombstone,
+                    // so `is_pk_visible_i64` would return true for every row.
+                    // Returning the batch unfiltered is exactly what the per-row
+                    // probe loop would produce — an observational identity — and
+                    // skips both the probe and the keep-mask/filter-kernel work.
+                    // Honors `min_delete_seq_to_apply`/insert records trivially
+                    // because it only fires when there is nothing to apply.
+                    if let Some((del_lo, del_hi)) = self.tombstones.deleted_key_range() {
+                        let mut bmin = i64::MAX;
+                        let mut bmax = i64::MIN;
+                        for &v in pk_slice {
+                            bmin = bmin.min(v);
+                            bmax = bmax.max(v);
+                        }
+                        if bmax < del_lo || bmin > del_hi {
+                            self.metrics.baseline.record_output(batch_size);
+                            return std::task::Poll::Ready(Some(Ok(batch)));
+                        }
+                    }
+
                     let mut keep_mask = BooleanBufferBuilder::new(batch_size);
                     let mut keep_count: usize = 0;
                     for &pk_value in pk_slice {

@@ -13069,6 +13069,66 @@ impl CayenneTableProvider {
     ///
     /// This is used for protected snapshots which should skip deletions that existed
     /// when they were created, but still honor newer deletions.
+    /// Closed `[min,max]` of the projected single Int64 PK column over this
+    /// branch's scan, if known **exactly**. Returns `None` on any uncertainty
+    /// — Inexact/Absent bounds (mutable overlays, no footer stats), a
+    /// multi-column PK, or a non-Int64 PK — in which case the caller must NOT
+    /// skip the deletion filter. This is read off the already-built plan at
+    /// plan time (the file-scan config attaches per-column `Statistics` via
+    /// `FileScanConfigBuilder::with_statistics`), so it costs no extra IO.
+    ///
+    /// Used by [`b3 sub-lever 1`](Self::apply_deletion_filter) to prove a
+    /// branch's scanned PK window is disjoint from every deletion and shed the
+    /// filter for that branch. The returned bound is a sound *superset* of the
+    /// branch's actual PK values (the file `[min,max]` bounds them, and the
+    /// post-delete true range is a subset), so a disjoint verdict against the
+    /// deleted-key range is conservative. Composite / hash-keyed indexes are
+    /// handled by the per-batch bloom sweep instead (the multi-PK guard here
+    /// returns `None`, so this never fires for them).
+    fn branch_int64_pk_range(
+        plan: &Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+    ) -> Option<(i64, i64)> {
+        // Single Int64 PK only; composite PKs return None (handled per-batch).
+        let [pk_idx] = pk_indices_in_projection else {
+            return None;
+        };
+        // DF53 accessor for whole-plan (all-partition) statistics.
+        let stats = plan.partition_statistics(None).ok()?;
+        let col = stats.column_statistics.get(*pk_idx)?;
+        let (DFPrecision::Exact(lo), DFPrecision::Exact(hi)) = (&col.min_value, &col.max_value)
+        else {
+            return None;
+        };
+        match (lo, hi) {
+            (ScalarValue::Int64(Some(lo)), ScalarValue::Int64(Some(hi))) => Some((*lo, *hi)),
+            _ => None,
+        }
+    }
+
+    /// `true` iff the branch's Exact Int64 PK scan window is provably disjoint
+    /// from `tombstones`' deleted-key range — i.e. no scanned PK can equal any
+    /// deleted PK, so the deletion filter would remove zero rows and can be
+    /// skipped (b3 sub-lever 1). `false` on any uncertainty (Inexact/Absent
+    /// stats, composite PK, zero deletions, or overlapping ranges) → keep the
+    /// filter. Conservative by construction; see `branch_int64_pk_range` and
+    /// `DeletionIndex::deleted_key_range`.
+    fn int64_branch_disjoint_from_deletions(
+        plan: &Arc<dyn ExecutionPlan>,
+        pk_indices_in_projection: &[usize],
+        tombstones: &DeletionIndex,
+    ) -> bool {
+        if let (Some((del_lo, del_hi)), Some((scan_lo, scan_hi))) = (
+            tombstones.deleted_key_range(),
+            Self::branch_int64_pk_range(plan, pk_indices_in_projection),
+        ) {
+            // Closed-interval disjoint test.
+            scan_hi < del_lo || scan_lo > del_hi
+        } else {
+            false
+        }
+    }
+
     fn apply_partial_deletion_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,

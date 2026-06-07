@@ -262,6 +262,23 @@ where
     /// exact value to decide whether a protected snapshot can skip deletion
     /// filtering without letting deleted rows through.
     max_sequence_number: Option<i64>,
+    /// Smallest / largest **deleted** key in the current immutable entries, in
+    /// the key's own ordering. `None` when no key has a recorded deletion.
+    /// Maintained monotonically (build-once / extend-only) exactly like
+    /// `max_sequence_number`; a future removal API must recompute these instead
+    /// of carrying a stale bound. Only the *delete* side populates these (a key
+    /// gaining its first deletion), mirroring the bloom population and
+    /// `delete_count` — insert-only entries are never folded in.
+    ///
+    /// For the Int64 index (`K = i64`) this is a true PK value range and the
+    /// query path (`branch_int64_pk_range` / per-batch gate) uses it to prove a
+    /// scan window is disjoint from every deletion and skip the row probe. For
+    /// the hash-keyed composite index (`K = u128`) the value is a min/max over
+    /// XXH3-128 *hashes* and is meaningless for PK-range pruning, so
+    /// `KeyDeletionIndex` deliberately exposes no `deleted_key_range()` accessor
+    /// (see its impl block).
+    min_deleted_key: Option<K>,
+    max_deleted_key: Option<K>,
     /// Number of distinct keys across both tiers.
     entry_count: usize,
     /// Number of keys with a recorded deletion (= bloom population).
@@ -278,7 +295,10 @@ where
 
 impl<K, S> LayeredTombstones<K, S>
 where
-    K: Copy + Eq + Hash,
+    // `Ord` is required to maintain the `min_deleted_key`/`max_deleted_key`
+    // range. Both concrete key types (`i64`, `u128`) satisfy it, so no caller
+    // breaks; the range is only *exposed* for the ordered Int64 key.
+    K: Copy + Eq + Hash + Ord,
     S: BuildHasher + Default + Clone,
 {
     fn empty() -> Self {
@@ -287,6 +307,8 @@ where
             delta: PersistentHashMap::default(),
             bloom: Arc::new(SplitBlockBloomFilter::new(MIN_BLOOM_CAPACITY)),
             max_sequence_number: None,
+            min_deleted_key: None,
+            max_deleted_key: None,
             entry_count: 0,
             delete_count: 0,
             insert_count: 0,
@@ -305,12 +327,22 @@ where
         let bloom = SplitBlockBloomFilter::new(capacity);
         let delete_count = deleted.len();
         let mut max_sequence_number = None;
+        let mut min_deleted_key: Option<K> = None;
+        let mut max_deleted_key: Option<K> = None;
         let mut base: HashMap<K, TombstoneEntry, S> =
             HashMap::with_capacity_and_hasher(delete_count, S::default());
         for (key, delete_seq) in deleted {
             bloom.insert(bloom_hash_of(&key));
             if max_sequence_number.is_none_or(|max| delete_seq > max) {
                 max_sequence_number = Some(delete_seq);
+            }
+            // Fold the deleted key into the running [min,max]. Delete side only,
+            // matching the bloom population and `delete_count`.
+            if min_deleted_key.is_none_or(|min| key < min) {
+                min_deleted_key = Some(key);
+            }
+            if max_deleted_key.is_none_or(|max| key > max) {
+                max_deleted_key = Some(key);
             }
             base.insert(
                 key,
@@ -333,6 +365,8 @@ where
             delta: PersistentHashMap::default(),
             bloom: Arc::new(bloom),
             max_sequence_number,
+            min_deleted_key,
+            max_deleted_key,
             delete_count,
             insert_count,
             bloom_capacity: capacity,
@@ -377,6 +411,8 @@ where
     ) -> Self {
         let mut delta = self.delta.clone();
         let mut max_sequence_number = self.max_sequence_number;
+        let mut min_deleted_key = self.min_deleted_key;
+        let mut max_deleted_key = self.max_deleted_key;
         let mut entry_count = self.entry_count;
         let mut delete_count = self.delete_count;
         let mut insert_count = self.insert_count;
@@ -397,6 +433,15 @@ where
             if outcome.new_delete {
                 delete_count += 1;
                 new_delete_hashes.push(bloom_hash_of(&key));
+                // Fold the newly-deleted key into the running [min,max]. Mirrors
+                // the bloom population; only keys gaining their first deletion
+                // enter the range, never insert-only keys.
+                if min_deleted_key.is_none_or(|min| key < min) {
+                    min_deleted_key = Some(key);
+                }
+                if max_deleted_key.is_none_or(|max| key > max) {
+                    max_deleted_key = Some(key);
+                }
             }
             if outcome.new_insert {
                 insert_count += 1;
@@ -460,6 +505,8 @@ where
             delta,
             bloom,
             max_sequence_number,
+            min_deleted_key,
+            max_deleted_key,
             entry_count,
             delete_count,
             insert_count,
@@ -609,6 +656,24 @@ impl DeletionIndex {
     #[must_use]
     pub fn max_sequence_number(&self) -> Option<i64> {
         self.core.max_sequence_number
+    }
+
+    /// Closed `[min,max]` of all **deleted** PK values in this index, or `None`
+    /// when no key has a recorded deletion (`delete_len() == 0`).
+    ///
+    /// This is a sound *superset* of the PKs the filter could remove: every PK
+    /// with a tombstone lies within it (including deletions below a protected
+    /// snapshot's `min_delete_seq_to_apply` cutoff that the visibility check
+    /// would skip — the range is intentionally NOT narrowed by sequence, which
+    /// keeps it a conservative superset of the applicable-by-sequence subset).
+    /// A scan window proven disjoint from this range therefore contains no
+    /// deletable PK, so the deletion filter can be skipped for that branch /
+    /// batch without dropping a live row or keeping a deleted one. See
+    /// `CayenneTableProvider::branch_int64_pk_range` and the
+    /// `Int64PkDeletionFilterStream` per-batch fast path.
+    #[must_use]
+    pub fn deleted_key_range(&self) -> Option<(i64, i64)> {
+        Some((self.core.min_deleted_key?, self.core.max_deleted_key?))
     }
 
     /// Bloom-filter check against deletion membership. Returns `false` if the key
@@ -870,6 +935,15 @@ impl KeyDeletionIndex {
     pub fn max_sequence_number(&self) -> Option<i64> {
         self.core.max_sequence_number
     }
+
+    // NOTE: there is deliberately NO `deleted_key_range()` here. The core's
+    // `min_deleted_key`/`max_deleted_key` are over the XXH3-128 *hash* of the
+    // PK bytes (the original bytes are not retained — see the module docs), so a
+    // min/max over them is meaningless for PK value-range pruning and could
+    // wrongly report a hash-window as disjoint from a scan's value window. The
+    // composite-PK read-tax is instead attacked by the batch-level bloom sweep
+    // in `KeyBasedDeletionFilterStream` (b3 sub-lever 2), which is sound because
+    // `might_contain` has no false negatives.
 
     /// Bloom-filter check against deletion membership; see
     /// [`DeletionIndex::might_contain`].
