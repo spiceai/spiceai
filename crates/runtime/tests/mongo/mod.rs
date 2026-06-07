@@ -50,9 +50,9 @@ const MONGODB_PORT1: u16 = 27019;
 #[cfg(feature = "duckdb")]
 const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
 #[cfg(feature = "duckdb")]
-const MONGODB_CHANGE_STREAM_INFERENCE_PORT: u16 = 27021;
+const MONGODB_CHANGE_STREAM_INFERENCE_PORT: u16 = 27035;
 #[cfg(feature = "duckdb")]
-const MONGODB_INFERENCE_PORT: u16 = 27022;
+const MONGODB_INFERENCE_PORT: u16 = 27036;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
