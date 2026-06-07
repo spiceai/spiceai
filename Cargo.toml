@@ -170,7 +170,7 @@ datafusion-common-runtime = "53.0.0"
 datafusion-datasource = "53.0.0"
 datafusion-execution = "53.0.0"
 datafusion-expr = "53.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "3c051ecedc8fb71220b89337dba02fa21ce3528a", features = ["sql"] } # spiceai fork (v0.5.3 DF53)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6433df67b1154c8c3c4779732b1b04c73714ce83", features = ["sql"] } # spiceai fork (v0.5.3 DF53)
 datafusion-functions = "53.0.0"
 datafusion-functions-json = "0.53"
 datafusion-physical-expr = "53.0.0"
@@ -354,6 +354,7 @@ flatbuffers = "25.2.10"
 # transitive vortex dependencies pulled in by other patched crates.
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
 vortex-datafusion = { path = "crates/vortex" }
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
@@ -434,7 +435,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
 # graph shares one `SQLExecutor`/federation crate; otherwise `SqlTable: SQLExecutor` (impl'd in
 # table-providers against crates.io federation) fails to satisfy fork-typed bounds in data_components.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "3c051ecedc8fb71220b89337dba02fa21ce3528a" } # spiceai fork (v0.5.3 DF53)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6433df67b1154c8c3c4779732b1b04c73714ce83" } # spiceai fork (v0.5.3 DF53)
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 

@@ -60,6 +60,14 @@ flatbuffers = { workspace = true }
 # enabled transitively by vortex-datafusion; naming it here keeps cayenne
 # building if that ever changes.
 vortex = { workspace = true, features = ["files"] }
+# `vortex-btrblocks` exposes the BtrBlocks compressor builder and the concrete
+# compression-scheme types (provider/delta_encoding.rs maps encoding levels to
+# scheme subsets). It is pulled transitively by vortex but with no features, so
+# name it directly to make the scheme types addressable. The `zstd` feature is
+# required for `schemes::string::ZstdScheme`, which the `compression_strategy=
+# zstd` full-tier strategy registers (the vortex umbrella's own `zstd` feature
+# does NOT turn on `vortex-btrblocks/zstd`).
+vortex-btrblocks = { workspace = true, features = ["zstd"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }

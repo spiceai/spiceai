@@ -56,8 +56,28 @@ limitations under the License.
 //! ([`WriteClass::Maintenance`]) always use the full default regardless of
 //! the configured level.
 
-use vortex::compressor::{BtrBlocksCompressorBuilder, FloatCode, IntCode, StringCode};
 use vortex::file::WriteStrategyBuilder;
+use vortex_btrblocks::schemes::{float, integer, string};
+use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme, SchemeExt};
+
+/// Build a [`BtrBlocksCompressorBuilder`] restricted to exactly `schemes`.
+///
+/// Starts from [`BtrBlocksCompressorBuilder::empty`] (no schemes registered)
+/// and registers each scheme in turn. Anything the registered schemes cannot
+/// shrink falls back to the canonical (uncompressed) encoding — there is no
+/// explicit "uncompressed" scheme to add in the pinned Vortex API.
+///
+/// Callers must pass a duplicate-free list:
+/// [`BtrBlocksCompressorBuilder::with_new_scheme`] panics on a repeated
+/// [`SchemeId`](vortex_btrblocks::SchemeId). The light-level sets below are
+/// curated by hand and contain no duplicates.
+fn builder_with_schemes(schemes: &[&'static dyn Scheme]) -> BtrBlocksCompressorBuilder {
+    schemes
+        .iter()
+        .fold(BtrBlocksCompressorBuilder::empty(), |builder, &scheme| {
+            builder.with_new_scheme(scheme)
+        })
+}
 
 use crate::metadata::{
     CompressionStrategy, DELTA_ENCODING_FULL_LEVEL, DELTA_ENCODING_MAX_LEVEL, DeltaEncoding,
@@ -79,10 +99,11 @@ pub(crate) fn full_strategy_builder_for(
     match strategy {
         CompressionStrategy::Btrblocks => None,
         CompressionStrategy::Zstd => {
-            let compressor = BtrBlocksCompressorBuilder::default()
-                .include_string([StringCode::Zstd, StringCode::ZstdBuffers])
-                .build();
-            Some(WriteStrategyBuilder::default().with_compressor(compressor))
+            // The default cascade deliberately excludes the Zstd string scheme;
+            // add it so the per-column search can pick it when it wins.
+            let builder =
+                BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme);
+            Some(WriteStrategyBuilder::default().with_btrblocks_builder(builder))
         }
     }
 }
@@ -156,80 +177,61 @@ pub(crate) fn strategy_builder_for_level(level: u8) -> Option<WriteStrategyBuild
         return None;
     }
 
-    let compressor = match level {
-        0 => BtrBlocksCompressorBuilder::empty()
-            .include_int([IntCode::Uncompressed])
-            .include_float([FloatCode::Uncompressed])
-            .include_string([StringCode::Uncompressed])
-            .build(),
-        1 => BtrBlocksCompressorBuilder::empty()
-            .include_int([IntCode::Uncompressed, IntCode::Constant, IntCode::Sparse])
-            .include_float([
-                FloatCode::Uncompressed,
-                FloatCode::Constant,
-                FloatCode::Sparse,
-            ])
-            .include_string([
-                StringCode::Uncompressed,
-                StringCode::Constant,
-                StringCode::Sparse,
-            ])
-            .build(),
-        2 => BtrBlocksCompressorBuilder::empty()
-            .include_int([
-                IntCode::Uncompressed,
-                IntCode::Constant,
-                IntCode::Sparse,
-                IntCode::Dict,
-            ])
-            .include_float([
-                FloatCode::Uncompressed,
-                FloatCode::Constant,
-                FloatCode::Sparse,
-                FloatCode::Dict,
-            ])
-            .include_string([
-                StringCode::Uncompressed,
-                StringCode::Constant,
-                StringCode::Sparse,
-                StringCode::Dict,
-            ])
-            .build(),
-        3 => BtrBlocksCompressorBuilder::empty()
-            .include_int([
-                IntCode::Uncompressed,
-                IntCode::Constant,
-                IntCode::Sparse,
-                IntCode::Dict,
-                IntCode::For,
-                IntCode::BitPacking,
-                IntCode::ZigZag,
-                IntCode::RunEnd,
-                IntCode::Sequence,
-            ])
-            .include_float([
-                FloatCode::Uncompressed,
-                FloatCode::Constant,
-                FloatCode::Sparse,
-                FloatCode::Dict,
-                FloatCode::RunEnd,
-            ])
-            .include_string([
-                StringCode::Uncompressed,
-                StringCode::Constant,
-                StringCode::Sparse,
-                StringCode::Dict,
-            ])
-            .build(),
+    // Pinned-Vortex `BtrBlocks` is scheme-list driven: an `empty()` builder has
+    // no schemes, so the cascade falls back to canonical (uncompressed) arrays
+    // for anything the registered schemes can't shrink — there is no explicit
+    // "uncompressed" scheme to add. Each light level starts from `empty()` and
+    // registers a widening subset; the full tier (handled above by the early
+    // return) keeps the session-default cascade.
+    let builder = match level {
+        // 0: no schemes — pure canonical/uncompressed (zero search, zero transform).
+        0 => BtrBlocksCompressorBuilder::empty(),
+        // 1: + constant / sparse detection (near-free; common CDC shapes).
+        1 => builder_with_schemes(&[
+            &integer::IntConstantScheme,
+            &integer::SparseScheme,
+            &float::FloatConstantScheme,
+            &float::NullDominatedSparseScheme,
+            &string::StringConstantScheme,
+            &string::NullDominatedSparseScheme,
+        ]),
+        // 2: + dictionary (cheap, high-value on repetitive CDC data).
+        2 => builder_with_schemes(&[
+            &integer::IntConstantScheme,
+            &integer::SparseScheme,
+            &integer::IntDictScheme,
+            &float::FloatConstantScheme,
+            &float::NullDominatedSparseScheme,
+            &float::FloatDictScheme,
+            &string::StringConstantScheme,
+            &string::NullDominatedSparseScheme,
+            &string::StringDictScheme,
+        ]),
+        // 3: + cheap numeric schemes (FoR, BitPacking, ZigZag, RunEnd, Sequence).
+        3 => builder_with_schemes(&[
+            &integer::IntConstantScheme,
+            &integer::SparseScheme,
+            &integer::IntDictScheme,
+            &integer::FoRScheme,
+            &integer::BitPackingScheme,
+            &integer::ZigZagScheme,
+            &integer::RunEndScheme,
+            &integer::SequenceScheme,
+            &float::FloatConstantScheme,
+            &float::NullDominatedSparseScheme,
+            &float::FloatDictScheme,
+            &float::FloatRLEScheme,
+            &string::StringConstantScheme,
+            &string::NullDominatedSparseScheme,
+            &string::StringDictScheme,
+        ]),
         // 4-6: everything in the default set except FSST — the symbol-table
         // training is the profiled dominant fixed cost on small string-bearing
         // deltas; numeric schemes keep their full default sets.
-        _ => BtrBlocksCompressorBuilder::default()
-            .exclude_string([StringCode::Fsst])
-            .build(),
+        _ => BtrBlocksCompressorBuilder::default().exclude_schemes([string::FSSTScheme.id()]),
     };
 
-    Some(WriteStrategyBuilder::default().with_compressor(compressor))
+    Some(WriteStrategyBuilder::default().with_btrblocks_builder(builder))
 }
 
 #[cfg(test)]
@@ -353,9 +355,9 @@ mod tests {
     #[test]
     fn zstd_full_strategy_includes_zstd_string_schemes() {
         // Engagement at the mapping level: `zstd` must actually add the Zstd
-        // string schemes to the search (the default set excludes them), and
+        // string scheme to the search (the default set excludes it), and
         // `btrblocks` must register no override (session default = the
-        // pre-feature cascade). Build the compressors directly to verify.
+        // pre-feature cascade).
         assert!(
             full_strategy_builder_for(&CompressionStrategy::Btrblocks).is_none(),
             "btrblocks must use the session-default strategy (no override)"
@@ -364,33 +366,34 @@ mod tests {
             full_strategy_builder_for(&CompressionStrategy::Zstd).is_some(),
             "zstd must register a full-tier strategy override"
         );
-        let zstd_compressor = BtrBlocksCompressorBuilder::default()
-            .include_string([StringCode::Zstd, StringCode::ZstdBuffers])
-            .build();
-        let codes: Vec<StringCode> = zstd_compressor
-            .string_schemes
-            .iter()
-            .map(|scheme| scheme.code())
-            .collect();
-        // Note: only `Zstd` is registrable at the pinned Vortex revision —
-        // `ZstdBuffers` has a code but its scheme object is not in
-        // `ALL_STRING_SCHEMES`, so `include_string` is a forward-compat no-op
-        // for it until the fork advances.
+
+        // The pinned Vortex builder no longer exposes its scheme list, so probe
+        // membership through `with_new_scheme`, which panics iff a scheme with
+        // the same `SchemeId` is already registered.
+        //
+        // The default cascade must NOT contain the Zstd string scheme — adding
+        // it must therefore succeed (no panic). This is the distinguishing
+        // addition that makes `cayenne_compression_strategy=zstd` real.
+        let added = std::panic::catch_unwind(|| {
+            BtrBlocksCompressorBuilder::default().with_new_scheme(&string::ZstdScheme)
+        });
         assert!(
-            codes.contains(&StringCode::Zstd),
-            "the zstd full-tier compressor must include the Zstd string \
-             scheme in the search; got {codes:?}"
+            added.is_ok(),
+            "the default cascade must NOT already include the Zstd string \
+             scheme (it is the zstd param's distinguishing addition)"
         );
-        let default_compressor = BtrBlocksCompressorBuilder::default().build();
-        let default_codes: Vec<StringCode> = default_compressor
-            .string_schemes
-            .iter()
-            .map(|scheme| scheme.code())
-            .collect();
+
+        // ...and once added, registering it a second time must panic, proving
+        // the zstd full-tier builder genuinely carries the Zstd string scheme.
+        let double_add = std::panic::catch_unwind(|| {
+            BtrBlocksCompressorBuilder::default()
+                .with_new_scheme(&string::ZstdScheme)
+                .with_new_scheme(&string::ZstdScheme)
+        });
         assert!(
-            !default_codes.contains(&StringCode::Zstd),
-            "the default cascade must NOT include Zstd (it is the zstd \
-             param's distinguishing addition); got {default_codes:?}"
+            double_add.is_err(),
+            "the zstd full-tier compressor must include the Zstd string scheme \
+             in the search"
         );
     }
 
