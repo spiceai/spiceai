@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::{Array, ArrayData, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
@@ -33,10 +35,10 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
+use datafusion::logical_expr::{ColumnarValue, Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
-use datafusion::physical_plan::expressions::{CastExpr, Column};
+use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
@@ -468,8 +470,11 @@ fn rewrite_column_names(
 /// Builds a [`ProjectionExec`] that renames columns from physical names back to logical names.
 ///
 /// For columns with nested types (Struct, List, Map) where the physical and logical data types
-/// differ (because nested field names are also physical), wraps the column in a [`CastExpr`]
-/// to trigger Arrow's recursive struct/list/map field renaming.
+/// differ (because nested field names are also physical), wraps the column in a
+/// [`RelabelFieldsExpr`] to recursively rename nested struct/list/map field names. A
+/// `CastExpr` can no longer be used for this: `DataFusion` 53 rejects a struct-to-struct
+/// cast whose source and target fields share no names (the physical names are opaque
+/// column-mapping ids), so the rename must be done as a metadata-only relabel instead.
 fn build_column_mapping_projection(
     exec: Arc<dyn ExecutionPlan>,
     physical_to_logical: &HashMap<String, String>,
@@ -487,13 +492,12 @@ fn build_column_mapping_projection(
                 .unwrap_or_else(|| field.name().clone());
 
             // If the logical field has a different data type (nested field names differ),
-            // wrap in CastExpr to recursively rename nested struct/list/map fields.
+            // relabel the nested struct/list/map field names from physical to logical.
             let expr: Arc<dyn PhysicalExpr> = match logical_schema.field_with_name(&logical_name) {
                 Ok(logical_field) if field.data_type() != logical_field.data_type() => {
-                    Arc::new(CastExpr::new(
+                    Arc::new(RelabelFieldsExpr::new(
                         Arc::new(Column::new(field.name(), i)),
                         logical_field.data_type().clone(),
-                        None,
                     ))
                 }
                 _ => Arc::new(Column::new(field.name(), i)),
@@ -504,6 +508,123 @@ fn build_column_mapping_projection(
         .collect();
 
     Ok(Arc::new(ProjectionExec::try_new(projection_expr, exec)?))
+}
+
+/// Recursively rebuilds `data` so its (possibly nested) field names match
+/// `target_type`, without touching any values, buffers, or null masks.
+///
+/// Delta column mapping stores nested struct/list/map field names under opaque
+/// physical names; the logical schema uses the logical names. Field names live
+/// in the Arrow `DataType`, so renaming is a metadata-only operation: relabel
+/// each child to the matching target nested type (positionally — column mapping
+/// preserves field order), then rebuild this level carrying `target_type`.
+fn relabel_array_data(
+    data: ArrayData,
+    target_type: &DataType,
+) -> std::result::Result<ArrayData, DataFusionError> {
+    if data.data_type() == target_type {
+        return Ok(data);
+    }
+
+    let target_child_types: Vec<DataType> = match target_type {
+        DataType::Struct(fields) => fields.iter().map(|f| f.data_type().clone()).collect(),
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            vec![field.data_type().clone()]
+        }
+        DataType::Map(field, _) => vec![field.data_type().clone()],
+        _ => Vec::new(),
+    };
+
+    let old_children = data.child_data().to_vec();
+    let new_children = if target_child_types.len() == old_children.len() {
+        old_children
+            .into_iter()
+            .zip(target_child_types.iter())
+            .map(|(child, child_target)| relabel_array_data(child, child_target))
+            .collect::<std::result::Result<Vec<_>, DataFusionError>>()?
+    } else {
+        old_children
+    };
+
+    data.into_builder()
+        .data_type(target_type.clone())
+        .child_data(new_children)
+        .build()
+        .map_err(DataFusionError::from)
+}
+
+/// Physical expression that renames the (possibly nested) field names of its
+/// input array to `target_type` without changing any values. Used by Delta
+/// column mapping to map physical field names back to logical names; replaces a
+/// `CastExpr`, which `DataFusion` 53 rejects for structs whose physical and
+/// logical field names don't overlap.
+#[derive(Debug, Clone, Eq)]
+struct RelabelFieldsExpr {
+    arg: Arc<dyn PhysicalExpr>,
+    target_type: DataType,
+}
+
+impl RelabelFieldsExpr {
+    fn new(arg: Arc<dyn PhysicalExpr>, target_type: DataType) -> Self {
+        Self { arg, target_type }
+    }
+}
+
+impl PartialEq for RelabelFieldsExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg.eq(&other.arg) && self.target_type.eq(&other.target_type)
+    }
+}
+
+impl std::hash::Hash for RelabelFieldsExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.arg.hash(state);
+        self.target_type.hash(state);
+    }
+}
+
+impl std::fmt::Display for RelabelFieldsExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RELABEL({} AS {})", self.arg, self.target_type)
+    }
+}
+
+impl PhysicalExpr for RelabelFieldsExpr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn data_type(&self, _input_schema: &Schema) -> std::result::Result<DataType, DataFusionError> {
+        Ok(self.target_type.clone())
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> std::result::Result<bool, DataFusionError> {
+        self.arg.nullable(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> std::result::Result<ColumnarValue, DataFusionError> {
+        let array = self.arg.evaluate(batch)?.into_array(batch.num_rows())?;
+        let relabeled = make_array(relabel_array_data(array.to_data(), &self.target_type)?);
+        Ok(ColumnarValue::Array(relabeled))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+        Ok(Arc::new(RelabelFieldsExpr::new(
+            Arc::clone(&children[0]),
+            self.target_type.clone(),
+        )))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
 }
 #[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
