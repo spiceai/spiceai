@@ -303,8 +303,32 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     }
                 }
             }
-            if let Some(message) = report.failure_message() {
+            let row_count_message = report.failure_message();
+            if let Some(message) = row_count_message.clone() {
                 error_messages.push(message);
+            }
+
+            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
+            if row_count_message.is_none() {
+                let analytical_result = {
+                    let spice_client = spiced_instance.spice_client(None, true).await?;
+                    correctness::verify_analytical_results(Arc::clone(&driver), &spice_client).await
+                };
+
+                match analytical_result {
+                    Ok(analytical) => {
+                        analytical.emit();
+                        if let Some(message) = analytical.failure_message() {
+                            error_messages.push(message);
+                        }
+                    }
+                    Err(e) => {
+                        error_messages.push(format!("HTAP analytical-query error: {e}"));
+                    }
+                }
+            } else {
+                println!("\nSkipping analytical-query gate — row-count gate did not pass");
             }
         }
         Err(e) => {

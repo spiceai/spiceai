@@ -11,6 +11,7 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-json.workspace = true
+arrow_tools = { path = "../../crates/arrow_tools" }
 async-trait.workspace = true
 aws-config.workspace = true
 aws-credential-types.workspace = true
