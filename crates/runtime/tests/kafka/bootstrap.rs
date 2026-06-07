@@ -263,10 +263,8 @@ pub async fn send_tombstone_to_kafka(
     let key_owned = key.to_string();
     let mut last_error = None;
     for attempt in 0..=MAX_RETRIES {
-        let record: FutureRecord<'_, String, Option<String>> = FutureRecord::to(topic)
-            .partition(partition)
-            .key(&key_owned)
-            .payload(&None::<String>);
+        let record: FutureRecord<'_, String, ()> =
+            FutureRecord::to(topic).partition(partition).key(&key_owned);
         match producer.send(record, QUEUE_TIMEOUT).await {
             Ok(_) => {
                 if attempt > 0 {
