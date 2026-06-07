@@ -53,6 +53,7 @@ Spice SQL runs on Apache DataFusion with the SQL parser configured for the Postg
 - `json_length`: Returns the length of a JSON array or object (SCALAR). Syntax: `json_length(json)`.
 - `json_object_keys`: Returns the keys of a JSON object (SCALAR). Syntax: `json_object_keys(json)`.
 - `json_tree`: Expands JSON into a tree of path, key, and value rows or structures. Syntax: `json_tree(json)`.
+- `json_tuple` (SCALAR). Syntax: `json_tuple(...)`.
 
 ### Search functions
 - `rerank`: Re-ranks search results or table rows using a configured reranker model. Syntax: `rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])`.
@@ -75,13 +76,16 @@ Spice SQL runs on Apache DataFusion with the SQL parser configured for the Postg
 
 ### Spark compatibility scalar functions
 Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.
-- `abs`, `array`, `ascii`, `bit_count`, `bit_get`, `bitmap_count`, `bitwise_not`, `char`
-- `concat`, `crc32`, `csc`, `date_add`, `date_sub`, `elt`, `expm1`, `factorial`
-- `format_string`, `hex`, `hour`, `if`, `ilike`, `last_day`, `length`, `like`
-- `luhn_check`, `make_dt_interval`, `make_interval`, `map_from_arrays`, `map_from_entries`, `minute`, `mod`, `next_day`
-- `parse_url`, `pmod`, `rint`, `sec`, `second`, `sha1`, `sha2`, `shiftleft`
-- `shiftright`, `shiftrightunsigned`, `shuffle`, `space`, `try_parse_url`, `try_url_decode`, `url_decode`, `url_encode`
-- `width_bucket`
+- `abs`, `add_months`, `array`, `array_contains`, `array_repeat`, `ascii`, `base64`, `bin`
+- `bit_count`, `bit_get`, `bitmap_bit_position`, `bitmap_bucket_number`, `bitmap_count`, `bitwise_not`, `char`, `concat`
+- `crc32`, `csc`, `date_add`, `date_diff`, `date_part`, `date_sub`, `date_trunc`, `elt`
+- `expm1`, `factorial`, `format_string`, `from_utc_timestamp`, `hex`, `hour`, `if`, `ilike`
+- `json_tuple`, `last_day`, `length`, `like`, `luhn_check`, `make_dt_interval`, `make_interval`, `map_from_arrays`
+- `map_from_entries`, `minute`, `mod`, `negative`, `next_day`, `parse_url`, `pmod`, `rint`
+- `sec`, `second`, `sha1`, `sha2`, `shiftleft`, `shiftright`, `shiftrightunsigned`, `shuffle`
+- `size`, `slice`, `space`, `str_to_map`, `substring`, `time_trunc`, `to_utc_timestamp`, `trunc`
+- `try_parse_url`, `try_url_decode`, `unbase64`, `unhex`, `unix_date`, `unix_micros`, `unix_millis`, `unix_seconds`
+- `url_decode`, `url_encode`, `width_bucket`
 
 ## Sample Data
 
