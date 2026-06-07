@@ -73,8 +73,8 @@ use duckdb::Connection;
 use tokio::runtime::Runtime;
 
 use common::{
-    CayenneFixture, Metastore, cayenne_insert, cayenne_insert_from_parquet, make_batch,
-    make_batch_grouped, schema, setup_cayenne_custom, warm_session_with_runtime, write_parquet,
+    CayenneFixture, Metastore, cayenne_insert, make_batch, make_batch_grouped, schema,
+    setup_cayenne_custom, warm_session_with_runtime, write_parquet,
 };
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -226,6 +226,43 @@ async fn try_query(ctx: &SessionContext, sql: &str) -> DataFusionResult<Vec<Reco
     ctx.sql(sql).await?.collect().await
 }
 
+/// Upsert from parquet through the BUDGETED session. The shared
+/// `cayenne_insert_from_parquet` helper builds its own
+/// `SessionContext::new()` — an unbudgeted pool — and
+/// `CayenneTableProvider::insert_into` draws execution memory from the
+/// SESSION's runtime env, so routing this lane through the helper would
+/// bypass the budget the bench exists to enforce (only the table-internal
+/// reservations would land on the budgeted pool). Errors are returned, not
+/// panicked, so a too-small budget can be reported as a skip.
+async fn try_upsert_from_parquet(
+    ctx: &SessionContext,
+    table: &Arc<cayenne::CayenneTableProvider>,
+    parquet_path: &std::path::Path,
+) -> DataFusionResult<u64> {
+    use datafusion::datasource::TableProvider;
+    use datafusion::prelude::ParquetReadOptions;
+    use datafusion_expr::dml::InsertOp;
+
+    let parquet_path = parquet_path.to_string_lossy().into_owned();
+    let df = ctx
+        .read_parquet::<&str>(parquet_path.as_str(), ParquetReadOptions::default())
+        .await?;
+    let input_exec = df.create_physical_plan().await?;
+    let insert_plan = table
+        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
+        .await?;
+    let results = datafusion::physical_plan::collect(insert_plan, ctx.task_ctx()).await?;
+    Ok(results
+        .first()
+        .and_then(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+        })
+        .map_or(0, |rows| rows.value(0)))
+}
+
 fn eprintln_lane_memory(engine: &str, workload: &str, budget_label: &str, bytes: u64) {
     eprintln!(
         "memory_budget: {engine}/{workload}@{budget_label} pool high-water = {bytes} bytes \
@@ -300,7 +337,11 @@ fn bench_memory_budget(c: &mut Criterion) {
             }
         }
 
-        // --- Cayenne upsert lane on a budgeted PK fixture.
+        // --- Cayenne upsert lane on a budgeted PK fixture. The upsert runs
+        //     through the lane's BUDGETED warm session (see
+        //     `try_upsert_from_parquet`) so both the query-side decode and
+        //     the table-side write reservations draw on the same budgeted
+        //     pool — the spiced topology.
         {
             let lane = rt.block_on(setup_budgeted_cayenne(
                 "memory_budget_upsert",
@@ -309,23 +350,38 @@ fn bench_memory_budget(c: &mut Criterion) {
             ));
             let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
             assert!(preload > 0, "cayenne upsert preload must insert rows");
-            lane.pool.reset_high_water();
-            group.bench_function(BenchmarkId::new("cayenne_upsert_16k", budget_label), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        let rows =
-                            cayenne_insert_from_parquet(&lane.fixture.table, &upsert_parquet).await;
-                        black_box(rows);
+            // Pre-flight once: a budget the upsert cannot fit is a finding
+            // to report, not a panic.
+            if let Err(e) = rt.block_on(try_upsert_from_parquet(
+                &lane.warm_ctx,
+                &lane.fixture.table,
+                &upsert_parquet,
+            )) {
+                eprintln!("memory_budget: cayenne/upsert_16k@{budget_label} SKIPPED — {e}");
+            } else {
+                lane.pool.reset_high_water();
+                group.bench_function(BenchmarkId::new("cayenne_upsert_16k", budget_label), |b| {
+                    b.iter(|| {
+                        rt.block_on(async {
+                            let rows = try_upsert_from_parquet(
+                                &lane.warm_ctx,
+                                &lane.fixture.table,
+                                &upsert_parquet,
+                            )
+                            .await
+                            .expect("pre-flighted upsert failed mid-bench");
+                            black_box(rows);
+                        });
                     });
                 });
-            });
-            let high_water = lane.pool.high_water_bytes() as u64;
-            eprintln_lane_memory("cayenne", "upsert_16k", budget_label, high_water);
-            assert!(
-                high_water <= budget_bytes as u64,
-                "cayenne/upsert_16k@{budget_label}: pool high-water {high_water} bytes \
-                 exceeds the configured budget {budget_bytes} — operator contract violated"
-            );
+                let high_water = lane.pool.high_water_bytes() as u64;
+                eprintln_lane_memory("cayenne", "upsert_16k", budget_label, high_water);
+                assert!(
+                    high_water <= budget_bytes as u64,
+                    "cayenne/upsert_16k@{budget_label}: pool high-water {high_water} bytes \
+                     exceeds the configured budget {budget_bytes} — operator contract violated"
+                );
+            }
         }
 
         // --- DuckDB lanes at the same budget.

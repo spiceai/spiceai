@@ -157,8 +157,12 @@ impl CayenneBgCompactor {
         }
     }
 
-    fn merge_count(&self) -> usize {
-        self.merges.load(Ordering::Relaxed)
+    /// Clone of the merge counter. Read it AFTER dropping the compactor —
+    /// the background task can complete one more in-flight pass during the
+    /// stop+join, so a pre-drop read can under-report (or, read as 0, fail
+    /// the validity gate spuriously).
+    fn merges_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.merges)
     }
 }
 
@@ -209,8 +213,10 @@ impl DuckDbBgCheckpointer {
         }
     }
 
-    fn checkpoint_count(&self) -> usize {
-        self.checkpoints.load(Ordering::Relaxed)
+    /// Clone of the checkpoint counter — read after drop+join, see
+    /// [`CayenneBgCompactor::merges_counter`].
+    fn checkpoints_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.checkpoints)
     }
 }
 
@@ -252,10 +258,13 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
         });
 
         // VALIDITY GATE: if no merge ever fired, the bench measured
-        // scan-under-append, not scan-under-compaction.
-        let merges = bg.merge_count();
+        // scan-under-append, not scan-under-compaction. Read the counter
+        // only after drop(bg) joins the task — an in-flight pass can still
+        // complete (and increment) during the stop+join.
+        let merges_counter = bg.merges_counter();
         drop(bg);
         drop(fixture);
+        let merges = merges_counter.load(Ordering::Relaxed);
         eprintln!("scan_under_compaction: {lane_label} background subset merges = {merges}");
         assert!(
             merges > 0,
@@ -274,9 +283,11 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
             black_box(v);
         });
     });
-    let checkpoints = bg.checkpoint_count();
+    // Same post-join read discipline as the Cayenne lane above.
+    let checkpoints_counter = bg.checkpoints_counter();
     drop(bg);
     drop(duckdb_fixture);
+    let checkpoints = checkpoints_counter.load(Ordering::Relaxed);
     eprintln!("scan_under_compaction: duckdb background checkpoints = {checkpoints}");
     assert!(
         checkpoints > 0,
