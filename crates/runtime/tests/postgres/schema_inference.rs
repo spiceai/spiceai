@@ -125,10 +125,13 @@ async fn seed_inventory(port: usize) -> Result<(), anyhow::Error> {
 
     conn.conn
         .execute(
+            // `uq_active_sku` is UNIQUE on (sku) WHERE active, so at most one active
+            // row may share a sku — keep sku 'A' across warehouses (exercises the
+            // composite PK) but only the warehouse-1 row is active.
             "INSERT INTO inventory (warehouse_id, sku, name, barcode, quantity, active, updated_at) VALUES
                 (1, 'A', 'Widget', 'BC1', 10, true,  now()),
                 (1, 'B', 'Gadget', 'BC2', 5,  false, now()),
-                (2, 'A', 'Widget', 'BC3', 7,  true,  now())",
+                (2, 'A', 'Widget', 'BC3', 7,  false, now())",
             &[],
         )
         .await?;
