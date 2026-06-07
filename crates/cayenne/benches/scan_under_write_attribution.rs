@@ -100,6 +100,10 @@ async fn insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
         .await
         .expect("insert plan");
     let results = collect(plan, ctx.task_ctx()).await.expect("insert");
+    // Fail loudly if the insert result is not the expected UInt64 row-count
+    // batch: silently returning 0 would let the background writer "progress"
+    // without proving rows landed, corrupting the warmup/validity gates this
+    // attribution harness depends on.
     results
         .first()
         .and_then(|batch| {
@@ -109,7 +113,7 @@ async fn insert(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> u64 {
                 .downcast_ref::<arrow::array::UInt64Array>()
                 .map(|counts| counts.value(0))
         })
-        .unwrap_or(0)
+        .expect("insert must return a UInt64 row-count batch")
 }
 
 async fn setup() -> Fixture {
@@ -283,7 +287,14 @@ fn main() {
                 while !stop.load(Ordering::Relaxed) {
                     let batch = make_batch(cursor, BG_BURST_ROWS);
                     cursor += BG_BURST_ROWS;
-                    let _ = insert(&table, batch).await;
+                    let written = insert(&table, batch).await;
+                    // The warmup/validity gates count COMPLETED inserts; a
+                    // no-op insert ticking the counter would fabricate
+                    // "ACTIVE" contention that never happened.
+                    assert_eq!(
+                        written, BG_BURST_ROWS as u64,
+                        "background insert must land exactly the burst rows"
+                    );
                     writes_done.fetch_add(1, Ordering::Relaxed);
                 }
             })
