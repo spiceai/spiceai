@@ -170,7 +170,17 @@ impl Drop for CayenneBgCompactor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            let _ = self.rt_handle.block_on(handle);
+            if let Err(join_err) = self.rt_handle.block_on(handle) {
+                // Propagate a background-compactor panic at the source —
+                // swallowed, it would resurface later as a misleading
+                // `merges = 0` validity failure (or as silently invalid
+                // numbers). Skip while already unwinding: panicking inside
+                // a panic-triggered drop aborts the process and eats the
+                // original message.
+                if join_err.is_panic() && !std::thread::panicking() {
+                    std::panic::resume_unwind(join_err.into_panic());
+                }
+            }
         }
     }
 }
@@ -224,7 +234,14 @@ impl Drop for DuckDbBgCheckpointer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if let Err(panic_payload) = handle.join() {
+                // Same rationale as CayenneBgCompactor::drop — surface the
+                // background panic at the source instead of as a misleading
+                // checkpoint-validity failure later.
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(panic_payload);
+                }
+            }
         }
     }
 }
