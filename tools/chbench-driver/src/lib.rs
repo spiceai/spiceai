@@ -29,19 +29,26 @@ pub use config::{ChBenchConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use ::rand::SeedableRng;
 use ::rand::rngs::StdRng;
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use futures::TryStreamExt;
 use governor::{
     Quota, RateLimiter,
     clock::DefaultClock,
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
+use secrecy::SecretBox;
 use snafu::{Snafu, ensure};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 /// Shared rate limiter gating the aggregate OLTP transaction rate across all terminals.
@@ -62,6 +69,9 @@ pub enum Error {
 
     #[snafu(display("Invalid OLTP target rate: {rate} (must be > 0)"))]
     InvalidRate { rate: u32 },
+
+    #[snafu(display("Failed to {action}: {message}"))]
+    Arrow { action: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -95,6 +105,14 @@ pub trait ChBenchDriver: Send + Sync {
 
     /// Read `COUNT(*)` from the *source* for a given table.
     async fn row_count(&self, table: &str) -> Result<i64>;
+
+    /// Execute an arbitrary read-only SQL statement against the source and
+    /// return the results as Arrow `RecordBatch`es.
+    ///
+    /// Used by the analytical-query gate to produce ground-truth results
+    /// for CH-benCH queries that are then compared against the same query run
+    /// through Spice.
+    async fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>>;
 }
 
 /// Postgres-backed CH-benCH driver.
@@ -102,6 +120,10 @@ pub struct PostgresChBenchDriver {
     client: tokio_postgres::Client,
     config: ChBenchConfig,
     source: PostgresSourceConfig,
+    /// Postgres pool that returns query results as Arrow `RecordBatch`es,
+    /// kept separate from `client` because the analytical-query gate
+    /// needs Arrow output to compare against Spice results
+    arrow_client: OnceCell<Arc<PostgresConnectionPool>>,
 }
 
 impl PostgresChBenchDriver {
@@ -129,7 +151,27 @@ impl PostgresChBenchDriver {
             client,
             config,
             source,
+            arrow_client: OnceCell::new(),
         })
+    }
+
+    /// Build the Arrow-returning connection pool from the source config.
+    async fn build_arrow_client(&self) -> Result<Arc<PostgresConnectionPool>> {
+        let mut params: HashMap<String, SecretBox<str>> = HashMap::new();
+        params.insert("host".into(), SecretBox::from(self.source.host.clone()));
+        params.insert("port".into(), SecretBox::from(self.source.port.to_string()));
+        params.insert("db".into(), SecretBox::from(self.source.db.clone()));
+        params.insert("user".into(), SecretBox::from(self.source.user.clone()));
+        params.insert("pass".into(), SecretBox::from(self.source.pass.clone()));
+        params.insert("sslmode".into(), SecretBox::from("disable".to_string()));
+
+        let pool = PostgresConnectionPool::new(params)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: "build PostgresConnectionPool".into(),
+                message: e.to_string(),
+            })?;
+        Ok(Arc::new(pool))
     }
 }
 
@@ -270,6 +312,34 @@ impl ChBenchDriver for PostgresChBenchDriver {
                 source,
             })?;
         Ok(rows.first().map_or(0, |row| row.get::<_, i64>(0)))
+    }
+
+    async fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let client = self
+            .arrow_client
+            .get_or_try_init(|| self.build_arrow_client())
+            .await?;
+
+        let conn = client.connect_direct().await.map_err(|e| Error::Arrow {
+            action: "acquire Postgres connection".into(),
+            message: e.to_string(),
+        })?;
+
+        let stream = conn
+            .query_arrow(sql, &[], None)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("execute arrow query: {sql}"),
+                message: e.to_string(),
+            })?;
+
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("collect arrow query results: {sql}"),
+                message: e.to_string(),
+            })
     }
 }
 
