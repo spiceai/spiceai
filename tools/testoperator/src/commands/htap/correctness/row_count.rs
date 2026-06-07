@@ -30,7 +30,7 @@ use test_framework::anyhow;
 use test_framework::opentelemetry::KeyValue;
 use tokio::time::sleep;
 
-use super::staleness::query_max_bench_ts_spice;
+use super::super::staleness::query_max_bench_ts_spice;
 
 /// Per-table source-vs-Spice row-count comparison.
 #[derive(Debug, Clone)]
