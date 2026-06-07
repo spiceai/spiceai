@@ -494,10 +494,9 @@ async fn mongodb_catalog_details(
     collection_name: &str,
     primary_key: &[String],
 ) -> Result<MongoCatalogDetails, Box<dyn std::error::Error + Send + Sync>> {
-    let connection = pool
-        .connect()
-        .await
-        .map_err(|e| format!("failed to connect to MongoDB: {e}"))?;
+    // Propagate the original error (`?` boxes the connection-pool error, preserving
+    // its type and source chain); the call site logs it with `%error` and context.
+    let connection = pool.connect().await?;
     let db = connection.client.database(&connection.db_name);
 
     // Secondary indexes via the `listIndexes` command. A collection has at most 64
