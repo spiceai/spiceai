@@ -14466,6 +14466,37 @@ mod tests {
     }
 
     #[test]
+    fn subset_merge_write_shape_serializes_position_tables_only() {
+        // The gate the parallel-compaction change rides on (review-caught:
+        // an earlier revision keyed on `is_position_based()` alone, which
+        // covers only PK-less tables and would have widened PK tables whose
+        // resolved deletion_mode is `position`).
+        const CORES: usize = 16;
+        const BYTES: u64 = 64 * 1024 * 1024;
+
+        // Position-scoped deletes (either family) => serial single writer.
+        assert_eq!(
+            subset_merge_write_shape(true, CORES, BYTES),
+            (1, None),
+            "position tables must keep the serial (1, None) merge shape"
+        );
+        // Key/no-delete tables => widened, size-estimated parallel shape.
+        assert_eq!(
+            subset_merge_write_shape(false, CORES, BYTES),
+            (CORES, Some(BYTES)),
+            "non-position tables must widen to the session partitions with \
+             the tier's byte estimate"
+        );
+        // A zeroed session config must not propagate a 0 cap (defensive
+        // parity with `target_partitions().max(1)` call sites elsewhere).
+        assert_eq!(
+            subset_merge_write_shape(false, 0, BYTES),
+            (1, Some(BYTES)),
+            "target_partitions == 0 must clamp to a single writer, not zero"
+        );
+    }
+
+    #[test]
     fn protected_snapshot_size_tier_classifies_by_geometric_ceilings() {
         let base = 8 * 1024 * 1024; // 8 MiB
         let growth = 8;

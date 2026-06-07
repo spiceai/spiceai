@@ -591,29 +591,12 @@ fn denied_spice_function_names() -> Vec<String> {
 static BUILTIN_DENIED_SPICE_FUNCTION_NAMES: LazyLock<Vec<String>> =
     LazyLock::new(denied_spice_function_names);
 
-static BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB: LazyLock<Vec<String>> = LazyLock::new(|| {
-    BUILTIN_DENIED_SPICE_FUNCTION_NAMES
-        .iter()
-        .filter(|name| name.as_str() != COSINE_DISTANCE_UDF_NAME)
-        .cloned()
-        .collect()
-});
-
 /// Dynamic deny-list: built-ins plus any user-registered functions. Held
 /// in a [`RwLock`] so that hot-reload can update the user slice without
 /// requiring callers to refactor.
 static DENY_LIST: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
     RwLock::new(Arc::new(build_function_support(
         BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
-        &[],
-    )))
-});
-
-/// DuckDB-specific dynamic deny-list: same as the default but allows
-/// `cosine_distance` (`DuckDB` translates it to `array_cosine_distance`).
-static DENY_LIST_DUCKDB: LazyLock<RwLock<Arc<FunctionSupport>>> = LazyLock::new(|| {
-    RwLock::new(Arc::new(build_function_support(
-        BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB.as_slice(),
         &[],
     )))
 });
@@ -670,12 +653,24 @@ fn build_function_support(builtins: &[String], user: &[String]) -> FunctionSuppo
     FunctionSupport::new(Some(FunctionRestriction::Deny(denied)), None, None)
 }
 
+/// Drop from a deny-list any function a backend can execute natively (the
+/// `native` names, typically derived from that backend's unparser dialect).
+///
+/// A Spice-specific function that the backend's dialect can rewrite into a real
+/// remote function — e.g. `cosine_distance` → `array_cosine_distance`, or `rand`
+/// → `random()` for `DuckDB` — should be federated, not denied. Names in
+/// `native` that aren't in the deny-list are ignored.
+fn deny_list_excluding_native(deny: &[String], native: &[&str]) -> Vec<String> {
+    let native: HashSet<&str> = native.iter().copied().collect();
+    deny.iter()
+        .filter(|name| !native.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn rebuild_deny_lists(user: &[String]) {
     let combined = build_function_support(BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(), user);
     *DENY_LIST.write() = Arc::new(combined);
-    let combined_duckdb =
-        build_function_support(BUILTIN_DENIED_SPICE_FUNCTION_NAMES_DUCKDB.as_slice(), user);
-    *DENY_LIST_DUCKDB.write() = Arc::new(combined_duckdb);
 }
 
 /// Add a user function name to the federation deny-list. Idempotent.
@@ -754,13 +749,44 @@ pub fn deny_spice_specific_functions() -> Arc<FunctionSupport> {
     Arc::clone(&*DENY_LIST.read())
 }
 
-/// Return the current [`FunctionSupport`] for `DuckDB` accelerators.
+/// Return a backend-specific federation deny-list: the default deny-list with
+/// the `native` functions removed so they federate (push down) instead.
 ///
-/// Identical to [`deny_spice_specific_functions`] except `cosine_distance` is
-/// allowed (`DuckDB` translates it to `array_cosine_distance`).
+/// `native` is the set of functions the target backend can execute itself,
+/// typically obtained from that backend's unparser dialect (e.g.
+/// [`crate::datafusion::dialect::duckdb_native_function_names`]). This is how the
+/// deny-list becomes connector/accelerator-aware: each backend only denies the
+/// Spice functions it genuinely can't run, and pushes down the ones its dialect
+/// can rewrite into a real remote function. Names in `native` that aren't in the
+/// deny-list are ignored. User-registered functions are always denied — no
+/// remote backend has a built-in equivalent for them — so only the built-in
+/// Spice functions are eligible for the carve-out.
+///
+/// Returns the cached default list when `native` is empty.
+#[must_use]
+pub fn deny_spice_specific_functions_excluding(native: &[&str]) -> Arc<FunctionSupport> {
+    if native.is_empty() {
+        return deny_spice_specific_functions();
+    }
+    let builtins =
+        deny_list_excluding_native(BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(), native);
+    let user = USER_FUNCTION_NAMES.read().clone();
+    Arc::new(build_function_support(&builtins, &user))
+}
+
+/// Return the [`FunctionSupport`] for `DuckDB` connectors and accelerators.
+///
+/// Identical to [`deny_spice_specific_functions`] except it allows every
+/// function the `DuckDB` unparser dialect can rewrite into native `DuckDB` SQL
+/// (e.g. `cosine_distance` → `array_cosine_distance`, `rand` → `random()`). The
+/// allowed set is derived from
+/// [`crate::datafusion::dialect::duckdb_native_function_names`] so it tracks the
+/// dialect automatically.
 #[must_use]
 pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
-    Arc::clone(&*DENY_LIST_DUCKDB.read())
+    deny_spice_specific_functions_excluding(
+        &crate::datafusion::dialect::duckdb_native_function_names(),
+    )
 }
 
 fn json_functions() -> Vec<String> {
@@ -1071,5 +1097,113 @@ mod tests {
                 "{name} should be denied by deny_spice_specific_functions"
             );
         }
+    }
+
+    /// Build a no-arg scalar-function expression with the given name so we can
+    /// probe a [`FunctionSupport`] by name regardless of the real UDF impl.
+    fn make_named_expr(name: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(stub_scalar_udf(name)),
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn duckdb_deny_list_allows_dialect_native_functions() {
+        // The DuckDB unparser dialect rewrites these into native DuckDB SQL
+        // (cosine_distance -> array_cosine_distance, inner_product ->
+        // array_inner_product, rand -> random()), so they must federate rather
+        // than be denied. Note `rand` is allowed purely by virtue of being in the
+        // dialect — no manual carve-out.
+        let support = deny_spice_functions_for_duckdb();
+        for name in [COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"] {
+            assert!(
+                support.supports(&make_named_expr(name)),
+                "{name} has a native DuckDB equivalent and should be pushed down"
+            );
+        }
+        // No native DuckDB equivalent — must stay denied.
+        let json_name = json_get_str_udf().name().to_string();
+        for name in [EMBED_UDF_NAME, json_name.as_str()] {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} has no native DuckDB equivalent and must stay denied"
+            );
+        }
+    }
+
+    #[test]
+    fn default_deny_list_denies_every_builtin() {
+        // Exhaustive "cannot push down" coverage: with no backend carve-out, the
+        // generic deny-list must block EVERY Spice-specific built-in (including
+        // functions a specific dialect could otherwise push down, e.g.
+        // cosine_distance / rand).
+        let support = deny_spice_specific_functions();
+        for name in BUILTIN_DENIED_SPICE_FUNCTION_NAMES.iter() {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} must be denied by the default (backend-agnostic) deny-list"
+            );
+        }
+    }
+
+    #[test]
+    fn excluding_subtracts_only_listed_native_functions() {
+        let support = deny_spice_specific_functions_excluding(&[COSINE_DISTANCE_UDF_NAME]);
+        assert!(
+            support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)),
+            "explicitly-excluded cosine_distance should be allowed"
+        );
+        assert!(
+            !support.supports(&make_named_expr("rand")),
+            "rand was not excluded and must stay denied"
+        );
+        // An empty exclusion behaves exactly like the default deny-list.
+        let default_support = deny_spice_specific_functions_excluding(&[]);
+        assert!(!default_support.supports(&make_named_expr(COSINE_DISTANCE_UDF_NAME)));
+    }
+
+    #[test]
+    fn duckdb_carveout_tracks_the_dialect() {
+        // Regression guard: the DuckDB allow-state of every built-in deny-listed
+        // function must match exactly what the DuckDB dialect can unparse, so the
+        // dialect and the deny-list can never drift.
+        let native: HashSet<&str> = crate::datafusion::dialect::duckdb_native_function_names()
+            .into_iter()
+            .collect();
+        let support = deny_spice_functions_for_duckdb();
+        for denied in BUILTIN_DENIED_SPICE_FUNCTION_NAMES.iter() {
+            let expected_allowed = native.contains(denied.as_str());
+            assert_eq!(
+                support.supports(&make_named_expr(denied)),
+                expected_allowed,
+                "{denied}: DuckDB allow-state must match dialect native support"
+            );
+        }
+    }
+
+    #[test]
+    fn duckdb_pushable_set_is_exactly_the_dialect_natives() {
+        // Pin the exact set of deny-listed Spice functions that CAN be pushed
+        // down to DuckDB. Everything else in the deny-list CANNOT. This makes the
+        // can/can't partition explicit: if a dialect change makes another Spice
+        // function pushable (or stops one), this test must be updated on purpose.
+        //
+        // `cosine_distance` -> array_cosine_distance, `inner_product` ->
+        // array_inner_product, `rand` -> random(). (Note: l2 distance federates
+        // via the non-deny-listed `array_distance` UDF, so it isn't part of this
+        // deny-list carve-out.)
+        use std::collections::BTreeSet;
+        let support = deny_spice_functions_for_duckdb();
+        let pushable: BTreeSet<&str> = BUILTIN_DENIED_SPICE_FUNCTION_NAMES
+            .iter()
+            .filter(|name| support.supports(&make_named_expr(name)))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            pushable,
+            BTreeSet::from([COSINE_DISTANCE_UDF_NAME, INNER_PRODUCT_UDF_NAME, "rand"]),
+            "unexpected change to the set of Spice functions pushable to DuckDB"
+        );
     }
 }
