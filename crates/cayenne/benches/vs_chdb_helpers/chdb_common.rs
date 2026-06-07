@@ -230,7 +230,9 @@ pub fn setup_chdb_with_schema(
     // counterpart to a DuckDB table / a Cayenne Vortex table for a scan bench.
     session
         .execute(
-            &format!("CREATE TABLE {table_name} ({columns}) ENGINE = MergeTree() ORDER BY {order_by}"),
+            &format!(
+                "CREATE TABLE {table_name} ({columns}) ENGINE = MergeTree() ORDER BY {order_by}"
+            ),
             None,
         )
         .expect("chdb create table");
@@ -241,9 +243,7 @@ pub fn setup_chdb_with_schema(
     let parquet_display = parquet_path.to_string_lossy();
     session
         .execute(
-            &format!(
-                "INSERT INTO {table_name} SELECT * FROM file('{parquet_display}', 'Parquet')"
-            ),
+            &format!("INSERT INTO {table_name} SELECT * FROM file('{parquet_display}', 'Parquet')"),
             None,
         )
         .expect("chdb insert from parquet");

@@ -46,10 +46,10 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 
-#[path = "vs_duckdb_helpers/common.rs"]
-mod common;
 #[path = "vs_chdb_helpers/chdb_common.rs"]
 mod chdb_common;
+#[path = "vs_duckdb_helpers/common.rs"]
+mod common;
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -207,7 +207,9 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
         drop(bg);
         drop(fixture);
         let merges = merges_counter.load(Ordering::Relaxed);
-        eprintln!("vs_chdb_scan_under_compaction: {lane_label} background subset merges = {merges}");
+        eprintln!(
+            "vs_chdb_scan_under_compaction: {lane_label} background subset merges = {merges}"
+        );
         assert!(
             merges > 0,
             "{lane_label}: background compactor never merged — the bench did not \
@@ -244,7 +246,9 @@ fn bench_scan_under_compaction(c: &mut Criterion) {
     });
 
     let optimize_count = optimizes.load(Ordering::Relaxed);
-    eprintln!("vs_chdb_scan_under_compaction: chdb interleaved OPTIMIZE FINAL passes = {optimize_count}");
+    eprintln!(
+        "vs_chdb_scan_under_compaction: chdb interleaved OPTIMIZE FINAL passes = {optimize_count}"
+    );
     assert!(
         optimize_count > 0,
         "chdb: no OPTIMIZE FINAL ran — the bench did not measure scan-under-maintenance"
