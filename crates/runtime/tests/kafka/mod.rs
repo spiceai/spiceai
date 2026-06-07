@@ -153,9 +153,9 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
 
     test_request_context()
         .scope(async {
+            const TEST_PORT: u16 = 19094;
             let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, &["fetch_latest_tombstone_test"]).await?;
-
+                start_kafka_docker_container(TEST_PORT, &["fetch_latest_tombstone_test"]).await?;
             // Send two normal messages followed by a tombstone on the tail.
             let messages: Vec<serde_json::Value> = vec![
                 json!({"id": 1, "schema": "v1"}),
@@ -165,7 +165,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
             send_tombstone_to_kafka(&producer, "fetch_latest_tombstone_test", 0, "key3").await?;
 
             let kafka_config = KafkaConfig {
-                brokers: format!("localhost:{KAFKA_PORT}"),
+                brokers: format!("localhost:{TEST_PORT}"),
                 security_protocol: "SASL_PLAINTEXT".to_string(),
                 sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
                 sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
