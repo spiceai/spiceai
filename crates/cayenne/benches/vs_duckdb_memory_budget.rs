@@ -135,7 +135,14 @@ impl HighWaterPool {
     }
 
     fn reset_high_water(&self) {
-        self.high_water.store(0, Ordering::Relaxed);
+        // Seed with the CURRENT reservation, not 0: the high-water only
+        // advances on grow/try_grow, so a pool holding steady-state
+        // reservations that don't grow further during the measured window
+        // would otherwise read 0 — hiding held memory (e.g. table-side
+        // caches sized during a pre-flight upsert and retained across the
+        // timed iterations).
+        self.high_water
+            .store(self.inner.reserved(), Ordering::Relaxed);
     }
 }
 
