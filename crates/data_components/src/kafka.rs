@@ -783,9 +783,8 @@ impl KafkaConsumer {
                         Ok(Some(Err(e))) => {
                             return Err(Error::UnableToReceiveMessage { source: e });
                         }
-                        Ok(None) => break,
-                        Err(_) if Instant::now() < deadline => continue,
-                        Err(_) => break,
+                        Err(_) if Instant::now() < deadline => {}
+                        Ok(None) | Err(_) => break,
                     }
                 }
 
