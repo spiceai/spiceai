@@ -25,6 +25,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{Field, Schema};
 use arrow_tools::record_batch::try_cast_to;
 use chbench_driver::ChBenchDriver;
@@ -178,11 +179,34 @@ pub async fn verify_analytical_results(
             }
         };
 
-        let outcome = match validate_with_expected_batches(query.name.as_ref(), &actual, &expected)
-        {
-            Ok(QueryValidationResult::Pass) => Outcome::Pass,
-            Ok(QueryValidationResult::Fail(reason)) => Outcome::Fail(format!("{reason:?}")),
-            Err(e) => Outcome::Fail(e.to_string()),
+        // Several benchmark queries have non-determenistic row order. Sort both sides by every column so comparison is set-based.
+        let (expected_sorted, actual_sorted) = match sort_for_comparison(&expected, &actual) {
+            Ok(pair) => pair,
+            Err(e) => {
+                results.push(AnalyticalQueryResult {
+                    name: query.name.to_string(),
+                    outcome: Outcome::Fail(format!("sort error: {e}")),
+                });
+                continue;
+            }
+        };
+
+        let outcome = if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
+            Outcome::Pass
+        } else {
+            match validate_with_expected_batches(
+                query.name.as_ref(),
+                &actual_sorted,
+                &expected_sorted,
+            ) {
+                Ok(QueryValidationResult::Pass) => Outcome::Pass,
+                Ok(QueryValidationResult::Fail(reason)) => Outcome::Fail(format!(
+                    "{reason:?} (source rows={}, spice rows={})",
+                    total_rows(&expected_sorted),
+                    total_rows(&actual_sorted),
+                )),
+                Err(e) => Outcome::Fail(e.to_string()),
+            }
         };
 
         results.push(AnalyticalQueryResult {
@@ -250,4 +274,43 @@ fn align_to_expected_schema(
         .iter()
         .map(|batch| try_cast_to(batch.clone(), Arc::clone(&target_schema)).map_err(Into::into))
         .collect()
+}
+
+/// Concatenate each side into a single batch and lex-sort both by every projected column.
+fn sort_for_comparison(
+    expected: &[RecordBatch],
+    actual: &[RecordBatch],
+) -> anyhow::Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    Ok((sort_all_columns(expected)?, sort_all_columns(actual)?))
+}
+
+fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn sort_all_columns(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>> {
+    let Some(schema) = batches.first().map(RecordBatch::schema) else {
+        return Ok(vec![]);
+    };
+    let combined = concat_batches(&schema, batches)?;
+    if combined.num_rows() < 2 {
+        return Ok(vec![combined]);
+    }
+
+    let sort_columns: Vec<SortColumn> = combined
+        .columns()
+        .iter()
+        .map(|c| SortColumn {
+            values: Arc::clone(c),
+            options: None,
+        })
+        .collect();
+    let indices = lexsort_to_indices(&sort_columns, None)?;
+    let new_columns = combined
+        .columns()
+        .iter()
+        .map(|c| take(c, &indices, None))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(vec![RecordBatch::try_new(schema, new_columns)?])
 }

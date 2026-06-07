@@ -219,8 +219,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // Calculate analytical throughput — QPH (queries per hour).
     let completed_queries: usize = metrics.metrics.iter().map(|q| q.iterations).sum();
-    #[expect(clippy::cast_precision_loss)]
-    let elapsed_secs = metrics.finished_at.saturating_sub(metrics.started_at) as f64 / 1000.0;
+    let elapsed = Duration::from_millis(
+        u64::try_from(metrics.finished_at.saturating_sub(metrics.started_at)).unwrap_or(0),
+    );
+    let elapsed_secs = elapsed.as_secs_f64();
     #[expect(clippy::cast_precision_loss)]
     let qph = if elapsed_secs > 0.0 {
         completed_queries as f64 / elapsed_secs * 3600.0
