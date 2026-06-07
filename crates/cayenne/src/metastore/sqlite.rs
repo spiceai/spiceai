@@ -44,7 +44,13 @@ const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 /// because it drained half a gigabyte. A small cap keeps both costs low: frequent
 /// background TRUNCATEs of a small WAL are cheap, acquisitions stay fast, and the
 /// hot COMMIT path still never checkpoints (the A2 invariant).
-const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 48 * 1024 * 1024;
+const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 160 * 1024 * 1024;
+// cycle-10 CORRECTION to the 48 MiB rationale above: benchmarked 48 MiB showed the
+// large-WAL acquisition tax was NOT the held-time driver (WAL max 369->77 MB yet
+// writer_held ROSE 219->307 ms) — the frequent TRUNCATEs each briefly block
+// writers, so a tiny cap is read-friendly but write-hostile (QPH 4,261->6,445
+// while CDC lag regressed). 160 MiB sits between the measured brackets:
+// TRUNCATEs ~3x rarer than 48 MiB, WAL stays modest for readers.
 
 /// `auto_vacuum` mode for the metastore DB.
 ///
