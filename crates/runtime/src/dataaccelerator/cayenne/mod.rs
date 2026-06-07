@@ -540,9 +540,7 @@ impl CayenneAccelerator {
             // network storage; larger files improve scan throughput on RAM-backed
             // mounts. Skipped for S3, where the engine default is kept. An
             // explicit operator value (or `auto`) is then applied on top.
-            if !is_s3
-                && let Some(size_mb) = hw.target_file_size_mb_override()
-            {
+            if !is_s3 && let Some(size_mb) = hw.target_file_size_mb_override() {
                 config.target_vortex_file_size_mb = size_mb;
             }
             config.target_vortex_file_size_mb = autotune::auto_or_usize(
@@ -792,6 +790,23 @@ impl CayenneAccelerator {
                 );
             }
             config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+            // `adaptive` depends on extended schema inference: the closed loop's
+            // data-aware warm-start (keyset sized to cardinality, memtable rows to
+            // real row width) needs the inferred `row_count`/`table_bytes`, which
+            // are present only when `schema_inference: extended` ran. Without them
+            // the loop would start blind, so fall back to `auto` (static) and tell
+            // the operator how to enable it. (`row_count`/`table_bytes` come ONLY
+            // from extended inference — unlike PK, which can also come from
+            // constraints — so they are the right signal to gate on.)
+            if config.dynamic_tuning
+                && workload.row_count.is_none()
+                && workload.table_bytes.is_none()
+            {
+                tracing::warn!(
+                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred cardinality/size for its warm-start), but no inferred schema was found; falling back to 'auto' (static). Set `schema_inference: extended` to enable adaptive tuning."
+                );
+                config.dynamic_tuning = false;
+            }
             config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
                 inline_flush: autotune::is_pinned(
                     acceleration,
@@ -1247,7 +1262,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
+            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
     ],
@@ -2863,7 +2878,6 @@ mod tests {
         assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
         assert!((16..=256).contains(&config.inline_flush_max_segments));
     }
-
 
     #[tokio::test]
     async fn test_vortex_config_defaults_use_large_write_refresh_profile() {

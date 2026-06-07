@@ -283,8 +283,10 @@ pub(crate) struct WorkloadProfile {
 
 impl WorkloadProfile {
     /// A profile with no data/schema signals — every derivation falls back to the
-    /// hardware-only default. Used by callers without inferred schema and by the
-    /// hardware-axis tests.
+    /// hardware-only default. A test convenience (the production paths always go
+    /// through [`Self::from_inferred`], which degrades to the same result when no
+    /// schema was inferred), so it is gated to test builds.
+    #[cfg(test)]
     #[must_use]
     pub fn hardware_only(small_write: bool) -> Self {
         Self {
@@ -434,7 +436,10 @@ mod tests {
     fn knob_unset_is_auto() {
         let accel = accel_with(&[]);
         assert_eq!(read_knob(&accel, &["cayenne_segment_cache_mb"]), Knob::Auto);
-        assert_eq!(auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256), 256);
+        assert_eq!(
+            auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256),
+            256
+        );
     }
 
     #[test]
@@ -461,7 +466,10 @@ mod tests {
             read_knob(&accel, &["cayenne_segment_cache_mb"]),
             Knob::Set(777)
         );
-        assert_eq!(auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256), 777);
+        assert_eq!(
+            auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256),
+            777
+        );
     }
 
     #[test]
@@ -469,7 +477,10 @@ mod tests {
         // `0` is a meaningful value for several knobs (disable inlining, disable
         // background compaction); it must reach the call site, not become auto.
         let accel = accel_with(&[("cayenne_inline_max_rows", "0")]);
-        assert_eq!(read_knob(&accel, &["cayenne_inline_max_rows"]), Knob::Set(0));
+        assert_eq!(
+            read_knob(&accel, &["cayenne_inline_max_rows"]),
+            Knob::Set(0)
+        );
         assert_eq!(auto_or_usize(&accel, &["cayenne_inline_max_rows"], 1024), 0);
     }
 
@@ -477,7 +488,10 @@ mod tests {
     fn knob_invalid_falls_back_to_auto() {
         let accel = accel_with(&[("cayenne_segment_cache_mb", "lots")]);
         assert_eq!(read_knob(&accel, &["cayenne_segment_cache_mb"]), Knob::Auto);
-        assert_eq!(auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256), 256);
+        assert_eq!(
+            auto_or_usize(&accel, &["cayenne_segment_cache_mb"], 256),
+            256
+        );
     }
 
     #[test]
@@ -499,7 +513,11 @@ mod tests {
     fn auto_or_u64_and_i64_resolve() {
         let auto = accel_with(&[("cayenne_compaction_background_interval_ms", "auto")]);
         assert_eq!(
-            auto_or_u64(&auto, &["cayenne_compaction_background_interval_ms"], 30_000),
+            auto_or_u64(
+                &auto,
+                &["cayenne_compaction_background_interval_ms"],
+                30_000
+            ),
             30_000
         );
         let set = accel_with(&[("cayenne_compaction_background_interval_ms", "5000")]);
@@ -508,7 +526,10 @@ mod tests {
             5_000
         );
         let i = accel_with(&[("cayenne_inline_flush_max_bytes", "auto")]);
-        assert_eq!(auto_or_i64(&i, &["cayenne_inline_flush_max_bytes"], 999), 999);
+        assert_eq!(
+            auto_or_i64(&i, &["cayenne_inline_flush_max_bytes"], 999),
+            999
+        );
     }
 
     // ---- pk_keyset_cache_mb -----------------------------------------------
@@ -680,7 +701,10 @@ mod tests {
         let mid = caps(4 * GIB, ResolvedAccelerationStorage::Ebs);
         assert_eq!(mid.max_bytes, 33_554_432); // 32 MiB
         assert_eq!(mid.max_rows, mid.max_bytes / 1024);
-        assert_eq!(mid.max_segments, (mid.max_bytes / (128 * 1024)).clamp(16, 256));
+        assert_eq!(
+            mid.max_segments,
+            (mid.max_bytes / (128 * 1024)).clamp(16, 256)
+        );
     }
 
     #[test]
@@ -778,37 +802,37 @@ mod tests {
                     for &meta in &storages {
                         let hw = HardwareProfile::new(c, m, data, meta);
                         for wl in &workloads {
-                        let keyset = hw.pk_keyset_cache_mb(wl);
-                        assert!(
-                            (256..=8 * 1024).contains(&keyset),
-                            "keyset {keyset} out of bounds for {hw:?}"
-                        );
+                            let keyset = hw.pk_keyset_cache_mb(wl);
+                            assert!(
+                                (256..=8 * 1024).contains(&keyset),
+                                "keyset {keyset} out of bounds for {hw:?}"
+                            );
 
-                        let segment = hw.segment_cache_mb();
-                        assert!(
-                            (256..=1024).contains(&segment),
-                            "segment {segment} out of bounds for {hw:?}"
-                        );
+                            let segment = hw.segment_cache_mb();
+                            assert!(
+                                (256..=1024).contains(&segment),
+                                "segment {segment} out of bounds for {hw:?}"
+                            );
 
-                        let caps = hw.inline_flush_caps(wl);
-                        assert!(
-                            (FLOOR_FLUSH_BYTES..=256 * 1_048_576).contains(&caps.max_bytes),
-                            "flush bytes {} out of bounds for {hw:?}",
-                            caps.max_bytes
-                        );
-                        assert!((16..=256).contains(&caps.max_segments));
-                        assert!(caps.max_rows >= FLOOR_FLUSH_ROWS);
+                            let caps = hw.inline_flush_caps(wl);
+                            assert!(
+                                (FLOOR_FLUSH_BYTES..=256 * 1_048_576).contains(&caps.max_bytes),
+                                "flush bytes {} out of bounds for {hw:?}",
+                                caps.max_bytes
+                            );
+                            assert!((16..=256).contains(&caps.max_segments));
+                            assert!(caps.max_rows >= FLOOR_FLUSH_ROWS);
 
-                        // Storage-aware file-size override is well-defined.
-                        match data {
-                            ResolvedAccelerationStorage::Ebs => {
-                                assert_eq!(hw.target_file_size_mb_override(), Some(256));
+                            // Storage-aware file-size override is well-defined.
+                            match data {
+                                ResolvedAccelerationStorage::Ebs => {
+                                    assert_eq!(hw.target_file_size_mb_override(), Some(256));
+                                }
+                                ResolvedAccelerationStorage::Tmpfs => {
+                                    assert_eq!(hw.target_file_size_mb_override(), Some(64));
+                                }
+                                _ => assert_eq!(hw.target_file_size_mb_override(), None),
                             }
-                            ResolvedAccelerationStorage::Tmpfs => {
-                                assert_eq!(hw.target_file_size_mb_override(), Some(64));
-                            }
-                            _ => assert_eq!(hw.target_file_size_mb_override(), None),
-                        }
                         }
                     }
                 }

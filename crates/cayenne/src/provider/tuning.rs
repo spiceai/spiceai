@@ -385,7 +385,8 @@ impl LiveKnobs {
         self.inline_flush_max_segments.load(Ordering::Relaxed)
     }
     pub fn compaction_background_interval_ms(&self) -> u64 {
-        self.compaction_background_interval_ms.load(Ordering::Relaxed)
+        self.compaction_background_interval_ms
+            .load(Ordering::Relaxed)
     }
     pub fn compaction_trigger_files(&self) -> usize {
         self.compaction_trigger_files.load(Ordering::Relaxed)
@@ -406,7 +407,8 @@ impl LiveKnobs {
                 let rows = (adj.new_value / 1024).max(64) as i64;
                 let segs = (adj.new_value / (128 * 1024)).clamp(16, 256) as i64;
                 self.inline_flush_max_rows.store(rows, Ordering::Relaxed);
-                self.inline_flush_max_segments.store(segs, Ordering::Relaxed);
+                self.inline_flush_max_segments
+                    .store(segs, Ordering::Relaxed);
             }
             Knob::CompactionIntervalMs => {
                 self.compaction_background_interval_ms
@@ -666,12 +668,20 @@ fn ewma(slot: &mut f64, sample: f64, prior_samples: u64) {
     }
 }
 
-#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn scale_u64(v: u64, factor: f64) -> u64 {
     ((v as f64) * factor).round() as u64
 }
 
-#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 fn scale_usize(v: usize, factor: f64) -> usize {
     ((v as f64) * factor).round() as usize
 }
@@ -711,7 +721,13 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    fn sample(rows: u64, apply_ms: u64, publish_ms: u64, encode_ms: u64, gap_ms: u64) -> WriteSample {
+    fn sample(
+        rows: u64,
+        apply_ms: u64,
+        publish_ms: u64,
+        encode_ms: u64,
+        gap_ms: u64,
+    ) -> WriteSample {
         WriteSample {
             rows,
             bytes: rows * 256,
@@ -763,7 +779,10 @@ mod tests {
             "rows/s ~10000, got {}",
             s.rows_per_sec
         );
-        assert!(s.apply_vs_arrival < 0.5, "20ms apply vs 100ms gap → keeping up");
+        assert!(
+            s.apply_vs_arrival < 0.5,
+            "20ms apply vs 100ms gap → keeping up"
+        );
         assert_eq!(stats.total_rows.load(Ordering::Relaxed), 20_000);
         assert_eq!(stats.total_batches.load(Ordering::Relaxed), 20);
     }

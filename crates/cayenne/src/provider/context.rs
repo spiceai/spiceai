@@ -455,8 +455,9 @@ impl CayenneContext {
         // the loop closes on memory as well as ingest/query behavior.
         tuning::sample_mem_pressure(&self.ingest_stats);
         let now = std::time::Instant::now();
-        let since_last = (*self.last_adjust.lock())
-            .map_or(std::time::Duration::MAX, |t| now.saturating_duration_since(t));
+        let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
+            now.saturating_duration_since(t)
+        });
         let snapshot = self.ingest_stats.snapshot();
         let adj = tuning::decide(
             &snapshot,
