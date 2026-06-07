@@ -259,15 +259,22 @@ impl TursoMetastore {
     /// Combined with the delete's sequence number, this enables ordering:
     /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
+    ///
+    /// Keyed directly on `(table_id, pk_bytes)` as a `WITHOUT ROWID`
+    /// composite primary key. The only access paths are `WHERE table_id = ?`
+    /// (leading-prefix scan) and the `INSERT OR REPLACE` upsert on
+    /// `(table_id, pk_bytes)`; both are served by the composite PK. The
+    /// previous never-read `insert_record_id` UUID `TEXT PRIMARY KEY` (plus a
+    /// redundant `UNIQUE(table_id, pk_bytes)`) is dropped (see `init_schema`
+    /// for the legacy-schema migration).
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id TEXT PRIMARY KEY,
             table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, pk_bytes)
-        )
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
     ";
 
     /// Schema for the `cayenne_snapshot_sequence` table.
@@ -563,6 +570,62 @@ impl MetastoreBackend for TursoMetastore {
                 .map_err(|e| CatalogError::Database {
                     message: format!("Failed to backfill inlined-delete published flag: {e}"),
                 })?;
+        }
+
+        // Migrate a legacy `cayenne_insert_record` (UUID `insert_record_id` TEXT
+        // PRIMARY KEY + redundant `UNIQUE(table_id, pk_bytes)`) to the `WITHOUT
+        // ROWID` composite-PK schema. The `CREATE TABLE IF NOT EXISTS` above
+        // leaves a pre-existing table untouched, so detect the old layout here and
+        // copy its rows forward. The table is ephemeral (cleared at every
+        // checkpoint and recoverable from the snapshot), but we copy the
+        // (table_id, pk_bytes, sequence_number) rows forward to preserve any
+        // in-flight pre-checkpoint re-insert sequences across the upgrade.
+        let mut ir_cols = conn
+            .query("PRAGMA table_info('cayenne_insert_record')", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to read cayenne_insert_record schema for migration: {e}"),
+            })?;
+        let mut has_legacy_uuid_column = false;
+        loop {
+            match ir_cols.next().await {
+                // Column name is at index 1 of PRAGMA table_info.
+                Ok(Some(row)) => {
+                    if let Ok(turso::Value::Text(name)) = row.get_value(1) {
+                        if name == "insert_record_id" {
+                            has_legacy_uuid_column = true;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(CatalogError::Database {
+                        message: format!(
+                            "Failed to read cayenne_insert_record schema for migration: {e}"
+                        ),
+                    });
+                }
+            }
+        }
+        drop(ir_cols);
+        if has_legacy_uuid_column {
+            conn.execute_batch(
+                "CREATE TABLE cayenne_insert_record_new (
+                    table_id TEXT NOT NULL,
+                    pk_bytes BLOB NOT NULL,
+                    sequence_number BIGINT NOT NULL,
+                    FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+                    PRIMARY KEY (table_id, pk_bytes)
+                ) WITHOUT ROWID;
+                INSERT OR REPLACE INTO cayenne_insert_record_new (table_id, pk_bytes, sequence_number)
+                    SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record;
+                DROP TABLE cayenne_insert_record;
+                ALTER TABLE cayenne_insert_record_new RENAME TO cayenne_insert_record;",
+            )
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to migrate cayenne_insert_record to WITHOUT ROWID: {e}"),
+            })?;
         }
 
         // Must run AFTER the `published` column migration above: the partial index

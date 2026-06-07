@@ -24,8 +24,9 @@
 //! 1. `begin_transaction()` — `BEGIN IMMEDIATE` (one `conn.call` round-trip).
 //! 2. delete-file rows, chunked by `MAX_PARAMS/9` (multi-VALUES `INSERT … ON
 //!    CONFLICT … DO UPDATE`).
-//! 3. insert-record rows, chunked by `MAX_PARAMS/4 = 8000` (multi-VALUES
-//!    `INSERT OR REPLACE INTO cayenne_insert_record`). One UUID minted per row.
+//! 3. insert-record rows, chunked by `MAX_PARAMS/3 = 10666` (multi-VALUES
+//!    `INSERT OR REPLACE INTO cayenne_insert_record`, keyed on the
+//!    `(table_id, pk_bytes)` WITHOUT ROWID composite PK).
 //! 4. snapshot-sequence (single `INSERT OR REPLACE`).
 //! 5. inline tombstone (single `INSERT INTO cayenne_inlined_delete`, ~1-3 MB
 //!    `delete_ipc` BLOB).
@@ -47,13 +48,13 @@
 //!   begin, delete-files, insert-records, snapshot, tombstone, commit.
 //! - `insert_records_only/keys=N` — just the insert-record chunks inside a txn
 //!   (the suspected volume driver), to see the scaling shape.
-//! - `prepare_cache/{aligned,tail}` — fixed 8000-row chunks (prepare_cached
+//! - `prepare_cache/{aligned,tail}` — fixed full-size chunks (prepare_cached
 //!   HIT) vs an odd tail-chunk size (prepare_cached MISS → re-parse of a giant
 //!   multi-VALUES statement).
 //! - `index_growth/{empty,preloaded}` — INSERT OR REPLACE into an empty
 //!   `cayenne_insert_record` vs one pre-loaded with 200K rows (the
-//!   between-checkpoint accumulation: the `UNIQUE(table_id, pk_bytes)` index is
-//!   only cleared by `clear_insert_records` at checkpoint).
+//!   between-checkpoint accumulation: the `(table_id, pk_bytes)` composite-PK
+//!   B-tree is only cleared by `clear_insert_records` at checkpoint).
 //!
 //! `cargo bench --bench folded_txn_decomposition -p cayenne`.
 
@@ -98,8 +99,8 @@ const PK_KEY_BYTES: usize = 16;
 
 /// `cayenne_catalog` chunking constants (mirrored verbatim).
 const MAX_PARAMS: usize = 32_000;
-const INSERT_RECORD_PARAMS_PER_ROW: usize = 4;
-const MAX_INSERT_RECORD_ROWS_PER_CHUNK: usize = MAX_PARAMS / INSERT_RECORD_PARAMS_PER_ROW; // 8000
+const INSERT_RECORD_PARAMS_PER_ROW: usize = 3;
+const MAX_INSERT_RECORD_ROWS_PER_CHUNK: usize = MAX_PARAMS / INSERT_RECORD_PARAMS_PER_ROW; // 10666
 const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
 const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
@@ -168,17 +169,16 @@ fn build_insert_records_chunk_sql(
     sequence_number: i64,
 ) -> (String, Vec<MetastoreValue>) {
     const PREFIX: &str = "INSERT OR REPLACE INTO cayenne_insert_record \
-         (insert_record_id, table_id, pk_bytes, sequence_number) VALUES ";
-    let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 32);
+         (table_id, pk_bytes, sequence_number) VALUES ";
+    let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 28);
     sql.push_str(PREFIX);
-    let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
+    let mut params = Vec::with_capacity(pk_bytes_list.len() * 3);
     for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
-        let base = i * 4 + 1;
+        let base = i * 3 + 1;
         if i > 0 {
             sql.push_str(", ");
         }
-        let _ = write!(sql, "(?{}, ?{}, ?{}, ?{})", base, base + 1, base + 2, base + 3);
-        params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+        let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
         params.push(MetastoreValue::Text(TABLE_ID.to_string()));
         params.push(MetastoreValue::Blob(pk_bytes.clone()));
         params.push(MetastoreValue::Integer(sequence_number));
@@ -250,7 +250,7 @@ async fn run_folded_per_statement(
             .expect("delete files");
     }
 
-    // insert-record chunks (8000 rows each)
+    // insert-record chunks (MAX_INSERT_RECORD_ROWS_PER_CHUNK = 10666 rows each)
     for chunk in keys.chunks(MAX_INSERT_RECORD_ROWS_PER_CHUNK) {
         let (sql, params) = build_insert_records_chunk_sql(chunk, insert_seq);
         tx.execute(ExecuteParams { sql: &sql, params })
@@ -319,17 +319,16 @@ async fn run_one_closure_batch(
         );
     }
 
-    // insert-record rows — ONE multi-VALUES statement (no 8000-row chunking
-    // needed: literals carry no bind-param budget), matching the fix's intent.
+    // insert-record rows — ONE multi-VALUES statement (no chunking needed:
+    // literals carry no bind-param budget), matching the fix's intent.
     sql.push_str(
-        "INSERT OR REPLACE INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) VALUES ",
+        "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ",
     );
     for (i, key) in keys.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        let id = uuid::Uuid::now_v7();
-        let _ = write!(sql, "('{id}', '{TABLE_ID}', x'");
+        let _ = write!(sql, "('{TABLE_ID}', x'");
         for b in key {
             let _ = write!(sql, "{b:02x}");
         }
@@ -556,11 +555,12 @@ fn bench_decompose(c: &mut Criterion) {
 }
 
 /// `prepare_cached` effect: the production path chunks insert-records by exactly
-/// 8000 rows, so every FULL chunk re-uses a cached prepared statement after the
-/// first burst, but the TAIL chunk's row count varies per burst → cache miss →
-/// re-parse of a multi-VALUES statement with up to ~32K placeholders. This lane
-/// contrasts an aligned (all-8000) burst with one whose only chunk is an odd
-/// size that changes every iteration (forcing a re-parse each time).
+/// `MAX_INSERT_RECORD_ROWS_PER_CHUNK` (10666) rows, so every FULL chunk re-uses a
+/// cached prepared statement after the first burst, but the TAIL chunk's row
+/// count varies per burst → cache miss → re-parse of a multi-VALUES statement
+/// with up to ~32K placeholders. This lane contrasts an aligned (all-full-chunk)
+/// burst with one whose only chunk is an odd size that changes every iteration
+/// (forcing a re-parse each time).
 fn bench_prepare_cache(c: &mut Criterion) {
     apply_runtime_pragmas();
     let rt = Runtime::new().expect("runtime");
@@ -569,7 +569,7 @@ fn bench_prepare_cache(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(10));
 
-    // Aligned: exactly one full 8000-row chunk every iteration (same SQL text ⇒
+    // Aligned: exactly one full-size chunk every iteration (same SQL text ⇒
     // prepare_cached HIT after iteration 1).
     let aligned_keys = make_keys(MAX_INSERT_RECORD_ROWS_PER_CHUNK);
     group.bench_function("aligned_8000", |b| {
@@ -623,8 +623,8 @@ fn bench_prepare_cache(c: &mut Criterion) {
 
 /// Index-growth effect: `cayenne_insert_record` accumulates rows between
 /// checkpoints (only `clear_insert_records` empties it). Each INSERT OR REPLACE
-/// probes the `UNIQUE(table_id, pk_bytes)` index, so a large resident index
-/// raises per-row cost. This lane inserts a fixed 20K-row burst into (a) an
+/// probes the `(table_id, pk_bytes)` composite-PK B-tree, so a large resident
+/// table raises per-row cost. This lane inserts a fixed 20K-row burst into (a) an
 /// empty table and (b) a table pre-loaded with 200K committed rows that are NOT
 /// cleared between iterations (distinct key ranges so no REPLACE collisions).
 fn bench_index_growth(c: &mut Criterion) {

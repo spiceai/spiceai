@@ -612,27 +612,19 @@ impl CayenneCatalog {
         use std::fmt::Write as _;
 
         const PREFIX: &str = "INSERT OR REPLACE INTO cayenne_insert_record \
-             (insert_record_id, table_id, pk_bytes, sequence_number) VALUES ";
-        // Each "(?N, ?N, ?N, ?N)" row is ≤ 32 bytes for the placeholder counts we hit.
-        let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 32);
+             (table_id, pk_bytes, sequence_number) VALUES ";
+        // Each "(?N, ?N, ?N)" row is ≤ 28 bytes for the placeholder counts we hit.
+        let mut sql = String::with_capacity(PREFIX.len() + pk_bytes_list.len() * 28);
         sql.push_str(PREFIX);
-        let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
+        let mut params = Vec::with_capacity(pk_bytes_list.len() * 3);
 
         for (i, pk_bytes) in pk_bytes_list.iter().enumerate() {
-            let base = i * 4 + 1; // SQLite params are 1-indexed
+            let base = i * 3 + 1; // SQLite params are 1-indexed
             if i > 0 {
                 sql.push_str(", ");
             }
             // `write!` into a `String` is infallible.
-            let _ = write!(
-                sql,
-                "(?{}, ?{}, ?{}, ?{})",
-                base,
-                base + 1,
-                base + 2,
-                base + 3
-            );
-            params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
+            let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
             params.push(MetastoreValue::Text(table_id.to_string()));
             params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
@@ -1388,13 +1380,12 @@ impl MetadataCatalog for CayenneCatalog {
         pk_bytes: Vec<u8>,
         sequence_number: i64,
     ) -> CatalogResult<()> {
-        let insert_record_id = uuid::Uuid::now_v7().to_string();
-        // Use INSERT OR REPLACE to update sequence if PK already exists
+        // Use INSERT OR REPLACE to update sequence if the (table_id, pk_bytes)
+        // composite PK already exists.
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3, ?4)",
+                sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
                 params: vec![
-                    MetastoreValue::Text(insert_record_id),
                     MetastoreValue::Text(table_id.to_string()),
                     MetastoreValue::Blob(pk_bytes),
                     MetastoreValue::Integer(sequence_number),
@@ -1415,13 +1406,13 @@ impl MetadataCatalog for CayenneCatalog {
         sequence_number: i64,
     ) -> CatalogResult<()> {
         // SQLite has a compile-time limit of SQLITE_MAX_VARIABLE_NUMBER (default
-        // 32 766) parameters per prepared statement.  Each row needs 4 params
-        // (insert_record_id, table_id, pk_bytes, sequence_number), so we chunk
-        // the list to stay within the limit.
+        // 32 766) parameters per prepared statement.  Each row needs 3 params
+        // (table_id, pk_bytes, sequence_number), so we chunk the list to stay
+        // within the limit.
         //
         // All chunks are wrapped in a single transaction so the operation is
         // atomic: either every chunk is applied or none is.
-        const PARAMS_PER_ROW: usize = 4;
+        const PARAMS_PER_ROW: usize = 3;
         const MAX_PARAMS: usize = 32_000; // conservative cap below the 32 766 default
         const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
 

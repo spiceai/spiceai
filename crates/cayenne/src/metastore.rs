@@ -96,12 +96,9 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     },
     ExpectedTable {
         name: "cayenne_insert_record",
-        columns: &[
-            "insert_record_id",
-            "table_id",
-            "pk_bytes",
-            "sequence_number",
-        ],
+        // WITHOUT ROWID composite-PK table keyed on (table_id, pk_bytes); the
+        // former `insert_record_id` UUID column was never read and is dropped.
+        columns: &["table_id", "pk_bytes", "sequence_number"],
     },
     ExpectedTable {
         name: "cayenne_snapshot_sequence",
