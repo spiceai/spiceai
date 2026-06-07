@@ -815,21 +815,12 @@ impl CayenneAccelerator {
                 "cayenne_compaction_trigger_protected_snapshots",
                 config.compaction_trigger_protected_snapshots,
             );
-            let age = crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &source.app().runtime.params,
-            )
-            .max_coalesce_age_ms;
-
-            if age > 0 {
-                config.compaction_trigger_snapshot_age_ms = age;
-            } else {
-                config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
-                    acceleration,
-                    "cayenne_compaction_trigger_snapshot_age_ms",
-                    config.compaction_trigger_snapshot_age_ms,
-                    "; 0 disables the age trigger",
-                );
-            }
+            config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
+                acceleration,
+                "cayenne_compaction_trigger_snapshot_age_ms",
+                config.compaction_trigger_snapshot_age_ms,
+                "; 0 disables the age trigger",
+            );
             config.compaction_max_levels = parse_usize(
                 acceleration,
                 "cayenne_compaction_max_levels",
