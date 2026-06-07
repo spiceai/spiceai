@@ -20,6 +20,7 @@ use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::caching::CacheRefreshHelper;
+use crate::accelerated_table::retention;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
@@ -733,6 +734,7 @@ impl RefreshTask {
                 Some(start_time),
                 streaming_data_update,
                 refresh.display_sql().as_deref(),
+                refresh.write_retention_sql_delete_expr.clone(),
             )
             .await
         {
@@ -847,6 +849,7 @@ impl RefreshTask {
         start_time: Option<SystemTime>,
         data_update: StreamingDataUpdate,
         sql: Option<&str>,
+        retention_sql_delete_expr: Option<Expr>,
     ) -> Result<(), RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
 
@@ -948,6 +951,16 @@ impl RefreshTask {
             )
             .await;
             return Err(e);
+        }
+
+        if let Some(retention_sql_delete_expr) = retention_sql_delete_expr {
+            let _ = retention::apply_retention_filters_once(
+                &self.dataset_name,
+                &self.accelerator,
+                retention_sql_delete_expr,
+                &self.io_runtime,
+            )
+            .await;
         }
 
         let refresh_stat = on_written_data_stat_available.try_recv().ok();

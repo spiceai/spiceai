@@ -39,6 +39,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser;
+use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::RngExt;
@@ -208,6 +209,10 @@ pub struct Refresh {
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
     pub(crate) caching_ttl: Option<Duration>,
+    /// Retention SQL delete expression to apply after a successful accelerator write.
+    /// Currently populated only for Arrow and PartitionedArrow accelerators;
+    /// DuckDB and Cayenne apply retention in their own write paths.
+    pub(crate) write_retention_sql_delete_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -614,6 +619,7 @@ impl Default for Refresh {
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
+            write_retention_sql_delete_expr: None,
         }
     }
 }

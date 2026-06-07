@@ -2318,6 +2318,31 @@ impl DataFusion {
             }
         }
 
+        let retention_delete_expr = match dataset.retention_sql() {
+            Some(retention_sql) => {
+                let parsed = retention_sql::parse_retention_sql(
+                    &dataset.name,
+                    retention_sql.as_str(),
+                    source_table_provider.schema(),
+                )
+                .context(RetentionSqlSnafu)?;
+
+                Some(parsed.delete_expr)
+            }
+            None => None,
+        };
+
+        // Arrow accelerators do not have engine-level write completion retention hooks,
+        // so apply retention_sql from the refresh write path.
+        if let Some(retention_delete_expr) = retention_delete_expr.clone()
+            && matches!(
+                acceleration_settings.engine,
+                Engine::Arrow | Engine::PartitionedArrow
+            )
+        {
+            refresh.write_retention_sql_delete_expr = Some(retention_delete_expr);
+        }
+
         // Create the accelerator write mutex early so it can be shared between the DataConnector, Refresher and the AcceleratedTable.
         let accelerator_write_mutex: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
@@ -2338,20 +2363,6 @@ impl DataFusion {
             // see the same columns they would have seen pre-isolation.
             accelerated_table_builder.user_facing_schema(Arc::clone(&refresh_schema));
         }
-
-        let retention_delete_expr = match dataset.retention_sql() {
-            Some(retention_sql) => {
-                let parsed = retention_sql::parse_retention_sql(
-                    &dataset.name,
-                    retention_sql.as_str(),
-                    source_table_provider.schema(),
-                )
-                .context(RetentionSqlSnafu)?;
-
-                Some(parsed.delete_expr)
-            }
-            None => None,
-        };
 
         let retention = Retention::builder()
             .time_column(dataset.time_column.clone())
