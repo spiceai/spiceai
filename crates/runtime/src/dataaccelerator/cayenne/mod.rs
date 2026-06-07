@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod autotune;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
@@ -55,9 +56,6 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::storage::{
-    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
-};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -159,149 +157,6 @@ impl Default for CayenneAccelerator {
     }
 }
 
-/// Optimal default byte budget (in MB) for the Cayenne primary-key keyset cache
-/// when the operator has not set `cayenne_pk_keyset_cache_mb`.
-///
-/// Scales with available machine memory (cgroup-aware via
-/// [`crate::resource_monitor::get_total_memory`]) so high-cardinality tables keep
-/// their upsert keyset resident instead of rebuilding it from a full-table scan
-/// on every CDC batch — the dominant ingest cost on large tables. Clamped to
-/// [256 MiB, 8 GiB]: the floor preserves historical behavior on small hosts; the
-/// ceiling bounds per-table cache memory on very large hosts.
-fn default_pk_keyset_cache_mb() -> usize {
-    const MIB: u64 = 1024 * 1024;
-    const FLOOR_MB: u64 = 256;
-    const CEIL_MB: u64 = 8 * 1024;
-    // ~1/32 of available memory: generous enough for SF100-class keysets
-    // (hundreds of MB to low GB) while leaving ample headroom for the query
-    // pool and other tables.
-    let scaled_mb = crate::resource_monitor::get_total_memory() / 32 / MIB;
-    usize::try_from(scaled_mb.clamp(FLOOR_MB, CEIL_MB)).unwrap_or(256)
-}
-
-/// Inline-memtable flush caps for the CDC / small-write path.
-///
-/// The inline memtable accumulates CDC mutations as Arrow-IPC BLOBs in the local
-/// metastore and is re-read on every scan until checkpointed to a Vortex file. A
-/// larger memtable lets memory-rich, fast-storage hosts batch more mutations per
-/// flush — fewer Vortex files, less small-file compaction and scan read-amp,
-/// which is the dominant sustained-ingest cost on large CDC tables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(clippy::struct_field_names)]
-struct InlineFlushCaps {
-    max_bytes: i64,
-    max_rows: i64,
-    max_segments: i64,
-}
-
-impl InlineFlushCaps {
-    /// Historical flat small-write caps (2 MiB / 2048 rows / 16 segments). Used
-    /// for non-inlining refresh profiles (where the caps are ignored) and as the
-    /// derivation floor (`inline_flush_caps_for` never returns less than this), so
-    /// no host regresses below the prior flat default.
-    const FLOOR: Self = Self {
-        max_bytes: SMALL_WRITE_INLINE_FLUSH_MAX_BYTES,
-        max_rows: SMALL_WRITE_INLINE_FLUSH_MAX_ROWS,
-        max_segments: SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS,
-    };
-}
-
-/// Derive the inline-memtable flush caps from total machine memory (cgroup-aware
-/// via [`crate::resource_monitor::get_total_memory`]) and the storage class of
-/// the *metastore* — where the memtable BLOBs live and the per-scan re-read cost
-/// (read-amp) is actually paid. Faster media tolerate a larger resident memtable.
-///
-/// Deliberately more conservative than the PK keyset cap (`default_pk_keyset_cache_mb`,
-/// `total_mem/32`, [256 MiB, 8 GiB]): the keyset is a pruning structure, whereas
-/// the memtable is raw, un-pruned data re-read on every scan. The byte budget is
-/// the primary lever; rows and segments are derived from it, preserving the floor
-/// ratios (2 MiB → 2048 rows / 16 segments). `max_segments` is additionally capped
-/// at 256 to bound per-scan merge fan-in, so a workload that accumulates many
-/// small entries can hit the segment trigger before the byte budget.
-fn inline_flush_caps_for(
-    total_mem_bytes: u64,
-    storage: ResolvedAccelerationStorage,
-) -> InlineFlushCaps {
-    const MIB: u64 = 1024 * 1024;
-    // 2 MiB == SMALL_WRITE_INLINE_FLUSH_MAX_BYTES (coupling asserted in tests).
-    // A hard minimum, so no host drops below the prior flat default; the memory at
-    // which scaling begins above the floor is storage-dependent (~128 MiB on
-    // LocalSsd, 256 MiB on Ebs/Unknown, 512 MiB on Tmpfs).
-    const FLOOR_BYTES: u64 = 2 * MIB;
-    // (divisor, ceiling) per metastore medium: faster re-read → larger memtable.
-    // Tmpfs is RAM-backed, so the memtable double-counts against memory — keep it
-    // smallest. Unknown falls back to the conservative EBS profile.
-    let (divisor, ceil_bytes): (u64, u64) = match storage {
-        ResolvedAccelerationStorage::LocalSsd => (64, 256 * MIB),
-        ResolvedAccelerationStorage::Tmpfs => (256, 64 * MIB),
-        ResolvedAccelerationStorage::Ebs | ResolvedAccelerationStorage::Unknown => (128, 128 * MIB),
-    };
-    let bytes = (total_mem_bytes / divisor).clamp(FLOOR_BYTES, ceil_bytes);
-    let rows = bytes / 1024; // ~1 KiB/row
-    let segments = (bytes / (128 * 1024)).clamp(16, 256); // ~128 KiB/segment, with a fan-in cap
-    InlineFlushCaps {
-        max_bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
-        max_rows: i64::try_from(rows).unwrap_or(i64::MAX),
-        max_segments: i64::try_from(segments).unwrap_or(i64::MAX),
-    }
-}
-
-fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize {
-    acceleration
-        .params
-        .get(key)
-        .map_or(default, |v| {
-            v.parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                );
-                default
-            })
-        })
-}
-
-fn parse_u64_with_hint(
-    acceleration: &Acceleration,
-    key: &str,
-    default: u64,
-    semantic_hint: &str,
-) -> u64 {
-    acceleration.params.get(key).map_or(default, |v| {
-        v.parse::<u64>().unwrap_or_else(|_| {
-            tracing::warn!(
-                "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-            );
-            default
-        })
-    })
-}
-
-fn parse_optional_usize<'a>(
-    acceleration: &Acceleration,
-    keys: &'a [&'a str],
-) -> Option<(&'a str, usize)> {
-    keys.iter().find_map(|&key| {
-        acceleration.params.get(key).and_then(|v| {
-            v.parse::<usize>().map_or_else(|_| {
-                tracing::warn!(
-                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                );
-                None
-            }, |value| Some((key, value)))
-            })
-    })
-}
-
-fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
-    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
-}
-
-fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
-    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
-    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
-    i64::try_from(parsed).unwrap_or(i64::MAX)
-}
-
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
@@ -310,15 +165,12 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
-const SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS: i64 = 16;
-const SMALL_WRITE_INLINE_FLUSH_MAX_BYTES: i64 = 2 * 1_048_576;
 const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_secs(300);
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
     acceleration: &Acceleration,
-    inline_flush_caps: InlineFlushCaps,
+    inline_flush_caps: autotune::InlineFlushCaps,
 ) {
     if uses_small_write_refresh_profile(acceleration) {
         config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
@@ -333,8 +185,8 @@ fn apply_refresh_mode_defaults(
         config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
         config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
         // Memtable flush caps scale with machine memory + metastore storage class
-        // (see `inline_flush_caps_for`). Explicit operator params still override
-        // these in the param-resolution pass below.
+        // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
+        // params still override these in the param-resolution pass below.
         config.inline_flush_max_rows = inline_flush_caps.max_rows;
         config.inline_flush_max_segments = inline_flush_caps.max_segments;
         config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
@@ -608,12 +460,11 @@ impl CayenneAccelerator {
             ..Default::default()
         };
 
-        // Storage-aware default for target Vortex file size on local disk.
-        // Smaller files reduce write amplification on EBS-class network
-        // storage; larger files improve scan throughput on tmpfs / RAM-backed
-        // mounts. Skip for S3 (cayenne_file_path/s3:// or s3_zone_ids) where
-        // we always use the engine default; the network-attached object
-        // store doesn't benefit from local mount classification.
+        // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
+        // single detected host profile so they move together for the host
+        // instead of being set in isolation. Every numeric knob below also
+        // accepts the literal `auto` (or being left unset) to opt into this
+        // derivation; an explicit value always overrides it. See `autotune`.
         if let Some(acceleration) = source.acceleration() {
             let is_s3 = acceleration
                 .params
@@ -623,101 +474,74 @@ impl CayenneAccelerator {
                     .params
                     .get("cayenne_file_path")
                     .is_some_and(|p| p.starts_with("s3://"));
-            let user_set_file_size = acceleration
-                .params
-                .contains_key("cayenne_target_file_size_mb");
+            let small_write = uses_small_write_refresh_profile(acceleration);
 
+            // Detect the host profile once: cores, cgroup-aware memory, and the
+            // storage medium under both the Vortex data files and the metastore
+            // (where the inline-memtable BLOBs live and the per-scan re-read cost
+            // is paid). A remote (`s3://`) or empty data path classifies as
+            // Unknown — correct, since the storage-aware file-size override below
+            // is skipped for object stores. `*_dir` may be a `file://` URI, so
+            // strip the scheme before probing the real filesystem path.
+            let data_dir = CayenneAccelerator::new().cayenne_data_dir(source).ok();
+            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
+            let hw = autotune::HardwareProfile::detect(
+                acceleration.storage_profile,
+                data_dir.as_deref().map_or("", fs_probe_path),
+                fs_probe_path(&metadata_dir),
+            )
+            .await;
+
+            // Storage-aware target Vortex file size on local disk (the `auto`
+            // baseline): smaller files reduce write amplification on EBS-class
+            // network storage; larger files improve scan throughput on RAM-backed
+            // mounts. Skipped for S3, where the engine default is kept. An
+            // explicit operator value (or `auto`) is then applied on top.
             if !is_s3
-                && !user_set_file_size
-                && let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source)
+                && let Some(size_mb) = hw.target_file_size_mb_override()
             {
-                let storage =
-                    resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
-                        .await;
-                let storage_default = match storage {
-                    ResolvedAccelerationStorage::Ebs => Some(256_usize),
-                    ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
-                    ResolvedAccelerationStorage::LocalSsd
-                    | ResolvedAccelerationStorage::Unknown => None,
-                };
-                if let Some(size_mb) = storage_default {
-                    tracing::debug!(
-                        target: "spiced::acceleration::cayenne",
-                        table = %table_name,
-                        configured = %acceleration.storage_profile,
-                        resolved = ?storage,
-                        target_file_size_mb = size_mb,
-                        "Applying storage-aware default cayenne_target_file_size_mb"
-                    );
-                    config.target_vortex_file_size_mb = size_mb;
-                }
+                config.target_vortex_file_size_mb = size_mb;
             }
-        }
-
-        if let Some(acceleration) = source.acceleration() {
-            // Inline-memtable flush caps scale with machine memory and the
-            // metastore's storage medium (where the memtable BLOBs live and the
-            // per-scan re-read cost is paid). Only the small-write/CDC profile
-            // inlines, so skip the storage probe (a spawn_blocking /proc-/sys read
-            // under the Auto profile) for other profiles.
-            let inline_flush_caps = if uses_small_write_refresh_profile(acceleration) {
-                let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
-                // `metadata_dir` may be a file:// URI; pass a real filesystem path
-                // so Auto storage detection doesn't misclassify it as Unknown.
-                let metastore_storage = resolve_acceleration_storage_async(
-                    acceleration.storage_profile,
-                    fs_probe_path(&metadata_dir),
-                )
-                .await;
-                let caps = inline_flush_caps_for(
-                    crate::resource_monitor::get_total_memory(),
-                    metastore_storage,
-                );
-                tracing::debug!(
-                    target: "spiced::acceleration::cayenne",
-                    table = %table_name,
-                    configured = %acceleration.storage_profile,
-                    resolved = ?metastore_storage,
-                    inline_flush_max_bytes = caps.max_bytes,
-                    inline_flush_max_rows = caps.max_rows,
-                    inline_flush_max_segments = caps.max_segments,
-                    "Applying memory/storage-aware inline-memtable flush caps"
-                );
-                caps
-            } else {
-                InlineFlushCaps::FLOOR
-            };
-
-            apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
-
-            config.segment_cache_mb = parse_usize(
+            config.target_vortex_file_size_mb = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_segment_cache_mb",
-                config.segment_cache_mb,
+                &["cayenne_target_file_size_mb"],
+                config.target_vortex_file_size_mb,
             );
 
-            // Operator override if set (0 → warn + minimum of 1 MB, mirroring
-            // upload_concurrency); otherwise an optimal default scaled to
-            // available machine memory (see `default_pk_keyset_cache_mb`).
+            // Inline-memtable flush caps scale with memory + the metastore's
+            // storage medium; only the small-write/CDC profile inlines, so other
+            // profiles keep the floor (the caps are then ignored downstream).
+            let inline_flush_caps = if small_write {
+                hw.inline_flush_caps()
+            } else {
+                autotune::InlineFlushCaps::FLOOR
+            };
+            apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
+
+            // Vortex segment cache: memory-aware `auto` default (scales up on
+            // memory-rich hosts, never below the historical 256 MiB), overridable.
+            config.segment_cache_mb = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_segment_cache_mb"],
+                hw.segment_cache_mb(),
+            );
+
+            // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
+            // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
             config.pk_keyset_cache_mb = Some(
-                match parse_optional_usize(
+                match autotune::read_knob(
                     acceleration,
                     &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
                 ) {
-                    Some((key, 0)) => {
-                        tracing::warn!("Invalid {key} value of 0. Using minimum value of 1 MB.");
+                    autotune::Knob::Auto => hw.pk_keyset_cache_mb(),
+                    autotune::Knob::Set(0) => {
+                        tracing::warn!(
+                            "Invalid cayenne_pk_keyset_cache_mb value of 0. Using minimum value of 1 MB."
+                        );
                         1
                     }
-                    Some((_key, mb)) => mb,
-                    None => default_pk_keyset_cache_mb(),
+                    autotune::Knob::Set(mb) => mb,
                 },
-            );
-
-            // Parse file size options
-            config.target_vortex_file_size_mb = parse_usize(
-                acceleration,
-                "cayenne_target_file_size_mb",
-                config.target_vortex_file_size_mb,
             );
 
             // Parse compression strategy
@@ -793,77 +617,82 @@ impl CayenneAccelerator {
                     .collect();
             }
 
-            if let Some((upload_concurrency_key, parsed_upload_concurrency)) = parse_optional_usize(
+            // Upload concurrency: `auto`/unset keeps the available-parallelism
+            // default; 0 → warn + minimum 1. The aggregate across all tables is
+            // separately bounded by the process-global encode budget.
+            match autotune::read_knob(
                 acceleration,
                 &["cayenne_upload_concurrency", "upload_concurrency"],
             ) {
-                if parsed_upload_concurrency == 0 {
+                autotune::Knob::Auto => {}
+                autotune::Knob::Set(0) => {
                     tracing::warn!(
-                        "Invalid {upload_concurrency_key} value of 0. Using minimum value of 1."
+                        "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
                     );
                     config.upload_concurrency = 1;
-                } else {
-                    config.upload_concurrency = parsed_upload_concurrency;
                 }
+                autotune::Knob::Set(n) => config.upload_concurrency = n,
             }
 
-            if let Some((write_concurrency_key, parsed_write_concurrency)) = parse_optional_usize(
+            // Write concurrency: `auto`/unset leaves the per-write default
+            // (session target_partitions, capped at the host core count and the
+            // global encode budget); 0 → warn + minimum 1.
+            match autotune::read_knob(
                 acceleration,
                 &["cayenne_write_concurrency", "write_concurrency"],
             ) {
-                if parsed_write_concurrency == 0 {
+                autotune::Knob::Auto => {}
+                autotune::Knob::Set(0) => {
                     tracing::warn!(
-                        "Invalid {write_concurrency_key} value of 0. Using minimum value of 1."
+                        "Invalid cayenne_write_concurrency value of 0. Using minimum value of 1."
                     );
                     config.write_concurrency = Some(1);
-                } else {
-                    config.write_concurrency = Some(parsed_write_concurrency);
                 }
+                autotune::Knob::Set(n) => config.write_concurrency = Some(n),
             }
 
-            config.compaction_trigger_files = parse_usize(
+            config.compaction_trigger_files = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_trigger_files",
+                &["cayenne_compaction_trigger_files"],
                 config.compaction_trigger_files,
             );
-            config.compaction_trigger_protected_snapshots = parse_usize(
+            config.compaction_trigger_protected_snapshots = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_trigger_protected_snapshots",
+                &["cayenne_compaction_trigger_protected_snapshots"],
                 config.compaction_trigger_protected_snapshots,
             );
-            config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
+            config.compaction_trigger_snapshot_age_ms = autotune::auto_or_u64(
                 acceleration,
-                "cayenne_compaction_trigger_snapshot_age_ms",
+                &["cayenne_compaction_trigger_snapshot_age_ms"],
                 config.compaction_trigger_snapshot_age_ms,
-                "; 0 disables the age trigger",
             );
-            config.compaction_max_levels = parse_usize(
+            config.compaction_max_levels = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_max_levels",
+                &["cayenne_compaction_max_levels"],
                 config.compaction_max_levels,
             );
-            config.compaction_max_files_per_pick = parse_usize(
+            config.compaction_max_files_per_pick = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_max_files_per_pick",
+                &["cayenne_compaction_max_files_per_pick"],
                 config.compaction_max_files_per_pick,
             );
 
-            config.inline_max_rows = parse_usize_aliases(
+            config.inline_max_rows = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_rows", "inline_max_rows"],
                 config.inline_max_rows,
             );
-            config.inline_max_bytes = parse_usize_aliases(
+            config.inline_max_bytes = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_bytes", "inline_max_bytes"],
                 config.inline_max_bytes,
             );
-            config.inline_max_buffer_bytes = parse_usize_aliases(
+            config.inline_max_buffer_bytes = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
                 config.inline_max_buffer_bytes,
             );
-            config.inline_flush_max_rows = parse_usize_aliases_as_i64(
+            config.inline_flush_max_rows = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_rows",
@@ -873,7 +702,7 @@ impl CayenneAccelerator {
                 ],
                 config.inline_flush_max_rows,
             );
-            config.inline_flush_max_segments = parse_usize_aliases_as_i64(
+            config.inline_flush_max_segments = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_segments",
@@ -883,7 +712,7 @@ impl CayenneAccelerator {
                 ],
                 config.inline_flush_max_segments,
             );
-            config.inline_flush_max_bytes = parse_usize_aliases_as_i64(
+            config.inline_flush_max_bytes = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_bytes",
@@ -894,28 +723,36 @@ impl CayenneAccelerator {
                 config.inline_flush_max_bytes,
             );
 
-            config.compaction_background_interval_ms = parse_u64_with_hint(
+            config.compaction_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
-                "cayenne_compaction_background_interval_ms",
+                &["cayenne_compaction_background_interval_ms"],
                 config.compaction_background_interval_ms,
-                "; 0 disables the background task",
             );
 
             // Surface cross-parameter and out-of-range issues that parse cleanly
             // but won't behave as intended (silently clamped at use, or don't
             // compose with each other) — see `VortexConfig::config_warnings`.
-            for warning in config.config_warnings(
-                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-            ) {
+            for warning in config.config_warnings(hw.cores) {
                 tracing::warn!(
                     "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
                 );
             }
 
-            tracing::debug!(
+            // One structured line per table recording the host basis and the
+            // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
+            // see exactly what was chosen on this host — the observability that
+            // makes "works regardless of the host machine" verifiable.
+            tracing::info!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                cores = hw.cores,
+                total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
+                data_storage = %hw.data_storage,
+                metastore_storage = %hw.metastore_storage,
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
-                "Cayenne Vortex config: segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.segment_cache_mb,
+                config.pk_keyset_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
                 config.write_concurrency,
@@ -923,6 +760,7 @@ impl CayenneAccelerator {
                 config.compression_strategy,
                 config.delta_encoding,
                 config.pk_conflict_detection.as_str(),
+                config.deletion_mode,
                 config.compaction_trigger_files,
                 config.compaction_trigger_protected_snapshots,
                 config.compaction_trigger_snapshot_age_ms,
@@ -1249,13 +1087,13 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
-            .default("256"),
+            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
+            .default("auto"),
         ParameterSpec::component("pk_keyset_cache_mb")
             .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")
-            .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
-            .default("256"),
+            .description("Target size for Vortex data files in MB. 'auto' (default, or when unset) is storage-aware: 256 MB on EBS-class network storage, 64 MB on RAM-backed (tmpfs) mounts, and the 256 MB engine default on local SSD / unknown / S3. Set an explicit MB value to override.")
+            .default("auto"),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
         ParameterSpec::component("compression_strategy")
@@ -1274,9 +1112,9 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
-            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
+            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count."),
         ParameterSpec::component("write_concurrency")
-            .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
+            .description("Writer partition override for unsorted Cayenne ingests. 'auto' (or unset) uses runtime.query.target_partitions, capped at the host core count and the process-global encode budget."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
@@ -2910,67 +2748,6 @@ mod tests {
         assert!((16..=256).contains(&config.inline_flush_max_segments));
     }
 
-    #[test]
-    fn test_inline_flush_caps_scale_with_memory_and_storage() {
-        const MIB: u64 = 1024 * 1024;
-        const GIB: u64 = 1024 * MIB;
-
-        // Floor: hosts at/under the floor keep the historical small-write caps.
-        // This also pins the FLOOR_BYTES ↔ SMALL_WRITE_INLINE_FLUSH_MAX_BYTES coupling.
-        assert_eq!(
-            inline_flush_caps_for(256 * MIB, ResolvedAccelerationStorage::Ebs),
-            InlineFlushCaps::FLOOR
-        );
-        assert_eq!(InlineFlushCaps::FLOOR.max_bytes, 2_097_152); // 2 MiB
-        assert_eq!(InlineFlushCaps::FLOOR.max_rows, 2_048);
-        assert_eq!(InlineFlushCaps::FLOOR.max_segments, 16);
-
-        // Degenerate inputs never panic; they clamp to the floor / ceiling.
-        assert_eq!(
-            inline_flush_caps_for(0, ResolvedAccelerationStorage::Unknown),
-            InlineFlushCaps::FLOOR
-        );
-        assert_eq!(
-            inline_flush_caps_for(u64::MAX, ResolvedAccelerationStorage::LocalSsd).max_bytes,
-            268_435_456 // 256 MiB ceiling, no overflow
-        );
-
-        // Per-class ceilings on a very large host.
-        assert_eq!(
-            inline_flush_caps_for(1024 * GIB, ResolvedAccelerationStorage::LocalSsd).max_bytes,
-            268_435_456 // 256 MiB
-        );
-        assert_eq!(
-            inline_flush_caps_for(1024 * GIB, ResolvedAccelerationStorage::Ebs).max_bytes,
-            134_217_728 // 128 MiB
-        );
-        assert_eq!(
-            inline_flush_caps_for(1024 * GIB, ResolvedAccelerationStorage::Unknown).max_bytes,
-            134_217_728 // 128 MiB (== Ebs, the safe default)
-        );
-        assert_eq!(
-            inline_flush_caps_for(1024 * GIB, ResolvedAccelerationStorage::Tmpfs).max_bytes,
-            67_108_864 // 64 MiB (RAM-backed → smallest)
-        );
-
-        // Faster medium ⇒ strictly larger memtable at equal memory.
-        let mem = 64 * GIB;
-        let ssd = inline_flush_caps_for(mem, ResolvedAccelerationStorage::LocalSsd);
-        let ebs = inline_flush_caps_for(mem, ResolvedAccelerationStorage::Ebs);
-        let tmpfs = inline_flush_caps_for(mem, ResolvedAccelerationStorage::Tmpfs);
-        assert!(ssd.max_bytes > ebs.max_bytes);
-        assert!(ebs.max_bytes > tmpfs.max_bytes);
-
-        // Mid-range scales between floor and ceiling (4 GiB on Ebs ⇒ 32 MiB), and
-        // rows/segments stay derived from the byte budget.
-        let mid = inline_flush_caps_for(4 * GIB, ResolvedAccelerationStorage::Ebs);
-        assert_eq!(mid.max_bytes, 33_554_432); // 32 MiB
-        assert_eq!(mid.max_rows, mid.max_bytes / 1024);
-        assert_eq!(
-            mid.max_segments,
-            (mid.max_bytes / (128 * 1024)).clamp(16, 256)
-        );
-    }
 
     #[tokio::test]
     async fn test_vortex_config_defaults_use_large_write_refresh_profile() {
