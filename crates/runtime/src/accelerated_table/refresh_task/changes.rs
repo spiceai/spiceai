@@ -664,24 +664,22 @@ impl RefreshTask {
         let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
 
         // In-memory CDC durability (`cdc_durability: memory`): if this stream's
-        // Cayenne provider is in memory mode, set up the deferred-commit queue and
-        // install the slot advancer that drains it after each durable checkpoint.
-        // `None` (and never populated) for file-mode streams, so the commit path
-        // is byte-identical there.
+        // Cayenne provider is in memory mode, set up the deferred-commit queue. The
+        // slot advancer is NOT installed here — it is armed LAZILY on the first
+        // batch whose committer reports `supports_deferral()` (a replayable source,
+        // e.g. the Postgres replication slot). Until armed, the provider keeps the
+        // durable write path (`has_slot_advancer()` gates engagement), so a
+        // non-replayable changes source never buffers un-acked rows in RAM. `None`
+        // (and never populated) for file-mode streams, so the commit path is
+        // byte-identical there.
         let deferred_commits: Option<DeferredCommitQueue> = {
             #[cfg(not(windows))]
             {
                 self.cayenne_accelerator()
                     .filter(|cayenne| cayenne.is_cdc_memory_mode())
-                    .map(|cayenne| {
-                        let queue: DeferredCommitQueue =
-                            Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
-                        cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
-                            queue: Arc::clone(&queue),
-                            dataset_name: dataset_name.clone(),
-                            runtime_status: Arc::clone(&self.runtime_status),
-                        }));
-                        queue
+                    .map(|_cayenne| {
+                        Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()))
+                            as DeferredCommitQueue
                     })
             }
             #[cfg(windows)]
@@ -1180,6 +1178,27 @@ impl RefreshTask {
                 }
 
                 let mut committers = Some(committers);
+
+                // Arm in-memory deferral lazily: install the slot advancer only once
+                // a committer that supports deferral (a replayable source — e.g. the
+                // Postgres replication slot) appears. Until armed, `has_slot_advancer`
+                // gates the provider write path to durable, so a non-replayable
+                // changes source never buffers un-acked rows in RAM. Idempotent —
+                // installs at most once per stream (no-op once already armed).
+                #[cfg(not(windows))]
+                if let Some(queue) = context.deferred_commits
+                    && committers
+                        .as_ref()
+                        .is_some_and(|cs| cs.iter().any(|c| c.supports_deferral()))
+                    && let Some(cayenne) = self.cayenne_accelerator()
+                    && !cayenne.has_slot_advancer()
+                {
+                    cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
+                        queue: Arc::clone(queue),
+                        dataset_name: context.dataset_name.clone(),
+                        runtime_status: Arc::clone(&self.runtime_status),
+                    }));
+                }
 
                 if let Some(finalize) = write_outcome.pending_finalize {
                     *context.pending_finalize = Some(PendingFinalizeCommit {

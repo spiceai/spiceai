@@ -5043,6 +5043,15 @@ impl CayenneTableProvider {
         *self.slot_advancer.lock() = Some(advancer);
     }
 
+    /// Whether the runtime has installed a [`SlotAdvancer`] — i.e. armed in-memory
+    /// deferral after confirming a replayable source committer. The write path
+    /// gates mem-mode engagement on this (in addition to [`Self::is_cdc_memory_mode`])
+    /// so a non-replayable source never buffers un-acked rows in RAM.
+    #[must_use]
+    pub fn has_slot_advancer(&self) -> bool {
+        self.slot_advancer.lock().is_some()
+    }
+
     /// The per-table mem-tier checkpoint lock, for the write path to serialize
     /// spills (only one checkpoint in flight at a time — the OOM-safety guard).
     pub(crate) fn mem_checkpoint_lock_for_writer(&self) -> Arc<tokio::sync::Mutex<()>> {

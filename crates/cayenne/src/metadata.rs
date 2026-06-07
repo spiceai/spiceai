@@ -498,10 +498,16 @@ impl DeletionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CdcDurability {
-    /// Per-batch durable metastore/Vortex persist before the slot ack (today).
-    #[default]
+    /// Per-batch durable metastore/Vortex persist before the slot ack. Explicit
+    /// opt-out from the in-memory default for strict per-batch durability.
     File,
     /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
+    /// Default: engages only for the changes/small-write refresh profile AND a
+    /// replayable source committer (the runtime arms it lazily on the first batch
+    /// whose committer reports `supports_deferral()`); every other profile/source
+    /// falls back to `File`, so the default never defers where a crash would lose
+    /// un-replayable data.
+    #[default]
     Memory,
 }
 
