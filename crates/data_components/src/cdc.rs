@@ -499,6 +499,15 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn noop_committer_does_not_support_deferral() {
+        // The conservative default: a committer with no replayable source offset
+        // (`NoOpCommitter` carries synthetic ready-signal envelopes) must NOT be
+        // deferred — deferring it advances nothing and there is nothing to
+        // re-stream, so an in-memory durability tier must never arm on it.
+        assert!(!NoOpCommitter.supports_deferral());
+    }
+
+    #[test]
     fn test_wrap_batch_as_change_batch() {
         // Create a test schema
         let schema = Arc::new(Schema::new(vec![

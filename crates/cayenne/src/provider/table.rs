@@ -16924,6 +16924,97 @@ mod tests {
         );
     }
 
+    /// Replayability safety gate (`cdc_durability: memory` is the default): the RAM
+    /// path must engage ONLY after the runtime arms it via `install_slot_advancer`
+    /// — which the runtime does only on the first batch whose committer reports
+    /// `supports_deferral()` (a replayable source). Until armed, a memory-mode
+    /// provider takes the DURABLE write path, so a non-replayable changes source
+    /// never buffers un-acked rows in RAM (no crash-loss window). This is the
+    /// provider-side half of the gate (`is_cdc_memory_mode() && has_slot_advancer()`
+    /// in the CDC write path).
+    #[tokio::test]
+    async fn memory_mode_engages_ram_only_after_slot_advancer_armed() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runtime_env = SessionContext::new().runtime_env();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "gate".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        let ctx = provider.create_session_context();
+        let task_ctx = ctx.task_ctx();
+
+        // Config is memory mode, but the runtime has NOT armed it (no replayable
+        // committer seen): the write MUST take the durable path.
+        assert!(provider.is_cdc_memory_mode(), "config is memory mode");
+        assert!(!provider.has_slot_advancer(), "not armed yet");
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let write1 = provider
+            .write_cdc_append_stream(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    b1.schema(),
+                    futures::stream::iter([Ok::<_, datafusion_common::DataFusionError>(b1)]),
+                )),
+                &task_ctx,
+            )
+            .await
+            .expect("durable write");
+        assert_eq!(
+            write1.in_memory_epoch(),
+            None,
+            "an unarmed memory-mode provider must write DURABLE, not to RAM"
+        );
+
+        // Arm it (as the runtime does on the first replayable committer); the next
+        // write engages the RAM tier.
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        assert!(provider.has_slot_advancer(), "armed");
+
+        let b2 = int64_id_batch(&[4, 5]);
+        let write2 = provider
+            .write_cdc_append_stream(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    b2.schema(),
+                    futures::stream::iter([Ok::<_, datafusion_common::DataFusionError>(b2)]),
+                )),
+                &task_ctx,
+            )
+            .await
+            .expect("ram write");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "an armed memory-mode provider engages the RAM tier"
+        );
+    }
+
     /// Helper to create a `CayenneTableProvider` with sort columns configured.
     ///
     /// Returns the provider and the temp dir (must be kept alive for the test duration).

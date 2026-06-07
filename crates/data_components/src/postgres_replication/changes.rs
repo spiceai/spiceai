@@ -815,6 +815,20 @@ mod tests {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
+    #[test]
+    fn lsn_committer_supports_deferral() {
+        // The Postgres replication slot retains WAL until `confirmed_flush`
+        // advances; deferring this commit holds the slot back, so a crash before the
+        // deferred commit re-streams the un-acked tail (exactly-once via the
+        // idempotent apply). So the LSN committer is the one committer an in-memory
+        // durability tier is allowed to arm/defer on.
+        let committer = LsnCommitter {
+            confirmed_flush: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            flush_to: 42,
+        };
+        assert!(committer.supports_deferral());
+    }
+
     fn make_relation() -> Relation {
         Relation {
             relation_id: 1,
