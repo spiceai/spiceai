@@ -30,6 +30,7 @@ use crate::{
     dataconnector::listing::{LISTING_TABLE_PARAMETERS, ObjectVersionType},
 };
 
+use object_store::client::{HttpError, HttpErrorKind};
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -355,6 +356,32 @@ impl ListingTableConnector for S3 {
     ) -> DataConnectorError {
         match error {
             object_store::Error::Generic { source, .. } => {
+                // object_store 0.13 preserves the transport classification
+                // (reqwest/hyper/IO timeouts) as a typed `HttpError` in the source
+                // chain. Surface timeouts with an actionable message instead of the
+                // opaque "error decoding response body" that body-read timeouts
+                // otherwise produce when many datasets are loaded concurrently.
+                if object_store_http_error_kind(source.as_ref()) == Some(HttpErrorKind::Timeout) {
+                    let client_timeout = self
+                        .params
+                        .get("client_timeout")
+                        .expose()
+                        .ok()
+                        .unwrap_or("30s (default)");
+                    return DataConnectorError::UnableToConnectInternal {
+                        dataconnector: format!("{self}"),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: format!(
+                            "S3 request timed out (client_timeout: {client_timeout}). This often \
+                             happens when many datasets are loaded concurrently and saturate the \
+                             network or I/O. Consider increasing the `client_timeout` parameter or \
+                             reducing the number of concurrent dataset loads. See {S3_DOCS}#params \
+                             for details."
+                        )
+                        .into(),
+                    };
+                }
+
                 if self.params.get("auth").expose().ok() == Some("iam_role") {
                     let err = Error::InvalidIAMRoleAuthentication { source };
 
@@ -379,6 +406,24 @@ impl ListingTableConnector for S3 {
             },
         }
     }
+}
+
+/// Walks an `object_store` error's source chain for the typed `HttpError`.
+/// `object_store` 0.13 classifies `reqwest`/`hyper`/I/O timeouts into
+/// `HttpErrorKind::Timeout` before flattening the error into
+/// `object_store::Error::Generic`, so we can detect timeouts via a typed downcast
+/// rather than matching on the error message.
+fn object_store_http_error_kind(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<HttpErrorKind> {
+    let mut next = Some(source);
+    while let Some(err) = next {
+        if let Some(http_error) = err.downcast_ref::<HttpError>() {
+            return Some(http_error.kind());
+        }
+        next = err.source();
+    }
+    None
 }
 
 register_data_connector!("s3", S3Factory);
@@ -421,6 +466,90 @@ mod tests {
             .with_runtime(Arc::new(RuntimeBuilder::new().build().await))
             .build()
             .expect("dataset should be built")
+    }
+
+    #[tokio::test]
+    async fn test_handle_object_store_error_surfaces_timeout() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset =
+            create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        // A body-read timeout: object_store classifies this as HttpErrorKind::Timeout
+        // and flattens it into Error::Generic before it reaches the connector.
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"),
+            )),
+        };
+
+        let message = connector
+            .handle_object_store_error(&dataset, error)
+            .to_string();
+        assert!(
+            message.contains("client_timeout"),
+            "timeout error should mention client_timeout, got: {message}"
+        );
+        assert!(
+            message.contains("timed out"),
+            "timeout error should say it timed out, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_object_store_error_timeout_includes_configured_value() {
+        let params = create_test_parameters(vec![(
+            "client_timeout".to_string(),
+            "120s".to_string().into(),
+        )])
+        .await;
+        let connector = create_test_connector(params);
+        let dataset =
+            create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"),
+            )),
+        };
+
+        let message = connector
+            .handle_object_store_error(&dataset, error)
+            .to_string();
+        assert!(
+            message.contains("120s"),
+            "timeout error should surface the configured client_timeout, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_object_store_error_non_timeout_is_not_misreported() {
+        let params = create_test_parameters(vec![]).await;
+        let connector = create_test_connector(params);
+        let dataset =
+            create_test_dataset("s3://spiceai-public-datasets/taxi_small_samples/").await;
+
+        // A decode error is NOT a timeout — it must not be reported as one. (Phillip's
+        // concern: typed detection must not mislead users into the wrong fix.)
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Decode,
+                std::io::Error::other("malformed response body"),
+            )),
+        };
+
+        let message = connector
+            .handle_object_store_error(&dataset, error)
+            .to_string();
+        assert!(
+            !message.contains("client_timeout"),
+            "non-timeout error must not be reported as a timeout, got: {message}"
+        );
     }
 
     #[tokio::test]

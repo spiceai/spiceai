@@ -18,12 +18,15 @@
 set -euo pipefail
 
 CARGO_TOML="${1:-Cargo.toml}"
-REPO_URL="https://github.com/datafusion-contrib/datafusion-table-providers.git"
+# datafusion-table-providers is maintained on the Spice org fork (aligned with the
+# other Spice forks: snowflake-rs, duckdb-rs). The spiceai-<df-version> branches
+# live here; CI validates the pinned commit is on the expected branch of this repo.
+REPO_URL="https://github.com/spiceai/datafusion-table-providers.git"
 BRANCH="${BRANCH:-spiceai}"
 
 # Extract the commit hash from the datafusion-table-providers line in [patch.crates-io]
 # Use portable regex (BSD sed on macOS doesn't support \s)
-COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'datafusion-contrib/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
+COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'spiceai/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
 
 if [[ -z "$COMMIT" ]]; then
     echo "Error: Could not find datafusion-table-providers commit in $CARGO_TOML"
@@ -60,7 +63,7 @@ if git merge-base --is-ancestor "$COMMIT" "$BRANCH_SHA" 2>/dev/null; then
 else
     echo "✗ Error: Commit $COMMIT is NOT on the '$BRANCH' branch"
     echo ""
-    echo "The datafusion-table-providers commit in Cargo.toml must be on the 'spiceai' branch."
-    echo "Please ensure your changes are merged to the spiceai branch before updating the commit."
+    echo "The datafusion-table-providers commit in Cargo.toml must be on the '$BRANCH' branch of $REPO_URL."
+    echo "Please ensure your changes are merged to the '$BRANCH' branch before updating the commit."
     exit 1
 fi
