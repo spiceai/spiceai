@@ -1227,8 +1227,25 @@ mod tests {
         out
     }
 
-    /// Build a single-column Int64 batch (key bytes = be_bytes) and run it
-    /// through a `KeyBasedDeletionFilterStream`; return the surviving PK values.
+    /// The single-Int64 `RowConverter` config the key-based filter stream uses
+    /// in these tests. The deletion index MUST be keyed with bytes produced by
+    /// the SAME converter — `RowConverter` does not emit raw big-endian bytes
+    /// (it prepends a validity sentinel and uses an order-preserving encoding),
+    /// so a raw `to_be_bytes()` key would never match the probed row key.
+    fn pk_row_converter() -> RowConverter {
+        RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("row converter")
+    }
+
+    /// Encode an i64 PK into the same row-key bytes the stream probes with.
+    fn pk_row_key(converter: &RowConverter, pk: i64) -> Box<[u8]> {
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(vec![pk])) as ArrayRef])
+            .expect("convert");
+        Box::<[u8]>::from(rows.row(0).as_ref())
+    }
+
+    /// Build a single-column Int64 batch and run it through a
+    /// `KeyBasedDeletionFilterStream`; return the surviving PK values.
     async fn run_keybased_filter(
         pks: Vec<i64>,
         index: KeyDeletionIndex,
@@ -1248,7 +1265,7 @@ mod tests {
             Arc::clone(&schema),
             futures::stream::iter([Ok(batch)]),
         ));
-        let row_converter = Arc::new(RowConverter::new(vec![SortField::new(DataType::Int64)])?);
+        let row_converter = Arc::new(pk_row_converter());
         let mut stream = KeyBasedDeletionFilterStream {
             input,
             tombstones: Arc::new(index),
@@ -1272,11 +1289,13 @@ mod tests {
         Ok(out)
     }
 
-    /// A KeyDeletionIndex keyed by the be_bytes of the given i64 PKs.
+    /// A `KeyDeletionIndex` keyed by the `RowConverter` row-key bytes of the given
+    /// i64 PKs (the same encoding the stream probes with — see `pk_row_key`).
     fn keyindex_from_i64(deleted: &[(i64, i64)]) -> KeyDeletionIndex {
+        let converter = pk_row_converter();
         let map: HashMap<Box<[u8]>, i64> = deleted
             .iter()
-            .map(|(pk, seq)| (Box::<[u8]>::from(pk.to_be_bytes().as_slice()), *seq))
+            .map(|(pk, seq)| (pk_row_key(&converter, *pk), *seq))
             .collect();
         KeyDeletionIndex::from_map(map)
     }
@@ -1387,15 +1406,15 @@ mod tests {
     }
 
     /// A re-inserted (upserted) PK is in the deleted set but visible under
-    /// `Apply` (insert_seq > delete_seq). The bloom hits, the walk keeps it.
+    /// `Apply` (`insert_seq` > `delete_seq`). The bloom hits, the walk keeps it.
     /// Proves the fast path does not interfere with insert-record visibility.
     #[tokio::test]
     async fn keybased_batch_bloom_hit_keeps_reinserted_row() -> datafusion_common::Result<()> {
-        let mut deleted: HashMap<Box<[u8]>, i64> = HashMap::new();
-        let mut inserts: HashMap<Box<[u8]>, i64> = HashMap::new();
-        let k2 = Box::<[u8]>::from(2_i64.to_be_bytes().as_slice());
-        deleted.insert(k2.clone(), 10); // pk=2 deleted at seq 10
-        inserts.insert(k2, 11); // re-inserted at seq 11 (> delete) → visible under Apply
+        // Key must use the SAME RowConverter encoding the stream probes with.
+        let converter = pk_row_converter();
+        let k2 = pk_row_key(&converter, 2);
+        let deleted = HashMap::from([(k2.clone(), 10_i64)]); // pk=2 deleted at seq 10
+        let inserts = HashMap::from([(k2, 11_i64)]); // re-inserted at seq 11 (> delete) → visible under Apply
         let index = KeyDeletionIndex::from_maps(deleted, inserts);
         let out = run_keybased_filter(vec![1, 2, 3], index, InsertRecordHandling::Apply).await?;
         assert_eq!(
