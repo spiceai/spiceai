@@ -643,14 +643,14 @@ mod tests {
         );
     }
 
-    /// Regression test for the DF53 / table-providers v0.11 SQLite Decimal
-    /// round-trip. A `Decimal128`/`Decimal256` column accelerated into SQLite
+    /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal
+    /// round-trip. A `Decimal128`/`Decimal256` column accelerated into `SQLite`
     /// must read back as a decimal, not fail with
     /// `Invalid column type Text ... name: col_Decimal`.
     ///
     /// The values intentionally include integer-valued decimals (`0.00`,
     /// `2.00`) alongside fractional ones (`1.11`, `99.99`) and a NULL so that
-    /// SQLite's per-cell storage class (NUMERIC affinity stores `0.00` as
+    /// `SQLite`'s per-cell storage class (NUMERIC affinity stores `0.00` as
     /// INTEGER, `1.11` as REAL, high-precision values as TEXT) is exercised
     /// across a heterogeneous column.
     #[tokio::test]
@@ -743,11 +743,11 @@ mod tests {
     }
 
     /// Regression test mirroring the Postgres/MySQL quickstart E2E failure
-    /// where a `List<Utf8>` column accelerated into SQLite read back with
+    /// where a `List<Utf8>` column accelerated into `SQLite` read back with
     /// `Failed to decode value: Json error: Encountered unexpected 'e' whilst
     /// parsing value`.
     ///
-    /// SQLite has no array storage class, so the list is persisted as TEXT and
+    /// `SQLite` has no array storage class, so the list is persisted as TEXT and
     /// the accelerated read path JSON-parses that text back into the declared
     /// `List<Utf8>`. The write side must therefore emit *valid JSON*
     /// (`["expired","active"]`), not the bare `[expired, active]` that
