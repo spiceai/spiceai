@@ -40,6 +40,8 @@ ignore = [
   "RUSTSEC-2026-0099",
   # Legacy `rustls` 0.21 dependencies pull `rustls-webpki` 0.101.x; newer 0.103.x is updated in Cargo.lock. Owner: AWS/MSSQL integrations.
   "RUSTSEC-2026-0104",
+  # `mysql_async` pulls the now-unmaintained `proc-macro-error2` via `mysql-common-derive`; no safe upgrade is available yet. Owner: connector-mysql/data connectors.
+  "RUSTSEC-2026-0173",
 ]
 
 [bans]
