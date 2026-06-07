@@ -107,17 +107,28 @@ impl CayenneContext {
         // reads exactly the static value until (and unless) the controller moves
         // it — enabling dynamic tuning is therefore a strict, bounded refinement,
         // never a behavior change on its own.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // When `write_concurrency` is unset, seed the live knob to the SAME value
+        // the write path resolves to (`DEFAULT_WRITE_CONCURRENCY` capped by host
+        // cores), not 0. The controller grows from this real current value; a 0
+        // seed (which the accessor and `decide()` both treat as 1) would make the
+        // first "raise under backpressure" actually DECREASE effective concurrency
+        // (e.g. default 4 → 2). Equivalent to unset for the write path, so this is
+        // not a behavior change when dynamic tuning is off.
+        let default_write_concurrency = super::table::DEFAULT_WRITE_CONCURRENCY.min(cores);
+        let wc_init = config
+            .write_concurrency
+            .unwrap_or(default_write_concurrency);
         let live_knobs = Arc::new(LiveKnobs::new(KnobValues {
             inline_flush_max_bytes: config.inline_flush_max_bytes,
             inline_flush_max_rows: config.inline_flush_max_rows,
             inline_flush_max_segments: config.inline_flush_max_segments,
             compaction_background_interval_ms: config.compaction_background_interval_ms,
             compaction_trigger_files: config.compaction_trigger_files,
-            write_concurrency: config.write_concurrency.unwrap_or(0),
+            write_concurrency: wc_init,
         }));
-        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
-        // memtable may grow up to 4× the static value (publish-bound relief) but
+        // memtable may grow up to 4× the static value (ingest-lag relief) but
         // never past 256 MiB (the largest static memory ceiling); concurrency is
         // capped at the core count (the global encode budget caps the aggregate).
         let min_flush_bytes: i64 = 2 * 1024 * 1024;
@@ -131,7 +142,6 @@ impl CayenneContext {
         // override is respected even in `adaptive` mode (`decide()` finds no room
         // and falls through to another, un-pinned lever).
         let pins = config.pinned_tuning_knobs;
-        let wc_init = config.write_concurrency.unwrap_or(0);
         let tuning_bounds = TuningBounds {
             inline_flush_max_bytes: if pins.inline_flush {
                 (config.inline_flush_max_bytes, config.inline_flush_max_bytes)

@@ -129,7 +129,7 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// independent tables oversubscribe the box under concurrent CDC. Users raise
 /// `cayenne_write_concurrency` explicitly when a table needs more encode
 /// parallelism. See `snapshot_write_concurrency`.
-const DEFAULT_WRITE_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 // Approximate per-entry `HashMap` control/allocation overhead used for the
 // cache budget. The exact value is allocator-dependent, so keep this estimate
 // centralized with `approx_pk_keyset_entry_bytes`.

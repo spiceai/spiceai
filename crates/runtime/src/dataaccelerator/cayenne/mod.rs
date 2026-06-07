@@ -1252,7 +1252,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("upload_concurrency")
             .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count."),
         ParameterSpec::component("write_concurrency")
-            .description("Writer partition override for unsorted Cayenne ingests. 'auto' (or unset) uses runtime.query.target_partitions, capped at the host core count and the process-global encode budget."),
+            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
