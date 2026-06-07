@@ -84,11 +84,8 @@ struct PendingFinalizeCommit {
 /// epoch and the source re-streams the un-checkpointed tail (exactly-once via
 /// the PK-idempotent apply). Shared (`Arc`) between the apply loop (which pushes)
 /// and the slot advancer installed on the provider (which drains).
-type DeferredCommitQueue = Arc<
-    tokio::sync::Mutex<
-        VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
-    >,
->;
+type DeferredCommitQueue =
+    Arc<tokio::sync::Mutex<VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>>>;
 
 /// The runtime's [`cayenne::SlotAdvancer`] implementation. Installed on a
 /// memory-mode Cayenne provider; when a checkpoint reports an epoch durable it
@@ -163,7 +160,10 @@ async fn deferred_commit_queue_is_empty(queue: &DeferredCommitQueue) -> bool {
 fn committers_all_support_deferral(
     committers: &[Box<dyn cdc::CommitChange + Send + Sync>],
 ) -> bool {
-    !committers.is_empty() && committers.iter().all(|committer| committer.supports_deferral())
+    !committers.is_empty()
+        && committers
+            .iter()
+            .all(|committer| committer.supports_deferral())
 }
 
 #[cfg(not(windows))]
@@ -1168,8 +1168,8 @@ impl RefreshTask {
         #[cfg(not(windows))]
         let can_defer_current_burst = committers_all_support_deferral(&committers);
         #[cfg(not(windows))]
-        let requires_durable_cdc_path = !can_defer_current_burst
-            || change_batch_requires_durable_cdc_path(&coalesced_batch);
+        let requires_durable_cdc_path =
+            !can_defer_current_burst || change_batch_requires_durable_cdc_path(&coalesced_batch);
 
         #[cfg(not(windows))]
         if let Some(queue) = context.deferred_commits
@@ -3709,12 +3709,8 @@ mod tests {
         );
 
         for op in ["d", "t", "x"] {
-            let batch = create_test_change_batch(
-                vec![op],
-                &[vec!["id"]],
-                vec![1],
-                vec![Some("row")],
-            );
+            let batch =
+                create_test_change_batch(vec![op], &[vec!["id"]], vec![1], vec![Some("row")]);
             assert!(
                 change_batch_requires_durable_cdc_path(&batch),
                 "operation {op} must force the durable CDC path"
@@ -3726,23 +3722,21 @@ mod tests {
     #[test]
     fn test_memory_cdc_deferral_requires_every_committer_to_support_deferral() {
         let log = CommitLog::new();
-        let deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(
-            DeferrableTrackingCommitter {
+        let deferrable: Box<dyn CommitChange + Send + Sync> =
+            Box::new(DeferrableTrackingCommitter {
                 id: 1,
                 log: Arc::clone(&log),
                 outcome: Ok(()),
-            },
-        );
+            });
         assert!(committers_all_support_deferral(&[deferrable]));
 
         let log = CommitLog::new();
-        let deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(
-            DeferrableTrackingCommitter {
+        let deferrable: Box<dyn CommitChange + Send + Sync> =
+            Box::new(DeferrableTrackingCommitter {
                 id: 1,
                 log: Arc::clone(&log),
                 outcome: Ok(()),
-            },
-        );
+            });
         let non_deferrable: Box<dyn CommitChange + Send + Sync> = Box::new(TrackingCommitter {
             id: 2,
             log,
@@ -3793,8 +3787,7 @@ mod tests {
             dataset_name: TableReference::bare("test"),
             runtime_status: crate::status::RuntimeStatus::new(),
         };
-        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 5)
-            .await;
+        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 5).await;
 
         assert_eq!(
             log.ids().await,
@@ -3804,7 +3797,11 @@ mod tests {
         let queue = queue.lock().await;
         assert_eq!(queue.len(), 2, "failed and future epochs remain queued");
         assert_eq!(queue[0].0, 5);
-        assert_eq!(queue[0].1.len(), 2, "failed plus untried committers requeue");
+        assert_eq!(
+            queue[0].1.len(),
+            2,
+            "failed plus untried committers requeue"
+        );
         assert_eq!(queue[1].0, 6);
     }
 
