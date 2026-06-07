@@ -389,7 +389,7 @@ impl TursoAccelerator {
     /// random I/O latency. Local SSD, tmpfs, and unknown storage keep the
     /// engine defaults.
     ///
-    /// Note: unlike rusqlite-backed SQLite, the Turso engine does not implement
+    /// Note: unlike `rusqlite`-backed `SQLite`, the Turso engine does not implement
     /// `PRAGMA mmap_size` and rejects it as an unknown pragma name, so we only
     /// tune the supported `cache_size` here.
     fn storage_setup_pragmas(

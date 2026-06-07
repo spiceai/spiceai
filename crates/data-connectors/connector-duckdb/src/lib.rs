@@ -37,7 +37,6 @@ use runtime::dataconnector::{
     DataConnectorFactory, DataConnectorResult,
 };
 use runtime::datafusion::dialect::new_duckdb_dialect;
-use runtime::datafusion::udf::deny_spice_functions_for_duckdb;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use spiceai_duckdb::AccessMode;

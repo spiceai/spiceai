@@ -807,8 +807,8 @@ fn apply_filter_additions(
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneOptimizerConfig, FilterAddition, apply_filter_additions,
-        plan_schema_fields,
+        CayenneDynamicFilterSharing, CayenneOptimizerConfig, FilterAddition,
+        apply_filter_additions, plan_schema_fields,
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
@@ -1899,7 +1899,7 @@ mod tests {
         Vec::new()
     }
 
-    /// Runs DataFusion's Post-phase physical filter pushdown — the phase that
+    /// Runs `DataFusion`'s Post-phase physical filter pushdown — the phase that
     /// plants hash-join dynamic filters into probe-side scans.
     fn push_down_filters(
         plan: Arc<dyn ExecutionPlan>,
@@ -1915,7 +1915,7 @@ mod tests {
     /// that replaced the forked `ExactLeftAccumulator` accumulator seam.
     ///
     /// For an inner join whose probe (right) side is a `CayenneAccelerationExec`,
-    /// DataFusion's Post-phase `FilterPushdown` must plant a
+    /// `DataFusion`'s Post-phase `FilterPushdown` must plant a
     /// `DynamicFilterPhysicalExpr` into the Cayenne scan's underlying file
     /// source. This is the effect the old `CayenneJoinRewriter` rule used to
     /// secure via a custom accumulator; the native path now provides it (with a
@@ -1926,7 +1926,8 @@ mod tests {
         let schema = order_line_schema();
         let build = file_exec(&schema, "build.vortex", None);
         let probe = cayenne_file_exec(&schema, "probe.vortex", None);
-        let join: Arc<dyn ExecutionPlan> = Arc::new(hash_join(build, probe, "order_id", "order_id"));
+        let join: Arc<dyn ExecutionPlan> =
+            Arc::new(hash_join(build, probe, "order_id", "order_id"));
 
         // Default config keeps `optimizer.enable_join_dynamic_filter_pushdown`
         // (and the umbrella `enable_dynamic_filter_pushdown`) enabled.
@@ -1947,14 +1948,12 @@ mod tests {
             displayable(optimized.as_ref()).indent(true)
         );
         assert!(
-            filters
-                .iter()
-                .any(|f| f.columns().contains("order_id")),
+            filters.iter().any(|f| f.columns().contains("order_id")),
             "the planted dynamic filter should reference the equi-join key column"
         );
     }
 
-    /// Companion to the inner-join regression: DataFusion only pushes
+    /// Companion to the inner-join regression: `DataFusion` only pushes
     /// join-derived dynamic filters through **inner** joins
     /// (`HashJoinExec::allow_join_dynamic_filter_pushdown`). A semi join must
     /// therefore *not* plant a dynamic filter into the Cayenne scan — the OOM

@@ -298,38 +298,37 @@ async fn retry_query_until_llm_found(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await {
-                Ok(rbs) => {
-                    let Some(rb) = rbs.first() else {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    };
+            // Back off on transient query errors so we don't hot-loop at the
+            // `wait_until_true` poll interval (matches the empty-result backoff below).
+            let Ok(rbs) =
+                crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await
+            else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
 
-                    if rb.num_rows() == 0 {
-                        sleep(Duration::from_secs(1)).await;
-                        return false;
-                    }
+            let Some(rb) = rbs.first() else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
 
-                    // Check if llm_count > 0
-                    let llm_count = rb
-                        .column_by_name("llm_count")
-                        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                        .map_or(0, |a| a.value(0));
+            if rb.num_rows() == 0 {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            }
 
-                    if llm_count > 0 {
-                        *data.lock().await = Some(rbs);
-                        true
-                    } else {
-                        sleep(Duration::from_secs(1)).await;
-                        false
-                    }
-                }
-                // Back off on transient query errors so we don't hot-loop at the
-                // `wait_until_true` poll interval (matches the empty-result backoff above).
-                Err(_) => {
-                    sleep(Duration::from_secs(1)).await;
-                    false
-                }
+            // Check if llm_count > 0
+            let llm_count = rb
+                .column_by_name("llm_count")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .map_or(0, |a| a.value(0));
+
+            if llm_count > 0 {
+                *data.lock().await = Some(rbs);
+                true
+            } else {
+                sleep(Duration::from_secs(1)).await;
+                false
             }
         }
     })
@@ -351,22 +350,21 @@ async fn retry_query_expecting_results(
         let query = query.clone();
         let data = Arc::clone(&data);
         async move {
-            match crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await {
-                Ok(rbs) => {
-                    if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
-                        sleep(Duration::from_secs(1)).await;
-                        false
-                    } else {
-                        *data.lock().await = Some(rbs);
-                        true
-                    }
-                }
-                // Back off on transient query errors so we don't hot-loop at the
-                // `wait_until_true` poll interval (matches the empty-result backoff above).
-                Err(_) => {
-                    sleep(Duration::from_secs(1)).await;
-                    false
-                }
+            // Back off on transient query errors so we don't hot-loop at the
+            // `wait_until_true` poll interval (matches the empty-result backoff below).
+            let Ok(rbs) =
+                crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await
+            else {
+                sleep(Duration::from_secs(1)).await;
+                return false;
+            };
+
+            if rbs.first().is_none_or(|rb| rb.num_rows() == 0) {
+                sleep(Duration::from_secs(1)).await;
+                false
+            } else {
+                *data.lock().await = Some(rbs);
+                true
             }
         }
     })

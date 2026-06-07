@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use datafusion_federation::sql::{
     LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
 };
-use datafusion_federation::{FederatedPlanNode, FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion_federation::{
+    FederatedPlanNode, FederatedTableProviderAdaptor, FederatedTableSource,
+};
 use std::sync::Arc;
 
 use crate::function_support::{FunctionSupport, contains_unsupported_functions};

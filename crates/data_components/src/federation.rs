@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! Spice-owned `SQLExecutor` wrapper that applies a function deny-list to
-//! federation decisions for any `SqlTable`-backed connector (Snowflake, ClickHouse, ODBC, …).
+//! federation decisions for any `SqlTable`-backed connector (Snowflake, `ClickHouse`, ODBC, …).
 //!
 //! This wrapper installs a logical optimizer that consults a `FunctionSupport`
 //! deny-list and unwraps federated plans when an unsupported function appears,

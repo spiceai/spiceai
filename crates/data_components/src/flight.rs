@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use crate::{Read, ReadWrite, sql_expr::to_sql_preserving_precedence};
 use arrow::{
     array::RecordBatch,
@@ -38,7 +39,6 @@ use datafusion::{
     sql::unparser::dialect::Dialect,
 };
 use datafusion_federation::sql::RemoteTableRef;
-use crate::function_support::FunctionSupport;
 use flight_client::{
     Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
 };

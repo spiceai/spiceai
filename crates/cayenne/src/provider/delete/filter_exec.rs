@@ -1067,7 +1067,9 @@ mod tests {
             .expect("partition statistics");
         assert_eq!(stats.num_rows, Precision::Inexact(3));
         // Aggregate (partition = None) must also be inexact, not unknown.
-        let agg = exec.partition_statistics(None).expect("aggregate statistics");
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics");
         assert_eq!(agg.num_rows, Precision::Inexact(3));
     }
 
@@ -1079,7 +1081,10 @@ mod tests {
             key_tombstones(),
             InsertRecordHandling::Apply,
             vec![0],
-            Arc::new(RowConverter::new(vec![arrow_row::SortField::new(DataType::Int64)]).unwrap()),
+            Arc::new(
+                RowConverter::new(vec![arrow_row::SortField::new(DataType::Int64)])
+                    .expect("Int64 row converter"),
+            ),
             None,
         );
         let stats = exec
@@ -1107,8 +1112,14 @@ mod tests {
         };
         let out = deletion_filtered_statistics(input_stats);
         let col = &out.column_statistics[0];
-        assert_eq!(col.min_value, Precision::Inexact(ScalarValue::Int64(Some(1))));
-        assert_eq!(col.max_value, Precision::Inexact(ScalarValue::Int64(Some(3))));
+        assert_eq!(
+            col.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            col.max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(3)))
+        );
         assert_eq!(col.null_count, Precision::Inexact(0));
     }
 

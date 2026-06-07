@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use async_trait::async_trait;
 use datafusion::{
     datasource::TableProvider,
@@ -22,7 +23,6 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool as db_connection_pool_datafusion, sql_provider_datafusion::SqlTable,
 };
-use crate::function_support::FunctionSupport;
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use std::sync::Arc;

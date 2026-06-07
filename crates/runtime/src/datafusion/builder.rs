@@ -1150,9 +1150,9 @@ fn hash_join_inlist_memory_limit_per_partition(
     }
 }
 
-/// Sizes DataFusion's native hash-join InList dynamic-filter budget
+/// Sizes `DataFusion`'s native hash-join `InList` dynamic-filter budget
 /// (`optimizer.hash_join_inlist_pushdown_max_size`) down to the runtime memory
-/// limit divided across `target_partitions`, never raising DataFusion's own
+/// limit divided across `target_partitions`, never raising `DataFusion`'s own
 /// default. This bounds the per-partition memory the native inner-join dynamic
 /// filter can spend materializing build-side keys as an `InList`; larger build
 /// sides automatically fall back to the hash-table membership strategy.

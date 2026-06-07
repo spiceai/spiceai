@@ -312,9 +312,9 @@ async fn federated_postgres_table_provider(
     let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
     let sql_table = Arc::new(
         SqlTable::new("postgres", &dyn_pool, table_reference.clone())
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-        .with_dialect(Arc::new(PostgreSqlDialect {})),
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .with_dialect(Arc::new(PostgreSqlDialect {})),
     );
 
     let schema = sql_table.schema();
