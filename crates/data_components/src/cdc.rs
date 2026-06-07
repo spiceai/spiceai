@@ -108,6 +108,18 @@ impl std::fmt::Display for StreamError {
 #[async_trait]
 pub trait CommitChange {
     async fn commit(&self) -> Result<(), CommitError>;
+
+    /// Whether deferring this commit is crash-safe: the source can re-stream from
+    /// its last durable checkpoint after a crash, so the source offset is advanced
+    /// only after downstream durability. Defaults to `false` (conservative — never
+    /// defer); overridden `true` only by committers backed by a replayable source
+    /// checkpoint (e.g. a Postgres replication slot). Consumers that defer the
+    /// commit behind a later durability fence (in-memory CDC tier) MUST gate that
+    /// deferral on this returning `true`, or a crash could lose data that the
+    /// source can no longer re-stream.
+    fn supports_deferral(&self) -> bool {
+        false
+    }
 }
 
 pub struct ChangeEnvelope {

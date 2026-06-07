@@ -285,6 +285,15 @@ impl CommitChange for LsnCommitter {
             }
         }
     }
+
+    /// The Postgres logical replication slot retains WAL until `confirmed_flush`
+    /// advances, and `commit()` here only advances that flush LSN. Deferring the
+    /// commit therefore holds the slot back, so a crash before the deferred commit
+    /// re-streams the un-acked tail from the slot — exactly-once via the idempotent
+    /// apply. Safe to defer.
+    fn supports_deferral(&self) -> bool {
+        true
+    }
 }
 
 /// Per-field Arrow builder that accepts `Option<&Value>` (text/null/unchanged)
