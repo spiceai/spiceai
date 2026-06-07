@@ -12661,7 +12661,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
 
         // Emit observability gauges every tick (regardless of whether dynamic
         // tuning is enabled — the accounting is always recorded).
-        let table = self.table_metadata.table_name.to_string();
+        let table = self.table_metadata.table_name.clone();
         let snap = self.context.ingest_snapshot();
         let knobs = self.context.live_knob_values();
         telemetry::track_cayenne_autotune_state(

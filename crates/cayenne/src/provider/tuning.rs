@@ -146,8 +146,7 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
     if let (Some(budget), Some(used)) = (global_memory_budget(), current_memory_bytes())
         && budget > 0
     {
-        #[allow(clippy::cast_precision_loss)]
-        stats.set_mem_pressure(used as f64 / budget as f64);
+        stats.set_mem_pressure(u64_to_f64(used) / u64_to_f64(budget));
     }
 }
 
@@ -241,8 +240,8 @@ impl IngestStats {
             .arrival_gap
             .map_or(apply_ms, duration_ms)
             .max(f64::from(1_u32) / 1000.0);
-        let inst_rows_per_sec = (s.rows as f64) * 1000.0 / window_ms;
-        let inst_bytes_per_sec = (s.bytes as f64) * 1000.0 / window_ms;
+        let inst_rows_per_sec = u64_to_f64(s.rows) * 1000.0 / window_ms;
+        let inst_bytes_per_sec = u64_to_f64(s.bytes) * 1000.0 / window_ms;
         let arrival_gap_ms = s.arrival_gap.map_or(apply_ms, duration_ms);
 
         let mut inner = self.inner.lock();
@@ -266,12 +265,14 @@ impl IngestStats {
     /// (`used / budget`). Sampled on the background tick so the controller can
     /// close the loop on memory (shrink live allocations under pressure). Values
     /// ≥ 1.0 (over budget) are preserved as pressure > 1.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn set_mem_pressure(&self, fraction: f64) {
         if !fraction.is_finite() || fraction < 0.0 {
             return;
         }
-        let milli = (fraction * 1000.0).round().min((u64::MAX - 1) as f64) as u64;
+        // Cap at a sane 1000× (pressure is ~0..2 in practice) so the f64→u64
+        // cast can't overflow; ×1000 keeps three decimals of resolution.
+        let milli = (fraction.min(1000.0) * 1000.0).round() as u64;
         self.mem_pressure_milli.store(milli, Ordering::Relaxed);
     }
 
@@ -287,10 +288,9 @@ impl IngestStats {
         } else {
             0.0
         };
-        #[allow(clippy::cast_precision_loss)]
         let mem_pressure = match self.mem_pressure_milli.load(Ordering::Relaxed) {
             u64::MAX => None,
-            milli => Some(milli as f64 / 1000.0),
+            milli => Some(u64_to_f64(milli) / 1000.0),
         };
         IngestSnapshot {
             rows_per_sec: inner.rows_per_sec,
@@ -400,12 +400,13 @@ impl LiveKnobs {
     pub fn apply(&self, adj: &Adjustment) {
         match adj.knob {
             Knob::InlineFlushBytes => {
-                self.inline_flush_max_bytes
-                    .store(adj.new_value as i64, Ordering::Relaxed);
+                let bytes = i64::try_from(adj.new_value).unwrap_or(i64::MAX);
+                self.inline_flush_max_bytes.store(bytes, Ordering::Relaxed);
                 // Keep rows/segments coherent with the byte budget (same ratios
                 // the static derivation uses: ~1 KiB/row, ~128 KiB/segment).
-                let rows = (adj.new_value / 1024).max(64) as i64;
-                let segs = (adj.new_value / (128 * 1024)).clamp(16, 256) as i64;
+                let rows = i64::try_from((adj.new_value / 1024).max(64)).unwrap_or(i64::MAX);
+                let segs =
+                    i64::try_from((adj.new_value / (128 * 1024)).clamp(16, 256)).unwrap_or(256);
                 self.inline_flush_max_rows.store(rows, Ordering::Relaxed);
                 self.inline_flush_max_segments
                     .store(segs, Ordering::Relaxed);
@@ -415,12 +416,16 @@ impl LiveKnobs {
                     .store(adj.new_value, Ordering::Relaxed);
             }
             Knob::CompactionTriggerFiles => {
-                self.compaction_trigger_files
-                    .store(adj.new_value as usize, Ordering::Relaxed);
+                self.compaction_trigger_files.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
             }
             Knob::WriteConcurrency => {
-                self.write_concurrency
-                    .store(adj.new_value as usize, Ordering::Relaxed);
+                self.write_concurrency.store(
+                    usize::try_from(adj.new_value).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
             }
         }
     }
@@ -484,10 +489,6 @@ pub(crate) struct Adjustment {
     pub reason: &'static str,
 }
 
-/// Multiplicative step for one adjustment (±50%). Large enough to converge in a
-/// few ticks, small enough that one move can't overshoot the whole range.
-const STEP: f64 = 1.5;
-
 /// Decide the single best bounded actuator move for the current behavior, or
 /// `None` to hold.
 ///
@@ -519,18 +520,18 @@ pub(crate) fn decide(
     // shrink it toward the floor. Running first means no growth rule below can
     // enlarge memory on an already-tight box; query read-amp is instead relieved
     // by compaction (which costs CPU, not memory).
-    if mem_high {
-        if let Some(v) = clamp_move_i64(
+    if mem_high
+        && let Some(v) = clamp_move_i64(
             cur.inline_flush_max_bytes,
             shrink_i64(cur.inline_flush_max_bytes),
             b.inline_flush_max_bytes,
-        ) {
-            return Some(Adjustment {
-                knob: Knob::InlineFlushBytes,
-                new_value: u64::try_from(v).unwrap_or(0),
-                reason: "memory pressure: shrink memtable to stay within the cgroup budget",
-            });
-        }
+        )
+    {
+        return Some(Adjustment {
+            knob: Knob::InlineFlushBytes,
+            new_value: u64::try_from(v).unwrap_or(0),
+            reason: "memory pressure: shrink memtable to stay within the cgroup budget",
+        });
     }
 
     // The system is unhealthy if ingest is falling behind OR queries are being
@@ -543,22 +544,22 @@ pub(crate) fn decide(
         // larger Vortex files — but only if memory allows; otherwise drain the
         // backlog with compaction (CPU, not memory).
         if read_amp_high {
-            if mem_ok {
-                if let Some(v) = clamp_move_i64(
+            if mem_ok
+                && let Some(v) = clamp_move_i64(
                     cur.inline_flush_max_bytes,
                     grow_i64(cur.inline_flush_max_bytes),
                     b.inline_flush_max_bytes,
-                ) {
-                    return Some(Adjustment {
-                        knob: Knob::InlineFlushBytes,
-                        new_value: u64::try_from(v).unwrap_or(0),
-                        reason: "high read-amp: larger memtable → fewer small files for queries",
-                    });
-                }
+                )
+            {
+                return Some(Adjustment {
+                    knob: Knob::InlineFlushBytes,
+                    new_value: u64::try_from(v).unwrap_or(0),
+                    reason: "high read-amp: larger memtable → fewer small files for queries",
+                });
             }
             if let Some(v) = clamp_move_u64(
                 cur.compaction_background_interval_ms,
-                scale_u64(cur.compaction_background_interval_ms, 1.0 / STEP),
+                shrink_u64(cur.compaction_background_interval_ms),
                 b.compaction_background_interval_ms,
             ) {
                 return Some(Adjustment {
@@ -605,7 +606,7 @@ pub(crate) fn decide(
                 // speed ingest at the cost of query latency.
                 if let Some(v) = clamp_move_usize(
                     cur.write_concurrency.max(1),
-                    scale_usize(cur.write_concurrency.max(1), STEP),
+                    grow_usize(cur.write_concurrency.max(1)),
                     b.write_concurrency,
                 ) {
                     return Some(Adjustment {
@@ -618,7 +619,7 @@ pub(crate) fn decide(
             // Last resort while behind: compact more to keep the snapshot lean.
             if let Some(v) = clamp_move_u64(
                 cur.compaction_background_interval_ms,
-                scale_u64(cur.compaction_background_interval_ms, 1.0 / STEP),
+                shrink_u64(cur.compaction_background_interval_ms),
                 b.compaction_background_interval_ms,
             ) {
                 return Some(Adjustment {
@@ -634,18 +635,20 @@ pub(crate) fn decide(
     // (4) Healthy on every axis (ingest caught up, queries not read-amp-bound,
     // memory comfortable) → give CPU back to queries by backing off background
     // compaction. Only when clearly idle, so we don't undo a recent speed-up.
-    if s.apply_vs_arrival < HEALTHY_RATIO && s.read_amp <= READ_AMP_LOW && mem_ok {
-        if let Some(v) = clamp_move_u64(
+    if s.apply_vs_arrival < HEALTHY_RATIO
+        && s.read_amp <= READ_AMP_LOW
+        && mem_ok
+        && let Some(v) = clamp_move_u64(
             cur.compaction_background_interval_ms,
-            scale_u64(cur.compaction_background_interval_ms, STEP),
+            grow_u64(cur.compaction_background_interval_ms),
             b.compaction_background_interval_ms,
-        ) {
-            return Some(Adjustment {
-                knob: Knob::CompactionIntervalMs,
-                new_value: v,
-                reason: "healthy: back off compaction to free CPU for queries",
-            });
-        }
+        )
+    {
+        return Some(Adjustment {
+            knob: Knob::CompactionIntervalMs,
+            new_value: v,
+            reason: "healthy: back off compaction to free CPU for queries",
+        });
     }
 
     None
@@ -668,32 +671,37 @@ fn ewma(slot: &mut f64, sample: f64, prior_samples: u64) {
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn scale_u64(v: u64, factor: f64) -> u64 {
-    ((v as f64) * factor).round() as u64
+// One adjustment step is ×3/2 (grow) or ×2/3 (shrink) — i.e. ±50% — done in
+// integer math to avoid lossy float casts. `grow` guarantees at least +1 so a
+// small value still makes progress; `saturating_mul` guards the (practically
+// impossible) overflow near the ceiling, where the clamp holds it anyway.
+fn grow_u64(v: u64) -> u64 {
+    (v.saturating_mul(3) / 2).max(v.saturating_add(1))
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn scale_usize(v: usize, factor: f64) -> usize {
-    ((v as f64) * factor).round() as usize
+fn shrink_u64(v: u64) -> u64 {
+    v * 2 / 3
 }
 
-/// Grow an `i64` knob by one [`STEP`] (non-negative inputs only; clamped at use).
+fn grow_usize(v: usize) -> usize {
+    (v.saturating_mul(3) / 2).max(v.saturating_add(1))
+}
+
+/// Grow an `i64` knob by one step (non-negative inputs only; clamped at use).
 fn grow_i64(v: i64) -> i64 {
-    i64::try_from(scale_u64(u64::try_from(v.max(0)).unwrap_or(0), STEP)).unwrap_or(i64::MAX)
+    i64::try_from(grow_u64(u64::try_from(v.max(0)).unwrap_or(0))).unwrap_or(i64::MAX)
 }
 
-/// Shrink an `i64` knob by one [`STEP`].
+/// Shrink an `i64` knob by one step.
 fn shrink_i64(v: i64) -> i64 {
-    i64::try_from(scale_u64(u64::try_from(v.max(0)).unwrap_or(0), 1.0 / STEP)).unwrap_or(0)
+    i64::try_from(shrink_u64(u64::try_from(v.max(0)).unwrap_or(0))).unwrap_or(0)
+}
+
+/// `u64` → `f64` for rate/ratio/pressure math. The precision loss is acceptable:
+/// these are EWMA estimates and metrics whose magnitudes never approach 2^52.
+#[expect(clippy::cast_precision_loss)]
+fn u64_to_f64(v: u64) -> f64 {
+    v as f64
 }
 
 /// Clamp `target` to `[lo, hi]` and return it only if it differs from `cur`
@@ -715,6 +723,11 @@ fn clamp_move_i64(cur: i64, target: i64, (lo, hi): (i64, i64)) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     use super::*;
 
     fn ms(n: u64) -> Duration {
@@ -846,7 +859,7 @@ mod tests {
         // checkpoints fewer, larger files, so ingest stops slowing scans.
         let adj = decide(&s, &knobs(), &bounds(), ms(60_000), ms(30_000)).expect("acts");
         assert_eq!(adj.knob, Knob::InlineFlushBytes);
-        assert!(adj.new_value > u64::try_from(knobs().inline_flush_max_bytes).unwrap());
+        assert!(adj.new_value > u64::try_from(knobs().inline_flush_max_bytes).expect("fits"));
         // With the memtable already at its ceiling, drain via compaction instead.
         let at_ceiling = KnobValues {
             inline_flush_max_bytes: bounds().inline_flush_max_bytes.1,
@@ -903,7 +916,7 @@ mod tests {
         let adj = decide(&s, &bigger, &bounds(), ms(60_000), ms(30_000)).expect("acts");
         assert_eq!(adj.knob, Knob::InlineFlushBytes);
         assert!(
-            adj.new_value < u64::try_from(bigger.inline_flush_max_bytes).unwrap(),
+            adj.new_value < u64::try_from(bigger.inline_flush_max_bytes).expect("fits"),
             "memtable must shrink under memory pressure"
         );
     }
@@ -1005,7 +1018,6 @@ mod tests {
     // ---- safety: bounds are never exceeded; no-op at extremes -------------
 
     #[test]
-    #[allow(clippy::cast_sign_loss)]
     fn adjustments_never_exceed_bounds() {
         let stats = IngestStats::new();
         warm(&stats, sample(1000, 150, 100, 20, 100), 20); // behind
@@ -1094,7 +1106,7 @@ mod tests {
         });
         let v = live.values();
         assert_eq!(v.inline_flush_max_bytes, 64 * 1024 * 1024);
-        assert_eq!(v.inline_flush_max_rows, (64 * 1024 * 1024 / 1024).max(64));
+        assert_eq!(v.inline_flush_max_rows, 64 * 1024 * 1024 / 1024);
         assert_eq!(
             v.inline_flush_max_segments,
             (64 * 1024 * 1024 / (128 * 1024)).clamp(16, 256)

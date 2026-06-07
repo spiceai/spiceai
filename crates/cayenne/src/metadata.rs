@@ -484,6 +484,10 @@ impl DeletionMode {
 /// explicit value is already frozen.) This is how the "override per config
 /// value" mode composes with `auto`/`adaptive`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent pin flag per adaptive-tunable knob"
+)]
 pub struct PinnedTuningKnobs {
     /// The inline-memtable flush caps were operator-set (don't adapt them).
     pub inline_flush: bool,
