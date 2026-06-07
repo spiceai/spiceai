@@ -100,15 +100,20 @@ impl MetricsCollector {
     /// source table) rather than being conflated with "no estimate available".
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+        // Release pairs with the Acquire load in `bootstrap_rows_expected()`: once a
+        // reader (the metrics callback, a different thread) observes the flag as `true`,
+        // the value store above is guaranteed visible — never a stale default `0`.
         self.bootstrap_rows_expected_known
-            .store(true, Ordering::Relaxed);
+            .store(true, Ordering::Release);
     }
     /// The estimated bootstrap row total, or `None` when no estimate is available
     /// (extended schema inference is off or surfaced no row count). `Some(0)` is a
     /// known-empty source table — deliberately distinct from `None`.
     #[must_use]
     pub fn bootstrap_rows_expected(&self) -> Option<u64> {
-        if self.bootstrap_rows_expected_known.load(Ordering::Relaxed) {
+        // Acquire pairs with the Release store in `set_bootstrap_rows_expected()` so the
+        // value load below never observes a stale default once the flag reads `true`.
+        if self.bootstrap_rows_expected_known.load(Ordering::Acquire) {
             Some(self.bootstrap_rows_expected.load(Ordering::Relaxed))
         } else {
             None
