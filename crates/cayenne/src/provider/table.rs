@@ -19832,6 +19832,14 @@ mod tests {
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_order_line_cdc_table_with_inline_max_rows(table_name, runtime_env, 0).await
+    }
+
+    async fn create_order_line_cdc_table_with_inline_max_rows(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        inline_max_rows: usize,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -19868,7 +19876,7 @@ mod tests {
             base_path: data_dir,
             partition_column: None,
             vortex_config: VortexConfig {
-                inline_max_rows: 0,
+                inline_max_rows,
                 deletion_mode: crate::metadata::DeletionMode::Key,
                 // Force the same over-budget existence-index mode that Ch-Bench
                 // `order_line` reaches at SF-100 scale, without needing millions
@@ -19909,6 +19917,49 @@ mod tests {
             ],
         )
         .expect("order_line batch is valid")
+    }
+
+    fn order_line_batch_with_extra_line(
+        schema: SchemaRef,
+        order_id: i64,
+        line_count: i64,
+        delivery_d: i64,
+        extra_order_id: i64,
+    ) -> RecordBatch {
+        use arrow::array::Int64Array;
+
+        let row_count = usize::try_from(line_count + 1).expect("line count fits usize");
+        let mut warehouse_ids = Vec::with_capacity(row_count);
+        let mut district_ids = Vec::with_capacity(row_count);
+        let mut order_ids = Vec::with_capacity(row_count);
+        let mut line_numbers = Vec::with_capacity(row_count);
+        let mut delivery_dates = Vec::with_capacity(row_count);
+
+        for line_number in 1..=line_count {
+            warehouse_ids.push(1);
+            district_ids.push(1);
+            order_ids.push(order_id);
+            line_numbers.push(line_number);
+            delivery_dates.push(delivery_d);
+        }
+
+        warehouse_ids.push(1);
+        district_ids.push(1);
+        order_ids.push(extra_order_id);
+        line_numbers.push(1);
+        delivery_dates.push(delivery_d);
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(warehouse_ids)),
+                Arc::new(Int64Array::from(district_ids)),
+                Arc::new(Int64Array::from(order_ids)),
+                Arc::new(Int64Array::from(line_numbers)),
+                Arc::new(Int64Array::from(delivery_dates)),
+            ],
+        )
+        .expect("order_line overflow batch is valid")
     }
 
     async fn collect_order_line_rows(
@@ -20156,6 +20207,127 @@ mod tests {
         assert_eq!(
             count_star, LINE_COUNT,
             "COUNT(*) must agree with the physical scan after composite-PK upserts"
+        );
+    }
+
+    /// Ch-Bench durable-path regression: the original order lines are small
+    /// enough to live in the metastore inline tier, but the delivery update
+    /// overflows the inline gate and stages replacement rows on disk. Source
+    /// commit/caught-up state must not run ahead of that staged finalize, and
+    /// the inline tombstone must hide every old metastore row once the staged
+    /// files are visible.
+    #[tokio::test]
+    async fn test_order_line_metastore_inline_replaced_by_staged_disk_keeps_count_exact() {
+        let ctx = SessionContext::new();
+        const LINE_COUNT: i64 = 128;
+        let (provider, _catalog, _tmp) = create_order_line_cdc_table_with_inline_max_rows(
+            "order_line_inline_to_staged",
+            ctx.runtime_env(),
+            usize::try_from(LINE_COUNT).expect("line count fits usize"),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch(Arc::clone(&schema), 42, LINE_COUNT, 0)),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("initial order_line insert should prepare")
+            .finish()
+            .await
+            .expect("finalize initial order_line insert");
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            LINE_COUNT,
+            "precondition: the initial order_line batch must live in metastore inline data"
+        );
+
+        assert_eq!(
+            collect_order_line_rows(&ctx, &provider, "order_line_inline_to_staged")
+                .await
+                .len(),
+            usize::try_from(LINE_COUNT).expect("line count fits usize"),
+            "warming the inline cache should expose every original line"
+        );
+
+        let delivery = provider
+            .write_cdc_append_stream(
+                single_batch_stream(order_line_batch_with_extra_line(
+                    Arc::clone(&schema),
+                    42,
+                    LINE_COUNT,
+                    1,
+                    43,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("delivery order_line upsert should prepare");
+        assert!(
+            delivery.has_pending_finalize(),
+            "the delivery batch must overflow the inline gate and stage replacement rows on disk"
+        );
+
+        let during = collect_order_line_rows(&ctx, &provider, "order_line_inline_to_staged").await;
+        assert_eq!(
+            during.len(),
+            usize::try_from(LINE_COUNT).expect("line count fits usize"),
+            "before staged finalize, the old inline rows remain visible and replacements are hidden"
+        );
+        assert!(
+            during
+                .iter()
+                .all(|(_, _, _, _, delivery_d)| *delivery_d == 0),
+            "before staged finalize, the inert tombstone must not hide old inline rows"
+        );
+
+        delivery
+            .finish()
+            .await
+            .expect("finalize staged delivery upsert");
+
+        let rows = collect_order_line_rows(&ctx, &provider, "order_line_inline_to_staged").await;
+        assert_eq!(
+            rows.len(),
+            usize::try_from(LINE_COUNT + 1).expect("line count fits usize"),
+            "finalized staged disk rows plus the extra new line must be visible exactly once"
+        );
+        for line_number in 1..=LINE_COUNT {
+            assert_eq!(
+                rows.iter()
+                    .filter(|(w_id, d_id, o_id, ol_number, delivery_d)| {
+                        *w_id == 1
+                            && *d_id == 1
+                            && *o_id == 42
+                            && *ol_number == line_number
+                            && *delivery_d == 1
+                    })
+                    .count(),
+                1,
+                "updated line item {line_number} must appear exactly once"
+            );
+        }
+        assert!(
+            rows.contains(&(1, 1, 43, 1, 1)),
+            "the overflow row that forced staging must also be visible, got {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(w_id, d_id, o_id, _, delivery_d)| {
+                    *w_id == 1 && *d_id == 1 && *o_id == 42 && *delivery_d == 0
+                })
+                .count(),
+            0,
+            "old metastore-inline order_line rows must be hidden after staged finalize, got {rows:?}"
+        );
+
+        let count_star = query_count_star(&ctx, &provider, "order_line_inline_to_staged").await;
+        assert_eq!(
+            count_star,
+            LINE_COUNT + 1,
+            "COUNT(*) must agree with the visible metastore-inline plus staged-disk row set"
         );
     }
 

@@ -797,7 +797,8 @@ impl CayenneAccelerator {
                     );
                 }
             }
-            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration) {
+            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
+            {
                 tracing::warn!(
                     "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; defaulting to `file`."
                 );
