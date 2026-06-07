@@ -860,6 +860,15 @@ impl CayenneAccelerator {
                 data_storage = %hw.data_storage,
                 metastore_storage = %hw.metastore_storage,
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
+                tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
+                // Inferred workload signals (from extended schema inference). When
+                // these are `None`/false the schema wasn't inferred for this table,
+                // so the data-aware sizing fell back to hardware-only and adaptive
+                // (if requested) was gated off — makes that immediately visible.
+                inferred_row_count = ?workload.row_count,
+                inferred_table_bytes = ?workload.table_bytes,
+                has_primary_key = workload.has_primary_key,
+                is_upsert = workload.is_upsert,
                 "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
                 config.segment_cache_mb,
                 config.pk_keyset_cache_mb,

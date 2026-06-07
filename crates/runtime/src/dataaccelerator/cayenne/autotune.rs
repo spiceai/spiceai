@@ -718,7 +718,7 @@ mod tests {
         };
         let wide = WorkloadProfile {
             row_count: Some(1_000_000),
-            table_bytes: Some(8_000_000_000), // 8 KB/row
+            table_bytes: Some(8_192_000_000), // 8 KiB/row
             ..WorkloadProfile::hardware_only(true)
         };
         let n = hw.inline_flush_caps(&narrow);
