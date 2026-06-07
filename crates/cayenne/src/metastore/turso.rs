@@ -267,7 +267,7 @@ impl TursoMetastore {
     /// `TEXT PRIMARY KEY` (plus a redundant `UNIQUE(table_id, pk_bytes)`) is
     /// dropped (see `init_schema` for the legacy-schema migration).
     ///
-    /// Unlike the SQLite backend, this table is NOT declared `WITHOUT ROWID`.
+    /// Unlike the `SQLite` backend, this table is NOT declared `WITHOUT ROWID`.
     /// `WITHOUT ROWID` is not currently supported by Turso under the `mvcc`
     /// journal mode that the metastore relies on for `BEGIN CONCURRENT`
     /// parallel writers (Turso rejects it with "WITHOUT ROWID tables are not
