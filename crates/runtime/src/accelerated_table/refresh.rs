@@ -39,6 +39,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser;
+use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::RngExt;
@@ -208,6 +209,10 @@ pub struct Refresh {
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
     pub(crate) caching_ttl: Option<Duration>,
+    /// Retention SQL delete expression to apply after a successful accelerator write.
+    /// Currently populated only for Arrow and PartitionedArrow accelerators;
+    /// DuckDB and Cayenne apply retention in their own write paths.
+    pub(crate) write_retention_sql_delete_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -614,6 +619,7 @@ impl Default for Refresh {
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
+            write_retention_sql_delete_expr: None,
         }
     }
 }
@@ -1116,34 +1122,39 @@ impl Refresher {
                     Some(res) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
-                        if matches!(res, Ok(())) {
+                        let refresh_succeeded = matches!(&res, Ok(()));
+                        // A retention failure can happen after a successful write, so cached
+                        // query results must be invalidated even though the refresh reports an error.
+                        let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
+
+                        if refresh_succeeded {
                             if let Some(notifier) = &notifier {
                                 notify_refresh_done(&dataset_name, &refresh, Arc::clone(notifier)).await;
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
+                        }
 
-                            if let Some(cache_provider_ref) = caching.as_ref() {
-                                // No cache provider means runtime is shutting down and cache is already cleaned up
-                                if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
-                                    }
-                            }
+                        if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
+                            // No cache provider means runtime is shutting down and cache is already cleaned up
+                            if let Some(cache_provider) = cache_provider_ref.upgrade()
+                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                    tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                                }
+                        }
 
-                            if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                                let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
-                                create_checkpoint_and_snapshot(
-                                    checkpointer,
-                                    snapshot_manager.as_ref(),
-                                    &federated_schema,
-                                    &snapshot_mutex,
-                                    &dataset_name,
-                                    &last_updated_at,
-                                    ForceCreate(false),
-                                    Some(&accelerator),
-                                    refresh_sql.as_deref(),
-                                ).await;
-                            }
+                        if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
+                            create_checkpoint_and_snapshot(
+                                checkpointer,
+                                snapshot_manager.as_ref(),
+                                &federated_schema,
+                                &snapshot_mutex,
+                                &dataset_name,
+                                &last_updated_at,
+                                ForceCreate(false),
+                                Some(&accelerator),
+                                refresh_sql.as_deref(),
+                            ).await;
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
@@ -1260,6 +1271,13 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
         .as_nanos()
 }
 
+fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
+    matches!(
+        result,
+        Ok(()) | Err(super::Error::FailedToApplyRetentionSql { .. })
+    )
+}
+
 async fn notify_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
@@ -1365,6 +1383,28 @@ mod tests {
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
         }
+    }
+
+    #[test]
+    fn test_refresh_result_changed_accelerator() {
+        assert!(refresh_result_changed_accelerator(&Ok(())));
+
+        assert!(refresh_result_changed_accelerator(&Err(
+            super::super::Error::FailedToApplyRetentionSql {
+                dataset_name: "retained_table".to_string(),
+                source: datafusion::error::DataFusionError::Execution(
+                    "retention failed after write".to_string(),
+                ),
+            }
+        )));
+
+        assert!(!refresh_result_changed_accelerator(&Err(
+            super::super::Error::FailedToRefreshDataset {
+                source: datafusion::error::DataFusionError::Execution(
+                    "source refresh failed before write".to_string(),
+                ),
+            }
+        )));
     }
 
     async fn setup_and_test(
