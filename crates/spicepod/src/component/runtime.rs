@@ -829,9 +829,27 @@ impl<'de> Deserialize<'de> for ApiKey {
     where
         D: serde::Deserializer<'de>,
     {
-        let input = String::deserialize(deserializer)?;
+        /// Externally tagged representation, e.g. `ReadOnly: { key: ... }`.
+        #[derive(Deserialize)]
+        enum ApiKeyRepr {
+            ReadOnly { key: String },
+            ReadWrite { key: String },
+        }
 
-        Ok(ApiKey::parse_str(&input))
+        /// Accepts either the structured variant form or the legacy string form
+        /// (`my-key`, `my-key:ro`, `my-key:rw`).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ApiKeyInput {
+            Key(ApiKeyRepr),
+            Legacy(String),
+        }
+
+        match ApiKeyInput::deserialize(deserializer)? {
+            ApiKeyInput::Key(ApiKeyRepr::ReadOnly { key }) => Ok(ApiKey::ReadOnly { key }),
+            ApiKeyInput::Key(ApiKeyRepr::ReadWrite { key }) => Ok(ApiKey::ReadWrite { key }),
+            ApiKeyInput::Legacy(input) => Ok(ApiKey::parse_str(&input)),
+        }
     }
 }
 
@@ -1182,6 +1200,67 @@ mod tests {
             api_key.keys[2],
             ApiKey::ReadWrite {
                 key: "api-key-3".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_api_keys_structured_format() {
+        let yaml = r"
+        api_key:
+            enabled: true
+            keys:
+                - ReadOnly:
+                    key: ${secrets:ro_api_key}
+                - ReadWrite:
+                    key: ${secrets:rw_api_key}
+        ";
+
+        let parsed: Auth = yaml::from_str(yaml).expect("Failed to parse Auth");
+
+        let api_key = parsed.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "${secrets:ro_api_key}".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[1],
+            ApiKey::ReadWrite {
+                key: "${secrets:rw_api_key}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_api_keys_structured_format_in_runtime() {
+        let yaml = r"
+            auth:
+                api_key:
+                    enabled: true
+                    keys:
+                        - ReadOnly:
+                            key: ${secrets:ro_api_key}
+                        - ReadWrite:
+                            key: ${secrets:rw_api_key}
+        ";
+
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let auth = runtime.auth.expect("auth section exists");
+        let api_key = auth.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "${secrets:ro_api_key}".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[1],
+            ApiKey::ReadWrite {
+                key: "${secrets:rw_api_key}".to_string()
             }
         );
     }
