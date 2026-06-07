@@ -30,7 +30,7 @@ aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
-axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-extra = { version = "0.12.5", features = ["typed-header", "query"] }
 ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
@@ -364,6 +364,9 @@ snowflake = [
     "data_components/snowflake",
 ]
 spark = ["data_components/spark_connect"]
+# Registers the Cayenne catalog connector. Intended for benchmarking only;
+# deliberately excluded from the default feature set.
+spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
     "db_connection_pool/sqlite",

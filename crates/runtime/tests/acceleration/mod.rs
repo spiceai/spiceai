@@ -38,6 +38,7 @@ mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
 mod hash_index;
+mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
 #[cfg(not(target_os = "windows"))]

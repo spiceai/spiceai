@@ -21,10 +21,12 @@ use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
     sql_provider_datafusion::{self, SqlTable},
 };
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use std::sync::Arc;
 
 use crate::Read;
+use crate::federation::create_spice_federated_table_provider;
 
 pub type ClickhouseConnectionPool =
     dyn DbConnectionPool<ClientHandle, &'static dyn Sync> + Send + Sync;
@@ -41,6 +43,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct ClickhouseTableFactory {
     pool: Arc<ClickhouseConnectionPool>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for ClickhouseTableFactory {
@@ -53,7 +56,21 @@ impl std::fmt::Debug for ClickhouseTableFactory {
 impl ClickhouseTableFactory {
     #[must_use]
     pub fn new(pool: Arc<ClickhouseConnectionPool>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            function_support: None,
+        }
+    }
+
+    /// Install the federation function deny-list. Functions on the list (Spice-only
+    /// UDFs such as `json_get_str`) are evaluated locally instead of being pushed
+    /// into the SQL sent to `ClickHouse`. Without this, `ClickHouse`'s `SqlTable`
+    /// inherits the upstream `can_execute_plan` default (always federate) and the
+    /// remote engine rejects the unknown function. See issue #10703.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 }
 
@@ -64,17 +81,19 @@ impl Read for ClickhouseTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_provider = Arc::new(
-            SqlTable::new("clickhouse", &pool, table_reference, None)
+        let sql_table = Arc::new(
+            SqlTable::new("clickhouse", &pool, table_reference.clone(), None)
                 .await
                 .context(UnableToConstructSQLTableSnafu)?,
         );
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let schema = sql_table.schema();
+        let table_provider = Arc::new(create_spice_federated_table_provider(
+            sql_table,
+            schema,
+            table_reference,
+            self.function_support.clone(),
+        ));
 
         Ok(table_provider)
     }

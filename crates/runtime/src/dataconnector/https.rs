@@ -18,6 +18,11 @@ use crate::component::dataset::Dataset;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::metrics::MetricsProvider;
 use crate::component::{ComponentInitialization, DatasetHealthMonitor, StartupOptions};
+use crate::dataconnector::client_identity::{
+    ClientIdentityConfig, ClientIdentityConfigError, TLS_CLIENT_CERTIFICATE,
+    TLS_CLIENT_CERTIFICATE_FILE, TLS_CLIENT_IDENTITY_PARAM_NAMES, TLS_CLIENT_KEY,
+    TLS_CLIENT_KEY_FILE,
+};
 use crate::dataconnector::http_rate_control::{
     self, HttpRateControlConfig, HttpRateControlMetricSource, HttpRateControlMetrics,
     HttpRateControlMetricsProvider,
@@ -39,6 +44,7 @@ use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::runtime::Handle;
@@ -52,7 +58,7 @@ use super::{
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use reqwest::{
-    Client,
+    Client, Identity,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use std::time::Duration;
@@ -587,8 +593,172 @@ impl Https {
         custom_headers
     }
 
+    fn client_identity_params_are_configured(&self) -> bool {
+        TLS_CLIENT_IDENTITY_PARAM_NAMES
+            .iter()
+            .any(|name| self.params.get(name).expose().ok().is_some())
+    }
+
+    fn map_client_identity_config_error(
+        &self,
+        dataset: &Dataset,
+        error: &ClientIdentityConfigError,
+    ) -> DataConnectorError {
+        match error {
+            ClientIdentityConfigError::Incomplete {
+                set_field,
+                missing_field,
+            } => DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: format!(
+                    "mTLS client identity is half-configured: '{}' is set but '{}' is missing. Set both fields to present a client certificate to the upstream HTTP server, or set neither.",
+                    self.params.user_param(set_field),
+                    self.params.user_param(missing_field),
+                ),
+            },
+            ClientIdentityConfigError::Ambiguous => {
+                DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "mTLS client identity is ambiguous: file-based params ('{}', '{}') cannot be mixed with inline params ('{}', '{}'). Use either the file-based pair or the inline pair, not both.",
+                        self.params.user_param(TLS_CLIENT_CERTIFICATE_FILE),
+                        self.params.user_param(TLS_CLIENT_KEY_FILE),
+                        self.params.user_param(TLS_CLIENT_CERTIFICATE),
+                        self.params.user_param(TLS_CLIENT_KEY),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn ensure_client_identity_supported_for_structured_dataset(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        if !self.client_identity_params_are_configured() {
+            return Ok(());
+        }
+
+        let params = TLS_CLIENT_IDENTITY_PARAM_NAMES
+            .iter()
+            .filter(|&&name| self.params.get(name).expose().ok().is_some())
+            .map(|&name| format!("'{}'", self.params.user_param(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "mTLS client identity parameters are not supported for structured HTTP file datasets that use the listing connector. Remove {params}, or use a dynamic JSON HTTP API dataset."
+            ),
+        })
+    }
+
+    fn resolve_client_identity_config(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Option<ClientIdentityConfig>> {
+        let client_certificate_path = self
+            .params
+            .get(TLS_CLIENT_CERTIFICATE_FILE)
+            .expose()
+            .ok()
+            .map(PathBuf::from);
+        let client_key_path = self
+            .params
+            .get(TLS_CLIENT_KEY_FILE)
+            .expose()
+            .ok()
+            .map(PathBuf::from);
+        let client_certificate_inline = self
+            .params
+            .get(TLS_CLIENT_CERTIFICATE)
+            .expose()
+            .ok()
+            .map(|s| s.as_bytes().to_vec());
+        let client_key_inline = self
+            .params
+            .get(TLS_CLIENT_KEY)
+            .expose()
+            .ok()
+            .map(|s| s.as_bytes().to_vec());
+
+        crate::dataconnector::client_identity::resolve_client_identity_config(
+            client_certificate_path,
+            client_key_path,
+            client_certificate_inline,
+            client_key_inline,
+        )
+        .map_err(|error| self.map_client_identity_config_error(dataset, &error))
+    }
+
+    async fn resolve_client_identity(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Option<Identity>> {
+        let Some(config) = self.resolve_client_identity_config(dataset)? else {
+            return Ok(None);
+        };
+
+        let identity_pem = match config {
+            ClientIdentityConfig::FromFiles {
+                cert_path,
+                key_path,
+            } => {
+                let cert = tokio::fs::read(&cert_path).await.boxed().map_err(|e| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: format!(
+                            "Failed to read mTLS client certificate file '{}'. Ensure the file exists and is readable.",
+                            cert_path.display()
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e,
+                    }
+                })?;
+                let key = tokio::fs::read(&key_path).await.boxed().map_err(|e| {
+                    DataConnectorError::InvalidConfiguration {
+                        dataconnector: "https".to_string(),
+                        message: format!(
+                            "Failed to read mTLS client key file '{}'. Ensure the file exists and is readable.",
+                            key_path.display()
+                        ),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: e,
+                    }
+                })?;
+
+                let mut identity_pem = Vec::with_capacity(cert.len() + key.len() + 1);
+                identity_pem.extend_from_slice(&cert);
+                identity_pem.push(b'\n');
+                identity_pem.extend_from_slice(&key);
+                identity_pem
+            }
+            ClientIdentityConfig::FromPem { cert_pem, key_pem } => {
+                let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
+                identity_pem.extend_from_slice(&cert_pem);
+                identity_pem.push(b'\n');
+                identity_pem.extend_from_slice(&key_pem);
+                identity_pem
+            }
+        };
+
+        Identity::from_pem(&identity_pem)
+            .map(Some)
+            .boxed()
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: "https".to_string(),
+                message: "Failed to parse mTLS client identity. Ensure the certificate chain and private key are PEM encoded and match.".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: e,
+            })
+    }
+
     /// Build HTTP client with configured timeouts and connection pool settings
-    fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
+    async fn build_http_client(&self, dataset: &Dataset) -> DataConnectorResult<Client> {
         let timeout_secs = self
             .params
             .get("client_timeout")
@@ -621,12 +791,23 @@ impl Https {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(90);
 
-        Client::builder()
+        let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(pool_max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+
+        if let Some(identity) = self.resolve_client_identity(dataset).await? {
+            // `Identity::from_pem` yields a rustls identity, but the workspace transitively
+            // enables reqwest's `default-tls` (native-tls) feature, which makes native-tls the
+            // default backend. Building a native-tls client with a PEM identity fails with
+            // "incompatible TLS identity type", so pin this client to rustls to match the
+            // identity type and load the mTLS client certificate.
+            builder = builder.use_rustls_tls().identity(identity);
+        }
+
+        builder
             .build()
             .boxed()
             .map_err(|e| DataConnectorError::InternalWithSource {
@@ -791,7 +972,7 @@ impl Https {
             }
         })?;
 
-        let client = self.build_http_client(dataset)?;
+        let client = self.build_http_client(dataset).await?;
 
         let HttpProviderParams {
             file_format,
@@ -956,7 +1137,7 @@ impl Https {
             .set_rate_controller(rate_controller.shared().controller.as_ref());
         provider = provider
             .with_rate_limiter(Some(rate_limiter))
-            .with_rate_controller(rate_controller.shared().controller.clone());
+            .with_rate_controller(rate_controller.shared().controller.as_ref().map(Arc::clone));
 
         let provider = Arc::new(provider);
         if let Some(metric_source) = &self.rate_control_metric_source {
@@ -1136,7 +1317,8 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
+    let mut column_order: Vec<String> =
+        dataset.columns.iter().map(|col| col.name.clone()).collect();
 
     // Reject the catch-all column itself being named after a reserved
     // HTTP metadata field — it would be ambiguous whether the column
@@ -1152,11 +1334,18 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let metadata_fields: std::collections::HashSet<String> = column_order
+    let mut metadata_fields: std::collections::HashSet<String> = column_order
         .iter()
         .filter(|name| HTTP_METADATA_FIELDS.contains(&name.as_str()))
         .cloned()
         .collect();
+
+    // Ensure `fetched_at` is always present so caching TTL eviction and
+    // append-mode `time_column` work even when the user omits the column.
+    if !column_order.iter().any(|n| n == "_fetched_at") {
+        column_order.push("_fetched_at".to_string());
+        metadata_fields.insert("_fetched_at".to_string());
+    }
 
     Ok(Some(HttpJsonNesting::new(
         column_order,
@@ -1179,7 +1368,7 @@ const HTTP_METADATA_FIELDS: &[&str] = &[
     "content",
     "response_status",
     "response_headers",
-    "fetched_at",
+    "_fetched_at",
 ];
 
 #[async_trait]
@@ -1194,6 +1383,7 @@ impl DataConnector for Https {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if self.is_structured_format(dataset) {
             self.ensure_rate_control_supported_for_structured_dataset(dataset)?;
+            self.ensure_client_identity_supported_for_structured_dataset(dataset)?;
             // Use ListingTableConnector for file-based structured formats (parquet, csv, etc.)
             // which properly handles file parsing with correct schemas
             let listing_connector =
@@ -1277,6 +1467,14 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Maximum number of idle connections to keep alive per host. Default: 10"),
         ParameterSpec::runtime("pool_idle_timeout")
             .description("Timeout for idle connections in the pool (in seconds). Default: 90"),
+        ParameterSpec::component(TLS_CLIENT_CERTIFICATE_FILE)
+            .description("Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_KEY_FILE)
+            .description("Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_CERTIFICATE).secret()
+            .description("Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
+        ParameterSpec::component(TLS_CLIENT_KEY).secret()
+            .description("Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params."),
         ParameterSpec::runtime("http_headers")
             .description("Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests."),
         ParameterSpec::runtime("max_retries")
@@ -1552,6 +1750,7 @@ mod tests {
     use app::AppBuilder;
     use secrecy::SecretString;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use tokio::sync::RwLock;
 
     async fn test_connector(file_format: Option<&str>) -> Https {
@@ -1631,6 +1830,63 @@ mod tests {
         });
 
         dataset
+    }
+
+    fn test_client_identity_pems() -> (String, String) {
+        // Hardcoded RSA 2048 self-signed test client identity PEMs (generated with openssl).
+        // Using RSA (instead of rcgen default EC) ensures reqwest::Identity::from_pem succeeds
+        // reliably on all CI runners (linux + macOS native-tls/rustls backends) for the
+        // file-based and inline mTLS client identity coverage tests.
+        const CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIDIzCCAgugAwIBAgIUSb5DSV5Kh+Rx2CH3fTGYEPXpgNAwDQYJKoZIhvcNAQEL
+BQAwITEfMB0GA1UEAwwWc3BpY2UtaHR0cC10ZXN0LWNsaWVudDAeFw0yNjA2MDMw
+MzI3NTZaFw0yNjA2MDUwMzI3NTZaMCExHzAdBgNVBAMMFnNwaWNlLWh0dHAtdGVz
+dC1jbGllbnQwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDSPWF1GXtp
+etJ82kiVbJioCQw5AbFgVkn7KV6kQo+rrple26ZzVRy3gXPJlVF0735qT/YCGpGU
+VO6IscOtnWHOwy+3pEAZio51W7SnTa6uzJVjForrqmjhvwuO5BZH3vEBp1ZC+VQ2
+Udyp7yA8ikYfpV7odxP4kzwt4HTYFbnVJJBLZ5ndWDPu1dfs11s8aqHniafFqk5O
+v2R2JZmepWKv+ku1zFi0OD3C4JgDd+nLFHEao552IoRvhm18HBYaI2OYCvIrgPWl
+KcSwizlkGtlPSGhJZA24gwthi7EM3u022ilZuo/SMuFlNse/UO6zCNo++sj7I1HP
+XwiMjfRGJlDrAgMBAAGjUzBRMB0GA1UdDgQWBBQsxny7qIXIe1+xSAYZfqgh/GuF
+nzAfBgNVHSMEGDAWgBQsxny7qIXIe1+xSAYZfqgh/GuFnzAPBgNVHRMBAf8EBTAD
+AQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCw95aWRvo/Nx088wguPn87svdNjgm2DQ7g
++1LBNS3Xsjv+hLjLPf5J2R3b09+faqUIEVIAiulq5BlhDNMisq6tTo/SnAHz85Tu
+98/p56pnkS8LP63nr2HY0T59NZFu2+t8rlYgNriXPIW1I8ac9VmYsphQHcIKe+jf
+CmOcr/NE5DhpJMfg5oTRXQO1qOWobqhoB/6z26LpT6LOkkbU7NYTqgeHC+wQU5Ve
+y9JLAntUo6x4XB+dL/Ec6DCWZn0B+LB8MJkM/Sy2rj1KAb6rJoZpFAwHllGepqbI
+azFN2bb89uBcm6Xy+Xg2TX/bH6XEdHLx2AFlaaFMxYO+siI2IvNz
+-----END CERTIFICATE-----
+";
+        const KEY_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDSPWF1GXtpetJ8
+2kiVbJioCQw5AbFgVkn7KV6kQo+rrple26ZzVRy3gXPJlVF0735qT/YCGpGUVO6I
+scOtnWHOwy+3pEAZio51W7SnTa6uzJVjForrqmjhvwuO5BZH3vEBp1ZC+VQ2Udyp
+7yA8ikYfpV7odxP4kzwt4HTYFbnVJJBLZ5ndWDPu1dfs11s8aqHniafFqk5Ov2R2
+JZmepWKv+ku1zFi0OD3C4JgDd+nLFHEao552IoRvhm18HBYaI2OYCvIrgPWlKcSw
+izlkGtlPSGhJZA24gwthi7EM3u022ilZuo/SMuFlNse/UO6zCNo++sj7I1HPXwiM
+jfRGJlDrAgMBAAECggEAAtb1Zzsa4aFyqmENNFRGxsfbtGfQP4VEc1hrTaJG7Bvs
+BZrHgSzkugEAavg4JQr/FOyGxB+1WHpbmaXdByezCua0BEthpxBDo4fDkhoiG+Md
+H9a0HA7HL+Izg8PGhHeZOPTlQ2GFJt6s/labUHYFqg1ckZzaIwD9TrLtB3/AbNKO
+8DwkdwsnPFKRT7bCZQLaN5bXVkLR7yADItg/LJawflk9QHsJmFK7zQglixK4Unzn
+RKneEFHMHytSeEZhaakwLB5T/S4zcBzBDLcdmi/k9cNChX1bqJyVO6Tyl8UlEX7q
+E69wnwTk0/OtCdyKrcXdtFWYacGK8YLkOZY9C/AhgQKBgQDuOrQ4PI/RUCm/HlmE
+wnczySouIjaLMcgk1Glv90BH+MKUm2HTIIj4gKmJ3RlVQaxVzcjQmNjKtTsYFqoR
+OpD/yifxmV1o6JiMFBOSn52BRJC7G0nLS28H+PJQWkrCMD2ZOz0w9YNIjRhqdma1
+JJux+K+DoQKfs/xkZ6uMVzv7SwKBgQDh7C4lmBn5gKb/RowI+rBxdhlzxGAn4ujx
+wzq2FEoRvU9t9W4zoQItYXa+jmfHM8vHGD0nOyULAKxDHqJ2sMdraIWeCbJ3l5wb
+JoqllL5fFPMNyZyHuiq7RjCeYPwJo/EEb31lySka+Jg8cyTVhI08dezkIxOnKNoZ
+a8cnVS7c4QKBgGvxP32Hu2aNGw1U9BzafGaDjNAwgmRZnyVI9alc78xso8XwDcg7
+IrTun2MvQm5F/o82Wfpid0CKE4ebpV1/Gvo7oBOxeQiy84PtCN1T42sSJT4SZEJw
+IJQNMcZE00Df2NlYZSaM5/p0rA55LZqARufCFczfpK+2PvNDohBJ6oy3AoGBAM0v
+9pGKXTzwDbwX1KNrG8lQ27j7B+HyAmNhTveD4enOqE9T8yzM9O9Gb9SN/c88Sb2f
+VBtHalNd3xZuwltOHzB8E67/W6mmds9p586PE3/DxSQmkhXrjVfdXdbaes4+qW2/
+3IIPe1fVpF5yrWeHJcddyzNAcF8HiV5BNvWQNinBAoGBAJRFBeOe15libL/IFI1W
+LimqRMVJsrPIIYJGEZjCVUCExqxKvhBt1ueVxomk+n6J+U8DYwMH4m4GF6YjTW6F
+BK4GgbAupmwJeJht3XVuLKbxPOj3F/Ubz/vBFScFa7o/mgLpfFOFY5509vOoEcki
+uGgYIHbi/F+GaiUPzDyqe5p9
+-----END PRIVATE KEY-----
+";
+        (CERT_PEM.to_string(), KEY_PEM.to_string())
     }
 
     fn assert_invalid_url_error(error: DataConnectorError) {
@@ -2046,6 +2302,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_http_structured_format_rejects_client_identity_params() {
+        let connector = test_connector_with(&[
+            ("file_format", "csv"),
+            ("http_tls_client_certificate", "inline-cert"),
+            // Only one param set, to verify error message lists only the configured one(s)
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/data.csv", RefreshMode::Full, None).await;
+
+        let error = connector
+            .read_provider(&dataset)
+            .await
+            .expect_err("structured HTTP file datasets should reject mTLS client identity params");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("mTLS client identity parameters are not supported"),
+                    "expected unsupported mTLS params error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_certificate"),
+                    "expected user-facing mTLS param in error, got: {message}"
+                );
+                assert!(
+                    !message.contains("http_tls_client_key"),
+                    "error should not mention unset key param, got: {message}"
+                );
+                assert!(
+                    message.contains("dynamic JSON HTTP API dataset"),
+                    "expected dynamic JSON guidance in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_http_auto_structured_format_detects_compressed_url_extension() {
         let connector = test_connector(None).await;
         let dataset =
@@ -2074,6 +2368,252 @@ mod tests {
             result.is_none(),
             "expected None when no auth params are configured"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_returns_none_when_unset() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let result = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("no mTLS params should be valid");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_parses_prefixed_file_params() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key_file", "/certs/client.key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let config = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected client identity config");
+
+        match config {
+            ClientIdentityConfig::FromFiles {
+                cert_path,
+                key_path,
+            } => {
+                assert_eq!(cert_path, PathBuf::from("/certs/client.pem"));
+                assert_eq!(key_path, PathBuf::from("/certs/client.key"));
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected file-based identity config, got {config:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_parses_prefixed_inline_params() {
+        let connector = test_connector_with(&[
+            (
+                "http_tls_client_certificate",
+                "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n",
+            ),
+            (
+                "http_tls_client_key",
+                "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n",
+            ),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let config = connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected client identity config");
+
+        match config {
+            ClientIdentityConfig::FromPem { cert_pem, key_pem } => {
+                assert!(cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+                assert!(key_pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected inline identity config, got {config:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_half_configured_file_identity() {
+        let connector =
+            test_connector_with(&[("http_tls_client_certificate_file", "/certs/client.pem")]).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("certificate file without key file should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("http_tls_client_certificate_file"),
+                    "expected certificate file param in error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_key_file"),
+                    "expected key file param in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_half_configured_inline_identity() {
+        let connector = test_connector_with(&[("http_tls_client_key", "not-a-key")]).await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("key without certificate should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("http_tls_client_key"),
+                    "expected key param in error, got: {message}"
+                );
+                assert!(
+                    message.contains("http_tls_client_certificate"),
+                    "expected certificate param in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_ambiguous_identity_sources() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key_file", "/certs/client.key"),
+            ("http_tls_client_certificate", "inline-cert"),
+            ("http_tls_client_key", "inline-key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("file and inline identities should be mutually exclusive");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("ambiguous"),
+                    "expected ambiguous identity error, got: {message}"
+                );
+                assert!(message.contains("http_tls_client_certificate_file"));
+                assert!(message.contains("http_tls_client_key_file"));
+                assert!(message.contains("http_tls_client_certificate"));
+                assert!(message.contains("http_tls_client_key"));
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_client_identity_config_rejects_any_mixed_file_and_inline_identity_params() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate_file", "/certs/client.pem"),
+            ("http_tls_client_key", "inline-key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_client_identity_config(&dataset)
+            .expect_err("any mix of file-based and inline mTLS params should be ambiguous");
+
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("ambiguous"),
+                    "expected ambiguous identity error, got: {message}"
+                );
+                assert!(message.contains("http_tls_client_certificate_file"));
+                assert!(message.contains("http_tls_client_key_file"));
+                assert!(message.contains("http_tls_client_certificate"));
+                assert!(message.contains("http_tls_client_key"));
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_http_client_rejects_invalid_inline_identity_pem() {
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate", "not a certificate"),
+            ("http_tls_client_key", "not a key"),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .build_http_client(&dataset)
+            .await
+            .expect_err("invalid inline PEM should be rejected");
+
+        match error {
+            DataConnectorError::InvalidConfiguration { message, .. } => {
+                assert!(
+                    message.contains("Failed to parse mTLS client identity"),
+                    "expected invalid PEM parse error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfiguration, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_http_client_accepts_valid_inline_identity_pem() {
+        let (cert_pem, key_pem) = test_client_identity_pems();
+        let connector = test_connector_with(&[
+            ("http_tls_client_certificate", cert_pem.as_str()),
+            ("http_tls_client_key", key_pem.as_str()),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        connector
+            .build_http_client(&dataset)
+            .await
+            .expect("valid inline mTLS identity should build an HTTP client");
+    }
+
+    #[tokio::test]
+    async fn build_http_client_accepts_valid_file_identity() {
+        let (cert_pem, key_pem) = test_client_identity_pems();
+        let dir = TempDir::new().expect("create temp dir for mTLS test certs");
+        let cert_path = dir.path().join("client.pem");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, &cert_pem).expect("write test client cert pem");
+        std::fs::write(&key_path, &key_pem).expect("write test client key pem");
+
+        let connector = test_connector_with(&[
+            (
+                "http_tls_client_certificate_file",
+                cert_path.to_str().expect("temp cert path is valid UTF-8"),
+            ),
+            (
+                "http_tls_client_key_file",
+                key_path.to_str().expect("temp key path is valid UTF-8"),
+            ),
+        ])
+        .await;
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+
+        connector
+            .build_http_client(&dataset)
+            .await
+            .expect("valid file-based mTLS identity should build an HTTP client");
     }
 
     #[tokio::test]
@@ -2271,10 +2811,17 @@ mod tests {
             .expect("parse should succeed")
             .expect("expected Some(nesting) when marker is present");
         assert_eq!(nesting.json_field_name, "data");
-        assert_eq!(nesting.column_order, vec!["id", "name", "data"]);
+        assert_eq!(
+            nesting.column_order,
+            vec!["id", "name", "data", "_fetched_at"]
+        );
         assert!(nesting.static_fields.contains("id"));
         assert!(nesting.static_fields.contains("name"));
         assert!(!nesting.static_fields.contains("data"));
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be auto-injected into metadata_fields"
+        );
     }
 
     #[tokio::test]
@@ -2359,10 +2906,20 @@ mod tests {
         assert_eq!(nesting.json_field_name, "data");
         assert_eq!(
             nesting.column_order,
-            vec!["request_path", "response_status", "id", "data"]
+            vec![
+                "request_path",
+                "response_status",
+                "id",
+                "data",
+                "_fetched_at"
+            ]
         );
         assert!(nesting.metadata_fields.contains("request_path"));
         assert!(nesting.metadata_fields.contains("response_status"));
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be auto-injected into metadata_fields"
+        );
         assert!(
             !nesting.metadata_fields.contains("id"),
             "non-reserved column must not be classified as metadata"
@@ -2371,6 +2928,7 @@ mod tests {
         // fields, otherwise the body would shadow the HTTP metadata.
         assert!(!nesting.static_fields.contains("request_path"));
         assert!(!nesting.static_fields.contains("response_status"));
+        assert!(!nesting.static_fields.contains("_fetched_at"));
         assert!(nesting.static_fields.contains("id"));
     }
 
@@ -2466,23 +3024,35 @@ mod tests {
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        assert_eq!(schema.fields().len(), 3);
-        for f in schema.fields() {
+        // 3 user-declared columns + auto-injected _fetched_at
+        assert_eq!(schema.fields().len(), 4);
+        // User-declared columns default to Utf8.
+        for name in &["id", "name", "data"] {
+            let f = schema
+                .field_with_name(name)
+                .expect("declared json_nest test column should exist in schema");
             assert_eq!(
                 f.data_type(),
                 &arrow_schema::DataType::Utf8,
-                "untyped json_nest column should default to Utf8 (field {})",
-                f.name()
+                "untyped json_nest column should default to Utf8 (field {name})",
             );
             assert!(f.is_nullable());
         }
+        // Auto-injected _fetched_at gets its type from base_table_schema.
+        let fetched_at = schema
+            .field_with_name("_fetched_at")
+            .expect("_fetched_at should be present in dynamic json_nest schema");
+        assert_eq!(
+            fetched_at.data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        );
         assert_eq!(
             schema
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id", "name", "data"]
+            vec!["id", "name", "data", "_fetched_at"]
         );
     }
 
@@ -2497,7 +3067,8 @@ mod tests {
         ];
         let schema = static_schema_for_https_dataset(&params, &dataset)
             .expect("json_nest dynamic mode -> Some");
-        assert_eq!(schema.fields().len(), 3);
+        // 3 user-declared columns + auto-injected _fetched_at
+        assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &arrow_schema::DataType::Int64);
         assert!(!schema.field(0).is_nullable());
@@ -2505,6 +3076,11 @@ mod tests {
         assert_eq!(schema.field(1).data_type(), &arrow_schema::DataType::Utf8);
         assert_eq!(schema.field(2).name(), "data");
         assert_eq!(schema.field(2).data_type(), &arrow_schema::DataType::Utf8);
+        assert_eq!(schema.field(3).name(), "_fetched_at");
+        assert_eq!(
+            schema.field(3).data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+        );
     }
 
     #[tokio::test]
@@ -2517,5 +3093,87 @@ mod tests {
         ];
         // Defer the user-facing error to the eager path.
         assert!(static_schema_for_https_dataset(&params, &dataset).is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_auto_injects_fetched_at() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        // User declares only body columns + catch-all, no _fetched_at.
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("title"),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+
+        assert!(
+            nesting.column_order.contains(&"_fetched_at".to_string()),
+            "_fetched_at should be auto-injected into column_order"
+        );
+        assert!(
+            nesting.metadata_fields.contains("_fetched_at"),
+            "_fetched_at should be in metadata_fields"
+        );
+        assert!(
+            !nesting.static_fields.contains("_fetched_at"),
+            "_fetched_at must not be a static body field"
+        );
+        // Auto-injected at the end, after user-declared columns.
+        assert_eq!(
+            nesting
+                .column_order
+                .last()
+                .expect("column_order should include auto-injected _fetched_at"),
+            "_fetched_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_does_not_duplicate_fetched_at() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        // User explicitly declares _fetched_at.
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("_fetched_at"),
+            column_with_marker("details", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+
+        let count = nesting
+            .column_order
+            .iter()
+            .filter(|n| *n == "_fetched_at")
+            .count();
+        assert_eq!(count, 1, "_fetched_at should not be duplicated");
+        assert!(nesting.metadata_fields.contains("_fetched_at"));
+        // When user declares it, it stays in the user's position.
+        assert_eq!(nesting.column_order[1], "_fetched_at");
+    }
+
+    #[tokio::test]
+    async fn build_json_nest_schema_includes_fetched_at_when_auto_injected() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting)");
+        let schema =
+            build_json_nest_schema(&dataset, &nesting).expect("schema build should succeed");
+
+        let fetched_at = schema
+            .field_with_name("_fetched_at")
+            .expect("_fetched_at should be present in the schema");
+        assert_eq!(
+            fetched_at.data_type(),
+            &arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            "_fetched_at should have its base_table_schema type"
+        );
     }
 }

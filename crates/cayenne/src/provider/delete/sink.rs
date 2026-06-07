@@ -671,6 +671,7 @@ impl CayenneDeletionSink {
         row_keys: Vec<Box<[u8]>>,
         delete_sequence: i64,
     ) -> super::super::Result<u64> {
+        let start = std::time::Instant::now();
         let table_name = &self.table_metadata.table_name;
 
         // Get the row keys snapshot from the PkDeletionStrategy (only valid for RowConverterBased)
@@ -693,7 +694,7 @@ impl CayenneDeletionSink {
         let current = deletion_snapshot.load_full();
         let new_deletion_count = row_keys
             .iter()
-            .filter(|key| current.deleted_row_keys.get(key.as_ref()).is_none())
+            .filter(|key| current.tombstones.get(key.as_ref()).is_none())
             .count();
 
         // Create a temporary metadata with the delete sequence number
@@ -725,15 +726,10 @@ impl CayenneDeletionSink {
         // Build a fresh snapshot with the new deletions and publish via ArcSwap.
         // Writes are serialised by the per-table write lock so the load+rebuild+store
         // sequence is race-free.
-        let updated = current.deleted_row_keys.extend_max(
-            written_row_keys
-                .iter()
-                .map(|key| (key.clone(), delete_sequence)),
-        );
-        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_arcs(
-            Arc::new(updated),
-            Arc::clone(&current.insert_records),
-        )));
+        let updated = current
+            .tombstones
+            .extend_max_deletes(written_row_keys.iter().map(|key| (key, delete_sequence)));
+        deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =
@@ -745,9 +741,10 @@ impl CayenneDeletionSink {
             })?;
 
         tracing::debug!(
-            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) at {:?}",
+            "Key-based deletion vector written and cache updated: {} key(s) (seq={}) duration_ms={} at {:?}",
             deleted_count,
             delete_sequence,
+            start.elapsed().as_millis(),
             result.path
         );
 
@@ -814,7 +811,7 @@ impl CayenneDeletionSink {
         let current = deletion_snapshot.load_full();
         let new_deletion_count = pk_values
             .iter()
-            .filter(|pk| current.deleted_pk.get(**pk).is_none())
+            .filter(|pk| current.tombstones.get(**pk).is_none())
             .count();
 
         // For Int64 PK deletions, we store them as key-based deletions
@@ -844,12 +841,9 @@ impl CayenneDeletionSink {
         // Writes are serialised by the per-table write lock so the load+rebuild+store
         // sequence is race-free.
         let updated = current
-            .deleted_pk
-            .extend_max(pk_values.iter().map(|&pk| (pk, delete_sequence)));
-        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_arcs(
-            Arc::new(updated),
-            Arc::clone(&current.insert_records),
-        )));
+            .tombstones
+            .extend_max_deletes(pk_values.iter().map(|&pk| (pk, delete_sequence)));
+        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
         self.refresh_deletion_memory_accounting();
 
         let deleted_count =

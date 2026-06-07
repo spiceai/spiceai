@@ -731,7 +731,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("unsupported operator should fail to convert")
                 .to_string()
                 .contains("Unsupported datafusion operator")
         );
@@ -742,7 +742,7 @@ mod tests {
         let col_expr = df_expr::Column::new("test_column", 0);
         let result = DefaultExpressionConvertor::default()
             .convert(&col_expr)
-            .unwrap();
+            .expect("column expression should convert");
 
         assert_snapshot!("expr_from_df_column", result.display_tree().to_string());
     }
@@ -752,7 +752,7 @@ mod tests {
         let literal_expr = df_expr::Literal::new(ScalarValue::Int32(Some(42)));
         let result = DefaultExpressionConvertor::default()
             .convert(&literal_expr)
-            .unwrap();
+            .expect("literal expression should convert");
 
         assert_snapshot!("expr_from_df_literal", result.display_tree().to_string());
     }
@@ -766,7 +766,7 @@ mod tests {
 
         let result = DefaultExpressionConvertor::default()
             .convert(&binary_expr)
-            .unwrap();
+            .expect("binary expression should convert");
 
         assert_snapshot!("expr_from_df_binary", result.display_tree().to_string());
     }
@@ -869,7 +869,7 @@ mod tests {
 
         let result = DefaultExpressionConvertor::default()
             .convert(&like_expr)
-            .unwrap();
+            .expect("like expression should convert");
         let like_opts = result.as_::<Like>();
         assert_eq!(
             like_opts,
@@ -895,11 +895,11 @@ mod tests {
                 "no".to_string(),
             )))) as Arc<dyn PhysicalExpr>),
         )
-        .unwrap();
+        .expect("CASE expression with ELSE should build");
 
         let result = DefaultExpressionConvertor::default()
             .convert(&case_expr)
-            .unwrap();
+            .expect("CASE expression with ELSE should convert");
 
         assert_snapshot!(
             "expr_from_df_case_when_with_else",
@@ -915,8 +915,10 @@ mod tests {
                 "yes".to_string(),
             )))) as Arc<dyn PhysicalExpr>,
         )];
-        let case_expr = Arc::new(df_expr::CaseExpr::try_new(None, when_then_expr, None).unwrap())
-            as Arc<dyn PhysicalExpr>;
+        let case_expr = Arc::new(
+            df_expr::CaseExpr::try_new(None, when_then_expr, None)
+                .expect("CASE expression without ELSE should build"),
+        ) as Arc<dyn PhysicalExpr>;
 
         let schema = Schema::new(vec![Field::new("active", DataType::Boolean, false)]);
         assert!(!can_be_pushed_down_impl(&case_expr, &schema));

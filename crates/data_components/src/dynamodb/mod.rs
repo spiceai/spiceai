@@ -100,6 +100,13 @@ pub enum Error {
     #[snafu(display("DynamoDB table {table_name} is empty"))]
     EmptyTable { table_name: String },
 
+    #[snafu(display(
+        "DynamoDB table '{table_name}' does not have Streams enabled. \
+         Enable Streams with StreamViewType NEW_AND_OLD_IMAGES to use refresh_mode: changes. \
+         See https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html#Streams.Enabling"
+    ))]
+    StreamsNotEnabled { table_name: String },
+
     #[snafu(display("Failed to serialize data to JSON: {source}"))]
     JsonSerializationError { source: serde_json::Error },
 

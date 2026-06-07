@@ -57,6 +57,15 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+/// Runtime param: fraction of `runtime.query.memory_limit` carved into a
+/// dedicated Cayenne compaction memory pool when Cayenne acceleration is
+/// configured on a dataset and dedicated thread pools are enabled.
+const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memory_fraction";
+/// Default carve fraction when the param is unset: 20% of the query budget to
+/// compaction, 80% retained for queries.
+const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
+const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
+const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -251,10 +260,91 @@ impl RuntimeBuilder {
         );
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+
+        // Process-global SQLite metastore pragma tuning (cache, mmap, busy
+        // timeout, WAL autocheckpoint, auto_vacuum). Applied once at startup;
+        // connections opened afterward pick up the values. Unset params keep the
+        // defaults on `SqliteMetastoreConfig`.
+        {
+            let mut metastore_cfg = cayenne::SqliteMetastoreConfig::default();
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_cache_mb")
+            {
+                metastore_cfg.cache_size_mb = v;
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_mmap_mb")
+            {
+                metastore_cfg.mmap_size_bytes = i64::try_from(v.saturating_mul(1024 * 1024))
+                    .unwrap_or(metastore_cfg.mmap_size_bytes);
+            }
+            if let Some(v) =
+                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_busy_timeout_ms")
+            {
+                metastore_cfg.busy_timeout_ms =
+                    u64::try_from(v).unwrap_or(metastore_cfg.busy_timeout_ms);
+            }
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                "cayenne_metastore_wal_autocheckpoint_pages",
+            ) {
+                metastore_cfg.wal_autocheckpoint_pages =
+                    u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
+            }
+            if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
+                metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
+                    "none" => cayenne::SqliteAutoVacuum::None,
+                    "incremental" => cayenne::SqliteAutoVacuum::Incremental,
+                    "full" => cayenne::SqliteAutoVacuum::Full,
+                    other => {
+                        tracing::warn!(
+                            "Invalid cayenne_metastore_auto_vacuum value `{other}`; expected none|incremental|full, using none."
+                        );
+                        cayenne::SqliteAutoVacuum::None
+                    }
+                };
+            }
+            cayenne::set_sqlite_metastore_config(metastore_cfg);
+        }
+
         let cayenne_filter_propagation_enabled =
             parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
+
+        // Carve a dedicated compaction memory pool only when Cayenne acceleration
+        // is configured (and enabled) on a dataset AND dedicated thread pools are
+        // enabled. This keeps non-Cayenne deployments at full query budget and
+        // matches the dedicated compaction runtime's "create only if Cayenne is
+        // enabled" lifecycle — the carved env is the signal spiced uses to bring
+        // up the compaction worker threads.
+        let cayenne_configured = self.app.as_ref().is_some_and(|app| {
+            app.datasets.iter().any(|dataset| {
+                dataset.acceleration.as_ref().is_some_and(|accel| {
+                    accel.enabled
+                        && accel
+                            .engine
+                            .as_deref()
+                            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
+                })
+            })
+        });
+        let dedicated_thread_pools_enabled = !matches!(
+            spicepod_rt
+                .params
+                .get("dedicated_thread_pool")
+                .map(String::as_str),
+            Some("disabled")
+        );
+        let compaction_memory_fraction = (cayenne_configured && dedicated_thread_pools_enabled)
+            .then(|| {
+                let requested = parse_f64_runtime_param(
+                    &spicepod_rt.params,
+                    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+                )
+                .unwrap_or(DEFAULT_COMPACTION_MEMORY_FRACTION);
+                clamp_cayenne_compaction_memory_fraction(requested)
+            });
 
         #[cfg(not(windows))]
         if cayenne_footer_cache_mb.is_some() {
@@ -430,6 +520,7 @@ impl RuntimeBuilder {
         .cayenne_sort_merge_min_rows(cayenne_sort_merge_min_rows)
         .cayenne_sort_merge_memory_pool_fraction(cayenne_sort_merge_memory_pool_fraction)
         .cayenne_footer_cache_mb(cayenne_footer_cache_mb)
+        .compaction_memory_fraction(compaction_memory_fraction)
         .cayenne_optimizer_rules(cayenne_optimizer_rules);
 
         if let Some(DistributedNode::Scheduler {
@@ -717,6 +808,19 @@ fn parse_f64_runtime_param(params: &HashMap<String, String>, key: &str) -> Optio
     }
 }
 
+fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
+    let clamped = value.clamp(
+        MIN_COMPACTION_MEMORY_FRACTION,
+        MAX_COMPACTION_MEMORY_FRACTION,
+    );
+    if !(MIN_COMPACTION_MEMORY_FRACTION..=MAX_COMPACTION_MEMORY_FRACTION).contains(&value) {
+        tracing::warn!(
+            "runtime.params.{CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM}={value} is outside supported range [{MIN_COMPACTION_MEMORY_FRACTION}, {MAX_COMPACTION_MEMORY_FRACTION}]; using {clamped}"
+        );
+    }
+    clamped
+}
+
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
@@ -916,6 +1020,17 @@ mod test {
         assert_eq!(parse_f64_runtime_param(&params, "nan"), None);
         assert_eq!(parse_f64_runtime_param(&params, "bad"), None);
         assert_eq!(parse_f64_runtime_param(&params, "missing"), None);
+    }
+
+    #[test]
+    fn test_clamp_cayenne_compaction_memory_fraction() {
+        for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
+            let actual = clamp_cayenne_compaction_memory_fraction(input);
+            assert!(
+                (actual - expected).abs() < f64::EPSILON,
+                "expected {input} to clamp to {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]
