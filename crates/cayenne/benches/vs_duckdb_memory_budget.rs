@@ -189,6 +189,7 @@ struct BudgetedCayenne {
 
 async fn setup_budgeted_cayenne(
     table_name: &str,
+    metastore: Metastore,
     budget_bytes: usize,
     with_pk: bool,
 ) -> BudgetedCayenne {
@@ -211,7 +212,7 @@ async fn setup_budgeted_cayenne(
 
     let fixture = setup_cayenne_custom(
         table_name,
-        Metastore::Sqlite,
+        metastore,
         primary_key,
         on_conflict,
         schema(),
@@ -306,88 +307,111 @@ fn bench_memory_budget(c: &mut Criterion) {
     write_parquet(&make_batch(schema(), 0, UPSERT_ROWS), &upsert_parquet);
 
     for &(budget_label, budget_bytes) in MEMORY_BUDGETS {
-        // --- Cayenne read lanes (scan + groupby) on one budgeted fixture.
-        {
-            let lane = rt.block_on(setup_budgeted_cayenne("memory_budget", budget_bytes, false));
-            let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
-            assert!(preload > 0, "cayenne preload must insert rows");
-            lane.pool.reset_high_water();
+        // All Cayenne metastore lanes (Sqlite, plus Turso when compiled in) —
+        // consistent with every other vs_duckdb_* bench, so memory-budget
+        // numbers stay directly comparable across the paired suite.
+        for &cay_lane in common::CAYENNE_LANES {
+            let lane_prefix = cay_lane.lane();
 
-            for (workload, sql) in [("scan_filter_sum", SCAN_SQL), ("groupby_16k", GROUPBY_SQL)] {
-                // Pre-flight once: a budget the workload cannot fit is a
-                // finding to report, not a panic.
-                if let Err(e) = rt.block_on(try_query(&lane.warm_ctx, sql)) {
-                    eprintln!("memory_budget: cayenne/{workload}@{budget_label} SKIPPED — {e}");
-                    continue;
-                }
+            // --- Cayenne read lanes (scan + groupby) on one budgeted fixture.
+            {
+                let lane = rt.block_on(setup_budgeted_cayenne(
+                    "memory_budget",
+                    cay_lane,
+                    budget_bytes,
+                    false,
+                ));
+                let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
+                assert!(preload > 0, "cayenne preload must insert rows");
                 lane.pool.reset_high_water();
-                group.bench_function(
-                    BenchmarkId::new(format!("cayenne_{workload}"), budget_label),
-                    |b| {
-                        b.iter(|| {
-                            rt.block_on(async {
-                                let batches = try_query(&lane.warm_ctx, sql)
-                                    .await
-                                    .expect("pre-flighted query failed mid-bench");
-                                black_box(batches);
+
+                for (workload, sql) in [("scan_filter_sum", SCAN_SQL), ("groupby_16k", GROUPBY_SQL)]
+                {
+                    // Pre-flight once: a budget the workload cannot fit is a
+                    // finding to report, not a panic.
+                    if let Err(e) = rt.block_on(try_query(&lane.warm_ctx, sql)) {
+                        eprintln!(
+                            "memory_budget: {lane_prefix}/{workload}@{budget_label} SKIPPED — {e}"
+                        );
+                        continue;
+                    }
+                    lane.pool.reset_high_water();
+                    group.bench_function(
+                        BenchmarkId::new(format!("{lane_prefix}_{workload}"), budget_label),
+                        |b| {
+                            b.iter(|| {
+                                rt.block_on(async {
+                                    let batches = try_query(&lane.warm_ctx, sql)
+                                        .await
+                                        .expect("pre-flighted query failed mid-bench");
+                                    black_box(batches);
+                                });
                             });
-                        });
-                    },
-                );
-                let high_water = lane.pool.high_water_bytes() as u64;
-                eprintln_lane_memory("cayenne", workload, budget_label, high_water);
-                assert!(
-                    high_water <= budget_bytes as u64,
-                    "cayenne/{workload}@{budget_label}: pool high-water {high_water} bytes \
-                     exceeds the configured budget {budget_bytes} — operator contract violated"
-                );
+                        },
+                    );
+                    let high_water = lane.pool.high_water_bytes() as u64;
+                    eprintln_lane_memory(lane_prefix, workload, budget_label, high_water);
+                    assert!(
+                        high_water <= budget_bytes as u64,
+                        "{lane_prefix}/{workload}@{budget_label}: pool high-water {high_water} \
+                         bytes exceeds the configured budget {budget_bytes} — operator contract \
+                         violated"
+                    );
+                }
             }
-        }
 
-        // --- Cayenne upsert lane on a budgeted PK fixture. The upsert runs
-        //     through the lane's BUDGETED warm session (see
-        //     `try_upsert_from_parquet`) so both the query-side decode and
-        //     the table-side write reservations draw on the same budgeted
-        //     pool — the spiced topology.
-        {
-            let lane = rt.block_on(setup_budgeted_cayenne(
-                "memory_budget_upsert",
-                budget_bytes,
-                true,
-            ));
-            let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
-            assert!(preload > 0, "cayenne upsert preload must insert rows");
-            // Pre-flight once: a budget the upsert cannot fit is a finding
-            // to report, not a panic.
-            if let Err(e) = rt.block_on(try_upsert_from_parquet(
-                &lane.warm_ctx,
-                &lane.fixture.table,
-                &upsert_parquet,
-            )) {
-                eprintln!("memory_budget: cayenne/upsert_16k@{budget_label} SKIPPED — {e}");
-            } else {
-                lane.pool.reset_high_water();
-                group.bench_function(BenchmarkId::new("cayenne_upsert_16k", budget_label), |b| {
-                    b.iter(|| {
-                        rt.block_on(async {
-                            let rows = try_upsert_from_parquet(
-                                &lane.warm_ctx,
-                                &lane.fixture.table,
-                                &upsert_parquet,
-                            )
-                            .await
-                            .expect("pre-flighted upsert failed mid-bench");
-                            black_box(rows);
-                        });
-                    });
-                });
-                let high_water = lane.pool.high_water_bytes() as u64;
-                eprintln_lane_memory("cayenne", "upsert_16k", budget_label, high_water);
-                assert!(
-                    high_water <= budget_bytes as u64,
-                    "cayenne/upsert_16k@{budget_label}: pool high-water {high_water} bytes \
-                     exceeds the configured budget {budget_bytes} — operator contract violated"
-                );
+            // --- Cayenne upsert lane on a budgeted PK fixture. The upsert
+            //     runs through the lane's BUDGETED warm session (see
+            //     `try_upsert_from_parquet`) so both the query-side decode and
+            //     the table-side write reservations draw on the same budgeted
+            //     pool — the spiced topology.
+            {
+                let lane = rt.block_on(setup_budgeted_cayenne(
+                    "memory_budget_upsert",
+                    cay_lane,
+                    budget_bytes,
+                    true,
+                ));
+                let preload = rt.block_on(cayenne_insert(&lane.fixture.table, base_batch.clone()));
+                assert!(preload > 0, "cayenne upsert preload must insert rows");
+                // Pre-flight once: a budget the upsert cannot fit is a finding
+                // to report, not a panic.
+                if let Err(e) = rt.block_on(try_upsert_from_parquet(
+                    &lane.warm_ctx,
+                    &lane.fixture.table,
+                    &upsert_parquet,
+                )) {
+                    eprintln!(
+                        "memory_budget: {lane_prefix}/upsert_16k@{budget_label} SKIPPED — {e}"
+                    );
+                } else {
+                    lane.pool.reset_high_water();
+                    group.bench_function(
+                        BenchmarkId::new(format!("{lane_prefix}_upsert_16k"), budget_label),
+                        |b| {
+                            b.iter(|| {
+                                rt.block_on(async {
+                                    let rows = try_upsert_from_parquet(
+                                        &lane.warm_ctx,
+                                        &lane.fixture.table,
+                                        &upsert_parquet,
+                                    )
+                                    .await
+                                    .expect("pre-flighted upsert failed mid-bench");
+                                    black_box(rows);
+                                });
+                            });
+                        },
+                    );
+                    let high_water = lane.pool.high_water_bytes() as u64;
+                    eprintln_lane_memory(lane_prefix, "upsert_16k", budget_label, high_water);
+                    assert!(
+                        high_water <= budget_bytes as u64,
+                        "{lane_prefix}/upsert_16k@{budget_label}: pool high-water {high_water} \
+                         bytes exceeds the configured budget {budget_bytes} — operator contract \
+                         violated"
+                    );
+                }
             }
         }
 

@@ -220,10 +220,13 @@ fn bench_cdc_multitable(c: &mut Criterion) {
             });
 
             // Teardown: dropping the go senders ends each worker loop; join
-            // them before the fixtures are torn down.
+            // them before the fixtures are torn down. Propagate panics — a
+            // writer that died late would otherwise be swallowed and the
+            // lane would report numbers from a partially failed run.
             drop(go_txs);
             for worker in workers {
-                let _ = rt.block_on(worker.handle);
+                rt.block_on(worker.handle)
+                    .expect("cayenne cdc writer task panicked");
             }
             drop(fixtures);
         }
@@ -294,7 +297,11 @@ fn bench_cdc_multitable(c: &mut Criterion) {
 
         drop(go_txs);
         for worker in workers {
-            let _ = worker.handle.join();
+            // Propagate late panics — same rationale as the Cayenne teardown.
+            worker
+                .handle
+                .join()
+                .expect("duckdb cdc writer thread panicked");
         }
         drop(fixture);
     }
