@@ -141,11 +141,11 @@ impl PartitionedWal {
                 let table = table_root.display().to_string();
 
                 // Sync the table root so the _partitioned_wal/ subdir entry is
-                // written through (ordering tier: plain fsync on macOS,
-                // fdatasync on Linux — see `provider/fsync_tier.rs`).
+                // written through (directory ordering tier: plain fsync on
+                // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
                 tokio::task::spawn_blocking(move || {
                     let dir = std::fs::File::open(&parent)?;
-                    crate::provider::fsync_tier::ordering_sync_std(&dir)
+                    crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
                 })
                 .await
                 .map_err(|source| Error::TaskPanicked { table, source })??;
@@ -237,7 +237,7 @@ impl PartitionedWal {
         // Step 3: fsync the parent dir (ordering tier) so the rename is
         // written through before dependent work proceeds.
         if let Ok(dir) = tokio::fs::File::open(&wal_dir).await
-            && let Err(e) = super::fsync_tier::ordering_sync_tokio_file(&dir).await
+            && let Err(e) = super::fsync_tier::ordering_sync_dir_tokio_file(&dir).await
         {
             // Directory fsync is best-effort: on some filesystems / OSes it
             // is a no-op anyway. Log the failure but don't abort — the WAL
@@ -352,7 +352,7 @@ impl PartitionedWal {
                 let wal_dir_display = wal_dir.display().to_string();
                 match tokio::task::spawn_blocking(move || {
                     std::fs::File::open(&wal_dir)
-                        .and_then(|f| crate::provider::fsync_tier::ordering_sync_std(&f))
+                        .and_then(|f| crate::provider::fsync_tier::ordering_sync_dir_std(&f))
                 })
                 .await
                 {

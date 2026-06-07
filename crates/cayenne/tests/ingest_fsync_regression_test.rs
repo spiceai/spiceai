@@ -146,9 +146,9 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         .expect("write_deletion_file function not found in delete/vector_io.rs");
 
     // The deletion-vector writer must sync the FileWriter's inner fd
-    // (`inner.sync_data()?`) — this is the cheap path that uses the open fd
-    // we already have. A previous revision additionally re-opened the file
-    // with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
+    // (`ordering_sync_std(&inner)`) — this is the cheap path that uses the
+    // open fd we already have. A previous revision additionally re-opened the
+    // file with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
     // which doubled the per-deletion fsync cost. The reopen must NOT come
     // back without a documented reason.
     //
@@ -173,13 +173,13 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         !body.contains(reopened_fsync_pattern),
         "write_deletion_file must NOT re-open the deletion vector file and \
          fsync it a second time. That reopen+fsync pattern is redundant work \
-         after `inner.sync_all()` on the writer's inner fd and was previously \
-         a per-deletion regression."
+         after `ordering_sync_std(&inner)` on the writer's inner fd and was \
+         previously a per-deletion regression."
     );
 
     // Also assert there is exactly one file-level sync call on the deletion
     // vector file in this function. The parent directory fsync
-    // (`ordering_sync_std(&dir)`) is allowed and distinct.
+    // (`ordering_sync_dir_std(&dir)`) is allowed and distinct.
     let file_sync_count = body
         .lines()
         .filter(|line| {
@@ -192,7 +192,7 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         "write_deletion_file must sync the deletion vector file exactly once \
          (the writer's inner fd, via `ordering_sync_std(&inner)`). Found \
          {file_sync_count} occurrence(s). Parent-directory fsync via \
-         `ordering_sync_std(&dir)` is distinct and not counted here."
+         `ordering_sync_dir_std(&dir)` is distinct and not counted here."
     );
 
     // Tier guard: no full-tier `sync_all` — and no direct `sync_data`, which
@@ -210,21 +210,43 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
 }
 
 #[test]
-fn write_deletion_file_still_fsyncs_parent_dir() {
+fn deletion_vector_write_parallelizes_files_and_coalesces_dir_sync() {
     // The companion fsync — the parent directory — must still happen, so the
-    // dirent for the new deletion-vector file is durable before the catalog
-    // is updated. This is the load-bearing half of the ACID-Durability fix
-    // that the removed reopen was *replicating*; we want to keep this one.
-    let body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write_deletion_file")
-        .expect("write_deletion_file function not found in delete/vector_io.rs");
-
+    // dirents for new deletion-vector files are durable before the catalog
+    // is updated. It now lives in `DeletionVectorWriter::write`, ONCE per
+    // batch: the per-spec files are written CONCURRENTLY (`try_join_all`,
+    // overlapping their file fsyncs — on EBS this collapses N serialized
+    // ~1 ms barrier round-trips into ~1), and a single deletions/-dir sync
+    // after they all complete flushes every pending dirent at once. Same
+    // durability contract, 1/N the directory barriers.
+    let write_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write")
+        .expect("DeletionVectorWriter::write not found in delete/vector_io.rs");
     assert!(
-        body.contains("ordering_sync_std(&dir)"),
-        "write_deletion_file must still fsync (ordering tier, \
-         `ordering_sync_std(&dir)`) the parent directory of the deletion \
-         vector file. Without this, a crash after the catalog records the \
-         path can leave the directory entry unwritten — the catalog now \
-         references a file that does not exist on restart."
+        write_body.contains("try_join_all"),
+        "DeletionVectorWriter::write must write the batch's deletion-vector \
+         files concurrently (try_join_all) — serializing them re-introduces \
+         N fsync round-trips per batch on network-attached storage."
+    );
+    // Exactly two dir syncs in `write`: the one-time snapshot-parent sync
+    // (first deletion vector for the snapshot) and the per-batch coalesced
+    // deletions/-dir sync. A third occurrence means a per-file dir sync
+    // crept back in.
+    let dir_sync_count = write_body.matches("ordering_sync_dir_std(&dir)").count();
+    assert_eq!(
+        dir_sync_count, 2,
+        "DeletionVectorWriter::write must contain exactly two directory \
+         syncs (one-time snapshot-parent + per-batch coalesced deletions/ \
+         dir). Found {dir_sync_count}."
+    );
+
+    // And write_deletion_file itself must NOT dir-sync — that would undo the
+    // coalescing by re-adding a barrier per file.
+    let file_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write_deletion_file")
+        .expect("write_deletion_file function not found in delete/vector_io.rs");
+    assert!(
+        !file_body.contains("ordering_sync_dir_std"),
+        "write_deletion_file must not fsync the parent directory per file — \
+         the caller issues one coalesced deletions/-dir sync per batch."
     );
 }
 
@@ -311,9 +333,9 @@ fn staged_commit_hot_path_uses_ordering_tier_syncs() {
     let body = extract_fn_body(TABLE_SRC, "sync_snapshot_dir")
         .expect("sync_snapshot_dir function not found in table.rs");
     assert!(
-        body.contains("ordering_sync_std(&dir)"),
+        body.contains("ordering_sync_dir_std(&dir)"),
         "sync_snapshot_dir must flush directory entries with the ordering \
-         tier (`fsync_tier::ordering_sync_std(&dir)`), not `sync_all` or \
+         tier (`fsync_tier::ordering_sync_dir_std(&dir)`), not `sync_all` or \
          `sync_data` (both F_FULLFSYNC on macOS). See the durability-tier \
          rationale in the function body and provider/fsync_tier.rs."
     );
