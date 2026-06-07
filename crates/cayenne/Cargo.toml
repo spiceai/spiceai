@@ -103,6 +103,14 @@ name = "metastore_operations"
 
 [[bench]]
 harness = false
+name = "folded_txn_decomposition"
+
+[[bench]]
+harness = false
+name = "insert_record_schema_variants"
+
+[[bench]]
+harness = false
 name = "deletion_strategies"
 
 [[bench]]
