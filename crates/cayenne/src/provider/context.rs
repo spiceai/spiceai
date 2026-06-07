@@ -25,6 +25,7 @@ use vortex::file::WriteStrategyBuilder;
 use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
 use vortex_session::VortexSession;
 
+use super::tuning::{self, IngestStats, KnobValues, LiveKnobs, TuningBounds};
 use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
@@ -58,6 +59,27 @@ pub struct CayenneContext {
     /// creation, ensuring that the `list_files_cache` (and other caches/object stores)
     /// are shared with the main query engine.
     runtime_env: Arc<RuntimeEnv>,
+    /// Live, runtime-tunable copies of the per-operation knobs. Initialized from
+    /// `config`, so reads are identical to the static config until the dynamic
+    /// controller (if enabled) adjusts them. The hot-path accessors below read
+    /// from here, making them the single choke point for dynamic tuning.
+    live_knobs: Arc<LiveKnobs>,
+    /// Rolling CDC ingest accounting (input rate + runtime response) feeding the
+    /// dynamic controller. Always recorded (cheap); only acted on when
+    /// `dynamic_tuning` is enabled.
+    ingest_stats: Arc<IngestStats>,
+    /// Static `[floor, ceiling]` the controller may move each live knob within.
+    tuning_bounds: TuningBounds,
+    /// Whether the closed-loop controller may mutate `live_knobs` (off by
+    /// default; the accounting still records regardless).
+    dynamic_tuning: bool,
+    /// Wall-clock of the last applied dynamic adjustment, for the controller's
+    /// dwell-time hysteresis. `None` until the first adjustment.
+    last_adjust: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Wall-clock of the previous recorded CDC write, used to derive the
+    /// inter-batch arrival interval (the offered-load signal). `None` until the
+    /// first write.
+    last_write: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -81,6 +103,63 @@ impl CayenneContext {
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
         let vortex_format = Self::create_vortex_format(config, dataset);
+        // Seed the live knobs from the static config so every hot-path accessor
+        // reads exactly the static value until (and unless) the controller moves
+        // it — enabling dynamic tuning is therefore a strict, bounded refinement,
+        // never a behavior change on its own.
+        let live_knobs = Arc::new(LiveKnobs::new(KnobValues {
+            inline_flush_max_bytes: config.inline_flush_max_bytes,
+            inline_flush_max_rows: config.inline_flush_max_rows,
+            inline_flush_max_segments: config.inline_flush_max_segments,
+            compaction_background_interval_ms: config.compaction_background_interval_ms,
+            compaction_trigger_files: config.compaction_trigger_files,
+            write_concurrency: config.write_concurrency.unwrap_or(0),
+        }));
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
+        // memtable may grow up to 4× the static value (publish-bound relief) but
+        // never past 256 MiB (the largest static memory ceiling); concurrency is
+        // capped at the core count (the global encode budget caps the aggregate).
+        let min_flush_bytes: i64 = 2 * 1024 * 1024;
+        let max_flush_bytes = config
+            .inline_flush_max_bytes
+            .max(min_flush_bytes)
+            .saturating_mul(4)
+            .clamp(min_flush_bytes, 256 * 1024 * 1024);
+        // A pinned (operator-set) knob's bounds collapse to a single point so the
+        // controller can never move it — that is how an explicit per-value
+        // override is respected even in `adaptive` mode (`decide()` finds no room
+        // and falls through to another, un-pinned lever).
+        let pins = config.pinned_tuning_knobs;
+        let wc_init = config.write_concurrency.unwrap_or(0);
+        let tuning_bounds = TuningBounds {
+            inline_flush_max_bytes: if pins.inline_flush {
+                (config.inline_flush_max_bytes, config.inline_flush_max_bytes)
+            } else {
+                (min_flush_bytes, max_flush_bytes)
+            },
+            compaction_background_interval_ms: if pins.compaction_interval {
+                (
+                    config.compaction_background_interval_ms,
+                    config.compaction_background_interval_ms,
+                )
+            } else {
+                (2_000, 60_000)
+            },
+            compaction_trigger_files: if pins.compaction_trigger {
+                (
+                    config.compaction_trigger_files,
+                    config.compaction_trigger_files,
+                )
+            } else {
+                (2, 32)
+            },
+            write_concurrency: if pins.write_concurrency {
+                (wc_init, wc_init)
+            } else {
+                (1, cores)
+            },
+        };
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
@@ -88,6 +167,12 @@ impl CayenneContext {
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
+            live_knobs,
+            ingest_stats: Arc::new(IngestStats::new()),
+            tuning_bounds,
+            dynamic_tuning: config.dynamic_tuning,
+            last_adjust: parking_lot::Mutex::new(None),
+            last_write: parking_lot::Mutex::new(None),
         })
     }
 
@@ -174,10 +259,13 @@ impl CayenneContext {
         self.config.upload_concurrency.max(1)
     }
 
-    /// Get the configured writer partition override for unsorted snapshot writes.
+    /// Get the writer partition override for unsorted snapshot writes (live:
+    /// dynamic-tunable). `0` in the live knob means "unset" (use the session
+    /// default), mirroring `config.write_concurrency == None`.
     #[must_use]
     pub fn write_concurrency(&self) -> Option<usize> {
-        self.config.write_concurrency.map(|v| v.max(1))
+        let wc = self.live_knobs.write_concurrency();
+        (wc != 0).then(|| wc.max(1))
     }
 
     /// Maximum rows in one write that may be inlined into the metastore.
@@ -198,22 +286,22 @@ impl CayenneContext {
         self.config.inline_max_buffer_bytes
     }
 
-    /// Maximum inline rows before checkpointing to Vortex.
+    /// Maximum inline rows before checkpointing to Vortex (live: dynamic-tunable).
     #[must_use]
     pub(crate) fn inline_flush_max_rows(&self) -> i64 {
-        self.config.inline_flush_max_rows.max(0)
+        self.live_knobs.inline_flush_max_rows().max(0)
     }
 
-    /// Maximum inline entries before checkpointing to Vortex.
+    /// Maximum inline entries before checkpointing to Vortex (live).
     #[must_use]
     pub(crate) fn inline_flush_max_segments(&self) -> i64 {
-        self.config.inline_flush_max_segments.max(0)
+        self.live_knobs.inline_flush_max_segments().max(0)
     }
 
-    /// Maximum inline IPC bytes before checkpointing to Vortex.
+    /// Maximum inline IPC bytes before checkpointing to Vortex (live).
     #[must_use]
     pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
-        self.config.inline_flush_max_bytes.max(0)
+        self.live_knobs.inline_flush_max_bytes().max(0)
     }
 
     /// Primary-key conflict detection behavior for inserts.
@@ -254,7 +342,7 @@ impl CayenneContext {
         // picker only ever asks "is bucket size < threshold".
         let target_bytes = u64::try_from(self.target_file_size_bytes()).unwrap_or(u64::MAX);
         super::compaction::CompactionPickerConfig::new(
-            self.config.compaction_trigger_files,
+            self.live_knobs.compaction_trigger_files(),
             self.config.compaction_max_files_per_pick,
             target_bytes,
         )
@@ -284,15 +372,15 @@ impl CayenneContext {
         }
     }
 
-    /// Background compaction interval. Returns `None` when disabled (interval = 0).
+    /// Background compaction interval (live: dynamic-tunable). Returns `None`
+    /// when disabled (interval = 0).
     #[must_use]
     pub(crate) fn compaction_background_interval(&self) -> Option<std::time::Duration> {
-        if self.config.compaction_background_interval_ms == 0 {
+        let ms = self.live_knobs.compaction_background_interval_ms();
+        if ms == 0 {
             None
         } else {
-            Some(std::time::Duration::from_millis(
-                self.config.compaction_background_interval_ms,
-            ))
+            Some(std::time::Duration::from_millis(ms))
         }
     }
 
@@ -300,6 +388,86 @@ impl CayenneContext {
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
         &self.upload_semaphore
+    }
+
+    /// Record one CDC write's measurements into the rolling ingest accounting.
+    /// Always on (cheap: a few atomics + a short-held mutex per *batch*); feeds
+    /// the dynamic controller and observability. The inter-batch arrival interval
+    /// (offered-load signal) is derived here from the previous write's timestamp,
+    /// so callers pass only what the write path already measures.
+    pub(crate) fn record_ingest(
+        &self,
+        rows: u64,
+        bytes: u64,
+        apply: std::time::Duration,
+        publish: std::time::Duration,
+        encode: std::time::Duration,
+    ) {
+        let now = std::time::Instant::now();
+        let arrival_gap = {
+            let mut last = self.last_write.lock();
+            let gap = last.map(|t| now.saturating_duration_since(t));
+            *last = Some(now);
+            gap
+        };
+        self.ingest_stats.record_write(tuning::WriteSample {
+            rows,
+            bytes,
+            apply,
+            publish,
+            encode,
+            arrival_gap,
+        });
+    }
+
+    /// A snapshot of the current ingest accounting (rate + response), for
+    /// observability/logging.
+    #[must_use]
+    pub(crate) fn ingest_snapshot(&self) -> tuning::IngestSnapshot {
+        self.ingest_stats.snapshot()
+    }
+
+    /// Current live knob values (after any dynamic adjustments), for metrics.
+    #[must_use]
+    pub(crate) fn live_knob_values(&self) -> tuning::KnobValues {
+        self.live_knobs.values()
+    }
+
+    /// Refresh the externally-observed environment/response signals (read amp +
+    /// cgroup memory pressure) so the next snapshot/control step sees fresh data.
+    /// Called on the background tick regardless of whether tuning is enabled, so
+    /// the accounting gauges stay live for observability.
+    pub(crate) fn observe_environment(&self, read_amp: usize) {
+        self.ingest_stats.set_read_amp(read_amp);
+        tuning::sample_mem_pressure(&self.ingest_stats);
+    }
+
+    /// Run one dynamic-tuning control step from the current accounting, applying
+    /// at most one bounded knob change to [`Self::live_knobs`]. Returns the
+    /// adjustment made (for logging) or `None` when tuning is disabled or no
+    /// change is warranted. Owns the dwell clock: `min_dwell` is the minimum
+    /// spacing enforced between applied changes.
+    pub(crate) fn retune(&self, min_dwell: std::time::Duration) -> Option<tuning::Adjustment> {
+        if !self.dynamic_tuning {
+            return None;
+        }
+        // Detect the environment (cgroup-aware memory usage) and fold it in, so
+        // the loop closes on memory as well as ingest/query behavior.
+        tuning::sample_mem_pressure(&self.ingest_stats);
+        let now = std::time::Instant::now();
+        let since_last = (*self.last_adjust.lock())
+            .map_or(std::time::Duration::MAX, |t| now.saturating_duration_since(t));
+        let snapshot = self.ingest_stats.snapshot();
+        let adj = tuning::decide(
+            &snapshot,
+            &self.live_knobs.values(),
+            &self.tuning_bounds,
+            since_last,
+            min_dwell,
+        )?;
+        self.live_knobs.apply(&adj);
+        *self.last_adjust.lock() = Some(now);
+        Some(adj)
     }
 
     /// Create a `VortexFormat` from configuration.

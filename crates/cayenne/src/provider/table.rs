@@ -2788,9 +2788,26 @@ impl CayenneTableProvider {
             );
         }
 
-        AppendMutationWriter::new(self, &self.context, task_context)
+        let result = AppendMutationWriter::new(self, &self.context, task_context)
             .write_cdc_pipelined(normalized, write_guard)
-            .await
+            .await;
+        // Feed the dynamic auto-tuner's rolling ingest accounting: the batch's
+        // row count and the full per-batch apply wall (lock-wait + write), which
+        // is the "am I keeping up with the offered load?" response signal. Cheap
+        // and recorded regardless of whether dynamic tuning is enabled (it also
+        // backs the always-on observability gauges). The publish/encode split is
+        // left at zero for now (a future refinement to sharpen the diagnosis);
+        // byte accounting is not tallied on this path.
+        if let Ok(cdc_write) = &result {
+            self.context.record_ingest(
+                cdc_write.rows,
+                0,
+                lock_wait_start.elapsed(),
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+        }
+        result
     }
 
     /// Returns whether retention filters are configured for this table.
@@ -12633,6 +12650,55 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
 
     fn compaction_target_name(&self) -> &str {
         &self.table_metadata.table_name
+    }
+
+    fn on_background_tick(&self) {
+        // Observe the query-health signal — protected-snapshot runs a scan must
+        // merge (read amplification, the ingest→query coupling) — and cgroup
+        // memory pressure, so the controller's snapshot reflects fresh data.
+        let read_amp = self.protected_snapshots.load().len();
+        self.context.observe_environment(read_amp);
+
+        // Emit observability gauges every tick (regardless of whether dynamic
+        // tuning is enabled — the accounting is always recorded).
+        let table = self.table_metadata.table_name.to_string();
+        let snap = self.context.ingest_snapshot();
+        let knobs = self.context.live_knob_values();
+        telemetry::track_cayenne_autotune_state(
+            &telemetry::CayenneAutotuneState {
+                rows_per_sec: snap.rows_per_sec,
+                bytes_per_sec: snap.bytes_per_sec,
+                apply_vs_arrival: snap.apply_vs_arrival,
+                read_amp: u64::try_from(read_amp).unwrap_or(0),
+                mem_pressure: snap.mem_pressure.unwrap_or(-1.0),
+                inline_flush_max_bytes: u64::try_from(knobs.inline_flush_max_bytes.max(0))
+                    .unwrap_or(0),
+                compaction_interval_ms: knobs.compaction_background_interval_ms,
+                write_concurrency: u64::try_from(knobs.write_concurrency).unwrap_or(0),
+            },
+            &[telemetry::KeyValue::new("table", table.clone())],
+        );
+
+        // The closed-loop control step. A no-op when dynamic tuning is disabled
+        // (returns `None`); otherwise applies at most one bounded knob change.
+        if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
+            telemetry::track_cayenne_autotune_adjustment(&[
+                telemetry::KeyValue::new("table", table.clone()),
+                telemetry::KeyValue::new("knob", adj.knob.as_str()),
+            ]);
+            tracing::info!(
+                target: "cayenne::tuning",
+                table = table.as_str(),
+                knob = adj.knob.as_str(),
+                new_value = adj.new_value,
+                reason = adj.reason,
+                "Cayenne dynamic auto-tune adjustment applied",
+            );
+        }
+    }
+
+    fn background_interval_hint(&self) -> Option<std::time::Duration> {
+        self.context.compaction_background_interval()
     }
 }
 

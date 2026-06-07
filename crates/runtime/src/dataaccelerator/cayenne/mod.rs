@@ -207,6 +207,44 @@ fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
     }
 }
 
+/// Whether the resolved `on_conflict` performs an upsert (replace existing rows
+/// on a primary-key conflict) versus do-nothing. This is the heavy-update CDC
+/// signal the keyset auto-derivation keys off: upsert tables can size the keyset
+/// to the source cardinality (then fall to the cheap bloom past the budget),
+/// whereas a do-nothing table cannot use the bloom (its false positives would
+/// wrongly drop rows) and keeps the conservative default.
+fn is_upsert_on_conflict(
+    on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+) -> bool {
+    matches!(
+        on_conflict,
+        Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(_))
+    )
+}
+
+/// Build the auto-tune [`autotune::WorkloadProfile`] from the dataset's refresh
+/// mode, its resolved primary keys / on_conflict, and any extended-schema-
+/// inference metadata carried on the Arrow schema (`spice.inferred_row_count` /
+/// `spice.inferred_table_bytes`, see `data_components::inferred_schema`). Every
+/// signal degrades gracefully: an unknown one falls back to the hardware-only
+/// derivation.
+fn build_workload_profile(
+    acceleration: Option<&Acceleration>,
+    schema: &Schema,
+    primary_keys: &[String],
+    on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+) -> autotune::WorkloadProfile {
+    let small_write = acceleration.is_some_and(uses_small_write_refresh_profile);
+    let inferred =
+        data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata());
+    autotune::WorkloadProfile::from_inferred(
+        small_write,
+        primary_keys,
+        is_upsert_on_conflict(on_conflict),
+        &inferred,
+    )
+}
+
 /// Returns true if the path is a local filesystem path (not a remote object store).
 ///
 /// Local paths include:
@@ -447,13 +485,18 @@ impl CayenneAccelerator {
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
-        Self::get_vortex_config_with_footer_cache(table_name, source, None).await
+        let small_write = source
+            .acceleration()
+            .is_some_and(uses_small_write_refresh_profile);
+        let workload = autotune::WorkloadProfile::hardware_only(small_write);
+        Self::get_vortex_config_with_footer_cache(table_name, source, None, &workload).await
     }
 
     async fn get_vortex_config_with_footer_cache(
         table_name: &str,
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
+        workload: &autotune::WorkloadProfile,
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
@@ -512,7 +555,7 @@ impl CayenneAccelerator {
             // storage medium; only the small-write/CDC profile inlines, so other
             // profiles keep the floor (the caps are then ignored downstream).
             let inline_flush_caps = if small_write {
-                hw.inline_flush_caps()
+                hw.inline_flush_caps(workload)
             } else {
                 autotune::InlineFlushCaps::FLOOR
             };
@@ -533,7 +576,7 @@ impl CayenneAccelerator {
                     acceleration,
                     &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
                 ) {
-                    autotune::Knob::Auto => hw.pk_keyset_cache_mb(),
+                    autotune::Knob::Auto => hw.pk_keyset_cache_mb(workload),
                     autotune::Knob::Set(0) => {
                         tracing::warn!(
                             "Invalid cayenne_pk_keyset_cache_mb value of 0. Using minimum value of 1 MB."
@@ -729,6 +772,58 @@ impl CayenneAccelerator {
                 config.compaction_background_interval_ms,
             );
 
+            // Tuning mode (`cayenne_tuning`): `auto` (default) derives correct
+            // values statically from the detected environment + inferred schema;
+            // `adaptive` additionally runs the closed-feedback loop that adapts
+            // the knobs over time within the environment-derived [floor, ceiling].
+            // Independently, an explicit per-knob value always overrides the
+            // derived value — and under `adaptive` it *pins* that knob, so the
+            // loop leaves it alone (its bounds collapse to a point downstream).
+            let tuning_mode = acceleration
+                .params
+                .get("cayenne_tuning")
+                .map(|v| v.trim().to_ascii_lowercase());
+            if let Some(mode) = &tuning_mode
+                && mode != "auto"
+                && mode != "adaptive"
+            {
+                tracing::warn!(
+                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
+                );
+            }
+            config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+            config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
+                inline_flush: autotune::is_pinned(
+                    acceleration,
+                    &[
+                        "cayenne_inline_flush_max_bytes",
+                        "inline_flush_max_bytes",
+                        "cayenne_inline_memtable_max_bytes",
+                        "inline_memtable_max_bytes",
+                        "cayenne_inline_flush_max_rows",
+                        "inline_flush_max_rows",
+                        "cayenne_inline_memtable_max_rows",
+                        "inline_memtable_max_rows",
+                        "cayenne_inline_flush_max_segments",
+                        "inline_flush_max_segments",
+                        "cayenne_inline_memtable_max_segments",
+                        "inline_memtable_max_segments",
+                    ],
+                ),
+                compaction_interval: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_compaction_background_interval_ms"],
+                ),
+                compaction_trigger: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_compaction_trigger_files"],
+                ),
+                write_concurrency: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_write_concurrency", "write_concurrency"],
+                ),
+            };
+
             // Surface cross-parameter and out-of-range issues that parse cleanly
             // but won't behave as intended (silently clamped at use, or don't
             // compose with each other) — see `VortexConfig::config_warnings`.
@@ -919,9 +1014,19 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = s3::is_s3_express_data_path(source);
-        let vortex_config =
-            Self::get_vortex_config_with_footer_cache(table_name, source, self.footer_cache_mb)
-                .await;
+        let workload = build_workload_profile(
+            acceleration,
+            schema.as_ref(),
+            &primary_keys,
+            on_conflict.as_ref(),
+        );
+        let vortex_config = Self::get_vortex_config_with_footer_cache(
+            table_name,
+            source,
+            self.footer_cache_mb,
+            &workload,
+        )
+        .await;
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store =
@@ -1068,8 +1173,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    27,
-    { S3_PARAMS_LEN + 27 },
+    28,
+    { S3_PARAMS_LEN + 28 },
 >(
     S3_PARAMETERS,
     [
@@ -1141,6 +1246,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
+        ParameterSpec::component("tuning")
+            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"])
+            .default("auto"),
     ],
 );
 
@@ -1663,10 +1772,17 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
+            let workload = build_workload_profile(
+                source.acceleration(),
+                arrow_schema.as_ref(),
+                &primary_keys,
+                on_conflict.as_ref(),
+            );
             let vortex_config = Self::get_vortex_config_with_footer_cache(
                 &table_name,
                 source,
                 self.footer_cache_mb,
+                &workload,
             )
             .await;
 

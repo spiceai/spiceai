@@ -49,6 +49,8 @@ limitations under the License.
 //! see the tests at the bottom of this file, which are the local, deterministic
 //! form of the CH-benCH host matrix.
 
+use data_components::inferred_schema::InferredSchema;
+
 use crate::component::dataset::acceleration::{Acceleration, StorageProfile};
 use crate::dataaccelerator::storage::{
     ResolvedAccelerationStorage, resolve_acceleration_storage_async,
@@ -160,11 +162,34 @@ impl HardwareProfile {
     /// (hundreds of MB to low GB) while leaving headroom for the query pool and
     /// sibling tables.
     #[must_use]
-    pub fn pk_keyset_cache_mb(&self) -> usize {
+    pub fn pk_keyset_cache_mb(&self, wl: &WorkloadProfile) -> usize {
         const FLOOR_MB: u64 = 256;
         const CEIL_MB: u64 = 8 * 1024;
-        let scaled_mb = self.total_mem_bytes / 32 / MIB;
-        usize::try_from(scaled_mb.clamp(FLOOR_MB, CEIL_MB)).unwrap_or(256)
+        // Hardware ceiling: ~1/32 of RAM, clamped. Large tables intentionally cap
+        // here and fall to the cheap bloom existence filter rather than ballooning
+        // the keyset (validated: heavy-update upsert tables do *better* on bloom
+        // than on a giant keyset rebuilt per batch).
+        let hardware_ceiling = (self.total_mem_bytes / 32 / MIB).clamp(FLOOR_MB, CEIL_MB);
+
+        // Data-aware: when the source cardinality is known (inferred row_count)
+        // and this is a PK upsert table, size the exact keyset to what it actually
+        // needs — saving memory on small tables — still capped at the hardware
+        // ceiling so huge tables fall to the bloom.
+        if wl.has_primary_key
+            && wl.is_upsert
+            && let Some(rows) = wl.row_count
+            && rows > 0
+        {
+            // Conservative per-entry estimate: hashmap overhead + value + key
+            // bytes (~16 B per PK column covers int/uuid-class keys). Over-
+            // estimating errs toward the hardware ceiling, which is the safe side.
+            let pk_arity = u64::try_from(wl.pk_arity.max(1)).unwrap_or(1);
+            let entry_bytes = 64 + 16 * pk_arity;
+            let needed_mb = (rows.saturating_mul(entry_bytes) / MIB).max(1);
+            return usize::try_from(needed_mb.clamp(FLOOR_MB, hardware_ceiling)).unwrap_or(256);
+        }
+
+        usize::try_from(hardware_ceiling).unwrap_or(256)
     }
 
     /// Size (in MB) of the in-memory Vortex decompressed-segment cache, which
@@ -204,7 +229,7 @@ impl HardwareProfile {
     /// rows / 16 segments). `max_segments` is additionally capped at 256 to bound
     /// per-scan merge fan-in.
     #[must_use]
-    pub fn inline_flush_caps(&self) -> InlineFlushCaps {
+    pub fn inline_flush_caps(&self, wl: &WorkloadProfile) -> InlineFlushCaps {
         const FLOOR_BYTES: u64 = 2 * MIB;
         // (divisor, ceiling) per metastore medium: faster re-read → larger
         // memtable. Tmpfs is RAM-backed, so the memtable double-counts against
@@ -218,12 +243,82 @@ impl HardwareProfile {
             }
         };
         let bytes = (self.total_mem_bytes / divisor).clamp(FLOOR_BYTES, ceil_bytes);
-        let rows = bytes / 1024; // ~1 KiB/row
+        // Rows per flush derive from the byte budget and the table's real average
+        // row width when known (inferred table_bytes / row_count): a wide table
+        // flushes fewer rows for the same bytes, a narrow one more. Falls back to
+        // ~1 KiB/row when the width is unknown (preserves prior behavior), and is
+        // floored so a very wide table never degenerates to a per-row flush.
+        let bytes_per_row = wl.avg_row_bytes().unwrap_or(1024).max(1);
+        let rows = (bytes / bytes_per_row).max(64);
         let segments = (bytes / (128 * 1024)).clamp(16, 256); // ~128 KiB/segment, fan-in cap
         InlineFlushCaps {
             max_bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             max_rows: i64::try_from(rows).unwrap_or(i64::MAX),
             max_segments: i64::try_from(segments).unwrap_or(i64::MAX),
+        }
+    }
+}
+
+/// Data-/workload-shape signals, derived from the dataset's refresh mode and the
+/// extended schema inference (`data_components::inferred_schema`). These refine
+/// the hardware-only derivations: an upsert/CDC table with a known cardinality
+/// gets a right-sized keyset, and a known average row width sharpens the inline
+/// memtable's row cap. All fields degrade gracefully — an unknown signal falls
+/// back to the hardware default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct WorkloadProfile {
+    /// Small-write / CDC refresh profile (changes / caching / fast append).
+    pub small_write: bool,
+    /// The table has a primary key (an upsert/dedup candidate under CDC).
+    pub has_primary_key: bool,
+    /// `on_conflict` resolves to upsert (heavy-update CDC) rather than do-nothing.
+    pub is_upsert: bool,
+    /// Number of primary-key columns (keyset entry-width proxy).
+    pub pk_arity: usize,
+    /// Estimated source row count (cardinality / scale-factor proxy), if inferred.
+    pub row_count: Option<u64>,
+    /// Estimated source table byte size, if inferred.
+    pub table_bytes: Option<u64>,
+}
+
+impl WorkloadProfile {
+    /// A profile with no data/schema signals — every derivation falls back to the
+    /// hardware-only default. Used by callers without inferred schema and by the
+    /// hardware-axis tests.
+    #[must_use]
+    pub fn hardware_only(small_write: bool) -> Self {
+        Self {
+            small_write,
+            ..Self::default()
+        }
+    }
+
+    /// Build from resolved primary-key columns, the upsert flag, and the inferred
+    /// schema (which carries `row_count` / `table_bytes` in its metadata).
+    #[must_use]
+    pub fn from_inferred(
+        small_write: bool,
+        primary_key: &[String],
+        is_upsert: bool,
+        inferred: &InferredSchema,
+    ) -> Self {
+        Self {
+            small_write,
+            has_primary_key: !primary_key.is_empty(),
+            is_upsert,
+            pk_arity: primary_key.len(),
+            row_count: inferred.row_count,
+            table_bytes: inferred.table_bytes,
+        }
+    }
+
+    /// Average source row width in bytes (`table_bytes / row_count`) when both are
+    /// known; `None` falls back to the engine's ~1 KiB/row assumption.
+    #[must_use]
+    pub fn avg_row_bytes(&self) -> Option<u64> {
+        match (self.table_bytes, self.row_count) {
+            (Some(bytes), Some(rows)) if rows > 0 => Some((bytes / rows).max(1)),
+            _ => None,
         }
     }
 }
@@ -299,6 +394,15 @@ pub(crate) fn auto_or_i64(acceleration: &Acceleration, keys: &[&str], derived: i
         Knob::Auto => derived,
         Knob::Set(n) => i64::try_from(n).unwrap_or(derived),
     }
+}
+
+/// Whether the operator pinned a knob with an explicit numeric value (i.e.
+/// [`read_knob`] resolves to [`Knob::Set`]). An explicit `auto` or an unset knob
+/// is NOT pinned — it opts into derivation (and, in `adaptive` mode, adaptation).
+/// Used to exclude operator-set knobs from the closed loop.
+#[must_use]
+pub(crate) fn is_pinned(acceleration: &Acceleration, keys: &[&str]) -> bool {
+    matches!(read_knob(acceleration, keys), Knob::Set(_))
 }
 
 #[cfg(test)]
@@ -411,26 +515,71 @@ mod tests {
 
     #[test]
     fn keyset_floor_and_ceiling() {
+        // Hardware-only profile (no inferred cardinality) → ~1/32 of RAM, clamped.
+        let wl = WorkloadProfile::hardware_only(true);
         // Small host clamps to the 256 MiB floor.
         assert_eq!(
-            profile(4, 4 * GIB, ResolvedAccelerationStorage::Ebs).pk_keyset_cache_mb(),
+            profile(4, 4 * GIB, ResolvedAccelerationStorage::Ebs).pk_keyset_cache_mb(&wl),
             256
         );
         // Huge host clamps to the 8 GiB ceiling.
         assert_eq!(
-            profile(128, 1024 * GIB, ResolvedAccelerationStorage::LocalSsd).pk_keyset_cache_mb(),
+            profile(128, 1024 * GIB, ResolvedAccelerationStorage::LocalSsd).pk_keyset_cache_mb(&wl),
             8 * 1024
         );
         // Degenerate input never panics.
         assert_eq!(
-            profile(1, u64::MAX, ResolvedAccelerationStorage::Unknown).pk_keyset_cache_mb(),
+            profile(1, u64::MAX, ResolvedAccelerationStorage::Unknown).pk_keyset_cache_mb(&wl),
             8 * 1024
         );
         // Mid host scales to ~1/32 of RAM (64 GiB → 2 GiB).
         assert_eq!(
-            profile(16, 64 * GIB, ResolvedAccelerationStorage::Ebs).pk_keyset_cache_mb(),
+            profile(16, 64 * GIB, ResolvedAccelerationStorage::Ebs).pk_keyset_cache_mb(&wl),
             2 * 1024
         );
+    }
+
+    #[test]
+    fn keyset_is_data_aware_for_upsert_tables() {
+        let hw = profile(16, 64 * GIB, ResolvedAccelerationStorage::Ebs);
+        let hardware_ceiling = 2 * 1024; // 64 GiB / 32
+        let upsert = |rows: u64, pk_arity: usize| WorkloadProfile {
+            small_write: true,
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity,
+            row_count: Some(rows),
+            table_bytes: None,
+        };
+
+        // A small upsert table sizes the keyset DOWN to what it needs (saving
+        // memory) instead of reserving the full hardware ceiling.
+        let small = hw.pk_keyset_cache_mb(&upsert(1_000_000, 1));
+        assert!(
+            small < hardware_ceiling,
+            "small table ({small} MB) should size below the {hardware_ceiling} MB ceiling"
+        );
+        assert!(small >= 256, "never below the floor");
+
+        // A huge upsert table caps at the hardware ceiling (then falls to bloom).
+        assert_eq!(
+            hw.pk_keyset_cache_mb(&upsert(10_000_000_000, 2)),
+            hardware_ceiling
+        );
+
+        // Wider PK ⇒ larger per-entry ⇒ larger (or equal) keyset at equal rows.
+        assert!(
+            hw.pk_keyset_cache_mb(&upsert(50_000_000, 4))
+                >= hw.pk_keyset_cache_mb(&upsert(50_000_000, 1))
+        );
+
+        // Non-upsert (DoNothing) or no-PK tables ignore cardinality and keep the
+        // hardware default — a bloom's false positives are unsafe under DoNothing.
+        let do_nothing = WorkloadProfile {
+            is_upsert: false,
+            ..upsert(1_000, 1)
+        };
+        assert_eq!(hw.pk_keyset_cache_mb(&do_nothing), hardware_ceiling);
     }
 
     // ---- segment_cache_mb -------------------------------------------------
@@ -476,7 +625,9 @@ mod tests {
 
     #[test]
     fn inline_flush_caps_scale_with_memory_and_storage() {
-        let caps = |mem, storage| profile(8, mem, storage).inline_flush_caps();
+        // Hardware-only profile ⇒ the ~1 KiB/row fallback, pinning prior behavior.
+        let wl = WorkloadProfile::hardware_only(true);
+        let caps = |mem, storage| profile(8, mem, storage).inline_flush_caps(&wl);
 
         // Floor: hosts at/under the threshold keep the historical small-write
         // caps. Pins the FLOOR_BYTES ↔ InlineFlushCaps::FLOOR coupling.
@@ -532,6 +683,64 @@ mod tests {
         assert_eq!(mid.max_segments, (mid.max_bytes / (128 * 1024)).clamp(16, 256));
     }
 
+    #[test]
+    fn inline_flush_rows_track_real_row_width() {
+        let hw = profile(8, 16 * GIB, ResolvedAccelerationStorage::Ebs);
+        // Same byte budget; rows scale inversely with the inferred average width.
+        let narrow = WorkloadProfile {
+            row_count: Some(1_000_000),
+            table_bytes: Some(256_000_000), // 256 B/row
+            ..WorkloadProfile::hardware_only(true)
+        };
+        let wide = WorkloadProfile {
+            row_count: Some(1_000_000),
+            table_bytes: Some(8_000_000_000), // 8 KB/row
+            ..WorkloadProfile::hardware_only(true)
+        };
+        let n = hw.inline_flush_caps(&narrow);
+        let w = hw.inline_flush_caps(&wide);
+        assert_eq!(n.max_bytes, w.max_bytes, "byte budget is width-independent");
+        assert!(
+            n.max_rows > w.max_rows,
+            "narrow rows ({}) should exceed wide rows ({})",
+            n.max_rows,
+            w.max_rows
+        );
+        // Width-derived: narrow ≈ bytes/256, wide ≈ bytes/8192.
+        assert_eq!(n.max_rows, n.max_bytes / 256);
+        assert_eq!(w.max_rows, (w.max_bytes / 8192).max(64));
+    }
+
+    #[test]
+    fn workload_profile_from_inferred_and_avg_row_bytes() {
+        let inferred = InferredSchema {
+            row_count: Some(2_000_000),
+            table_bytes: Some(1_024_000_000),
+            ..InferredSchema::default()
+        };
+        let pk = vec!["tenant_id".to_string(), "id".to_string()];
+        let wl = WorkloadProfile::from_inferred(true, &pk, true, &inferred);
+        assert!(wl.has_primary_key);
+        assert!(wl.is_upsert);
+        assert_eq!(wl.pk_arity, 2);
+        assert_eq!(wl.row_count, Some(2_000_000));
+        assert_eq!(wl.avg_row_bytes(), Some(512)); // 1_024_000_000 / 2_000_000
+
+        // No PK columns ⇒ not a PK table; unknown width ⇒ no avg.
+        let empty = WorkloadProfile::from_inferred(true, &[], false, &InferredSchema::default());
+        assert!(!empty.has_primary_key);
+        assert_eq!(empty.pk_arity, 0);
+        assert_eq!(empty.avg_row_bytes(), None);
+
+        // Zero row_count never divides-by-zero.
+        let zero = WorkloadProfile {
+            row_count: Some(0),
+            table_bytes: Some(1024),
+            ..WorkloadProfile::default()
+        };
+        assert_eq!(zero.avg_row_bytes(), None);
+    }
+
     // ---- the host matrix (local form of the CH-benCH host sweep) ----------
 
     /// Across a representative AWS-instance matrix (4–128 cores, 8 GiB–256 GiB,
@@ -549,13 +758,27 @@ mod tests {
             ResolvedAccelerationStorage::Unknown,
         ];
 
+        // Exercise both an unknown-data profile and an upsert profile with a
+        // large inferred cardinality + width — both must stay in bounds.
+        let workloads = [
+            WorkloadProfile::hardware_only(true),
+            WorkloadProfile {
+                small_write: true,
+                has_primary_key: true,
+                is_upsert: true,
+                pk_arity: 3,
+                row_count: Some(5_000_000_000),
+                table_bytes: Some(2_000_000_000_000),
+            },
+        ];
+
         for &c in &cores {
             for &m in &mems {
                 for &data in &storages {
                     for &meta in &storages {
                         let hw = HardwareProfile::new(c, m, data, meta);
-
-                        let keyset = hw.pk_keyset_cache_mb();
+                        for wl in &workloads {
+                        let keyset = hw.pk_keyset_cache_mb(wl);
                         assert!(
                             (256..=8 * 1024).contains(&keyset),
                             "keyset {keyset} out of bounds for {hw:?}"
@@ -567,7 +790,7 @@ mod tests {
                             "segment {segment} out of bounds for {hw:?}"
                         );
 
-                        let caps = hw.inline_flush_caps();
+                        let caps = hw.inline_flush_caps(wl);
                         assert!(
                             (FLOOR_FLUSH_BYTES..=256 * 1_048_576).contains(&caps.max_bytes),
                             "flush bytes {} out of bounds for {hw:?}",
@@ -585,6 +808,7 @@ mod tests {
                                 assert_eq!(hw.target_file_size_mb_override(), Some(64));
                             }
                             _ => assert_eq!(hw.target_file_size_mb_override(), None),
+                        }
                         }
                     }
                 }
@@ -607,9 +831,10 @@ mod tests {
                 ResolvedAccelerationStorage::Ebs,
                 ResolvedAccelerationStorage::Ebs,
             );
-            let keyset_bytes = u64::try_from(hw.pk_keyset_cache_mb()).unwrap_or(0) * MIB_U;
+            let wl = WorkloadProfile::hardware_only(true);
+            let keyset_bytes = u64::try_from(hw.pk_keyset_cache_mb(&wl)).unwrap_or(0) * MIB_U;
             let segment_bytes = u64::try_from(hw.segment_cache_mb()).unwrap_or(0) * MIB_U;
-            let memtable_bytes = u64::try_from(hw.inline_flush_caps().max_bytes).unwrap_or(0);
+            let memtable_bytes = u64::try_from(hw.inline_flush_caps(&wl).max_bytes).unwrap_or(0);
             let per_table_bytes = keyset_bytes + segment_bytes + memtable_bytes;
             let fleet_bytes = per_table_bytes * FLEET;
             assert!(
