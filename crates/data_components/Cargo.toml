@@ -226,3 +226,8 @@ name = "object_filter"
 harness = false
 name = "mongodb_change_stream"
 required-features = ["mongodb"]
+
+[[bench]]
+harness = false
+name = "kafka_decode"
+required-features = ["bench", "kafka"]
