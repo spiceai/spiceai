@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "3311cd72a619de6ad9914f95299bb25ce667f93b" } # spiceai-53 (v0.11.0 DF53)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "51c56f8a5aaad9fe46dfb020f3b46a9377b7681f" } # lukim/tp-53-patches-df53-seam (DF53 + Spice patches: with_function_support seam, Engine model, sqlite between)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -295,7 +295,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 spice-cloud-client = { path = "crates/spice-cloud-client" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "619c8b2a7c14b73828462c919dd82eba657af08c" } # branch: spiceai-58
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "946bdbc7887c3c90093ad8935d254d894f4bad3b" } # branch: lukim/snowflake-objectstore-013 (arrow58 + object_store 0.13)
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
@@ -474,8 +474,6 @@ arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
-
-object_store = { git = "https://github.com/spiceai/arrow-rs-object-store.git", rev = "55b8f3b38f44b5fa289f1fcc89d657fd56202dce" }
 
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
