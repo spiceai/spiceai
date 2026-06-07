@@ -41,9 +41,17 @@ limitations under the License.
 //! cache survives a process crash, and the staging-WAL recovery protocol
 //! (`ensure_no_incomplete_write`) heals interrupted commits either way.
 //!
-//! On non-macOS platforms these helpers are `File::sync_data` — on Linux that
-//! is `fdatasync(2)`, which still issues a device flush and skips only
-//! metadata journaling irrelevant to reading the bytes back.
+//! On non-macOS platforms the REGULAR-FILE helpers ([`ordering_sync_std`] /
+//! [`ordering_sync_tokio_file`]) are `File::sync_data` — on Linux that is
+//! `fdatasync(2)`, which still issues a device flush and skips only metadata
+//! journaling irrelevant to reading the bytes back. The DIRECTORY variants
+//! ([`ordering_sync_dir_std`] / [`ordering_sync_dir_tokio_file`]) are the
+//! deliberate exception: they keep full `sync_all` on non-macOS, because
+//! `fdatasync`'s "metadata required to retrieve the data" wording leaves
+//! directory-entry durability implementation-defined, and a dirent that
+//! vanishes after power loss un-publishes the file it referenced. On macOS
+//! both file and directory variants are plain `fsync(2)` (the metastore
+//! weakest-link argument above applies to either handle kind there).
 //!
 //! Cold paths (table create/drop, metastore initialization, partition
 //! creation) intentionally do NOT use this module and keep `sync_all`.
