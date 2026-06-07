@@ -666,7 +666,7 @@ pub fn track_cayenne_inline_cache_populate(delta: bool, dimensions: &[KeyValue])
 static CAYENNE_LIST_FILES_CACHE_DELTA_APPLIES: OnceLock<Counter<u64>> = OnceLock::new();
 static CAYENNE_LIST_FILES_CACHE_EVICTIONS: OnceLock<Counter<u64>> = OnceLock::new();
 
-/// Counts how a current-snapshot publish updated DataFusion's list-files cache:
+/// Counts how a current-snapshot publish updated `DataFusion`'s list-files cache:
 /// a delta-apply (the moved files were merged onto the cached directory listing,
 /// avoiding a full re-LIST) or an eviction (the whole directory entry was
 /// dropped, forcing the next scan to re-LIST — the fallback for compaction,

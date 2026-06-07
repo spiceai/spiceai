@@ -591,10 +591,10 @@ impl MetastoreBackend for TursoMetastore {
             match ir_cols.next().await {
                 // Column name is at index 1 of PRAGMA table_info.
                 Ok(Some(row)) => {
-                    if let Ok(turso::Value::Text(name)) = row.get_value(1) {
-                        if name == "insert_record_id" {
-                            has_legacy_uuid_column = true;
-                        }
+                    if let Ok(turso::Value::Text(name)) = row.get_value(1)
+                        && name == "insert_record_id"
+                    {
+                        has_legacy_uuid_column = true;
                     }
                 }
                 Ok(None) => break,

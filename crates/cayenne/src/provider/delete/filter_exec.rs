@@ -59,7 +59,7 @@ limitations under the License.
 //! is never folded into pruning. Projections and limits are deliberately not
 //! pushed through (the execs need their PK columns, and being row-reducing a
 //! child limit could under-produce). See the OLAP-under-load audit, finding R1,
-//! and the SOTA scan (ClickHouse PREWHERE / Iceberg-V3 deletion-vector layering).
+//! and the SOTA scan (`ClickHouse` PREWHERE / Iceberg-V3 deletion-vector layering).
 
 use crate::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};

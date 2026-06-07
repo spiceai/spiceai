@@ -406,6 +406,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// or the commit fails. Failures roll back the entire transaction; the
     /// catalog is left unchanged (no partial delete-file / insert-record /
     /// snapshot-sequence / tombstone / pending-flip state).
+    #[expect(clippy::too_many_arguments)]
     async fn commit_on_conflict_deletions_with_tombstone(
         &self,
         delete_files: Vec<DeleteFile>,
@@ -752,7 +753,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// a timer instead of relying on the inline `wal_autocheckpoint` firing a
     /// passive checkpoint on a CDC commit/UPDATE — which lands an fsync inside
     /// the WAL-write-locked Stage-A/Stage-B window. The checkpoint must NOT block
-    /// writers or wait for readers (SQLite `PASSIVE`), so a failure or a busy WAL
+    /// writers or wait for readers (`SQLite` `PASSIVE`), so a failure or a busy WAL
     /// is a no-op the next tick retries. Default implementation does nothing.
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         Ok(())

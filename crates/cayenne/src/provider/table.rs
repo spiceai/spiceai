@@ -628,9 +628,7 @@ impl CayenneCdcWrite {
                 // fence. This is the real I/O of the publish — on EBS the dir
                 // fsync is a device flush.
                 let apply_move_start = Instant::now();
-                if let Err(move_err) = prepared_append.apply_under_held_barrier().await {
-                    return Err(move_err);
-                }
+                prepared_append.apply_under_held_barrier().await?;
                 record_cayenne_write_phase(
                     self.table.table_name(),
                     "publish_apply_move",
@@ -1855,14 +1853,14 @@ pub struct CayenneTableProvider {
     /// # Why deferring the DURABLE flip is crash-safe
     ///
     /// The durable flip is now purely a convergence step; durability/recovery
-    /// rests entirely on the UNCHANGED Option-D invariant (correctness_audit.md
+    /// rests entirely on the UNCHANGED Option-D invariant (`correctness_audit.md`
     /// §5/§7): a tombstone is written durably `published = false` in Stage-A and
     /// its replacement files' staging WAL is durable BEFORE it; Stage-B's
     /// `apply_under_held_barrier` makes the replacement files durable and removes
     /// the WAL. So at ANY crash point a durable `published = 0` tombstone whose
     /// replacement is durable is healed on reopen by `publish_orphan_inlined_deletes`
     /// (flips ALL `published = 0` → 1 unconditionally) — exactly the existing
-    /// "crash before finish()" recovery. The in-memory set is lost on crash,
+    /// "crash before `finish()`" recovery. The in-memory set is lost on crash,
     /// which is correct: it only ever ADVANCED visibility past the durable flag,
     /// never the reverse, so losing it cannot resurface a row (the orphan sweep
     /// re-publishes). No new vanish/double-apply window.
@@ -1929,7 +1927,7 @@ pub struct CayenneTableProvider {
     /// Side-channel carrying `(snapshot_id, ObjectMeta of moved files)` from a
     /// current-snapshot staged move, so the next
     /// `publish_current_snapshot_files_changed_under_held_fence` can DELTA-APPLY
-    /// them onto the DataFusion list-files cache instead of evicting the whole
+    /// them onto the `DataFusion` list-files cache instead of evicting the whole
     /// snapshot-directory listing and forcing a full re-LIST.
     ///
     /// Written by `move_staging_files_local` / `move_staging_files_s3` (which
@@ -1943,6 +1941,7 @@ pub struct CayenneTableProvider {
     /// time, so a stale entry left by a move whose publish was skipped can never
     /// be applied onto a different snapshot's listing. Only current-snapshot moves
     /// populate it; staged→new-snapshot moves (compaction/overwrite) do not.
+    #[expect(clippy::type_complexity)]
     last_moved_snapshot_files: Arc<ParkingMutex<Option<(String, Vec<ObjectMeta>)>>>,
     /// Tracks whether a staging WAL may be present (for fast-path short-circuit
     /// of expensive S3 GET / local FS read in `ensure_no_incomplete_write`).
@@ -2445,7 +2444,7 @@ impl TombstoneDelta {
 /// Cap on the pending tombstone-delta queue (cycle-5 TASK 1). When EITHER the
 /// number of queued deltas OR the total queued keys exceeds these, the next
 /// inline-cache miss falls back to a FULL rebuild (which reads the whole corpus
-/// + the full deletion maps, so it captures every tombstone) and resets the
+/// plus the full deletion maps, so it captures every tombstone) and resets the
 /// queue baseline. This bounds both the queue's memory and the per-miss
 /// re-filter work between checkpoints, while keeping the delta path on the
 /// common per-batch single-tombstone case. A checkpoint clears the queue
@@ -3834,6 +3833,10 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be cleaned or created.
+    // Retained as the legacy whole-`_staging/` cleanup path (referenced by the
+    // doc links above); the live CDC pipeline now uses the per-snapshot
+    // `clear_orphan_staging_dirs` / `clear_staging_snapshot_dir` variants.
+    #[expect(dead_code)]
     pub(crate) async fn clear_staging_dir(&self) -> Result<()> {
         // Fast path: if a previous append completed cleanly (or this is the
         // first write after open and no orphan files were present), staging is
@@ -4160,10 +4163,10 @@ impl CayenneTableProvider {
             let metadata = tokio::fs::metadata(target_dir.join(file_name)).await.ok()?;
             metas.push(ObjectMeta {
                 location: prefix.child(file_name_str),
-                last_modified: metadata
-                    .modified()
-                    .map(chrono::DateTime::<chrono::Utc>::from)
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                last_modified: metadata.modified().map_or_else(
+                    |_| chrono::Utc::now(),
+                    chrono::DateTime::<chrono::Utc>::from,
+                ),
                 size: metadata.len(),
                 e_tag: None,
                 version: None,
@@ -4215,7 +4218,7 @@ impl CayenneTableProvider {
         // (bucket-stripped), so build the delta-apply locations the same way the
         // scan's LIST would — `prefix.child(relative)` — rather than from the
         // object-store move prefix, which may not be byte-identical.
-        let cache_prefix = ListingTableUrl::parse(&Self::snapshot_dir_url(
+        let cache_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
             current_snapshot,
@@ -10695,7 +10698,7 @@ impl CayenneTableProvider {
     /// When an entry exists, the new metas are appended to its files (deduped by
     /// `location`, so a re-published file is not double-listed) and `put` back.
     /// Listing-cache filtering is prefix-based and order-independent, so no sort
-    /// is required. On the pinned DataFusion fork the `ListFilesCache` value type
+    /// is required. On the pinned `DataFusion` fork the `ListFilesCache` value type
     /// is `Arc<Vec<ObjectMeta>>` (with `Extra = Option<Path>`); the non-extra
     /// `CacheAccessor::{get,put}` variants are used here.
     fn apply_list_files_cache_additions(
