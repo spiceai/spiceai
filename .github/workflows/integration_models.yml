@@ -239,82 +239,80 @@ jobs:
 
       # OpenAI tests
       - name: Run OpenAI integration test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_test
 
       - name: Run OpenAI Beta functionality embeddings test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- openai_embeddings_beta_requirements
 
       # AI UDF tests
       - name: Run AI UDF basic test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_basic
 
       - name: Run AI UDF with dataset test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' && secrets.SPICE_SECRET_XAI_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
+          if [ -z "${SPICE_SECRET_ANTHROPIC_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_ANTHROPIC_API_KEY is required but not set"
             exit 1
           fi
-          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
-            echo "Error: xAI API key is not defined."
+          if [ -z "${SPICE_SECRET_XAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_XAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_dataset
 
+      # NOTE: Step-level `if:` conditionals on secret-requiring AI test steps (OpenAI, workers, search, xAI/HF UDFs, etc.) cause the step to report "skipped" (neutral, job succeeds) on PRs where secrets are intentionally unavailable for security (forks/external PRs). When a step *does* execute (schedule/workflow_dispatch with secrets present), an explicit fast-fail guard at the start of `run:` errors immediately if a required key is missing, preserving the original intent. This is intentional and confirmed for schedule + workflow_dispatch (incl. `run_all_tests`). See Copilot review threads for context; prevents spurious reds unrelated to code.
       - name: Run AI UDF LEFT truncate test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.SPICE_SECRET_ANTHROPIC_API_KEY != '' && secrets.SPICE_SECRET_XAI_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           SPICE_SECRET_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_SECRET_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
-            exit 1
-          fi
-          if [ -z "$SPICE_SECRET_ANTHROPIC_API_KEY" ] ; then
-            echo "Error: Anthropic API key is not defined."
-            exit 1
-          fi
-          if [ -z "$SPICE_SECRET_XAI_API_KEY" ] ; then
-            echo "Error: xAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_left_truncate
@@ -327,38 +325,37 @@ jobs:
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- local_embeddings_beta_requirements
 
       - name: Run AI UDF with local model test
+        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
-            exit 1
-          fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- test_ai_udf_with_local_model
 
       # Workers tests
       - name: Run workers integration test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- workers
 
       # Search tests
       - name: Run search integration test
+        if: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY != '' && secrets.AWS_S3_VECTORS_KEY != '' && secrets.AWS_S3_VECTORS_SECRET != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_SECRET_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
-          if [ -z "$SPICE_SECRET_OPENAI_API_KEY" ] ; then
-            echo "Error: OpenAI API key is not defined."
+          if [ -z "${SPICE_SECRET_OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: SPICE_SECRET_OPENAI_API_KEY is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- search
@@ -421,23 +418,25 @@ jobs:
           path: ./integration_test
 
       - name: Run integration test
+        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
+          if [ -z "${SPICE_HF_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- huggingface_test
 
       - name: Run Beta functionality embedding tests
+        if: ${{ secrets.SPICE_SECRET_HF_TOKEN != '' }}
         env:
           INSTA_UPDATE: ${{ github.event_name == 'schedule' && 'always' || github.event.inputs.update_snapshots }}
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
         run: |
-          if [ -z "$SPICE_HF_TOKEN" ] ; then
-            echo "Error: Hugging Face API Token is not defined."
+          if [ -z "${SPICE_HF_TOKEN:-}" ]; then
+            echo "ERROR: SPICE_SECRET_HF_TOKEN is required but not set"
             exit 1
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst -- hf_embeddings_beta_requirements

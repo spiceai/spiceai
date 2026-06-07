@@ -2201,8 +2201,8 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: r"
                 INSERT INTO cayenne_inlined_delete
-                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number)
-                VALUES (?1, ?2, ?3, ?4, ?5)
+                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number, published)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ",
                 params: vec![
                     MetastoreValue::Text(inlined_id.clone()),
@@ -2210,10 +2210,76 @@ impl MetadataCatalog for CayenneCatalog {
                     MetastoreValue::Blob(delete.delete_ipc),
                     MetastoreValue::Integer(delete.delete_count),
                     MetastoreValue::Integer(delete.sequence_number),
+                    MetastoreValue::Integer(i64::from(delete.published)),
                 ],
             })
             .await?;
         Ok(inlined_id)
+    }
+
+    async fn mark_inlined_delete_published(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_inlined_delete SET published = 1 \
+                      WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(inlined_id.to_string()),
+                ],
+            })
+            .await
+    }
+
+    async fn mark_inlined_delete_unpublished(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_inlined_delete SET published = 0 \
+                      WHERE table_id = ?1 AND inlined_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(inlined_id.to_string()),
+                ],
+            })
+            .await
+    }
+
+    async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64> {
+        // Count the unpublished tombstones first (the execute helper returns no
+        // affected-row count). The `published = 0` partial index
+        // (`idx_cayenne_inlined_delete_unpublished`) lets both the COUNT and the
+        // UPDATE seek straight to the in-flight rows instead of scanning every
+        // tombstone for the table under the `(table_id, sequence_number)` index.
+        let pending: i64 = self
+            .metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_inlined_delete \
+                          WHERE table_id = ?1 AND published = 0",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await?;
+
+        if pending > 0 {
+            self.metastore
+                .execute_helper(ExecuteParams {
+                    sql: "UPDATE cayenne_inlined_delete SET published = 1 \
+                          WHERE table_id = ?1 AND published = 0",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                })
+                .await?;
+        }
+
+        Ok(u64::try_from(pending).unwrap_or(0))
     }
 
     async fn commit_inlined_mutation(
@@ -2624,7 +2690,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at
+                    SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at, published
                     FROM cayenne_inlined_delete
                     WHERE table_id = ?1
                     ORDER BY sequence_number
@@ -2639,6 +2705,44 @@ impl MetadataCatalog for CayenneCatalog {
                         delete_count: row.get_i64(3)?,
                         sequence_number: row.get_i64(4)?,
                         created_at: row.get_string(5)?,
+                        published: row.get_bool(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>> {
+        // Hot read path: same shape as `get_inlined_deletes` but pushes the
+        // `published = 1` gate into SQL so unpublished tombstones' expensive
+        // `delete_ipc` blobs are never materialised/shipped only to be skipped in
+        // memory. `published = 1` is exactly the complement of the Rust
+        // `!delete.published` skip, so the no-transient-PK-vanish gate is
+        // preserved. Seeks via the complement of the
+        // `idx_cayenne_inlined_delete_unpublished` partial index.
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at, published
+                    FROM cayenne_inlined_delete
+                    WHERE table_id = ?1 AND published = 1
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDelete {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        delete_ipc: row.get_blob(2)?,
+                        delete_count: row.get_i64(3)?,
+                        sequence_number: row.get_i64(4)?,
+                        created_at: row.get_string(5)?,
+                        published: row.get_bool(6)?,
                     })
                 },
             )
@@ -3126,6 +3230,17 @@ fn log_configuration_differences(
         differences.push(format!(
             "compression_strategy: {:?} -> {:?}",
             stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
+        ));
+    }
+
+    // Note: `delta_encoding` is deliberately NOT part of the data-compatibility
+    // gate (`is_data_compatible`): every level emits standard Vortex encodings
+    // readable by the same scan, so a level change applies to future writes
+    // only and must not force a table re-create. Surface it in the change log.
+    if stored.vortex_config.delta_encoding != options.vortex_config.delta_encoding {
+        differences.push(format!(
+            "delta_encoding: {} -> {} (write-time only; existing data unaffected)",
+            stored.vortex_config.delta_encoding, options.vortex_config.delta_encoding
         ));
     }
 
@@ -4897,6 +5012,7 @@ mod tests {
                 delete_count: 2,
                 sequence_number: 2,
                 created_at: String::new(),
+                published: false,
             })
             .await
             .expect("Failed to add inlined delete");

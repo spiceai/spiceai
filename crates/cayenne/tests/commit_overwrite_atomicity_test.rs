@@ -191,6 +191,7 @@ async fn plant_full_pre_overwrite_state(
             delete_count: 2,
             sequence_number: 23,
             created_at: String::new(),
+            published: true,
         })
         .await
         .expect("add_inlined_delete");

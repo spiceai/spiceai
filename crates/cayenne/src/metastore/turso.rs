@@ -328,12 +328,25 @@ impl TursoMetastore {
             delete_count BIGINT NOT NULL,
             sequence_number BIGINT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            published INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
 
     const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
     const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
+    /// Partial index over the unpublished tombstones (Option D). The only other
+    /// `cayenne_inlined_delete` index is `(table_id, sequence_number)`, which a
+    /// `WHERE table_id = ? AND published = 0` predicate cannot seek — it has to
+    /// scan every tombstone for the table. This partial index covers exactly the
+    /// in-flight `published = 0` rows (a tiny set; finalize flips them to 1), so
+    /// `publish_orphan_inlined_deletes`' COUNT/UPDATE seek straight to them. Its
+    /// complement also accelerates the hot read path's
+    /// `WHERE table_id = ? AND published = 1` (`get_published_inlined_deletes`).
+    /// Turso/libSQL (`turso_core` 0.6.1) supports partial indexes: the index
+    /// translator binds the `WHERE` predicate and skips non-matching rows during
+    /// index population, matching `SQLite` partial-index semantics.
+    const INLINED_DELETE_UNPUBLISHED_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_unpublished ON cayenne_inlined_delete(table_id) WHERE published = 0";
 }
 
 /// Borrowed view of a `turso::Row` implementing `MetastoreRow`. Typed
@@ -515,7 +528,6 @@ impl MetastoreBackend for TursoMetastore {
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to create inlined_delete index: {e}"),
             })?;
-
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored
         // because the column may already exist (libSQL doesn't support IF NOT EXISTS for ALTER).
         let _ = conn
@@ -530,6 +542,37 @@ impl MetastoreBackend for TursoMetastore {
                 (),
             )
             .await;
+
+        // Per-tombstone activation flag for `cayenne_inlined_delete`. When the
+        // ALTER actually adds the column (Ok), every existing row took the
+        // default (0); backfill legacy rows to 1 because they were always active
+        // under the pre-flag semantics (leaving them 0 would resurrect the old
+        // inline copies they hide). On a fresh DB / later startups the column
+        // already exists, the ALTER errors, and the backfill is skipped so a
+        // legitimately in-flight `published = 0` tombstone is never re-activated.
+        if conn
+            .execute(
+                "ALTER TABLE cayenne_inlined_delete ADD COLUMN published INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .await
+            .is_ok()
+        {
+            conn.execute("UPDATE cayenne_inlined_delete SET published = 1", ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to backfill inlined-delete published flag: {e}"),
+                })?;
+        }
+
+        // Must run AFTER the `published` column migration above: the partial index
+        // predicate (`WHERE published = 0`) references the column, so creating it
+        // first on a pre-flag metastore would fail and abort `init_schema`.
+        conn.execute(Self::INLINED_DELETE_UNPUBLISHED_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to create inlined_delete unpublished index: {e}"),
+            })?;
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.

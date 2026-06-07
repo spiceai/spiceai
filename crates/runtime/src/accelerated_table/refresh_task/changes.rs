@@ -188,8 +188,12 @@ pub struct CdcConfig {
     /// exceed this on its own; otherwise the next envelope is carried into the
     /// next burst before we allocate a concatenated batch.
     pub max_coalesced_bytes: usize,
-    /// Maximum CDC coalesce age in milliseconds. A value of 0 leaves
-    /// accelerator-specific age defaults unchanged.
+    /// CDC apply-loop linger window in milliseconds. When `> 0`, the drain
+    /// keeps accumulating envelopes into a single coalesced write until
+    /// `max_coalesced_envelopes` / `max_coalesced_bytes` is reached, or this
+    /// window elapses — whichever comes first. The window is measured from the
+    /// START of the previous apply, so time spent applying the previous burst
+    /// counts toward the budget.
     pub max_coalesce_age_ms: u64,
     /// Maximum time to wait for the previous source-side commit before
     /// surfacing ingestion as stalled.
@@ -197,9 +201,17 @@ pub struct CdcConfig {
 }
 
 const CDC_PREFETCH_BUFFER_DEFAULT: usize = 128;
-const CDC_PREFETCH_BUFFER_MAX: usize = 1024;
+// Prefetch depth is the REAL coalescing ceiling: the burst drain is a non-blocking
+// `try_recv` loop (no await), so a batch can only grow as large as what is already
+// buffered in this channel. With the old 1024 max the 4096 envelope cap never bound.
+// Raised 1024 -> 16384 so high-throughput tables form larger bursts, amortizing the
+// fixed per-batch publish cost (one EBS directory `sync_all()` per batch per table)
+// over more rows. `max_coalesced_bytes` (128 MiB default) still bounds peak burst memory,
+// and the drain never waits, so low-load latency is unchanged (burst.len()==1).
+const CDC_PREFETCH_BUFFER_MAX: usize = 16384;
 const CDC_MAX_COALESCED_ENVELOPES_DEFAULT: usize = 256;
-const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 4096;
+// Raised 4096 -> 16384 to match the prefetch ceiling (otherwise it would re-clip the burst).
+const CDC_MAX_COALESCED_ENVELOPES_MAX: usize = 16384;
 const CDC_MAX_COALESCED_BYTES_DEFAULT: usize = 128 * 1024 * 1024;
 const CDC_MAX_COALESCED_BYTES_MAX: usize = 1024 * 1024 * 1024;
 const CDC_MAX_COALESCE_AGE_MS_DEFAULT: u64 = 0;
@@ -446,13 +458,33 @@ impl RefreshTask {
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
+        self.start_changes_stream_with_config(
+            cdc_config(),
+            refresh,
+            changes_stream,
+            caching,
+            ready_sender,
+            initial_load_completed,
+        )
+        .await
+    }
+
+    /// Inner driver for [`Self::start_changes_stream`] with an explicit
+    /// [`CdcConfig`]. Split out to simplify testing.
+    async fn start_changes_stream_with_config(
+        &self,
+        cdc_cfg: CdcConfig,
+        refresh: Arc<RwLock<Refresh>>,
+        changes_stream: ChangesStream,
+        caching: Option<Weak<Caching>>,
+        ready_sender: Option<Arc<Notify>>,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.display_sql();
 
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
-
-        let cdc_cfg = cdc_config();
 
         // Pipeline source-stream reads with apply+commit by running the source
         // in its own task on the refresh runtime and feeding a bounded channel.
@@ -511,6 +543,7 @@ impl RefreshTask {
         let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
         let mut pending_finalize: Option<PendingApplyFinalize> = None;
         let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
+        let mut last_cycle_start = Instant::now();
         let write_ctx = SessionContext::new();
         let write_session_state = write_ctx.state();
         let recv_wait_labels = [KeyValue::new("dataset", dataset_name.to_string())];
@@ -531,20 +564,29 @@ impl RefreshTask {
             let Some(first) = next_item else {
                 break;
             };
-            // Drain whatever is already buffered in the prefetch channel
-            // (no `await` between try_recv calls). Under low load the buffer
-            // is empty after the initial recv and `burst.len() == 1` — that
-            // path matches the pre-pipelining serial cost exactly. Under
-            // high load (PG WAL bulk insert, Debezium catch-up, Kafka
-            // backlog) we collect a contiguous run and apply it in one shot,
-            // amortizing the per-envelope `SessionContext` + `insert_into`
-            // planning cost over the whole burst.
+            // Coalesce a contiguous run of buffered envelopes into one
+            // accelerator write, in two phases.
+            //
+            // Phase 1 (always): a non-blocking `try_recv` loop with no `await`,
+            // draining whatever is already buffered. With `max_coalesce_age_ms
+            // == 0` (default) this is the entire drain, so low load applies a
+            // single envelope immediately
+            //
+            // Phase 2 (linger, only when `max_coalesce_age_ms > 0`): keep
+            // awaiting more envelopes until the envelope cap, the byte budget, or
+            // a deadline anchored at the START of the previous apply
+            // (`last_cycle_start`) is reached.
             let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
                 Vec::with_capacity(8);
             let mut burst_bytes = cdc_item_memory_size(&first);
             burst.push(first);
             let max_burst = cdc_cfg.max_coalesced_envelopes;
             let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
+            // Set when the source-reader channel closes mid-linger: apply the
+            // buffered burst, then exit the outer loop (the `rx.recv()` at the
+            // top would otherwise observe the same end-of-stream next iteration).
+            let mut channel_closed = false;
+
             while burst.len() < max_burst {
                 match rx.try_recv() {
                     Ok(item) => {
@@ -563,6 +605,52 @@ impl RefreshTask {
                 }
             }
 
+            // Don't linger when the burst is already at/over the byte budget:
+            if cdc_cfg.max_coalesce_age_ms > 0
+                && carried_item.is_none()
+                && burst.len() < max_burst
+                && burst_bytes < max_burst_bytes
+            {
+                let deadline =
+                    last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
+                while burst.len() < max_burst && burst_bytes < max_burst_bytes {
+                    // Flush immediately on shutdown rather than waiting out the
+                    // window — teardown must not block on intentional linger.
+                    if self.runtime_status.is_shutdown() {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Some(item)) => {
+                            let item_bytes = cdc_item_memory_size(&item);
+                            if burst_bytes > 0
+                                && item_bytes > 0
+                                && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
+                            {
+                                carried_item = Some(item);
+                                break;
+                            }
+                            burst_bytes = burst_bytes.saturating_add(item_bytes);
+                            burst.push(item);
+                        }
+                        Ok(None) => {
+                            channel_closed = true;
+                            break;
+                        }
+                        Err(_elapsed) => break,
+                    }
+                }
+            }
+
+            // Mark the start of this burst's processing cycle: the next burst's
+            // linger deadline is measured from here, so the apply below counts as
+            // accumulation age.
+            last_cycle_start = Instant::now();
+
             let mut apply_context = ApplyContext {
                 refresh_sql: sql.as_deref(),
                 dataset_name: &dataset_name,
@@ -578,6 +666,9 @@ impl RefreshTask {
             if !self.apply_burst(&mut apply_context, burst).await {
                 rx.close();
                 reader_handle.abort();
+                break;
+            }
+            if channel_closed {
                 break;
             }
         }
@@ -2082,6 +2173,82 @@ mod tests {
         assert_eq!(config.max_coalesce_age_ms, 90_000);
     }
 
+    /// Change D: the coalescing/prefetch ceilings were raised 4096/1024 -> 16384.
+    /// A burst configuration LARGER than the old 4096 cap (e.g. 8000-16384) must
+    /// now be accepted verbatim by `cdc_config_from_params` — proving the cap is
+    /// 16384, not the old 4096 (which would re-clip the burst) and not the 256
+    /// default (a silent fallback). Both `cdc_max_coalesced_envelopes` and the
+    /// prefetch buffer (the REAL coalescing ceiling, since the drain `try_recv`s
+    /// only what is already buffered) must accept the raised values.
+    #[test]
+    fn cdc_config_from_params_accepts_burst_above_old_4096_cap() {
+        // Sanity: the consts were actually raised to 16384.
+        assert_eq!(
+            CDC_MAX_COALESCED_ENVELOPES_MAX, 16_384,
+            "max coalesced envelopes ceiling must be raised to 16384"
+        );
+        assert_eq!(
+            CDC_PREFETCH_BUFFER_MAX, 16_384,
+            "prefetch-buffer ceiling must be raised to 16384"
+        );
+
+        for n in [8_000_usize, 12_000, 16_000, 16_384] {
+            let config = cdc_config_from_params(&std::collections::HashMap::from([
+                ("cdc_max_coalesced_envelopes".to_string(), n.to_string()),
+                ("cdc_prefetch_buffer".to_string(), n.to_string()),
+            ]));
+
+            assert_eq!(
+                config.max_coalesced_envelopes, n,
+                "cdc_max_coalesced_envelopes={n} (above the old 4096 cap, within the new 16384 ceiling) must be accepted verbatim, not clipped"
+            );
+            assert!(
+                config.max_coalesced_envelopes > 4_096,
+                "the configured burst {n} must NOT be silently clipped back to the old 4096 cap"
+            );
+            assert_ne!(
+                config.max_coalesced_envelopes, CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+                "an in-range burst {n} must NOT silently fall back to the 256 default"
+            );
+
+            assert_eq!(
+                config.prefetch_buffer, n,
+                "cdc_prefetch_buffer={n} (within the new 16384 ceiling) must be accepted verbatim"
+            );
+            assert!(
+                config.prefetch_buffer > 1_024,
+                "the configured prefetch {n} must NOT be silently clipped back to the old 1024 cap"
+            );
+        }
+    }
+
+    /// A burst configuration ABOVE the new 16384 ceiling is out of range and must
+    /// fall back to the default (256) — it must NOT be silently clamped to the new
+    /// max, nor to the old 4096 cap. (Guarded so a `SPICE_CDC_*` env override in
+    /// the test environment, which `resolve_cdc_param` consults on fallback,
+    /// doesn't make this flaky.)
+    #[test]
+    fn cdc_config_from_params_rejects_burst_above_new_16384_ceiling() {
+        let env_overridden = std::env::var("SPICE_CDC_MAX_COALESCED_ENVELOPES").is_ok();
+        if env_overridden {
+            return;
+        }
+        let over = CDC_MAX_COALESCED_ENVELOPES_MAX + 1;
+        let config = cdc_config_from_params(&std::collections::HashMap::from([(
+            "cdc_max_coalesced_envelopes".to_string(),
+            over.to_string(),
+        )]));
+
+        assert_eq!(
+            config.max_coalesced_envelopes, CDC_MAX_COALESCED_ENVELOPES_DEFAULT,
+            "an out-of-range burst {over} must fall back to the default, not be clamped"
+        );
+        assert_ne!(
+            config.max_coalesced_envelopes, 4_096,
+            "out-of-range fallback must not resurrect the old 4096 cap"
+        );
+    }
+
     #[test]
     fn bounded_warning_keys_eviction_allows_rewarning_old_keys() {
         let mut warning_keys = BoundedWarningKeys::default();
@@ -2616,10 +2783,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_reuses_cached_insert_plan_for_upserts() {
-        let insert_calls = Arc::new(AtomicUsize::new(0));
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(CountingInsertProvider {
             inner: make_mem_table() as Arc<dyn TableProvider>,
-            insert_calls: Arc::clone(&insert_calls),
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
         });
         let task = make_refresh_task(provider as Arc<dyn TableProvider>);
         let ctx = SessionContext::new();
@@ -2646,9 +2815,14 @@ mod tests {
         );
 
         assert_eq!(
-            insert_calls.load(AtomicOrdering::SeqCst),
+            insert_plan_calls.load(AtomicOrdering::SeqCst),
             1,
             "CDC upserts should reuse the cached insert_into plan"
+        );
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "the cached plan should still be executed once per write"
         );
     }
 
@@ -2979,10 +3153,14 @@ mod tests {
     };
     use datafusion::catalog::Session;
     use datafusion::error::Result as DataFusionResult;
+    use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
-    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    };
     use datafusion::prelude::Expr;
     use futures::stream::{self as fstream};
+    use std::any::Any;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
@@ -3070,6 +3248,212 @@ mod tests {
         fstream::iter(items).boxed()
     }
 
+    /// Builds a `ChangesStream` that yields each item only after `delay`, so
+    /// item N arrives at roughly `N * delay`.
+    fn make_delayed_changes_stream(
+        items: Vec<Result<ChangeEnvelope, CdcStreamError>>,
+        delay: Duration,
+    ) -> ChangesStream {
+        fstream::iter(items)
+            .then(move |item| async move {
+                tokio::time::sleep(delay).await;
+                item
+            })
+            .boxed()
+    }
+
+    /// A baseline `CdcConfig` for tests with caps high enough that only the
+    /// `max_coalesce_age_ms` field under test governs flushing.
+    fn test_cdc_config(max_coalesce_age_ms: u64) -> CdcConfig {
+        CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            max_coalesced_bytes: 128 * 1024 * 1024,
+            max_coalesce_age_ms,
+            commit_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Run a changes stream with an explicit `CdcConfig`, bypassing the process-global `cdc_config()`
+    async fn run_changes_stream_with_config(
+        task: &RefreshTask,
+        cfg: CdcConfig,
+        stream: ChangesStream,
+    ) -> crate::accelerated_table::Result<()> {
+        let refresh = Arc::new(RwLock::new(
+            crate::accelerated_table::refresh::Refresh::default(),
+        ));
+        task.start_changes_stream_with_config(
+            cfg,
+            refresh,
+            stream,
+            None,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// With a large `max_coalesce_age_ms`, the apply loop lingers and coalesces
+    /// several slowly-arriving envelopes into a single accelerator write rather
+    /// than one write per envelope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_linger_coalesces_delayed_items_into_one_write() {
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        // 4 envelopes ~100ms apart (~400ms total) — far inside the 5s window.
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
+
+        run_changes_stream_with_config(&task, test_cdc_config(5_000), stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // One plan execution == one accelerator write. The linger window must
+        // fold all four delayed envelopes into a single write. (`insert_plan_calls`
+        // would be 1 regardless, since the insert plan is built once and cached
+        // — see `CountingInsertProvider`.)
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "a large linger window must coalesce all delayed envelopes into one write"
+        );
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2, 3, 4],
+            "all envelopes must still commit in arrival order"
+        );
+    }
+
+    /// With `max_coalesce_age_ms = 0` (default), the apply loop does NOT wait:
+    /// each slowly-arriving envelope is applied on its own, so the writes are
+    /// NOT all coalesced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_linger_applies_delayed_items_separately() {
+        let insert_plan_calls = Arc::new(AtomicUsize::new(0));
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::clone(&insert_plan_calls),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| Ok(make_tracked_envelope(id, Arc::clone(&log), false)))
+            .collect();
+        let stream = make_delayed_changes_stream(items, Duration::from_millis(100));
+
+        run_changes_stream_with_config(&task, test_cdc_config(0), stream)
+            .await
+            .expect("changes stream should succeed");
+
+        // Each delayed envelope arrives after the previous one has been applied,
+        // so without a linger window each is written on its own — one plan
+        // execution per envelope. `insert_plan_calls` can't see this: the insert
+        // plan is built once and cached (see `CountingInsertProvider`).
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            4,
+            "without a linger window, each delayed envelope must be written on its own"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
+    }
+
+    /// When the buffered burst already meets/exceeds the byte budget, the linger
+    /// phase must NOT wait: no further envelope could be admitted (any would trip
+    /// the byte cap and be carried), so waiting only delays an already-full
+    /// write. Here the first envelope alone exceeds a 1-byte budget, the linger
+    /// window is huge (60s), and the source then parks open — so a buggy linger
+    /// would block the write for the full 60s. The write must instead land
+    /// promptly, well inside the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_over_byte_budget_burst_does_not_linger() {
+        // Stream yields one envelope, then parks forever (keeps the channel open
+        // so a buggy linger blocks on `rx.recv()` rather than seeing EOF).
+        struct YieldOnceThenParkStream {
+            yielded: bool,
+            log: Arc<CommitLog>,
+        }
+        impl futures::Stream for YieldOnceThenParkStream {
+            type Item = Result<ChangeEnvelope, CdcStreamError>;
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                if self.yielded {
+                    Poll::Pending
+                } else {
+                    self.yielded = true;
+                    Poll::Ready(Some(Ok(make_tracked_envelope(
+                        1,
+                        Arc::clone(&self.log),
+                        false,
+                    ))))
+                }
+            }
+        }
+
+        let insert_execution_calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingInsertProvider {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            insert_plan_calls: Arc::new(AtomicUsize::new(0)),
+            insert_execution_calls: Arc::clone(&insert_execution_calls),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        // 1-byte budget so a single real envelope is already over budget, paired
+        // with a 60s linger window the fix must refuse to wait out.
+        let cfg = CdcConfig {
+            prefetch_buffer: 128,
+            max_coalesced_envelopes: 256,
+            max_coalesced_bytes: 1,
+            max_coalesce_age_ms: 60_000,
+            commit_timeout: Duration::from_secs(30),
+        };
+
+        let stream: ChangesStream = YieldOnceThenParkStream {
+            yielded: false,
+            log: Arc::clone(&log),
+        }
+        .boxed();
+
+        let join =
+            tokio::spawn(async move { run_changes_stream_with_config(&task, cfg, stream).await });
+
+        // The write must land far inside the 60s linger window. A 5s deadline is
+        // generous for the immediate write yet nowhere near the buggy 60s wait.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while insert_execution_calls.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "over-budget burst was held by the linger window instead of writing immediately",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            insert_execution_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the over-budget envelope must be written exactly once, on its own"
+        );
+        assert_eq!(log.ids().await, vec![1]);
+
+        // Source parks forever; tear the apply task down.
+        join.abort();
+    }
+
     /// Counts every poll on the inner stream, and lets us pull on demand via
     /// an inner channel. This makes pipeline overlap directly observable.
     async fn run_changes_stream(
@@ -3115,7 +3499,8 @@ mod tests {
     #[derive(Debug)]
     struct CountingInsertProvider {
         inner: Arc<dyn TableProvider>,
-        insert_calls: Arc<AtomicUsize>,
+        insert_plan_calls: Arc<AtomicUsize>,
+        insert_execution_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -3148,8 +3533,68 @@ mod tests {
             input: Arc<dyn ExecutionPlan>,
             insert_op: InsertOp,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            self.insert_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            self.inner.insert_into(state, input, insert_op).await
+            self.insert_plan_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let inner_plan = self.inner.insert_into(state, input, insert_op).await?;
+            Ok(Arc::new(CountingExec {
+                inner: inner_plan,
+                insert_execution_calls: Arc::clone(&self.insert_execution_calls),
+            }))
+        }
+    }
+
+    /// Delegating [`ExecutionPlan`] that bumps a counter every time it is
+    /// executed. Wrapping the plan returned by `insert_into` lets a test count
+    /// accelerator writes
+    #[derive(Debug)]
+    struct CountingExec {
+        inner: Arc<dyn ExecutionPlan>,
+        insert_execution_calls: Arc<AtomicUsize>,
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "CountingExec")
+        }
+    }
+
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn properties(&self) -> &PlanProperties {
+            self.inner.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let inner = children
+                .into_iter()
+                .next()
+                .expect("CountingExec expects exactly one child ExecutionPlan");
+            Ok(Arc::new(CountingExec {
+                inner,
+                insert_execution_calls: Arc::clone(&self.insert_execution_calls),
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> DataFusionResult<SendableRecordBatchStream> {
+            self.insert_execution_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.execute(partition, context)
         }
     }
 

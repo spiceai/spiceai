@@ -15,24 +15,16 @@ limitations under the License.
 */
 use crate::{
     Runtime,
-    datafusion::{
-        SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA,
-        request_context_extension::get_current_datafusion,
-    },
+    datafusion::request_context_extension::get_current_datafusion,
     http::v1::{ResponseMetadata, ResponseMimeType, to_http_response},
-    model::LLMChatCompletionsModelStore,
-    tools::{
-        builtin::{
-            sample::{
-                SampleTableMethod, SampleTableParams, distinct::DistinctColumnsParams,
-                random::RandomSampleParams, tool::SampleDataTool,
-            },
-            table_schema::{TableSchemaTool, TableSchemaToolParams},
+    model::{
+        LLMChatCompletionsModelStore,
+        nsql::{
+            DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT, MAX_NSQL_CONTEXT_SAMPLE_LIMIT, NsqlContextError,
+            NsqlContextJsonResponse, NsqlContextOptions, build_nsql_context,
         },
-        utils::create_tool_use_messages,
     },
 };
-use async_openai::types::chat::ChatCompletionRequestMessage;
 use axum::{
     Extension, Json,
     http::StatusCode,
@@ -41,22 +33,19 @@ use axum::{
         sse::{Event, KeepAlive},
     },
 };
-use axum_extra::TypedHeader;
-use datafusion::sql::TableReference;
+use axum_extra::{TypedHeader, extract::Query};
 use futures::{StreamExt, TryStreamExt};
 use headers_accept::Accept;
-use http::HeaderMap;
-use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use arrow::array::RecordBatch;
-use itertools::Itertools;
 use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
 use serde::{Deserialize, Serialize};
 use spicepod::component::model::ModelType;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::accept_header_types;
@@ -65,12 +54,20 @@ use crate::datafusion::query::QueryBuilder;
 // Default number of retries for NSQL queries if the generated query fails to execute
 const DEFAULT_NSQL_RETRIES: u8 = 10;
 
-// Maximum number of concurrent sampling tools executions for NSQL
-const DATA_SAMPLING_MAX_CONCURRENT: usize = 10;
-
 // NSQL streaming keep alive interval in seconds
 const NSQL_STREAM_KEEP_ALIVE: u64 = 30;
 
+static NSQL_CONTEXT_RESPONSE_MEDIA_TYPES: [MediaType<'static>; 3] = [
+    MediaType::new(names::TEXT, names::MARKDOWN),
+    MediaType::new(names::TEXT, names::PLAIN),
+    MediaType::new(names::APPLICATION, names::JSON),
+];
+
+enum NsqlContextResponseFormat {
+    Markdown,
+    PlainText,
+    Json,
+}
 fn clean_model_based_sql(input: &str) -> String {
     let no_dashes = match input.strip_prefix("--") {
         Some(rest) => rest.to_string(),
@@ -82,59 +79,37 @@ fn clean_model_based_sql(input: &str) -> String {
     one_query.trim().to_string()
 }
 
-/// Create subsequent Assistant and Tool messages simulating a model requesting to use the `sample_data` tool, then receiving the result for the following sampling methods:
-///  - Distinct columns
-///  - Random sample
-///
-/// Convert the [`SampleTableParams`] into how an LLM would ask to use it (via a [`ChatCompletionRequestAssistantMessage`]).
-/// Convert the result of a [`SampleDataTool`] call how we would return it to the LLM, (via a [`ChatCompletionRequestToolMessage`]).
-async fn sample_messages(
-    sample_from: &[TableReference],
-    rt: Arc<Runtime>,
-    table_allowlist: Option<ResolvedTableAwareAllowlist>,
-) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let message_futures = sample_from.iter().flat_map(|dataset| {
-        [
-            SampleTableParams::DistinctColumns(DistinctColumnsParams {
-                tbl: dataset.to_string(),
-                limit: 3,
-                cols: None,
-            }),
-            SampleTableParams::RandomSample(RandomSampleParams {
-                tbl: dataset.to_string(),
-                limit: 3,
-            }),
-        ]
-        .into_iter()
-        .map(|params| {
-            let rt = Arc::clone(&rt);
-            let allowlist = table_allowlist.clone();
-            async move {
-                let method = SampleTableMethod::from(&params);
-                create_tool_use_messages(
-                    &SampleDataTool::new(rt.datafusion(), method.clone())
-                        .with_table_allowlist(allowlist),
-                    format!("sample-{method:?}").as_str(),
-                    &params,
-                )
-                .instrument(Span::current())
-                .await
-            }
-        })
-    });
+fn default_nsql_context_sample_limit() -> usize {
+    DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT
+}
 
-    let tool_call_messages = futures::stream::iter(message_futures)
-        .boxed()
-        .buffer_unordered(DATA_SAMPLING_MAX_CONCURRENT)
-        .try_collect::<Vec<_>>()
-        .await?;
+fn validate_context_limit(
+    name: &str,
+    enabled: bool,
+    limit: usize,
+) -> Result<(), (StatusCode, String)> {
+    if enabled && limit == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Query parameter '{name}' must be greater than 0 when enabled"),
+        ));
+    }
 
-    Ok(tool_call_messages.into_iter().flatten().collect())
+    if limit > MAX_NSQL_CONTEXT_SAMPLE_LIMIT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Query parameter '{name}' must be less than or equal to {MAX_NSQL_CONTEXT_SAMPLE_LIMIT}"
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub struct Request {
     /// The natural language query to be converted into SQL
     pub query: String,
@@ -148,7 +123,7 @@ pub struct Request {
     pub stream: bool,
 
     /// Whether sample data is included in the context for SQL generation. Default: false
-    #[serde(default = "default_sample_data_enabled")]
+    #[serde(default = "default_sample_data_enabled", alias = "sampledataenabled")]
     pub sample_data_enabled: bool,
 
     /// Names of datasets to sample from when constructing model context; this is a sampling hint and does not restrict which tables queries can target. If omitted, all datasets are used.
@@ -156,8 +131,61 @@ pub struct Request {
     pub datasets: Option<Vec<String>>,
 
     /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "promptcachekey")]
     pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
+#[cfg_attr(feature = "openapi", into_params(parameter_in = Query))]
+#[serde(rename_all = "snake_case")]
+pub struct ContextRequest {
+    /// The name of the model whose dataset allowlist should be used. If omitted, Spice defaults to the only compatible LLM model configured in the Spicepod.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Whether distinct-value samples are included in the context block. Also accepts `sample_data_enabled` for compatibility with `/v1/nsql` request bodies. Default: false.
+    #[serde(default, alias = "sample_data_enabled")]
+    pub include_sampling: bool,
+
+    /// Maximum number of rows per distinct-value sample. Default: 3, maximum: 100.
+    #[serde(default = "default_nsql_context_sample_limit")]
+    pub sampling_limit: usize,
+
+    /// Whether example rows are included in the context block. Defaults to `include_sampling` when omitted, matching `/v1/nsql` `sample_data_enabled` behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_examples: Option<bool>,
+
+    /// Maximum number of example rows per dataset. Default: 3, maximum: 100.
+    #[serde(default = "default_nsql_context_sample_limit")]
+    pub examples_limit: usize,
+
+    /// Names of datasets to include in the context block. If omitted, all datasets visible to the selected model are included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<String>,
+}
+
+impl ContextRequest {
+    fn context_options(&self) -> Result<NsqlContextOptions, (StatusCode, String)> {
+        let include_examples = self.include_examples.unwrap_or(self.include_sampling);
+        validate_context_limit("sampling_limit", self.include_sampling, self.sampling_limit)?;
+        validate_context_limit("examples_limit", include_examples, self.examples_limit)?;
+
+        Ok(NsqlContextOptions::new(
+            self.include_sampling,
+            self.sampling_limit,
+            include_examples,
+            self.examples_limit,
+        ))
+    }
+
+    fn datasets(&self) -> Option<Vec<String>> {
+        if self.datasets.is_empty() {
+            None
+        } else {
+            Some(self.datasets.clone())
+        }
+    }
 }
 
 fn default_sample_data_enabled() -> bool {
@@ -167,6 +195,220 @@ fn default_sample_data_enabled() -> bool {
 /// Checks if the request is asking to only generate SQL.
 fn return_sql_only(accept: Option<&TypedHeader<Accept>>) -> bool {
     accept.is_some_and(|a| accept_header_types(a).contains(&"application/sql".to_string()))
+}
+
+fn context_response_format(
+    accept: Option<&TypedHeader<Accept>>,
+) -> Option<NsqlContextResponseFormat> {
+    let content_type = accept.map_or(Some(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES[0]), |header| {
+        header.0.negotiate(&NSQL_CONTEXT_RESPONSE_MEDIA_TYPES)
+    })?;
+
+    if content_type.subty == names::PLAIN {
+        Some(NsqlContextResponseFormat::PlainText)
+    } else if content_type.subty == names::JSON {
+        Some(NsqlContextResponseFormat::Json)
+    } else {
+        Some(NsqlContextResponseFormat::Markdown)
+    }
+}
+
+fn nsql_context_response(
+    context: NsqlContextJsonResponse,
+    accept: Option<&TypedHeader<Accept>>,
+) -> Response {
+    let Some(response_format) = context_response_format(accept) else {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "Supported response content types are text/markdown, text/plain, and application/json",
+        )
+            .into_response();
+    };
+
+    match response_format {
+        NsqlContextResponseFormat::Json => Json(context).into_response(),
+        NsqlContextResponseFormat::Markdown => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            );
+            (StatusCode::OK, headers, context.context).into_response()
+        }
+        NsqlContextResponseFormat::PlainText => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            (StatusCode::OK, headers, context.context).into_response()
+        }
+    }
+}
+
+fn nsql_context_error_response(error: &NsqlContextError) -> (StatusCode, String) {
+    let status = match error {
+        NsqlContextError::DatasetNotFound { .. } => StatusCode::BAD_REQUEST,
+        NsqlContextError::AppNotPrepared
+        | NsqlContextError::InvalidModelDatasets { .. }
+        | NsqlContextError::ContextMessage { .. }
+        | NsqlContextError::SchemaContext { .. }
+        | NsqlContextError::FunctionContext { .. }
+        | NsqlContextError::SampleContext { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (status, error.to_string())
+}
+
+/// Text-to-SQL Context (NSQL)
+///
+/// Return the same context block that `/v1/nsql` injects into the configured NSQL model.
+///
+/// The response is a markdown/plain-text block or JSON object containing the in-scope datasets, schemas,
+/// Spice-specific SQL functions, registered user-defined functions, relevant JSON/Spark compatibility functions,
+/// and optional sample data.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/nsql/context",
+    operation_id = "get_nsql_context",
+    tag = "SQL",
+    params(
+        ("Accept" = String, Header, description = "The format of the response, one of 'text/markdown' (default), 'text/plain', or 'application/json'."),
+        ContextRequest
+    ),
+    responses(
+        (status = 200, description = "NSQL context block", content((
+            String = "text/markdown",
+            example = "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`\n\n## Schemas\n| table | column | type | nullable |\n| --- | --- | --- | --- |\n| sales_data | customer_id | Utf8 | false |\n\n## SQL Functions\nUse Spice.ai/DataFusion SQL."
+        ), (
+            String = "text/plain",
+            example = "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
+        ), (
+            NsqlContextJsonResponse = "application/json",
+            example = json!({
+                "context": "# Spice.ai NSQL Context\n- Write SQL for the Spice runtime...",
+                "instructions": ["Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect."],
+                "sql": {
+                    "engine": "Apache DataFusion",
+                    "version": "52.5.0",
+                    "dialect": "PostgreSQL",
+                    "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
+                    "notes": ["Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context."]
+                },
+                "datasets": [{
+                    "name": "sales.orders",
+                    "schema": "sales",
+                    "table": "orders",
+                    "description": "Customer orders",
+                    "metadata": {"description": "Customer orders"},
+                    "columns": [{
+                        "name": "customer_id",
+                        "data_type": "Utf8",
+                        "nullable": false,
+                        "description": "Customer account identifier",
+                        "metadata": {"description": "Customer account identifier"},
+                        "primary_key": false,
+                        "unique": false,
+                        "indexed": true,
+                        "vector_search": true,
+                        "full_text_search": true
+                    }],
+                    "primary_key": ["order_id"],
+                    "unique_constraints": [],
+                    "foreign_keys": [{
+                        "columns": ["customer_id"],
+                        "foreign_table": "spice.sales.customers",
+                        "foreign_columns": ["id"]
+                    }],
+                    "indexes": [{
+                        "name": "customer_id",
+                        "columns": ["customer_id"],
+                        "kind": "enabled",
+                        "source": "spicepod.acceleration.indexes"
+                    }],
+                    "search": {
+                        "vector": [{
+                            "column": "customer_id",
+                            "function": "vector_search",
+                            "syntax": "vector_search(sales.orders, 'query text', customer_id)",
+                            "model": "embed_model",
+                            "engine": "duckdb_vector_index",
+                            "row_id_columns": ["order_id"],
+                            "vector_size": 384,
+                            "chunked": false,
+                            "index": {"name": "duckdb_vector_index", "columns": ["customer_id", "order_id"], "kind": "duckdb_vector_index", "source": "runtime_index"},
+                            "required_columns": ["customer_id", "order_id"],
+                            "notes": []
+                        }],
+                        "full_text": [{
+                            "column": "customer_id",
+                            "function": "text_search",
+                            "syntax": "text_search(sales.orders, 'query text', customer_id)",
+                            "engine": "tantivy",
+                            "index_store": "memory",
+                            "row_id_columns": ["order_id"],
+                            "index": {"name": "full_text", "columns": ["customer_id", "order_id"], "kind": "full_text", "source": "runtime_index"},
+                            "required_columns": ["customer_id", "order_id"],
+                            "notes": []
+                        }]
+                    }
+                }],
+                "functions": {
+                    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
+                    "json": [],
+                    "search": [],
+                    "additional": [],
+                    "spark_compatibility": {"description": "Spark-compatible scalar functions are available.", "functions": []},
+                    "user_defined": []
+                },
+                "samples": []
+            })
+        ))),
+        (status = 400, description = "Invalid request parameters", content((
+            String = "text/plain", example = "Dataset 'sales.orders' not found"
+        ))),
+        (status = 406, description = "Requested response content type is not available", content((
+            String = "text/plain", example = "Supported response content types are text/markdown, text/plain, and application/json"
+        ))),
+        (status = 500, description = "Internal server error", content((
+            String, example = "Unexpected internal error. App not prepared in runtime."
+        )))
+    )
+))]
+pub(crate) async fn get_context(
+    Extension(rt): Extension<Arc<Runtime>>,
+    accept: Option<TypedHeader<Accept>>,
+    Query(params): Query<ContextRequest>,
+) -> Response {
+    let request_context = RequestContext::current(AsyncMarker::new().await);
+
+    let context_options = match params.context_options() {
+        Ok(options) => options,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    let model = match resolve_nsql_model_name(params.model.clone(), &rt).await {
+        Ok(model) => model,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
+    let context = match build_nsql_context(
+        rt,
+        &request_context,
+        &model,
+        context_options,
+        params.datasets(),
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            let (status, message) = nsql_context_error_response(&error);
+            return (status, message).into_response();
+        }
+    };
+
+    nsql_context_response(context.json, accept.as_ref())
 }
 
 /// Text-to-SQL (NSQL)
@@ -331,27 +573,6 @@ pub(crate) async fn handle_nsql_query(
         Err((status, message)) => return (status, headers, message),
     };
 
-    let table_allowlist_opt = match table_allowlist(&model, &rt).await {
-        Ok(ta) => ta,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e);
-        }
-    };
-
-    // Validate that requested datasets are within the model's allowlist
-    if let (Some(requested_datasets), Some(allowlist)) = (&datasets, &table_allowlist_opt) {
-        for ds in requested_datasets {
-            let table_ref = TableReference::parse_str(ds);
-            if !allowlist.table_is_allowed(&table_ref) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    headers,
-                    format!("Dataset '{ds}' not found"),
-                );
-            }
-        }
-    }
-
     crate::model::add_tools_used(&context, 1);
 
     let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
@@ -360,52 +581,23 @@ pub(crate) async fn handle_nsql_query(
         crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
     }
 
-    // Default to all available tables if specific table(s) are not provided.
-    let tables = datasets
-        .map(|ds| ds.iter().map(TableReference::from).collect_vec())
-        .unwrap_or(
-            df.get_user_table_names()
-                .into_iter()
-                .filter(|t| {
-                    table_allowlist_opt
-                        .as_ref()
-                        .is_none_or(|a| a.table_is_allowed(t))
-                })
-                .collect(),
-        );
-
-    // Create assistant/tool result messages for calling `table_schema` tool for all or provided tables.
-    let schema_messages = match create_tool_use_messages(
-        &TableSchemaTool::new(Arc::clone(&rt), None, None)
-            .with_table_allowlist(table_allowlist_opt.clone()),
-        "schemas-nsql",
-        &TableSchemaToolParams::new(tables.iter().map(ToString::to_string).collect::<Vec<_>>()),
+    let nsql_context = match build_nsql_context(
+        Arc::clone(&rt),
+        &context,
+        &model,
+        NsqlContextOptions::from_nsql_request(sample_data_enabled),
+        datasets,
     )
     .instrument(span.clone())
     .await
     {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!("Error getting schema messages: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+        Ok(context) => context,
+        Err(error) => {
+            let (status, message) = nsql_context_error_response(&error);
+            return (status, headers, message);
         }
     };
-
-    // Create sample data assistant/tool messages if user wants to sample from dataset(s).
-    let sample_data_messages = if sample_data_enabled {
-        match sample_messages(&tables, Arc::clone(&rt), table_allowlist_opt.clone())
-            .instrument(span.clone())
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("Error sampling datasets for NSQL messages: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
-            }
-        }
-    } else {
-        vec![]
-    };
+    let table_allowlist_opt = nsql_context.table_allowlist.clone();
 
     let nql_model = {
         let models = llms.read().await;
@@ -446,8 +638,7 @@ pub(crate) async fn handle_nsql_query(
             );
         };
 
-        req.messages.extend(schema_messages.clone());
-        req.messages.extend(sample_data_messages.clone());
+        req.messages.push(nsql_context.message.clone());
         if let Some(prompt_cache_key) = &prompt_cache_key {
             req.prompt_cache_key = Some(prompt_cache_key.clone());
         }
@@ -604,49 +795,37 @@ fn compatible_nsql_model_names(app: &app::App) -> Vec<String> {
         .collect()
 }
 
-/// Construct a [`ResolvedTableAwareAllowlist`] based on the `App`'s `model.datasets`.
-async fn table_allowlist(
-    model_name: &str,
-    rt: &Arc<Runtime>,
-) -> Result<Option<ResolvedTableAwareAllowlist>, String> {
-    let Some(app) = rt.read_app().await else {
-        return Err("Unexpected internal error. App not prepared in runtime.".to_string());
-    };
-
-    // Create table allowlist from the model's datasets configuration
-    let model_datasets = app
-        .models
-        .iter()
-        .find(|m| m.name == model_name)
-        .map(|m| m.datasets.clone())
-        .unwrap_or_default();
-
-    let table_allowlist = if model_datasets.is_empty() {
-        None
-    } else {
-        match ResolvedTableAwareAllowlist::with_defaults(
-            SPICE_DEFAULT_CATALOG,
-            SPICE_DEFAULT_SCHEMA,
-        )
-        .with_table_patterns(model_datasets)
-        {
-            Ok(allowlist) => Some(allowlist),
-            Err(_) => {
-                return Err(format!(
-                    "Unexpected internal error. Model '{model_name}' datasets are invalid."
-                ));
-            }
-        }
-    };
-    Ok(table_allowlist)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        datafusion::udf::UserFunctionInfo,
+        model::nsql::{
+            NsqlColumnContext, NsqlDatasetContext, NsqlDatasetSearchContext, NsqlForeignKeyContext,
+            NsqlFullTextSearchContext, NsqlIndexContext, NsqlVectorSearchContext,
+            SampleContextBlock, all_context_function_names_for_test,
+            nsql_function_context_for_test, render_nsql_context_block,
+            user_function_context_entries, write_user_function_context_entries,
+        },
+    };
     use app::AppBuilder;
+    use axum_extra::extract::Query as ExtraQuery;
+    use datafusion::sql::TableReference;
+    use http::Uri;
+    use http_body_util::BodyExt;
     use serde_json::json;
-    use spicepod::component::model::Model;
+    use spicepod::component::{
+        function::{
+            Function, FunctionArg, FunctionKind, FunctionReturns, Signature,
+            Volatility as FunctionVolatility,
+        },
+        model::Model,
+        runtime::{Functions, Runtime as SpicepodRuntime},
+    };
+    use std::{
+        collections::{BTreeMap, HashMap, HashSet},
+        str::FromStr,
+    };
 
     fn app_with_models(models: Vec<Model>) -> app::App {
         let mut builder = AppBuilder::new("test");
@@ -654,6 +833,85 @@ mod tests {
             builder = builder.with_model(model);
         }
         builder.build()
+    }
+
+    fn app_with_functions(functions_enabled: bool, functions: Vec<Function>) -> app::App {
+        let runtime = SpicepodRuntime {
+            functions: if functions_enabled {
+                Functions::enabled()
+            } else {
+                Functions::default()
+            },
+            ..Default::default()
+        };
+
+        let mut builder = AppBuilder::new("test").with_runtime(runtime);
+        for function in functions {
+            builder = builder.with_function(function);
+        }
+        builder.build()
+    }
+
+    fn test_function(name: &str, enabled: bool) -> Function {
+        Function {
+            name: name.to_string(),
+            from: "sql".to_string(),
+            enabled,
+            description: Some(format!("{name} description")),
+            kind: FunctionKind::Scalar,
+            volatility: FunctionVolatility::Stable,
+            signature: Signature {
+                tables: vec![],
+                args: vec![FunctionArg {
+                    name: "x".to_string(),
+                    arrow_type: "int64".to_string(),
+                }],
+                returns: Some(FunctionReturns::Scalar("int64".to_string())),
+            },
+            body: Some("x".to_string()),
+            body_ref: None,
+            metadata: HashMap::new(),
+            params: HashMap::new(),
+            depends_on: vec![],
+            metrics: None,
+            as_tool: false,
+        }
+    }
+
+    fn test_table_function(name: &str, enabled: bool) -> Function {
+        let mut function = test_function(name, enabled);
+        function.kind = FunctionKind::Table;
+        function.signature.returns = Some(FunctionReturns::Table(vec![FunctionArg {
+            name: "value".to_string(),
+            arrow_type: "int64".to_string(),
+        }]));
+        function
+    }
+
+    fn ticket_priority_function() -> Function {
+        let mut function = test_function("ticket_priority", true);
+        function.description =
+            Some("Converts support-ticket sentiment into a priority score.".to_string());
+        function.signature.args = vec![FunctionArg {
+            name: "sentiment".to_string(),
+            arrow_type: "utf8".to_string(),
+        }];
+        function.signature.returns = Some(FunctionReturns::Scalar("int64".to_string()));
+        function
+    }
+
+    fn test_user_function_info(name: &str) -> UserFunctionInfo {
+        UserFunctionInfo {
+            name: name.to_string(),
+            kind: "scalar".to_string(),
+            volatility: "volatile".to_string(),
+            from: "sql".to_string(),
+            description: None,
+        }
+    }
+
+    fn accept_header(value: &str) -> TypedHeader<Accept> {
+        TypedHeader(Accept::from_str(value).expect("accept header should parse"))
     }
 
     #[test]
@@ -665,6 +923,550 @@ mod tests {
 
         assert_eq!(request.model, None);
         assert!(!request.sample_data_enabled);
+    }
+
+    #[test]
+    fn request_accepts_legacy_lowercase_field_aliases() {
+        let request: Request = serde_json::from_value(json!({
+            "query": "show total sales",
+            "sampledataenabled": true,
+            "promptcachekey": "sales-dashboard"
+        }))
+        .expect("request should deserialize legacy lowercase aliases");
+
+        assert!(request.sample_data_enabled);
+        assert_eq!(request.prompt_cache_key.as_deref(), Some("sales-dashboard"));
+    }
+
+    #[test]
+    fn nsql_context_response_defaults_to_markdown() {
+        let response =
+            nsql_context_response(NsqlContextJsonResponse::minimal_for_test("context"), None);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "text/markdown; charset=utf-8"
+        );
+    }
+
+    #[tokio::test]
+    async fn nsql_context_response_negotiates_plain_text() {
+        let accept = accept_header("text/plain");
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test(nsql_context_block_with_samples_for_test()),
+            Some(&accept),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "text/plain; charset=utf-8"
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("response body should be UTF-8");
+
+        assert!(body.contains("## Datasets"));
+        assert!(body.contains("`sales.orders`: Customer orders"));
+        assert!(body.contains("## SQL Functions"));
+        assert!(body.contains("## Sample Data"));
+
+        insta::assert_snapshot!("nsql_context_plain_text_response", body);
+    }
+
+    #[tokio::test]
+    async fn nsql_context_response_negotiates_json() {
+        let accept = accept_header("application/json");
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test("context"),
+            Some(&accept),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .expect("content type should be set")
+                .to_str()
+                .expect("content type should be valid ASCII"),
+            "application/json"
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be JSON");
+
+        assert_eq!(body["context"], json!("context"));
+        assert_eq!(body["sql"]["engine"], json!("Apache DataFusion"));
+        assert_eq!(body["sql"]["dialect"], json!("PostgreSQL"));
+        assert!(
+            body["datasets"]
+                .as_array()
+                .expect("datasets should be an array")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nsql_context_response_rejects_unsupported_accept() {
+        let accept = accept_header("application/xml");
+        let response = nsql_context_response(
+            NsqlContextJsonResponse::minimal_for_test("context"),
+            Some(&accept),
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[test]
+    fn context_request_defaults_to_no_sampling_or_examples() {
+        let request: ContextRequest = serde_json::from_value(json!({}))
+            .expect("context request should deserialize with omitted optional fields");
+
+        let options = request
+            .context_options()
+            .expect("default context options should be valid");
+
+        assert!(!options.include_sampling);
+        assert_eq!(options.sampling_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
+        assert!(!options.include_examples);
+        assert_eq!(options.examples_limit, DEFAULT_NSQL_CONTEXT_SAMPLE_LIMIT);
+        assert!(request.datasets.is_empty());
+    }
+
+    #[test]
+    fn context_request_sample_data_enabled_defaults_examples_to_sampling() {
+        let request: ContextRequest = serde_json::from_value(json!({
+            "sample_data_enabled": true
+        }))
+        .expect("context request should accept sample_data_enabled alias");
+
+        let options = request
+            .context_options()
+            .expect("sample_data_enabled context options should be valid");
+
+        assert!(options.include_sampling);
+        assert!(options.include_examples);
+
+        let request: ContextRequest = serde_json::from_value(json!({
+            "sample_data_enabled": true,
+            "include_examples": false
+        }))
+        .expect("context request should allow include_examples override");
+
+        let options = request
+            .context_options()
+            .expect("explicit include_examples override should be valid");
+
+        assert!(options.include_sampling);
+        assert!(!options.include_examples);
+    }
+
+    #[test]
+    fn context_request_parses_repeated_dataset_query_params() {
+        let uri: Uri = "/v1/nsql/context?datasets=sales.orders&datasets=support_tickets"
+            .parse()
+            .expect("query URI should parse");
+
+        let ExtraQuery(request) = ExtraQuery::<ContextRequest>::try_from_uri(&uri)
+            .expect("context request should parse repeated dataset keys");
+
+        assert_eq!(request.datasets, vec!["sales.orders", "support_tickets"]);
+        assert_eq!(
+            request.datasets(),
+            Some(vec![
+                "sales.orders".to_string(),
+                "support_tickets".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn context_request_validates_enabled_limits() {
+        let request: ContextRequest = serde_json::from_value(json!({
+            "include_sampling": true,
+            "sampling_limit": 0
+        }))
+        .expect("context request should deserialize");
+
+        let (status, message) = request
+            .context_options()
+            .expect_err("enabled sampling should reject a zero limit");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            message,
+            "Query parameter 'sampling_limit' must be greater than 0 when enabled"
+        );
+    }
+
+    fn nsql_context_function_context_for_test(include_search_functions: bool) -> String {
+        let app = app_with_functions(true, vec![ticket_priority_function()]);
+        let mut available_names = snapshot_context_function_names_for_test();
+        available_names.insert("ticket_priority".to_string());
+
+        nsql_function_context_for_test(
+            &app,
+            &available_names,
+            include_search_functions,
+            include_search_functions,
+        )
+        .render_markdown()
+    }
+
+    fn snapshot_context_function_names_for_test() -> HashSet<String> {
+        let mut names = all_context_function_names_for_test();
+        names.remove("ai");
+        names.remove("embed");
+        names
+    }
+
+    fn nsql_context_block_with_samples_for_test() -> String {
+        let tables = vec![
+            TableReference::parse_str("sales.orders"),
+            TableReference::parse_str("support_tickets"),
+        ];
+        let dataset_contexts = vec![
+            NsqlDatasetContext {
+                name: "sales.orders".to_string(),
+                catalog: None,
+                schema: Some("sales".to_string()),
+                table: "orders".to_string(),
+                description: Some("Customer orders".to_string()),
+                metadata: BTreeMap::new(),
+                columns: vec![],
+                primary_key: vec![],
+                unique_constraints: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                search: NsqlDatasetSearchContext::default(),
+            },
+            NsqlDatasetContext {
+                name: "support_tickets".to_string(),
+                catalog: None,
+                schema: None,
+                table: "support_tickets".to_string(),
+                description: Some("Customer support tickets".to_string()),
+                metadata: BTreeMap::new(),
+                columns: vec![],
+                primary_key: vec![],
+                unique_constraints: vec![],
+                foreign_keys: vec![],
+                indexes: vec![],
+                search: NsqlDatasetSearchContext::default(),
+            },
+        ];
+        let schema_context = r"
+| table_reference | column_name | data_type | nullable | description |
+| --- | --- | --- | --- | --- |
+| sales.orders | order_id | Int64 | false | Unique order identifier |
+| sales.orders | customer_id | Utf8 | false | Customer account identifier |
+| support_tickets | ticket_id | Int64 | false | Support ticket identifier |
+| support_tickets | sentiment | Utf8 | true | Model-derived sentiment label |
+    ";
+        let relationship_context = r"
+### `sales.orders`
+- Primary key: `order_id`
+- Foreign keys:
+    - (`customer_id`) references `spice.sales.customers` (`id`)
+- Indexes:
+    - `customer_id`: `customer_id` (enabled, spicepod.acceleration.indexes)
+- Search indexes:
+    - vector search on `customer_id` using `embed_model`. Syntax: `vector_search(sales.orders, 'query text', customer_id)`. Engine/index: `duckdb_vector_index`. Row id: `order_id`.
+    - full-text search on `customer_id` using `tantivy`. Syntax: `text_search(sales.orders, 'query text', customer_id)`. Row id: `order_id`.
+        ";
+        let sample_context_blocks = vec![
+            SampleContextBlock {
+                title: "Distinct value samples for `support_tickets`".to_string(),
+                content: "| sentiment |\n| --- |\n| positive |\n| negative |".to_string(),
+            },
+            SampleContextBlock {
+                title: "Example rows for `sales.orders`".to_string(),
+                content: "| order_id | customer_id |\n| --- | --- |\n| 42 | CUST-1 |".to_string(),
+            },
+        ];
+
+        render_nsql_context_block(
+            &tables,
+            &dataset_contexts,
+            schema_context,
+            relationship_context,
+            &nsql_context_function_context_for_test(true),
+            &sample_context_blocks,
+        )
+    }
+
+    fn nsql_context_block_no_datasets_for_test() -> String {
+        render_nsql_context_block(
+            &[],
+            &[],
+            "",
+            "",
+            &nsql_context_function_context_for_test(false),
+            &[],
+        )
+    }
+
+    #[test]
+    fn nsql_context_block_snapshot() {
+        insta::assert_snapshot!(
+            "nsql_context_block_with_samples",
+            nsql_context_block_with_samples_for_test()
+        );
+    }
+
+    #[test]
+    fn nsql_context_block_no_datasets_snapshot() {
+        let context = nsql_context_block_no_datasets_for_test();
+
+        assert!(context.contains("No datasets are currently in scope."));
+        assert!(context.contains("## SQL Functions"));
+        assert!(context.contains("Apache DataFusion version"));
+
+        insta::assert_snapshot!("nsql_context_block_no_datasets", context);
+    }
+
+    #[test]
+    fn nsql_context_json_response_snapshot() {
+        let mut response = NsqlContextJsonResponse::minimal_for_test("# Spice.ai NSQL Context");
+        response.datasets = vec![NsqlDatasetContext {
+            name: "sales.orders".to_string(),
+            catalog: Some("spice".to_string()),
+            schema: Some("sales".to_string()),
+            table: "orders".to_string(),
+            description: Some("Customer orders".to_string()),
+            metadata: BTreeMap::from([("description".to_string(), "Customer orders".to_string())]),
+            columns: vec![
+                NsqlColumnContext {
+                    name: "order_id".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                    description: Some("Unique order identifier".to_string()),
+                    source_type: Some("bigint".to_string()),
+                    metadata: BTreeMap::from([
+                        (
+                            "description".to_string(),
+                            "Unique order identifier".to_string(),
+                        ),
+                        ("source_type".to_string(), "bigint".to_string()),
+                    ]),
+                    primary_key: true.into(),
+                    unique: false.into(),
+                    indexed: true.into(),
+                    vector_search: false.into(),
+                    full_text_search: false.into(),
+                },
+                NsqlColumnContext {
+                    name: "customer_id".to_string(),
+                    data_type: "Utf8".to_string(),
+                    nullable: false,
+                    description: Some("Customer account identifier".to_string()),
+                    source_type: Some("text".to_string()),
+                    metadata: BTreeMap::from([
+                        (
+                            "description".to_string(),
+                            "Customer account identifier".to_string(),
+                        ),
+                        ("source_type".to_string(), "text".to_string()),
+                    ]),
+                    primary_key: false.into(),
+                    unique: false.into(),
+                    indexed: true.into(),
+                    vector_search: true.into(),
+                    full_text_search: true.into(),
+                },
+            ],
+            primary_key: vec!["order_id".to_string()],
+            unique_constraints: vec![vec!["order_id".to_string()]],
+            foreign_keys: vec![NsqlForeignKeyContext {
+                columns: vec!["customer_id".to_string()],
+                foreign_table: "spice.sales.customers".to_string(),
+                foreign_columns: vec!["id".to_string()],
+            }],
+            indexes: vec![NsqlIndexContext {
+                name: Some("customer_id".to_string()),
+                columns: vec!["customer_id".to_string()],
+                kind: "enabled".to_string(),
+                source: "spicepod.acceleration.indexes".to_string(),
+            }],
+            search: NsqlDatasetSearchContext {
+                vector: vec![NsqlVectorSearchContext {
+                    column: "customer_id".to_string(),
+                    function: "vector_search".to_string(),
+                    syntax: "vector_search(sales.orders, 'query text', customer_id)".to_string(),
+                    model: "embed_model".to_string(),
+                    engine: Some("duckdb_vector_index".to_string()),
+                    row_id_columns: vec!["order_id".to_string()],
+                    vector_size: Some(384),
+                    chunked: false,
+                    input_mode: Some("scalar".to_string()),
+                    required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                    index: Some(NsqlIndexContext {
+                        name: Some("duckdb_vector_index".to_string()),
+                        columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                        kind: "duckdb_vector_index".to_string(),
+                        source: "runtime_index".to_string(),
+                    }),
+                    notes: vec![],
+                }],
+                full_text: vec![NsqlFullTextSearchContext {
+                    column: "customer_id".to_string(),
+                    function: "text_search".to_string(),
+                    syntax: "text_search(sales.orders, 'query text', customer_id)".to_string(),
+                    engine: "tantivy".to_string(),
+                    index_store: "memory".to_string(),
+                    row_id_columns: vec!["order_id".to_string()],
+                    required_columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                    index: Some(NsqlIndexContext {
+                        name: Some("full_text".to_string()),
+                        columns: vec!["customer_id".to_string(), "order_id".to_string()],
+                        kind: "full_text".to_string(),
+                        source: "runtime_index".to_string(),
+                    }),
+                    notes: vec![],
+                }],
+            },
+        }];
+        let app = AppBuilder::new("test").build();
+        response.functions = nsql_function_context_for_test(
+            &app,
+            &snapshot_context_function_names_for_test(),
+            true,
+            true,
+        );
+        response.samples = vec![SampleContextBlock {
+            title: "Example rows for `sales.orders`".to_string(),
+            content: "| order_id | customer_id |\n| --- | --- |\n| 42 | CUST-1 |".to_string(),
+        }];
+
+        let response = serde_json::to_string_pretty(&response)
+            .expect("structured NSQL context should serialize");
+
+        insta::assert_snapshot!("nsql_context_json_response", response);
+    }
+
+    #[test]
+    fn nsql_user_function_context_snapshot() {
+        let app = app_with_functions(
+            true,
+            vec![
+                test_function("Haversine_Km", true),
+                test_table_function("Rows_Fn", true),
+            ],
+        );
+        let available_names = HashSet::from(["haversine_km".to_string(), "rows_fn".to_string()]);
+        let user_function_infos = vec![
+            test_user_function_info("Rows_Fn"),
+            test_user_function_info("Haversine_Km"),
+        ];
+        let entries = user_function_context_entries(&app, &available_names, user_function_infos);
+        let mut output = String::new();
+
+        write_user_function_context_entries(&mut output, &entries);
+
+        insta::assert_snapshot!("nsql_user_function_context", output);
+    }
+
+    #[test]
+    fn user_function_context_entries_include_registered_spicepod_signatures() {
+        let app = app_with_functions(
+            true,
+            vec![
+                test_function("Haversine_Km", true),
+                test_table_function("Rows_Fn", true),
+            ],
+        );
+        let available_names = HashSet::from(["haversine_km".to_string(), "rows_fn".to_string()]);
+        let user_function_infos = vec![
+            test_user_function_info("Rows_Fn"),
+            test_user_function_info("Haversine_Km"),
+        ];
+
+        let entries = user_function_context_entries(&app, &available_names, user_function_infos);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Haversine_Km");
+        assert_eq!(
+            entries[0].syntax.as_deref(),
+            Some("Haversine_Km(x int64) -> int64")
+        );
+        assert_eq!(entries[0].kind, "scalar");
+        assert_eq!(entries[0].volatility, "stable");
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Haversine_Km description")
+        );
+        assert_eq!(entries[1].name, "Rows_Fn");
+        assert_eq!(
+            entries[1].syntax.as_deref(),
+            Some("Rows_Fn(x int64) -> TABLE(value int64)")
+        );
+        assert_eq!(entries[1].kind, "table");
+
+        let mut output = String::new();
+        write_user_function_context_entries(&mut output, &entries);
+        assert!(output.contains("### User-defined functions"));
+        assert!(output.contains("Syntax: `Haversine_Km(x int64) -> int64`."));
+        assert!(output.contains("Syntax: `Rows_Fn(x int64) -> TABLE(value int64)`."));
+    }
+
+    #[test]
+    fn user_function_context_entries_filter_to_enabled_registered_functions() {
+        let app = app_with_functions(
+            true,
+            vec![
+                test_function("Registered_Fn", true),
+                test_function("Disabled_Fn", false),
+            ],
+        );
+        let available_names = HashSet::from([
+            "registered_fn".to_string(),
+            "disabled_fn".to_string(),
+            "missing_declaration_fn".to_string(),
+        ]);
+        let user_function_infos = vec![
+            test_user_function_info("Registered_Fn"),
+            test_user_function_info("Disabled_Fn"),
+            test_user_function_info("Missing_Declaration_Fn"),
+        ];
+
+        let entries = user_function_context_entries(&app, &available_names, user_function_infos);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Registered_Fn");
+
+        let disabled_app = app_with_functions(true, vec![test_function("Registered_Fn", true)]);
+        let mut disabled_app = disabled_app;
+        disabled_app.runtime.functions = Functions::default();
+        let entries = user_function_context_entries(
+            &disabled_app,
+            &available_names,
+            vec![test_user_function_info("Registered_Fn")],
+        );
+
+        assert!(entries.is_empty());
     }
 
     #[test]

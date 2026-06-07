@@ -17,30 +17,25 @@ limitations under the License.
 //! Regression bench for the composite-PK on-conflict cache update in
 //! `CayenneTableProvider::apply_on_conflict_deletions`.
 //!
-//! The production path writes key-based deletion records, takes the owned
-//! `Vec<Box<[u8]>>` back from the catalog write result, and extends two
-//! immutable cache indexes:
-//!
-//! - `deleted_row_keys`: clones each key because the same key set is still
-//!   needed by the second cache update.
-//! - `insert_records`: consumes the owned key vector with `into_iter()`, so
-//!   the second update moves keys instead of cloning them again.
-//!
-//! A future edit that changes the second update back to `.iter().cloned()`
-//! pays one extra `Box<[u8]>` allocation per conflict. With ~8 K conflicts
-//! and ~32-byte composite keys, that is ~8 K avoidable heap allocations and
-//! ~256 KB of redundant key copies per upsert.
+//! The production path historically extended TWO immutable cache indexes per
+//! conflict batch — `deleted_row_keys` (cloning each key) and
+//! `insert_records` (moving the keys) — i.e. two full passes and two maps.
+//! The fused tombstone index records the deletion and the re-insertion in a
+//! single `extend_max_conflicts` pass over borrowed keys (the index stores
+//! XXH3-128 identities, never the key bytes), so the second pass and every
+//! per-key `Box<[u8]>` clone disappear.
 //!
 //! ## What this bench measures
 //!
 //! Pure CPU shape. Two lanes per conflict-count:
 //!
-//! - `regression_clone_both_indices`: clones keys into both cache indexes.
-//! - `current_move_second_index`: mirrors the current code by cloning into
-//!   the first index and moving the owned keys into the second.
+//! - `historical_two_indexes`: the pre-fusion shape — two extend passes
+//!   building two indexes from the same key set.
+//! - `current_fused_single_pass`: one `extend_max_conflicts` pass building
+//!   the fused index.
 //!
-//! Both end up with equivalent cache indexes. The difference is one fewer
-//! `Box<[u8]>` clone per conflict in the current path.
+//! A future edit that re-splits the indexes (or re-introduces per-key key
+//! cloning) shows up as the `current` lane regressing toward `historical`.
 //!
 //! `cargo bench --bench apply_on_conflict_keys_double_clone -p cayenne`.
 
@@ -79,39 +74,21 @@ fn build_deleted_row_keys(n: usize) -> Vec<Box<[u8]>> {
         .collect()
 }
 
-fn regression_clone_both_indices(
-    written_keys: &[Box<[u8]>],
-) -> (KeyDeletionIndex, KeyDeletionIndex) {
+fn historical_two_indexes(written_keys: &[Box<[u8]>]) -> (KeyDeletionIndex, KeyDeletionIndex) {
     let empty_deleted = KeyDeletionIndex::empty();
-    let deleted_row_keys = empty_deleted.extend_max(
-        written_keys
-            .iter()
-            .map(|key| (key.clone(), DELETE_SEQUENCE)),
-    );
+    let deleted_row_keys =
+        empty_deleted.extend_max_deletes(written_keys.iter().map(|key| (key, DELETE_SEQUENCE)));
 
     let empty_inserts = KeyDeletionIndex::empty();
-    let insert_records = empty_inserts.extend_max(
-        written_keys
-            .iter()
-            .map(|key| (key.clone(), INSERT_SEQUENCE)),
-    );
+    let insert_records =
+        empty_inserts.extend_max_deletes(written_keys.iter().map(|key| (key, INSERT_SEQUENCE)));
 
     (deleted_row_keys, insert_records)
 }
 
-fn current_move_second_index(written_keys: Vec<Box<[u8]>>) -> (KeyDeletionIndex, KeyDeletionIndex) {
-    let empty_deleted = KeyDeletionIndex::empty();
-    let deleted_row_keys = empty_deleted.extend_max(
-        written_keys
-            .iter()
-            .map(|key| (key.clone(), DELETE_SEQUENCE)),
-    );
-
-    let empty_inserts = KeyDeletionIndex::empty();
-    let insert_records =
-        empty_inserts.extend_max(written_keys.into_iter().map(|key| (key, INSERT_SEQUENCE)));
-
-    (deleted_row_keys, insert_records)
+fn current_fused_single_pass(written_keys: &[Box<[u8]>]) -> KeyDeletionIndex {
+    let empty = KeyDeletionIndex::empty();
+    empty.extend_max_conflicts(written_keys.iter(), DELETE_SEQUENCE, INSERT_SEQUENCE)
 }
 
 fn bench_double_clone(c: &mut Criterion) {
@@ -120,32 +97,21 @@ fn bench_double_clone(c: &mut Criterion) {
         let written_keys = build_deleted_row_keys(n);
         group.throughput(Throughput::Elements(throughput_elements(n)));
 
+        group.bench_with_input(BenchmarkId::new("historical_two_indexes", n), &n, |b, _| {
+            b.iter(|| {
+                let pair = historical_two_indexes(black_box(&written_keys));
+                black_box(pair);
+            });
+        });
+
         group.bench_with_input(
-            BenchmarkId::new("regression_clone_both_indices", n),
+            BenchmarkId::new("current_fused_single_pass", n),
             &n,
             |b, _| {
                 b.iter(|| {
-                    let pair = regression_clone_both_indices(black_box(&written_keys));
-                    black_box(pair);
+                    let index = current_fused_single_pass(black_box(&written_keys));
+                    black_box(index);
                 });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("current_move_second_index", n),
-            &n,
-            |b, _| {
-                // `iter_batched` hands the measured function an owned vector
-                // each iteration so the in-tree move is real while input setup
-                // remains outside the measured body.
-                b.iter_batched(
-                    || written_keys.clone(),
-                    |owned| {
-                        let pair = current_move_second_index(owned);
-                        black_box(pair);
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
             },
         );
     }

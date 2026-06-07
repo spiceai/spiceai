@@ -530,6 +530,62 @@ pub fn register_cayenne_compaction_metrics(compaction_pool_bytes: u64) {
     cayenne_compaction_memory_pool_bytes().record(compaction_pool_bytes, &[]);
 }
 
+static CAYENNE_INLINE_TOMBSTONE_WRITES: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_INLINE_TOMBSTONE_KEYS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts inline-tombstone writes on the on-conflict upsert path: one increment
+/// per `add_inlined_tombstone` that actually writes a tombstone (the cheap,
+/// O(deleted keys) path that hides the prior inline copy of an upserted PK),
+/// plus a second counter for the number of keys hidden. Pair with
+/// [`track_cayenne_inline_rewrite_fallback`] — the ratio of tombstone writes to
+/// rewrite fallbacks shows how often the CDC stream takes the cheap path versus
+/// the O(corpus) inline rewrite. `dimensions` should carry `table`.
+pub fn track_cayenne_inline_tombstone_write(keys: u64, dimensions: &[KeyValue]) {
+    CAYENNE_INLINE_TOMBSTONE_WRITES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_inline_tombstone_writes_total")
+                .with_description(
+                    "On-conflict upserts that wrote an inline tombstone (the cheap O(deleted keys) path that hides the prior inline copy of an upserted PK).",
+                )
+                .build()
+        })
+        .add(1, dimensions);
+    CAYENNE_INLINE_TOMBSTONE_KEYS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_inline_tombstone_keys_total")
+                .with_description(
+                    "Total PK keys hidden by inline tombstones on the on-conflict upsert path.",
+                )
+                .with_unit("keys")
+                .build()
+        })
+        .add(keys, dimensions);
+}
+
+static CAYENNE_INLINE_REWRITE_FALLBACKS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts the O(corpus) inline-data rewrite fallback
+/// (`build_inlined_data_rewrite_for_pk_keys`): one increment per call that
+/// actually removed inline rows (i.e. re-decoded and rewrote the inline corpus
+/// to drop the superseded copies). This still fires on the inline-insert path
+/// (`write_cdc_pipelined` inline fallback). A non-zero rate alongside
+/// [`track_cayenne_inline_tombstone_write`] makes the tombstone-vs-rewrite ratio
+/// observable. `dimensions` should carry `table`.
+pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
+    CAYENNE_INLINE_REWRITE_FALLBACKS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_inline_rewrite_fallbacks_total")
+                .with_description(
+                    "Calls to the O(corpus) inline-data rewrite fallback that removed superseded inline rows (vs the cheap inline-tombstone path).",
+                )
+                .build()
+        })
+        .add(1, dimensions);
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 

@@ -215,13 +215,32 @@ impl CayenneStagedAppend {
     /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
     /// or remove WAL) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
+        use super::table::record_cayenne_write_phase;
+
+        // Carve the single `publish` phase into its four cost centers so the
+        // metastore WAL, lock contention, object-store moves, and final commit can
+        // be attributed separately. Under concurrent writes the `publish_lock_wait`
+        // bucket (acquiring the visibility lock + listing fence) is the one that
+        // grows: publishes serialize across the table, so a high lock-wait vs a
+        // high move/commit distinguishes lock-bound from work-bound finalization.
+        let wal_start = Instant::now();
         self.write_wal().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish_wal_write", wal_start);
+
+        let lock_start = Instant::now();
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         let _fence = self.table.lock_listing_fence_write_owned().await;
+        record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
+
+        let move_start = Instant::now();
         self.move_staged_files().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish_move_files", move_start);
+
+        let commit_start = Instant::now();
         self.remove_wal().await?;
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
+        record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
         Ok(())
     }
 
@@ -664,6 +683,7 @@ impl CayenneTableProvider {
                 // The prepared insert is a lazily-consumed stream of unknown
                 // size; shard across the full write concurrency (prior behavior).
                 None,
+                super::delta_encoding::WriteClass::Delta,
             )
             .await
         {

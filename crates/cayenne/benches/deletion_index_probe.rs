@@ -70,7 +70,6 @@ fn bench_int64_probe(c: &mut Criterion) {
 
     let pk_array = build_int64_pk_column(ROWS_PER_BATCH);
     let pk_slice = pk_array.values();
-    let empty_inserts = DeletionIndex::empty();
 
     for ratio in DELETION_RATIOS {
         let index = build_int64_index(ROWS_PER_BATCH, ratio);
@@ -84,9 +83,9 @@ fn bench_int64_probe(c: &mut Criterion) {
                     for &pk in pk_slice.iter() {
                         let visible = match index.get(pk) {
                             None => true,
-                            Some(del_seq) => empty_inserts
-                                .get(pk)
-                                .is_some_and(|ins_seq| ins_seq > del_seq),
+                            Some(t) => t
+                                .insert_sequence
+                                .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
                         };
                         keep += usize::from(visible);
                     }
@@ -124,7 +123,6 @@ fn bench_row_keys_probe(c: &mut Criterion) {
     group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
 
     let row_keys = build_row_keys(ROWS_PER_BATCH);
-    let empty_inserts = KeyDeletionIndex::empty();
 
     for ratio in DELETION_RATIOS {
         let index = build_key_index(ROWS_PER_BATCH, ratio);
@@ -137,9 +135,9 @@ fn bench_row_keys_probe(c: &mut Criterion) {
                     for key in &row_keys {
                         let visible = match index.get(key.as_ref()) {
                             None => true,
-                            Some(del_seq) => empty_inserts
-                                .get(key.as_ref())
-                                .is_some_and(|ins_seq| ins_seq > del_seq),
+                            Some(t) => t
+                                .insert_sequence
+                                .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
                         };
                         keep += usize::from(visible);
                     }
@@ -236,7 +234,7 @@ fn bench_extend_max_at_growing_cache_sizes(c: &mut Criterion) {
                 // every iteration takes the Vacant branch. (If we extended
                 // with an existing key, the Occupied branch would short-
                 // circuit and obscure the new-key bloom-insert work.)
-                let next = base.extend_max([((n as i64) + 1, 2)]);
+                let next = base.extend_max_deletes([((n as i64) + 1, 2)]);
                 black_box(next);
             });
         });
@@ -267,7 +265,7 @@ fn bench_extend_max_cumulative_from_empty(c: &mut Criterion) {
                 // stays roughly flat.
                 let mut idx = DeletionIndex::empty();
                 for i in 0..total as i64 {
-                    idx = idx.extend_max([(i, 1)]);
+                    idx = idx.extend_max_deletes([(i, 1)]);
                 }
                 black_box(idx);
             });

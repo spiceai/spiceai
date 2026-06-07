@@ -46,15 +46,16 @@ on:
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
-        default: '60'
+        default: '300'
         type: string
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-large-runners'
+        default: 'spiceai-dev-xlarge-runners'
         type: choice
         options:
           - 'spiceai-dev-large-runners'
+          - 'spiceai-dev-xlarge-runners'
 jobs:
   run-htap:
     name: Run CH-BenCHmark
