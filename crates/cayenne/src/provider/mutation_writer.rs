@@ -40,13 +40,13 @@ limitations under the License.
 //!
 //! On-conflict (upsert) tables DO pipeline: the burst stages into a new
 //! protected snapshot and the on-conflict deletions are resolved and published
-//! by the backgrounded `finish()`. The one exception is a batch that replaces
-//! *inlined* rows — the staged on-conflict commit can't represent an inline
-//! rewrite, and that is only known after validation. Such a batch stages
-//! optimistically and then falls back to a synchronous publish that reuses the
-//! staged files (tracked by the `cdc_path_inline_fallback` write-phase metric),
-//! rather than excluding every inline-bearing upsert table from the pipeline up
-//! front.
+//! by the backgrounded `finish()`. Batches that replace *inlined* rows pipeline
+//! too (Option D): `prepare_on_conflict_deletions_for_staged_snapshot` writes
+//! the inline tombstone durably with `published = false`, the read filter skips
+//! unpublished tombstones, and `finish()` flips the flag durably under the
+//! listing fence before the replacement files become discoverable — so the old
+//! inline row stays visible until, and is hidden exactly when, the replacement
+//! appears (no transient vanish, and no synchronous-publish fallback).
 //!
 //! ## Inline-memtable admission
 //!
@@ -258,17 +258,36 @@ impl<'a> AppendMutationWriter<'a> {
         // `PostWriteMaintenance`, the pipelined path can run for retention-
         // configured tables — the bg scheduler picks up the retention request
         // after publish (see `CayenneCdcWrite::finish`).
-        // On-conflict upserts can stage even when the table holds inlined data.
-        // Whether a given batch actually replaces inlined rows is only known
-        // after validation (it populates `on_conflict_deletions`), so rather
-        // than excluding every inline-bearing upsert table from the pipeline up
-        // front, we stage optimistically and fall back to the synchronous
-        // publish *after* staging if the batch turns out to touch inlined rows
-        // (the staged on-conflict commit can't represent an inline rewrite).
-        // This lets inline-bearing upsert tables pipeline every batch that does
-        // not conflict with inlined rows.
-        let can_stage_for_pipeline =
-            !pending_pk_deletions && self.table.metadata().partition_column.is_none();
+        //
+        // On-conflict upserts always *attempt* to stage: the Vortex files are
+        // written into a staging snapshot and whether a batch actually replaces
+        // inlined rows is only known after validation, so we stage optimistically.
+        // A batch that replaces inlined rows ALSO publishes from the background
+        // (Option D — the durable per-tombstone activation flag):
+        // `prepare_on_conflict_deletions_for_staged_snapshot` writes the inline
+        // tombstone with `published = false` at a `delete_sequence` below the
+        // staged `snapshot_sequence`; the read filter (`load_inlined_deletion_maps`)
+        // skips unpublished tombstones, so an inline-cache rebuild triggered by a
+        // concurrent same-table inline INSERT during the staged window cannot hide
+        // the old inline row (no transient vanish). `CayenneCdcWrite::finish` flips
+        // the flag durably under the listing fence, BEFORE the replacement files
+        // are moved into the snapshot, then bumps the inline generation — so live
+        // readers see the old row until exactly the moment the replacement appears.
+        // The previous unconditional synchronous inline-fallback is removed; the
+        // only synchronous resort left is the hard error when staging genuinely
+        // cannot complete.
+        //
+        // A table that already holds pending PK deletions (`pending_pk_deletions`)
+        // no longer forces the blocking synchronous path. Such a batch stages into
+        // a ProtectedSnapshot whose deletion threshold (`snapshot_sequence`) is
+        // reserved at stage time ABOVE the current max delete sequence, so the
+        // replacement rows in the new snapshot apply only deletes with
+        // `delete_seq > snapshot_sequence` — they are immune to every pre-existing
+        // tombstone and can neither resurface nor vanish (see
+        // `prepare_on_conflict_deletions_for_staged_snapshot` and
+        // `process_stream_into_keyset`). Partitioned tables still take the blocking
+        // path: their visibility flip can't be deferred to a backgrounded publish.
+        let can_stage_for_pipeline = self.table.metadata().partition_column.is_none();
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
@@ -336,7 +355,18 @@ impl<'a> AppendMutationWriter<'a> {
             } => {
                 prepared_stream = stream;
                 let estimated_bytes = Some(buffered_bytes);
-                let stage_on_conflict = may_have_on_conflict_deletions;
+                // Stage into a ProtectedSnapshot whenever the batch may carry
+                // on-conflict deletions OR the table already holds pending PK
+                // deletions. The latter case may produce no new delete payload
+                // (a non-upsert append into a table that has tombstones), but it
+                // still needs a ProtectedSnapshot so the new rows get a sequence
+                // (`snapshot_sequence`) reserved above the existing tombstones and
+                // are therefore not hidden by them — a plain current-snapshot
+                // append could let an existing tombstone mask a freshly appended
+                // row at the same PK. `prepare_on_conflict_deletions_for_staged_snapshot`
+                // handles the empty-delete case (reserve 1 sequence, publish a
+                // bare ProtectedSnapshot).
+                let stage_on_conflict = may_have_on_conflict_deletions || pending_pk_deletions;
                 let (staging_snapshot_id, target_snapshot_id, target_kind) = if stage_on_conflict {
                     let (staging_snapshot_id, target_snapshot_id) =
                         CayenneTableProvider::new_staging_snapshot_id_pair();
@@ -382,101 +412,21 @@ impl<'a> AppendMutationWriter<'a> {
                     validated_keys,
                 } = take_post_validation(&post_validation);
 
-                // Inline-conflict fallback. The staged on-conflict commit cannot
-                // represent an inline rewrite, and whether a batch replaces inlined
-                // rows is only known now (after validation). Rather than erroring,
-                // publish synchronously here, reusing the already-staged Vortex files.
-                //
-                // Order and primitives mirror the non-pipelined
-                // `write_new_snapshot_after_validation`: move the staged files into
-                // the (protected) target snapshot, apply the conflict resolution
-                // (inline rewrite + file/position tombstones + re-insert records),
-                // then make the snapshot visible. The new snapshot's deletion
-                // threshold is its own sequence, allocated *after* the conflict
-                // deletes, so those deletes never hide the replacement rows.
-                //
-                // This inherits the synchronous on-conflict path's publish window
-                // (a concurrent scan may briefly observe the conflict delete before
-                // the replacement snapshot is visible) — i.e. it is no worse than
-                // the path these inline-bearing upsert tables took before the gate
-                // was relaxed. Hardening both publish paths to be fully atomic
-                // without a long listing-fence hold is a separate item.
-                if stage_on_conflict && on_conflict_deletions.has_inlined_deletions() {
-                    let superseded = on_conflict_deletions.total_superseded();
-
-                    // ProtectedSnapshot targets do not take `write_lock`, so this
-                    // composes with the held write guard. Files land in the target
-                    // dir but stay invisible until the snapshot is published below.
-                    prepared_append.apply_under_barrier().await?;
-
-                    // Publish the conflict deletes and the protected snapshot under
-                    // one scan fence so readers observe either the old row or the
-                    // replacement row, never a mixed generation.
-                    let _visibility = self.table.visibility_lock_arc().lock_owned().await;
-                    let _fence = self.table.lock_listing_fence_write_owned().await;
-
-                    // Runs while the write guard is held, as the deletion sink
-                    // expects. Rewrites inlined rows and tombstones file rows.
-                    let update = self
-                        .table
-                        .apply_on_conflict_deletions(on_conflict_deletions)
-                        .await?;
-
-                    let snapshot_sequence = self
-                        .table
-                        .catalog()
-                        .increment_sequence_number(self.table.table_id())
-                        .await?;
-                    self.table
-                        .record_written_snapshot_sequence(&target_snapshot_id, snapshot_sequence)
-                        .await?;
-                    self.table
-                        .commit_on_conflict_publish(
-                            update,
-                            Some((&target_snapshot_id, snapshot_sequence)),
-                        )
-                        .await;
-                    prepared_append.finish().await?;
-                    drop(held_write_guard);
-
-                    let retention_requested = self.table.has_retention_delete_filters();
-                    if retention_requested {
-                        self.table.clear_cached_pk_keyset();
-                    } else {
-                        self.table.record_file_pk_keys(&validated_keys);
-                    }
-                    let live_rows_delta = i64::try_from(rows)
-                        .unwrap_or(i64::MAX)
-                        .saturating_sub(i64::try_from(superseded).unwrap_or(i64::MAX));
-                    self.table.schedule_post_write_maintenance(
-                        Some(stats_acc),
-                        false,
-                        retention_requested,
-                        live_rows_delta,
-                    );
-
-                    tracing::debug!(
-                        table = self.table.table_name(),
-                        rows,
-                        writer_ops,
-                        superseded,
-                        duration_ms = write_start.elapsed().as_millis(),
-                        "CDC pipelined append fell back to synchronous publish (batch replaces inlined rows)"
-                    );
-                    // Distinct label so the inline-fallback frequency is measurable:
-                    // it shows whether relaxing the gate for inline-bearing upsert
-                    // tables mostly pipelines (rare fallback) or mostly thrashes.
-                    record_cayenne_write_phase(
-                        self.table.table_name(),
-                        "cdc_path_inline_fallback",
-                        write_start,
-                    );
-                    return Ok(CayenneCdcWrite::completed(
-                        self.table.clone_for_write_operations(),
-                        rows,
-                    ));
-                }
-
+                // Inline-conflict batches now STAGE inert (Option D), exactly like
+                // file-conflict batches: `prepare_on_conflict_deletions_for_staged_snapshot`
+                // writes the inline tombstone durably with `published = false` at a
+                // `delete_sequence` reserved below the staged `snapshot_sequence`,
+                // and the read filter (`load_inlined_deletion_maps`) skips
+                // unpublished tombstones, so the old inline row stays visible
+                // throughout the staged window even if a concurrent same-table
+                // inline INSERT triggers an inline-cache rebuild. The owning
+                // snapshot's finalize (`CayenneCdcWrite::finish`) flips the flag
+                // durably — before the replacement files become discoverable — so
+                // the old row is hidden exactly when the replacement appears (no
+                // transient vanish). The previous unconditional synchronous
+                // inline-fallback (which blocked publish under the write guard) is
+                // gone; the only remaining synchronous resort is the hard error
+                // path below when staging genuinely cannot complete.
                 let prepared_on_conflict = if stage_on_conflict {
                     match self
                         .table
@@ -629,7 +579,11 @@ impl<'a> AppendMutationWriter<'a> {
         let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
             let new_snapshot_start = Instant::now();
             let (rows, stats_acc, validated_keys, superseded) = self
-                .write_new_snapshot_after_validation(prepared_stream, &post_validation)
+                .write_new_snapshot_after_validation(
+                    prepared_stream,
+                    &post_validation,
+                    estimated_bytes,
+                )
                 .await?;
             tracing::debug!(
                 table = self.table.table_name(),
@@ -700,6 +654,7 @@ impl<'a> AppendMutationWriter<'a> {
         &self,
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        estimated_bytes: Option<u64>,
     ) -> Result<(
         u64,
         Arc<ColumnStatsAccumulator>,
@@ -716,11 +671,14 @@ impl<'a> AppendMutationWriter<'a> {
                 target_size_bytes,
                 &new_snapshot_id,
                 self.task_context.session_config().target_partitions(),
-                // This pending-deletions / on-conflict new-snapshot path does not
-                // pre-buffer the delta, so its size is unknown here; keep the
-                // prior full-fan-out behavior. (Reached only when a write carries
-                // pending PK deletes or on-conflict upserts.)
-                None,
+                // Lower-bound size estimate populated from the inline-gate
+                // buffer when the write attempted to inline first (the common
+                // on-conflict upsert shape: small deltas fully buffered by the
+                // gate, so the bound is exact). `None` when inlining was
+                // skipped (partition/retention tables) — those keep the prior
+                // full-fan-out behavior and the full default delta encoding.
+                estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -898,6 +856,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {
@@ -956,6 +915,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {

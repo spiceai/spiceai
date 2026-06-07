@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::args::{BackendMode, LocalSpicedArgs, StdioArgs};
+use crate::args::{LocalSpicedArgs, StdioArgs};
 use crate::stdio_server;
 
 /// Construct a [`StdioArgs`] pinned to the local backend from the minimal
@@ -25,32 +25,12 @@ pub async fn run_local_spiced_server(args: &LocalSpicedArgs) -> anyhow::Result<(
 fn to_stdio_args(args: &LocalSpicedArgs) -> StdioArgs {
     StdioArgs {
         verbose: args.verbose,
-        backend: BackendMode::Local,
+        scenario: args.scenario.clone(),
+        scenario_base_path: None,
         ready_wait: args.ready_wait,
-        aws_region: args.aws_region.clone(),
-        cayenne_data_dir: args.cayenne_data_dir.clone(),
-        cayenne_metadata_dir: args.cayenne_metadata_dir.clone(),
-        scheduler_state_location: args.scheduler_state_location.clone(),
-        query_memory_limit: args.query_memory_limit.clone(),
-        // SCP-only fields — unused in local mode
         spice_cloud_api_url: String::new(),
-        channel: None,
-        image_tag: None,
         api_key: None,
-        flight_url: None,
-        app_memory_limit: None,
-        app_cpu_limit: None,
-        app_cpu_request: None,
-        app_memory_request: None,
-        app_replicas: None,
-        executor_replicas: 1,
-        executor_memory_limit: None,
-        executor_cpu_limit: None,
-        executor_cpu_request: None,
-        executor_memory_request: None,
-        app_storage_size_gb: None,
-        executor_storage_size_gb: None,
-        ephemeral_storage_limit_gb: None,
-        organization_tag: None,
+        spiced_binary: args.spiced_binary.clone(),
+        spice_debug: false,
     }
 }

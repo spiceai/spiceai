@@ -18,7 +18,7 @@
 #   SF=200                 scale factor (warehouses); terminals default to SF*10
 #   DURATION=300           steady-state workload seconds
 #   READY=2400             max seconds to wait for spiced to become ready
-#   SPICEPOD=test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned.yaml
+#   SPICEPOD=test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned-sf100.yaml
 #   SPICED=target/debug/spiced          path to the spiced binary
 #   TESTOP=target/debug/testoperator    path to the testoperator binary
 #   OUTDIR=/tmp/chbench-<sf>             telemetry output directory
@@ -44,7 +44,7 @@ DURATION="${DURATION:-300}"
 READY="${READY:-2400}"
 TERMINALS="${TERMINALS:-}"      # OLTP terminals; empty = testoperator default (SF*10)
 CONCURRENCY="${CONCURRENCY:-}"  # OLAP query threads; empty = testoperator default
-SPICEPOD="${SPICEPOD:-test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned.yaml}"
+SPICEPOD="${SPICEPOD:-test/spicepods/chbench/accelerated/postgres-cayenne[file]-cdc-tuned-sf100.yaml}"
 SPICED="${SPICED:-target/debug/spiced}"
 TESTOP="${TESTOP:-target/debug/testoperator}"
 OUTDIR="${OUTDIR:-/tmp/chbench-sf${SF}}"
