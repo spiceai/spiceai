@@ -579,7 +579,11 @@ impl<'a> AppendMutationWriter<'a> {
         let (total_rows, write_stats_acc, validated_keys, superseded) = if needs_new_snapshot {
             let new_snapshot_start = Instant::now();
             let (rows, stats_acc, validated_keys, superseded) = self
-                .write_new_snapshot_after_validation(prepared_stream, &post_validation)
+                .write_new_snapshot_after_validation(
+                    prepared_stream,
+                    &post_validation,
+                    estimated_bytes,
+                )
                 .await?;
             tracing::debug!(
                 table = self.table.table_name(),
@@ -650,6 +654,7 @@ impl<'a> AppendMutationWriter<'a> {
         &self,
         prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        estimated_bytes: Option<u64>,
     ) -> Result<(
         u64,
         Arc<ColumnStatsAccumulator>,
@@ -666,11 +671,14 @@ impl<'a> AppendMutationWriter<'a> {
                 target_size_bytes,
                 &new_snapshot_id,
                 self.task_context.session_config().target_partitions(),
-                // This pending-deletions / on-conflict new-snapshot path does not
-                // pre-buffer the delta, so its size is unknown here; keep the
-                // prior full-fan-out behavior. (Reached only when a write carries
-                // pending PK deletes or on-conflict upserts.)
-                None,
+                // Lower-bound size estimate populated from the inline-gate
+                // buffer when the write attempted to inline first (the common
+                // on-conflict upsert shape: small deltas fully buffered by the
+                // gate, so the bound is exact). `None` when inlining was
+                // skipped (partition/retention tables) — those keep the prior
+                // full-fan-out behavior and the full default delta encoding.
+                estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
@@ -848,6 +856,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {
@@ -906,6 +915,7 @@ impl<'a> AppendMutationWriter<'a> {
                 &target.staging_snapshot_id,
                 self.task_context.session_config().target_partitions(),
                 target.estimated_bytes,
+                crate::provider::delta_encoding::WriteClass::Delta,
             )
             .await
         {
