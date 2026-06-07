@@ -209,7 +209,7 @@ impl DeltaTable {
             .build(),
         );
 
-        Self::with_engine(table_url, engine)
+        Self::with_engine(table_url, engine, parquet_object_store)
     }
 
     /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
@@ -223,13 +223,14 @@ impl DeltaTable {
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
-        let engine = Arc::new(DefaultEngine::new(object_store));
-        Self::with_engine(table_url, engine)
+        let engine = Arc::new(DefaultEngine::new(Arc::clone(&object_store)));
+        Self::with_engine(table_url, engine, object_store)
     }
 
     fn with_engine(
         table_url: Url,
         engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        parquet_object_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<Self> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())
