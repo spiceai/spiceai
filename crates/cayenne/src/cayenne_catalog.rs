@@ -3588,6 +3588,17 @@ fn log_configuration_differences(
         ));
     }
 
+    // Note: `delta_encoding` is deliberately NOT part of the data-compatibility
+    // gate (`is_data_compatible`): every level emits standard Vortex encodings
+    // readable by the same scan, so a level change applies to future writes
+    // only and must not force a table re-create. Surface it in the change log.
+    if stored.vortex_config.delta_encoding != options.vortex_config.delta_encoding {
+        differences.push(format!(
+            "delta_encoding: {} -> {} (write-time only; existing data unaffected)",
+            stored.vortex_config.delta_encoding, options.vortex_config.delta_encoding
+        ));
+    }
+
     if stored.path != options.base_path {
         differences.push(format!(
             "base_path: {:?} -> {:?}",

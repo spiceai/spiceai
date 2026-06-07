@@ -4768,6 +4768,7 @@ impl CayenneTableProvider {
                 &new_snapshot_id,
                 target_partitions,
                 estimated_bytes,
+                super::delta_encoding::WriteClass::Delta,
             )
             .await?;
 
@@ -4884,6 +4885,7 @@ impl CayenneTableProvider {
         snapshot_id: &str,
         target_partitions: usize,
         estimated_bytes: Option<u64>,
+        write_class: super::delta_encoding::WriteClass,
     ) -> Result<(u64, usize, Arc<ColumnStatsAccumulator>)> {
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         use std::time::Instant;
@@ -4923,8 +4925,26 @@ impl CayenneTableProvider {
         // config (only `create_writer_physical_plan` does). The shard count is
         // size-aware: a write smaller than one target file stays a single shard
         // regardless of `target_partitions` (see `snapshot_shard_count`).
-        let write_format =
-            self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes);
+        //
+        // Delta writes additionally resolve a `cayenne_delta_encoding` level:
+        // small fresh deltas encode with a light scheme set (skipping the
+        // per-file BtrBlocks strategy search + FSST training that dominate
+        // small-write encode cost) and are re-encoded properly when compaction
+        // folds them. Maintenance writes (compaction, rewrites, overwrites)
+        // always use the full default strategy. See `provider::delta_encoding`.
+        let encoding_level = super::delta_encoding::effective_level(
+            self.context.delta_encoding(),
+            write_class,
+            estimated_bytes,
+            target_size_bytes,
+        );
+        let write_format = match super::delta_encoding::strategy_builder_for_level(encoding_level) {
+            Some(strategy) => self.context.write_format_with_strategy(
+                strategy,
+                self.write_shard_config(target_partitions, target_size_bytes, estimated_bytes),
+            ),
+            None => self.write_shard_format(target_partitions, target_size_bytes, estimated_bytes),
+        };
 
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
@@ -5156,13 +5176,34 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
     ) -> Arc<VortexFormat> {
         let base = self.context.file_format();
+        match self.write_shard_config(
+            session_target_partitions,
+            target_size_bytes,
+            estimated_bytes,
+        ) {
+            Some(config) => Arc::new(base.with_write_shard(config)),
+            None => Arc::clone(base),
+        }
+    }
+
+    /// The intra-write shard configuration this write earns, or `None` for a
+    /// single serial writer. Shared by [`Self::write_shard_format`] (default
+    /// encoding) and the delta-encoding strategy-override path
+    /// (`CayenneContext::write_format_with_strategy`) so the two write paths
+    /// produce identically-sharded output formats.
+    fn write_shard_config(
+        &self,
+        session_target_partitions: usize,
+        target_size_bytes: usize,
+        estimated_bytes: Option<u64>,
+    ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
             session_target_partitions,
             target_size_bytes,
             estimated_bytes,
         );
         if shard_count <= 1 {
-            return Arc::clone(base);
+            return None;
         }
         let shard_key_columns = self
             .pk_column_indices
@@ -5175,10 +5216,10 @@ impl CayenneTableProvider {
                     .map(|f| f.name().clone())
             })
             .collect::<Vec<_>>();
-        Arc::new(base.with_write_shard(WriteShardConfig {
+        Some(WriteShardConfig {
             write_concurrency: shard_count,
             shard_key_columns,
-        }))
+        })
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -8514,7 +8555,14 @@ impl CayenneTableProvider {
         let (total_rows, chunk_count, _stats_acc) = self
             // Sorted rewrite: `has_sort_columns()` already forces a single shard
             // (and `target_partitions = 1`), so no size estimate is needed.
-            .write_to_snapshot(sorted_stream, target_size_bytes, &new_snapshot_id, 1, None)
+            .write_to_snapshot(
+                sorted_stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                1,
+                None,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
             .await?;
 
         if total_rows == 0 {
@@ -9286,6 +9334,7 @@ impl CayenneTableProvider {
                 // file is the whole point), so the shard count is forced to 1
                 // regardless; no size estimate needed.
                 None,
+                super::delta_encoding::WriteClass::Maintenance,
             )
             .await;
 
@@ -9667,6 +9716,7 @@ impl CayenneTableProvider {
                 // collapse read fan-out, so the shard count is forced to 1; no
                 // size estimate needed.
                 None,
+                super::delta_encoding::WriteClass::Maintenance,
             )
             .await;
 
@@ -11561,6 +11611,7 @@ impl CayenneTableProvider {
                         &self.get_current_snapshot_id(),
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
+                        super::delta_encoding::WriteClass::Delta,
                     )
                     .await?;
                 stats
