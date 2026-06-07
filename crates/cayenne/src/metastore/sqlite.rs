@@ -37,13 +37,14 @@ const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 /// — the size above which the background maintenance-tick checkpoint escalates
 /// from PASSIVE to TRUNCATE (cycle-8 TASK A2). See that field for the rationale.
 ///
-/// 48 MiB, not 512 MiB (cycle-9, MEASURED): at 512 MiB the WAL reached ~370 MB
-/// between drains under SF-100 @10K txn/s, and every writer acquisition paid the
-/// large-WAL overhead (`writer_held` stayed ~219 ms with `wait` 323 ms ⇒ writers
-/// saturated), while each eventual TRUNCATE took ~1.9 s — expensive precisely
-/// because it drained half a gigabyte. A small cap keeps both costs low: frequent
-/// background TRUNCATEs of a small WAL are cheap, acquisitions stay fast, and the
-/// hot COMMIT path still never checkpoints (the A2 invariant).
+/// 160 MiB (cycle-10, bracketed by measurement). The sweep at SF-100 @10K txn/s:
+/// at 512 MiB the WAL reached ~370 MB between drains and every writer acquisition
+/// paid the large-WAL overhead (`writer_held` ~219 ms, `wait` 323 ms), each
+/// TRUNCATE costing ~1.9 s (it drained half a gigabyte); at 48 MiB the TRUNCATEs
+/// fired so often their brief writer-lock made writes hostile (`writer_held` rose
+/// to ~307 ms even though the WAL stayed small). 160 MiB sits between the brackets
+/// — TRUNCATEs ~3× rarer than at 48 MiB while the file stays modest for readers —
+/// and the hot COMMIT path still never checkpoints (the A2 invariant).
 const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 160 * 1024 * 1024;
 // cycle-10 CORRECTION to the 48 MiB rationale above: benchmarked 48 MiB showed the
 // large-WAL acquisition tax was NOT the held-time driver (WAL max 369->77 MB yet
@@ -149,9 +150,10 @@ pub struct SqliteMetastoreConfig {
     /// continuous writer, never truncates the `-wal` file — it plateaus at its
     /// high-water mark. A TRUNCATE reclaims the file but briefly takes the WAL
     /// write lock, so it is gated behind this cap and runs ONLY on the background
-    /// tick, NEVER on the hot write path. Defaults to 512 MiB: large enough that
-    /// a busy table rarely hits it (the PASSIVE drain keeps the live frame count
-    /// low) yet small enough to bound the file if a tick ever lags. `0` makes
+    /// tick, NEVER on the hot write path. Defaults to
+    /// [`DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES`] (160 MiB — bracketed by
+    /// measurement; see that const's rationale): TRUNCATEs are infrequent enough
+    /// not to tax writers, yet the file stays bounded if a tick lags. `0` makes
     /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
     pub wal_truncate_threshold_bytes: u64,
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs

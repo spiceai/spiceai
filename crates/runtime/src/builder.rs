@@ -72,6 +72,8 @@ const CAYENNE_METASTORE_MMAP_MB_PARAM: &str = "cayenne_metastore_mmap_mb";
 const CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM: &str = "cayenne_metastore_busy_timeout_ms";
 const CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM: &str =
     "cayenne_metastore_wal_autocheckpoint_pages";
+const CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM: &str =
+    "cayenne_metastore_wal_truncate_threshold_mb";
 const CAYENNE_METASTORE_AUTO_VACUUM_PARAM: &str = "cayenne_metastore_auto_vacuum";
 
 /// Runtime param: fraction of `runtime.query.memory_limit` carved into a
@@ -96,6 +98,7 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_MMAP_MB_PARAM,
     CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM,
     CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
+    CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
 ];
 
@@ -373,7 +376,7 @@ impl RuntimeBuilder {
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,
-                "cayenne_metastore_wal_truncate_threshold_mb",
+                CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
             ) {
                 metastore_cfg.wal_truncate_threshold_bytes =
                     u64::try_from(v.saturating_mul(1024 * 1024))
