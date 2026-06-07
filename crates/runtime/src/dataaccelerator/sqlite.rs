@@ -742,6 +742,94 @@ mod tests {
         assert_eq!(total_rows, 5, "should round-trip all 5 decimal rows");
     }
 
+    /// Regression test mirroring the Postgres/MySQL quickstart E2E failure
+    /// where a `List<Utf8>` column accelerated into SQLite read back with
+    /// `Failed to decode value: Json error: Encountered unexpected 'e' whilst
+    /// parsing value`.
+    ///
+    /// SQLite has no array storage class, so the list is persisted as TEXT and
+    /// the accelerated read path JSON-parses that text back into the declared
+    /// `List<Utf8>`. The write side must therefore emit *valid JSON*
+    /// (`["expired","active"]`), not the bare `[expired, active]` that
+    /// `ArrayFormatter` produces. The list values intentionally include strings
+    /// with spaces and embedded quotes to exercise JSON quoting/escaping.
+    #[tokio::test]
+    async fn test_sqlite_list_round_trip() {
+        use arrow::array::{ListBuilder, StringBuilder};
+
+        let item_field = arrow::datatypes::Field::new("item", DataType::Utf8, true);
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "tags",
+                DataType::List(Arc::new(item_field)),
+                true,
+            ),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("list_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // List<Utf8> values, including strings with spaces and quotes -- exactly
+        // the shape the buggy ArrayFormatter path rendered as invalid JSON.
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder.values().append_value("expired");
+        list_builder.values().append_value("active");
+        list_builder.append(true);
+        list_builder.values().append_value("needs \"quote\"");
+        list_builder.values().append_value("has space");
+        list_builder.append(true);
+        let tags = list_builder.finish();
+        let ids = Int64Array::from(vec![1, 2]);
+
+        let data =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(tags)])
+                .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Read back -- this is where the regression manifests: the SQLite TEXT
+        // cell must be valid JSON for the List cast to succeed.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back List<Utf8> data without a JSON decode error");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "should round-trip all 2 list rows");
+    }
+
     #[tokio::test]
     async fn test_sqlite_file_initialization() {
         let app = app::AppBuilder::new("test").build();
