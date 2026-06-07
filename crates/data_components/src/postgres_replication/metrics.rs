@@ -25,7 +25,7 @@ limitations under the License.
 
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::SystemTime;
 
@@ -44,7 +44,8 @@ pub struct MetricsCollector {
 
     // Bootstrap progress.
     bootstrap_rows_total: AtomicU64,
-    bootstrap_rows_expected: AtomicU64, // 0 = unknown; set from extended schema inference
+    bootstrap_rows_expected: AtomicU64, // valid only when `bootstrap_rows_expected_known`
+    bootstrap_rows_expected_known: AtomicBool, // false = no estimate yet (distinct from `0`)
     bootstrap_complete: AtomicU64,      // 0 = running/not-started, 1 = done
 
     // LSN position.
@@ -95,21 +96,32 @@ impl MetricsCollector {
     }
 
     /// Set the estimated total rows to bootstrap (from extended schema inference).
-    /// `0` leaves the total unknown. Enables a progress fraction during the snapshot.
+    /// Marks the estimate as known, so a count of `0` is a valid value (a known-empty
+    /// source table) rather than being conflated with "no estimate available".
     pub fn set_bootstrap_rows_expected(&self, n: u64) {
         self.bootstrap_rows_expected.store(n, Ordering::Relaxed);
+        self.bootstrap_rows_expected_known
+            .store(true, Ordering::Relaxed);
     }
+    /// The estimated bootstrap row total, or `None` when no estimate is available
+    /// (extended schema inference is off or surfaced no row count). `Some(0)` is a
+    /// known-empty source table — deliberately distinct from `None`.
     #[must_use]
-    pub fn bootstrap_rows_expected(&self) -> u64 {
-        self.bootstrap_rows_expected.load(Ordering::Relaxed)
+    pub fn bootstrap_rows_expected(&self) -> Option<u64> {
+        if self.bootstrap_rows_expected_known.load(Ordering::Relaxed) {
+            Some(self.bootstrap_rows_expected.load(Ordering::Relaxed))
+        } else {
+            None
+        }
     }
-    /// Bootstrap progress as a percent (0–100), or `None` when the expected total
-    /// is unknown. Clamped to 100 since the source estimate is approximate.
+    /// Bootstrap progress as a percent (0–100), or `None` when the expected total is
+    /// unknown. A known-empty source table (`Some(0)`) reports `Some(100)` — the
+    /// snapshot is trivially complete. Clamped to 100 since the estimate is approximate.
     #[must_use]
     pub fn bootstrap_progress_percent(&self) -> Option<u64> {
-        let expected = self.bootstrap_rows_expected.load(Ordering::Relaxed);
+        let expected = self.bootstrap_rows_expected()?;
         if expected == 0 {
-            return None;
+            return Some(100);
         }
         let total = self.bootstrap_rows_total.load(Ordering::Relaxed);
         Some((total.saturating_mul(100) / expected).min(100))
@@ -215,7 +227,7 @@ impl Metrics {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
     }
     #[must_use]
-    pub fn bootstrap_rows_expected(&self) -> u64 {
+    pub fn bootstrap_rows_expected(&self) -> Option<u64> {
         self.collector.bootstrap_rows_expected()
     }
     /// Bootstrap progress percent (0–100), or `None` when the expected total is unknown.
@@ -311,16 +323,29 @@ mod tests {
     fn bootstrap_progress_tracks_expected() {
         let c = MetricsCollector::new();
         let m = Metrics::new(Arc::clone(&c));
-        // Unknown until an expected total is set.
+        // Unknown until an expected total is set: both the estimate and the progress
+        // percent read as `None` (never a misleading `0`).
+        assert_eq!(m.bootstrap_rows_expected(), None);
         assert_eq!(m.bootstrap_progress_percent(), None);
 
         c.set_bootstrap_rows_expected(200);
         c.add_bootstrap_rows(50);
-        assert_eq!(m.bootstrap_rows_expected(), 200);
+        assert_eq!(m.bootstrap_rows_expected(), Some(200));
         assert_eq!(m.bootstrap_progress_percent(), Some(25));
 
         // The estimate can be exceeded; progress clamps at 100.
         c.add_bootstrap_rows(1000);
+        assert_eq!(m.bootstrap_progress_percent(), Some(100));
+    }
+
+    #[test]
+    fn bootstrap_empty_table_is_distinct_from_unknown() {
+        // A known-empty source table (expected `0`) is a complete bootstrap, not
+        // "unknown" — `0` must not be conflated with an absent estimate.
+        let c = MetricsCollector::new();
+        let m = Metrics::new(Arc::clone(&c));
+        c.set_bootstrap_rows_expected(0);
+        assert_eq!(m.bootstrap_rows_expected(), Some(0));
         assert_eq!(m.bootstrap_progress_percent(), Some(100));
     }
 

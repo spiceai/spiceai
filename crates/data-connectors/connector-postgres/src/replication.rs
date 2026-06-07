@@ -265,7 +265,8 @@ const METRICS: &[MetricSpec] = &[
     )
     .description(
         "Estimated total rows for the initial-snapshot bootstrap, from extended schema \
-             inference (0 when unknown). Progress = bootstrap_rows_total / bootstrap_rows_expected.",
+             inference. Not reported when no estimate is available (`0` means a known-empty \
+             source table). Progress = bootstrap_rows_total / bootstrap_rows_expected.",
     )
     .auto_register(),
     MetricSpec::new(
@@ -397,7 +398,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             }
             "replication_bootstrap_rows_expected" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    instrument.observe(m.bootstrap_rows_expected(), &attributes);
+                    // Observe only when an estimate exists, so an absent series (rather
+                    // than `0`) means "unknown" and `0` is a known-empty source table.
+                    if let Some(expected) = m.bootstrap_rows_expected() {
+                        instrument.observe(expected, &attributes);
+                    }
                 })))
             }
             "replication_bootstrap_complete" => {

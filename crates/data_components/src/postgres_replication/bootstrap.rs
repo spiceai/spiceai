@@ -209,7 +209,7 @@ pub fn snapshot_stream(
                     tracing::debug!(
                         dataset = %dataset_name,
                         rows = total_rows,
-                        expected = metrics.bootstrap_rows_expected(),
+                        expected = ?metrics.bootstrap_rows_expected(),
                         progress_percent = percent,
                         "initial snapshot bootstrap progress"
                     );
@@ -250,7 +250,7 @@ pub fn snapshot_stream(
         tracing::info!(
             dataset = %dataset_name,
             rows = total_rows,
-            expected = metrics.bootstrap_rows_expected(),
+            expected = ?metrics.bootstrap_rows_expected(),
             "initial snapshot bootstrap complete"
         );
 
