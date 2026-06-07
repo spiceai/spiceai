@@ -2411,7 +2411,16 @@ const fn subset_merge_write_shape(
     if keeps_positions_serial {
         (1, None)
     } else {
-        (session_target_partitions, Some(total_input_bytes))
+        // Clamp to >= 1, matching the defensive treatment of
+        // `target_partitions` elsewhere (e.g. vortex `format.rs` and the
+        // runtime builder treat 0 as invalid): a zeroed session config must
+        // not propagate a 0 cap into the write path.
+        let cap = if session_target_partitions == 0 {
+            1
+        } else {
+            session_target_partitions
+        };
+        (cap, Some(total_input_bytes))
     }
 }
 
@@ -8795,7 +8804,9 @@ impl CayenneTableProvider {
         //   above) and PK-less tables on the legacy `PositionBased` strategy.
         //   Their tombstones are file-path scoped and the rewrite's position
         //   bake-in assumes a single output sequence, so they keep the serial
-        //   single-file shape explicitly.
+        //   single-WRITER shape explicitly (even a serial writer still rolls
+        //   multiple files past the target size — see the
+        //   `subset_merge_write_shape` docs).
         let keeps_positions_serial =
             serialize_position_deletes || self.pk_deletion_strategy.is_position_based();
         let (target_partitions, estimated_bytes) = subset_merge_write_shape(
@@ -12678,6 +12689,13 @@ mod tests {
             (CORES, Some(BYTES)),
             "non-position tables must widen to the session partitions with \
              the tier's byte estimate"
+        );
+        // A zeroed session config must not propagate a 0 cap (defensive
+        // parity with `target_partitions().max(1)` call sites elsewhere).
+        assert_eq!(
+            subset_merge_write_shape(false, 0, BYTES),
+            (1, Some(BYTES)),
+            "target_partitions == 0 must clamp to a single writer, not zero"
         );
     }
 
