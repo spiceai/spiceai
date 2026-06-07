@@ -55,6 +55,23 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     dataset
 }
 
+/// Like [`make_mongodb_dataset`] (DuckDB-accelerated, full refresh) but opts into
+/// `schema_inference: extended` with no explicit primary key, so the runtime infers
+/// `_id` as the primary key and surfaces the collection's secondary indexes and sort
+/// order. The non-CDC counterpart to [`make_mongodb_change_stream_dataset_inferred`].
+#[cfg(feature = "duckdb")]
+pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    let mut dataset = make_mongodb_dataset(path, name, port, false);
+    dataset.schema_inference = SchemaInference::Extended;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
