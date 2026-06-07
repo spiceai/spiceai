@@ -726,8 +726,6 @@ impl PartitionResultStream {
                 MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE,
                 use_tls,
                 customize_endpoint,
-                3,
-                250,
             )
             .await
             .map_err(|e| {
@@ -744,8 +742,9 @@ impl PartitionResultStream {
                 .fetch_partition(
                     &executor_meta.id,
                     &location.partition_id,
-                    location.file_id,
-                    location.is_sort_shuffle,
+                    &location.path,
+                    &executor_meta.host,
+                    executor_meta.port,
                     USE_FLIGHT_TRANSFER,
                 )
                 .await
