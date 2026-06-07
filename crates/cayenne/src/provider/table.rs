@@ -15675,12 +15675,15 @@ mod tests {
         // 256 MB target file size ⇒ encode-shard unit = target/16 = 16 MiB.
         let tsb = 256 * 1024 * 1024usize;
         let mib = 1024 * 1024u64;
+        // The table sets no explicit cayenne_write_concurrency, so the shard
+        // count is capped at `snapshot_write_concurrency` = DEFAULT_WRITE_CONCURRENCY
+        // (4) clamped to session_target_partitions (8) ⇒ 4.
         // A small exact delta (< one unit) stays a single file.
         assert_eq!(provider.snapshot_shard_count(8, tsb, Some(2 * mib)), 1);
-        // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16,
-        // clamped to the requested write concurrency.
-        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib)), 8);
-        // Mid-size flush: 48 MiB / 16 MiB = 3 shards.
+        // A checkpoint-sized flush earns real fan-out: 256 MiB / 16 MiB = 16
+        // unit-shards, capped to the write-concurrency ceiling (4).
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(256 * mib)), 4);
+        // Mid-size flush: 48 MiB / 16 MiB = 3 shards (under the cap ⇒ unit-driven).
         assert_eq!(provider.snapshot_shard_count(8, tsb, Some(48 * mib)), 3);
         // A tiny configured target (≤ 16 MiB) keeps the old whole-file unit.
         let small_tsb = 8 * 1024 * 1024usize;
@@ -15854,8 +15857,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_shard_count_boundary_scales_with_target_files() {
-        // Between the extremes the shard count tracks the number of target files
-        // the write fills, capped at write_concurrency.
+        // The shard count tracks the number of *encode-shard units* the write
+        // fills, capped at write_concurrency. cycle-2: the unit is target/16
+        // (floored at 16 MiB), not the whole target-file size — small CDC deltas
+        // stay single-file while checkpoint-scale flushes fan out.
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ctx = SessionContext::new();
         let (provider, _temp_dir) = create_sorted_cayenne_table(
@@ -15867,19 +15872,23 @@ mod tests {
         .await;
 
         let tsb = provider.context.target_file_size_bytes();
-        let unit = tsb as u64;
+        // Mirror the production unit formula so this is robust to the default
+        // target_file_size: clamp(target/16, min(16 MiB, target), target).
+        let target = tsb as u64;
+        let unit = (target / 16).clamp((16 * 1024 * 1024u64).min(target), target);
 
-        // Exactly 1 file's worth ⇒ 1 shard (need to *exceed* one file to earn a
-        // second).
+        // < 1 unit ⇒ 1 shard (need to *fill* a unit to earn a second).
+        assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit - 1)), 1);
+        // Exactly 1 unit ⇒ 1 shard.
         assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit)), 1);
-        // 3 files' worth ⇒ 3 shards (below the concurrency cap of 8).
+        // 3 units' worth ⇒ 3 shards (below the concurrency cap of 4).
         assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 3)), 3);
-        // 3.9 files' worth still floors to 3 shards.
+        // 3.9 units' worth still floors to 3 shards.
         assert_eq!(
             provider.snapshot_shard_count(8, tsb, Some(unit * 3 + unit * 9 / 10)),
             3
         );
-        // 12 files' worth, but with no per-table override the default
+        // 12 units' worth, but with no per-table override the default
         // write_concurrency is DEFAULT_WRITE_CONCURRENCY (4), so it clamps to 4.
         assert_eq!(provider.snapshot_shard_count(8, tsb, Some(unit * 12)), 4);
     }
