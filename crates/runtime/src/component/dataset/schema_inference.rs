@@ -442,6 +442,18 @@ mod tests {
     }
 
     #[test]
+    fn does_not_apply_sort_for_changes_refresh_mode() {
+        let mut acc = accel(Engine::DuckDB);
+        acc.refresh_mode = Some(RefreshMode::Changes);
+        let inferred = InferredSchema {
+            sort_columns: vec![sort("created_at", true)],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at"]), "ds");
+        assert!(acc.params.is_empty());
+    }
+
+    #[test]
     fn empty_inferred_is_noop() {
         let mut acc = accel(Engine::DuckDB);
         apply_inferred_schema(&mut acc, &InferredSchema::default(), &schema(&["id"]), "ds");
