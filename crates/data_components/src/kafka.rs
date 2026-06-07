@@ -765,7 +765,7 @@ impl KafkaConsumer {
                 // same timeout rather than assuming messages are already
                 // buffered after the first poll.
                 let mut stream = Box::pin(temp_consumer.consumer.stream());
-                let mut burst = Vec::new();
+                let mut burst: Vec<rdkafka::message::OwnedMessage> = Vec::new();
 
                 while burst.len() < TOMBSTONE_SCAN_WINDOW {
                     let poll_timeout = std::cmp::min(
@@ -778,15 +778,15 @@ impl KafkaConsumer {
                             if msg.offset() > window_end {
                                 break; // Past the window
                             }
-                            burst.push(msg);
+                            burst.push(msg.detach());
                         }
-                        Ok(Some(Err(e))) => {
                         Ok(Some(Err(e))) => {
                             return Err(Error::UnableToReceiveMessage { source: e });
                         }
                         Ok(None) => break,
                         Err(_) if Instant::now() < deadline => continue,
                         Err(_) => break,
+                    }
                 }
 
                 // Search backward through the burst for a non-tombstone.
