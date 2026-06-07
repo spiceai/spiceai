@@ -13,7 +13,7 @@ expression: response
   ],
   "sql": {
     "engine": "Apache DataFusion",
-    "version": "52.5.0",
+    "version": "53.1.0",
     "dialect": "PostgreSQL",
     "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
     "notes": [
