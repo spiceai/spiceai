@@ -350,6 +350,22 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_row_range(row_range);
             }
 
+            // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
+            // `StatFn`). The conjuncts collected here are translated to a Vortex
+            // `Expression` and handed to `ScanBuilder::with_some_filter` below. Inside
+            // Vortex the zoned layout reader rewrites that expression into a stats
+            // predicate (`Expression::falsify`) and prunes whole zones whose min/max
+            // can't satisfy it (`ZoneMap::prune`). Dynamic hash-join filters (the
+            // InList fragments produced by the native dynamic-filter pass) flow through
+            // the same path: `collect_vortex_pushdown_conjunct` unwraps
+            // `DynamicFilterPhysicalExpr` via `.current()` at file-open time (not plan
+            // build time), and Vortex's `PruningResult::mask()` re-derives the zone mask
+            // whenever the dynamic expression's version advances — so a build side that
+            // populates after the scan starts still prunes zones. `VortexAccessPlan`
+            // (applied above) only adds a row `Selection`; it does not bypass this
+            // filter, so stats pruning still engages under position-delete scans.
+            // Filters Vortex can't translate (`skipped_dynamic`) are dropped here but
+            // still feed the coarser per-file `FilePruner`/`PrunableStream` above.
             let filter = filter
                 .and_then(|f| {
                     // Verify that all filters we've accepted from DataFusion get pushed down.
