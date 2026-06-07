@@ -19,7 +19,7 @@ limitations under the License.
 //! Cayenne exposes many `cayenne_*` knobs whose optimal values depend on the
 //! host (cores, RAM, storage medium) and the workload (refresh mode / ingest
 //! shape). Hand-tuning them per deployment is brittle: a config tuned for a
-//! 128-core box with local NVMe is wrong for a 4-core container on EBS, and a
+//! 128-core box with local `NVMe` is wrong for a 4-core container on EBS, and a
 //! config tuned for a bulk backfill is wrong for steady-state CDC. This module
 //! derives a coherent default for the memory-/cpu-/storage-sensitive knobs from
 //! a single [`HardwareProfile`] so the knobs move *together* for the host
@@ -354,15 +354,15 @@ pub(crate) fn read_knob(acceleration: &Acceleration, keys: &[&str]) -> Knob {
         if value.eq_ignore_ascii_case("auto") {
             return Knob::Auto;
         }
-        return match value.parse::<usize>() {
-            Ok(n) => Knob::Set(n),
-            Err(_) => {
+        return value.parse::<usize>().map_or_else(
+            |_| {
                 tracing::warn!(
                     "An invalid '{key}' value was provided: '{raw}'. Expected a non-negative integer or 'auto'; using the auto-derived default. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
                 );
                 Knob::Auto
-            }
-        };
+            },
+            Knob::Set,
+        );
     }
     Knob::Auto
 }

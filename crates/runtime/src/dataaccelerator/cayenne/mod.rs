@@ -223,7 +223,7 @@ fn is_upsert_on_conflict(
 }
 
 /// Build the auto-tune [`autotune::WorkloadProfile`] from the dataset's refresh
-/// mode, its resolved primary keys / on_conflict, and any extended-schema-
+/// mode, its resolved primary keys / `on_conflict`, and any extended-schema-
 /// inference metadata carried on the Arrow schema (`spice.inferred_row_count` /
 /// `spice.inferred_table_bytes`, see `data_components::inferred_schema`). Every
 /// signal degrades gracefully: an unknown one falls back to the hardware-only
