@@ -692,21 +692,29 @@ pub trait MetadataCatalog: Send + Sync {
     /// and append new inline data rows.
     ///
     /// Inline mutations rewrite row-store metadata entries in place instead of adding
-    /// delete-marker side records. Newly appended inline data rows receive a fresh
-    /// sequence number when present; rewritten rows retain their original sequence.
+    /// delete-marker side records. Newly appended inline data rows are stamped with
+    /// the caller-supplied `assigned_sequence` (all appended rows in one call share
+    /// that sequence); rewritten rows retain their original sequence.
     ///
-    /// Returns `Some(sequence_number)` with the sequence assigned to the newly
-    /// appended `data` rows (all appended rows in one call share that sequence),
-    /// or `None` when no new data rows were appended. Callers use this to gate
-    /// the in-memory visibility of the appended rows behind a published
-    /// watermark so concurrent scans never observe them before their paired
-    /// in-memory changes (e.g. a file deletion-cache update) are published.
+    /// `assigned_sequence` is reserved by the caller from the per-table in-memory
+    /// sequence allocator (lever B2) — strictly above any other sequence the
+    /// caller allocated for the same logical operation (e.g. a paired file
+    /// `delete_seq`). This call performs NO counter mutation: the allocator owns
+    /// allocation and keeps `cayenne_table.current_sequence_number` at-or-ahead
+    /// via its reserve-ahead refill, so stamping the row from a bound parameter
+    /// (instead of bumping + reading back the DB counter) keeps the inlined-row
+    /// sequence strictly above every value the allocator has handed out.
+    ///
+    /// Returns `Some(assigned_sequence)` when new `data` rows were appended (so
+    /// the caller can advance its published-visibility watermark), or `None` when
+    /// no new data rows were appended.
     async fn commit_inlined_mutation(
         &self,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
+        assigned_sequence: i64,
     ) -> CatalogResult<Option<i64>>;
 
     /// Get all inlined delete entries for a table.

@@ -2316,6 +2316,7 @@ impl MetadataCatalog for CayenneCatalog {
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
+        assigned_sequence: i64,
     ) -> CatalogResult<Option<i64>> {
         if updated_data.is_empty() && deleted_inlined_ids.is_empty() && data.is_empty() {
             return Ok(None);
@@ -2347,7 +2348,10 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        let sequence_increment = i64::from(!data.is_empty());
+        // The appended rows are stamped with the caller-supplied
+        // `assigned_sequence` (lever B2). `None` when no rows are appended, so
+        // the caller does not advance its visibility watermark for a no-op.
+        let appended_sequence = (!data.is_empty()).then_some(assigned_sequence);
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
@@ -2363,39 +2367,11 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             })?;
 
-            // Sequence assigned to the appended `data` rows (all share one
-            // sequence per call).
-            let mut assigned_sequence: Option<i64> = None;
-
-            if sequence_increment > 0 {
-                let row_values = tx
-                    .query_row_values(QueryRowParams {
-                        sql: "UPDATE cayenne_table SET current_sequence_number = current_sequence_number + ?1 WHERE table_id = ?2 RETURNING current_sequence_number",
-                        params: vec![
-                            MetastoreValue::Integer(sequence_increment),
-                            MetastoreValue::Text(table_id.to_string()),
-                        ],
-                    })
-                    .await
-                    .map_err(|e| CatalogError::InvalidOperation {
-                        message: "Failed to execute inline mutation transaction".to_string(),
-                        source: Box::new(e),
-                    })?;
-                let value =
-                    row_values
-                        .first()
-                        .ok_or_else(|| CatalogError::InvalidOperationNoSource {
-                            message: "Inline mutation sequence update returned no columns"
-                                .to_string(),
-                        })?;
-                assigned_sequence =
-                    Some(
-                        i64::from_value(value).map_err(|e| CatalogError::InvalidOperation {
-                            message: "Failed to parse inline mutation sequence number".to_string(),
-                            source: Box::new(e),
-                        })?,
-                    );
-            }
+            // Lever B2: NO counter mutation here. Allocation moved to the
+            // in-memory `SeqAllocator` on the provider; the DB high-water is kept
+            // at-or-ahead by the allocator's reserve-ahead refill, so the
+            // appended row is stamped directly from `assigned_sequence` below
+            // (a bound parameter) instead of bumping + reading back the counter.
 
             for updated in &updated_data {
                 tx.execute(ExecuteParams {
@@ -2443,7 +2419,7 @@ impl MetadataCatalog for CayenneCatalog {
                     sql: r"
                     INSERT INTO cayenne_inlined_data
                         (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
-                    VALUES (?1, ?2, ?3, ?4, ?5, (SELECT current_sequence_number FROM cayenne_table WHERE table_id = ?2))
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                     ",
                     params: vec![
                         MetastoreValue::Text(inlined_id),
@@ -2451,6 +2427,10 @@ impl MetadataCatalog for CayenneCatalog {
                         data_entry.partition_key.clone().into(),
                         MetastoreValue::Blob(data_entry.data_ipc.clone()),
                         MetastoreValue::Integer(data_entry.record_count),
+                        // Lever B2: stamp the caller-allocated sequence directly,
+                        // replacing the prior correlated subquery read of the DB
+                        // counter (which no longer moves inside this txn).
+                        MetastoreValue::Integer(assigned_sequence),
                     ],
                 })
                 .await
@@ -2461,7 +2441,7 @@ impl MetadataCatalog for CayenneCatalog {
             }
 
             match tx.commit().await {
-                Ok(()) => return Ok(assigned_sequence),
+                Ok(()) => return Ok(appended_sequence),
                 Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
                     let delay = retry_backoff_delay(attempt);
                     tracing::debug!(

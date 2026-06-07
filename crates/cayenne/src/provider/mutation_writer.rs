@@ -764,11 +764,10 @@ impl<'a> AppendMutationWriter<'a> {
         // `publish_cas` is the atomic deletion-cache + protected-snapshot publish.
         let publish_start = Instant::now();
         let seq_start = Instant::now();
-        let new_sequence = self
-            .table
-            .catalog()
-            .increment_sequence_number(self.table.table_id())
-            .await?;
+        // Lever B2: in-memory allocator (shared with the staged path on this
+        // same provider), so the sync-publish snapshot sequence stays on the one
+        // monotone source instead of acquiring the metastore writer here.
+        let new_sequence = self.table.reserve_sequences_local(1).await?;
 
         // Durably record the new snapshot's sequence before making it visible.
         self.table

@@ -1559,6 +1559,84 @@ struct CachedTableStatistics {
     raw: Option<TableStatistics>,
 }
 
+/// Block size for the in-memory sequence allocator (lever B2). Each metastore
+/// `UPDATE … += BLOCK … RETURNING` refill durably reserves this many sequence
+/// numbers in one writer acquisition; they are then served from memory until
+/// exhausted, amortizing the writer cost to ~1/BLOCK reservations. A crash
+/// wastes at most `BLOCK - 1` sequences (the unused tail of the current block)
+/// but can NEVER reissue one (the DB high-water is always >= every handed-out
+/// value — see `SeqAllocator` and `reserve_sequences_local`). There is no
+/// correctness ceiling on this value; it only trades waste-on-crash against
+/// refill frequency.
+pub(crate) const SEQ_RESERVE_BLOCK: i64 = 1024;
+
+/// In-memory sequence allocator (lever B2). Hands out monotonic per-table
+/// sequence numbers WITHOUT acquiring the metastore writer on the hot path.
+///
+/// `next` is the lowest UNUSED sequence; `persisted_hi` is the highest value
+/// durably reserved in `cayenne_table.current_sequence_number`.
+///
+/// INVARIANT (held whenever the allocator lock is not inside a refill):
+/// `next - 1 <= persisted_hi` — every value already handed out is `<=
+/// persisted_hi`, i.e. the DB row is always at-or-ahead of what we have issued.
+/// The refill durably bumps `persisted_hi` (an fsynced `UPDATE … RETURNING`)
+/// BEFORE advancing `next` past the newly reserved range, so a crash/restart
+/// reseeds from a DB high-water that is `>=` every value ever handed out and
+/// therefore never reissues one. See `reserve_sequences_local`.
+pub(crate) struct SeqAllocator {
+    /// Next sequence number to hand out.
+    next: i64,
+    /// Highest value durably written to `cayenne_table.current_sequence_number`.
+    persisted_hi: i64,
+}
+
+/// Reserve `count` (>= 1) consecutive sequence numbers from a shared in-memory
+/// allocator (lever B2), refilling from the metastore only when the in-memory
+/// block is exhausted. Returns the FIRST of the contiguous reserved block (the
+/// half-open range `first ..= first + count - 1`). This is the single
+/// implementation shared by [`CayenneTableProvider::reserve_sequences_local`]
+/// and the DML delete sink, so every sequence handout for a table goes through
+/// one monotone source.
+///
+/// See [`CayenneTableProvider::reserve_sequences_local`] for the
+/// monotonicity-on-reopen correctness argument.
+pub(crate) async fn reserve_sequences_in(
+    allocator: &tokio::sync::Mutex<SeqAllocator>,
+    catalog: &Arc<dyn MetadataCatalog>,
+    table_id: &str,
+    table_name: &str,
+    count: u32,
+) -> CatalogResult<i64> {
+    let count = i64::from(count.max(1));
+    let mut allocator = allocator.lock().await;
+
+    if allocator.next + count - 1 > allocator.persisted_hi {
+        let bump = std::cmp::max(SEQ_RESERVE_BLOCK, count);
+        let bump_u32 = u32::try_from(bump).unwrap_or(u32::MAX);
+        let block_first = catalog.reserve_sequence_numbers(table_id, bump_u32).await?;
+        let reserved = i64::from(bump_u32);
+        let new_hi = block_first.checked_add(reserved - 1).ok_or_else(|| {
+            CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "sequence-number high-water overflow reserving {reserved} for table {table_name}"
+                ),
+            }
+        })?;
+        allocator.next = std::cmp::max(allocator.next, block_first);
+        allocator.persisted_hi = new_hi;
+    }
+
+    let first = allocator.next;
+    allocator.next += count;
+    debug_assert!(
+        allocator.next - 1 <= allocator.persisted_hi,
+        "B2 invariant violated: next-1 ({}) > persisted_hi ({})",
+        allocator.next - 1,
+        allocator.persisted_hi,
+    );
+    Ok(first)
+}
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -1744,6 +1822,16 @@ pub struct CayenneTableProvider {
     /// `scan_state_lock.write()` — atomically with the paired file
     /// deletion-cache update.
     published_inlined_seq: Arc<AtomicI64>,
+    /// In-memory sequence allocator (lever B2). The single source of truth for
+    /// every sequence number this table hands out — the staged/sync on-conflict
+    /// paths, the inline-insert path, the checkpoint flush, the publish path,
+    /// and the DML delete sinks all route through it so memory and the DB row
+    /// never diverge in a way that reorders handouts. Behind a
+    /// `tokio::sync::Mutex` because a refill awaits the metastore `UPDATE`; the
+    /// common (in-block) path takes the lock, does arithmetic, drops it (no
+    /// `await`). Shared across `clone_for_write` clones — the provider is a
+    /// per-table singleton, so all writers of one table share one allocator.
+    seq_allocator: Arc<tokio::sync::Mutex<SeqAllocator>>,
     /// Inline-conflict tombstones (Option D) that Stage-B has activated IN
     /// MEMORY but whose DURABLE `published = 1` flip has been deferred (cycle-4
     /// lever b1★ — Stage-B writer-free).
@@ -4598,6 +4686,18 @@ impl CayenneTableProvider {
         // gated until published.
         let initial_inlined_seq = table_metadata.current_sequence_number;
 
+        // Seed the in-memory sequence allocator (lever B2) from the DB
+        // high-water. `next = persisted_hi + 1` is the first unused sequence;
+        // the allocator invariant `next - 1 == persisted_hi` holds at open with
+        // zero handed-out values. A reopen after a crash reseeds from the (only
+        // ever monotonically increasing) DB row, so every previously handed-out
+        // value is strictly below the new `next` — nothing is reissued.
+        let persisted_hi = table_metadata.current_sequence_number;
+        let seq_allocator = Arc::new(tokio::sync::Mutex::new(SeqAllocator {
+            next: persisted_hi + 1,
+            persisted_hi,
+        }));
+
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
 
         // Register the S3 object store in the shared RuntimeEnv once during
@@ -4659,6 +4759,7 @@ impl CayenneTableProvider {
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
+            seq_allocator,
             inlined_locally_published: Arc::new(ParkingMutex::new(HashSet::new())),
             pending_durable_tombstone_flips: Arc::new(ParkingMutex::new(Vec::new())),
             pending_tombstone_deltas: Arc::new(ParkingMutex::new(PendingTombstoneDeltas::default())),
@@ -5337,6 +5438,9 @@ impl CayenneTableProvider {
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
+            // Shared so every writer clone of the same table allocates from one
+            // monotone source (lever B2) — memory and the DB row never diverge.
+            seq_allocator: Arc::clone(&self.seq_allocator),
             inlined_locally_published: Arc::clone(&self.inlined_locally_published),
             pending_durable_tombstone_flips: Arc::clone(&self.pending_durable_tombstone_flips),
             pending_tombstone_deltas: Arc::clone(&self.pending_tombstone_deltas),
@@ -5355,6 +5459,40 @@ impl CayenneTableProvider {
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             background_compactor: Arc::clone(&self.background_compactor),
         }
+    }
+
+    /// Reserve `count` (>= 1) consecutive sequence numbers in-memory (lever B2).
+    /// Returns the FIRST of the contiguous block `[first, first + count)`.
+    ///
+    /// Acquires the metastore writer ONLY when the in-memory block is exhausted
+    /// (amortized ~1/`SEQ_RESERVE_BLOCK` reservations); the common path is a
+    /// `tokio::sync::Mutex` lock + arithmetic with no `await`, so it removes the
+    /// per-batch writer-queue wait that `stage_seq_reserve` measured.
+    ///
+    /// # Correctness (monotonicity-on-reopen)
+    ///
+    /// The refill durably bumps the DB high-water (`reserve_sequence_numbers`,
+    /// an fsynced autocommit `UPDATE … += bump … RETURNING`) and sets
+    /// `persisted_hi = new_hi` BEFORE advancing `next` past the reserved range,
+    /// so the invariant `next - 1 <= persisted_hi` holds at every point an
+    /// outside observer (another task, or the next process after a crash) can
+    /// read either value. A crash therefore wastes at most `SEQ_RESERVE_BLOCK -
+    /// 1` sequences (the unused tail of the last block) but reseeds from a DB
+    /// row that is `>=` every value ever handed out — no value is ever reissued.
+    /// The lock is held across the refill `await`, so concurrent bursts cannot
+    /// double-refill or observe a torn `persisted_hi`, and a multi-writer race
+    /// is resolved by the metastore-serialized `+=` returning the authoritative
+    /// high-water (each process re-bases `next` to the start of the block it
+    /// durably claimed, so processes get disjoint blocks).
+    pub(crate) async fn reserve_sequences_local(&self, count: u32) -> CatalogResult<i64> {
+        reserve_sequences_in(
+            &self.seq_allocator,
+            &self.catalog,
+            &self.table_metadata.table_id,
+            &self.table_metadata.table_name,
+            count,
+        )
+        .await
     }
 
     async fn load_table_statistics(
@@ -5812,6 +5950,7 @@ impl CayenneTableProvider {
             Vec::new(),
             Arc::clone(self.context.runtime_env()),
             None,
+            Arc::clone(&self.seq_allocator),
         );
 
         for file_group in &listed.file_groups {
@@ -6991,8 +7130,12 @@ impl CayenneTableProvider {
         rewrite: InlinedDataRewrite,
         data: Vec<InlinedData>,
         appended_rows: usize,
+        assigned_sequence: Option<i64>,
     ) -> CatalogResult<()> {
-        let Some(commit) = self.commit_inlined_data_durable(rewrite, data).await? else {
+        let Some(commit) = self
+            .commit_inlined_data_durable(rewrite, data, assigned_sequence)
+            .await?
+        else {
             return Ok(());
         };
         self.publish_inlined_mutation(appended_rows, commit.removed_rows, commit.published_seq);
@@ -7002,14 +7145,34 @@ impl CayenneTableProvider {
     /// Durably commit an inlined-data mutation to the catalog WITHOUT publishing
     /// the in-memory visibility change. Returns `Some(InlinedDurableCommit)`
     /// when a commit occurred, or `None` when there was nothing to commit.
+    ///
+    /// `assigned_sequence` (lever B2) is the sequence to stamp on appended `data`
+    /// rows — it MUST be `Some` whenever `data` is non-empty (reserved by the
+    /// caller from the in-memory allocator, strictly above any paired
+    /// `delete_seq`). It is ignored for rewrite-/delete-only mutations (empty
+    /// `data`), which append no rows and therefore consume no sequence.
     async fn commit_inlined_data_durable(
         &self,
         rewrite: InlinedDataRewrite,
         data: Vec<InlinedData>,
+        assigned_sequence: Option<i64>,
     ) -> CatalogResult<Option<InlinedDurableCommit>> {
         if rewrite.is_empty() && data.is_empty() {
             return Ok(None);
         }
+
+        // Appended rows require a caller-reserved sequence; a rewrite-/delete-only
+        // mutation appends nothing and the value is unused by the catalog impl.
+        let stamp_sequence = if data.is_empty() {
+            assigned_sequence.unwrap_or(0)
+        } else {
+            assigned_sequence.ok_or_else(|| CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "internal: inline append for table {} has no reserved sequence (lever B2)",
+                    self.table_metadata.table_name
+                ),
+            })?
+        };
 
         let removed_rows = rewrite.removed_rows;
         let published_seq = self
@@ -7019,6 +7182,7 @@ impl CayenneTableProvider {
                 rewrite.updated_data,
                 rewrite.deleted_inlined_ids,
                 data,
+                stamp_sequence,
             )
             .await?;
 
@@ -7290,9 +7454,11 @@ impl CayenneTableProvider {
         // hold the single SQLite writer across object-store I/O, serializing
         // every other table behind this one's DV upload.
         let seq_reserve_start = Instant::now();
+        // Lever B2: serve the reserved block from the in-memory allocator. This
+        // hits the metastore writer only ~1/`SEQ_RESERVE_BLOCK` batches, so the
+        // `stage_seq_reserve` phase below now reads ~0 ms except on a refill.
         let base = self
-            .catalog
-            .reserve_sequence_numbers(&self.table_metadata.table_id, sequence_count)
+            .reserve_sequences_local(sequence_count)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!(
@@ -7879,9 +8045,10 @@ impl CayenneTableProvider {
         // the new file row stays visible. Reserving here, before the caller's
         // `increment_sequence_number`, satisfies both.
         let reserve_count = if has_file_key_deletions { 2 } else { 1 };
+        // Lever B2: same in-memory allocator as the staged path, so the sync
+        // last-resort path and the staged path share one monotone source.
         let base = self
-            .catalog
-            .reserve_sequence_numbers(&self.table_metadata.table_id, reserve_count)
+            .reserve_sequences_local(reserve_count)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Failed to reserve sequence numbers for on-conflict: {err}"),
@@ -7951,6 +8118,7 @@ impl CayenneTableProvider {
                 Vec::new(),
                 Arc::clone(self.context.runtime_env()),
                 None,
+                Arc::clone(&self.seq_allocator),
             );
             sink.persist_position_based_deletions(position_specs)
                 .await
@@ -10042,6 +10210,7 @@ impl CayenneTableProvider {
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
             Some(Arc::clone(&self.write_lock)),
+            Arc::clone(&self.seq_allocator),
         );
 
         let deleted_count =
@@ -10810,23 +10979,29 @@ impl CayenneTableProvider {
         let has_file_deletions =
             !file_deleted_pk_i64.is_empty() || !file_deleted_row_keys.is_empty();
 
-        // Reserve the deletion sequence BEFORE `commit_inlined_data_mutation` so
-        // the inline entry gets a strictly higher sequence number.
-        let delete_seq = if has_file_deletions {
-            Some(
-                self.catalog
-                    .increment_sequence_number(&self.table_metadata.table_id)
-                    .await
-                    .map_err(|err| Error::Catalog {
-                        source: CatalogError::InvalidOperationNoSource {
-                            message: format!(
-                                "Failed to pre-reserve deletion sequence for inline insert: {err}"
-                            ),
-                        },
-                    })?,
-            )
+        // Lever B2 + I5: allocate the file-deletion sequence and the inline-row
+        // sequence from the SAME in-memory allocator as ONE contiguous block, so
+        // the inline entry's sequence is strictly higher than the `delete_seq`
+        // (`inline_seq = delete_seq + 1`). Previously the `delete_seq` came from
+        // a `reserve_sequence_numbers` call and the inline-row seq was derived
+        // INSIDE `commit_inlined_mutation` by bumping the DB counter again — with
+        // the allocator owning allocation, the DB counter no longer moves inside
+        // that txn, so the inline-row seq must be reserved here and passed in.
+        //   - file deletions present: block of 2 -> [delete_seq, inline_seq]
+        //   - inline-only:            block of 1 -> [inline_seq]
+        let block_count = if has_file_deletions { 2 } else { 1 };
+        let block_first = self
+            .reserve_sequences_local(block_count)
+            .await
+            .map_err(|err| Error::Catalog {
+                source: CatalogError::InvalidOperationNoSource {
+                    message: format!("Failed to reserve sequences for inline insert: {err}"),
+                },
+            })?;
+        let (delete_seq, inline_seq) = if has_file_deletions {
+            (Some(block_first), block_first + 1)
         } else {
-            None
+            (None, block_first)
         };
 
         let rewrite = self
@@ -10840,7 +11015,10 @@ impl CayenneTableProvider {
         // Durably commit the inlined data WITHOUT publishing visibility yet, so
         // making the new inlined row visible and hiding the file-backed row it
         // supersedes can be published together under one
-        // `scan_state_lock.write()`.
+        // `scan_state_lock.write()`. The inline-row sequence (`inline_seq`,
+        // reserved above from the same allocator and strictly above
+        // `delete_seq`) is passed in; `commit_inlined_mutation` no longer mutates
+        // the DB counter.
         let inlined_commit = self
             .commit_inlined_data_durable(
                 rewrite,
@@ -10850,6 +11028,7 @@ impl CayenneTableProvider {
                     ipc_bytes,
                     i64::try_from(total_rows).unwrap_or(i64::MAX),
                 )],
+                Some(inline_seq),
             )
             .await?;
 
@@ -11689,10 +11868,9 @@ impl CayenneTableProvider {
                     .await?;
                 stats
             } else {
-                let sequence_number = self
-                    .catalog
-                    .increment_sequence_number(&self.table_metadata.table_id)
-                    .await?;
+                // Lever B2: the checkpoint flush's new snapshot sequence comes
+                // from the same allocator as every other handout for this table.
+                let sequence_number = self.reserve_sequences_local(1).await?;
                 let (_rows, stats) = self
                     .insert_to_new_snapshot_with_sequence(
                         stream,
@@ -12003,7 +12181,8 @@ impl CayenneTableProvider {
             )
         })?;
 
-        self.commit_inlined_data_mutation(rewrite, vec![], 0)
+        // Rewrite-/delete-only: no rows appended, so no sequence is consumed.
+        self.commit_inlined_data_mutation(rewrite, vec![], 0, None)
             .await
             .map_err(|err| {
                 datafusion_common::DataFusionError::Execution(format!(
@@ -13875,6 +14054,7 @@ impl CayenneTableProvider {
             snapshot_tables,
             Arc::clone(self.context.runtime_env()),
             write_lock,
+            Arc::clone(&self.seq_allocator),
         ))
     }
 
@@ -13923,6 +14103,7 @@ impl CayenneTableProvider {
             Vec::new(), // no protected snapshots for PositionBased
             Arc::clone(self.context.runtime_env()),
             None, // write lock already held above
+            Arc::clone(&self.seq_allocator),
         );
 
         let deleted = sink
@@ -16359,6 +16540,365 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    // ----------------------------------------------------------------------
+    // Lever B2 — in-memory sequence allocator + reserve-ahead persistence.
+    // ----------------------------------------------------------------------
+
+    /// (B2.1) Monotonic across a simulated reopen. Reserve a few interleaved
+    /// blocks, drop the provider WITHOUT flushing anything extra (a crash with an
+    /// unused block tail), reopen from the same DB, reserve more. Every new value
+    /// must be strictly greater than every old one, no value repeats, and the DB
+    /// high-water after reopen is >= the max old value (the reserve-ahead floor).
+    #[tokio::test]
+    async fn test_b2_monotonic_across_simulated_reopen() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("b2_monotonic_reopen", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let mut handed_out = Vec::new();
+        for count in [1_u32, 2, 3, 1, 2] {
+            let first = provider
+                .reserve_sequences_local(count)
+                .await
+                .expect("reserve");
+            for offset in 0..i64::from(count) {
+                handed_out.push(first + offset);
+            }
+        }
+        let max_pre = *handed_out.iter().max().expect("some handed out");
+
+        // Simulate a crash: drop the provider (in-memory tail is lost) and reopen
+        // from the same metastore DB. The new allocator reseeds from the DB row.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open("b2_monotonic_reopen")
+            .await
+            .expect("reopen");
+
+        // The DB high-water must already be >= every value handed out pre-crash
+        // (reserve-ahead persists the block before any handout).
+        let db_hi = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("db high-water");
+        assert!(
+            db_hi >= max_pre,
+            "DB high-water {db_hi} must be >= max handed-out {max_pre} (reserve-ahead floor)"
+        );
+
+        let mut after = Vec::new();
+        for count in [1_u32, 3, 2] {
+            let first = reopened
+                .reserve_sequences_local(count)
+                .await
+                .expect("reserve after reopen");
+            for offset in 0..i64::from(count) {
+                after.push(first + offset);
+            }
+        }
+
+        // No reissue: every post-reopen value strictly above every pre-crash one.
+        for v in &after {
+            assert!(
+                *v > max_pre,
+                "post-reopen value {v} must exceed every pre-crash value (max {max_pre})"
+            );
+        }
+        // Global uniqueness across the crash boundary.
+        let mut all: Vec<i64> = handed_out.iter().chain(after.iter()).copied().collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "no sequence value may be handed out twice"
+        );
+    }
+
+    /// (B2.2) Reserve-ahead exhaustion fires exactly `ceil(total / BLOCK)` DB
+    /// writes. Each refill bumps the durable `current_sequence_number` by exactly
+    /// `SEQ_RESERVE_BLOCK`, so after `total` single-unit reservations the DB
+    /// high-water == `ceil(total / BLOCK) * BLOCK` — i.e. precisely that many
+    /// refills happened, not one per reservation. Contiguity + strict
+    /// monotonicity hold across the refill boundary.
+    #[tokio::test]
+    async fn test_b2_reserve_ahead_block_exhaustion() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("b2_block_exhaustion", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Cross at least two block boundaries with single-unit reservations.
+        let total: i64 = SEQ_RESERVE_BLOCK * 2 + 5;
+        let mut handed_out = Vec::with_capacity(usize::try_from(total).expect("fits"));
+        for _ in 0..total {
+            handed_out.push(provider.reserve_sequences_local(1).await.expect("reserve"));
+        }
+
+        // Strictly increasing and contiguous (1..=total) — a brand-new table
+        // starts at DB high-water 0, so the first handed-out value is 1.
+        for (expected, actual) in (1_i64..).zip(&handed_out) {
+            assert_eq!(*actual, expected, "single-unit reservations are dense");
+        }
+
+        // Exactly ceil(total / BLOCK) refills, each += BLOCK. (`i64::div_ceil`
+        // is still unstable on this toolchain, so compute it by hand; `total`
+        // and `SEQ_RESERVE_BLOCK` are both positive here.)
+        let expected_refills = (total + SEQ_RESERVE_BLOCK - 1) / SEQ_RESERVE_BLOCK;
+        let db_hi = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("db high-water");
+        assert_eq!(
+            db_hi,
+            expected_refills * SEQ_RESERVE_BLOCK,
+            "DB high-water proves exactly {expected_refills} refills (not one per reservation)"
+        );
+    }
+
+    /// (B2.3) Crash mid-block wastes the unused tail but never reissues. Hand out
+    /// `k < BLOCK` values, capture the durable DB high-water `H`, reopen, reserve
+    /// again. The first new value == `H + 1` (the tail `(handed_out_max, H]` is
+    /// skipped = wasted) and is strictly above every pre-crash value.
+    #[tokio::test]
+    async fn test_b2_crash_mid_block_wastes_but_never_reissues() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("b2_crash_mid_block", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // One reservation triggers a full-BLOCK refill; hand out only a few.
+        let mut handed_out = Vec::new();
+        for _ in 0..3 {
+            handed_out.push(provider.reserve_sequences_local(1).await.expect("reserve"));
+        }
+        let max_pre = *handed_out.iter().max().expect("some");
+        let durable_hi = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("db high-water");
+        assert!(
+            durable_hi > max_pre,
+            "the block reserved past the handed-out values (tail {durable_hi} > {max_pre})"
+        );
+
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open("b2_crash_mid_block")
+            .await
+            .expect("reopen");
+
+        let first_after = reopened
+            .reserve_sequences_local(1)
+            .await
+            .expect("reserve after reopen");
+        assert_eq!(
+            first_after,
+            durable_hi + 1,
+            "the unused block tail is wasted; the next value resumes at DB high-water + 1"
+        );
+        assert!(
+            first_after > max_pre,
+            "no pre-crash value is reissued ({first_after} > {max_pre})"
+        );
+    }
+
+    /// (B2.4) Concurrent bursts get disjoint, strictly-monotone blocks. N tasks
+    /// each reserve M times on one shared provider; the union has no duplicates,
+    /// size N*M*count, and is a gap-allowed strictly-increasing set when sorted.
+    #[tokio::test]
+    async fn test_b2_concurrent_bursts_disjoint() {
+        const TASKS: usize = 8;
+        const PER_TASK: usize = 64;
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("b2_concurrent_bursts", ctx.runtime_env()).await;
+        let provider = Arc::new(provider);
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let provider = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move {
+                let mut local = Vec::with_capacity(PER_TASK * 2);
+                for i in 0..PER_TASK {
+                    // Alternate count 1 and 2 to exercise multi-unit blocks too.
+                    let count = if i % 2 == 0 { 1_u32 } else { 2 };
+                    let first = provider
+                        .reserve_sequences_local(count)
+                        .await
+                        .expect("reserve in task");
+                    for offset in 0..i64::from(count) {
+                        local.push(first + offset);
+                    }
+                }
+                local
+            }));
+        }
+
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.await.expect("task join"));
+        }
+
+        // Per task: floor(PER_TASK/2) reservations of count 1 + ceil(PER_TASK/2)
+        // of count 2 (even index -> 1 unit, odd index -> 2 units).
+        let units_per_task = PER_TASK / 2 + PER_TASK.div_ceil(2) * 2;
+        let expected_len = TASKS * units_per_task;
+        assert_eq!(all.len(), expected_len, "every reserved unit accounted for");
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            total,
+            "concurrent bursts must hand out fully disjoint sequence values"
+        );
+        // Strictly increasing after sort+dedup (already guaranteed by dedup ==
+        // total), and each adjacent pair differs by >= 1 (gaps are legal).
+        for window in all.windows(2) {
+            assert!(window[1] > window[0], "sorted set is strictly increasing");
+        }
+    }
+
+    /// (B2.5) I5 regression: the inline-INSERT-with-file-deletion path stamps the
+    /// inlined row's sequence strictly ABOVE the file `delete_seq`. Both are
+    /// allocated from the one in-memory allocator as a contiguous block
+    /// (`delete_seq = base`, `inline_seq = base + 1`). Previously the inline-row
+    /// seq was derived by a second DB-counter bump inside `commit_inlined_mutation`;
+    /// this guards the unification onto the allocator.
+    #[tokio::test]
+    async fn test_b2_inline_seq_above_delete_seq() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_inline_enabled_upsert_table("b2_inline_above_delete", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Seed PK=7 into a FILE (large batch, no conflict yet).
+        let seed = provider
+            .write_cdc_append_stream(
+                single_batch_stream(large_upsert_batch_with_conflict(
+                    Arc::clone(&schema),
+                    7,
+                    70,
+                    900_000,
+                )),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed PK=7 into a file");
+        if seed.has_pending_finalize() {
+            seed.finish().await.expect("finalize seed");
+        }
+
+        // SMALL upsert of PK=7: fits the inline window, so it takes the
+        // inline-insert path with a file deletion for the prior file-backed PK=7.
+        let small = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[7], &[777])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("inline upsert of PK=7");
+        if small.has_pending_finalize() {
+            small.finish().await.expect("finalize inline upsert");
+        }
+
+        // The new copy of PK=7 must now live inline (the inline-insert path ran).
+        let inlined = catalog
+            .get_inlined_data(&table_id)
+            .await
+            .expect("read inlined data");
+        let inline_seq = inlined
+            .iter()
+            .map(|row| row.sequence_number)
+            .max()
+            .expect("the inline upsert appended an inlined row");
+
+        // The file `DeleteFile` hiding the prior file-backed PK=7 carries delete_seq.
+        let delete_files = catalog
+            .get_table_delete_files(&table_id)
+            .await
+            .expect("read delete files");
+        let delete_seq = delete_files
+            .iter()
+            .map(|df| df.sequence_number)
+            .max()
+            .expect("a DeleteFile was written for the superseded file row");
+
+        assert!(
+            inline_seq > delete_seq,
+            "I5: inlined-row seq {inline_seq} must be strictly above the file delete_seq {delete_seq}"
+        );
+        // And both are above every prior sequence (the durable high-water covers them).
+        let db_hi = catalog
+            .get_sequence_number(&table_id)
+            .await
+            .expect("db high-water");
+        assert!(
+            db_hi >= inline_seq,
+            "reserve-ahead keeps the DB high-water {db_hi} >= the stamped inline seq {inline_seq}"
+        );
+
+        // Observable correctness: only the latest value for PK=7, no resurrected copy.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "b2_inline_above_delete").await;
+        assert!(
+            pairs.contains(&(7, 777)),
+            "latest PK=7 visible, got {pairs:?}"
+        );
+        assert!(
+            !pairs.contains(&(7, 70)),
+            "old file-backed PK=7 hidden, got {pairs:?}"
+        );
+    }
+
+    /// (B2.6) R4 regression: a metastore export captures a
+    /// `current_sequence_number` that is >= every value handed out — i.e. the
+    /// reserve-ahead floor keeps a restored snapshot from reissuing sequences.
+    /// (This would FAIL under a fold-on-commit design that leaves the in-memory
+    /// counter ahead of the DB row between commits.)
+    #[tokio::test]
+    async fn test_b2_export_high_water_not_stale() {
+        use crate::metastore::snapshot::SliceValue;
+
+        let ctx = SessionContext::new();
+        let (provider, catalog, tmp) =
+            create_cdc_upsert_table("b2_export_high_water", ctx.runtime_env()).await;
+
+        // Hand out several values across more than one block boundary, but stop
+        // mid-block so the in-memory `next` is strictly below `persisted_hi`.
+        let mut max_handed_out = 0_i64;
+        for _ in 0..(SEQ_RESERVE_BLOCK + 7) {
+            max_handed_out = provider.reserve_sequences_local(1).await.expect("reserve");
+        }
+
+        // Export via the same path a cold-start snapshot uses (R4).
+        let slice = catalog
+            .export_dataset_slice("b2_export_high_water", tmp.path())
+            .await
+            .expect("export dataset slice");
+        let table_rows = slice
+            .tables
+            .get("cayenne_table")
+            .expect("cayenne_table in slice");
+        assert_eq!(table_rows.len(), 1, "exactly one table row");
+        // `current_sequence_number` is the 11th column (index 10) of
+        // `cayenne_table` in `EXPECTED_TABLES` column order.
+        let exported_hi = match &table_rows[0][10] {
+            SliceValue::Integer(v) => *v,
+            other => panic!("current_sequence_number must export as Integer, got {other:?}"),
+        };
+
+        assert!(
+            exported_hi >= max_handed_out,
+            "exported high-water {exported_hi} must be >= max handed-out {max_handed_out} \
+             (reserve-ahead keeps the snapshot floor safe)"
+        );
     }
 
     #[tokio::test]
