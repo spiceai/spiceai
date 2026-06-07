@@ -710,6 +710,43 @@ impl CayenneCatalog {
         sql.push_str(SUFFIX);
         (sql, params)
     }
+
+    /// Build a single batched `UPDATE … SET published = 1 WHERE table_id = ?
+    /// AND inlined_id IN (?, ?, …)` for a chunk of deferred tombstone flips
+    /// (cycle-8 TASK D4).
+    ///
+    /// Exactly equivalent to running one `UPDATE … WHERE inlined_id = ?` per id
+    /// (each flip is an idempotent set-to-1; the order of the rows updated is
+    /// irrelevant since every match lands the same constant), but collapses N
+    /// per-row writer round-trips into one statement — shrinking both the
+    /// statement count and the WAL frame churn the folded Stage-A txn holds the
+    /// writer across. `table_id` binds once as `?1`; each id is `?2..`.
+    fn build_flip_published_chunk_sql(
+        table_id: &str,
+        inlined_ids: &[String],
+    ) -> (String, Vec<MetastoreValue>) {
+        use std::fmt::Write as _;
+
+        const PREFIX: &str = "UPDATE cayenne_inlined_delete SET published = 1 \
+             WHERE table_id = ?1 AND inlined_id IN (";
+        let mut sql = String::with_capacity(PREFIX.len() + inlined_ids.len() * 6 + 1);
+        sql.push_str(PREFIX);
+        let mut params = Vec::with_capacity(inlined_ids.len() + 1);
+        params.push(MetastoreValue::Text(table_id.to_string()));
+
+        for (i, inlined_id) in inlined_ids.iter().enumerate() {
+            // `table_id` took ?1, so ids start at ?2.
+            let placeholder = i + 2;
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "?{placeholder}");
+            params.push(MetastoreValue::Text(inlined_id.clone()));
+        }
+        sql.push(')');
+
+        (sql, params)
+    }
 }
 
 #[async_trait]
@@ -2725,6 +2762,12 @@ impl MetadataCatalog for CayenneCatalog {
         const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
         const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
+        // cycle-8 TASK D4: deferred-flip UPDATE chunking. The batched UPDATE binds
+        // one shared `table_id` plus one `inlined_id` per flip, so a chunk of K
+        // flips uses `1 + K` params. Cap K so the bind count stays under
+        // `MAX_PARAMS` (the `- 1` reserves the slot for `table_id`).
+        const MAX_FLIP_ROWS_PER_CHUNK: usize = MAX_PARAMS - 1;
+
         // Fast path: nothing to commit AND no tombstone AND no deferred flips —
         // identical short-circuit to `commit_on_conflict_deletions`. A batch with
         // ONLY deferred flips (b1★ drain riding an otherwise-empty staged commit)
@@ -2953,20 +2996,16 @@ impl MetadataCatalog for CayenneCatalog {
             // b1★: apply any DEFERRED durable `published = 1` flips from previously-
             // finalized tombstones as the LAST statements before commit, so they
             // ride THIS batch's single `BEGIN IMMEDIATE` acquisition (no extra
-            // writer round-trip). Each is an idempotent single-row UPDATE — a
-            // no-op if the row was already flipped or cleared by a checkpoint.
+            // writer round-trip). cycle-8 TASK D4: BATCHED into one
+            // `… WHERE inlined_id IN (…)` per MAX_PARAMS chunk (mirrors the
+            // delete-file/insert-record chunking) instead of one round-trip per
+            // id, so a large drained-flip batch holds the writer across far fewer
+            // statements. Still idempotent (set-to-1) and a no-op for rows already
+            // flipped or cleared by a checkpoint; the IN-list is order-independent.
             let mut flip_retry = false;
-            for inlined_id in pending_durable_flips {
-                let res = tx
-                    .execute(ExecuteParams {
-                        sql: "UPDATE cayenne_inlined_delete SET published = 1 \
-                              WHERE table_id = ?1 AND inlined_id = ?2",
-                        params: vec![
-                            MetastoreValue::Text(table_id.to_string()),
-                            MetastoreValue::Text(inlined_id.clone()),
-                        ],
-                    })
-                    .await;
+            for chunk in pending_durable_flips.chunks(MAX_FLIP_ROWS_PER_CHUNK) {
+                let (sql, params) = Self::build_flip_published_chunk_sql(table_id, chunk);
+                let res = tx.execute(ExecuteParams { sql: &sql, params }).await;
                 if let Err(e) = res {
                     if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
                         flip_retry = true;
@@ -2974,7 +3013,7 @@ impl MetadataCatalog for CayenneCatalog {
                     }
                     drop(tx);
                     return Err(CatalogError::InvalidOperation {
-                        message: "Failed to apply deferred tombstone flip inside on-conflict (with tombstone) transaction"
+                        message: "Failed to apply deferred tombstone flip chunk inside on-conflict (with tombstone) transaction"
                             .to_string(),
                         source: Box::new(e),
                     });
@@ -2985,7 +3024,7 @@ impl MetadataCatalog for CayenneCatalog {
                 sleep_before_metastore_write_retry(
                     attempt,
                     max_attempts,
-                    "apply deferred tombstone flip inside on-conflict (with tombstone) transaction",
+                    "apply deferred tombstone flip chunk inside on-conflict (with tombstone) transaction",
                 )
                 .await;
                 continue 'attempts;
@@ -4428,6 +4467,139 @@ mod tests {
             published.len(),
             1,
             "after the flip the tombstone becomes visible on the published path"
+        );
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_with_tombstone_batches_deferred_flips() {
+        // cycle-8 TASK D4: a batch carrying several deferred `published = 1` flips
+        // must publish ALL of them in the one folded txn — the batched
+        // `… inlined_id IN (…)` UPDATE is exactly equivalent to the prior per-row
+        // loop. Stage several inert tombstones, then ride their ids as
+        // `pending_durable_flips` on a later commit and assert every one flips.
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_tombstone_flip_batch_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "test_table_flip_batch".to_string(),
+                schema,
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "/tmp/cayenne_test".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("Failed to create table");
+
+        // Stage 5 inert (published = false) tombstones, capturing their ids.
+        let mut staged_ids = Vec::new();
+        for i in 0..5_i64 {
+            let id = catalog
+                .commit_on_conflict_deletions_with_tombstone(
+                    vec![],
+                    &table_id,
+                    vec![],
+                    0,
+                    None,
+                    Some(InlinedDelete {
+                        inlined_id: String::new(),
+                        table_id: table_id.clone(),
+                        delete_ipc: vec![u8::try_from(i).unwrap_or(0)],
+                        delete_count: 1,
+                        sequence_number: i + 1,
+                        created_at: String::new(),
+                        published: false,
+                    }),
+                    &[],
+                )
+                .await
+                .expect("stage inert tombstone")
+                .expect("tombstone id");
+            staged_ids.push(id);
+        }
+
+        // None are published yet.
+        assert!(
+            catalog
+                .get_published_inlined_deletes(&table_id)
+                .await
+                .expect("get published")
+                .is_empty(),
+            "freshly-staged tombstones must be inert"
+        );
+
+        // Commit a batch that carries ALL 5 ids as deferred flips (no other work).
+        let ret = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![],
+                &table_id,
+                vec![],
+                0,
+                None,
+                None,
+                &staged_ids,
+            )
+            .await
+            .expect("flip-only commit should succeed");
+        assert!(ret.is_none(), "no tombstone supplied ⇒ no returned id");
+
+        // Every staged tombstone is now published — the batched IN-list UPDATE
+        // flipped them all in the one folded transaction.
+        let published = catalog
+            .get_published_inlined_deletes(&table_id)
+            .await
+            .expect("get published after batched flips");
+        assert_eq!(
+            published.len(),
+            5,
+            "all deferred flips must be applied by the batched UPDATE"
+        );
+        let mut published_ids: Vec<String> = published.into_iter().map(|d| d.inlined_id).collect();
+        published_ids.sort();
+        let mut expected = staged_ids.clone();
+        expected.sort();
+        assert_eq!(
+            published_ids, expected,
+            "exactly the staged ids must be flipped (no more, no fewer)"
+        );
+
+        // Idempotent: re-flipping the same ids is a harmless no-op (set-to-1).
+        catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![],
+                &table_id,
+                vec![],
+                0,
+                None,
+                None,
+                &staged_ids,
+            )
+            .await
+            .expect("re-flip should be an idempotent no-op");
+        assert_eq!(
+            catalog
+                .get_published_inlined_deletes(&table_id)
+                .await
+                .expect("get published after re-flip")
+                .len(),
+            5,
+            "re-applying the flips must not change the published set"
         );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);

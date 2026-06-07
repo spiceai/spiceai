@@ -33,6 +33,11 @@ use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
+/// Default WAL-size cap (bytes) for [`SqliteMetastoreConfig::wal_truncate_threshold_bytes`]
+/// — the size above which the background maintenance-tick checkpoint escalates
+/// from PASSIVE to TRUNCATE (cycle-8 TASK A2). See that field for the rationale.
+const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
+
 /// `auto_vacuum` mode for the metastore DB.
 ///
 /// A high-update upsert table (e.g. `district`) frees pages as it supersedes
@@ -86,20 +91,55 @@ pub struct SqliteMetastoreConfig {
     pub mmap_size_bytes: i64,
     /// `busy_timeout` in milliseconds.
     pub busy_timeout_ms: u64,
-    /// `wal_autocheckpoint` threshold in pages.
+    /// `wal_autocheckpoint` threshold in pages. `0` DISABLES `SQLite`'s inline
+    /// auto-checkpoint entirely (per the `SQLite` docs, a threshold of 0 turns
+    /// auto-checkpointing off).
     ///
-    /// cycle-5 TASK 2b: raised from the SQLite default (10_000 pages ≈ 40 MB) so
-    /// the inline auto-checkpoint — which fires a PASSIVE checkpoint (and its
-    /// main-DB fsync) on whichever COMMIT/UPDATE trips the threshold — almost
-    /// never lands inside the WAL-write-locked Stage-A/Stage-B window on a
-    /// heavy-upsert table. The WAL is instead drained off the hot path by the
-    /// background maintenance tick (`MetadataCatalog::checkpoint_wal`, a
-    /// non-blocking PASSIVE checkpoint every debounce). This raised value stays a
-    /// bounded backstop: if the background tick ever stalls, the inline
-    /// checkpoint still caps the WAL here. Combined with the compacted
-    /// `delete_ipc` payload (TASK 2a) the WAL grows far slower, so even the
-    /// backstop rarely fires.
+    /// # WAL-drain contract (cycle-8 TASK A2)
+    ///
+    /// The default is `0` — the inline auto-checkpoint is OFF, so a checkpoint
+    /// (and its blocking main-DB fsync) can NEVER fire from inside a hot CDC
+    /// COMMIT's WAL-write-locked window. This eliminates the invisible inline
+    /// autocheckpoint tax that dominated `writer_held`: a multi-MB tombstone
+    /// payload per txn was tripping the page threshold constantly, folding a
+    /// full checkpoint fsync into the hot COMMIT with no Rust call site for our
+    /// metrics to see.
+    ///
+    /// With the inline checkpoint off, the WAL is drained EXCLUSIVELY off the hot
+    /// path by [`SqliteMetastore::checkpoint_wal`], which runs on a DEDICATED
+    /// connection (never a pool writer slot) on the background maintenance tick
+    /// (`MetadataCatalog::checkpoint_wal`, debounced ~100 ms). That checkpoint is
+    /// PASSIVE by default (never blocks writers, never waits for readers) and
+    /// ESCALATES to TRUNCATE only when the sampled WAL size exceeds
+    /// [`Self::wal_truncate_threshold_bytes`] — a TRUNCATE briefly blocks writers,
+    /// so it is gated behind that size cap and runs ONLY on the maintenance tick, never
+    /// on the hot write path. PASSIVE alone never truncates the WAL file under a
+    /// continuous writer (it cannot reclaim frames past the reader/writer mark),
+    /// so without the size-triggered TRUNCATE the `-wal` file would plateau at its
+    /// high-water mark; the TRUNCATE escalation reclaims it.
+    ///
+    /// Why the WAL cannot grow unbounded with the inline checkpoint off: the
+    /// dedicated-connection checkpoint copies committed frames into the main DB
+    /// every maintenance tick (which fires whenever a write schedules
+    /// maintenance — i.e. continuously under CDC load), and the size-triggered
+    /// TRUNCATE caps the file. A non-zero value here may be set via
+    /// `cayenne_metastore_wal_autocheckpoint_pages` to RE-ENABLE the inline
+    /// backstop (e.g. if the maintenance tick is disabled), but that re-introduces
+    /// the inline-COMMIT fsync tax this default exists to remove.
     pub wal_autocheckpoint_pages: u32,
+    /// WAL-size cap in bytes above which the background maintenance-tick
+    /// checkpoint escalates from PASSIVE to TRUNCATE (cycle-8 TASK A2).
+    ///
+    /// With the inline auto-checkpoint disabled (`wal_autocheckpoint_pages = 0`)
+    /// a PASSIVE checkpoint copies committed frames into the main DB but, under a
+    /// continuous writer, never truncates the `-wal` file — it plateaus at its
+    /// high-water mark. A TRUNCATE reclaims the file but briefly takes the WAL
+    /// write lock, so it is gated behind this cap and runs ONLY on the background
+    /// tick, NEVER on the hot write path. Defaults to 512 MiB: large enough that
+    /// a busy table rarely hits it (the PASSIVE drain keeps the live frame count
+    /// low) yet small enough to bound the file if a tick ever lags. `0` makes
+    /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
+    pub wal_truncate_threshold_bytes: u64,
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
     /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
     pub auto_vacuum: SqliteAutoVacuum,
@@ -111,14 +151,19 @@ impl Default for SqliteMetastoreConfig {
             cache_size_mb: 256,
             mmap_size_bytes: 1_073_741_824, // 1 GiB
             busy_timeout_ms: 30_000,
-            // cycle-5 TASK 2b set this to 100_000 (~400 MB backstop) to keep the
-            // inline checkpoint off the hot path; cycle-6 MEASURED a uniform
-            // ~+350-430ms tax on every writer acquisition at that size (the
-            // wal-index walk grows with the WAL), hitting even bare-autocommit
-            // statements (stage_seq_reserve 178→554ms). 32_000 (~128 MB) keeps
-            // the off-hot-path design — the background maintenance-tick PASSIVE
-            // checkpoint remains the primary drain — while bounding the walk.
-            wal_autocheckpoint_pages: 32_000,
+            // cycle-8 TASK A2: DISABLE the inline auto-checkpoint (0 = off). The
+            // arc: cycle-5 raised it to 100_000 (~400 MB) to push the inline
+            // checkpoint off the hot path, cycle-6 lowered it to 32_000 (~128 MB)
+            // to bound a measured wal-index-walk tax; cycle-8 MEASURED that even
+            // at 32_000 a multi-MB tombstone payload per txn trips the threshold
+            // constantly, so a checkpoint fsync still landed INSIDE the hot
+            // COMMIT (the dominant, metrics-invisible component of writer_held).
+            // 0 removes that tax entirely: the WAL is drained exclusively by the
+            // dedicated-connection background checkpoint (PASSIVE, escalating to
+            // TRUNCATE past `wal_truncate_threshold_bytes`) on the maintenance
+            // tick. See the field doc for the full drain contract.
+            wal_autocheckpoint_pages: 0,
+            wal_truncate_threshold_bytes: DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES,
             auto_vacuum: SqliteAutoVacuum::None,
         }
     }
@@ -224,6 +269,15 @@ async fn configure_sqlite_connection(
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
+    /// Connection used ONLY by [`SqliteMetastore::checkpoint_wal`] (cycle-8 TASK
+    /// A2). The background maintenance-tick checkpoint runs here so it never
+    /// contends a `conns` slot — a writer that finds every `conns` slot busy
+    /// falls back to `lock_owned()` on `conns[0]`, so reusing `conns[0]` for the
+    /// checkpoint could (rarely) serialize a hot writer behind it. A dedicated
+    /// connection guarantees the off-hot-path drain stays off the hot path even
+    /// under full pool saturation. It still targets the same shared `-wal` file,
+    /// so a single checkpoint here covers the catalog's tables.
+    checkpoint_conn: Arc<Mutex<tokio_rusqlite::Connection>>,
 }
 
 impl SqliteConnectionPool {
@@ -386,9 +440,15 @@ impl SqliteMetastore {
                 for _ in 0..k {
                     conns.push(Arc::new(Mutex::new(self.open_connection().await?)));
                 }
+                // cycle-8 TASK A2: dedicated checkpoint connection (see the field
+                // doc). One extra connection per metastore DB, used only by the
+                // background WAL drain so it never lands on a `conns` slot a hot
+                // writer could fall back to.
+                let checkpoint_conn = Arc::new(Mutex::new(self.open_connection().await?));
                 Ok(Arc::new(SqliteConnectionPool {
                     conns,
                     next: AtomicUsize::new(0),
+                    checkpoint_conn,
                 }))
             })
             .await
@@ -1062,33 +1122,62 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
-        // cycle-5 TASK 2b: PASSIVE WAL checkpoint on the first pool connection
-        // (one checkpoint covers the shared WAL; concurrent checkpoints would
-        // conflict). PASSIVE never blocks writers and never waits for readers —
-        // it copies as many committed frames into the main DB as it safely can
-        // and returns. A busy WAL just leaves frames for the next tick. This is
-        // the background drain that lets `wal_autocheckpoint` be raised so a
-        // passive checkpoint no longer fires inline on a hot CDC commit.
+        // cycle-8 TASK A2: the SOLE WAL drain. With the inline auto-checkpoint
+        // disabled (`wal_autocheckpoint_pages = 0`) no checkpoint ever fires from
+        // a hot CDC COMMIT; this background-tick checkpoint is now the only thing
+        // that copies committed frames into the main DB. It runs on a DEDICATED
+        // connection (never a `conns` writer slot — see the field doc) so it can
+        // never serialize a hot writer.
+        //
+        // Mode: PASSIVE by default (never blocks writers, never waits for
+        // readers; a busy WAL just leaves frames for the next tick). A PASSIVE
+        // checkpoint under a continuous writer copies frames but never TRUNCATEs
+        // the `-wal` file, so the file plateaus at its high-water mark. We
+        // ESCALATE to TRUNCATE only when the sampled size exceeds the configured
+        // `wal_truncate_threshold_bytes` — TRUNCATE briefly takes the WAL write
+        // lock, which is acceptable on this off-hot-path background tick (and
+        // bounds the file) but would be unacceptable on the hot path, which is
+        // exactly why the inline auto-checkpoint is off.
         let Some(pool) = self.pool.get() else {
             return Ok(());
         };
-        let Some(conn) = pool.conns.first() else {
-            return Ok(());
-        };
+        let conn = &pool.checkpoint_conn;
         let guard = conn.lock().await;
-        // METRIC 2 (checkpoint duration): time the PASSIVE checkpoint with
-        // mode=passive_background (this IS the off-hot-path background drain).
+
+        // Sample the -wal size BEFORE the checkpoint to pick the mode (cheap
+        // stat()). Past the cap we TRUNCATE to reclaim the file; otherwise
+        // PASSIVE keeps writers unblocked. The pre-checkpoint sample is the size
+        // the truncate decision must be based on (the post-checkpoint sample
+        // below is the resulting drained size for the gauge).
+        let wal_bytes_before = self.read_wal_bytes().await;
+        let truncate = wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes;
+        let mode_label = if truncate {
+            "truncate_background"
+        } else {
+            "passive_background"
+        };
+
+        // METRIC 2 (checkpoint duration): time the checkpoint with the chosen
+        // background mode (this IS the off-hot-path background drain).
         let checkpoint_start = std::time::Instant::now();
         guard
-            .call(|conn| {
+            .call(move |conn| {
                 let journal_mode: String =
                     conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
                 if journal_mode.eq_ignore_ascii_case("wal") {
-                    // wal_checkpoint returns (busy, log, checkpointed).
-                    let _: (i32, i32, i32) =
-                        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                        })?;
+                    // wal_checkpoint returns (busy, log, checkpointed). TRUNCATE
+                    // reclaims the file once frames are copied; PASSIVE leaves the
+                    // file in place for reuse. A TRUNCATE that finds the WAL busy
+                    // returns busy=1 and does partial work — never an error, so
+                    // the next tick retries (the cap re-trips).
+                    let pragma = if truncate {
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    } else {
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    };
+                    let _: (i32, i32, i32) = conn.query_row(pragma, [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
                 }
                 Ok::<_, rusqlite::Error>(())
             })
@@ -1100,7 +1189,7 @@ impl MetastoreBackend for SqliteMetastore {
             )?;
         telemetry::track_cayenne_metastore_checkpoint(
             checkpoint_start.elapsed(),
-            &[telemetry::KeyValue::new("mode", "passive_background")],
+            &[telemetry::KeyValue::new("mode", mode_label)],
         );
         // METRIC 2 (WAL bytes): sample the -wal file size right after the
         // checkpoint copied as many frames as it could. A cheap stat(); a missing
@@ -1111,16 +1200,22 @@ impl MetastoreBackend for SqliteMetastore {
 }
 
 impl SqliteMetastore {
-    /// Sample the current `-wal` file size (cheap `stat()`) and publish it to the
-    /// METRIC 2 `cayenne_metastore_wal_bytes` gauge. Best-effort: a missing or
-    /// unreadable file reports 0 (the WAL was truncated or not yet created).
-    async fn sample_wal_bytes(&self) {
+    /// Read the current `-wal` file size in bytes (cheap `stat()`), without
+    /// recording it. Best-effort: a missing or unreadable file reports 0 (the WAL
+    /// was truncated or not yet created).
+    ///
+    /// `tokio::fs::metadata` (not `std::fs`): this runs on the async maintenance
+    /// tick, so a blocking stat would stall a Tokio worker thread (PR #11206
+    /// review).
+    async fn read_wal_bytes(&self) -> u64 {
         let wal_path = format!("{}-wal", self.db_path());
-        // `tokio::fs::metadata` (not `std::fs`): this runs on the async maintenance
-        // tick, so a blocking stat would stall a Tokio worker thread (PR #11206 review).
-        let bytes = tokio::fs::metadata(&wal_path)
-            .await
-            .map_or(0, |m| m.len());
+        tokio::fs::metadata(&wal_path).await.map_or(0, |m| m.len())
+    }
+
+    /// Sample the current `-wal` file size and publish it to the METRIC 2
+    /// `cayenne_metastore_wal_bytes` gauge.
+    async fn sample_wal_bytes(&self) {
+        let bytes = self.read_wal_bytes().await;
         telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
     }
 }
@@ -1317,5 +1412,194 @@ impl MetastoreTransaction for SqliteTransaction {
         )?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metastore::{ExecuteParams, MetastoreValue, QueryRowParams};
+
+    /// `SQLITE_METASTORE_CONFIG` is process-wide and read at connection-open
+    /// time (and, for the truncate threshold, at `checkpoint_wal` time). The
+    /// cycle-8 TASK A2 tests below mutate it, so they serialize through this lock
+    /// and each sets the exact config it needs while holding it — preventing a
+    /// parallel test from observing another's override. A `tokio` Mutex (not
+    /// `std`) so the guard can be held across the `.await`s in the test body
+    /// (the writes are tiny) without the held-guard-across-await lint.
+    static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn temp_metastore() -> (tempfile::TempDir, SqliteMetastore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cayenne_test.db");
+        let metastore = SqliteMetastore::new(format!("sqlite://{}", db_path.display()));
+        (dir, metastore)
+    }
+
+    /// Create a tiny table and append `n` rows each carrying a ~`blob_kib` KiB
+    /// blob, growing the WAL. With `wal_autocheckpoint = 0` (TASK A2 default) the
+    /// engine never drains it inline, so the `-wal` file accumulates every frame.
+    async fn grow_wal(metastore: &SqliteMetastore, n: usize, blob_kib: usize) {
+        metastore
+            .execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, payload BLOB)")
+            .await
+            .expect("create table");
+        let blob = vec![0xABu8; blob_kib * 1024];
+        for i in 0..i64::try_from(n).unwrap_or(i64::MAX) {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT INTO t (id, payload) VALUES (?1, ?2)",
+                    params: vec![
+                        MetastoreValue::Integer(i),
+                        MetastoreValue::Blob(blob.clone()),
+                    ],
+                })
+                .await
+                .expect("insert row");
+        }
+    }
+
+    /// TASK A2: a connection opened under the default config has the inline WAL
+    /// auto-checkpoint DISABLED (`PRAGMA wal_autocheckpoint` returns 0), so a
+    /// checkpoint can never fire inside a hot COMMIT.
+    #[tokio::test]
+    async fn test_wal_autocheckpoint_disabled_by_default() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        // Read the live pragma off an actual pooled connection (round-trips
+        // through the same open path a writer uses).
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.conns[0].lock().await;
+        let autocheckpoint: i64 = guard
+            .call(|conn| conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0)))
+            .await
+            .expect("read pragma");
+        assert_eq!(
+            autocheckpoint, 0,
+            "inline WAL auto-checkpoint must be disabled (0) by default so no checkpoint fsync lands inside a hot CDC COMMIT"
+        );
+
+        // The dedicated checkpoint connection must also have it disabled.
+        let cp_guard = pool.checkpoint_conn.lock().await;
+        let cp_autocheckpoint: i64 = cp_guard
+            .call(|conn| conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0)))
+            .await
+            .expect("read pragma on checkpoint conn");
+        assert_eq!(cp_autocheckpoint, 0);
+    }
+
+    /// TASK A2: with the inline checkpoint off, the background `checkpoint_wal`
+    /// is the SOLE drain. Force the TRUNCATE escalation (threshold = 0) and
+    /// assert it reclaims a grown `-wal` file — proving the off-hot-path drain
+    /// keeps the WAL bounded without the inline backstop.
+    #[tokio::test]
+    async fn test_background_checkpoint_truncates_grown_wal() {
+        let _guard = CONFIG_LOCK.lock().await;
+        // threshold = 0 → every background checkpoint escalates to TRUNCATE.
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            wal_truncate_threshold_bytes: 0,
+            ..SqliteMetastoreConfig::default()
+        });
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        // Grow the WAL: ~64 rows × 64 KiB ≈ 4 MiB of frames that the disabled
+        // inline auto-checkpoint never drained.
+        grow_wal(&metastore, 64, 64).await;
+        let wal_before = metastore.read_wal_bytes().await;
+        assert!(
+            wal_before > 1024 * 1024,
+            "expected the WAL to accumulate (no inline checkpoint); got {wal_before} bytes"
+        );
+
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        let wal_after = metastore.read_wal_bytes().await;
+        assert!(
+            wal_after < wal_before,
+            "background checkpoint must drain the WAL: before={wal_before} after={wal_after}"
+        );
+        // TRUNCATE reclaims the file outright in a quiescent DB (no other writer
+        // holds frames), so it should collapse to ~0.
+        assert!(
+            wal_after <= 64 * 1024,
+            "TRUNCATE-mode background checkpoint should reclaim the -wal file; after={wal_after} bytes"
+        );
+
+        // The data survived the drain (frames were copied into the main DB before
+        // truncation) — read it back through a fresh query.
+        let count: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM t",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count rows");
+        assert_eq!(count, 64, "all rows must be durable after the WAL drain");
+
+        // Restore the default so the non-zero threshold does not leak to other
+        // crate tests that open metastores concurrently with the lock released.
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+    }
+
+    /// TASK A2: the default PASSIVE background checkpoint (WAL well under the
+    /// 512 MiB cap) drains the accumulated frames into the main DB without
+    /// requiring TRUNCATE. After it runs, an independent TRUNCATE finds nothing
+    /// left to copy and reclaims the file — proving PASSIVE fully checkpointed.
+    #[tokio::test]
+    async fn test_background_passive_checkpoint_drains_into_main_db() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        grow_wal(&metastore, 32, 64).await;
+        let wal_before = metastore.read_wal_bytes().await;
+        assert!(wal_before > 0, "WAL should hold frames before the drain");
+
+        // Default threshold (512 MiB) ⇒ PASSIVE (our ~2 MiB WAL is far below it).
+        metastore
+            .checkpoint_wal()
+            .await
+            .expect("passive checkpoint");
+
+        // PASSIVE copies frames into the main DB but does not truncate the file;
+        // prove the copy happened by checking an independent TRUNCATE on the
+        // dedicated conn now reports `log == checkpointed` (everything already in
+        // the main DB) and the file collapses to ~0.
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.checkpoint_conn.lock().await;
+        let (busy, log, checkpointed): (i64, i64, i64) = guard
+            .call(|conn| {
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+            })
+            .await
+            .expect("follow-up truncate");
+        drop(guard);
+        assert_eq!(
+            busy, 0,
+            "no writer should be blocking the follow-up checkpoint"
+        );
+        assert_eq!(
+            log, checkpointed,
+            "the prior PASSIVE checkpoint should have copied every frame into the main DB (log={log}, checkpointed={checkpointed})"
+        );
+
+        let wal_after = metastore.read_wal_bytes().await;
+        assert!(
+            wal_after <= 64 * 1024,
+            "WAL should be reclaimed after a full drain; after={wal_after} bytes"
+        );
     }
 }

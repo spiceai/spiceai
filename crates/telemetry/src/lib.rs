@@ -831,9 +831,13 @@ pub fn track_cayenne_metastore_writer_held(duration: Duration, dimensions: &[Key
 }
 
 // METRIC 2 — metastore WAL telemetry. The WAL gauge is sampled (cheap `stat()`)
-// on each background maintenance checkpoint tick and after the inline-backstop
-// checkpoint; the checkpoint histogram times the PASSIVE checkpoint itself with a
-// `mode` label (`passive_background` / `inline_backstop`).
+// on each background maintenance checkpoint tick; the checkpoint histogram times
+// the checkpoint itself with a `mode` label: `passive_background` (the default
+// off-hot-path PASSIVE drain) or `truncate_background` (the size-triggered
+// TRUNCATE escalation when the WAL exceeds its cap). With the inline
+// auto-checkpoint disabled (cycle-8 TASK A2) these background modes are the sole
+// WAL drain; an `inline_backstop` mode would only appear if a deployment
+// re-enabled the inline auto-checkpoint via `wal_autocheckpoint_pages > 0`.
 
 static CAYENNE_METASTORE_WAL_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
@@ -860,8 +864,10 @@ static CAYENNE_METASTORE_CHECKPOINT_MS: OnceLock<Histogram<f64>> = OnceLock::new
 
 /// Records the wall-clock duration of a metastore WAL checkpoint. `dimensions`
 /// should carry a `mode` label: `passive_background` (the off-hot-path
-/// maintenance-tick PASSIVE checkpoint) or `inline_backstop` (a checkpoint driven
-/// to bound a WAL the background tick let grow).
+/// maintenance-tick PASSIVE checkpoint, the common case), `truncate_background`
+/// (the same tick escalated to TRUNCATE once the WAL exceeds its size cap), or
+/// `inline_backstop` (only if a deployment re-enabled the inline auto-checkpoint
+/// via `wal_autocheckpoint_pages > 0`).
 pub fn track_cayenne_metastore_checkpoint(duration: Duration, dimensions: &[KeyValue]) {
     CAYENNE_METASTORE_CHECKPOINT_MS
         .get_or_init(|| {

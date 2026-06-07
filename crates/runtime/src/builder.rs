@@ -291,6 +291,14 @@ impl RuntimeBuilder {
                 metastore_cfg.wal_autocheckpoint_pages =
                     u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
             }
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                "cayenne_metastore_wal_truncate_threshold_mb",
+            ) {
+                metastore_cfg.wal_truncate_threshold_bytes =
+                    u64::try_from(v.saturating_mul(1024 * 1024))
+                        .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
+            }
             if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
                 metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
                     "none" => cayenne::SqliteAutoVacuum::None,

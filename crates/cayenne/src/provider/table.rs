@@ -9147,14 +9147,19 @@ impl CayenneTableProvider {
         // No-op when the queue is empty (the common case).
         self.drain_pending_durable_tombstone_flips().await;
 
-        // cycle-5 TASK 2b: drain the per-table metastore WAL off the hot commit
-        // path with a non-blocking PASSIVE checkpoint. Paired with the raised
-        // `wal_autocheckpoint` threshold, this keeps the WAL bounded WITHOUT an
-        // inline passive checkpoint firing on a Stage-A/Stage-B commit (which
-        // would land an fsync inside the WAL-write-locked window). PASSIVE never
-        // blocks writers or waits for readers, so this never stalls CDC; a busy
-        // WAL just leaves frames for the next tick. Best-effort: logged, never
-        // propagated to fail the originating write.
+        // cycle-8 TASK A2: drain the per-table metastore WAL off the hot commit
+        // path. With the inline auto-checkpoint DISABLED
+        // (`wal_autocheckpoint_pages = 0`), this background-tick checkpoint is the
+        // SOLE WAL drain — no checkpoint ever fires inside a hot Stage-A/Stage-B
+        // COMMIT's WAL-write-locked window (which would land a blocking fsync
+        // there). It runs on a dedicated connection (never a pool writer slot),
+        // is PASSIVE by default (never blocks writers or waits for readers; a busy
+        // WAL just leaves frames for the next tick), and self-escalates to
+        // TRUNCATE only when the WAL exceeds its size cap. Best-effort: logged,
+        // never propagated to fail the originating write. This runs every
+        // maintenance debounce, which fires whenever a write schedules
+        // maintenance — i.e. continuously under CDC load — so the WAL drains
+        // promptly even though the inline backstop is off.
         if let Err(e) = self.catalog.checkpoint_wal().await {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
