@@ -1,0 +1,401 @@
+---
+source: crates/runtime/src/http/v1/nsql.rs
+expression: response
+---
+{
+  "context": "# Spice.ai NSQL Context",
+  "instructions": [
+    "Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
+    "Return only valid SQL code, without markdown fences.",
+    "Quote column names that contain capitals or special characters with double quotes.",
+    "For tables with schemas and catalogs, use \"catalog\".\"schema\".\"table\", not \"catalog.schema.table\".",
+    "Use table and column descriptions, primary keys, foreign keys, unique constraints, and indexes when choosing joins and filters."
+  ],
+  "sql": {
+    "engine": "Apache DataFusion",
+    "version": "52.5.0",
+    "dialect": "PostgreSQL",
+    "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
+    "notes": [
+      "Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context.",
+      "Not every PostgreSQL extension is implemented; prefer the functions listed in this response when generating SQL for Spice.",
+      "Table functions such as text_search, vector_search, json_tree, and list_udfs are used in the FROM clause.",
+      "Run SELECT * FROM list_udfs() to inspect all functions registered in the current DataFusion context.",
+      "Use LIMIT for exploratory or broad-result queries unless the user explicitly asks for all rows."
+    ]
+  },
+  "datasets": [
+    {
+      "name": "sales.orders",
+      "catalog": "spice",
+      "schema": "sales",
+      "table": "orders",
+      "description": "Customer orders",
+      "metadata": {
+        "description": "Customer orders"
+      },
+      "columns": [
+        {
+          "name": "order_id",
+          "data_type": "Int64",
+          "nullable": false,
+          "description": "Unique order identifier",
+          "source_type": "bigint",
+          "metadata": {
+            "description": "Unique order identifier",
+            "source_type": "bigint"
+          },
+          "primary_key": true,
+          "unique": false,
+          "indexed": true,
+          "vector_search": false,
+          "full_text_search": false
+        },
+        {
+          "name": "customer_id",
+          "data_type": "Utf8",
+          "nullable": false,
+          "description": "Customer account identifier",
+          "source_type": "text",
+          "metadata": {
+            "description": "Customer account identifier",
+            "source_type": "text"
+          },
+          "primary_key": false,
+          "unique": false,
+          "indexed": true,
+          "vector_search": true,
+          "full_text_search": true
+        }
+      ],
+      "primary_key": [
+        "order_id"
+      ],
+      "unique_constraints": [
+        [
+          "order_id"
+        ]
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "customer_id"
+          ],
+          "foreign_table": "spice.sales.customers",
+          "foreign_columns": [
+            "id"
+          ]
+        }
+      ],
+      "indexes": [
+        {
+          "name": "customer_id",
+          "columns": [
+            "customer_id"
+          ],
+          "kind": "enabled",
+          "source": "spicepod.acceleration.indexes"
+        }
+      ],
+      "search": {
+        "vector": [
+          {
+            "column": "customer_id",
+            "function": "vector_search",
+            "syntax": "vector_search(sales.orders, 'query text', customer_id)",
+            "model": "embed_model",
+            "engine": "duckdb_vector_index",
+            "row_id_columns": [
+              "order_id"
+            ],
+            "vector_size": 384,
+            "chunked": false,
+            "input_mode": "scalar",
+            "index": {
+              "name": "duckdb_vector_index",
+              "columns": [
+                "customer_id",
+                "order_id"
+              ],
+              "kind": "duckdb_vector_index",
+              "source": "runtime_index"
+            },
+            "required_columns": [
+              "customer_id",
+              "order_id"
+            ],
+            "notes": []
+          }
+        ],
+        "full_text": [
+          {
+            "column": "customer_id",
+            "function": "text_search",
+            "syntax": "text_search(sales.orders, 'query text', customer_id)",
+            "engine": "tantivy",
+            "index_store": "memory",
+            "row_id_columns": [
+              "order_id"
+            ],
+            "index": {
+              "name": "full_text",
+              "columns": [
+                "customer_id",
+                "order_id"
+              ],
+              "kind": "full_text",
+              "source": "runtime_index"
+            },
+            "required_columns": [
+              "customer_id",
+              "order_id"
+            ],
+            "notes": []
+          }
+        ]
+      }
+    }
+  ],
+  "functions": {
+    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect. Standard DataFusion SQL functions are available. Additional Spice-specific and registered user-defined functions are listed below. Run SELECT * FROM list_udfs() to inspect the full registered function inventory",
+    "json": [
+      {
+        "name": "flatten_json",
+        "syntax": "flatten_json(json)",
+        "description": "Flattens JSON objects into key-value rows or structures."
+      },
+      {
+        "name": "flatten_json_properties",
+        "syntax": "flatten_json_properties(json_schema)",
+        "description": "Flattens JSON-schema properties into key-value rows or structures."
+      },
+      {
+        "name": "json_as_text",
+        "syntax": "json_as_text(json)",
+        "description": "Converts a JSON value to text.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_contains",
+        "syntax": "json_contains(json, value)",
+        "description": "Returns whether one JSON value contains another.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_from_scalar",
+        "syntax": "json_from_scalar(value)",
+        "description": "Converts a scalar value to JSON.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get",
+        "syntax": "json_get(json, path)",
+        "description": "Extracts a JSON value by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_array",
+        "syntax": "json_get_array(json, path)",
+        "description": "Extracts a JSON array by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_bool",
+        "syntax": "json_get_bool(json, path)",
+        "description": "Extracts a boolean value from JSON by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_float",
+        "syntax": "json_get_float(json, path)",
+        "description": "Extracts a floating-point value from JSON by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_int",
+        "syntax": "json_get_int(json, path)",
+        "description": "Extracts an integer value from JSON by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_json",
+        "syntax": "json_get_json(json, path)",
+        "description": "Extracts a nested JSON value by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_get_str",
+        "syntax": "json_get_str(json, path)",
+        "description": "Extracts a string value from JSON by path.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_length",
+        "syntax": "json_length(json)",
+        "description": "Returns the length of a JSON array or object.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_object_keys",
+        "syntax": "json_object_keys(json)",
+        "description": "Returns the keys of a JSON object.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "json_tree",
+        "syntax": "json_tree(json)",
+        "description": "Expands JSON into a tree of path, key, and value rows or structures."
+      }
+    ],
+    "search": [
+      {
+        "name": "rerank",
+        "syntax": "rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])",
+        "description": "Re-ranks search results or table rows using a configured reranker model."
+      },
+      {
+        "name": "rrf",
+        "syntax": "rrf(text_search(...), vector_search(...)[, limit => n])",
+        "description": "Combines multiple search result sets using reciprocal rank fusion."
+      },
+      {
+        "name": "text_search",
+        "syntax": "text_search(dataset, 'query text'[, column])",
+        "description": "Runs full-text search over a configured searchable dataset."
+      },
+      {
+        "name": "vector_search",
+        "syntax": "vector_search(dataset, 'query text'[, column])",
+        "description": "Runs vector search over a configured embedding/vector index."
+      }
+    ],
+    "additional": [
+      {
+        "name": "bucket",
+        "syntax": "bucket(value, buckets)",
+        "description": "Assigns a numeric expression to a bucket boundary.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "col_description",
+        "syntax": "col_description(table_catalog, table_schema, table_name, column_name)",
+        "description": "Returns the configured description for a table column.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "cosine_distance",
+        "syntax": "cosine_distance(vector_a, vector_b)",
+        "description": "Computes cosine distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "digest_many",
+        "syntax": "digest_many(value[, ...])",
+        "description": "Computes a digest for one or more input expressions.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "inner_product",
+        "syntax": "inner_product(vector_a, vector_b)",
+        "description": "Computes the inner product of two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_distance",
+        "syntax": "l2_distance(vector_a, vector_b)",
+        "description": "Computes Euclidean distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_norm",
+        "syntax": "l2_norm(vector)",
+        "description": "Computes the L2 norm of a vector.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "l2_squared_distance",
+        "syntax": "l2_squared_distance(vector_a, vector_b)",
+        "description": "Computes squared Euclidean distance between two vectors.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "list_udfs",
+        "syntax": "list_udfs()",
+        "description": "Lists functions registered in the current DataFusion context."
+      },
+      {
+        "name": "obj_description",
+        "syntax": "obj_description(table_catalog, table_schema, table_name)",
+        "description": "Returns the configured description for a table or object.",
+        "function_type": "SCALAR"
+      },
+      {
+        "name": "truncate",
+        "syntax": "truncate(value, precision)",
+        "description": "Truncates values to the requested precision.",
+        "function_type": "SCALAR"
+      }
+    ],
+    "spark_compatibility": {
+      "description": "Spark-compatible scalar functions are available for arrays, maps, structs, dates, strings, hashes, URLs, XML, and other common Spark SQL expressions.",
+      "functions": [
+        "abs",
+        "array",
+        "ascii",
+        "bit_count",
+        "bit_get",
+        "bitmap_count",
+        "bitwise_not",
+        "char",
+        "concat",
+        "crc32",
+        "csc",
+        "date_add",
+        "date_sub",
+        "elt",
+        "expm1",
+        "factorial",
+        "format_string",
+        "hex",
+        "hour",
+        "if",
+        "ilike",
+        "last_day",
+        "length",
+        "like",
+        "luhn_check",
+        "make_dt_interval",
+        "make_interval",
+        "map_from_arrays",
+        "map_from_entries",
+        "minute",
+        "mod",
+        "next_day",
+        "parse_url",
+        "pmod",
+        "rint",
+        "sec",
+        "second",
+        "sha1",
+        "sha2",
+        "shiftleft",
+        "shiftright",
+        "shiftrightunsigned",
+        "shuffle",
+        "space",
+        "try_parse_url",
+        "try_url_decode",
+        "url_decode",
+        "url_encode",
+        "width_bucket"
+      ]
+    },
+    "user_defined": []
+  },
+  "samples": [
+    {
+      "title": "Example rows for `sales.orders`",
+      "content": "| order_id | customer_id |\n| --- | --- |\n| 42 | CUST-1 |"
+    }
+  ]
+}
