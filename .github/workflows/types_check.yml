@@ -21,7 +21,7 @@ jobs:
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
-      - run: rustup toolchain install 1.94.1 --profile minimal
+      - run: rustup toolchain install 1.95.0 --profile minimal
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:

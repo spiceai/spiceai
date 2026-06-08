@@ -92,7 +92,7 @@ homepage = "https://spice.ai"
 license-file = "LICENSE"
 publish = false
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 version = "2.0.0-unstable"
 
 [workspace.dependencies]
@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "6d01d73d109f31026999ae8df4457b32723de10e" } # spiceai-53 (PR #6 merged: DF53 + with_function_support seam on both DuckDB factories, Engine model, sqlite between, sqlite decimal(p,s) NUMERIC affinity)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "5eb7c5d38ed44c0aaf41f1552449f641b7ea2622" } # spiceai-53 (PRs #6+#7+#8 merged: DF53 + with_function_support seam, Engine model, sqlite between/decimal(p,s) NUMERIC affinity, rusqlite 0.40 + UInt64 read-as-i64)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -284,7 +284,7 @@ reqwest = { version = "=0.12.24", features = ["json", "rustls-tls", "gzip", "bro
 reqsign-core = "3.0.0"
 rmcp = { version = "1.5.0", default-features = false }
 roaring = "0.11"
-rusqlite = { version = "0.37.0", features = ["bundled-decimal", "chrono"] }
+rusqlite = { version = "0.40.0", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
 schemars = "1.2.1"
@@ -444,7 +444,8 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 # (spiceai_duckdb_fork 1.4.4) was retired so runtime and table-providers share one
 # duckdb type set (AccessMode/Error/Connection/Transaction).
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58)
-rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6d062676210d095df45eafa6e19fd8" }
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" }       # 0.40.1 + bundled-decimal (PR #2)
+tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" } # allow rusqlite 0.40 (PR #1)
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }

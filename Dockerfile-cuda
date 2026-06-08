@@ -1,5 +1,5 @@
 #syntax=docker/dockerfile:1.2
-ARG RUST_VERSION=1.94.1
+ARG RUST_VERSION=1.95.0
 
 FROM nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04 AS build
 
