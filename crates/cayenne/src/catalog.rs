@@ -22,7 +22,7 @@ limitations under the License.
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, TableMetadata, TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -561,30 +561,6 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear table-level aggregate statistics for a table.
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()>;
-
-    /// Upsert per-file footer statistics for listing-time pruning.
-    async fn upsert_snapshot_file_statistics(
-        &self,
-        stats: &SnapshotFileStatistics,
-    ) -> CatalogResult<()>;
-
-    /// Get persisted per-file statistics for one object in a snapshot.
-    async fn get_snapshot_file_statistics(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-        file_path: &str,
-    ) -> CatalogResult<Option<SnapshotFileStatistics>>;
-
-    /// Drop per-file statistics rows for snapshots other than the current one.
-    async fn clear_snapshot_file_statistics_except(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<()>;
-
-    /// Clear all per-file statistics rows for a table.
-    async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is

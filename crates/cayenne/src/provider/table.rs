@@ -28,7 +28,7 @@ use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFileStatistics, TableMetadata, TableStatistics,
+    TableMetadata, TableStatistics,
 };
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
@@ -139,12 +139,6 @@ const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
 const MIN_CONSECUTIVE_INLIST_REWRITE_VALUES: usize = 4;
-/// Upper bound on PK `IN` list cardinality that qualifies for `target_partitions = 1`.
-const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
-/// Upper bound on PK `BETWEEN` span (inclusive) for selective scan fan-out control.
-const MAX_PK_SELECTIVE_RANGE_SPAN: i64 = 32;
-/// Maximum tombstone keys pushed into the Vortex scan predicate as `NOT IN`.
-const MAX_VORTEX_KEY_DELETE_PUSHDOWN: usize = 256;
 
 #[derive(Debug, Default)]
 struct BoundedWarningKeys {
@@ -355,8 +349,6 @@ struct InlinedViewEntry {
     /// Batches already decoded from IPC and filtered through the deletion map.
     /// Empty when all rows in this entry were removed by the deletion filter.
     batches: Vec<RecordBatch>,
-    /// Conservative min/max over the decoded IPC batches (pre-tombstone filter).
-    statistics: Arc<Statistics>,
 }
 
 /// Cached result of [`CayenneTableProvider::read_inlined_batches`] and
@@ -916,9 +908,7 @@ impl ColumnStatsAccumulator {
     }
 
     /// Compute `DataFusion` `ColumnStatistics` from a single Arrow column.
-    pub(crate) fn compute_column_stats(
-        col: &dyn arrow::array::Array,
-    ) -> datafusion_common::ColumnStatistics {
+    fn compute_column_stats(col: &dyn arrow::array::Array) -> datafusion_common::ColumnStatistics {
         use datafusion_common::stats::Precision;
 
         let null_count = Precision::Exact(col.null_count());
@@ -1397,17 +1387,6 @@ fn inline_memtable_pressure_with_thresholds(
         return Some(InlineMemtablePressure::IpcBytes);
     }
     None
-}
-
-struct SnapshotScanListingRequest<'a> {
-    state: &'a dyn Session,
-    table_url: &'a ListingTableUrl,
-    options: &'a ListingOptions,
-    partition_filters: &'a [Expr],
-    data_filters: &'a [Expr],
-    snapshot_id: &'a str,
-    limit: Option<usize>,
-    scan_schema: SchemaRef,
 }
 
 struct SnapshotFilesForScan {
@@ -6179,16 +6158,7 @@ impl CayenneTableProvider {
         );
         let scan_schema = Self::snapshot_scan_schema(&self.table_metadata.schema, &options);
         let listed = self
-            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
-                state: &state,
-                table_url: &table_url,
-                options: &options,
-                partition_filters: &[],
-                data_filters: &[],
-                snapshot_id: &snapshot_id,
-                limit: None,
-                scan_schema,
-            })
+            .list_files_for_snapshot_scan(&state, &table_url, &options, &[], None, scan_schema)
             .await
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
@@ -11037,7 +11007,7 @@ impl CayenneTableProvider {
         // uses `refresh_listing_table_under_held_fence` instead so it can hold
         // every participating partition's fence across one barrier window.
         let _fence = self.listing_fence.write().await;
-        self.refresh_listing_table_under_held_fence().await
+        self.refresh_listing_table_under_held_fence()
     }
 
     /// Drop every entry in [`Self::scan_file_statistics`].
@@ -11061,7 +11031,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be reconstructed.
-    pub(crate) async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
+    pub(crate) fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id();
@@ -11083,21 +11053,6 @@ impl CayenneTableProvider {
         )?;
 
         self.listing_table.store(new_listing_table);
-
-        if let Err(error) = self
-            .catalog
-            .clear_snapshot_file_statistics_except(
-                &self.table_metadata.table_id,
-                &current_snapshot,
-            )
-            .await
-        {
-            tracing::debug!(
-                table = %self.table_metadata.table_name,
-                error = %error,
-                "Failed to clear stale per-file snapshot statistics after listing refresh"
-            );
-        }
 
         tracing::debug!(
             "Refreshed listing table for {} (under held fence) to pick up new files",
@@ -12040,7 +11995,6 @@ impl CayenneTableProvider {
         Ok(InlinedViewEntry {
             batches: filtered_batches,
             envelope: entry.envelope.clone(),
-            statistics: Arc::clone(&entry.statistics),
         })
     }
 
@@ -12054,12 +12008,6 @@ impl CayenneTableProvider {
     ) -> Result<InlinedViewEntry> {
         let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
             .map_err(|e| super::Error::Arrow { source: e })?;
-        // Pre-filter stats are a conservative superset: tombstone removal can only
-        // shrink row ranges, never widen min/max.
-        let statistics = Arc::new(super::file_pruning::statistics_from_record_batches(
-            &self.table_metadata.schema,
-            &entry_batches,
-        ));
         let mut filtered_batches = Vec::with_capacity(entry_batches.len());
         for batch in entry_batches {
             if let Some(filtered) = self.filter_inlined_batch_for_deletions(
@@ -12073,7 +12021,6 @@ impl CayenneTableProvider {
         Ok(InlinedViewEntry {
             batches: filtered_batches,
             envelope: entry,
-            statistics,
         })
     }
 
@@ -12363,47 +12310,26 @@ impl CayenneTableProvider {
         !snapshot.tombstones.int64_pk.is_empty() || !snapshot.tombstones.row_keys.is_empty()
     }
 
-    fn pruned_inlined_batches(
+    fn inlined_batches_with_mem_tier_visibility(
         &self,
         view: &[InlinedViewEntry],
         mem_tier: &crate::provider::mem_tier::MemTier,
-        pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
         if view.is_empty() {
             return Ok(Vec::new());
         }
 
-        let schema = Arc::clone(&self.table_metadata.schema);
-        let removal = if Self::mem_tier_has_tombstones(mem_tier) {
-            Some(Self::mem_tier_deletion_maps(mem_tier))
-        } else {
-            None
-        };
+        if !Self::mem_tier_has_tombstones(mem_tier) {
+            return Ok(view
+                .iter()
+                .flat_map(|entry| entry.batches.iter().cloned())
+                .collect());
+        }
 
+        let removal = Self::mem_tier_deletion_maps(mem_tier);
         let mut batches = Vec::new();
         for entry in view {
-            let visible = if let Some(ref removal) = removal {
-                self.apply_tombstone_removal_to_entry(entry, removal)?
-            } else if entry.batches.is_empty() {
-                continue;
-            } else {
-                entry.clone()
-            };
-
-            if visible.batches.is_empty() {
-                continue;
-            }
-
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    visible.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )?
-            {
-                continue;
-            }
-
+            let visible = self.apply_tombstone_removal_to_entry(entry, &removal)?;
             batches.extend(visible.batches);
         }
         Ok(batches)
@@ -12412,26 +12338,14 @@ impl CayenneTableProvider {
     fn visible_mem_tier_batches(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
-        pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Vec<RecordBatch>> {
         if snapshot.segments.is_empty() {
             return Ok(Vec::new());
         }
 
-        let schema = Arc::clone(&self.table_metadata.schema);
         let inlined_deletions = Self::mem_tier_deletion_maps(snapshot);
         let mut visible_batches: Vec<RecordBatch> = Vec::new();
         for segment in snapshot.segments.iter() {
-            if let Some(predicate) = pruning_predicate
-                && super::file_pruning::should_prune_statistics(
-                    segment.statistics.as_ref(),
-                    &schema,
-                    predicate,
-                )?
-            {
-                continue;
-            }
-
             for batch in segment.batches.iter() {
                 let Some(visible) = self.filter_inlined_batch_for_deletions(
                     batch.clone(),
@@ -12595,8 +12509,9 @@ impl CayenneTableProvider {
         }
         let flushed_epoch = snapshot.epoch;
         let inlined_view = self.cached_inlined_view().await?;
-        let mut batches = self.pruned_inlined_batches(&inlined_view, &snapshot, None)?;
-        let mem_batches = self.visible_mem_tier_batches(&snapshot, None)?;
+        let mut batches =
+            self.inlined_batches_with_mem_tier_visibility(&inlined_view, &snapshot)?;
+        let mem_batches = self.visible_mem_tier_batches(&snapshot)?;
         let flushed_mem_rows: usize = mem_batches.iter().map(RecordBatch::num_rows).sum();
         batches.extend(mem_batches);
 
@@ -12704,7 +12619,7 @@ impl CayenneTableProvider {
                 i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
                 Ordering::Relaxed,
             );
-            self.refresh_listing_table_under_held_fence().await?;
+            self.refresh_listing_table_under_held_fence()?;
             stats
         };
 
@@ -12778,15 +12693,12 @@ impl CayenneTableProvider {
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
         effective_projection: Option<&Vec<usize>>,
-        pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if snapshot.is_empty() || snapshot.segments.is_empty() {
             return Ok(None);
         }
 
-        let visible_batches = self
-            .visible_mem_tier_batches(snapshot, pruning_predicate)
-            .map_err(|e| {
+        let visible_batches = self.visible_mem_tier_batches(snapshot).map_err(|e| {
             datafusion_common::DataFusionError::Execution(format!(
                 "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
                 self.table_metadata.table_name
@@ -12938,7 +12850,7 @@ impl CayenneTableProvider {
             };
 
             self.clear_inlined_metadata_after_checkpoint().await?;
-            self.refresh_listing_table_under_held_fence().await?;
+            self.refresh_listing_table_under_held_fence()?;
             // The flush moved every inline row to a file, but the keyset still tags
             // those rows `Inlined`. Without this flip a later upsert will lead to duplicate record.
             self.flip_inlined_keyset_entries_to_file_unlocated();
@@ -13860,16 +13772,14 @@ impl CayenneTableProvider {
             statistics,
             grouped_by_partition,
         } = self
-            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+            .list_files_for_snapshot_scan(
                 state,
-                table_url: &table_url,
-                options: &options,
-                partition_filters: &partition_filters,
-                data_filters: &data_filters,
-                snapshot_id,
-                limit: statistic_file_limit,
-                scan_schema: Arc::clone(&scan_schema),
-            })
+                &table_url,
+                &options,
+                &partition_filters,
+                statistic_file_limit,
+                Arc::clone(&scan_schema),
+            )
             .await?;
 
         if partitioned_file_lists.is_empty() {
@@ -13936,93 +13846,52 @@ impl CayenneTableProvider {
 
     async fn list_files_for_snapshot_scan(
         &self,
-        request: &SnapshotScanListingRequest<'_>,
+        state: &dyn Session,
+        table_url: &ListingTableUrl,
+        options: &ListingOptions,
+        partition_filters: &[Expr],
+        limit: Option<usize>,
+        scan_schema: SchemaRef,
     ) -> datafusion_common::Result<SnapshotFilesForScan> {
-        let collect_stats = request.options.collect_stat
+        let collect_stats = options.collect_stat
             && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
-        let store = request.state.runtime_env().object_store(request.table_url)?;
-        let meta_fetch_concurrency = request
-            .state
-            .config_options()
-            .execution
-            .meta_fetch_concurrency;
+        let store = state.runtime_env().object_store(table_url)?;
+        let meta_fetch_concurrency = state.config_options().execution.meta_fetch_concurrency;
         let file_list = pruned_partition_list(
-            request.state,
+            state,
             store.as_ref(),
-            request.table_url,
-            request.partition_filters,
-            &request.options.file_extension,
-            &request.options.table_partition_cols,
+            table_url,
+            partition_filters,
+            &options.file_extension,
+            &options.table_partition_cols,
         )
         .await?;
 
-        let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
-            super::file_pruning::build_listing_pruning_predicate(
-                &request.scan_schema,
-                request.data_filters,
-            )?
-        } else {
-            None
-        };
-
-        let table_name = self.table_metadata.table_name.clone();
         let files = file_list
             .map(|part_file| async {
                 let part_file = part_file?;
                 let statistics = if collect_stats {
                     self.collect_scan_file_statistics(
-                        request.state,
-                        request.snapshot_id,
+                        state,
                         &store,
-                        request.options.format.as_ref(),
+                        options.format.as_ref(),
                         &part_file,
                     )
                     .await?
                 } else {
                     Arc::new(Statistics::new_unknown(&self.table_metadata.schema))
                 };
-                let part_file = part_file.with_statistics(statistics);
-                if let Some(ref predicate) = listing_pruning_predicate
-                    && super::file_pruning::should_prune_partitioned_file(
-                        &part_file,
-                        &request.scan_schema,
-                        predicate,
-                    )?
-                {
-                    tracing::debug!(
-                        table = %table_name,
-                        file = %part_file.object_meta.location,
-                        "Pruned Vortex file at listing time via footer statistics"
-                    );
-                    return Ok(None);
-                }
-                Ok(Some(part_file))
+                DataFusionResult::Ok(part_file.with_statistics(statistics))
             })
-            .buffer_unordered(meta_fetch_concurrency)
-            .filter_map(|result| async move {
-                match result {
-                    Ok(Some(file)) => Some(Ok(file)),
-                    Ok(None) => None,
-                    Err(err) => Some(Err(err)),
-                }
-            });
+            .buffer_unordered(meta_fetch_concurrency);
 
-        let (file_group, inexact_stats) = Self::collect_scan_files_with_limit(
-            files,
-            request.limit,
-            collect_stats,
-        )
-        .await?;
+        let (file_group, inexact_stats) =
+            Self::collect_scan_files_with_limit(files, limit, collect_stats).await?;
 
-        let threshold = request
-            .state
-            .config_options()
-            .optimizer
-            .preserve_file_partitions;
+        let threshold = state.config_options().optimizer.preserve_file_partitions;
         let (file_groups, grouped_by_partition) =
-            if threshold > 0 && !request.options.table_partition_cols.is_empty() {
-                let grouped = file_group
-                    .group_by_partition_values(request.options.target_partitions);
+            if threshold > 0 && !options.table_partition_cols.is_empty() {
+                let grouped = file_group.group_by_partition_values(options.target_partitions);
                 if grouped.len() >= threshold {
                     (grouped, true)
                 } else {
@@ -14031,24 +13900,16 @@ impl CayenneTableProvider {
                         .flat_map(FileGroup::into_inner)
                         .collect::<Vec<_>>();
                     (
-                        FileGroup::new(all_files)
-                            .split_files(request.options.target_partitions),
+                        FileGroup::new(all_files).split_files(options.target_partitions),
                         false,
                     )
                 }
             } else {
-                (
-                    file_group.split_files(request.options.target_partitions),
-                    false,
-                )
+                (file_group.split_files(options.target_partitions), false)
             };
 
-        let (file_groups, statistics) = compute_all_files_statistics(
-            file_groups,
-            Arc::clone(&request.scan_schema),
-            collect_stats,
-            inexact_stats,
-        )?;
+        let (file_groups, statistics) =
+            compute_all_files_statistics(file_groups, scan_schema, collect_stats, inexact_stats)?;
 
         Ok(SnapshotFilesForScan {
             file_groups,
@@ -14060,7 +13921,6 @@ impl CayenneTableProvider {
     async fn collect_scan_file_statistics(
         &self,
         state: &dyn Session,
-        snapshot_id: &str,
         store: &Arc<dyn ObjectStore>,
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
@@ -14073,36 +13933,6 @@ impl CayenneTableProvider {
             return Ok(cached.statistics);
         }
 
-        let file_path = part_file.object_meta.location.to_string();
-        let file_size_bytes =
-            i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
-
-        if let Ok(Some(persisted)) = self
-            .catalog
-            .get_snapshot_file_statistics(
-                &self.table_metadata.table_id,
-                snapshot_id,
-                &file_path,
-            )
-            .await
-            && persisted.file_size_bytes == file_size_bytes
-            && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
-                &persisted.statistics_blob,
-                &self.table_metadata.schema,
-                persisted.num_rows,
-            )
-        {
-            self.scan_file_statistics.put(
-                &part_file.object_meta.location,
-                CachedFileMetadata::new(
-                    part_file.object_meta.clone(),
-                    Arc::clone(&statistics),
-                    None,
-                ),
-            );
-            return Ok(statistics);
-        }
-
         let statistics = Arc::new(
             format
                 .infer_stats(
@@ -14113,36 +13943,6 @@ impl CayenneTableProvider {
                 )
                 .await?,
         );
-
-        if let Some(blob) = crate::stats::statistics_to_persisted_blob(
-            statistics.as_ref(),
-            &self.table_metadata.schema,
-        ) {
-            let num_rows = match statistics.num_rows {
-                DFPrecision::Exact(rows) => i64::try_from(rows).unwrap_or(0),
-                DFPrecision::Inexact(rows) => i64::try_from(rows).unwrap_or(0),
-                DFPrecision::Absent => 0,
-            };
-            if let Err(error) = self
-                .catalog
-                .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
-                    table_id: self.table_metadata.table_id.clone(),
-                    snapshot_id: snapshot_id.to_string(),
-                    file_path,
-                    file_size_bytes,
-                    num_rows,
-                    statistics_blob: blob,
-                })
-                .await
-            {
-                tracing::debug!(
-                    table = %self.table_metadata.table_name,
-                    error = %error,
-                    "Failed to persist per-file snapshot statistics; continuing with footer stats"
-                );
-            }
-        }
-
         self.scan_file_statistics.put(
             &part_file.object_meta.location,
             CachedFileMetadata::new(part_file.object_meta.clone(), Arc::clone(&statistics), None),
@@ -14525,46 +14325,6 @@ impl CayenneTableProvider {
                 .any(|expr| pk_column_equals_literal(expr, pk_name))
         })
     }
-
-    /// Returns `true` when scan filters are selective enough that byte-range
-    /// file-group fan-out is wasted work: point equality on every PK column,
-    /// or (single-column Int64 PK only) a small `IN` list or tight `BETWEEN`.
-    fn is_pk_selective_scan(&self, filters: &[Expr]) -> bool {
-        if self.is_pk_point_lookup(filters) {
-            return true;
-        }
-        if self.pk_column_indices.len() != 1 {
-            return false;
-        }
-        let pk_name = self.table_metadata.schema.field(self.pk_column_indices[0]).name();
-        filters
-            .iter()
-            .any(|expr| pk_selective_in_or_range(expr, pk_name))
-    }
-
-    /// Build a Vortex-pushdown tombstone exclusion filter for sparse Int64 PK
-    /// deletes on the main scan path. Rows guaranteed hidden by the deletion
-    /// index are expressed as `pk NOT IN (...)` so Vortex can prune chunks and
-    /// listing can drop non-overlapping files before decode.
-    fn vortex_key_delete_pushdown_filter(
-        &self,
-        deletion_snapshot: &PkDeletionSnapshot,
-    ) -> Option<Expr> {
-        let PkDeletionSnapshot::Int64Pk { tombstones } = deletion_snapshot else {
-            return None;
-        };
-        if self.pk_column_indices.len() != 1 {
-            return None;
-        }
-        let pk_name = self.table_metadata.schema.field(self.pk_column_indices[0]).name();
-        super::file_pruning::tombstone_exclusion_filter(
-            pk_name,
-            tombstones,
-            InsertRecordHandling::Apply,
-            None,
-            MAX_VORTEX_KEY_DELETE_PUSHDOWN,
-        )
-    }
 }
 
 /// Walks `expr` looking for `Column(name) = Literal` (or the flipped form).
@@ -14601,42 +14361,6 @@ fn is_literal_like(expr: &Expr) -> bool {
         Expr::Literal(_, _) => true,
         Expr::Cast(c) => is_literal_like(&c.expr),
         Expr::TryCast(c) => is_literal_like(&c.expr),
-        _ => false,
-    }
-}
-
-/// `true` when `expr` is a selective single-column Int64 PK `IN` or `BETWEEN`.
-fn pk_selective_in_or_range(expr: &Expr, pk_name: &str) -> bool {
-    match expr {
-        Expr::InList(in_list) => {
-            if in_list.negated || !matches_column(&in_list.expr, pk_name) {
-                return false;
-            }
-            let len = in_list.list.len();
-            if len == 0 || len > MAX_PK_SELECTIVE_INLIST_VALUES {
-                return false;
-            }
-            in_list.list.iter().all(|item| extract_integer_literal(item).is_some())
-        }
-        Expr::Between(between) => {
-            if between.negated || !matches_column(&between.expr, pk_name) {
-                return false;
-            }
-            match (
-                extract_integer_literal(&between.low),
-                extract_integer_literal(&between.high),
-            ) {
-                (Some(lo), Some(hi)) => {
-                    let span = hi.checked_sub(lo).and_then(|d| d.checked_add(1));
-                    span.is_some_and(|span| span <= MAX_PK_SELECTIVE_RANGE_SPAN)
-                }
-                _ => false,
-            }
-        }
-        Expr::BinaryExpr(bin) if bin.op == Operator::And => {
-            pk_selective_in_or_range(&bin.left, pk_name)
-                || pk_selective_in_or_range(&bin.right, pk_name)
-        }
         _ => false,
     }
 }
@@ -14839,6 +14563,14 @@ impl TableProvider for CayenneTableProvider {
             })?;
         };
         let deletion_snapshot = deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot);
+        let inlined_batches = self
+            .inlined_batches_with_mem_tier_visibility(&inlined_view, &mem_tier_snapshot)
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to apply in-memory CDC tier tombstone visibility to inlined data for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
@@ -14919,17 +14651,7 @@ impl TableProvider for CayenneTableProvider {
         // row (two `i64` comparisons vs an N-element set probe). See
         // `pk_in_list_vs_range_rewrite` bench.
         let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
-        let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
-        if let Some(tombstone_filter) =
-            self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
-        {
-            tracing::trace!(
-                table = %self.table_metadata.table_name,
-                "Injected sparse key-delete tombstone exclusion into Vortex scan filters"
-            );
-            scan_filters_owned.push(tombstone_filter);
-        }
-        let scan_filters: &[Expr] = &scan_filters_owned;
+        let scan_filters: &[Expr] = effective_filters.as_ref().map_or(filters, Vec::as_slice);
         if retention_keep_filter.is_some() {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
@@ -14938,23 +14660,6 @@ impl TableProvider for CayenneTableProvider {
             );
         }
 
-        let segment_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
-            &self.table_metadata.schema,
-            scan_filters,
-        )?;
-        let inlined_batches = self
-            .pruned_inlined_batches(
-                &inlined_view,
-                &mem_tier_snapshot,
-                segment_pruning_predicate.as_ref(),
-            )
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to apply in-memory CDC tier tombstone visibility to inlined data for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-
         // For PK point lookups (e.g. `WHERE pk_col = K`), force the inner
         // `ListingTable` to use `target_partitions = 1` so DataFusion does NOT
         // byte-range-split the matching file across N file_groups. The fan-out
@@ -14962,7 +14667,7 @@ impl TableProvider for CayenneTableProvider {
         // up the lookup because only one chunk in one file_group actually
         // contains K. See `pk_lookup_file_group_fanout` bench.
         let scan_listing_config_override;
-        let scan_listing_config = if self.is_pk_selective_scan(scan_filters) {
+        let scan_listing_config = if self.is_pk_point_lookup(scan_filters) {
             scan_listing_config_override = state.config().clone().with_target_partitions(1);
             &scan_listing_config_override
         } else {
@@ -15066,11 +14771,7 @@ impl TableProvider for CayenneTableProvider {
         // uses; only the tombstone SOURCE differs — the in-RAM map vs the
         // metastore). `None` (and skipped) in file mode, where the tier is empty.
         let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
-            .build_mem_tier_scan_plan(
-                &mem_tier_snapshot,
-                effective_projection.as_ref(),
-                segment_pruning_predicate.as_ref(),
-            )?
+            .build_mem_tier_scan_plan(&mem_tier_snapshot, effective_projection.as_ref())?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
         // Build the final plan:
@@ -15201,6 +14902,10 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        if self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions() {
+            return None;
+        }
+
         // Prefer the metastore-persisted table statistics (loaded from Vortex
         // file footers) when present — they cover columns the ListingTable
         // does not expose synchronously without rescanning footers.
@@ -18111,16 +17816,14 @@ mod tests {
         let file_limit = Some(rows_per_file + 1);
 
         let direct_files = provider
-            .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
-                state: &ctx.state(),
-                table_url: &table_url,
-                options: &options,
-                partition_filters: &[],
-                data_filters: &[],
-                snapshot_id: &snapshot_id,
-                limit: file_limit,
-                scan_schema: Arc::clone(&scan_schema),
-            })
+            .list_files_for_snapshot_scan(
+                &ctx.state(),
+                &table_url,
+                &options,
+                &[],
+                file_limit,
+                Arc::clone(&scan_schema),
+            )
             .await
             .expect("direct scan file listing should succeed");
         let listing_files = listing_table
@@ -19912,37 +19615,6 @@ mod tests {
     fn pk_range_rejected() {
         let expr = col("id").gt(lit_i64(42));
         assert!(!pk_column_equals_literal(&expr, "id"));
-    }
-
-    #[test]
-    fn pk_selective_small_inlist() {
-        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
-            Box::new(col("id")),
-            vec![lit_i64(1), lit_i64(2), lit_i64(3)],
-            false,
-        ));
-        assert!(pk_selective_in_or_range(&in_list, "id"));
-    }
-
-    #[test]
-    fn pk_selective_large_inlist_rejected() {
-        let values: Vec<Expr> = (0..64).map(lit_i64).collect();
-        let in_list = Expr::InList(datafusion_expr::expr::InList::new(
-            Box::new(col("id")),
-            values,
-            false,
-        ));
-        assert!(!pk_selective_in_or_range(&in_list, "id"));
-    }
-
-    #[test]
-    fn pk_selective_tight_between() {
-        assert!(pk_selective_in_or_range(&between_int("id", 10, 20), "id"));
-    }
-
-    #[test]
-    fn pk_selective_wide_between_rejected() {
-        assert!(!pk_selective_in_or_range(&between_int("id", 1, 10_000), "id"));
     }
 
     #[test]

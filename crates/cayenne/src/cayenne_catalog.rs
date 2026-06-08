@@ -19,8 +19,7 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, SnapshotFileStatistics, TableMetadata,
-    TableStatistics,
+    PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -554,7 +553,6 @@ impl CayenneCatalog {
              DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_pk_index WHERE table_id = {table_id_literal}; \
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
@@ -2026,89 +2024,6 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn upsert_snapshot_file_statistics(
-        &self,
-        stats: &SnapshotFileStatistics,
-    ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file_statistics \
-                      (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params: vec![
-                    MetastoreValue::Text(stats.table_id.clone()),
-                    MetastoreValue::Text(stats.snapshot_id.clone()),
-                    MetastoreValue::Text(stats.file_path.clone()),
-                    MetastoreValue::Integer(stats.file_size_bytes),
-                    MetastoreValue::Integer(stats.num_rows),
-                    MetastoreValue::Blob(stats.statistics_blob.clone()),
-                ],
-            })
-            .await
-    }
-
-    async fn get_snapshot_file_statistics(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-        file_path: &str,
-    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
-        let results = self
-            .metastore
-            .query_helper(
-                QueryParams {
-                    sql: r"
-                    SELECT table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob
-                    FROM cayenne_snapshot_file_statistics
-                    WHERE table_id = ?1 AND snapshot_id = ?2 AND file_path = ?3
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(table_id.to_string()),
-                        MetastoreValue::Text(snapshot_id.to_string()),
-                        MetastoreValue::Text(file_path.to_string()),
-                    ],
-                },
-                |row| {
-                    Ok(SnapshotFileStatistics {
-                        table_id: row.get_string(0)?,
-                        snapshot_id: row.get_string(1)?,
-                        file_path: row.get_string(2)?,
-                        file_size_bytes: row.get_i64(3)?,
-                        num_rows: row.get_i64(4)?,
-                        statistics_blob: row.get_blob(5)?,
-                    })
-                },
-            )
-            .await?;
-        Ok(results.into_iter().next())
-    }
-
-    async fn clear_snapshot_file_statistics_except(
-        &self,
-        table_id: &str,
-        snapshot_id: &str,
-    ) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file_statistics \
-                      WHERE table_id = ?1 AND snapshot_id != ?2",
-                params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
-                    MetastoreValue::Text(snapshot_id.to_string()),
-                ],
-            })
-            .await
-    }
-
-    async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()> {
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.to_string())],
-            })
-            .await
-    }
-
     async fn upsert_pk_index(
         &self,
         table_id: &str,
@@ -3297,18 +3212,6 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to delete table statistics.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 5b. Delete per-file snapshot statistics
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete snapshot file statistics.".to_string(),
                 source: Box::new(e),
             })?;
 

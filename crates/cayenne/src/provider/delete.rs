@@ -50,7 +50,6 @@ pub(crate) use sink::file_based::FileBasedDeletionSink;
 // Crate-internal types used by table.rs
 pub(crate) use filter_exec::{
     InsertRecordHandling, Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec,
-    is_pk_visible_i64,
 };
 pub(crate) use vector_io::{
     DeletionIdentifier, DeletionVectorWriteResult, DeletionVectorWriteSpec, DeletionVectorWriter,

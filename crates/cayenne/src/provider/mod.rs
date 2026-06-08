@@ -76,7 +76,6 @@ pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
 pub(crate) mod delta_encoding;
-pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod mem_tier;
 pub(crate) mod mem_tier_budget;

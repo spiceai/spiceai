@@ -37,8 +37,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
-use arrow_schema::Schema;
-use datafusion_common::Statistics;
 use async_trait::async_trait;
 
 /// In-RAM tombstones for one mem tier, mirroring the strategy split that
@@ -112,8 +110,6 @@ pub(crate) struct MemSegment {
     /// The inline data sequence assigned to this segment's rows (the visibility
     /// watermark used by the merge-on-read deletion filter).
     pub(crate) data_sequence: i64,
-    /// Exact min/max over this segment's batches for predicate-based pruning.
-    pub(crate) statistics: Arc<Statistics>,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -181,21 +177,11 @@ impl MemTier {
         incoming_rows: u64,
         superseded: u64,
     ) -> Self {
-        let statistics = batches.first().map_or_else(
-            || Arc::new(Statistics::new_unknown(&Schema::empty())),
-            |first| {
-                Arc::new(crate::provider::file_pruning::statistics_from_record_batches(
-                    first.schema_ref(),
-                    batches.as_ref(),
-                ))
-            },
-        );
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
         segments.extend(self.segments.iter().cloned());
         segments.push(MemSegment {
             batches,
             data_sequence,
-            statistics,
         });
 
         let mut merged_tombstones = self.tombstones.clone();
