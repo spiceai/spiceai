@@ -23,6 +23,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 impl DatasetCheckpoint {
     pub(super) async fn init_turso(pool: &Arc<TursoConnectionPool>) -> Result<()> {
+        let _schema_guard = pool.acquire_schema_write_lock().await;
         let conn = pool.connect().await.map_err(Error::external)?;
 
         let create_table = format!(
@@ -41,6 +42,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) async fn migrate_turso(pool: &Arc<TursoConnectionPool>) -> Result<()> {
+        let _schema_guard = pool.acquire_schema_write_lock().await;
         let conn = pool.connect().await.map_err(Error::external)?;
 
         // Check if schema_json column exists
@@ -127,6 +129,7 @@ impl DatasetCheckpoint {
         schema: &SchemaRef,
         refresh_sql: Option<&str>,
     ) -> Result<()> {
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let conn = pool.connect().await.map_err(Error::external)?;
         let schema_json = Self::serialize_schema(schema)?;
         let refresh_sql_owned = refresh_sql.map(ToString::to_string);
@@ -190,6 +193,7 @@ impl DatasetCheckpoint {
     }
 
     pub(super) async fn delete_turso(&self, pool: &Arc<TursoConnectionPool>) -> Result<()> {
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let conn = pool.connect().await.map_err(Error::external)?;
 
         let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
