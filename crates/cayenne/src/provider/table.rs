@@ -78,6 +78,7 @@ use datafusion_execution::cache::cache_manager::FileStatisticsCache;
 use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
+use datafusion_expr::utils::conjunction;
 use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
@@ -5757,8 +5758,16 @@ impl CayenneTableProvider {
     }
 
     fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
-        let has_pending_visibility_changes =
-            self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
+        // Live inline/RAM-tier rows live only in the metastore — they are NOT
+        // reflected in the persisted file statistics (`commit_inlined_data_mutation`
+        // updates `inlined_row_count` but does not re-persist the table-stats
+        // `num_rows`). Fold their net count back into `num_rows` so the join
+        // planner sizes cardinalities against the real live row count instead of
+        // an undercount, while keeping the result `Inexact` (the inline rows are
+        // not represented in the column min/max/NDV, so we never claim `Exact`).
+        let inlined_rows = self.inlined_row_count.load(Ordering::Relaxed).max(0);
+        let has_pending_visibility_changes = self.has_pending_deletions() || inlined_rows > 0;
+        let inlined_rows = usize::try_from(inlined_rows).unwrap_or(usize::MAX);
 
         let cache = self.table_statistics.read();
         let cached_ref: Option<&Statistics> = if has_pending_visibility_changes {
@@ -5778,24 +5787,64 @@ impl CayenneTableProvider {
                     full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
                     "Returning top-level table statistics only for wide table"
                 );
-                return Some(Self::top_level_statistics_only(source, false));
+                return Some(Self::add_inlined_rows_to_statistics(
+                    Self::top_level_statistics_only(source, false),
+                    inlined_rows,
+                ));
             }
-            return Some(source.clone());
+            return Some(Self::add_inlined_rows_to_statistics(
+                source.clone(),
+                inlined_rows,
+            ));
         }
 
         // Cache-miss visibility-overlay path: cache.optimizer_inexact is None,
         // so transform optimizer on-the-fly. Rare — test seed only.
         if has_pending_visibility_changes {
-            let optimizer = cache.optimizer.clone()?;
+            let Some(optimizer) = cache.optimizer.clone() else {
+                drop(cache);
+                // No persisted stats at all, but we DO know the inline live-row
+                // count. Hand the planner that cardinality (Inexact, columns
+                // unknown) rather than `None`, so a join against an actively
+                // inlining CDC table is still sized instead of treated as
+                // statistics-less.
+                return (inlined_rows > 0).then(|| Statistics {
+                    num_rows: datafusion_common::stats::Precision::Inexact(inlined_rows),
+                    total_byte_size: datafusion_common::stats::Precision::Absent,
+                    column_statistics: Vec::new(),
+                });
+            };
             drop(cache);
             let inexact = Self::statistics_to_inexact(optimizer);
             if inexact.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
-                return Some(Self::top_level_statistics_only(&inexact, false));
+                return Some(Self::add_inlined_rows_to_statistics(
+                    Self::top_level_statistics_only(&inexact, false),
+                    inlined_rows,
+                ));
             }
-            return Some(inexact);
+            return Some(Self::add_inlined_rows_to_statistics(inexact, inlined_rows));
         }
 
         None
+    }
+
+    /// Fold the live inline/RAM-tier row count into a statistics object's
+    /// `num_rows`, downgrading it to `Inexact` (the inline rows are not reflected
+    /// in the column-level statistics, so the result is an estimate/superset and
+    /// must never claim `Exact`). A zero `inlined_rows` is returned unchanged so
+    /// the no-inline path keeps whatever precision it already had.
+    fn add_inlined_rows_to_statistics(mut stats: Statistics, inlined_rows: usize) -> Statistics {
+        use datafusion_common::stats::Precision;
+        if inlined_rows == 0 {
+            return stats;
+        }
+        stats.num_rows = match stats.num_rows {
+            Precision::Exact(n) | Precision::Inexact(n) => {
+                Precision::Inexact(n.saturating_add(inlined_rows))
+            }
+            Precision::Absent => Precision::Inexact(inlined_rows),
+        };
+        stats
     }
 
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
@@ -10486,6 +10535,76 @@ impl CayenneTableProvider {
         Ok(Arc::new(filter_exec))
     }
 
+    /// Wrap an in-memory scan branch (the durable inline corpus or the RAM CDC
+    /// tier) with a `FilterExec` applying the query's scan-level `filters`.
+    ///
+    /// # Why
+    ///
+    /// The file-backed branches of a Cayenne scan get their predicate at
+    /// execution time from `VortexSource::try_pushdown_filters` (`DataFusion`'s
+    /// physical optimizer pushes the post-scan `FilterExec` into the source).
+    /// The inline / RAM-tier branches are `MemorySourceConfig` execs, which do
+    /// NOT support filter pushdown — so without this wrapper the post-scan
+    /// `FilterExec` can never be removed (its `if_all` pushdown fails on the
+    /// un-filterable memory branch) and survives, re-filtering *every* row in
+    /// the union, including the already-pruned file output.
+    ///
+    /// Adding the predicate as a `FilterExec` directly above each memory branch
+    /// makes that branch report the parent filters as fully handled during
+    /// pushdown, so the redundant post-scan `FilterExec` is dropped while the
+    /// inline / RAM rows are still correctly filtered. The predicate is the
+    /// query's own filter, evaluated by a real `FilterExec`, so it applies to
+    /// every returned row exactly — preserving correctness under active inline
+    /// CDC.
+    ///
+    /// Best-effort: if the predicate cannot be built against this branch's
+    /// (projected) schema, the branch is returned unwrapped. Correctness still
+    /// holds because the post-scan `FilterExec` then survives and filters it;
+    /// only the redundant-filter optimization is skipped for that scan.
+    fn wrap_memory_branch_with_scan_filters(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        filters: &[Expr],
+    ) -> Arc<dyn ExecutionPlan> {
+        if filters.is_empty() {
+            return plan;
+        }
+
+        let arrow_schema = plan.schema();
+        let Ok(df_schema) = DFSchema::try_from(arrow_schema.as_ref().clone()) else {
+            return plan;
+        };
+        let execution_props = ExecutionProps::new();
+
+        let Some(predicate) = conjunction(filters.iter().cloned()) else {
+            return plan;
+        };
+
+        match datafusion_physical_expr::create_physical_expr(
+            &predicate,
+            &df_schema,
+            &execution_props,
+        )
+        .and_then(|physical_filter| FilterExec::try_new(physical_filter, Arc::clone(&plan)))
+        {
+            Ok(filter_exec) => {
+                tracing::trace!(
+                    table = %self.table_metadata.table_name,
+                    "Applied scan filters to in-memory CDC branch so the post-scan FilterExec can be dropped"
+                );
+                Arc::new(filter_exec)
+            }
+            Err(e) => {
+                tracing::trace!(
+                    table = %self.table_metadata.table_name,
+                    error = %e,
+                    "Could not pre-filter in-memory CDC branch; leaving post-scan FilterExec to filter it"
+                );
+                plan
+            }
+        }
+    }
+
     /// Apply retention filters by running the configured delete sink against
     /// the current table state.
     ///
@@ -14595,13 +14714,18 @@ impl TableProvider for CayenneTableProvider {
             if projected_batches.is_empty() {
                 None
             } else {
-                Some(
+                let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                         &[projected_batches],
                         proj_schema,
                         None,
-                    )?,
-                )
+                    )?;
+                // Pre-filter the inline branch with the query's scan filters so
+                // the post-scan FilterExec can be pushed away (this MemoryExec
+                // does not support filter pushdown on its own). The user filters
+                // are evaluated by a real FilterExec, so every returned inline
+                // row matches the predicate — correct under active inline CDC.
+                Some(self.wrap_memory_branch_with_scan_filters(inline_exec, filters))
             }
         };
 
@@ -14610,8 +14734,9 @@ impl TableProvider for CayenneTableProvider {
         // `filter_inlined_batch_for_deletions` path the durable inline corpus
         // uses; only the tombstone SOURCE differs — the in-RAM map vs the
         // metastore). `None` (and skipped) in file mode, where the tier is empty.
-        let mem_plan: Option<Arc<dyn ExecutionPlan>> =
-            self.build_mem_tier_scan_plan(&mem_tier_snapshot, effective_projection.as_ref())?;
+        let mem_plan: Option<Arc<dyn ExecutionPlan>> = self
+            .build_mem_tier_scan_plan(&mem_tier_snapshot, effective_projection.as_ref())?
+            .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
         // Build the final plan:
         // - If protected snapshots exist: deletion filter on main, UNION with snapshots
@@ -14684,6 +14809,33 @@ impl TableProvider for CayenneTableProvider {
         Ok(Arc::new(CayenneAccelerationExec::new(plan)))
     }
 
+    // Filter-pushdown exactness contract (read before changing the arms below):
+    //
+    // * Partition-column filters → `Exact`. Partition pruning eliminates whole
+    //   partition directories during file listing, so every row the scan can
+    //   return provably satisfies the predicate. There is no inline/RAM-tier
+    //   partitioning, but partition tables also never inline (the staged path is
+    //   forced for partitioned tables — see `write_cdc_pipelined`), so a
+    //   partition filter can never leak an unfiltered inline row.
+    //
+    // * All other (data-column) filters → `Inexact`, deliberately, NOT `Exact`.
+    //   The file-backed branch applies a data predicate ONLY when DataFusion's
+    //   post-scan `FilterExec` is pushed into `VortexSource::try_pushdown_filters`
+    //   by the physical optimizer; nothing in `scan()` itself can set the Vortex
+    //   predicate (its fields are crate-private to `vortex-datafusion`). Reporting
+    //   `Exact` would make DataFusion DROP that `FilterExec` at the logical level,
+    //   leaving the file branch unfiltered for any predicate Vortex cannot convert
+    //   (`can_be_pushed_down == false`) — a correctness bug. So we keep `Inexact`
+    //   ("uncertain ⇒ Inexact").
+    //
+    //   The post-scan `FilterExec` is still NOT a permanent tax under active
+    //   inline CDC: `scan()` now wraps each in-memory branch (inline corpus + RAM
+    //   tier) with its own `FilterExec` for the same predicate
+    //   (`wrap_memory_branch_with_scan_filters`). Once every union child applies
+    //   the predicate (Vortex via pushdown, memory branches via their own
+    //   `FilterExec`), the physical `FilterPushdown` rule's `if_all` succeeds and
+    //   removes the redundant post-scan `FilterExec` for every Vortex-convertible
+    //   predicate — achieving the drop without the `Exact` correctness hazard.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -14721,13 +14873,20 @@ impl TableProvider for CayenneTableProvider {
         // Prefer the metastore-persisted table statistics (loaded from Vortex
         // file footers) when present — they cover columns the ListingTable
         // does not expose synchronously without rescanning footers.
+        //
+        // `cached_table_statistics_for_optimizer` folds the live inline/RAM-tier
+        // row count into `num_rows` (Inexact), and synthesizes a count-only
+        // estimate even on a full stats cache-miss when inline rows exist — so an
+        // actively-inlining CDC table reports a real cardinality to the join
+        // planner instead of falling through to `None`.
         if let Some(stats) = self.cached_table_statistics_for_optimizer() {
             return Some(stats);
         }
 
-        // Inlined rows live only in the metastore; the ListingTable would
-        // under-count, so return None and let DataFusion treat the table as
-        // statistics-less rather than misleading the optimizer.
+        // Defensive: if we somehow reach here with inline rows present (no
+        // persisted stats AND `cached_table_statistics_for_optimizer` returned
+        // None), the ListingTable alone would under-count the inline rows, so
+        // return None rather than mislead the optimizer with a file-only count.
         if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
             return None;
         }
@@ -19597,6 +19756,148 @@ mod tests {
             1,
             "exactly one visible row for PK=1, got {pairs:?}"
         );
+    }
+
+    /// Flatten `(id, value)` pairs from result batches, sorted. Shared by the
+    /// predicate-filtered scan tests.
+    fn collect_id_value_pairs_from_batches(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+        use arrow::array::Int64Array;
+        let mut pairs = Vec::new();
+        for batch in batches {
+            let id_idx = batch.schema().index_of("id").expect("id column");
+            let value_idx = batch.schema().index_of("value").expect("value column");
+            let ids = batch
+                .column(id_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let values = batch
+                .column(value_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value is Int64");
+            for row in 0..batch.num_rows() {
+                pairs.push((ids.value(row), values.value(row)));
+            }
+        }
+        pairs.sort_unstable();
+        pairs
+    }
+
+    /// P1-1: a predicate-filtered scan over an actively-inlining CDC table must
+    /// return ONLY the rows matching the predicate. The inline branch is a
+    /// `MemoryExec` that does not support filter pushdown, so the scan now wraps
+    /// it with its own `FilterExec`; this drives the full `DataFusion` logical +
+    /// physical pipeline (where the post-scan `FilterExec` may be dropped) and
+    /// proves correctness is preserved while inline rows are live.
+    #[tokio::test]
+    async fn test_inline_cdc_filtered_scan_returns_only_matching_rows() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_inline_enabled_upsert_table("inline_filtered_scan", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed several rows into the inline memtable (each small batch inlines).
+        for (id, value) in [(1_i64, 10_i64), (2, 20), (3, 30), (4, 40), (5, 50)] {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[value]),
+            )
+            .await;
+        }
+        assert!(
+            provider.cached_inlined_row_count() >= 5,
+            "precondition: all five rows must be live in the inline memtable, got {}",
+            provider.cached_inlined_row_count()
+        );
+
+        ctx.deregister_table("inline_filtered_scan").ok();
+        ctx.register_table("inline_filtered_scan", Arc::new(provider.clone_for_write()))
+            .expect("table registered");
+
+        // Equality predicate: exactly one inline row matches.
+        let eq_rows = ctx
+            .sql("SELECT id, value FROM inline_filtered_scan WHERE id = 3")
+            .await
+            .expect("eq query planned")
+            .collect()
+            .await
+            .expect("eq query executed");
+        let eq_pairs = collect_id_value_pairs_from_batches(&eq_rows);
+        assert_eq!(
+            eq_pairs,
+            vec![(3, 30)],
+            "WHERE id = 3 must return exactly the matching inline row, got {eq_pairs:?}"
+        );
+
+        // Range predicate: a strict subset of the inline rows match.
+        let range_rows = ctx
+            .sql("SELECT id, value FROM inline_filtered_scan WHERE id > 3")
+            .await
+            .expect("range query planned")
+            .collect()
+            .await
+            .expect("range query executed");
+        let range_pairs = collect_id_value_pairs_from_batches(&range_rows);
+        assert_eq!(
+            range_pairs,
+            vec![(4, 40), (5, 50)],
+            "WHERE id > 3 must return only the matching inline rows, got {range_pairs:?}"
+        );
+
+        // A predicate matching no row returns nothing (no inline row leaks).
+        let none_rows = ctx
+            .sql("SELECT id, value FROM inline_filtered_scan WHERE id = 999")
+            .await
+            .expect("empty query planned")
+            .collect()
+            .await
+            .expect("empty query executed");
+        assert!(
+            collect_id_value_pairs_from_batches(&none_rows).is_empty(),
+            "a non-matching predicate must return no inline rows"
+        );
+    }
+
+    /// P1-2: `statistics()` must fold the live inline row count into `num_rows`
+    /// (as `Inexact`) so the join planner gets a real cardinality, instead of
+    /// returning `None`/an undercount, while inline CDC rows are live.
+    #[tokio::test]
+    async fn test_statistics_includes_inline_rows() {
+        use datafusion_common::stats::Precision;
+
+        let (provider, _catalog, _tmp) = create_inline_enabled_upsert_table(
+            "inline_stats_rowcount",
+            SessionContext::new().runtime_env(),
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let seeded = 4_i64;
+        for id in 1..=seeded {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+        assert_eq!(
+            provider.cached_inlined_row_count(),
+            seeded,
+            "precondition: all seeded rows live inline"
+        );
+
+        let stats = provider
+            .statistics()
+            .expect("statistics must be present while inline rows are live (not None)");
+
+        match stats.num_rows {
+            Precision::Inexact(n) => assert!(
+                n >= usize::try_from(seeded).expect("fits"),
+                "num_rows must include the {seeded} inline rows, got {n}"
+            ),
+            other => panic!("inline-row count must be Inexact (estimate), got {other:?}"),
+        }
     }
 
     /// Sequential delete+reinsert of the SAME PK across multiple large upserts
