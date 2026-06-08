@@ -184,6 +184,12 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
             )
             .await?;
 
+            // Clean up container after test
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
             assert!(
                 result.is_some(),
                 "fetch_latest_message should return a message"
@@ -195,12 +201,6 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
                 json!({"id": 2, "schema": "v2"}),
                 "latest non-tombstone should be the second message"
             );
-
-            // Clean up container after test
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
 
             Ok(())
         })
@@ -256,16 +256,16 @@ async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()>
             )
             .await?;
 
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
             let (key, value) = result.expect(
                 "fetch_latest_message should skip multiple trailing tombstones and return a value",
             );
             assert!(key.is_none());
             assert_eq!(value, json!({"id": 2, "schema": "v2"}));
-
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
 
             Ok(())
         })
@@ -342,6 +342,12 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
             )
             .await?;
 
+            // Clean up container after test
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
             assert!(
                 result.is_some(),
                 "fetch_latest_message should return a message across partitions"
@@ -355,12 +361,6 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
                 json!({"id": 2, "schema": "v2"}),
                 "latest non-tombstone across all partitions should be the message with timestamp 2000"
             );
-
-            // Clean up container after test
-            running_container.remove().await.map_err(|e| {
-                tracing::error!("running_container.remove: {e}");
-                anyhow::Error::msg(e.to_string())
-            })?;
 
             Ok(())
         })

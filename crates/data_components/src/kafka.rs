@@ -779,10 +779,11 @@ impl KafkaConsumer {
         let mut stream = Box::pin(consumer.stream());
         let mut burst = Vec::new();
 
-        while burst.len()
-            < usize::try_from(TOMBSTONE_SCAN_WINDOW)
-                .expect("tombstone scan window must fit in usize")
-        {
+        let mut stream = Box::pin(consumer.stream());
+        let mut burst = Vec::new();
+        let window_limit = usize::try_from(TOMBSTONE_SCAN_WINDOW).unwrap_or(0);
+
+        while burst.len() < window_limit {
             let poll_timeout = std::cmp::min(
                 Duration::from_secs(5),
                 deadline.saturating_duration_since(Instant::now()),
