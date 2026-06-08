@@ -208,8 +208,8 @@ impl super::AcceleratedTable {
                         );
                     }
                 }
-                Err(_) => continue,
-            };
+                Err(_) => {}
+            }
         }
     }
 }

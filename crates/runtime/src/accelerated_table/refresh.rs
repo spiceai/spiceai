@@ -210,8 +210,8 @@ pub struct Refresh {
     /// TTL for cache entries. Data older than this is considered stale.
     pub(crate) caching_ttl: Option<Duration>,
     /// Retention SQL delete expression to apply after a successful accelerator write.
-    /// Currently populated only for Arrow and PartitionedArrow accelerators;
-    /// DuckDB and Cayenne apply retention in their own write paths.
+    /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
+    /// `DuckDB` and Cayenne apply retention in their own write paths.
     pub(crate) write_retention_sql_delete_expr: Option<Expr>,
 }
 
