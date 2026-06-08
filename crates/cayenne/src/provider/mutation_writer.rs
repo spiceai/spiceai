@@ -572,8 +572,11 @@ impl<'a> AppendMutationWriter<'a> {
     /// In-memory CDC write path (`cdc_durability: memory`). Drains the validated
     /// stream into RAM, computes the on-conflict tombstones in memory, and
     /// appends to the mem tier — deferring the source slot ack to a checkpoint —
-    /// with per-table + global byte caps that spill (and, under sustained
-    /// overload, fall back to the durable path) so the tier can never OOM.
+    /// with byte caps (per-table, plus a process-wide one when the runtime has
+    /// installed the global budget) that spill (and, under sustained overload,
+    /// fall back to the durable path) so the resident tier cannot grow without
+    /// bound. The caps bound the resident tier, not a single apply: each prepared
+    /// burst is still buffered fully in RAM before the cap is checked.
     ///
     /// PK conflict validation still runs (it populated `post_validation` as the
     /// stream was prepared); only the per-batch DURABILITY is deferred.

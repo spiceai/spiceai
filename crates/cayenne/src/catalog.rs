@@ -407,9 +407,16 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be opened, any statement fails,
-    /// or the commit fails. Failures roll back the entire transaction; the
-    /// catalog is left unchanged (no partial delete-file / insert-record /
-    /// snapshot-sequence / tombstone / pending-flip state).
+    /// or the commit fails. In the single-transaction override (`CayenneCatalog`)
+    /// a failure rolls back the whole transaction, leaving the catalog unchanged
+    /// (no partial delete-file / insert-record / snapshot-sequence / tombstone /
+    /// pending-flip state). The trait DEFAULT implementation below is NOT atomic
+    /// across its steps — it runs `commit_on_conflict_deletions`, then the
+    /// deferred `published = 1` flips, then the tombstone INSERT as separate
+    /// calls, so a failure in a later step can leave earlier writes already
+    /// committed. Exactly-once still holds: the caller only clears its in-memory
+    /// pending-flip queue on overall success, and any orphaned `published = 0`
+    /// tombstone is crash-healed on reopen by `publish_orphan_inlined_deletes`.
     #[expect(clippy::too_many_arguments)]
     async fn commit_on_conflict_deletions_with_tombstone(
         &self,
