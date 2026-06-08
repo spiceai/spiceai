@@ -128,7 +128,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -199,7 +199,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
@@ -269,7 +269,7 @@ jobs:
 
       - name: Build spiced and spice CLI
         working-directory: bin/spiced
-        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models -p spiced -p spice --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features release,models,spicebench -p spiced -p spice --target-dir ../../target
 
       - name: tar spiced binary
         run: |
