@@ -201,8 +201,9 @@ impl MemTier {
     /// Wall-clock age of the oldest un-checkpointed segment, or zero when empty.
     #[must_use]
     pub(crate) fn age_ms(&self) -> u64 {
-        self.oldest_append
-            .map_or(0, |t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+        self.oldest_append.map_or(0, |t| {
+            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
     }
 }
 
