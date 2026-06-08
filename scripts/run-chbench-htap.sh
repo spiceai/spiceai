@@ -39,7 +39,7 @@ case "${1:-}" in -h|--help) sed -n '2,40p' "$0"; exit 0;; esac
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT" || exit 2
 
-SF="${SF:-5}"
+SF="${SF:-200}"
 DURATION="${DURATION:-300}"
 READY="${READY:-2400}"
 TERMINALS="${TERMINALS:-}"      # OLTP terminals; empty = testoperator default (SF*10)
@@ -119,6 +119,7 @@ if [ -n "$PG_CONTAINER" ]; then
 fi
 
 echo "Running CH-benCH HTAP: SF=$SF duration=${DURATION}s ready-wait=${READY}s -> $OUTDIR"
+# Pipe output to terminal and to file
 SPICED_LOG="$SPICED_LOG" "$TESTOP" run htap \
   -p "$SPICEPOD" -s "$REPO_ROOT/$SPICED" \
   --query-set chbench --scale-factor "$SF" --validate \
