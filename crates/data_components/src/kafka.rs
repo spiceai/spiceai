@@ -52,7 +52,7 @@ pub use rdkafka;
 // Number of messages to fetch in a single burst when scanning backward
 // past tombstones. One network round-trip pulls this many records into
 // the local buffer, eliminating per-tombstone seek overhead.
-const TOMBSTONE_SCAN_WINDOW: usize = 100;
+const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -779,7 +779,10 @@ impl KafkaConsumer {
         let mut stream = Box::pin(consumer.stream());
         let mut burst = Vec::new();
 
-        while burst.len() < TOMBSTONE_SCAN_WINDOW {
+        while burst.len()
+            < usize::try_from(TOMBSTONE_SCAN_WINDOW)
+                .expect("tombstone scan window must fit in usize")
+        {
             let poll_timeout = std::cmp::min(
                 Duration::from_secs(5),
                 deadline.saturating_duration_since(Instant::now()),
@@ -803,7 +806,7 @@ impl KafkaConsumer {
                 Ok(Some(Err(e))) => {
                     return Err(Error::UnableToReceiveMessage { source: e });
                 }
-                Err(_) if Instant::now() < deadline => continue,
+                Err(_) if Instant::now() < deadline => {}
                 Ok(None) | Err(_) => break,
             }
         }
@@ -829,7 +832,7 @@ impl KafkaConsumer {
                 break;
             }
 
-            let window_start = std::cmp::max(low, window_end - (TOMBSTONE_SCAN_WINDOW as i64) + 1);
+            let window_start = std::cmp::max(low, window_end - TOMBSTONE_SCAN_WINDOW + 1);
             let mut fetch_start = window_start;
             let mut window_burst = Vec::new();
 
