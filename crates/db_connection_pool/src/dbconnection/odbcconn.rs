@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::Cursor as IoCursor;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
@@ -80,12 +79,6 @@ pub enum Error {
     ODBCArrowReadError {
         source: arrow_odbc::arrow::error::ArrowError,
     },
-    #[snafu(display("Failed to serialize ODBC Arrow response: {source}"))]
-    ODBCArrowSerializeError {
-        source: arrow_odbc::arrow::error::ArrowError,
-    },
-    #[snafu(display("Failed to deserialize ODBC Arrow response: {source}"))]
-    ODBCArrowDeserializeError { source: arrow::error::ArrowError },
     #[snafu(display("ODBC driver error: {source}"))]
     ArrowODBCError { source: arrow_odbc::Error },
     #[snafu(display("ODBC connection error: {source}"))]
@@ -427,45 +420,19 @@ fn build_odbc_reader<C: Cursor>(
     builder.build(cursor).context(ArrowODBCSnafu)
 }
 
+// arrow-odbc is built against the workspace Arrow (its `arrow` dep resolves to the
+// patched workspace Arrow), so its schema type is already the workspace `Schema` —
+// no conversion (previously an Arrow-57 -> 58 IPC round-trip) is needed.
 fn odbc_schema_to_arrow(schema: &arrow_odbc::arrow::datatypes::Schema) -> Result<Schema, Error> {
-    let mut buffer = Vec::new();
-    {
-        let mut writer = source_arrow_ipc::writer::StreamWriter::try_new(&mut buffer, schema)
-            .context(ODBCArrowSerializeSnafu)?;
-        writer.finish().context(ODBCArrowSerializeSnafu)?;
-    }
-
-    let reader = arrow::ipc::reader::StreamReader::try_new(IoCursor::new(buffer), None)
-        .context(ODBCArrowDeserializeSnafu)?;
-    Ok(reader.schema().as_ref().clone())
+    Ok(schema.clone())
 }
 
+// arrow-odbc record batches are already workspace Arrow batches (Arrow clones are
+// shallow Arc bumps), so we pass them through directly.
 fn odbc_record_batch_to_arrow(
     record_batch: &arrow_odbc::arrow::record_batch::RecordBatch,
 ) -> Result<RecordBatch, Error> {
-    let mut buffer = Vec::new();
-    let schema = record_batch.schema();
-    {
-        let mut writer =
-            source_arrow_ipc::writer::StreamWriter::try_new(&mut buffer, schema.as_ref())
-                .context(ODBCArrowSerializeSnafu)?;
-        writer
-            .write(record_batch)
-            .context(ODBCArrowSerializeSnafu)?;
-        writer.finish().context(ODBCArrowSerializeSnafu)?;
-    }
-
-    let mut reader = arrow::ipc::reader::StreamReader::try_new(IoCursor::new(buffer), None)
-        .context(ODBCArrowDeserializeSnafu)?;
-    let Some(batch) = reader.next() else {
-        return Err(Error::ArrowError {
-            source: arrow::error::ArrowError::ParseError(
-                "ODBC Arrow IPC stream did not contain a record batch".to_string(),
-            ),
-        });
-    };
-
-    batch.context(ODBCArrowDeserializeSnafu)
+    Ok(record_batch.clone())
 }
 
 /// Extracts diagnostic error messages from an ODBC handle after a failed call.
