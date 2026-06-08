@@ -26,20 +26,20 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion_common::ScalarValue;
 use datafusion_common::pruning::PrunableStatistics;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{DFSchema, Result, Statistics};
 use datafusion_datasource::PartitionedFile;
 use datafusion_expr::utils::conjunction;
-use datafusion_expr::{col, lit, Expr};
-use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, col, lit};
 
-use super::delete::{is_pk_visible_i64, InsertRecordHandling};
+use super::delete::{InsertRecordHandling, is_pk_visible_i64};
 use super::deletion_index::DeletionIndex;
 use datafusion_physical_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::metrics::Count;
-use datafusion_pruning::{build_pruning_predicate, FilePruner};
+use datafusion_pruning::{FilePruner, build_pruning_predicate};
 
 use super::table::ColumnStatsAccumulator;
 
@@ -144,8 +144,7 @@ pub(crate) fn should_prune_statistics(
         return Ok(false);
     }
 
-    let prunable =
-        PrunableStatistics::new(vec![Arc::new(stats.clone())], Arc::clone(schema));
+    let prunable = PrunableStatistics::new(vec![Arc::new(stats.clone())], Arc::clone(schema));
     let Some(pruning_predicate) =
         build_pruning_predicate(Arc::clone(predicate), schema, &Count::default())
     else {
@@ -279,7 +278,10 @@ mod tests {
             ],
         );
 
-        assert_eq!(stats.num_rows, datafusion_common::stats::Precision::Exact(3));
+        assert_eq!(
+            stats.num_rows,
+            datafusion_common::stats::Precision::Exact(3)
+        );
         assert_eq!(
             stats.column_statistics[0].min_value,
             datafusion_common::stats::Precision::Exact(ScalarValue::Int64(Some(1)))
@@ -293,7 +295,8 @@ mod tests {
     #[test]
     fn prunes_segment_disjoint_from_predicate() {
         let schema = test_schema();
-        let stats = statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
+        let stats =
+            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
         let predicate = build_listing_pruning_predicate(&schema, &[col("id").eq(lit(99))])
             .expect("predicate")
             .expect("some");
@@ -307,14 +310,9 @@ mod tests {
     #[test]
     fn tombstone_exclusion_builds_negated_in_list() {
         let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2)]));
-        let filter = tombstone_exclusion_filter(
-            "id",
-            &index,
-            InsertRecordHandling::Ignore,
-            None,
-            256,
-        )
-        .expect("filter");
+        let filter =
+            tombstone_exclusion_filter("id", &index, InsertRecordHandling::Ignore, None, 256)
+                .expect("filter");
         let Expr::InList(in_list) = filter else {
             panic!("expected negated IN list");
         };
@@ -324,10 +322,7 @@ mod tests {
 
     #[test]
     fn tombstone_exclusion_skips_reinserted_upsert_keys() {
-        let index = DeletionIndex::from_maps(
-            HashMap::from([(10, 5)]),
-            HashMap::from([(10, 6)]),
-        );
+        let index = DeletionIndex::from_maps(HashMap::from([(10, 5)]), HashMap::from([(10, 6)]));
         assert!(
             tombstone_exclusion_filter("id", &index, InsertRecordHandling::Apply, None, 256)
                 .is_none(),
@@ -338,7 +333,8 @@ mod tests {
     #[test]
     fn keeps_segment_overlapping_predicate() {
         let schema = test_schema();
-        let stats = statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
+        let stats =
+            statistics_from_record_batches(&schema, &[batch(&[1, 2, 3], &[None, None, None])]);
         let predicate = build_listing_pruning_predicate(&schema, &[col("id").eq(lit(2))])
             .expect("predicate")
             .expect("some");

@@ -11086,10 +11086,7 @@ impl CayenneTableProvider {
 
         if let Err(error) = self
             .catalog
-            .clear_snapshot_file_statistics_except(
-                &self.table_metadata.table_id,
-                &current_snapshot,
-            )
+            .clear_snapshot_file_statistics_except(&self.table_metadata.table_id, &current_snapshot)
             .await
         {
             tracing::debug!(
@@ -12787,11 +12784,11 @@ impl CayenneTableProvider {
         let visible_batches = self
             .visible_mem_tier_batches(snapshot, pruning_predicate)
             .map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
-                self.table_metadata.table_name
-            ))
-        })?;
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
 
         if visible_batches.is_empty() {
             return Ok(None);
@@ -13940,7 +13937,10 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<SnapshotFilesForScan> {
         let collect_stats = request.options.collect_stat
             && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
-        let store = request.state.runtime_env().object_store(request.table_url)?;
+        let store = request
+            .state
+            .runtime_env()
+            .object_store(request.table_url)?;
         let meta_fetch_concurrency = request
             .state
             .config_options()
@@ -14007,41 +14007,36 @@ impl CayenneTableProvider {
                 }
             });
 
-        let (file_group, inexact_stats) = Self::collect_scan_files_with_limit(
-            files,
-            request.limit,
-            collect_stats,
-        )
-        .await?;
+        let (file_group, inexact_stats) =
+            Self::collect_scan_files_with_limit(files, request.limit, collect_stats).await?;
 
         let threshold = request
             .state
             .config_options()
             .optimizer
             .preserve_file_partitions;
-        let (file_groups, grouped_by_partition) =
-            if threshold > 0 && !request.options.table_partition_cols.is_empty() {
-                let grouped = file_group
-                    .group_by_partition_values(request.options.target_partitions);
-                if grouped.len() >= threshold {
-                    (grouped, true)
-                } else {
-                    let all_files = grouped
-                        .into_iter()
-                        .flat_map(FileGroup::into_inner)
-                        .collect::<Vec<_>>();
-                    (
-                        FileGroup::new(all_files)
-                            .split_files(request.options.target_partitions),
-                        false,
-                    )
-                }
+        let (file_groups, grouped_by_partition) = if threshold > 0
+            && !request.options.table_partition_cols.is_empty()
+        {
+            let grouped = file_group.group_by_partition_values(request.options.target_partitions);
+            if grouped.len() >= threshold {
+                (grouped, true)
             } else {
+                let all_files = grouped
+                    .into_iter()
+                    .flat_map(FileGroup::into_inner)
+                    .collect::<Vec<_>>();
                 (
-                    file_group.split_files(request.options.target_partitions),
+                    FileGroup::new(all_files).split_files(request.options.target_partitions),
                     false,
                 )
-            };
+            }
+        } else {
+            (
+                file_group.split_files(request.options.target_partitions),
+                false,
+            )
+        };
 
         let (file_groups, statistics) = compute_all_files_statistics(
             file_groups,
@@ -14074,16 +14069,11 @@ impl CayenneTableProvider {
         }
 
         let file_path = part_file.object_meta.location.to_string();
-        let file_size_bytes =
-            i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
+        let file_size_bytes = i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
 
         if let Ok(Some(persisted)) = self
             .catalog
-            .get_snapshot_file_statistics(
-                &self.table_metadata.table_id,
-                snapshot_id,
-                &file_path,
-            )
+            .get_snapshot_file_statistics(&self.table_metadata.table_id, snapshot_id, &file_path)
             .await
             && persisted.file_size_bytes == file_size_bytes
             && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
@@ -14536,7 +14526,11 @@ impl CayenneTableProvider {
         if self.pk_column_indices.len() != 1 {
             return false;
         }
-        let pk_name = self.table_metadata.schema.field(self.pk_column_indices[0]).name();
+        let pk_name = self
+            .table_metadata
+            .schema
+            .field(self.pk_column_indices[0])
+            .name();
         filters
             .iter()
             .any(|expr| pk_selective_in_or_range(expr, pk_name))
@@ -14556,7 +14550,11 @@ impl CayenneTableProvider {
         if self.pk_column_indices.len() != 1 {
             return None;
         }
-        let pk_name = self.table_metadata.schema.field(self.pk_column_indices[0]).name();
+        let pk_name = self
+            .table_metadata
+            .schema
+            .field(self.pk_column_indices[0])
+            .name();
         super::file_pruning::tombstone_exclusion_filter(
             pk_name,
             tombstones,
@@ -14616,7 +14614,10 @@ fn pk_selective_in_or_range(expr: &Expr, pk_name: &str) -> bool {
             if len == 0 || len > MAX_PK_SELECTIVE_INLIST_VALUES {
                 return false;
             }
-            in_list.list.iter().all(|item| extract_integer_literal(item).is_some())
+            in_list
+                .list
+                .iter()
+                .all(|item| extract_integer_literal(item).is_some())
         }
         Expr::Between(between) => {
             if between.negated || !matches_column(&between.expr, pk_name) {
@@ -14920,9 +14921,8 @@ impl TableProvider for CayenneTableProvider {
         // `pk_in_list_vs_range_rewrite` bench.
         let effective_filters = rewritten_scan_filters(filters, retention_keep_filter.as_ref());
         let mut scan_filters_owned = effective_filters.unwrap_or_else(|| filters.to_vec());
-        if let Some(tombstone_filter) =
-            self.vortex_key_delete_pushdown_filter(&deletion_snapshot)
-        {
+        let mem_tier_pruning_filters = scan_filters_owned.clone();
+        if let Some(tombstone_filter) = self.vortex_key_delete_pushdown_filter(&deletion_snapshot) {
             tracing::trace!(
                 table = %self.table_metadata.table_name,
                 "Injected sparse key-delete tombstone exclusion into Vortex scan filters"
@@ -14941,6 +14941,10 @@ impl TableProvider for CayenneTableProvider {
         let segment_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
             &self.table_metadata.schema,
             scan_filters,
+        )?;
+        let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
+            &self.table_metadata.schema,
+            &mem_tier_pruning_filters,
         )?;
         let inlined_batches = self
             .pruned_inlined_batches(
@@ -15069,7 +15073,7 @@ impl TableProvider for CayenneTableProvider {
             .build_mem_tier_scan_plan(
                 &mem_tier_snapshot,
                 effective_projection.as_ref(),
-                segment_pruning_predicate.as_ref(),
+                mem_tier_pruning_predicate.as_ref(),
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
@@ -15217,6 +15221,13 @@ impl TableProvider for CayenneTableProvider {
         // None), the ListingTable alone would under-count the inline rows, so
         // return None rather than mislead the optimizer with a file-only count.
         if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+
+        // Position deletes are applied inside the Vortex access plan. If no
+        // cached table stats are available, the synchronous ListingTable stats
+        // are raw file-footer stats and do not account for the pending bitmap.
+        if self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions() {
             return None;
         }
 
@@ -19942,7 +19953,10 @@ mod tests {
 
     #[test]
     fn pk_selective_wide_between_rejected() {
-        assert!(!pk_selective_in_or_range(&between_int("id", 1, 10_000), "id"));
+        assert!(!pk_selective_in_or_range(
+            &between_int("id", 1, 10_000),
+            "id"
+        ));
     }
 
     #[test]
@@ -21417,6 +21431,54 @@ mod tests {
                 .expect("read inline tombstones")
                 .is_empty(),
             "a position-based table must persist no inline tombstone"
+        );
+    }
+
+    /// When position deletes are pending and the cached aggregate stats are not
+    /// available, `statistics()` must not fall back to raw ListingTable footer
+    /// stats. Those stats do not account for the Vortex access-plan deletion
+    /// bitmap and can overstate cardinality until maintenance repopulates the
+    /// cache.
+    #[tokio::test]
+    async fn test_statistics_cache_miss_with_position_deletes_returns_none() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_position_based_table("position_stats_cache_miss", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30]),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("flush stats");
+        assert!(
+            provider.statistics().is_some(),
+            "precondition: position table should expose stats before deletes"
+        );
+
+        let delete_plan = provider
+            .delete_from(
+                &ctx.state(),
+                vec![col("id").eq(datafusion_expr::lit(2_i64))],
+            )
+            .await
+            .expect("delete plan");
+        collect(delete_plan, ctx.task_ctx())
+            .await
+            .expect("delete executed");
+        assert!(
+            provider.has_pending_deletions(),
+            "precondition: delete should leave a pending position bitmap"
+        );
+
+        provider.clear_cached_table_statistics_unlocked();
+        assert!(
+            provider.statistics().is_none(),
+            "with pending position deletes and no cached aggregate, raw ListingTable stats must be suppressed"
         );
     }
 

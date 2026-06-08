@@ -19,8 +19,7 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, SnapshotFileStatistics, TableMetadata,
-    TableStatistics,
+    PartitionMetadata, PkConflictDetection, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]

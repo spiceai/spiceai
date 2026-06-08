@@ -38,8 +38,8 @@ use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
-use datafusion_common::Statistics;
 use async_trait::async_trait;
+use datafusion_common::Statistics;
 
 /// In-RAM tombstones for one mem tier, mirroring the strategy split that
 /// `load_inlined_deletion_maps` produces for the durable inline path. Each map
@@ -184,10 +184,12 @@ impl MemTier {
         let statistics = batches.first().map_or_else(
             || Arc::new(Statistics::new_unknown(&Schema::empty())),
             |first| {
-                Arc::new(crate::provider::file_pruning::statistics_from_record_batches(
-                    first.schema_ref(),
-                    batches.as_ref(),
-                ))
+                Arc::new(
+                    crate::provider::file_pruning::statistics_from_record_batches(
+                        first.schema_ref(),
+                        batches.as_ref(),
+                    ),
+                )
             },
         );
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
