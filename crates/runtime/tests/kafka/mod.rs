@@ -153,7 +153,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
 
     test_request_context()
         .scope(async {
-            const TEST_PORT: u16 = 19094;
+            const TEST_PORT: u16 = 19096;
             let (running_container, producer) =
                 start_kafka_docker_container(TEST_PORT, &["fetch_latest_tombstone_test"]).await?;
             // Send two normal messages followed by a tombstone on the tail.
@@ -188,7 +188,7 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
                 result.is_some(),
                 "fetch_latest_message should return a message"
             );
-            let (key, value) = result.expect("result");
+            let (key, value) = result.expect("fetch_latest_message should return the latest value");
             assert!(key.is_none(), "normal messages have no key");
             assert_eq!(
                 value,
@@ -197,6 +197,71 @@ async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> 
             );
 
             // Clean up container after test
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies backward scan skips a longer tombstone run at the partition tail.
+#[tokio::test]
+async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const TEST_PORT: u16 = 19097;
+            let (running_container, producer) =
+                start_kafka_docker_container(TEST_PORT, &["fetch_latest_many_tombstones_test"])
+                    .await?;
+
+            let messages: Vec<serde_json::Value> = vec![
+                json!({"id": 1, "schema": "v1"}),
+                json!({"id": 2, "schema": "v2"}),
+            ];
+            send_messages_to_kafka(&producer, "fetch_latest_many_tombstones_test", &messages)
+                .await?;
+
+            for i in 0..5 {
+                send_tombstone_to_kafka(
+                    &producer,
+                    "fetch_latest_many_tombstones_test",
+                    0,
+                    &format!("tombstone-{i}"),
+                )
+                .await?;
+            }
+
+            let kafka_config = KafkaConfig {
+                brokers: format!("localhost:{TEST_PORT}"),
+                security_protocol: "SASL_PLAINTEXT".to_string(),
+                sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
+                sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
+                sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
+                ssl_ca_location: None,
+                enable_ssl_certificate_verification: true,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            };
+
+            let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_many_tombstones_test",
+                &kafka_config,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            let (key, value) = result.expect(
+                "fetch_latest_message should skip multiple trailing tombstones and return a value",
+            );
+            assert!(key.is_none());
+            assert_eq!(value, json!({"id": 2, "schema": "v2"}));
+
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
                 anyhow::Error::msg(e.to_string())
@@ -281,7 +346,9 @@ async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()>
                 result.is_some(),
                 "fetch_latest_message should return a message across partitions"
             );
-            let (key, value) = result.expect("result");
+            let (key, value) = result.expect(
+                "fetch_latest_message should return the newest non-tombstone across partitions",
+            );
             assert!(key.is_none(), "normal messages have no key");
             assert_eq!(
                 value,
