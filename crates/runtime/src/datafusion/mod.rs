@@ -4499,7 +4499,7 @@ mod tests {
 
         let plan_cache_provider = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ));
         let df = Arc::new(

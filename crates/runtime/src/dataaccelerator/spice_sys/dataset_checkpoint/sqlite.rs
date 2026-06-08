@@ -278,7 +278,7 @@ mod tests {
         let pool = SqliteConnectionPoolFactory::new(
             "",
             Mode::Memory,
-            std::time::Duration::from_millis(5000),
+            std::time::Duration::from_secs(5),
         )
         .build()
         .await
@@ -300,7 +300,7 @@ mod tests {
         let pool = SqliteConnectionPoolFactory::new(
             "",
             Mode::Memory,
-            std::time::Duration::from_millis(5000),
+            std::time::Duration::from_secs(5),
         )
         .build()
         .await

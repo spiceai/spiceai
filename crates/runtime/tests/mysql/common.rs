@@ -45,8 +45,8 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
 const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
-const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mysql_docker_container(

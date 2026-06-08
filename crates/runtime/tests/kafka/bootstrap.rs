@@ -32,7 +32,7 @@ pub const KAFKA_SASL_PASSWORD: &str = "kafka123";
 pub const KAFKA_SASL_MECHANISM: &str = "SCRAM-SHA-256";
 
 const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.1.6";
-const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 
 #[instrument]
 pub async fn start_kafka_docker_container(

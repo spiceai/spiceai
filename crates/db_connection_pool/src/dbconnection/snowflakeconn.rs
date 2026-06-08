@@ -1473,7 +1473,7 @@ mod tests {
             ],
         );
 
-        for (epoch, fraction) in epochs.into_iter().zip(fractions.into_iter()) {
+        for (epoch, fraction) in epochs.into_iter().zip(fractions) {
             if let (Some(epoch_val), Some(fraction_val)) = (epoch, fraction) {
                 builder
                     .field_builder::<Int64Builder>(0)

@@ -419,13 +419,13 @@ async fn test_cayenne_with_partitioned_tpch() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(240)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(4)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
             }
 
-            runtime_ready_check_with_timeout(&rt, Duration::from_secs(600)).await;
+            runtime_ready_check_with_timeout(&rt, Duration::from_mins(10)).await;
 
             let queries = QuerySet::Tpch
                 .get_queries(None, None, None, None)
@@ -564,13 +564,13 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(240)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(4)) => {
                     return Err(format!("Timed out waiting for datasets to load for {zone_count}-zone scenario"));
                 }
                 () = cloned_rt.load_components() => {}
             }
 
-            runtime_ready_check_with_timeout(&rt, Duration::from_secs(300)).await;
+            runtime_ready_check_with_timeout(&rt, Duration::from_mins(5)).await;
 
             let table_ref = TableReference::bare(table_name.as_str());
             if !rt.datafusion().is_accelerated(&table_ref).await {

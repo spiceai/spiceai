@@ -166,7 +166,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -313,7 +313,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -449,7 +449,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -606,7 +606,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -764,7 +764,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -910,7 +910,7 @@ async fn test_refresh_sql_with_bucket_function() -> Result<(), anyhow::Error> {
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timeout waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

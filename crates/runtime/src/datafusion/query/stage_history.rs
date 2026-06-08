@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn override_replaces_timestamps_with_stage_window() {
-        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let emit_at = UNIX_EPOCH + Duration::from_secs(10_000);
         let mut span = stage_span(
             emit_at,
             emit_at + Duration::from_millis(2),
@@ -425,14 +425,14 @@ mod tests {
         BallistaStageMiddleware.transform(&mut span);
         assert_eq!(
             span.start_time,
-            UNIX_EPOCH + Duration::from_millis(1_000_000)
+            UNIX_EPOCH + Duration::from_secs(1_000)
         );
-        assert_eq!(span.end_time, UNIX_EPOCH + Duration::from_millis(1_005_000));
+        assert_eq!(span.end_time, UNIX_EPOCH + Duration::from_secs(1_005));
     }
 
     #[test]
     fn override_leaves_span_unchanged_for_other_span_names() {
-        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let emit_at = UNIX_EPOCH + Duration::from_secs(10_000);
         let mut span = stage_span(
             emit_at,
             emit_at + Duration::from_millis(2),
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn override_skipped_when_attributes_missing() {
-        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let emit_at = UNIX_EPOCH + Duration::from_secs(10_000);
         let mut span = stage_span(emit_at, emit_at + Duration::from_millis(2), vec![]);
         BallistaStageMiddleware.transform(&mut span);
         assert_eq!(span.start_time, emit_at);
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn override_skipped_when_window_is_inverted_or_zero() {
-        let emit_at = UNIX_EPOCH + Duration::from_millis(10_000_000);
+        let emit_at = UNIX_EPOCH + Duration::from_secs(10_000);
         // start > end is nonsense from a partly-recorded stage.
         let mut span = stage_span(
             emit_at,

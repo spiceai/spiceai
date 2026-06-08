@@ -309,7 +309,7 @@ async fn load_runtime(app: App) -> Result<Runtime, String> {
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err("Timed out waiting for datasets to load".to_string());
         }
         () = cloned_rt.load_components() => {}
@@ -460,8 +460,7 @@ async fn start_runtime_http_server(rt: Arc<Runtime>) -> Result<String, String> {
                 .get(&health_url)
                 .send()
                 .await
-                .map(|response| response.status().is_success())
-                .unwrap_or(false)
+                .map_or(false, |response| response.status().is_success())
         }
     })
     .await;
@@ -833,7 +832,7 @@ async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), Stri
 
             let cloned_rt = Arc::clone(&rt);
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for components to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}

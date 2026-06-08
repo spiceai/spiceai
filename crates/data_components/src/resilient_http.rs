@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn test_bounded_retry_delay_clamps_large_retry_after() {
         let delay = bounded_retry_delay(
-            Some(Duration::from_secs(3600)),
+            Some(Duration::from_hours(1)),
             Duration::from_secs(5),
             MAX_HTTP_BACKOFF,
         );

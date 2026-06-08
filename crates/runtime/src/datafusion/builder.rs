@@ -1345,7 +1345,7 @@ mod tests {
             "Default analyzer rules have changed"
         );
         let expected_rule_names = vec!["resolve_grouping_function", "type_coercion"];
-        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
+        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names) {
             assert_eq!(
                 expected_name,
                 rule.name(),

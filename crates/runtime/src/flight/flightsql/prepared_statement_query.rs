@@ -927,7 +927,7 @@ mod tests {
         // Create a DataFusion instance with plan caching enabled (simulating Runtime setup)
         let plan_cache = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();
@@ -982,7 +982,7 @@ mod tests {
         // Create a DataFusion instance with plan caching enabled
         let plan_cache = Arc::new(SimpleCache::new(
             512,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
         ))
         .as_tabled_provider();

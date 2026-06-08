@@ -315,31 +315,31 @@ mod tests {
         // - Third call: num_retries becomes 3, returns BACKOFF_INTERVALS_MS[3] = 3000ms
         assert_eq!(
             backoff.next_backoff(),
-            Some(Duration::from_millis(1000)),
+            Some(Duration::from_secs(1)),
             "First interval should be exactly 1000ms"
         );
 
         assert_eq!(
             backoff.next_backoff(),
-            Some(Duration::from_millis(2000)),
+            Some(Duration::from_secs(2)),
             "Second interval should be exactly 2000ms"
         );
 
         assert_eq!(
             backoff.next_backoff(),
-            Some(Duration::from_millis(3000)),
+            Some(Duration::from_secs(3)),
             "Third interval should be exactly 3000ms"
         );
 
         assert_eq!(
             backoff.next_backoff(),
-            Some(Duration::from_millis(5000)),
+            Some(Duration::from_secs(5)),
             "Fourth interval should be exactly 5000ms"
         );
 
         assert_eq!(
             backoff.next_backoff(),
-            Some(Duration::from_millis(8000)),
+            Some(Duration::from_secs(8)),
             "Fifth interval should be exactly 8000ms"
         );
 
@@ -356,7 +356,7 @@ mod tests {
         let mut backoff = RetryBackoffBuilder::new()
             .method(BackoffMethod::Linear)
             .randomization_factor(0.0)
-            .base_interval(Duration::from_millis(2000))
+            .base_interval(Duration::from_secs(2))
             .max_retries(Some(5))
             .build();
 
@@ -374,7 +374,7 @@ mod tests {
         let mut backoff = RetryBackoffBuilder::new()
             .method(BackoffMethod::Exponential)
             .randomization_factor(0.0)
-            .base_interval(Duration::from_millis(1000))
+            .base_interval(Duration::from_secs(1))
             .max_retries(Some(5))
             .build();
 

@@ -229,13 +229,13 @@ async fn run_inner_workload() -> Result<(), anyhow::Error> {
     let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
 
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(300)) => {
+        () = tokio::time::sleep(Duration::from_mins(5)) => {
             return Err(anyhow::anyhow!("Timed out waiting for runtime components to load"));
         }
         () = Arc::clone(&runtime).load_components() => {}
     }
 
-    wait_until_runtime_ready(&runtime, Duration::from_secs(120)).await?;
+    wait_until_runtime_ready(&runtime, Duration::from_mins(2)).await?;
 
     let loaded_rows = query_single_u64(&runtime, "SELECT COUNT(*) FROM oom_events").await?;
     eprintln!("Loaded rows currently visible in Cayenne table: {loaded_rows}");

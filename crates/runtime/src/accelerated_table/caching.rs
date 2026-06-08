@@ -2593,7 +2593,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2633,7 +2633,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2673,7 +2673,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2713,7 +2713,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = None; // No stale-while-revalidate
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2743,7 +2743,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2767,7 +2767,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2808,7 +2808,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2832,7 +2832,7 @@ mod tests {
             .expect("Time went backwards")
             .as_nanos() as i64;
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Duration::from_secs(30);
         #[expect(clippy::cast_possible_truncation)]
         let max_age_nanos = max_age.as_nanos() as i64;
@@ -2905,7 +2905,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_freshness_empty_batches() {
         let batches: Vec<RecordBatch> = Vec::new();
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&batches, max_age, stale_while_revalidate)
@@ -2991,7 +2991,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let freshness =
             check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
 
@@ -3020,7 +3020,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let freshness =
             check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
 
@@ -3109,7 +3109,7 @@ mod tests {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_nanos()
-                - Duration::from_secs(120).as_nanos()) as i64;
+                - Duration::from_mins(2).as_nanos()) as i64;
             // All entries have the same stale timestamp
             let timestamp = TimestampNanosecondArray::from(vec![
                 Some(two_min_ago),
@@ -3143,8 +3143,8 @@ mod tests {
             col("request_query").eq(lit("id=1")),
         ];
 
-        let max_age = Some(Duration::from_secs(60)); // 60 second TTL
-        let stale_while_revalidate = Some(Duration::from_secs(300)); // 5 minute SWR window
+        let max_age = Some(Duration::from_mins(1)); // 60 second TTL
+        let stale_while_revalidate = Some(Duration::from_mins(5)); // 5 minute SWR window
         let in_flight_revalidations: InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
 

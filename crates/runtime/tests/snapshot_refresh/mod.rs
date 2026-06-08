@@ -407,7 +407,7 @@ impl SnapshotRefreshFixture {
 }
 
 async fn load_runtime(rt: Arc<Runtime>) -> Result<()> {
-    timeout(Duration::from_secs(120), Arc::clone(&rt).load_components())
+    timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
         .await
         .map_err(|_| anyhow!("Timed out waiting for runtime components to load"))?;
     runtime_ready_check(rt.as_ref()).await;
@@ -494,7 +494,7 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
     }
 
     let first_id = fixture
-        .wait_for_snapshot_id(0, Duration::from_secs(60))
+        .wait_for_snapshot_id(0, Duration::from_mins(1))
         .await
         .context("waiting for writer to produce initial snapshot")?;
     if first_id != 0 {
@@ -522,7 +522,7 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
     fixture.write_source(MUTATED_CSV)?;
 
     let next_id = fixture
-        .wait_for_snapshot_id(first_id + 1, Duration::from_secs(60))
+        .wait_for_snapshot_id(first_id + 1, Duration::from_mins(1))
         .await
         .context("waiting for writer to publish a snapshot for the mutated source")?;
     if next_id <= first_id {
@@ -531,7 +531,7 @@ async fn run_inner(fixture: &SnapshotRefreshFixture) -> Result<()> {
         ));
     }
 
-    wait_for_reader_swap(&reader, 5, Duration::from_secs(60)).await?;
+    wait_for_reader_swap(&reader, 5, Duration::from_mins(1)).await?;
     assert_swap_sanity(&reader).await?;
 
     reader.shutdown().await;

@@ -4265,7 +4265,7 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
-            max_age: Duration::from_secs(60),
+            max_age: Duration::from_mins(1),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,

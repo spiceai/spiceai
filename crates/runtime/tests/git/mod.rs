@@ -39,8 +39,7 @@ fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .map_or(false, |o| o.status.success())
 }
 
 /// Initialize a local git repository with a small, deterministic file set so
@@ -129,7 +128,7 @@ async fn git_connector_local_repo_lists_files() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -189,7 +188,7 @@ async fn git_connector_local_repo_include_glob() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

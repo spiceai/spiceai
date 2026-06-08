@@ -113,7 +113,7 @@ mod nsql {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -475,7 +475,7 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
         });
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -531,7 +531,7 @@ async fn openai_test_chat_completion_gpt5_mini() -> Result<(), anyhow::Error> {
         });
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -590,7 +590,7 @@ async fn openai_test_chat_completion_gpt5_mini_with_endpoint() -> Result<(), any
         });
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
             () = Arc::clone(&rt).load_components() => {}
@@ -665,7 +665,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
             );
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -720,7 +720,7 @@ async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -770,7 +770,7 @@ async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -862,7 +862,7 @@ async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -955,7 +955,7 @@ async fn openai_responses_api_with_tools_non_streaming() -> Result<(), anyhow::E
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -1025,7 +1025,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -1047,7 +1047,7 @@ async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
                 resp = responses_client.create(request) => {
                     resp?
                 }
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for OpenAI response"));
                 }
             };

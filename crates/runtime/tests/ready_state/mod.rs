@@ -606,7 +606,7 @@ async fn run_ready_state_test(
 
         tracing::info!("Loading components");
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
             }
             () = cloned_rt.load_components() => {}
@@ -683,7 +683,7 @@ async fn run_ready_state_test(
         // Run a query before data is loaded
         let query_sql = format!("SELECT * FROM {dataset_name}");
         let query_result = tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
             }
             result = rt.datafusion().query_builder(&query_sql).build().run() => {
@@ -699,7 +699,7 @@ async fn run_ready_state_test(
             // Run EXPLAIN to see execution plan
             let explain_sql = format!("EXPLAIN {query_sql}");
             let explain_result = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for explain to complete"));
                 }
                 result = rt.datafusion().query_builder(&explain_sql).build().run() => {
@@ -718,7 +718,7 @@ async fn run_ready_state_test(
 
             // Convert the stream to a vector with timeout
             let results: Result<Vec<RecordBatch>, _> = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
                 }
                 result = query_result.data.try_collect::<Vec<_>>() => {
@@ -733,7 +733,7 @@ async fn run_ready_state_test(
             // Run EXPLAIN
             let explain_sql = format!("EXPLAIN {query_sql}");
             let explain_result = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for explain to complete"));
                 }
                 result = rt.datafusion().query_builder(&explain_sql).build().run() => {
@@ -783,7 +783,7 @@ async fn run_ready_state_test(
         // Now re-run the explain query to see the accelerated plan
         let explain_sql = format!("EXPLAIN {query_sql}");
         let explain_result = tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for explain to complete"));
             }
             result = rt.datafusion().query_builder(&explain_sql).build().run() => {
@@ -1014,7 +1014,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
 
             tracing::info!("Loading components");
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -1031,7 +1031,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
 
             // Convert the stream to a vector with timeout
             let results: Result<Vec<RecordBatch>, _> = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
                 }
                 result = query_result.data.try_collect::<Vec<_>>() => {
@@ -1044,7 +1044,7 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
 
             // But queries to federated_on_load_mixed should fail because it's not ready yet
             let query_result = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
                 }
                 result = rt
@@ -1129,7 +1129,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             tracing::info!("Loading components");
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -1146,7 +1146,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             // Convert the stream to a vector with timeout
             let results: Result<Vec<RecordBatch>, _> = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     Err(DataFusionError::Execution("Timed out waiting for query results".to_string()))
                 }
                 result = query_result.data.try_collect::<Vec<_>>() => {
@@ -1159,7 +1159,7 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
 
             // But queries to federated_on_load_mixed should fail because it's not ready yet
             let query_result = tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for query to complete"));
                 }
                 result = rt

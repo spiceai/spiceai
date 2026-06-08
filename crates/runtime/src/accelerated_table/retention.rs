@@ -405,7 +405,7 @@ mod tests {
         // Retention period only - delete records older than 10 days
         test_retention_scenario(
             None,
-            Some(Duration::from_secs(10 * 24 * 60 * 60)), // 10 days
+            Some(Duration::from_hours(240)), // 10 days
             Some("timestamp_col"),
             3, // Should remain 3 records (recent ones)
         )
@@ -417,7 +417,7 @@ mod tests {
         // Both retention SQL and period - delete old records AND where deleted = true
         test_retention_scenario(
             Some("DELETE FROM test WHERE deleted = true"),
-            Some(Duration::from_secs(10 * 24 * 60 * 60)),
+            Some(Duration::from_hours(240)),
             Some("timestamp_col"),
             2, // Should remain 2 records (where deleted = false and recent)
         )
@@ -429,7 +429,7 @@ mod tests {
         // Very short retention period - delete almost everything
         test_retention_scenario(
             None,
-            Some(Duration::from_secs(2 * 24 * 60 * 60)), // 2 days
+            Some(Duration::from_hours(48)), // 2 days
             Some("timestamp_col"),
             1, // Should remain 1 record (very recent)
         )

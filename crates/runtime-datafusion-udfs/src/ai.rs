@@ -1024,8 +1024,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages");
@@ -1060,8 +1059,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1101,8 +1099,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1135,8 +1132,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1167,8 +1163,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1268,8 +1263,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1418,8 +1412,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages in parallel");
@@ -1551,8 +1544,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             ),
         )
         .await;
@@ -1632,8 +1624,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1674,8 +1665,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1721,8 +1711,7 @@ mod tests {
                 messages,
                 None,
                 std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                    .map_or(4, std::num::NonZero::get),
             )
             .await;
 

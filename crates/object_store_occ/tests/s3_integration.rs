@@ -59,8 +59,7 @@ fn get_test_prefix() -> String {
     let base_prefix = std::env::var("AWS_S3_PREFIX").unwrap_or_default();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis());
 
     if base_prefix.is_empty() {
         format!("object_store_occ_test/{timestamp}/")

@@ -89,7 +89,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
                 start_interval: None,
             })
             .build()?
-            .run(Some(Duration::from_secs(60)))
+            .run(Some(Duration::from_mins(1)))
             .await?;
 
         // Give rustfs a moment to fully initialize
@@ -180,7 +180,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     // Load components with a timeout
     let cloned_rt = Arc::clone(&runtime);
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             container.remove().await?;
             return Err(anyhow::anyhow!("Timed out waiting for dataset to load"));
         }

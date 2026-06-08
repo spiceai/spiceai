@@ -404,7 +404,7 @@ mod tests {
             "pass".to_string(),
             "localhost".to_string(),
             "22".to_string(),
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
         );
         assert_eq!(config.host, "localhost");
         assert!(config.timeout.is_some());

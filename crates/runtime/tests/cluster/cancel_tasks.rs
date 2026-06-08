@@ -226,7 +226,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for scheduler components"));
                 }
                 () = Arc::clone(&scheduler_rt).load_components() => {}
@@ -284,7 +284,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for executor components"));
                 }
                 () = Arc::clone(&executor_rt).load_components() => {}

@@ -12962,7 +12962,7 @@ mod tests {
                 &warning_keys,
                 &protected_snapshots,
                 2,
-                Some(Duration::from_secs(300)),
+                Some(Duration::from_mins(5)),
                 now,
             ),
             Some(SnapshotMaintenanceTrigger::ProtectedSnapshotCount {
@@ -12986,13 +12986,13 @@ mod tests {
                 &warning_keys,
                 &protected_snapshots,
                 8,
-                Some(Duration::from_secs(60)),
+                Some(Duration::from_mins(1)),
                 now,
             ),
             Some(SnapshotMaintenanceTrigger::ProtectedSnapshotAge {
                 protected_snapshot_count: 2,
                 oldest_snapshot_age: Duration::from_secs(100),
-                trigger_age: Duration::from_secs(60),
+                trigger_age: Duration::from_mins(1),
             })
         );
     }
@@ -13008,7 +13008,7 @@ mod tests {
                 &warning_keys,
                 &protected_snapshots,
                 8,
-                Some(Duration::from_secs(60)),
+                Some(Duration::from_mins(1)),
                 now,
             ),
             None
@@ -13026,7 +13026,7 @@ mod tests {
                 &warning_keys,
                 &protected_snapshots,
                 8,
-                Some(Duration::from_secs(60)),
+                Some(Duration::from_mins(1)),
                 now,
             ),
             None

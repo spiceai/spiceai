@@ -39,7 +39,7 @@ limitations under the License.
 //! use duration_parse::{parse_duration, format_duration};
 //!
 //! let d = parse_duration("1h30m").unwrap();
-//! assert_eq!(d, Duration::from_secs(5400));
+//! assert_eq!(d, Duration::from_mins(90));
 //!
 //! let s = format_duration(Duration::from_secs(3661));
 //! assert_eq!(s, "1h 1m 1s");
@@ -89,8 +89,8 @@ impl ParseError {
 /// use duration_parse::parse_duration;
 ///
 /// assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
-/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-/// assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_secs(5400));
+/// assert_eq!(parse_duration("5m").unwrap(), Duration::from_mins(5));
+/// assert_eq!(parse_duration("1.5h").unwrap(), Duration::from_mins(90));
 /// assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
 /// assert_eq!(parse_duration("42").unwrap(), Duration::from_secs(42));
 /// ```
@@ -581,15 +581,15 @@ mod tests {
     #[test]
     fn test_parse_basic_units() {
         assert_eq!(parse_duration("10s").expect("10s"), Duration::from_secs(10));
-        assert_eq!(parse_duration("5m").expect("5m"), Duration::from_secs(300));
-        assert_eq!(parse_duration("2h").expect("2h"), Duration::from_secs(7200));
+        assert_eq!(parse_duration("5m").expect("5m"), Duration::from_mins(5));
+        assert_eq!(parse_duration("2h").expect("2h"), Duration::from_hours(2));
         assert_eq!(
             parse_duration("1d").expect("1d"),
-            Duration::from_secs(86400)
+            Duration::from_hours(24)
         );
         assert_eq!(
             parse_duration("1w").expect("1w"),
-            Duration::from_secs(604_800)
+            Duration::from_hours(168)
         );
         assert_eq!(
             parse_duration("500ms").expect("500ms"),
@@ -631,7 +631,7 @@ mod tests {
         );
         assert_eq!(
             parse_duration("2.5h").expect("2.5h"),
-            Duration::from_secs(9000)
+            Duration::from_mins(150)
         );
     }
 
@@ -639,7 +639,7 @@ mod tests {
     fn test_parse_compound() {
         assert_eq!(
             parse_duration("1h30m").expect("1h30m"),
-            Duration::from_secs(5400)
+            Duration::from_mins(90)
         );
         assert_eq!(
             parse_duration("1m30s").expect("1m30s"),
@@ -734,9 +734,9 @@ mod tests {
 
     #[test]
     fn test_format_weeks() {
-        assert_eq!(format_duration(Duration::from_secs(604_800)), "1w");
+        assert_eq!(format_duration(Duration::from_hours(168)), "1w");
         assert_eq!(
-            format_duration(Duration::from_secs(604_800 + 86_400)),
+            format_duration(Duration::from_hours(192)),
             "1w 1d"
         );
     }
@@ -762,7 +762,7 @@ mod tests {
         // format_duration produces space-separated segments like "1h 1m 1s"
         assert_eq!(
             parse_duration("1h 30m").expect("1h 30m"),
-            Duration::from_secs(5400),
+            Duration::from_mins(90),
         );
         assert_eq!(
             parse_duration("1h 1m 1s").expect("1h 1m 1s"),
@@ -770,7 +770,7 @@ mod tests {
         );
         assert_eq!(
             parse_duration("1d  2h   3m").expect("multi-space"),
-            Duration::from_secs(86_400 + 7200 + 180),
+            Duration::from_mins(1563),
         );
     }
 
@@ -781,7 +781,7 @@ mod tests {
             Duration::from_secs(3661),
             Duration::from_secs(86_400 + 3600 + 60 + 1),
             Duration::from_millis(1500),
-            Duration::from_secs(604_800 + 86_400),
+            Duration::from_hours(192),
         ];
         for d in durations {
             let formatted = format_duration(d);
