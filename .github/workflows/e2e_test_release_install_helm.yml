@@ -129,14 +129,16 @@ jobs:
             # Get latest release tag from GitHub
             RELEASE_VERSION=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | jq -r '.tag_name')
             echo "Using latest release version: $RELEASE_VERSION"
-            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1). 
-            IMAGE_TAG="${RELEASE_VERSION#v}-models"
+            # remove prefix 'v' from RELEASE_VERSION. (i.e. v1.10.1 -> 1.10.1).
+            # Models are included in the default image as of v2.0.0; there is no
+            # longer a separate `-models` image tag.
+            IMAGE_TAG="${RELEASE_VERSION#v}"
             echo "version=${RELEASE_VERSION#v}" >> $GITHUB_OUTPUT
             echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=github-release" >> $GITHUB_OUTPUT
           else
             echo "Using specified version: $CHART_VERSION"
-            IMAGE_TAG="${CHART_VERSION}-models"
+            IMAGE_TAG="${CHART_VERSION}"
             echo "version=$CHART_VERSION" >> $GITHUB_OUTPUT
             echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
             echo "source=local" >> $GITHUB_OUTPUT
@@ -314,7 +316,7 @@ jobs:
           helm upgrade spice-test ./deploy/chart \
             --namespace spice-system \
             --set image.repository=ghcr.io/spiceai/spiceai \
-            --set image.tag=${{ steps.chart-version.outputs.version }}-models \
+            --set image.tag=${{ steps.chart-version.outputs.version }} \
             --set replicaCount=1 \
             --set service.type=ClusterIP \
             --wait \
