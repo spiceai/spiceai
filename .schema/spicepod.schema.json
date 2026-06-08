@@ -5723,6 +5723,24 @@
           "description": "Timeout for idle connections in the pool (in seconds). Default: 90",
           "type": "string"
         },
+        "http_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
         "http_headers": {
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
           "type": "string"
@@ -6054,6 +6072,24 @@
         "pool_idle_timeout": {
           "description": "Timeout for idle connections in the pool (in seconds). Default: 90",
           "type": "string"
+        },
+        "http_tls_client_certificate_file": {
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream HTTP server requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_key_file": {
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string"
+        },
+        "http_tls_client_certificate": {
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_tls_client_key": {
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'. Applies to dynamic JSON API endpoints only; structured HTTP file datasets reject mTLS client identity params.",
+          "type": "string",
+          "x-secret": true
         },
         "http_headers": {
           "description": "Custom HTTP headers to include in requests. Format: 'Header1: Value1, Header2: Value2'. Headers are applied to all requests.",
@@ -6838,20 +6874,20 @@
           "type": "string"
         },
         "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         },
         "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         }
@@ -6884,20 +6920,20 @@
           "type": "string"
         },
         "spiceai_tls_client_certificate_file": {
-          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate'.",
+          "description": "Path to a PEM client certificate chain to present during the TLS handshake when the upstream Spice runtime requires mutual TLS. Must be set together with 'tls_client_key_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_key_file": {
-          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_key'.",
+          "description": "Path to the PEM private key matching 'tls_client_certificate_file'. Must be set together with 'tls_client_certificate_file'. Mutually exclusive with 'tls_client_certificate' and 'tls_client_key'.",
           "type": "string"
         },
         "spiceai_tls_client_certificate": {
-          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file'.",
+          "description": "Inline PEM client certificate chain (or ${ secrets:... } reference) to present during the TLS handshake for mutual TLS. Must be set together with 'tls_client_key'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         },
         "spiceai_tls_client_key": {
-          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_key_file'.",
+          "description": "Inline PEM private key (or ${ secrets:... } reference) matching 'tls_client_certificate'. Must be set together with 'tls_client_certificate'. Mutually exclusive with 'tls_client_certificate_file' and 'tls_client_key_file'.",
           "type": "string",
           "x-secret": true
         }
@@ -7009,6 +7045,10 @@
           "type": "string",
           "default": "256"
         },
+        "cayenne_pk_keyset_cache_mb": {
+          "description": "Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory.",
+          "type": "string"
+        },
         "cayenne_target_file_size_mb": {
           "description": "Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.",
           "type": "string",
@@ -7027,6 +7067,11 @@
             "zstd"
           ]
         },
+        "cayenne_delta_encoding": {
+          "description": "Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.",
+          "type": "string",
+          "default": "auto"
+        },
         "cayenne_pk_conflict_detection": {
           "description": "Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.",
           "type": "string",
@@ -7034,6 +7079,16 @@
           "enum": [
             "auto",
             "none"
+          ]
+        },
+        "cayenne_deletion_mode": {
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'position' (merge-on-read): per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' is the explicit opt-out: deletes are applied above the Vortex scan via a per-row RowConverter probe.",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "key",
+            "position"
           ]
         },
         "cayenne_upload_concurrency": {
@@ -7380,6 +7435,10 @@
           "type": "string",
           "x-secret": true
         },
+        "unity_catalog_credential_vending": {
+          "description": "When set to 'enabled', short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
+          "type": "string"
+        },
         "unity_catalog_aws_region": {
           "description": "The AWS region to use for S3 storage.",
           "type": "string",
@@ -7399,6 +7458,10 @@
           "description": "The AWS endpoint to use for S3 storage.",
           "type": "string",
           "x-secret": true
+        },
+        "unity_catalog_aws_allow_http": {
+          "description": "Enables insecure HTTP connections to the AWS endpoint. Defaults to false.",
+          "type": "string"
         },
         "unity_catalog_azure_storage_account_name": {
           "description": "The storage account to use for Azure storage.",
@@ -7451,6 +7514,10 @@
           "description": "The personal access token used to authenticate against the DataBricks API.",
           "type": "string",
           "x-secret": true
+        },
+        "databricks_credential_vending": {
+          "description": "When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
+          "type": "string"
         },
         "mode": {
           "description": "The execution mode for querying against Databricks.",
@@ -8105,6 +8172,14 @@
         "chat_template": {
           "description": "Customizes the transformation of OpenAI chat messages into a character stream for the model.",
           "type": "string"
+        },
+        "trust_pickle": {
+          "description": "Allow loading pickle-based weight files (.pt / .pth / .ckpt / .bin). These formats execute arbitrary code on load and are disabled by default. Set to 'true' only when the model weights come from a fully trusted source.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "tools": {
           "description": "Which tools should be made available to the model. Set to 'auto' to automatically choose between direct tools and searchable discovery without data sampling tools, 'all' to use built-in and Spicepod-configured tools directly, or 'search_registry' to require searchable tool discovery.",
