@@ -147,6 +147,40 @@ pub enum CheckAvailability {
     Disabled,
 }
 
+/// Selects the depth of source-schema inference.
+///
+/// Base column/type inference is always performed and required — this knob only
+/// controls whether the runtime *additionally* infers the table's primary key,
+/// secondary indexes, and sort/clustering columns to fill acceleration settings
+/// the user did not specify in the Spicepod.
+///
+/// Applies to all refresh modes. Only connectors that emit inferred-schema
+/// metadata (currently `PostgreSQL` and `MongoDB`) are affected; others treat
+/// `extended` as a no-op.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaInference {
+    /// Base column/type inference only (default) — exactly as before. The column
+    /// schema is always inferred from the source; no primary-key/index/sort
+    /// detection is performed.
+    #[default]
+    Standard,
+    /// In addition to the base column schema, auto-detect and apply the primary
+    /// key, secondary indexes, and sort/clustering columns from the source when
+    /// they are not explicitly configured.
+    Extended,
+}
+
+impl std::fmt::Display for SchemaInference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaInference::Standard => write!(f, "standard"),
+            SchemaInference::Extended => write!(f, "extended"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -230,6 +264,15 @@ pub struct Dataset {
     /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
     #[serde(default, skip_serializing_if = "is_default")]
     pub check_availability: CheckAvailability,
+
+    /// Controls the depth of source-schema inference (primary key, indexes, sort columns).
+    ///
+    /// Options: `standard` / `extended`. Defaults to `standard` (base column/type
+    /// inference only, exactly as before). When `extended`, the runtime additionally
+    /// fills any acceleration settings the user left unset using metadata inferred from
+    /// the source (currently the `PostgreSQL` and `MongoDB` connectors).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub schema_inference: SchemaInference,
 }
 
 impl Nameable for Dataset {
@@ -265,6 +308,7 @@ impl Dataset {
             vectors: None,
             full_text_search: None,
             check_availability: CheckAvailability::default(),
+            schema_inference: SchemaInference::default(),
         }
     }
 
@@ -355,6 +399,7 @@ impl WithDependsOn<Dataset> for Dataset {
             vectors: self.vectors.clone(),
             full_text_search: self.full_text_search.clone(),
             check_availability: self.check_availability,
+            schema_inference: self.schema_inference,
         }
     }
 }
@@ -436,6 +481,8 @@ struct DatasetDeserializer {
     full_text_search: Option<FtsStore>,
     #[serde(default, skip_serializing_if = "is_default")]
     check_availability: CheckAvailability,
+    #[serde(default, skip_serializing_if = "is_default")]
+    schema_inference: SchemaInference,
 }
 
 #[expect(deprecated)]
@@ -489,6 +536,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             vectors: deserializer.vectors,
             full_text_search: deserializer.full_text_search,
             check_availability: deserializer.check_availability,
+            schema_inference: deserializer.schema_inference,
         })
     }
 }
@@ -528,6 +576,44 @@ mod check_availability_tests {
         ";
         let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
         assert_eq!(dataset.check_availability, CheckAvailability::Auto);
+    }
+}
+
+#[cfg(test)]
+mod schema_inference_tests {
+    use super::*;
+    use yaml;
+
+    #[test]
+    fn test_schema_inference_standard_by_default() {
+        let yaml = r"
+            name: test
+            from: postgres:public.orders
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
+    }
+
+    #[test]
+    fn test_schema_inference_extended_via_config() {
+        let yaml = r"
+            name: test
+            from: postgres:public.orders
+            schema_inference: extended
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.schema_inference, SchemaInference::Extended);
+    }
+
+    #[test]
+    fn test_schema_inference_standard_via_config() {
+        let yaml = r"
+            name: test
+            from: postgres:public.orders
+            schema_inference: standard
+        ";
+        let dataset: Dataset = yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.schema_inference, SchemaInference::Standard);
     }
 }
 

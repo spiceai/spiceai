@@ -340,6 +340,20 @@ pub(crate) trait CompactionRunner: Send + Sync {
 
     /// Identifier used in log messages.
     fn compaction_target_name(&self) -> &str;
+
+    /// Called once per background wake, before draining the compaction backlog.
+    /// A hook for per-tick maintenance — in particular the dynamic auto-tuning
+    /// control step (sample the environment + ingest/query response, apply at
+    /// most one bounded knob change) and its metric emission. Default no-op so
+    /// other [`CompactionRunner`] impls (e.g. test stubs) need not implement it.
+    fn on_background_tick(&self) {}
+
+    /// The (possibly dynamically-tuned) background interval to use for the NEXT
+    /// wake. `None` keeps the spawn-time interval. Lets the auto-tuner widen or
+    /// tighten the compaction cadence at runtime. Default `None`.
+    fn background_interval_hint(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Maximum protected-snapshot merge passes a single table runs per wake-up
@@ -386,9 +400,13 @@ impl BackgroundCompactor {
         // from the query and refresh runtimes) when one has been injected;
         // otherwise fall back to the ambient runtime.
         let handle = spawn_compaction(async move {
+            // The interval is re-read from the runner each wake so the dynamic
+            // auto-tuner can widen/tighten the compaction cadence at runtime
+            // (defaults to the spawn-time interval when no hint is given).
+            let mut current = interval;
             'wake: loop {
                 tokio::select! {
-                    () = tokio::time::sleep(interval) => {}
+                    () = tokio::time::sleep(current) => {}
                     () = shutdown_task.notified() => break,
                 }
 
@@ -396,6 +414,14 @@ impl BackgroundCompactor {
                     // Provider dropped — task exits naturally.
                     break;
                 };
+
+                // Per-wake hook: the dynamic auto-tuning control step (+metrics).
+                // Runs before draining and before re-reading the interval so a
+                // just-applied cadence change takes effect on the next sleep.
+                runner.on_background_tick();
+                if let Some(next) = runner.background_interval_hint() {
+                    current = next;
+                }
 
                 // Drain the protected-snapshot backlog instead of doing a single
                 // tier-merge per tick. Each `run_compaction_trigger` merges only
