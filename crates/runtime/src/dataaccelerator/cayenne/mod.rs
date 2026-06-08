@@ -2378,9 +2378,6 @@ impl PartitionCreator for CayennePartitionCreator {
 
         let partition_provider = Arc::new(cayenne_table);
         partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-        // No-op for partition providers (never `is_cdc_memory_mode()`), spawned
-        // for symmetry with the compaction task.
-        partition_provider.spawn_background_mem_tier_checkpoint();
         Ok(Partition {
             partition_values,
             table_provider: partition_provider,
@@ -2452,8 +2449,6 @@ impl PartitionCreator for CayennePartitionCreator {
 
             let partition_provider = Arc::new(cayenne_table);
             partition_provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
-            // No-op for partition providers (never `is_cdc_memory_mode()`).
-            partition_provider.spawn_background_mem_tier_checkpoint();
             result.push(Partition {
                 partition_values,
                 table_provider: partition_provider,
