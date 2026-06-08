@@ -586,6 +586,213 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
         .add(1, dimensions);
 }
 
+// ---- Auto-tuning (cayenne::provider::tuning) ------------------------------
+
+/// A table's auto-tuner state: the measured ingest/response signals plus the
+/// live (possibly dynamically-tuned) knob values. Emitted as gauges on every
+/// background tick — useful whether or not dynamic tuning is enabled, since the
+/// accounting is always recorded (it makes "what did auto pick, and how is the
+/// table behaving" observable in Prometheus).
+#[derive(Debug, Clone, Copy)]
+pub struct CayenneAutotuneState {
+    /// Measured CDC ingest rate, rows/sec (EWMA).
+    pub rows_per_sec: f64,
+    /// Measured CDC ingest rate, bytes/sec (EWMA); `< 0` ⇒ unavailable (the
+    /// gauge is then suppressed rather than emitting a misleading 0).
+    pub bytes_per_sec: f64,
+    /// Apply latency / offered-load interval; `> 1` ⇒ ingest falling behind.
+    pub apply_vs_arrival: f64,
+    /// Read amplification (runs a scan must merge); high ⇒ ingest slowing queries.
+    pub read_amp: u64,
+    /// cgroup-aware memory usage fraction of the budget; `< 0` ⇒ unknown.
+    pub mem_pressure: f64,
+    /// Per-batch apply wall time (EWMA, ms) — the latency the controller weighs
+    /// against the offered-load interval.
+    pub apply_ms: f64,
+    /// Live inline-memtable flush byte budget.
+    pub inline_flush_max_bytes: u64,
+    /// Live background compaction interval (ms).
+    pub compaction_interval_ms: u64,
+    /// Live small-file compaction trigger (file count).
+    pub compaction_trigger_files: u64,
+    /// Configured target Vortex file size (MB) — the reference compacted files
+    /// should trend toward (compare against `cayenne_compaction_merged_bytes`).
+    pub target_file_size_mb: u64,
+    /// Live write/encode concurrency (0 = session default).
+    pub write_concurrency: u64,
+}
+
+static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_BYTES_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_APPLY_VS_ARRIVAL: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_READ_AMP: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_MEM_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_APPLY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_INLINE_FLUSH_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
+
+/// Emit the auto-tuner state gauges for one table. `dimensions` should carry
+/// `table`. Called on each background tick.
+pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[KeyValue]) {
+    CAYENNE_AT_ROWS_PER_SEC
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_rows_per_sec")
+                .with_description("Measured CDC ingest rate (rows/sec, EWMA).")
+                .build()
+        })
+        .record(state.rows_per_sec, dimensions);
+    // Suppress the bytes/sec gauge when byte accounting is unavailable
+    // (`bytes_per_sec < 0`) rather than reporting a misleading 0 under load.
+    if state.bytes_per_sec >= 0.0 {
+        CAYENNE_AT_BYTES_PER_SEC
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_bytes_per_sec")
+                    .with_description("Measured CDC ingest rate (bytes/sec, EWMA).")
+                    .with_unit("By/s")
+                    .build()
+            })
+            .record(state.bytes_per_sec, dimensions);
+    }
+    CAYENNE_AT_APPLY_VS_ARRIVAL
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_apply_vs_arrival")
+                .with_description(
+                    "Apply latency / offered-load interval; > 1 means ingest is falling behind.",
+                )
+                .build()
+        })
+        .record(state.apply_vs_arrival, dimensions);
+    CAYENNE_AT_READ_AMP
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_ingest_read_amp")
+                .with_description(
+                    "Read amplification (protected-snapshot runs a scan must merge); high means ingest is slowing queries.",
+                )
+                .build()
+        })
+        .record(state.read_amp, dimensions);
+    CAYENNE_AT_MEM_PRESSURE
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_mem_pressure")
+                .with_description(
+                    "cgroup-aware memory usage as a fraction of the budget; negative means unknown.",
+                )
+                .build()
+        })
+        .record(state.mem_pressure, dimensions);
+    CAYENNE_AT_INLINE_FLUSH_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_inline_flush_max_bytes")
+                .with_description("Current (live) inline-memtable flush byte budget.")
+                .with_unit("By")
+                .build()
+        })
+        .record(state.inline_flush_max_bytes, dimensions);
+    CAYENNE_AT_COMPACTION_INTERVAL_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_compaction_interval_ms")
+                .with_description("Current (live) background compaction interval.")
+                .with_unit("ms")
+                .build()
+        })
+        .record(state.compaction_interval_ms, dimensions);
+    CAYENNE_AT_APPLY_MS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_apply_ms")
+                .with_description("Per-batch CDC apply wall time (EWMA).")
+                .with_unit("ms")
+                .build()
+        })
+        .record(state.apply_ms, dimensions);
+    CAYENNE_AT_COMPACTION_TRIGGER_FILES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_compaction_trigger_files")
+                .with_description("Current (live) small-file compaction trigger (file count).")
+                .build()
+        })
+        .record(state.compaction_trigger_files, dimensions);
+    CAYENNE_AT_TARGET_FILE_SIZE_MB
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_target_file_size_mb")
+                .with_description(
+                    "Configured target Vortex file size — the reference compacted files should trend toward (compare cayenne_compaction_merged_bytes).",
+                )
+                .with_unit("MiB")
+                .build()
+        })
+        .record(state.target_file_size_mb, dimensions);
+    CAYENNE_AT_WRITE_CONCURRENCY
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_write_concurrency")
+                .with_description("Current (live) write/encode concurrency (0 = session default).")
+                .build()
+        })
+        .record(state.write_concurrency, dimensions);
+}
+
+static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts dynamic auto-tune adjustments applied. `dimensions` should carry
+/// `table` and `knob`. A non-zero rate means the closed loop is actively
+/// adapting the table to its observed workload.
+pub fn track_cayenne_autotune_adjustment(dimensions: &[KeyValue]) {
+    CAYENNE_AT_ADJUSTMENTS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_autotune_adjustments_total")
+                .with_description("Dynamic auto-tune adjustments applied, by knob.")
+                .build()
+        })
+        .add(1, dimensions);
+}
+
+static CAYENNE_COMPACTION_MERGED_BYTES: OnceLock<Histogram<u64>> = OnceLock::new();
+
+/// Records the bytes a protected-snapshot subset compaction merged into one
+/// output (≈ the resulting compacted file size). Compare its distribution
+/// against `cayenne_autotune_target_file_size_mb` to see whether compaction is
+/// trending to the target file size or stalling below it (a read-amplification
+/// signal the adaptive tuner cares about). `dimensions` should carry `table`.
+pub fn track_cayenne_compaction_merged_bytes(bytes: u64, dimensions: &[KeyValue]) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    CAYENNE_COMPACTION_MERGED_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_histogram("cayenne_compaction_merged_bytes")
+                .with_description(
+                    "Bytes merged into one output by a protected-snapshot subset compaction (≈ compacted file size); compare to the target file size.",
+                )
+                .with_unit("By")
+                .with_boundaries(vec![
+                    MIB,
+                    4.0 * MIB,
+                    16.0 * MIB,
+                    32.0 * MIB,
+                    64.0 * MIB,
+                    128.0 * MIB,
+                    256.0 * MIB,
+                    512.0 * MIB,
+                    1024.0 * MIB,
+                ])
+                .build()
+        })
+        .record(bytes, dimensions);
+}
+
 static SNAPSHOT_BOOTSTRAP_DURATION_MS: OnceLock<Counter<f64>> = OnceLock::new();
 static SNAPSHOT_BOOTSTRAP_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 
