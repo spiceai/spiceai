@@ -19996,7 +19996,7 @@ mod tests {
                 n >= usize::try_from(seeded).expect("fits"),
                 "num_rows must include the {seeded} inline rows, got {n}"
             ),
-            other => panic!("num_rows must be present, got {other:?}"),
+            other @ Precision::Absent => panic!("num_rows must be present, got {other:?}"),
         }
     }
 
