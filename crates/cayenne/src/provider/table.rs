@@ -5780,16 +5780,13 @@ impl CayenneTableProvider {
     }
 
     fn cached_table_statistics_for_optimizer(&self) -> Option<Statistics> {
-        // Live inline/RAM-tier rows live only in the metastore — they are NOT
-        // reflected in the persisted file statistics (`commit_inlined_data_mutation`
-        // updates `inlined_row_count` but does not re-persist the table-stats
-        // `num_rows`). Fold their net count back into `num_rows` so the join
-        // planner sizes cardinalities against the real live row count instead of
-        // an undercount, while keeping the result `Inexact` (the inline rows are
-        // not represented in the column min/max/NDV, so we never claim `Exact`).
-        let inlined_rows = self.inlined_row_count.load(Ordering::Relaxed).max(0);
-        let has_pending_visibility_changes = self.has_pending_deletions() || inlined_rows > 0;
-        let inlined_rows = usize::try_from(inlined_rows).unwrap_or(usize::MAX);
+        // Inline/RAM-tier rows are already reflected in the persisted `num_rows`
+        // via `live_rows_delta` (passed to `schedule_post_write_maintenance` from
+        // `try_inline_or_restream` and the staged-append path). We must NOT add
+        // `inlined_row_count` on top — doing so double-counts the inline rows
+        // because both the persisted delta AND the in-memory counter capture them.
+        let has_pending_visibility_changes =
+            self.has_pending_deletions() || self.inlined_row_count.load(Ordering::Relaxed) > 0;
 
         let cache = self.table_statistics.read();
         let cached_ref: Option<&Statistics> = if has_pending_visibility_changes {
@@ -5809,15 +5806,9 @@ impl CayenneTableProvider {
                     full_column_sync_limit = TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT,
                     "Returning top-level table statistics only for wide table"
                 );
-                return Some(Self::add_inlined_rows_to_statistics(
-                    Self::top_level_statistics_only(source, false),
-                    inlined_rows,
-                ));
+                return Some(Self::top_level_statistics_only(source, false));
             }
-            return Some(Self::add_inlined_rows_to_statistics(
-                source.clone(),
-                inlined_rows,
-            ));
+            return Some(source.clone());
         }
 
         // Cache-miss visibility-overlay path: cache.optimizer_inexact is None,
@@ -5825,13 +5816,16 @@ impl CayenneTableProvider {
         if has_pending_visibility_changes {
             let Some(optimizer) = cache.optimizer.clone() else {
                 drop(cache);
-                // No persisted stats at all, but we DO know the inline live-row
-                // count. Hand the planner that cardinality (Inexact, columns
-                // unknown) rather than `None`, so a join against an actively
-                // inlining CDC table is still sized instead of treated as
-                // statistics-less.
-                return (inlined_rows > 0).then(|| Statistics {
-                    num_rows: datafusion_common::stats::Precision::Inexact(inlined_rows),
+                // No persisted stats at all (pre-first-maintenance window on a
+                // new CDC table). `inlined_row_count` is the only cardinality
+                // signal available — hand it to the planner as Inexact so a join
+                // against an actively-inlining table is sized rather than treated
+                // as statistics-less. Safe: no persisted `num_rows` exists yet,
+                // so there is nothing to double-count against.
+                let inlined = self.inlined_row_count.load(Ordering::Relaxed).max(0);
+                let inlined = usize::try_from(inlined).unwrap_or(usize::MAX);
+                return (inlined > 0).then(|| Statistics {
+                    num_rows: datafusion_common::stats::Precision::Inexact(inlined),
                     total_byte_size: datafusion_common::stats::Precision::Absent,
                     column_statistics: Vec::new(),
                 });
@@ -5839,34 +5833,12 @@ impl CayenneTableProvider {
             drop(cache);
             let inexact = Self::statistics_to_inexact(optimizer);
             if inexact.column_statistics.len() > TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT {
-                return Some(Self::add_inlined_rows_to_statistics(
-                    Self::top_level_statistics_only(&inexact, false),
-                    inlined_rows,
-                ));
+                return Some(Self::top_level_statistics_only(&inexact, false));
             }
-            return Some(Self::add_inlined_rows_to_statistics(inexact, inlined_rows));
+            return Some(inexact);
         }
 
         None
-    }
-
-    /// Fold the live inline/RAM-tier row count into a statistics object's
-    /// `num_rows`, downgrading it to `Inexact` (the inline rows are not reflected
-    /// in the column-level statistics, so the result is an estimate/superset and
-    /// must never claim `Exact`). A zero `inlined_rows` is returned unchanged so
-    /// the no-inline path keeps whatever precision it already had.
-    fn add_inlined_rows_to_statistics(mut stats: Statistics, inlined_rows: usize) -> Statistics {
-        use datafusion_common::stats::Precision;
-        if inlined_rows == 0 {
-            return stats;
-        }
-        stats.num_rows = match stats.num_rows {
-            Precision::Exact(n) | Precision::Inexact(n) => {
-                Precision::Inexact(n.saturating_add(inlined_rows))
-            }
-            Precision::Absent => Precision::Inexact(inlined_rows),
-        };
-        stats
     }
 
     fn top_level_statistics_only(stats: &Statistics, inexact: bool) -> Statistics {
@@ -11528,9 +11500,23 @@ impl CayenneTableProvider {
             let _fence = self.lock_listing_fence_write_owned().await;
             let _view_guard = self.scan_state_lock.write().await;
             if let Some(commit) = inlined_commit {
+                // Net the live inline-row count by BOTH inlined supersedes
+                // (commit.removed_rows: prior inline entries rewritten/removed)
+                // AND file-backed supersedes (file_deleted_pk_i64 /
+                // file_deleted_row_keys: existing file rows hidden by deletion
+                // vectors). Without subtracting file-backed supersedes,
+                // `inlined_row_count` overcounts — it would grow by the full
+                // insert count even though some of those rows merely replace
+                // existing file-backed rows (which are hidden by deletion
+                // vectors, not removed from the inline memtable).
+                let file_superseded = i64::try_from(
+                    file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
+                )
+                .unwrap_or(i64::MAX);
+                let total_removed = commit.removed_rows.saturating_add(file_superseded);
                 self.publish_inlined_mutation(
                     total_rows,
-                    commit.removed_rows,
+                    total_removed,
                     commit.published_seq,
                 );
             }
@@ -14925,11 +14911,9 @@ impl TableProvider for CayenneTableProvider {
         // file footers) when present — they cover columns the ListingTable
         // does not expose synchronously without rescanning footers.
         //
-        // `cached_table_statistics_for_optimizer` folds the live inline/RAM-tier
-        // row count into `num_rows` (Inexact), and synthesizes a count-only
-        // estimate even on a full stats cache-miss when inline rows exist — so an
-        // actively-inlining CDC table reports a real cardinality to the join
-        // planner instead of falling through to `None`.
+        // `live_rows_delta` in `schedule_post_write_maintenance` updates the
+        // persisted `num_rows` for both staged and inline write paths, so the
+        // cached stats reflect the live row count after maintenance runs.
         if let Some(stats) = self.cached_table_statistics_for_optimizer() {
             return Some(stats);
         }
@@ -19994,16 +19978,33 @@ mod tests {
             "precondition: all seeded rows live inline"
         );
 
+        // Before maintenance runs, no persisted stats exist yet — the
+        // inline-only fallback returns the inlined_row_count as an Inexact
+        // cardinality estimate so the join planner can still size the table.
+        let pre_stats = provider
+            .statistics()
+            .expect("inline-only fallback must return Inexact count before maintenance");
+        match pre_stats.num_rows {
+            Precision::Inexact(n) => assert!(
+                n >= usize::try_from(seeded).expect("fits"),
+                "pre-maintenance Inexact num_rows must cover the {seeded} inline rows, got {n}"
+            ),
+            other => panic!("pre-maintenance num_rows must be Inexact, got {other:?}"),
+        }
+
+        // After maintenance, `live_rows_delta` propagates the inline row
+        // count into persisted `num_rows`.
+        provider.flush_pending_maintenance().await.expect("flush");
         let stats = provider
             .statistics()
-            .expect("statistics must be present while inline rows are live (not None)");
+            .expect("statistics must be present after maintenance flush");
 
         match stats.num_rows {
-            Precision::Inexact(n) => assert!(
+            Precision::Exact(n) | Precision::Inexact(n) => assert!(
                 n >= usize::try_from(seeded).expect("fits"),
                 "num_rows must include the {seeded} inline rows, got {n}"
             ),
-            other => panic!("inline-row count must be Inexact (estimate), got {other:?}"),
+            other => panic!("num_rows must be present, got {other:?}"),
         }
     }
 
