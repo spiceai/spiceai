@@ -11500,20 +11500,17 @@ impl CayenneTableProvider {
             let _fence = self.lock_listing_fence_write_owned().await;
             let _view_guard = self.scan_state_lock.write().await;
             if let Some(commit) = inlined_commit {
-                // Net the live inline-row count by BOTH inlined supersedes
-                // (commit.removed_rows: prior inline entries rewritten/removed)
-                // AND file-backed supersedes (file_deleted_pk_i64 /
-                // file_deleted_row_keys: existing file rows hidden by deletion
-                // vectors). Without subtracting file-backed supersedes,
-                // `inlined_row_count` overcounts — it would grow by the full
-                // insert count even though some of those rows merely replace
-                // existing file-backed rows (which are hidden by deletion
-                // vectors, not removed from the inline memtable).
-                let file_superseded =
-                    i64::try_from(file_deleted_pk_i64.len() + file_deleted_row_keys.len())
-                        .unwrap_or(i64::MAX);
-                let total_removed = commit.removed_rows.saturating_add(file_superseded);
-                self.publish_inlined_mutation(total_rows, total_removed, commit.published_seq);
+                // `inlined_row_count` must reflect the actual number of rows
+                // living in the inline memtable — scan paths use it as a
+                // visibility signal (`> 0` → read inline data). Only subtract
+                // inlined supersedes (prior inline entries rewritten), NOT
+                // file-backed supersedes. The file-backed supersede netting is
+                // handled by `live_rows_delta` in `try_inline_or_restream`.
+                self.publish_inlined_mutation(
+                    total_rows,
+                    commit.removed_rows,
+                    commit.published_seq,
+                );
             }
             if let Some(delete_seq) = delete_seq {
                 self.update_file_deletion_cache(

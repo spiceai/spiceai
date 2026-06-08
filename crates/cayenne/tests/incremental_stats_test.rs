@@ -202,24 +202,24 @@ async fn test_live_num_rows_and_ndv_under_upsert(
 }
 
 // ---------------------------------------------------------------------------
-// Regression tests for inline upsert num_rows double-counting
+// Regression tests for inline num_rows double-counting (40a6ffa3dd)
 // ---------------------------------------------------------------------------
 //
-// These two tests cover the two sub-bugs introduced when `add_inlined_rows_to_statistics`
-// was added to `cached_table_statistics_for_optimizer` without accounting for the
-// `live_rows_delta` already updating persisted `num_rows` on the inline write path.
+// `add_inlined_rows_to_statistics` in `cached_table_statistics_for_optimizer`
+// folded `inlined_row_count` into the optimizer's `num_rows`, but `num_rows`
+// was already updated via `live_rows_delta` through `schedule_post_write_maintenance`
+// on the inline write path — double-counting every inline row.
 //
-// Bug 1: inline upsert superseding FILE-BACKED rows overcounted `inlined_row_count`
-//         because `publish_inlined_mutation` only subtracted inlined supersedes, not
-//         file-backed supersedes.
-// Bug 2: fresh inline inserts (no supersedes) double-counted because `live_rows_delta`
-//         updated `num_rows` AND `inlined_row_count` was separately added on top.
+// Test A: inline upsert superseding file-backed rows — `live_rows_delta` is 0
+//         but `inlined_row_count` grew, so `num_rows` overcounted.
+// Test B: fresh inline insert (no supersedes) — `live_rows_delta` is N and
+//         `inlined_row_count` also grew by N, so `num_rows` overcounted by N.
 
 test_with_backends!(test_inline_upsert_superseding_file_rows);
 test_with_backends!(test_fresh_inline_after_staged_no_double_count);
 
-/// Regression test for bug 1: an inline upsert that supersedes file-backed rows
-/// must net the supersedes so `num_rows` stays correct.
+/// Regression test A: an inline upsert that supersedes file-backed rows
+/// must not inflate `num_rows` — `live_rows_delta` nets the supersedes.
 async fn test_inline_upsert_superseding_file_rows(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -279,7 +279,7 @@ async fn test_inline_upsert_superseding_file_rows(
     Ok(())
 }
 
-/// Regression test for bug 2: a fresh inline insert (no supersedes) after a
+/// Regression test B: a fresh inline insert (no supersedes) after a
 /// staged insert must not double-count the new rows.
 async fn test_fresh_inline_after_staged_no_double_count(
     fixture: common::TestFixture,
