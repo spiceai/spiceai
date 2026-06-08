@@ -32,20 +32,24 @@ impl MongoSys {
 
         let conn = pool.connect().await.map_err(Error::external)?;
 
-        let create_table = format!(
-            "CREATE TABLE IF NOT EXISTS {MONGODB_TABLE_NAME} (
-                dataset_name TEXT PRIMARY KEY,
-                resume_token_json TEXT NOT NULL,
-                cluster_time_ts INTEGER,
-                schema_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )"
-        );
-        conn.execute(&create_table, ())
-            .await
-            .map_err(Error::external)?;
+        {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
+            let create_table = format!(
+                "CREATE TABLE IF NOT EXISTS {MONGODB_TABLE_NAME} (
+                    dataset_name TEXT PRIMARY KEY,
+                    resume_token_json TEXT NOT NULL,
+                    cluster_time_ts INTEGER,
+                    schema_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"
+            );
+            conn.execute(&create_table, ())
+                .await
+                .map_err(Error::external)?;
+        }
 
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let upsert = format!(
             "INSERT INTO {MONGODB_TABLE_NAME}
              (dataset_name, resume_token_json, cluster_time_ts, schema_json, created_at, updated_at)
@@ -108,6 +112,7 @@ impl MongoSys {
 
     pub(super) async fn delete_turso(&self, pool: &Arc<TursoConnectionPool>) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
+        let _schema_guard = pool.acquire_schema_read_lock().await;
         let conn = pool.connect().await.map_err(Error::external)?;
         let delete = format!("DELETE FROM {MONGODB_TABLE_NAME} WHERE dataset_name = ?1");
         conn.execute(&delete, turso::params![dataset_name])

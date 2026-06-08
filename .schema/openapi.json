@@ -6265,7 +6265,6 @@
         "type": "object",
         "description": "A simplified message input to the model (EasyInputMessage in the OpenAPI spec).\n\nThis is the most user-friendly way to provide messages, supporting both simple\nstring content and structured content. Role can include `assistant` for providing\nprevious assistant responses.",
         "required": [
-          "type",
           "role",
           "content"
         ],
