@@ -89,6 +89,7 @@ pub(crate) mod sink;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
+pub(crate) mod tuning;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod write_budget;
@@ -104,6 +105,7 @@ pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
+pub use tuning::set_global_memory_budget;
 pub use write_budget::set_global_encode_concurrency;
 
 // Re-export deletion utilities for advanced use cases

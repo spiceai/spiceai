@@ -382,6 +382,13 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
+# Local vendored fork of `mysql-common-derive` (path: vendor/mysql-common-derive)
+# that drops the unmaintained `proc-macro-error2` dependency (RUSTSEC-2026-0173).
+# Pulled in transitively via `mysql_async` (the MySQL connector); it was the sole
+# consumer of `proc-macro-error2` in the tree. The fork keeps the same 0.32.1 API
+# and derive output. See vendor/mysql-common-derive/README.md.
+mysql-common-derive = { path = "vendor/mysql-common-derive" }
+
 # Redirect candle-core / kernels / nn / transformers to the spiceai fork;
 # this matches the git rev pinned in [workspace.dependencies] above.
 candle-core = { git = "https://github.com/spiceai/candle.git", rev = "6ee27a4d621a3470cbf83596722c16de7cf97f12" } # spiceai

@@ -129,7 +129,7 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// independent tables oversubscribe the box under concurrent CDC. Users raise
 /// `cayenne_write_concurrency` explicitly when a table needs more encode
 /// parallelism. See `snapshot_write_concurrency`.
-const DEFAULT_WRITE_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 // Approximate per-entry `HashMap` control/allocation overhead used for the
 // cache budget. The exact value is allocator-dependent, so keep this estimate
 // centralized with `approx_pk_keyset_entry_bytes`.
@@ -3445,11 +3445,20 @@ impl CayenneTableProvider {
         task_context: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<CayenneCdcWrite> {
         let target_schema = Arc::clone(&self.table_metadata.schema);
+        // Tally the in-memory Arrow size of every batch as it streams through, so
+        // the auto-tuner sees the real ingest *volume* (bytes/s), not just rows/s.
+        // Costs one relaxed add per batch on a path that already touches each batch.
+        let ingest_bytes = Arc::new(AtomicU64::new(0));
+        let ingest_bytes_tally = Arc::clone(&ingest_bytes);
         let normalized = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&target_schema),
             data.map(move |batch_result| {
                 batch_result.and_then(|batch| {
                     arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                        .inspect(|cast| {
+                            ingest_bytes_tally
+                                .fetch_add(cast.get_array_memory_size() as u64, Ordering::Relaxed);
+                        })
                         .map_err(Into::into)
                 })
             }),
@@ -3466,9 +3475,22 @@ impl CayenneTableProvider {
             );
         }
 
-        AppendMutationWriter::new(self, &self.context, task_context)
+        let result = AppendMutationWriter::new(self, &self.context, task_context)
             .write_cdc_pipelined(normalized, write_guard)
-            .await
+            .await;
+        // Feed the dynamic auto-tuner's rolling ingest accounting: the batch's row
+        // count, the real ingested bytes (tallied above), and the full per-batch
+        // apply wall (lock-wait + write) — the "am I keeping up with the offered
+        // load?" response signal. Cheap and recorded regardless of whether dynamic
+        // tuning is enabled (it also backs the always-on observability gauges).
+        if let Ok(cdc_write) = &result {
+            self.context.record_ingest(
+                cdc_write.rows,
+                ingest_bytes.load(Ordering::Relaxed),
+                lock_wait_start.elapsed(),
+            );
+        }
+        result
     }
 
     /// Returns whether retention filters are configured for this table.
@@ -10371,6 +10393,35 @@ impl CayenneTableProvider {
             "Fast protected-snapshot subset compaction completed"
         );
 
+        // Record the merged *output* size so operators (and the adaptive tuner's
+        // observability) can see whether compaction is trending toward the target
+        // file size or stalling below it. Compare to cayenne_autotune_target_file_size_mb.
+        // The new snapshot's actual on-disk Vortex bytes are the meaningful figure:
+        // deletions + re-encoding/compression make the output materially smaller
+        // than the summed inputs, so reporting the input sum would overstate it.
+        // Best-effort — fall back to the input sum only if sizing the output fails.
+        let merged_output_bytes = match self.list_snapshot_files_with_sizes(&new_snapshot_id).await
+        {
+            Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+            Err(e) => {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to size compaction output snapshot for the merged-bytes \
+                     metric; falling back to total input bytes: {e}"
+                );
+                total_input_bytes
+            }
+        };
+        telemetry::track_cayenne_compaction_merged_bytes(
+            merged_output_bytes,
+            &[telemetry::KeyValue::new(
+                "table",
+                self.table_metadata.table_name.clone(),
+            )],
+        );
+
         Ok(true)
     }
 
@@ -15198,6 +15249,62 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
 
     fn compaction_target_name(&self) -> &str {
         &self.table_metadata.table_name
+    }
+
+    fn on_background_tick(&self) {
+        // Observe the query-health signal — protected-snapshot runs a scan must
+        // merge (read amplification, the ingest→query coupling) — and cgroup
+        // memory pressure, so the controller's snapshot reflects fresh data.
+        let read_amp = self.protected_snapshots.load().len();
+        self.context.observe_environment(read_amp);
+
+        // Emit observability gauges every tick (regardless of whether dynamic
+        // tuning is enabled — the accounting is always recorded).
+        let table = self.table_metadata.table_name.clone();
+        let snap = self.context.ingest_snapshot();
+        let knobs = self.context.live_knob_values();
+        telemetry::track_cayenne_autotune_state(
+            &telemetry::CayenneAutotuneState {
+                rows_per_sec: snap.rows_per_sec,
+                bytes_per_sec: snap.bytes_per_sec,
+                apply_vs_arrival: snap.apply_vs_arrival,
+                read_amp: u64::try_from(read_amp).unwrap_or(0),
+                mem_pressure: snap.mem_pressure.unwrap_or(-1.0),
+                apply_ms: snap.apply_ms,
+                inline_flush_max_bytes: u64::try_from(knobs.inline_flush_max_bytes.max(0))
+                    .unwrap_or(0),
+                compaction_interval_ms: knobs.compaction_background_interval_ms,
+                compaction_trigger_files: u64::try_from(knobs.compaction_trigger_files)
+                    .unwrap_or(0),
+                target_file_size_mb: u64::try_from(
+                    self.context.target_file_size_bytes() / (1024 * 1024),
+                )
+                .unwrap_or(0),
+                write_concurrency: u64::try_from(knobs.write_concurrency).unwrap_or(0),
+            },
+            &[telemetry::KeyValue::new("table", table.clone())],
+        );
+
+        // The closed-loop control step. A no-op when dynamic tuning is disabled
+        // (returns `None`); otherwise applies at most one bounded knob change.
+        if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
+            telemetry::track_cayenne_autotune_adjustment(&[
+                telemetry::KeyValue::new("table", table.clone()),
+                telemetry::KeyValue::new("knob", adj.knob.as_str()),
+            ]);
+            tracing::info!(
+                target: "cayenne::tuning",
+                table = table.as_str(),
+                knob = adj.knob.as_str(),
+                new_value = adj.new_value,
+                reason = adj.reason,
+                "Cayenne dynamic auto-tune adjustment applied",
+            );
+        }
+    }
+
+    fn background_interval_hint(&self) -> Option<std::time::Duration> {
+        self.context.compaction_background_interval()
     }
 }
 
