@@ -14023,8 +14023,18 @@ impl CayenneTableProvider {
                         file = %part_file.object_meta.location,
                         "Pruned Vortex file at listing time via footer statistics"
                     );
+                    telemetry::track_cayenne_scan_files(
+                        1,
+                        1,
+                        &[telemetry::KeyValue::new("table", table_name.clone())],
+                    );
                     return Ok(None);
                 }
+                telemetry::track_cayenne_scan_files(
+                    1,
+                    0,
+                    &[telemetry::KeyValue::new("table", table_name.clone())],
+                );
                 Ok(Some(part_file))
             })
             .buffer_unordered(meta_fetch_concurrency)
