@@ -1643,7 +1643,7 @@ impl SnapshotManager {
             .filter(|entry| Some(entry.snapshot_id) != dataset_metadata.current_snapshot_id)
             .cloned()
             .collect();
-        remaining.sort_by(|a, b| b.snapshot_id.cmp(&a.snapshot_id));
+        remaining.sort_by_key(|b| std::cmp::Reverse(b.snapshot_id));
         ordered_snapshots.extend(remaining);
 
         let current_engine = self.engine.to_string();
