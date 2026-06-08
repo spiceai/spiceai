@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableType;
-use datafusion::logical_expr::TableSource;
-use datafusion::optimizer::optimizer::Optimizer;
-use datafusion_federation::{FederatedTableSource, FederationProvider, sql::SQLTableSource};
+use datafusion::logical_expr::{LogicalPlan, TableSource};
+use datafusion_federation::{
+    FederatedTableSource, FederationAnalyzerForLogicalPlan, FederationProvider, sql::SQLTableSource,
+};
 
 pub struct AcceleratedTableFederatedTableSource {
     table_source: SQLTableSource,
@@ -116,10 +117,10 @@ impl FederationProvider for AcceleratedTableFederationProvider {
         self.federation_provider().and_then(|x| x.compute_context())
     }
 
-    fn optimizer(&self) -> Option<Arc<Optimizer>> {
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         if !self.enabled {
             return None;
         }
-        self.federation_provider()?.optimizer()
+        self.federation_provider()?.analyzer(plan)
     }
 }

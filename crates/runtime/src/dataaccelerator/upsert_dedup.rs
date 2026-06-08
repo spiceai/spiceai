@@ -321,9 +321,20 @@ impl ExecutionPlan for UpsertDedupExec {
 
                 let deduped_batch = deduplicate_batch(&batch, &constraints, &upsert_options)?;
 
+                // `validate_batch_with_constraints` now takes an owned `Vec<RecordBatch>` plus an
+                // `&datafusion_table_providers::util::constraints::UpsertOptions`
+                // (datafusion-table-providers `sgrebnov/spiceai-53`). Map our local `UpsertOptions`
+                // (field-identical) to that type. We use the call as a constraint check here — dedup
+                // is already applied above — so the returned (potentially modified) batches are
+                // discarded and the locally deduped batch is returned, preserving the prior behavior.
+                let tp_upsert_options =
+                    datafusion_table_providers::util::constraints::UpsertOptions::default()
+                        .with_remove_duplicates(upsert_options.remove_duplicates)
+                        .with_last_write_wins(upsert_options.last_write_wins);
                 datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                    std::slice::from_ref(&deduped_batch),
+                    std::slice::from_ref(&deduped_batch).to_vec(),
                     &constraints,
+                    &tp_upsert_options,
                 )
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;

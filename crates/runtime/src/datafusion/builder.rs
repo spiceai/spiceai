@@ -69,7 +69,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
-use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
+use datafusion_federation::{FederatedPlanner, FederationAnalyzerRule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
@@ -629,7 +629,9 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_optimizer_rule(Arc::new(FederationOptimizerRule::new()))
+            // Federation is wired up as the `FederationAnalyzerRule` (prepended via
+            // `AnalyzerRulesBuilder::with_federation`, see below) plus the `FederatedPlanner`
+            // extension planner (registered in `default_extension_planners`).
             // Replace the default analyzer rules with an empty set so we can add our own predefined list later (see `AnalyzerRulesBuilder`).
             .with_analyzer_rules(vec![])
             .with_query_planner(Arc::new(
@@ -827,7 +829,8 @@ impl DataFusionBuilder {
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
-        for rule in AnalyzerRulesBuilder::default().build() {
+        // Federation runs as the first of these (see `AnalyzerRulesBuilder::with_federation`).
+        for rule in AnalyzerRulesBuilder::default().with_federation(true).build() {
             ctx.add_analyzer_rule(rule);
         }
         for rule in self.additional_analyzer_rules {
@@ -1071,6 +1074,7 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
 #[derive(Default)]
 pub struct AnalyzerRulesBuilder {
     extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+    federation: bool,
 }
 
 impl AnalyzerRulesBuilder {
@@ -1088,6 +1092,20 @@ impl AnalyzerRulesBuilder {
         self
     }
 
+    /// Enable query federation by prepending the `FederationAnalyzerRule`.
+    ///
+    /// As of datafusion-federation `sgrebnov/spiceai-53`, federation is implemented as an
+    /// analyzer rule (it was an optimizer rule prior to the DF53 update). It must run before the
+    /// other analyzer rules (`ResolveGroupingFunction`/`TypeCoercion`), which only affect internal
+    /// `DataFusion` execution, so that the federated query engines see the un-rewritten plan. This
+    /// matches `datafusion_federation::default_analyzer_rules()`, which lists the federation rule
+    /// first. Callers must also register the `FederatedPlanner` extension planner.
+    #[must_use]
+    pub fn with_federation(mut self, federation: bool) -> Self {
+        self.federation = federation;
+        self
+    }
+
     /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
     /// as opposed to when underlying federated query engines will execute the query.
     ///
@@ -1095,6 +1113,9 @@ impl AnalyzerRulesBuilder {
     #[must_use]
     pub fn build(self) -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
         let mut rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![];
+        if self.federation {
+            rules.push(Arc::new(FederationAnalyzerRule::new()) as Arc<dyn AnalyzerRule + Send + Sync>);
+        }
         rules.extend([
             Arc::new(ResolveGroupingFunction::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,

@@ -234,9 +234,19 @@ impl DataSink for DuckDBPartitionedDataSink {
             for (partition_name, batch) in batches {
                 let partition_batches = if let Some(constraints) = &self.constraints {
                     let deduped_batch = deduplicate_batch(&batch, constraints, &upsert_options)?;
+                    // `validate_batch_with_constraints` now takes an owned `Vec<RecordBatch>` plus
+                    // an `&datafusion_table_providers::util::constraints::UpsertOptions`
+                    // (datafusion-table-providers `sgrebnov/spiceai-53`). Map our local
+                    // (field-identical) `UpsertOptions` to that type; the call is a constraint check
+                    // (dedup already applied above) so its returned batches are discarded.
+                    let tp_upsert_options =
+                        datafusion_table_providers::util::constraints::UpsertOptions::default()
+                            .with_remove_duplicates(upsert_options.remove_duplicates)
+                            .with_last_write_wins(upsert_options.last_write_wins);
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        std::slice::from_ref(&deduped_batch),
+                        std::slice::from_ref(&deduped_batch).to_vec(),
                         constraints,
+                        &tp_upsert_options,
                     )
                     .await
                     .context(ConstraintViolationSnafu)

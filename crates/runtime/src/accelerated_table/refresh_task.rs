@@ -66,9 +66,7 @@ use datafusion::{
     sql::TableReference,
 };
 use datafusion_expr::{LogicalPlanBuilder, UNNAMED_TABLE, ident};
-use datafusion_federation::{
-    FederatedPlanner, FederatedTableProviderAdaptor, FederationOptimizerRule,
-};
+use datafusion_federation::{FederatedPlanner, FederatedTableProviderAdaptor};
 use datafusion_optimizer_rules::physical_plan::HttpParamsPushdown;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, is_retriable_error,
@@ -1599,7 +1597,7 @@ impl RefreshTask {
         disable_federation: bool,
         io_runtime: Handle,
     ) -> SessionContext {
-        let mut state_builder = SessionStateBuilder::new()
+        let state_builder = SessionStateBuilder::new()
             .with_config(get_df_default_config())
             .with_runtime_env(default_runtime_env(io_runtime))
             .with_default_features();
@@ -1607,14 +1605,15 @@ impl RefreshTask {
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
             vec![Arc::new(IndexTableScanExtensionPlanner::new())];
 
-        let analyzer_rules_builder = AnalyzerRulesBuilder::default();
+        // Federation is implemented as the `FederationAnalyzerRule` (prepended by
+        // `AnalyzerRulesBuilder::with_federation`) plus the `FederatedPlanner` extension planner as
+        // of datafusion-federation `sgrebnov/spiceai-53` (it was an optimizer rule prior to the
+        // DF53 update). Only wire them up when federation is enabled; when disabled, leave them out
+        // so the query plans against the accelerator only.
+        let analyzer_rules_builder =
+            AnalyzerRulesBuilder::default().with_federation(!disable_federation);
 
-        // Federation is implemented as an optimizer rule (`FederationOptimizerRule`) plus the
-        // `FederatedPlanner` extension planner in DataFusion 53. Only wire them up when federation
-        // is enabled; when disabled, leave them out so the query plans against the accelerator only.
         if !disable_federation {
-            state_builder =
-                state_builder.with_optimizer_rule(Arc::new(FederationOptimizerRule::new()));
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 

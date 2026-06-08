@@ -53,7 +53,9 @@ impl AcceleratedTable {
 
         let table_source = SQLTableSource::new_with_schema(
             Arc::clone(&sql_table_source.provider),
-            sql_table_source.table_reference().into(),
+            // `table_reference()` returns `&MultiPartTableReference`; `new_with_schema` now takes
+            // `impl Into<RemoteTableRef>`, which is implemented for the owned value, so clone it.
+            sql_table_source.table_reference().clone(),
             Arc::clone(&self.schema()),
         );
 

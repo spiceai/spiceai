@@ -443,10 +443,10 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::error::DataFusionError;
-    use datafusion::logical_expr::TableSource;
-    use datafusion::optimizer::optimizer::Optimizer;
+    use datafusion::logical_expr::{LogicalPlan, TableSource};
     use datafusion_federation::{
-        FederatedTableProviderAdaptor, FederatedTableSource, FederationProvider,
+        FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
+        FederationProvider,
     };
 
     #[test]
@@ -490,7 +490,7 @@ mod tests {
             Some("test-context".to_string())
         }
 
-        fn optimizer(&self) -> Option<Arc<Optimizer>> {
+        fn analyzer(&self, _plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
             None
         }
     }
