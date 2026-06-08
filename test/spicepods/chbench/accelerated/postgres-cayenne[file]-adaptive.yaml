@@ -8,13 +8,17 @@ name: postgres-cayenne[file]-adaptive
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
-# Two requirements the adaptive loop gates on (both satisfied here):
-#   - `schema_inference: extended` per dataset — the data-aware warm-start needs the inferred
-#     row_count/table_bytes (PostgreSQL emits them); without it adaptive silently falls back to auto.
-#   - background compaction enabled — the controller rides the per-table compaction tick. Left at
-#     the auto-derived (non-zero) default here; NOT pinned, so the loop is free to move it.
-# No per-knob value is set anywhere: an explicit knob would *pin* it under adaptive (collapsing its
-# tuning bounds to a point), so basing this off the un-pinned baseline gives the loop full freedom.
+# `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
+#     PostgreSQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
+#     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
+#     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
+#     overrides a user-set value, so declaring them would just suppress the very thing we test).
+#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
+#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+# Background compaction stays at the auto-derived (non-zero) default — the controller rides its
+# tick. No per-knob value is set anywhere: an explicit knob would *pin* it under adaptive
+# (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
@@ -36,6 +40,8 @@ runtime:
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
 
   - from: postgres:warehouse
     name: warehouse
@@ -49,9 +55,6 @@ datasets:
       engine: cayenne
       mode: file
       refresh_mode: changes
-      primary_key: w_id
-      on_conflict:
-        w_id: upsert
       params: &cayenne_params
         cayenne_tuning: adaptive
 
@@ -62,11 +65,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_district
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (d_w_id, d_id)
-      on_conflict:
-        (d_w_id, d_id): upsert
+    acceleration: *cayenne_accel
 
   - from: postgres:customer
     name: customer
@@ -75,11 +74,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_customer
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (c_w_id, c_d_id, c_id)
-      on_conflict:
-        (c_w_id, c_d_id, c_id): upsert
+    acceleration: *cayenne_accel
 
   - from: postgres:new_order
     name: new_order
@@ -88,11 +83,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (no_w_id, no_d_id, no_o_id)
-      on_conflict:
-        (no_w_id, no_d_id, no_o_id): upsert
+    acceleration: *cayenne_accel
 
   - from: postgres:oorder
     name: oorder
@@ -101,11 +92,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_oorder
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (o_w_id, o_d_id, o_id)
-      on_conflict:
-        (o_w_id, o_d_id, o_id): upsert
+    acceleration: *cayenne_accel
 
   - from: postgres:order_line
     name: order_line
@@ -114,11 +101,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_order_line
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
-      on_conflict:
-        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+    acceleration: *cayenne_accel
 
   - from: postgres:stock
     name: stock
@@ -127,74 +110,40 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_stock
       pg_replication_initial_snapshot: 'true'
-    acceleration:
-      <<: *cayenne_accel
-      primary_key: (s_w_id, s_i_id)
-      on_conflict:
-        (s_w_id, s_i_id): upsert
+    acceleration: *cayenne_accel
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: PK / on_conflict / indexes come from extended inference.
 
   - from: postgres:item
     name: item
     schema_inference: extended
     params:
       <<: *postgres_params
-    acceleration:
+    acceleration: &cayenne_accel_full
       enabled: true
       engine: cayenne
       mode: file
       refresh_mode: full
-      primary_key: i_id
-      on_conflict:
-        i_id: upsert
-      params:
-        <<: *cayenne_params
+      params: *cayenne_params
 
   - from: postgres:region
     name: region
     schema_inference: extended
     params:
       <<: *postgres_params
-    acceleration:
-      enabled: true
-      engine: cayenne
-      mode: file
-      refresh_mode: full
-      primary_key: r_regionkey
-      on_conflict:
-        r_regionkey: upsert
-      params:
-        <<: *cayenne_params
+    acceleration: *cayenne_accel_full
 
   - from: postgres:nation
     name: nation
     schema_inference: extended
     params:
       <<: *postgres_params
-    acceleration:
-      enabled: true
-      engine: cayenne
-      mode: file
-      refresh_mode: full
-      primary_key: n_nationkey
-      on_conflict:
-        n_nationkey: upsert
-      params:
-        <<: *cayenne_params
+    acceleration: *cayenne_accel_full
 
   - from: postgres:supplier
     name: supplier
     schema_inference: extended
     params:
       <<: *postgres_params
-    acceleration:
-      enabled: true
-      engine: cayenne
-      mode: file
-      refresh_mode: full
-      primary_key: su_suppkey
-      on_conflict:
-        su_suppkey: upsert
-      params:
-        <<: *cayenne_params
+    acceleration: *cayenne_accel_full
