@@ -3514,6 +3514,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
+ "datafusion-pruning",
  "datafusion-table-providers",
  "duckdb",
  "flatbuffers",

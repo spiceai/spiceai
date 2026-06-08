@@ -242,6 +242,32 @@ pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Stat
     }
 }
 
+/// Serialize `DataFusion` scan statistics to a persisted Vortex blob.
+///
+/// Returns `None` when any column cannot be converted or serialization fails.
+pub(crate) fn statistics_to_persisted_blob(stats: &Statistics, schema: &Schema) -> Option<Vec<u8>> {
+    if stats.column_statistics.len() != schema.fields().len() {
+        return None;
+    }
+    let column_stats: Vec<StatsSet> = stats
+        .column_statistics
+        .iter()
+        .map(column_stats_to_stats_set)
+        .collect();
+    let file_stats = build_file_statistics(column_stats, schema);
+    serialize_file_statistics(&file_stats).ok()
+}
+
+/// Restore `DataFusion` scan statistics from a persisted Vortex blob.
+pub(crate) fn statistics_from_persisted_blob(
+    blob: &[u8],
+    schema: &Schema,
+    num_rows: i64,
+) -> Option<Arc<Statistics>> {
+    let file_stats = deserialize_file_statistics(blob, schema).ok()?;
+    Some(Arc::new(file_statistics_to_df(&file_stats, num_rows)))
+}
+
 /// Serialize a Vortex [`FileStatistics`] to bytes.
 pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<Vec<u8>> {
     let fb = stats.write_flatbuffer_bytes()?;
