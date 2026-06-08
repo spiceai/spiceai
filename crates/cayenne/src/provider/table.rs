@@ -11509,16 +11509,11 @@ impl CayenneTableProvider {
                 // insert count even though some of those rows merely replace
                 // existing file-backed rows (which are hidden by deletion
                 // vectors, not removed from the inline memtable).
-                let file_superseded = i64::try_from(
-                    file_deleted_pk_i64.len() + file_deleted_row_keys.len(),
-                )
-                .unwrap_or(i64::MAX);
+                let file_superseded =
+                    i64::try_from(file_deleted_pk_i64.len() + file_deleted_row_keys.len())
+                        .unwrap_or(i64::MAX);
                 let total_removed = commit.removed_rows.saturating_add(file_superseded);
-                self.publish_inlined_mutation(
-                    total_rows,
-                    total_removed,
-                    commit.published_seq,
-                );
+                self.publish_inlined_mutation(total_rows, total_removed, commit.published_seq);
             }
             if let Some(delete_seq) = delete_seq {
                 self.update_file_deletion_cache(
