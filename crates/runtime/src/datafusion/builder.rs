@@ -36,7 +36,7 @@ use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
     CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
-    CayenneOptimizerConfig,
+    CayenneMaintainedAggregateRewriter, CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -169,6 +169,7 @@ struct CayenneLogicalOptimizerRules {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CayennePhysicalOptimizerRules {
     dynamic_filter_sharing: bool,
+    maintained_aggregate: bool,
     anti_join_sort_merge: bool,
     exact_join_filter: bool,
 }
@@ -185,6 +186,7 @@ impl CayenneOptimizerRules {
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
+                maintained_aggregate: true,
                 anti_join_sort_merge: true,
                 exact_join_filter: false,
             },
@@ -202,6 +204,7 @@ impl CayenneOptimizerRules {
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
+                maintained_aggregate: true,
                 anti_join_sort_merge: true,
                 exact_join_filter: true,
             },
@@ -219,6 +222,7 @@ impl CayenneOptimizerRules {
             },
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: false,
+                maintained_aggregate: false,
                 anti_join_sort_merge: false,
                 exact_join_filter: false,
             },
@@ -268,6 +272,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_dynamic_filter_sharing(&mut self, enabled: bool) {
         self.physical.dynamic_filter_sharing = enabled;
+    }
+
+    #[must_use]
+    pub const fn maintained_aggregate(self) -> bool {
+        self.physical.maintained_aggregate
+    }
+
+    pub fn set_maintained_aggregate(&mut self, enabled: bool) {
+        self.physical.maintained_aggregate = enabled;
     }
 
     #[must_use]
@@ -689,6 +702,11 @@ impl DataFusionBuilder {
             if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
                 state = state
                     .with_physical_optimizer_rule(Arc::new(CayenneDynamicFilterSharing::new()));
+            }
+            if self.cayenne_optimizer_rules.maintained_aggregate() {
+                state = state.with_physical_optimizer_rule(Arc::new(
+                    CayenneMaintainedAggregateRewriter::new(),
+                ));
             }
             if self.cayenne_optimizer_rules.anti_join_sort_merge() {
                 state = state.with_physical_optimizer_rule(Arc::new(
@@ -1706,6 +1724,7 @@ mod tests {
             physical_rule_names,
             vec![
                 "CayenneDynamicFilterSharing",
+                "CayenneMaintainedAggregateRewriter",
                 "CayenneAntiJoinSortMergeRewriter",
             ],
             "Default Cayenne physical optimizer selection should preserve prior safe defaults without re-enabling the exact join filter"
@@ -1785,11 +1804,14 @@ mod tests {
     #[cfg(not(windows))]
     fn test_built_datafusion_can_enable_one_cayenne_physical_rule() {
         let mut rules = CayenneOptimizerRules::none();
-        rules.set_exact_join_filter(true);
+        rules.set_maintained_aggregate(true);
 
         let (_, physical_rule_names) = built_datafusion_cayenne_rule_names(rules);
 
-        assert_eq!(physical_rule_names, vec!["CayenneJoinRewriter"]);
+        assert_eq!(
+            physical_rule_names,
+            vec!["CayenneMaintainedAggregateRewriter"]
+        );
     }
 
     #[test]
@@ -1805,6 +1827,8 @@ mod tests {
         semi_join_pushdown.set_semi_join_pushdown(true);
         let mut dynamic_filter_sharing = CayenneOptimizerRules::none();
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
+        let mut maintained_aggregate = CayenneOptimizerRules::none();
+        maintained_aggregate.set_maintained_aggregate(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
         anti_join_sort_merge.set_anti_join_sort_merge(true);
         let mut exact_join_filter = CayenneOptimizerRules::none();
@@ -1835,6 +1859,11 @@ mod tests {
                 dynamic_filter_sharing,
                 vec![],
                 vec!["CayenneDynamicFilterSharing"],
+            ),
+            (
+                maintained_aggregate,
+                vec![],
+                vec!["CayenneMaintainedAggregateRewriter"],
             ),
             (
                 anti_join_sort_merge,
@@ -2296,6 +2325,10 @@ mod tests {
             .iter()
             .position(|name| *name == "CayenneDynamicFilterSharing")
             .expect("Cayenne dynamic filter sharing rule should be registered");
+        let cayenne_maintained_aggregate_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneMaintainedAggregateRewriter")
+            .expect("Cayenne maintained aggregate rewriter should be registered");
         let cayenne_anti_sort_merge_position = rule_names
             .iter()
             .position(|name| *name == "CayenneAntiJoinSortMergeRewriter")
@@ -2312,6 +2345,14 @@ mod tests {
         assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
             "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so same-source joins can receive shared scan filters before any sort-merge rewrite"
+        );
+        assert!(
+            cayenne_filter_sharing_position < cayenne_maintained_aggregate_position,
+            "CayenneMaintainedAggregateRewriter should run with the Cayenne physical rules after DataFusion's built-in physical optimizer rules"
+        );
+        assert!(
+            cayenne_maintained_aggregate_position < cayenne_anti_sort_merge_position,
+            "CayenneMaintainedAggregateRewriter should run before Cayenne join rewrites"
         );
         assert!(
             cayenne_anti_sort_merge_position < cayenne_join_rewriter_position,

@@ -3513,6 +3513,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions",
+ "datafusion-functions-aggregate",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-table-providers",

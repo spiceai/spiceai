@@ -104,6 +104,7 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
@@ -120,6 +121,7 @@ use runtime_datafusion::join_accumulator::{
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::maintained_aggregate::{MaintainedAggregateExec, MaintainedAggregateRegistry};
 use crate::provider::CayenneAccelerationExec;
 use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
 use crate::provider::scan::{IsCayenneAccelerationExec, ScanDynamicFilter, ScanIdentity};
@@ -147,6 +149,26 @@ impl CayenneDynamicFilterSharing {
     #[must_use]
     pub fn new() -> Self {
         Self
+    }
+}
+
+/// Rewrites exact aggregate queries over Cayenne scans to a table-maintained
+/// aggregate batch when the scan and registry epochs match.
+#[derive(Default)]
+pub struct CayenneMaintainedAggregateRewriter;
+
+impl CayenneMaintainedAggregateRewriter {
+    /// Create a new `CayenneMaintainedAggregateRewriter` optimizer rule.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl std::fmt::Debug for CayenneMaintainedAggregateRewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneMaintainedAggregateRewriter")
+            .finish()
     }
 }
 
@@ -285,6 +307,63 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
         })
         .data()
     }
+}
+
+impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
+    fn name(&self) -> &'static str {
+        "CayenneMaintainedAggregateRewriter"
+    }
+
+    fn schema_check(&self) -> bool {
+        false
+    }
+
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        plan.transform_down(|node| {
+            let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some((source, scan_epoch)) = maintained_aggregate_source(aggregate.input()) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(batch) = source.batch_for_aggregate(aggregate, scan_epoch)? else {
+                return Ok(Transformed::no(node));
+            };
+
+            Ok(Transformed::yes(
+                Arc::new(MaintainedAggregateExec::try_new(batch)?) as Arc<dyn ExecutionPlan>,
+            ))
+        })
+        .data()
+    }
+}
+
+fn maintained_aggregate_source(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
+    if let Some(cayenne_scan) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+        return cayenne_scan.maintained_aggregates();
+    }
+
+    let any = plan.as_any();
+    if any.downcast_ref::<RepartitionExec>().is_none()
+        && any.downcast_ref::<CoalesceBatchesExec>().is_none()
+        && any
+            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+            .is_none()
+    {
+        return None;
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    maintained_aggregate_source(children[0])
 }
 
 #[derive(Clone)]
@@ -1137,16 +1216,24 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneJoinRewriter, CayenneOptimizerConfig, FilterAddition,
-        apply_filter_additions, plan_schema_fields,
+        CayenneDynamicFilterSharing, CayenneJoinRewriter, CayenneMaintainedAggregateRewriter,
+        CayenneOptimizerConfig, FilterAddition, apply_filter_additions, plan_schema_fields,
+    };
+    use crate::maintained_aggregate::{
+        MaintainedAggregateExec, MaintainedAggregateExpr, MaintainedAggregateFunction,
+        MaintainedAggregateRegistry, MaintainedAggregateSpec,
     };
     use crate::provider::CayenneAccelerationExec;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::physical_expr::aggregate::AggregateExprBuilder;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
@@ -1160,6 +1247,7 @@ mod tests {
     use datafusion_datasource::file_stream::FileOpener;
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_datasource::{PartitionedFile, TableSchema};
+    use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_expr::{PhysicalExpr, conjunction};
@@ -1172,6 +1260,109 @@ mod tests {
     use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
     use std::any::Any;
     use std::sync::Arc;
+
+    fn maintained_aggregate_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, true),
+        ]))
+    }
+
+    fn maintained_aggregate_test_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            maintained_aggregate_test_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), Some("a"), Some("b")])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])),
+            ],
+        )
+        .expect("test batch should be valid")
+    }
+
+    fn maintained_count_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())]);
+        let aggregate_expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("count(*)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![Arc::new(aggregate_expr)],
+            vec![None],
+            input,
+            schema,
+        )?))
+    }
+
+    #[test]
+    fn maintained_aggregate_rewriter_replaces_fresh_matching_aggregate() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[batch.clone()])?;
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        let aggregate = maintained_count_aggregate(cayenne_scan, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(aggregate, &ConfigOptions::default())?;
+
+        assert!(
+            optimized
+                .as_any()
+                .downcast_ref::<MaintainedAggregateExec>()
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintained_aggregate_rewriter_preserves_stale_epoch_aggregate() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let batch = maintained_aggregate_test_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[batch.clone()])?;
+        registry.mark_stale(2);
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 2,
+        )) as Arc<dyn ExecutionPlan>;
+        let aggregate = maintained_count_aggregate(cayenne_scan, schema)?;
+
+        let optimized = CayenneMaintainedAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
+
+        assert!(
+            optimized.as_any().downcast_ref::<AggregateExec>().is_some(),
+            "stale maintained aggregate state must not rewrite"
+        );
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct TestFileSource {

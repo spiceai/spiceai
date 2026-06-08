@@ -63,6 +63,7 @@ use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
+use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -117,6 +118,57 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
         Ok(compiled) => compiled,
         Err(e) => unreachable!("Unable to compile regexp: {e}"),
     });
+
+fn maintained_aggregate_specs_for_cayenne(
+    acceleration: Option<&Acceleration>,
+) -> Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec> {
+    let Some(acceleration) = acceleration else {
+        return Vec::new();
+    };
+
+    if acceleration.maintained_aggregates.is_empty() {
+        return Vec::new();
+    }
+
+    if !acceleration.partition_by.is_empty() {
+        tracing::warn!(
+            "Cayenne maintained_aggregates is not yet supported on partitioned tables; base table scans will be used for aggregate queries"
+        );
+        return Vec::new();
+    }
+
+    acceleration
+        .maintained_aggregates
+        .iter()
+        .map(
+            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                group_by: aggregate.group_by.clone(),
+                aggregates: aggregate
+                    .aggregates
+                    .iter()
+                    .map(
+                        |expr| {
+                            cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                    function: match expr.function {
+                        spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                        }
+                        spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                        }
+                    },
+                    column: expr.column.clone(),
+                }
+                        },
+                    )
+                    .collect(),
+            },
+        )
+        .collect()
+}
 
 /// Transform schema according to `unsupported_type_action` policy.
 /// Delegates to `cayenne::transform_schema_for_vortex`.
@@ -1115,6 +1167,7 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration);
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -1181,7 +1234,8 @@ impl CayenneAccelerator {
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
-            .with_retention_filters(retention_filters);
+            .with_retention_filters(retention_filters)
+            .with_maintained_aggregates(maintained_aggregate_specs);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }

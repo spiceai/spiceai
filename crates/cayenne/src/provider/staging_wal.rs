@@ -285,6 +285,7 @@ impl CayenneStagedAppend {
         self.remove_wal().await?;
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
+        self.table.mark_maintained_aggregates_stale();
         record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
         Ok(())
     }
@@ -520,6 +521,7 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
+        self.table.mark_maintained_aggregates_stale();
         Ok(())
     }
 
@@ -554,6 +556,7 @@ impl PreparedStagedAppend {
             self.table
                 .publish_current_snapshot_files_changed_under_held_fence();
         }
+        self.table.mark_maintained_aggregates_stale();
         Ok(())
     }
 

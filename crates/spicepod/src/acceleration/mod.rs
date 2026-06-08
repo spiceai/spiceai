@@ -284,6 +284,40 @@ pub enum SnapshotsCompaction {
     Enabled,
 }
 
+/// A Cayenne-maintained aggregate view declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaintainedAggregate {
+    /// Columns used as the `GROUP BY` key, in query output order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
+
+    /// Aggregate expressions maintained for each group, in query output order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregates: Vec<MaintainedAggregateExpr>,
+}
+
+/// One aggregate expression inside a maintained aggregate view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaintainedAggregateExpr {
+    pub function: MaintainedAggregateFunction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+/// Aggregate functions supported by Cayenne maintained aggregate views.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MaintainedAggregateFunction {
+    Count,
+    Sum,
+    Avg,
+}
+
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -361,6 +395,9 @@ pub struct Acceleration {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub on_conflict: HashMap<String, OnConflictBehavior>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maintained_aggregates: Vec<MaintainedAggregate>,
 
     /// Controls write behavior for read-write accelerated datasets.
     /// Only applies when `access: read_write` and the dataset is accelerated.
@@ -476,6 +513,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            maintained_aggregates: Vec::new(),
             write_mode: WriteMode::default(),
             storage_profile: StorageProfile::default(),
             metrics: None,
@@ -548,6 +586,42 @@ mod tests {
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates() {
+        let yaml = r"
+                maintained_aggregates:
+                  - group_by: [customer_id]
+                    aggregates:
+                      - function: count
+                      - function: sum
+                        column: amount
+                      - function: avg
+                        column: latency_ms
+            ";
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(acceleration.maintained_aggregates.len(), 1);
+        let maintained = &acceleration.maintained_aggregates[0];
+        assert_eq!(maintained.group_by, vec!["customer_id"]);
+        assert_eq!(
+            maintained.aggregates,
+            vec![
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("amount".to_string()),
+                },
+                MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Avg,
+                    column: Some("latency_ms".to_string()),
+                },
+            ]
         );
     }
 

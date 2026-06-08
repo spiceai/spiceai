@@ -89,6 +89,7 @@ chdb-bench = ["dep:chdb-rust"]
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
 datafusion-federation.workspace = true
+datafusion-functions-aggregate = { workspace = true }
 datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true

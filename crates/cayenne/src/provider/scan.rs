@@ -20,6 +20,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::maintained_aggregate::MaintainedAggregateRegistry;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -53,6 +54,8 @@ use datafusion_physical_plan::{
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
+    maintained_aggregates: Option<Arc<MaintainedAggregateRegistry>>,
+    maintained_aggregate_epoch: u64,
 }
 
 impl CayenneAccelerationExec {
@@ -62,6 +65,44 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            maintained_aggregates: None,
+            maintained_aggregate_epoch: 0,
+        }
+    }
+
+    /// Creates a new `CayenneAccelerationExec` carrying maintained aggregate
+    /// state captured at the table scan visibility epoch.
+    #[must_use]
+    pub fn new_with_maintained_aggregates(
+        inner: Arc<dyn ExecutionPlan>,
+        maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+        maintained_aggregate_epoch: u64,
+    ) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            maintained_aggregates: Some(maintained_aggregates),
+            maintained_aggregate_epoch,
+        }
+    }
+
+    /// Returns the maintained aggregate registry and scan epoch captured for
+    /// this table scan, if aggregate maintenance is enabled for the table.
+    #[must_use]
+    pub(crate) fn maintained_aggregates(&self) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
+        self.maintained_aggregates
+            .as_ref()
+            .map(|registry| (registry, self.maintained_aggregate_epoch))
+    }
+
+    fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
+        match &self.maintained_aggregates {
+            Some(registry) => Self::new_with_maintained_aggregates(
+                inner,
+                Arc::clone(registry),
+                self.maintained_aggregate_epoch,
+            ),
+            None => Self::new(inner),
         }
     }
 
@@ -129,7 +170,7 @@ impl CayenneAccelerationExec {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(Self::new(inner))))
+        Ok(Some(Arc::new(self.wrap_rewritten_child(inner))))
     }
 }
 
@@ -540,7 +581,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let Some(input) = children.into_iter().next() else {
             unreachable!("should have one input");
         };
-        Ok(Arc::new(CayenneAccelerationExec::new(input)))
+        Ok(Arc::new(self.wrap_rewritten_child(input)))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -605,7 +646,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         self.inner
             .with_fetch(limit)
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>)
+            .map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -623,9 +664,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner
             .try_swapping_with_projection(projection)
             .map(|plan| {
-                plan.map(|plan| {
-                    Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>
-                })
+                plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
             })
     }
 
@@ -656,8 +695,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
-        Ok(result
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
+        Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
     }
 }
 
