@@ -116,13 +116,16 @@ pub fn apply_inferred_schema(
         }
     }
 
-    // 3) Sort columns — only when no engine sort param is configured, and not for
-    // `refresh_mode: changes`. For CDC the accelerator is driven by the upsert key,
-    // not a refresh-time sort; applying `on_refresh_sort_columns` to a change-stream
-    // dataset is at best a no-op and risks perturbing its initial snapshot/refresh,
-    // so inferred-CDC acceleration stays equivalent to a hand-configured one.
+    // 3) Sort columns — only when no engine sort param is configured. Whether a
+    // change-stream dataset gets one is engine-dependent (decided inside
+    // `apply_inferred_sort`): for DuckDB/Arrow the inferred sort drives the
+    // refresh itself, which is a no-op for a change stream and risks perturbing
+    // its initial snapshot, so it stays disabled. Cayenne is the exception — its
+    // `cayenne_sort_columns` sorts the background COMPACTION rewrite, not the
+    // change stream, so it applies even in changes mode and is what keeps
+    // per-file zone maps tight for listing-time pruning on heavy CDC tables.
     let is_changes = acceleration.refresh_mode == Some(RefreshMode::Changes);
-    let applied_sort = !is_changes && apply_inferred_sort(acceleration, inferred, effective_schema);
+    let applied_sort = apply_inferred_sort(acceleration, inferred, effective_schema, is_changes);
 
     tracing::debug!(
         dataset = %dataset_name,
@@ -138,6 +141,7 @@ fn apply_inferred_sort(
     acceleration: &mut Acceleration,
     inferred: &InferredSchema,
     effective_schema: &SchemaRef,
+    is_changes: bool,
 ) -> bool {
     if inferred.sort_columns.is_empty() {
         return false;
@@ -161,6 +165,17 @@ fn apply_inferred_sort(
         // Sqlite / Turso / PostgreSQL accelerators have no sort param.
         _ => return false,
     };
+
+    // For `refresh_mode: changes`, skip engines whose sort param drives the
+    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `sort_columns`): a
+    // refresh-time sort is a no-op for a change stream and risks perturbing the
+    // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
+    // the background compaction rewrite, not the change stream (which stays
+    // unsorted by design), so it applies and keeps per-file zone maps tight for
+    // listing-time pruning on the heavy update tables.
+    if is_changes && engine != Engine::Cayenne {
+        return false;
+    }
 
     // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
     let user_configured = acceleration.params.contains_key(key)
@@ -440,7 +455,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_apply_sort_for_changes_refresh_mode() {
+    fn does_not_apply_sort_for_changes_refresh_mode_on_refresh_time_engines() {
+        // DuckDB/Arrow apply the inferred sort as a *refresh-time* sort, which is
+        // a no-op for a change stream and risks perturbing its initial snapshot —
+        // so it stays disabled in changes mode. (Cayenne is the exception; see
+        // `applies_sort_for_changes_refresh_mode_on_cayenne`.)
         let mut acc = accel(Engine::DuckDB);
         acc.refresh_mode = Some(RefreshMode::Changes);
         let inferred = InferredSchema {
@@ -449,6 +468,25 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at"]), "ds");
         assert!(acc.params.is_empty());
+    }
+
+    #[test]
+    fn applies_sort_for_changes_refresh_mode_on_cayenne() {
+        // Cayenne's `cayenne_sort_columns` sorts the background COMPACTION rewrite,
+        // not the change stream, so an inferred sort SHOULD be applied even in
+        // changes mode — this is what keeps per-file zone maps tight for
+        // listing-time pruning on heavy CDC tables.
+        let mut acc = accel(Engine::Cayenne);
+        acc.refresh_mode = Some(RefreshMode::Changes);
+        let inferred = InferredSchema {
+            sort_columns: vec![sort("created_at", true), sort("id", false)],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at", "id"]), "ds");
+        assert_eq!(
+            acc.params.get("cayenne_sort_columns").map(String::as_str),
+            Some("created_at, id")
+        );
     }
 
     #[test]

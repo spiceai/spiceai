@@ -30,7 +30,6 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, dml::InsertOp};
-use datafusion::optimizer::optimizer::Optimizer;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -45,7 +44,9 @@ use snafu::prelude::*;
 use snowflake_api::{QueryResult, SnowflakeApi};
 use tokio::sync::Mutex;
 
-use datafusion_federation::{FederatedTableProviderAdaptor, FederationProvider};
+use datafusion_federation::{
+    FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan, FederationProvider,
+};
 
 use crate::delete::{DeletionExec, DeletionSink};
 
@@ -171,11 +172,11 @@ impl FederationProvider for SnowflakeTableProvider {
             .and_then(|a| a.source.federation_provider().compute_context())
     }
 
-    fn optimizer(&self) -> Option<Arc<Optimizer>> {
+    fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         self.read_provider
             .as_any()
             .downcast_ref::<FederatedTableProviderAdaptor>()
-            .and_then(|a| a.source.federation_provider().optimizer())
+            .and_then(|a| a.source.federation_provider().analyzer(plan))
     }
 }
 

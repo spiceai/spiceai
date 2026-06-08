@@ -739,6 +739,7 @@ impl SnowflakeTableFactory {
                 &pool,
                 Arc::clone(&schema),
                 table_reference_for_provider.clone(),
+                None,
             )
             .with_dialect(Arc::clone(&dialect)),
         );

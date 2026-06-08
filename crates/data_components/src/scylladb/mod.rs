@@ -204,7 +204,7 @@ impl Read for ScyllaDbTableFactory {
             .context(UnableToFetchTableSchemaSnafu)?;
 
         // Create the base SqlTable with CQL dialect
-        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone())
+        let base_table = SqlTable::new("scylladb", &pool, table_reference.clone(), None)
             .await
             .context(UnableToConstructSQLTableSnafu)?
             .with_dialect(Arc::new(CqlDialect::new()));
