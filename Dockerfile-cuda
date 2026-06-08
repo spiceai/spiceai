@@ -1,7 +1,7 @@
 #syntax=docker/dockerfile:1.2
 ARG RUST_VERSION=1.94.1
 
-FROM nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:13.3.0-cudnn-devel-ubuntu24.04 AS build
 
 # cache mounts below may already exist and owned by root
 USER root
@@ -45,7 +45,7 @@ RUN \
     cargo build --release --features ${CARGO_FEATURES:-default} && \
     cp /build/target/release/spiced /root/spiced
 
-FROM nvidia/cuda:13.2.1-cudnn-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS runtime
 ENV CUDA_NVCC_FLAGS=-fPIE
 ARG CARGO_FEATURES
 

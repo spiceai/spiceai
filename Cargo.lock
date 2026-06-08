@@ -1568,10 +1568,11 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.114.0"
+version = "1.115.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af371ac7d45e005e4e944738d2744cdcef86c0662f38d6f9df3ba69826ab6e62"
+checksum = "715fd8729709daa491b2d4aeed33e576d76031c164ad34b65062ea585d97ad5e"
 dependencies = [
+ "arc-swap",
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
@@ -1642,10 +1643,11 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.148.0"
+version = "1.149.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "508842e39aaeb0a076ce000a240033fb7576d3a128f2c6e4fbc1a92372ea10fa"
+checksum = "074cd1198f7b138cf75b9b9e13c44bf2777e05a9acd1f895c7021fc8bfb17474"
 dependencies = [
+ "arc-swap",
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
