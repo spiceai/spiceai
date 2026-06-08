@@ -295,7 +295,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 spice-cloud-client = { path = "crates/spice-cloud-client" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "a9828507d5954c8a854c1dc1514ac5b9ba7c2f97" } # spiceai-58 + ObjectStoreExt import fix (PR #9); re-pin to spiceai-58 tip once merged
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "94bd751f86872321e90d6f9be0c890b98a480cbb" } # spiceai-58 (PR #9 merged: arrow 58 + object_store 0.13 + ObjectStoreExt)
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }

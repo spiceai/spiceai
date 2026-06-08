@@ -169,11 +169,7 @@ where
         let odbc_schema = arrow_schema_from(&mut prepared, None, false)
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchema { source: e })?;
-        let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema).map_err(|e| {
-            dbconnection::Error::UnableToGetSchema {
-                source: e.to_string().into(),
-            }
-        })?);
+        let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema));
 
         Ok(schema)
     }
@@ -218,7 +214,7 @@ where
 
             let mut prepared = cxn.prepare(&sql)?;
             let odbc_schema = Arc::new(arrow_schema_from(&mut prepared, None, false)?);
-            let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema)?);
+            let schema = Arc::new(odbc_schema_to_arrow(&odbc_schema));
             blocking_channel_send(&schema_tx, Arc::clone(&schema))?;
 
             let mut statement = prepared.into_handle();
@@ -292,7 +288,7 @@ where
                     .into());
                 }
                 let batch = batch.context(ODBCArrowReadSnafu)?;
-                blocking_channel_send(&batch_tx, odbc_record_batch_to_arrow(&batch)?)?;
+                blocking_channel_send(&batch_tx, odbc_record_batch_to_arrow(&batch))?;
             }
             if !cloned_token.is_cancelled() {
                 cloned_token.cancel();
@@ -423,16 +419,16 @@ fn build_odbc_reader<C: Cursor>(
 // arrow-odbc is built against the workspace Arrow (its `arrow` dep resolves to the
 // patched workspace Arrow), so its schema type is already the workspace `Schema` —
 // no conversion (previously an Arrow-57 -> 58 IPC round-trip) is needed.
-fn odbc_schema_to_arrow(schema: &arrow_odbc::arrow::datatypes::Schema) -> Result<Schema, Error> {
-    Ok(schema.clone())
+fn odbc_schema_to_arrow(schema: &arrow_odbc::arrow::datatypes::Schema) -> Schema {
+    schema.clone()
 }
 
 // arrow-odbc record batches are already workspace Arrow batches (Arrow clones are
 // shallow Arc bumps), so we pass them through directly.
 fn odbc_record_batch_to_arrow(
     record_batch: &arrow_odbc::arrow::record_batch::RecordBatch,
-) -> Result<RecordBatch, Error> {
-    Ok(record_batch.clone())
+) -> RecordBatch {
+    record_batch.clone()
 }
 
 /// Extracts diagnostic error messages from an ODBC handle after a failed call.
