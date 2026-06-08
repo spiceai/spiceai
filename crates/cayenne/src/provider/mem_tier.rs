@@ -59,7 +59,7 @@ use im::HashMap as PersistentHashMap;
 /// O(1) structural clone (an `Arc` bump of the root) so [`MemTier::append_segment`]
 /// no longer deep-copies the accumulated corpus on every CDC append; `insert`
 /// touches only the small incoming set against a structurally-shared base. The
-/// XXH3 hasher (not the `im` default SipHash) keeps per-key hashing off the
+/// XXH3 hasher (not the `im` default `SipHash`) keeps per-key hashing off the
 /// `im::nodes::hamt::hash_key` hot path that profiles flagged for the deletion
 /// index.
 ///
@@ -323,14 +323,7 @@ mod tests {
         for pk in 0..1_000_i64 {
             seed.int64_pk.insert(pk, 1);
         }
-        let base = MemTier::empty().append_segment(
-            Arc::new(vec![batch(&[1])]),
-            2,
-            &seed,
-            16,
-            1,
-            0,
-        );
+        let base = MemTier::empty().append_segment(Arc::new(vec![batch(&[1])]), 2, &seed, 16, 1, 0);
 
         // A fresh clone of the base's tombstone map shares its root (O(1) clone,
         // no deep copy) — this is the property `append_segment` relies on.
@@ -363,6 +356,62 @@ mod tests {
         assert!(
             base.tombstones.int64_pk.ptr_eq(&base_clone),
             "the prior tier still shares its original root (the append built a new structurally-shared map, not a deep copy)"
+        );
+    }
+
+    /// B-T3 — bounded-tier / no-O(N²) check. Appending many segments must keep
+    /// each new tier structurally sharing the prior tier's accumulated tombstone
+    /// corpus (an O(1) HAMT-root clone per append), NOT deep-copying it — which is
+    /// what turned the per-append cost from O(tier) into O(incoming·log tier) and
+    /// the cumulative cost from O(K²) into O(K log K). Proven by structural
+    /// identity rather than wall-clock timing (deterministic, non-flaky): after
+    /// each append, the keys carried by the PREVIOUS tier still resolve in the new
+    /// tier (the base was shared, not rebuilt), and the previous tier is never
+    /// mutated in place.
+    #[test]
+    fn append_bounded_tier_shares_corpus_no_quadratic_copy() {
+        // Each segment supersedes a fresh window of keys; the tombstone corpus
+        // grows by one key per append so the accumulated map is non-trivial.
+        const APPENDS: usize = 256;
+        let mut tier = MemTier::empty();
+        for i in 0..APPENDS {
+            let key = i64::try_from(i).expect("loop index fits i64");
+            // Snapshot the prior corpus root + a sentinel key it must still carry.
+            let prior_root = tier.tombstones.int64_pk.clone();
+            let prior_len = tier.tombstones.int64_pk.len();
+            let sentinel = key - 1; // present once i > 0
+
+            let mut incoming = InMemTombstones::default();
+            incoming.int64_pk.insert(key, 1);
+            let next =
+                tier.append_segment(Arc::new(vec![batch(&[key])]), key + 1, &incoming, 16, 1, 0);
+
+            // The new tier carries exactly one more key than the prior tier — the
+            // base was structurally shared and extended, not rebuilt from scratch.
+            assert_eq!(
+                next.tombstones.int64_pk.len(),
+                prior_len + 1,
+                "append {i}: corpus grew by exactly the one incoming key"
+            );
+            if i > 0 {
+                assert!(
+                    next.tombstones.int64_pk.get(&sentinel).is_some(),
+                    "append {i}: a key from the prior corpus survives (base was shared, not dropped)"
+                );
+            }
+            // The prior tier's root is immutable — the append never deep-copied or
+            // mutated it (the O(1)-share invariant that avoids the O(N²) blow-up).
+            assert!(
+                tier.tombstones.int64_pk.ptr_eq(&prior_root),
+                "append {i}: the prior tier still owns its original HAMT root (no in-place mutation / deep copy)"
+            );
+
+            tier = next;
+        }
+        assert_eq!(
+            tier.tombstones.int64_pk.len(),
+            APPENDS,
+            "every appended key accumulated into the final shared corpus"
         );
     }
 

@@ -1003,7 +1003,8 @@ mod tests {
             "an empty config must inherit the non-zero age cap via serde default"
         );
         assert_eq!(
-            from_empty.cdc_mem_tier_checkpoint_interval_ms, config.cdc_mem_tier_checkpoint_interval_ms,
+            from_empty.cdc_mem_tier_checkpoint_interval_ms,
+            config.cdc_mem_tier_checkpoint_interval_ms,
             "an empty config must inherit the non-zero checkpoint interval via serde default"
         );
     }

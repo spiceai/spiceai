@@ -4086,7 +4086,7 @@ impl CayenneTableProvider {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let id = name.to_string_lossy();
-            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
             if is_dir && self.staging_append_is_inflight(&id) {
                 kept_any = true;
                 continue;
@@ -4314,7 +4314,7 @@ impl CayenneTableProvider {
             let file_name_str = file_name.to_str()?;
             let metadata = tokio::fs::metadata(target_dir.join(file_name)).await.ok()?;
             metas.push(ObjectMeta {
-                location: prefix.child(file_name_str),
+                location: prefix.clone().join(file_name_str),
                 last_modified: metadata.modified().map_or_else(
                     |_| chrono::Utc::now(),
                     chrono::DateTime::<chrono::Utc>::from,
@@ -4408,7 +4408,7 @@ impl CayenneTableProvider {
                 ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
             if let Some(prefix) = &cache_prefix {
                 moved_metas.push(ObjectMeta {
-                    location: prefix.child(relative),
+                    location: prefix.clone().join(relative),
                     last_modified: meta.last_modified,
                     size: meta.size,
                     e_tag: None,
@@ -15521,6 +15521,7 @@ impl CayenneTableProvider {
     /// tables (which are never `is_cdc_memory_mode()`).
     ///
     /// Returns `true` if a task was spawned by this call, `false` otherwise.
+    #[must_use]
     pub fn spawn_background_mem_tier_checkpoint(self: &Arc<Self>) -> bool {
         if self.background_mem_tier_checkpointer.get().is_some() {
             return false;
@@ -17434,13 +17435,8 @@ mod tests {
     #[tokio::test]
     async fn mem_tier_periodic_tick_is_noop_when_unarmed() {
         let runtime_env = SessionContext::new().runtime_env();
-        let (provider, _tmp) = create_memory_mode_table_with_caps(
-            "unarmed_periodic",
-            runtime_env,
-            i64::MAX,
-            0,
-        )
-        .await;
+        let (provider, _tmp) =
+            create_memory_mode_table_with_caps("unarmed_periodic", runtime_env, i64::MAX, 0).await;
         assert!(provider.is_cdc_memory_mode(), "memory mode active");
         assert!(!provider.has_slot_advancer(), "not armed");
         // Must not panic and must leave the (empty) tier untouched.
@@ -17491,7 +17487,12 @@ mod tests {
             "first batch is under the byte cap"
         );
         provider
-            .append_to_mem_tier(vec![int64_id_batch(&[1, 2, 3])], &no_deletions, one_batch_bytes, 0)
+            .append_to_mem_tier(
+                vec![int64_id_batch(&[1, 2, 3])],
+                &no_deletions,
+                one_batch_bytes,
+                0,
+            )
             .await
             .expect("append epoch 1");
         // A second batch's would-be cumulative size crosses the cap.
@@ -17514,6 +17515,10 @@ mod tests {
     /// the next write (even though the byte cap is generous), forcing a spill on a
     /// slow-trickle table.
     #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the no-op SlotAdvancer is defined inline next to its single use"
+    )]
     async fn mem_tier_write_path_age_cap_fires() {
         let runtime_env = SessionContext::new().runtime_env();
         // Generous byte cap, tiny age cap.
@@ -22187,14 +22192,14 @@ mod tests {
             .expect("list-files cache present");
 
         // Seed an existing listing with one file.
-        let existing_loc = prefix.child("part-0.vortex");
+        let existing_loc = prefix.clone().join("part-0.vortex");
         cache.put(
             &key,
             CachedFileList::new(vec![test_object_meta(existing_loc.as_ref(), 100)]),
         );
 
         // Delta-apply two new files, one of which duplicates the existing one.
-        let new_a = prefix.child("part-1.vortex");
+        let new_a = prefix.join("part-1.vortex");
         let additions = vec![
             test_object_meta(new_a.as_ref(), 200),
             test_object_meta(existing_loc.as_ref(), 100), // duplicate location
@@ -22234,7 +22239,7 @@ mod tests {
             path: prefix.clone(),
         };
 
-        let new_a = prefix.child("part-0.vortex");
+        let new_a = prefix.join("part-0.vortex");
         let additions = vec![test_object_meta(new_a.as_ref(), 200)];
         let applied =
             CayenneTableProvider::apply_list_files_cache_additions(&runtime_env, url, &additions);
@@ -22279,7 +22284,7 @@ mod tests {
 
     impl StatsOverrideExec {
         fn new(inner: Arc<dyn ExecutionPlan>, stats: Statistics) -> Self {
-            let properties = inner.properties().clone();
+            let properties = Arc::clone(inner.properties());
             Self {
                 inner,
                 stats,
