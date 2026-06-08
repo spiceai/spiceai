@@ -39,7 +39,7 @@ case "${1:-}" in -h|--help) sed -n '2,40p' "$0"; exit 0;; esac
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT" || exit 2
 
-SF="${SF:-200}"
+SF="${SF:-5}"
 DURATION="${DURATION:-300}"
 READY="${READY:-2400}"
 TERMINALS="${TERMINALS:-}"      # OLTP terminals; empty = testoperator default (SF*10)
@@ -125,8 +125,8 @@ SPICED_LOG="$SPICED_LOG" "$TESTOP" run htap \
   --ready-wait "$READY" --duration "$DURATION" \
   ${TERMINALS:+--terminals "$TERMINALS"} \
   ${CONCURRENCY:+--concurrency "$CONCURRENCY"} \
-  --disable-progress-bars --scrape-spiced-metrics > "$LOG" 2>&1
-testop_exit=$?
+  --disable-progress-bars --scrape-spiced-metrics 2>&1 | tee "$LOG"
+testop_exit=${PIPESTATUS[0]}
 echo "TESTOP_EXIT=$testop_exit"
 kill "$CPU_PID" "$QLAT_PID" ${OLTP_PID:+$OLTP_PID} 2>/dev/null
 

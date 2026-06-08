@@ -776,7 +776,78 @@ impl RefreshTask {
             let recv_start = Instant::now();
             let next_item = match carried_item.take() {
                 Some(item) => Some(item),
-                None => rx.recv().await,
+                // While waiting for the next source item, also drive any deferred
+                // Stage-B finalize from the previous durable burst to completion.
+                // The finalize task runs on its own, but its post-finalize side
+                // effects (dataset-ready signal, cache invalidation, and the
+                // source-offset commit of the finalized burst's committers) are
+                // otherwise only applied on the NEXT burst or at end-of-stream. On
+                // an idle source — e.g. between the initial snapshot and the first
+                // live change in an HTAP workload — that next burst never comes, so
+                // without draining the finalize here the dataset would never report
+                // ready and the source slot would never advance. `biased` polls the
+                // source first, so a busy stream always prefers progress on new data
+                // and keeps the finalize pipelined (joined by the next write); only
+                // a genuinely idle wait drains the finalize early.
+                None => loop {
+                    let Some(mut pending) = pending_finalize.take() else {
+                        break rx.recv().await;
+                    };
+                    tokio::select! {
+                        biased;
+                        item = rx.recv() => {
+                            // Source produced an item first: keep the finalize
+                            // deferred (the upcoming write path joins it) and
+                            // process the item, preserving Stage-A/Stage-B overlap.
+                            pending_finalize = Some(pending);
+                            break item;
+                        }
+                        join_result = &mut pending.finalize => {
+                            let finalize_error = classify_finalize_result(
+                                join_result,
+                                &dataset_name,
+                                self.runtime_status.is_shutdown(),
+                            );
+                            if let Some(error_message) = finalize_error {
+                                self.set_refresh_status(
+                                    sql.as_deref(),
+                                    status::ComponentStatus::error_with_message(error_message),
+                                )
+                                .await;
+                                rx.close();
+                                reader_handle.abort();
+                                break None;
+                            }
+                            let mut context = ApplyContext {
+                                refresh_sql: sql.as_deref(),
+                                dataset_name: &dataset_name,
+                                caching: caching.as_ref(),
+                                ready_sender: ready_sender.as_ref(),
+                                initial_load_completed: &initial_load_completed,
+                                write_ctx: &write_ctx,
+                                write_session_state: &write_session_state,
+                                commit_timeout: cdc_cfg.commit_timeout,
+                                pending_finalize: &mut pending_finalize,
+                                pending_commit: &mut pending_commit,
+                                deferred_commits: deferred_commits.as_ref(),
+                            };
+                            if !self
+                                .run_finalize_side_effects(
+                                    &mut context,
+                                    pending.committers,
+                                    pending.ready_after_finalize,
+                                )
+                                .await
+                            {
+                                rx.close();
+                                reader_handle.abort();
+                                break None;
+                            }
+                            // Finalize drained (pending_finalize is now None);
+                            // loop back to wait for the next item without it.
+                        }
+                    }
+                },
             };
             metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), &recv_wait_labels);
             let Some(first) = next_item else {
@@ -913,73 +984,25 @@ impl RefreshTask {
                 )
                 .await;
             } else {
-                if pending.ready_after_finalize {
-                    initial_load_completed.store(true, Ordering::Relaxed);
-                    if let Some(sender) = ready_sender.as_ref() {
-                        sender.notify_waiters();
-                    }
-                    self.update_component_status(status::ComponentStatus::Ready)
-                        .await;
-                }
-
-                if let Some(cache_provider_ref) = caching.as_ref()
-                    && let Some(cache_provider) = cache_provider_ref.upgrade()
-                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
-                    && !self.runtime_status.is_shutdown()
-                {
-                    tracing::error!(
-                        "Failed to invalidate cached results for dataset {dataset_name}: {e}"
-                    );
-                }
-
-                if !pending.committers.is_empty() {
-                    let mut previous_commit_failed = false;
-                    if let Some(prev) = pending_commit.take()
-                        && let Some(error_message) = join_pending_commit(
-                            prev,
-                            &dataset_name,
-                            self.runtime_status.is_shutdown(),
-                            cdc_cfg.commit_timeout,
-                        )
-                        .await
-                    {
-                        self.set_refresh_status(
-                            sql.as_deref(),
-                            status::ComponentStatus::error_with_message(error_message),
-                        )
-                        .await;
-                        previous_commit_failed = true;
-                    }
-
-                    if !previous_commit_failed {
-                        #[cfg(not(windows))]
-                        if let Some(queue) = deferred_commits.as_ref()
-                            && let Some(cayenne) = self.cayenne_accelerator()
-                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
-                                cayenne,
-                                queue,
-                                &dataset_name,
-                                &self.runtime_status,
-                            )
-                            .await
-                        {
-                            self.set_refresh_status(
-                                sql.as_deref(),
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            previous_commit_failed = true;
-                        }
-                    }
-
-                    if !previous_commit_failed {
-                        pending_commit = Some(spawn_ordered_commit_task(
-                            pending.committers,
-                            Arc::clone(&self.runtime_status),
-                            dataset_name.clone(),
-                        ));
-                    }
-                }
+                let mut context = ApplyContext {
+                    refresh_sql: sql.as_deref(),
+                    dataset_name: &dataset_name,
+                    caching: caching.as_ref(),
+                    ready_sender: ready_sender.as_ref(),
+                    initial_load_completed: &initial_load_completed,
+                    write_ctx: &write_ctx,
+                    write_session_state: &write_session_state,
+                    commit_timeout: cdc_cfg.commit_timeout,
+                    pending_finalize: &mut pending_finalize,
+                    pending_commit: &mut pending_commit,
+                    deferred_commits: deferred_commits.as_ref(),
+                };
+                self.run_finalize_side_effects(
+                    &mut context,
+                    pending.committers,
+                    pending.ready_after_finalize,
+                )
+                .await;
             }
         }
 
@@ -1108,6 +1131,95 @@ impl RefreshTask {
         true
     }
 
+    /// Run the post-finalize side effects for a deferred Stage-B finalize that
+    /// has already completed successfully: signal dataset readiness (when this
+    /// burst carried the initial-load marker), invalidate cached query results,
+    /// and hand the burst's now-durable source committers to the ordered
+    /// background commit chain so the source offset/slot advances.
+    ///
+    /// Shared by every site that drains a [`PendingFinalizeCommit`]: the next
+    /// burst's write path, the idle-source race at the top of the apply loop,
+    /// and the end-of-stream drain. The caller is responsible for joining the
+    /// finalize task itself (and surfacing any finalize error) before calling
+    /// this; here the finalize is known to have succeeded. Returns `false` when
+    /// a fatal commit error was surfaced and the stream should stop.
+    async fn run_finalize_side_effects(
+        &self,
+        context: &mut ApplyContext<'_>,
+        committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+        ready_after_finalize: bool,
+    ) -> bool {
+        if ready_after_finalize {
+            context
+                .initial_load_completed
+                .store(true, Ordering::Relaxed);
+            if let Some(sender) = context.ready_sender {
+                sender.notify_waiters();
+            }
+            self.update_component_status(status::ComponentStatus::Ready)
+                .await;
+        }
+
+        if let Some(cache_provider_ref) = context.caching
+            && let Some(cache_provider) = cache_provider_ref.upgrade()
+            && let Err(e) = cache_provider.invalidate_for_table(context.dataset_name.clone())
+            && !self.runtime_status.is_shutdown()
+        {
+            tracing::error!(
+                "Failed to invalidate cached results for dataset {}: {e}",
+                context.dataset_name
+            );
+        }
+
+        if !committers.is_empty() {
+            #[cfg(not(windows))]
+            if let Some(queue) = context.deferred_commits
+                && let Some(cayenne) = self.cayenne_accelerator()
+                && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
+                    cayenne,
+                    queue,
+                    context.dataset_name,
+                    &self.runtime_status,
+                )
+                .await
+            {
+                self.set_refresh_status(
+                    context.refresh_sql,
+                    status::ComponentStatus::error_with_message(error_message),
+                )
+                .await;
+                return false;
+            }
+
+            if let Some(previous_commit) = context.pending_commit.take() {
+                let commit_wait_start = Instant::now();
+                if let Some(error_message) = join_pending_commit(
+                    previous_commit,
+                    context.dataset_name,
+                    self.runtime_status.is_shutdown(),
+                    context.commit_timeout,
+                )
+                .await
+                {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+                record_cdc_fixed_cost(context.dataset_name, "commit_wait", commit_wait_start);
+            }
+
+            *context.pending_commit = Some(spawn_ordered_commit_task(
+                committers,
+                Arc::clone(&self.runtime_status),
+                context.dataset_name.clone(),
+            ));
+        }
+        true
+    }
+
     /// Apply a contiguous run of successful envelopes as a single coalesced
     /// write, then append their commits to the ordered background commit chain.
     async fn apply_envelope_run(
@@ -1231,78 +1343,15 @@ impl RefreshTask {
                     }
                     record_cdc_fixed_cost(context.dataset_name, "finalize_wait", finalize_start);
 
-                    if previous_pending.ready_after_finalize {
-                        context
-                            .initial_load_completed
-                            .store(true, Ordering::Relaxed);
-                        if let Some(sender) = context.ready_sender {
-                            sender.notify_waiters();
-                        }
-                        self.update_component_status(status::ComponentStatus::Ready)
-                            .await;
-                    }
-
-                    if let Some(cache_provider_ref) = context.caching
-                        && let Some(cache_provider) = cache_provider_ref.upgrade()
-                        && let Err(e) =
-                            cache_provider.invalidate_for_table(context.dataset_name.clone())
-                        && !self.runtime_status.is_shutdown()
-                    {
-                        tracing::error!(
-                            "Failed to invalidate cached results for dataset {}: {e}",
-                            context.dataset_name
-                        );
-                    }
-
-                    if !previous_pending.committers.is_empty() {
-                        #[cfg(not(windows))]
-                        if let Some(queue) = context.deferred_commits
-                            && let Some(cayenne) = self.cayenne_accelerator()
-                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
-                                cayenne,
-                                queue,
-                                context.dataset_name,
-                                &self.runtime_status,
-                            )
-                            .await
-                        {
-                            self.set_refresh_status(
-                                context.refresh_sql,
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            return false;
-                        }
-
-                        if let Some(previous_commit) = context.pending_commit.take() {
-                            let commit_wait_start = Instant::now();
-                            if let Some(error_message) = join_pending_commit(
-                                previous_commit,
-                                context.dataset_name,
-                                self.runtime_status.is_shutdown(),
-                                context.commit_timeout,
-                            )
-                            .await
-                            {
-                                self.set_refresh_status(
-                                    context.refresh_sql,
-                                    status::ComponentStatus::error_with_message(error_message),
-                                )
-                                .await;
-                                return false;
-                            }
-                            record_cdc_fixed_cost(
-                                context.dataset_name,
-                                "commit_wait",
-                                commit_wait_start,
-                            );
-                        }
-
-                        *context.pending_commit = Some(spawn_ordered_commit_task(
+                    if !self
+                        .run_finalize_side_effects(
+                            context,
                             previous_pending.committers,
-                            Arc::clone(&self.runtime_status),
-                            context.dataset_name.clone(),
-                        ));
+                            previous_pending.ready_after_finalize,
+                        )
+                        .await
+                    {
+                        return false;
                     }
                 }
 
@@ -2033,7 +2082,20 @@ async fn join_pending_finalize(
     dataset_name: &TableReference,
     is_shutdown: bool,
 ) -> Option<String> {
-    match handle.await {
+    classify_finalize_result(handle.await, dataset_name, is_shutdown)
+}
+
+/// Classify a resolved CDC finalize join result into an optional error message,
+/// treating shutdown-time failures/cancellations as expected. Split out from
+/// [`join_pending_finalize`] so the idle-source race in the apply loop — which
+/// resolves the finalize [`tokio::task::JoinHandle`] via `select!` rather than
+/// awaiting it directly — can share the exact same classification.
+fn classify_finalize_result(
+    result: std::result::Result<crate::accelerated_table::Result<()>, tokio::task::JoinError>,
+    dataset_name: &TableReference,
+    is_shutdown: bool,
+) -> Option<String> {
+    match result {
         Ok(Ok(())) => None,
         Ok(Err(e)) if is_shutdown => {
             tracing::debug!("CDC apply finalizer for {dataset_name} failed during shutdown: {e}");
