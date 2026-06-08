@@ -1048,6 +1048,31 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
+/// Per-file statistics for one Vortex object in a snapshot directory.
+///
+/// Persisted in `cayenne_snapshot_file_statistics` so listing-time pruning can
+/// reuse footer min/max without re-reading every object on each scan. Rows are
+/// keyed by `(table_id, snapshot_id, file_path)` and invalidated when
+/// `file_size_bytes` no longer matches the object store metadata.
+///
+/// Consumers must treat these values as optimization hints only.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileStatistics {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Snapshot directory the file was listed from (`UUIDv7`)
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` file (as returned by listing)
+    pub file_path: String,
+    /// Cached `ObjectMeta::size` at the time stats were captured
+    pub file_size_bytes: i64,
+    /// Row count from the file footer when stats were captured
+    pub num_rows: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
+    /// and null count)
+    pub statistics_blob: Vec<u8>,
+}
+
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
 /// Stores per-column statistics (min, max, null count) maintained incrementally
