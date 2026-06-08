@@ -17182,6 +17182,7 @@ mod tests {
     /// provider-side half of the gate (`is_cdc_memory_mode() && has_slot_advancer()`
     /// in the CDC write path).
     #[tokio::test]
+    #[expect(clippy::items_after_statements)]
     async fn memory_mode_engages_ram_only_after_slot_advancer_armed() {
         use arrow::datatypes::{DataType, Field, Schema};
 
@@ -18445,6 +18446,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(clippy::items_after_statements)]
     async fn test_mem_tier_upsert_tombstones_cover_inline_and_disk_across_checkpoint() {
         let ctx = SessionContext::new();
         let runtime_env = ctx.runtime_env();
@@ -20481,6 +20483,7 @@ mod tests {
         .expect("order_line overflow batch is valid")
     }
 
+    #[expect(clippy::similar_names)]
     async fn collect_order_line_rows(
         ctx: &SessionContext,
         provider: &CayenneTableProvider,
@@ -20534,7 +20537,7 @@ mod tests {
                 ));
             }
         }
-        rows.sort();
+        rows.sort_unstable();
         rows
     }
 
@@ -20655,6 +20658,7 @@ mod tests {
     /// version visible, and keep SQL `COUNT(*)` in lockstep with the physical
     /// scan count.
     #[tokio::test]
+    #[expect(clippy::items_after_statements)]
     async fn test_order_line_composite_pk_bloom_delivery_upsert_keeps_count_exact() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) =
@@ -20736,6 +20740,7 @@ mod tests {
     /// the inline tombstone must hide every old metastore row once the staged
     /// files are visible.
     #[tokio::test]
+    #[expect(clippy::items_after_statements)]
     async fn test_order_line_metastore_inline_replaced_by_staged_disk_keeps_count_exact() {
         let ctx = SessionContext::new();
         const LINE_COUNT: i64 = 128;

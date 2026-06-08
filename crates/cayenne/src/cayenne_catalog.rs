@@ -5262,7 +5262,7 @@ mod tests {
     /// is read back verbatim (`pk_bytes` + `sequence_number`), a checkpoint
     /// clear (`clear_insert_records`) empties it, and a fresh re-insert lands
     /// again. This exercises the full catalog write→BLOB→read→clear cycle the
-    /// deletion-visibility ordering depends on (insert_seq > delete_seq ⇒ the
+    /// deletion-visibility ordering depends on (`insert_seq` > `delete_seq` ⇒ the
     /// PK is resurrected). Uses a real `now_v7()` `table_id` from `create_table`
     /// so the 16-byte encoding path (not the non-UUID fallback) is taken.
     #[tokio::test]
