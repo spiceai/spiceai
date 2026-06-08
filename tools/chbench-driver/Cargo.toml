@@ -7,9 +7,14 @@ license-file.workspace = true
 publish = false
 
 [dependencies]
+arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+datafusion-table-providers = { workspace = true, features = ["postgres"] }
+futures = { workspace = true }
+governor = { workspace = true, features = ["std"] }
 rand = { workspace = true }
+secrecy = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tokio-postgres = { workspace = true }

@@ -75,6 +75,8 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod delta_encoding;
+pub(crate) mod fsync_tier;
 pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod overwrite;
@@ -87,8 +89,10 @@ pub(crate) mod streaming;
 pub(crate) mod table;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
+pub(crate) mod write_budget;
 
 // Re-export the main type at the module level for convenience
+pub use compaction::{set_compaction_runtime_env, set_compaction_runtime_handle};
 pub use context::CayenneContext;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
@@ -96,6 +100,7 @@ pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
+pub use write_budget::set_global_encode_concurrency;
 
 // Re-export deletion utilities for advanced use cases
 pub use delete::CayenneDeletionSink;

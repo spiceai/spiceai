@@ -290,8 +290,17 @@ impl CayenneTableProvider {
         }
 
         let target_size_bytes = self.target_file_size_bytes();
+        // Overwrite replaces the entire table, so it is large by definition;
+        // shard across the full write concurrency (no size cap on the fan-out).
         let (row_count, _files_written, write_stats_acc) = self
-            .write_to_snapshot(data, target_size_bytes, &new_snapshot_id, target_partitions)
+            .write_to_snapshot(
+                data,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+                None,
+                crate::provider::delta_encoding::WriteClass::Maintenance,
+            )
             .await?;
 
         if !is_s3 {

@@ -26,11 +26,13 @@ use datafusion_table_providers::sql::{
         expr::{self, Engine},
     },
 };
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use std::sync::Arc;
 
 use crate::Read;
+use crate::federation::create_spice_federated_table_provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -60,6 +62,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct ODBCTableFactory<'a> {
     pool: Arc<ODBCDbConnectionPool<'a>>,
     dialect: Option<Arc<dyn Dialect + Send + Sync>>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl<'a> ODBCTableFactory<'a>
@@ -71,7 +74,21 @@ where
         pool: Arc<ODBCDbConnectionPool<'a>>,
         dialect: Option<Arc<dyn Dialect + Send + Sync>>,
     ) -> Self {
-        Self { pool, dialect }
+        Self {
+            pool,
+            dialect,
+            function_support: None,
+        }
+    }
+
+    /// Install the federation function deny-list. Functions on the list (Spice-only
+    /// UDFs such as `json_get_str`) are evaluated locally instead of being pushed
+    /// into the SQL sent through ODBC, where the remote engine would reject the
+    /// unknown function. See issue #10703.
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 }
 
@@ -87,9 +104,14 @@ where
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
 
-        let table = SqlTable::new("odbc", &dyn_pool, table_reference, Some(Engine::ODBC))
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let table = SqlTable::new(
+            "odbc",
+            &dyn_pool,
+            table_reference.clone(),
+            Some(Engine::ODBC),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let table = if let Some(dialect) = &self.dialect {
             table.with_dialect(Arc::clone(dialect))
@@ -97,13 +119,14 @@ where
             table
         };
 
-        let table_provider = Arc::new(table);
-
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let sql_table = Arc::new(table);
+        let schema = sql_table.schema();
+        let table_provider = Arc::new(create_spice_federated_table_provider(
+            sql_table,
+            schema,
+            table_reference,
+            self.function_support.clone(),
+        ));
 
         Ok(table_provider)
     }

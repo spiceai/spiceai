@@ -35,6 +35,7 @@ datafusion-physical-plan = { workspace = true }
 datafusion-table-providers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
+im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
@@ -54,7 +55,11 @@ url = { workspace = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }
 flatbuffers = { workspace = true }
-vortex = { workspace = true }
+# `files` exposes `vortex::file::WriteStrategyBuilder` for the delta-encoding
+# write-strategy overrides (provider/delta_encoding.rs). The feature is already
+# enabled transitively by vortex-datafusion; naming it here keeps cayenne
+# building if that ever changes.
+vortex = { workspace = true, features = ["files"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
@@ -65,6 +70,13 @@ aegis = { version = "0.9.3", default-features = false, features = [
     "std",
     "pure-rust",
 ] }
+
+# Ordering-tier fsync on the staged-commit hot path (provider/fsync_tier.rs):
+# on macOS both std `sync_all` AND `sync_data` are fcntl(F_FULLFSYNC) (~4-5 ms
+# per call, measured), so the plain-fsync ordering tier needs a direct
+# libc::fsync. See the module docs for the durability rationale.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [features]
 default = []
@@ -96,6 +108,10 @@ name = "deletion_strategies"
 [[bench]]
 harness = false
 name = "deletion_index_probe"
+
+[[bench]]
+harness = false
+name = "deletion_index_probe_large"
 
 [[bench]]
 harness = false
@@ -247,6 +263,21 @@ required-features = ["duckdb-bench"]
 
 [[bench]]
 harness = false
+name = "vs_duckdb_memory_budget"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_scan_under_compaction"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_duckdb_cdc_multitable"
+required-features = ["duckdb-bench"]
+
+[[bench]]
+harness = false
 name = "compaction_picker"
 
 [[bench]]
@@ -287,3 +318,11 @@ name = "get_max_delete_sequence_walk"
 [[bench]]
 harness = false
 name = "apply_on_conflict_keys_double_clone"
+
+[[bench]]
+harness = false
+name = "delta_encoding_sweep"
+
+[[bench]]
+harness = false
+name = "scan_under_write_attribution"

@@ -5,3 +5,5 @@ tests:
     scale_factor: 1
     duration: 600
     ready_wait: 60
+    query_overrides: duckdb
+    rate: 10000

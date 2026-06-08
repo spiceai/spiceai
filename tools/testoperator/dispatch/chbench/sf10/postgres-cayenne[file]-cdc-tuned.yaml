@@ -1,7 +1,8 @@
 tests:
   htap:
-    spicepod_path: accelerated/postgres-cayenne[file]-cdc-tuned.yaml
-    runner_type: spiceai-dev-large-runners
+    spicepod_path: accelerated/postgres-cayenne[file]-cdc-tuned-sf10.yaml
+    runner_type: spiceai-dev-xlarge-runners
     scale_factor: 10
     duration: 600
     ready_wait: 300
+    rate: 10000

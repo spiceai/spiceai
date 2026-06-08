@@ -1,19 +1,34 @@
 version: v1
 kind: Spicepod
-name: postgres-cayenne[file]-cdc-tuned
+name: postgres-cayenne[file]-cdc-tuned-sf1000
 
+# Target: xlarge-runner — 64 vCPU / 256 GiB RAM, SSD storage.
+#
+# Key tuning:
+#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384 (runtime max after Lever D
+#     raised CDC_PREFETCH_BUFFER_MAX / CDC_MAX_COALESCED_ENVELOPES_MAX 4096->16384):
+#     larger CDC bursts cut metastore round-trips and keep WAL drain ahead of bursty OLTP.
+#   - target_partitions 64: read-path parallelism matched to vCPU count.
+#   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
+#     upsert tables; reference tables use lighter settings.
 runtime:
   params:
-    cdc_prefetch_buffer: '1024'
-    cdc_max_coalesced_envelopes: '1024'
-    cdc_max_coalesced_bytes: '67108864' # 64 MB
-    cdc_max_coalesce_age_ms: '2000'
+    cdc_prefetch_buffer: '16384'
+    cdc_max_coalesced_envelopes: '16384'
+    cdc_max_coalesced_bytes: '536870912' # 512 MB
+    cdc_max_coalesce_age_ms: '4000'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
-    cayenne_footer_cache_mb: '256'
+    cayenne_footer_cache_mb: '1024'
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
   query:
-    memory_limit: 40GiB
-    target_partitions: 32
+    target_partitions: 64
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
 
 postgres_connection_params: &postgres_params
   pg_host: 127.0.0.1
@@ -46,10 +61,14 @@ datasets:
       params: &accel_high_volume
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/district
-        cayenne_write_concurrency: '16'
-        cayenne_upload_concurrency: '32'
+        cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '1024'
-        cayenne_compaction_trigger_protected_snapshots: '4'
+        cayenne_compaction_trigger_protected_snapshots: '3'
+        # Pinned to 1 GiB (SF-1000 sweep): a small keyset budget keeps the heavy-update
+        # tables (stock, order_line) on the cheap bloom path and hits the <30s lag goal for
+        # all 22 queries. The memory-aware auto-default (total_mem/32 -> ~8 GiB on a 256 GiB
+        # host) is BACKWARDS — it over-sizes the exact keyset and hurts those tables. Pin 1024.
+        cayenne_pk_keyset_cache_mb: '1024'
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
         cayenne_compaction_background_interval_ms: '3000'
@@ -130,7 +149,7 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        cayenne_write_concurrency: '32'
+        cayenne_write_concurrency: '4'
         cayenne_target_file_size_mb: '256'
         cayenne_compaction_trigger_files: '8'
         cayenne_compaction_trigger_snapshot_age_ms: '30000'
@@ -180,8 +199,9 @@ datasets:
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/warehouse
         cayenne_write_concurrency: '4'
-        cayenne_upload_concurrency: '4'
         cayenne_segment_cache_mb: '64'
+        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        cayenne_pk_keyset_cache_mb: '1024'
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh).
@@ -219,8 +239,9 @@ datasets:
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/region
         cayenne_write_concurrency: '2'
-        cayenne_upload_concurrency: '2'
         cayenne_segment_cache_mb: '16'
+        # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
+        cayenne_pk_keyset_cache_mb: '1024'
 
   - from: postgres:nation
     name: nation

@@ -506,34 +506,21 @@ pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
 /// Suggest the closest valid parameter name for a user-typo'd key.
 ///
-/// Compares against the user-facing form of every spec (including prefix where relevant).
-/// Returns `Some(candidate)` only when edit distance is low enough to be useful,
-/// to avoid misleading suggestions for keys that are genuinely unknown.
+/// Compares against the user-facing form of every non-deprecated spec
+/// (including prefix where relevant) using the shared
+/// [`util::levenshtein::closest_match`] helper so the "did you mean" UX is
+/// the same as for runtime tunables and connector names.
 fn closest_param_suggestion(
     all_params: &[ParameterSpec],
     prefix: &str,
     typo: &str,
 ) -> Option<String> {
-    let typo_lower = typo.to_ascii_lowercase();
-    let mut best: Option<(String, usize)> = None;
-    for p in all_params {
-        if p.deprecation_message.is_some() {
-            continue;
-        }
-        let candidate = p.display_name(prefix);
-        let d = util::levenshtein::distance(&typo_lower, &candidate.to_ascii_lowercase());
-        if best.as_ref().is_none_or(|(_, best_d)| d < *best_d) {
-            best = Some((candidate, d));
-        }
-    }
-    let (candidate, distance) = best?;
-    // Bound: at most 1/3 of the longer string (so short typos only match very close names).
-    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
-    if distance <= max_allowed {
-        Some(candidate)
-    } else {
-        None
-    }
+    let candidates: Vec<String> = all_params
+        .iter()
+        .filter(|p| p.deprecation_message.is_none())
+        .map(|p| p.display_name(prefix))
+        .collect();
+    util::levenshtein::closest_match(typo, &candidates)
 }
 
 /// Build the suffix appended to "Missing required parameter: <name>" when a required

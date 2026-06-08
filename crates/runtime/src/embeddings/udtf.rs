@@ -36,7 +36,7 @@ use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
 use datafusion::logical_expr::expr::FieldMetadata;
-use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
     common::Column,
@@ -136,6 +136,43 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         Ok(sig) => sig,
         Err(_) => Signature::variadic_any(Volatility::Stable),
     }
+});
+
+static VECTOR_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
+    doc_section: DocSection::default(),
+    description: "Runs vector search over a configured embedding/vector index.".to_string(),
+    syntax_example: "vector_search(tbl, 'query text'[, column])".to_string(),
+    sql_example: None,
+    arguments: Some(vec![
+        (
+            "tbl".to_string(),
+            "Dataset or table reference with an embedding/vector index.".to_string(),
+        ),
+        ("query".to_string(), "Search query text.".to_string()),
+        (
+            "column".to_string(),
+            "Optional indexed column to search when the dataset has multiple vector indexes."
+                .to_string(),
+        ),
+        (
+            "limit".to_string(),
+            "Optional maximum number of search results.".to_string(),
+        ),
+        (
+            "include_score".to_string(),
+            "Whether to include the search score column; defaults to true.".to_string(),
+        ),
+        (
+            "rank_weight".to_string(),
+            "Optional per-query weighting factor when nested inside rrf().".to_string(),
+        ),
+        (
+            "distance_metric".to_string(),
+            "Optional vector distance metric such as cosine or l2.".to_string(),
+        ),
+    ]),
+    alternative_syntax: None,
+    related_udfs: Some(vec!["rrf".to_string(), "rerank".to_string()]),
 });
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -790,6 +827,10 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
 
     fn signature(&self) -> &Signature {
         &VECTOR_SEARCH_SIGNATURE
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        Some(&*VECTOR_SEARCH_DOCUMENTATION)
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {

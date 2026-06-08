@@ -162,7 +162,7 @@ pub async fn registered_catalog_names() -> Vec<String> {
 /// Closest-match suggestion for an unknown catalog connector name. Reuses the
 /// same scoring/threshold helper as data connectors so behaviour is consistent.
 pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
-    crate::dataconnector::closest_name(name, &registered_catalog_names().await)
+    util::levenshtein::closest_match(name, &registered_catalog_names().await)
 }
 
 pub async fn register_all() {
@@ -272,6 +272,16 @@ pub async fn register_all() {
             oracle::OracleCatalog::new_connector,
             oracle::PREFIX,
             oracle::PARAMETERS,
+        ),
+    );
+
+    #[cfg(all(not(windows), feature = "spicebench"))]
+    registry.insert(
+        cayenne::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            cayenne::CayenneCatalogConnector::new_connector,
+            cayenne::PREFIX,
+            cayenne::PARAMETERS,
         ),
     );
 
@@ -541,6 +551,18 @@ mod tests {
             assert!(
                 guard.contains_key(oracle::PREFIX),
                 "oracle should be registered"
+            );
+            #[cfg(all(not(windows), feature = "spicebench"))]
+            assert!(
+                guard.contains_key(cayenne::PREFIX),
+                "cayenne should be registered"
+            );
+            // Guard against accidental re-registration: by default (without the
+            // `spicebench` feature) the Cayenne catalog connector must NOT be registered.
+            #[cfg(all(not(windows), not(feature = "spicebench")))]
+            assert!(
+                !guard.contains_key(cayenne::PREFIX),
+                "cayenne should not be registered without the spicebench feature"
             );
         }
 

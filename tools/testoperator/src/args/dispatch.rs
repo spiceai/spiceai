@@ -304,6 +304,8 @@ pub enum RunnerType {
     Dev,
     #[serde(rename = "spiceai-dev-large-runners")]
     DevLarge,
+    #[serde(rename = "spiceai-dev-xlarge-runners")]
+    DevXLarge,
 }
 
 /// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator-text-to-sql-tests.yml`.
@@ -438,6 +440,15 @@ pub struct HtapDispatchArgs {
     /// Override the number of OLTP terminals (default: `scale_factor` * 10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminals: Option<usize>,
+    /// Override default number of concurrent analytical query clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u64>,
+    /// Engine-specific query overrides
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_overrides: Option<QueryOverridesArg>,
+    /// Optional target OLTP transaction rate for the OLTP workload (txn/s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
 }
 
 fn default_queryset() -> String {
@@ -683,5 +694,30 @@ tests:
             serialized.get("terminals").is_none(),
             "terminals should be omitted when None"
         );
+    }
+
+    #[test]
+    fn test_xlarge_runner_type_round_trip() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 10
+    duration: 600
+    ready_wait: 300
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.htap[0].runner_type,
+            RunnerType::DevXLarge
+        ));
+
+        // Verify it serializes back to the expected workflow input value
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert_eq!(serialized["runner_type"], "spiceai-dev-xlarge-runners");
     }
 }

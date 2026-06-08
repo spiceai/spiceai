@@ -146,16 +146,25 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         .expect("write_deletion_file function not found in delete/vector_io.rs");
 
     // The deletion-vector writer must sync the FileWriter's inner fd
-    // (`inner.sync_all()?`) — this is the cheap path that uses the open fd
-    // we already have. A previous revision additionally re-opened the file
-    // with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
+    // (`ordering_sync_std(&inner)`) — this is the cheap path that uses the
+    // open fd we already have. A previous revision additionally re-opened the
+    // file with `OpenOptions::new().write(true).open(...)` to fsync it AGAIN,
     // which doubled the per-deletion fsync cost. The reopen must NOT come
     // back without a documented reason.
+    //
+    // Ordering tier (`fsync_tier::ordering_sync_std`), not `sync_all` or
+    // `sync_data`: on macOS BOTH std calls are `fcntl(F_FULLFSYNC)` (~4-5 ms
+    // full drive-cache flush per call, measured), while the helper issues
+    // plain `fsync(2)` (~66 µs) — the same macOS tier as the SQLite
+    // metastore (`synchronous=NORMAL`, no fullfsync pragma) whose commit
+    // makes this file visible, so a full-tier flush here could not raise
+    // end-to-end durability. See `provider/fsync_tier.rs`.
     assert!(
-        body.contains("inner.sync_all()"),
-        "write_deletion_file must call `inner.sync_all()` on the FileWriter's \
-         inner std::fs::File — this is the fsync that ensures the deletion \
-         vector data is durable before we record the path in the catalog."
+        body.contains("ordering_sync_std(&inner)"),
+        "write_deletion_file must call `fsync_tier::ordering_sync_std(&inner)` \
+         on the FileWriter's inner std::fs::File — this is the fsync that \
+         writes the deletion vector data through before we record the path \
+         in the catalog."
     );
 
     let reopened_fsync_pattern =
@@ -164,47 +173,80 @@ fn write_deletion_file_fsyncs_inner_fd_not_a_reopened_fd() {
         !body.contains(reopened_fsync_pattern),
         "write_deletion_file must NOT re-open the deletion vector file and \
          fsync it a second time. That reopen+fsync pattern is redundant work \
-         after `inner.sync_all()` on the writer's inner fd and was previously \
-         a per-deletion regression."
+         after `ordering_sync_std(&inner)` on the writer's inner fd and was \
+         previously a per-deletion regression."
     );
 
-    // Also assert there is at most one `*.sync_all()` call on any file
-    // descriptor for the deletion vector file in this function. The parent
-    // directory fsync (`dir.sync_all()`) is allowed and distinct.
-    let file_sync_all_count = body
+    // Also assert there is exactly one file-level sync call on the deletion
+    // vector file in this function. The parent directory fsync
+    // (`ordering_sync_dir_std(&dir)`) is allowed and distinct.
+    let file_sync_count = body
         .lines()
         .filter(|line| {
             let line = line.trim();
-            // `inner.sync_all()` or `f.sync_all()` style calls on the data file
-            // itself. Match on the bare `sync_all()` suffix while excluding the
-            // parent-dir `dir.sync_all()` line.
-            line.contains(".sync_all()") && !line.contains("dir.sync_all()")
+            line.contains("ordering_sync_std(&inner)")
         })
         .count();
     assert_eq!(
-        file_sync_all_count, 1,
-        "write_deletion_file must call `sync_all()` on the deletion vector \
-         file exactly once (the writer's inner fd). Found {file_sync_all_count} \
-         occurrence(s). Parent-directory fsync via `dir.sync_all()` is allowed \
-         and is filtered out of this count."
+        file_sync_count, 1,
+        "write_deletion_file must sync the deletion vector file exactly once \
+         (the writer's inner fd, via `ordering_sync_std(&inner)`). Found \
+         {file_sync_count} occurrence(s). Parent-directory fsync via \
+         `ordering_sync_dir_std(&dir)` is distinct and not counted here."
+    );
+
+    // Tier guard: no full-tier `sync_all` — and no direct `sync_data`, which
+    // on macOS is ALSO F_FULLFSYNC — may creep back onto this per-deletion
+    // hot path. The ordering tier (`fsync_tier::ordering_sync_std`) is the
+    // documented contract; a full-tier flush re-introduces ~4-5 ms per
+    // deletion vector on macOS for zero end-to-end durability gain (the
+    // catalog commit it protects is SQLite synchronous=NORMAL).
+    assert!(
+        !body.contains(".sync_all()") && !body.contains(".sync_data()"),
+        "write_deletion_file must not call `.sync_all()`/`.sync_data()` \
+         directly (both are F_FULLFSYNC on macOS) — route through \
+         `fsync_tier::ordering_sync_std` and see provider/fsync_tier.rs."
     );
 }
 
 #[test]
-fn write_deletion_file_still_fsyncs_parent_dir() {
+fn deletion_vector_write_parallelizes_files_and_coalesces_dir_sync() {
     // The companion fsync — the parent directory — must still happen, so the
-    // dirent for the new deletion-vector file is durable before the catalog
-    // is updated. This is the load-bearing half of the ACID-Durability fix
-    // that the removed reopen was *replicating*; we want to keep this one.
-    let body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write_deletion_file")
-        .expect("write_deletion_file function not found in delete/vector_io.rs");
-
+    // dirents for new deletion-vector files are durable before the catalog
+    // is updated. It now lives in `DeletionVectorWriter::write`, ONCE per
+    // batch: the per-spec files are written CONCURRENTLY (`try_join_all`,
+    // overlapping their file fsyncs — on EBS this collapses N serialized
+    // ~1 ms barrier round-trips into ~1), and a single deletions/-dir sync
+    // after they all complete flushes every pending dirent at once. Same
+    // durability contract, 1/N the directory barriers.
+    let write_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write")
+        .expect("DeletionVectorWriter::write not found in delete/vector_io.rs");
     assert!(
-        body.contains("dir.sync_all()"),
-        "write_deletion_file must still fsync the parent directory of the \
-         deletion vector file. Without this, a crash after the catalog records \
-         the path can leave the directory entry unwritten — the catalog now \
-         references a file that does not exist on restart."
+        write_body.contains("try_join_all"),
+        "DeletionVectorWriter::write must write the batch's deletion-vector \
+         files concurrently (try_join_all) — serializing them re-introduces \
+         N fsync round-trips per batch on network-attached storage."
+    );
+    // Exactly two dir syncs in `write`: the one-time snapshot-parent sync
+    // (first deletion vector for the snapshot) and the per-batch coalesced
+    // deletions/-dir sync. A third occurrence means a per-file dir sync
+    // crept back in.
+    let dir_sync_count = write_body.matches("ordering_sync_dir_std(&dir)").count();
+    assert_eq!(
+        dir_sync_count, 2,
+        "DeletionVectorWriter::write must contain exactly two directory \
+         syncs (one-time snapshot-parent + per-batch coalesced deletions/ \
+         dir). Found {dir_sync_count}."
+    );
+
+    // And write_deletion_file itself must NOT dir-sync — that would undo the
+    // coalescing by re-adding a barrier per file.
+    let file_body = extract_fn_body(DELETE_VECTOR_IO_SRC, "write_deletion_file")
+        .expect("write_deletion_file function not found in delete/vector_io.rs");
+    assert!(
+        !file_body.contains("ordering_sync_dir_std"),
+        "write_deletion_file must not fsync the parent directory per file — \
+         the caller issues one coalesced deletions/-dir sync per batch."
     );
 }
 
@@ -229,8 +271,9 @@ fn write_staging_wal_local_uses_single_open_write_fsync() {
         .lines()
         .filter(|line| {
             let line = line.trim();
-            line.contains(".sync_all()")
-                && !line.contains("dir.sync_all()")
+            (line.contains(".sync_all()")
+                || line.contains(".sync_data()")
+                || line.contains("ordering_sync_tokio_file("))
                 && !line.contains("staging_dir")
                 && !line.contains("parent")
         })
@@ -238,12 +281,84 @@ fn write_staging_wal_local_uses_single_open_write_fsync() {
 
     assert!(
         file_sync_count <= 1,
-        "write_staging_wal_local must perform at most one file-level sync_all \
+        "write_staging_wal_local must perform at most one file-level sync \
          after writing the WAL content (efficient single open+write+fsync). \
          Found {file_sync_count} file syncs. A redundant reopen+fsync was \
          previously present on the hot ingestion path and has been removed."
     );
+
+    // Tier guard: the WAL marker sync must be the ordering tier
+    // (`fsync_tier::ordering_sync_tokio_file` → plain fsync on macOS,
+    // fdatasync on Linux), never `sync_all`/`sync_data` — BOTH are
+    // F_FULLFSYNC (~4-5 ms per call) on macOS. Losing this marker in a
+    // power-loss window only orphans staging files that
+    // `ensure_no_incomplete_write` audits and discards, and the metastore's
+    // visibility commits (SQLite synchronous=NORMAL) are no stronger — so a
+    // full-tier flush here is pure per-batch latency. See
+    // `provider/fsync_tier.rs` for the measurements.
+    assert!(
+        body.contains("ordering_sync_tokio_file(&file)"),
+        "write_staging_wal_local must sync the WAL marker with the ordering \
+         tier (`fsync_tier::ordering_sync_tokio_file(&file)`)."
+    );
+    assert!(
+        !body.contains(".sync_all()") && !body.contains(".sync_data()"),
+        "write_staging_wal_local must not call `.sync_all()`/`.sync_data()` \
+         directly (both are F_FULLFSYNC on macOS) on the staged-append hot \
+         path — route through fsync_tier and see provider/fsync_tier.rs."
+    );
 }
+
+#[test]
+fn staged_commit_hot_path_uses_ordering_tier_syncs() {
+    // The staged-commit hot path pays one barrier per call site per batch.
+    // On macOS, BOTH std `sync_all` AND `sync_data` map to
+    // `fcntl(F_FULLFSYNC)` — a full drive-cache flush measured at ~4-5 ms per
+    // call — while plain `fsync(2)` (what `fsync_tier::ordering_sync_*`
+    // issues there) is ~66 µs. On Linux the helper is `fdatasync`, still a
+    // device flush.
+    //
+    // Full-tier barriers on this path bought no end-to-end durability: the
+    // SQLite metastore runs `journal_mode=WAL, synchronous=NORMAL` with no
+    // `fullfsync` pragma, so the catalog transaction that makes staged files
+    // visible is itself only plain-fsync durable on macOS (NORMAL does not
+    // even fsync at every commit). A power-loss window that loses
+    // ordering-tier data necessarily also loses the catalog rows referencing
+    // it. Before this contract, a single 2,000-row staged upsert paid 5-7
+    // F_FULLFSYNCs ≈ ~25 ms of pure barrier latency — the dominant fixed cost
+    // of small staged batches (vs_duckdb_upsert_scaling).
+    //
+    // `sync_snapshot_dir` is the shared dir-barrier helper used by the write,
+    // staging-WAL, move/publish, and compaction paths; pin its tier here.
+    let body = extract_fn_body(TABLE_SRC, "sync_snapshot_dir")
+        .expect("sync_snapshot_dir function not found in table.rs");
+    assert!(
+        body.contains("ordering_sync_dir_std(&dir)"),
+        "sync_snapshot_dir must flush directory entries with the ordering \
+         tier (`fsync_tier::ordering_sync_dir_std(&dir)`), not `sync_all` or \
+         `sync_data` (both F_FULLFSYNC on macOS). See the durability-tier \
+         rationale in the function body and provider/fsync_tier.rs."
+    );
+    assert!(
+        !body.contains(".sync_all()") && !body.contains(".sync_data()"),
+        "sync_snapshot_dir must not call `.sync_all()`/`.sync_data()` \
+         directly: every staged CDC batch pays this barrier multiple times, \
+         both are F_FULLFSYNC on macOS, and the metastore's visibility \
+         commits (SQLite synchronous=NORMAL) are no stronger — the full \
+         flush is pure latency with no durability gain."
+    );
+
+    // And the helper itself must implement the macOS ordering tier with a
+    // plain `libc::fsync` (std offers no cheaper-than-F_FULLFSYNC call).
+    assert!(
+        FSYNC_TIER_SRC.contains("libc::fsync"),
+        "provider/fsync_tier.rs must issue plain `libc::fsync` on macOS — \
+         std `sync_all`/`sync_data` are both F_FULLFSYNC there (measured \
+         ~4-5 ms vs ~66 µs for plain fsync)."
+    );
+}
+
+const FSYNC_TIER_SRC: &str = include_str!("../src/provider/fsync_tier.rs");
 
 // -----------------------------------------------------------------------------
 // Devil's Advocate / "Be really sure" analysis (for the recurring /loop task)
@@ -697,68 +812,73 @@ fn partitioned_wal_local_writer_uses_single_open_for_tmp_file() {
 // DeletionIndex incremental-bloom regression tests
 // -----------------------------------------------------------------------------
 //
-// `DeletionIndex::extend_max` is called on every PK-aware upsert/delete to
-// merge new (pk → delete_seq) entries into the cached deletion snapshot.
+// The layered deletion index's shared `extend` core is called on every
+// PK-aware upsert/delete (via `extend_max_deletes` / `extend_max_conflicts`)
+// to merge new (pk → tombstone) entries into the cached deletion snapshot.
 // A previous revision rebuilt the bloom filter from scratch on every call,
 // turning each per-row update into O(N) work where N is the cumulative
 // cache size. The cumulative cost across M writes was O(M·N), the root
 // cause of the ~200% ingestion regression on upsert-heavy workloads with
-// growing deletion sets (fix landed in commit e8abb4cac4).
+// growing deletion sets (fix landed in commit e8abb4cac4; the layered
+// rewrite preserves the same amortization invariants in `extend`).
 
 const DELETION_INDEX_SRC: &str = include_str!("../src/provider/deletion_index.rs");
 
 #[test]
-fn deletion_index_extend_max_tracks_new_keys_for_incremental_bloom() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+fn deletion_index_extend_tracks_new_keys_for_incremental_bloom() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
     assert!(
-        body.contains("new_keys"),
-        "DeletionIndex::extend_max must track newly-inserted keys (typical \
-         pattern: `let mut new_keys: Vec<_> = Vec::new();`) so the bloom \
-         can be updated incrementally for the K new keys instead of being \
-         rebuilt from scratch over all N entries. This turns the per-call \
-         cost from O(N) to O(K) amortized."
+        body.contains("new_delete_hashes"),
+        "the layered index's `extend` must track newly-deleted keys \
+         (`new_delete_hashes`) so the bloom can be updated incrementally \
+         for the K new keys instead of being rebuilt from scratch over all \
+         N entries. This keeps the per-call cost O(K) amortized."
     );
 
     assert!(
-        body.contains("Vacant") && body.contains("Occupied"),
-        "DeletionIndex::extend_max must use explicit `Entry::Occupied` / \
-         `Entry::Vacant` matching so only newly-inserted keys are recorded \
-         for incremental bloom insertion."
+        body.contains("outcome.new_delete"),
+        "`extend` must record a bloom hash only for keys gaining their \
+         first deletion (`outcome.new_delete`) so repeat-deletes of the \
+         same key do not inflate the incremental insert set."
     );
 }
 
 #[test]
-fn deletion_index_extend_max_has_amortized_rebuild_trigger() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+fn deletion_index_extend_has_amortized_rebuild_trigger() {
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
     assert!(
-        body.contains("bloom_capacity.saturating_mul(2)") || body.contains("bloom_capacity * 2"),
-        "DeletionIndex::extend_max must compare the new entry count against \
-         `2 * bloom_capacity` to decide when to rebuild. The doubling \
-         threshold amortizes the rebuild cost to O(K) per call (geometric \
-         series). A tighter threshold would re-introduce the regression; a \
-         looser threshold would leak false-positive budget."
+        body.contains("delete_count > self.bloom_capacity"),
+        "`extend` must rebuild the bloom only when deletion growth has \
+         outpaced the sized capacity (`delete_count > self.bloom_capacity`). \
+         Rebuilding more eagerly re-introduces the O(M·N) regression."
+    );
+
+    assert!(
+        body.contains("bloom_capacity_for"),
+        "`extend` must size the rebuilt bloom via `bloom_capacity_for` \
+         (2x headroom) so the rebuild cadence stays geometric and the \
+         filter never spends long windows saturated."
     );
 }
 
 #[test]
 fn deletion_index_does_not_unconditionally_rebuild_bloom() {
-    let body = extract_fn_body(DELETION_INDEX_SRC, "extend_max")
-        .expect("extend_max function not found in deletion_index.rs");
+    let body = extract_fn_body(DELETION_INDEX_SRC, "extend")
+        .expect("extend function not found in deletion_index.rs");
 
-    // The pre-fix implementation ended every extend_max call with
-    // `Self::from_map(entries)`, which unconditionally walks every entry
-    // to rebuild the bloom. Forbid the bare trailing-rebuild pattern.
-    let regressed_tail = "        Self::from_map(entries)\n    }";
+    // The pre-fix implementation rebuilt the bloom over every entry on every
+    // call. The layered `extend` must keep the full rebuild behind the
+    // capacity guard and otherwise insert only the new hashes in place.
     assert!(
-        !body.contains(regressed_tail),
-        "DeletionIndex::extend_max must NOT end with `Self::from_map(entries)` \
-         as its unconditional tail. That pattern walks every entry to rebuild \
-         the bloom on every call, producing O(N²) cumulative work on upsert \
-         workloads."
+        body.contains("for hash in new_delete_hashes"),
+        "`extend` must have an incremental branch that inserts only the new \
+         deletion hashes into the shared bloom (O(K) work), instead of \
+         walking every entry on every call (O(N²) cumulative on upsert \
+         workloads)."
     );
 }
 

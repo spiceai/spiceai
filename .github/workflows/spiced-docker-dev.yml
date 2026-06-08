@@ -128,9 +128,9 @@ jobs:
         run: |
           variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
           fi
 
       - name: Build ARM64 image
@@ -196,9 +196,9 @@ jobs:
         run: |
           variant="${{ inputs.variant }}"
           if [ "$variant" = "models" ]; then
-            echo "CARGO_FEATURES=release,models" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,models,spicebench" >> $GITHUB_ENV
           else
-            echo "CARGO_FEATURES=release" >> $GITHUB_ENV
+            echo "CARGO_FEATURES=release,spicebench" >> $GITHUB_ENV
           fi
 
       - name: Build AMD64 image

@@ -179,3 +179,23 @@ pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::
         .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });
+
+/// Time the CDC apply loop spent blocked waiting to receive the next batch from
+/// the source-reader channel (i.e. waiting on the replication-slot read + WAL
+/// decode that the reader task performs). This is the discriminator for the
+/// "unaccounted per-batch overhead" gap: a high recv-wait means the apply loop
+/// is *source-bound* (the reader cannot decode/deliver batches fast enough),
+/// while a near-zero recv-wait means the loop is *apply-bound* (the bottleneck
+/// is the accelerator write, e.g. Cayenne's synchronous on-conflict path). Pair
+/// it with `cdc_apply_burst_duration_ms` for full per-batch attribution
+/// (wall-clock ≈ recv-wait + apply-burst).
+pub(crate) static CDC_SOURCE_RECV_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_source_recv_wait_ms")
+        .with_description(
+            "Duration in milliseconds the CDC apply loop waited to receive the next batch from the source-reader channel. High = source-bound (slot read / WAL decode can't keep up); near-zero = apply-bound.",
+        )
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});

@@ -312,8 +312,15 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
+    #[cfg(feature = "postgres-accel")]
     #[snafu(display(
         "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
+    ))]
+    AcceleratorEngineNotAvailable { name: String },
+
+    #[cfg(not(feature = "postgres-accel"))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, and sqlite."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -498,6 +505,10 @@ const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
+const CACHE_MAINTENANCE: &str = "cache_maintenance";
+
+/// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -928,6 +939,28 @@ impl Runtime {
         Ok(())
     }
 
+    /// Periodically drives moka housekeeping so invalidation predicates and
+    /// expired entries are reclaimed even on caches with no `get`/`insert`
+    /// traffic. Returns immediately when no cache is configured; otherwise loops
+    /// until the task is cancelled at shutdown.
+    pub(crate) async fn run_cache_maintenance(self: Arc<Self>) -> Result<()> {
+        let caching = self.datafusion().caching();
+        if caching.results.is_none()
+            && caching.plans.is_none()
+            && caching.search.is_none()
+            && caching.embeddings.is_none()
+        {
+            return Ok(());
+        }
+
+        let mut interval = tokio::time::interval(CACHE_MAINTENANCE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            caching.run_pending_maintenance().await;
+        }
+    }
+
     /// Periodically recompute and rebroadcast this executor's per-table row-count
     /// statistics to all schedulers. `PartitionsLoaded` is otherwise only sent on
     /// initial load / assignment change, so during streaming ETL the coordinator's
@@ -937,6 +970,11 @@ impl Runtime {
     pub(crate) async fn run_executor_statistics_reporter(self: Arc<Self>) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(45));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The statistics source (`local_executor_table_statistics`) reads the
+        // Cayenne metastore aggregate, which is maintained incrementally on the
+        // write path: always-fresh, O(1), and never degrades to a row-count-only
+        // result mid-ingest. So there is no non-degrading cache here — each tick
+        // simply broadcasts the current aggregate.
         loop {
             interval.tick().await;
             let Some(broadcaster) = self.executor_outbound_broadcaster() else {
@@ -972,11 +1010,13 @@ impl Runtime {
                 "Reporting per-executor table statistics to schedulers"
             );
             for table in tables {
-                if let Some((statistics, column_names)) =
+                let table_key = table.to_string();
+                if let Some((stats, column_names)) =
                     crate::cluster::partition::local_executor_table_statistics(&df, &table).await
                 {
+                    let encoded = runtime_cluster::encode_statistics(&stats);
                     broadcaster
-                        .broadcast_executor_statistics(table.to_string(), statistics, column_names)
+                        .broadcast_executor_statistics(table_key, encoded, column_names)
                         .await;
                 }
             }
@@ -1405,6 +1445,16 @@ impl Runtime {
             })
             .await;
 
+        // `None` cancellation token: the loop is aborted at shutdown.
+        let maintenance_self = Arc::clone(&self);
+        let cache_maintenance_future = self
+            .start_runtime_task(
+                CACHE_MAINTENANCE,
+                None,
+                maintenance_self.run_cache_maintenance(),
+            )
+            .await;
+
         // wait for all servers to shut down or if any of the servers fail to start
         if let Some(cluster_future) = maybe_cluster_future {
             return match tokio::try_join!(
@@ -1412,6 +1462,7 @@ impl Runtime {
                 flight_future,
                 metrics_future,
                 pods_watcher_future,
+                cache_maintenance_future,
                 cluster_future,
                 shutdown_signal_future
             ) {
@@ -1425,6 +1476,7 @@ impl Runtime {
             flight_future,
             metrics_future,
             pods_watcher_future,
+            cache_maintenance_future,
             shutdown_signal_future
         ) {
             Err(err) => Err(err),

@@ -29,7 +29,7 @@ limitations under the License.
 
 use arrow_schema::DataType;
 use datafusion::common::exec_err;
-use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signature, Volatility};
 use datafusion::{
     catalog::{TableFunctionImpl, TableProvider},
     common::Column,
@@ -84,6 +84,39 @@ pub static TEXT_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     Signature::user_defined(Volatility::Stable)
         .with_parameter_names(param_names)
         .unwrap_or_else(|_| unreachable!("valid parameter names for text_search"))
+});
+
+static TEXT_SEARCH_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
+    doc_section: DocSection::default(),
+    description: "Runs full-text search over a configured searchable dataset.".to_string(),
+    syntax_example: "text_search(tbl, 'query text'[, column])".to_string(),
+    sql_example: None,
+    arguments: Some(vec![
+        (
+            "tbl".to_string(),
+            "Dataset or table reference with a full-text search index.".to_string(),
+        ),
+        ("query".to_string(), "Search query text.".to_string()),
+        (
+            "column".to_string(),
+            "Optional indexed column to search when the dataset has multiple full-text indexes."
+                .to_string(),
+        ),
+        (
+            "limit".to_string(),
+            "Optional maximum number of search results.".to_string(),
+        ),
+        (
+            "include_score".to_string(),
+            "Whether to include the search score column; defaults to true.".to_string(),
+        ),
+        (
+            "rank_weight".to_string(),
+            "Optional per-query weighting factor when nested inside rrf().".to_string(),
+        ),
+    ]),
+    alternative_syntax: None,
+    related_udfs: Some(vec!["rrf".to_string(), "rerank".to_string()]),
 });
 
 #[derive(Debug, PartialEq, Clone)]
@@ -604,6 +637,10 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
     fn signature(&self) -> &Signature {
         &TEXT_SEARCH_SIGNATURE
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        Some(&*TEXT_SEARCH_DOCUMENTATION)
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {

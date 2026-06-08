@@ -30,7 +30,7 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
-    telemetry::track_query_count(dimensions);
+    telemetry::track_query_count(&without_anonymous_excluded(dimensions));
     QUERY_COUNT.add(1, dimensions);
 }
 

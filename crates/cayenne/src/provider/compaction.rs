@@ -35,10 +35,116 @@ limitations under the License.
 //! periodically invokes the runner. The task is `Semaphore`-gated so a fleet of
 //! tables can't overwhelm the writer pool.
 
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::future::Future;
+use std::sync::{Arc, LazyLock, Weak};
+use std::time::{Duration, Instant};
 
+use datafusion_execution::runtime_env::RuntimeEnv;
+use parking_lot::{Mutex, RwLock};
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
+
+/// Process-wide handle to the dedicated compaction runtime, injected once at
+/// startup by the binary (see `spiced`'s runtime setup). All Cayenne tables in
+/// the process share it.
+///
+/// Compaction — both the size-tiered protected-snapshot merge and the full
+/// snapshot rewrite — is CPU-heavy and runs in the background. Isolating it on
+/// its own runtime keeps it off the query (compute) and CDC (refresh) runtimes
+/// so a rewrite can't steal worker threads from latency-sensitive work. The
+/// runtime is created with low thread priority, so compaction soaks up spare
+/// cores without starving queries or ingest.
+///
+/// Replaceable so test binaries that create and drop multiple runtimes in one
+/// process do not keep spawning onto a handle from an already-dropped runtime.
+/// When unset — unit tests, embedders that don't wire it up, or
+/// `dedicated_thread_pool=disabled` — compaction falls back to [`tokio::spawn`]
+/// on the ambient runtime, preserving prior behavior.
+static COMPACTION_RUNTIME: LazyLock<RwLock<Option<Handle>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Inject the dedicated compaction runtime handle. Called once at process
+/// startup. Later calls replace the previous handle so tests that create a new
+/// runtime after dropping an old one do not retain stale global state.
+pub fn set_compaction_runtime_handle(handle: Handle) {
+    let mut guard = COMPACTION_RUNTIME.write();
+    if guard.is_some() {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            "Replacing compaction runtime handle"
+        );
+    }
+    *guard = Some(handle);
+}
+
+/// Spawn a compaction task onto the dedicated compaction runtime if one has
+/// been injected, otherwise onto the ambient runtime via [`tokio::spawn`].
+///
+/// Returns the [`JoinHandle`] so callers can abort the task (e.g. the
+/// background compactor aborts on drop). [`JoinHandle::abort`] works across
+/// runtimes, so storing and aborting the handle is valid regardless of which
+/// runtime the task landed on.
+pub(crate) fn spawn_compaction<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = COMPACTION_RUNTIME.read().clone();
+    spawn_on(handle.as_ref(), future)
+}
+
+/// Spawn `future` on `handle` if provided, otherwise on the ambient runtime via
+/// [`tokio::spawn`]. Extracted from [`spawn_compaction`] so the routing decision
+/// is unit-testable with a local handle, without setting the process-global
+/// [`COMPACTION_RUNTIME`] (which would pollute sibling tests in the binary).
+fn spawn_on<F>(handle: Option<&Handle>, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match handle {
+        Some(handle) => handle.spawn(future),
+        None => tokio::spawn(future),
+    }
+}
+
+/// Process-wide dedicated compaction memory environment, injected once at
+/// startup by the binary when Cayenne acceleration is configured (and dedicated
+/// thread pools are enabled).
+///
+/// Carries a [`RuntimeEnv`] whose memory pool is a separate budget carved from
+/// `runtime.query.memory_limit` (sized in the runtime's `DataFusion` builder)
+/// while sharing the query environment's object-store registry — so compaction
+/// reads and writes the same stores but accounts its working memory against an
+/// isolated, bounded pool that cannot starve queries.
+///
+/// Replaceable for the same reason as [`COMPACTION_RUNTIME`]: integration tests
+/// can create multiple runtime environments in one process.
+///
+/// When unset (no Cayenne, dedicated pools disabled, unit tests, other
+/// embedders) compaction falls back to the shared query environment via
+/// [`super::context::CayenneContext::runtime_env`], preserving prior behavior.
+static COMPACTION_RUNTIME_ENV: LazyLock<RwLock<Option<Arc<RuntimeEnv>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Inject the dedicated compaction memory environment. Called once at process
+/// startup. Later calls replace the previous environment so tests do not retain
+/// stale global state.
+pub fn set_compaction_runtime_env(env: Arc<RuntimeEnv>) {
+    let mut guard = COMPACTION_RUNTIME_ENV.write();
+    if guard.is_some() {
+        tracing::debug!(
+            target: "cayenne::compaction",
+            "Replacing compaction runtime env"
+        );
+    }
+    *guard = Some(env);
+}
+
+/// The dedicated compaction memory environment, if one was injected.
+pub(crate) fn compaction_runtime_env() -> Option<Arc<RuntimeEnv>> {
+    COMPACTION_RUNTIME_ENV.read().clone()
+}
 
 /// Tier thresholds derived from `target_vortex_file_size_mb`.
 ///
@@ -236,12 +342,23 @@ pub(crate) trait CompactionRunner: Send + Sync {
     fn compaction_target_name(&self) -> &str;
 }
 
+/// Maximum protected-snapshot merge passes a single table runs per wake-up
+/// before yielding back to the interval cadence. Each pass merges one size-tier,
+/// so under backlog this drains up to `MAX_DRAIN_PASSES_PER_WAKE` tiers per tick
+/// (vs. exactly one before), while still bounding how long one table can hold
+/// the compaction runtime away from its peers. Passes stop early as soon as a
+/// table is caught up (`run_compaction_trigger` returns `Ok(false)`).
+const MAX_DRAIN_PASSES_PER_WAKE: usize = 64;
+
 /// Per-table background compactor.
 ///
-/// Owns a tokio task that wakes every `interval`, acquires a permit from the
-/// shared semaphore, and calls `runner.run_compaction_trigger()`. Cancellation
+/// Owns a tokio task that wakes every `interval`, then drains its
+/// protected-snapshot backlog by running up to [`MAX_DRAIN_PASSES_PER_WAKE`]
+/// merge passes — each acquiring a permit from the shared semaphore and calling
+/// `runner.run_compaction_trigger()` — until it is caught up. Cancellation
 /// happens via [`Drop`]: dropping the `BackgroundCompactor` fires the shutdown
-/// `Notify` and aborts the task's `JoinHandle`.
+/// `Notify`, then moves bounded task draining to a detached OS thread so dropping
+/// the provider never blocks a Tokio worker thread.
 ///
 /// The runner is held via `Weak` so the task does not keep the
 /// `CayenneTableProvider` alive past its caller's `Arc` lifetime.
@@ -265,8 +382,11 @@ impl BackgroundCompactor {
         let shutdown = Arc::new(Notify::new());
         let shutdown_task = Arc::clone(&shutdown);
 
-        let handle = tokio::spawn(async move {
-            loop {
+        // Spawn onto the dedicated compaction runtime (low priority, isolated
+        // from the query and refresh runtimes) when one has been injected;
+        // otherwise fall back to the ambient runtime.
+        let handle = spawn_compaction(async move {
+            'wake: loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {}
                     () = shutdown_task.notified() => break,
@@ -277,28 +397,58 @@ impl BackgroundCompactor {
                     break;
                 };
 
-                // Acquire a permit, gating concurrent background compactions
-                // across all tables sharing the semaphore.
-                let Ok(_permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                    // Semaphore closed — provider tree shutting down.
-                    break;
-                };
+                // Drain the protected-snapshot backlog instead of doing a single
+                // tier-merge per tick. Each `run_compaction_trigger` merges only
+                // the lowest size-tier, so one pass per `interval` tops out at
+                // ~one tier every few seconds — far below the ingest rate at high
+                // tpmC, letting the protected set run away (5k+ files at SF-1000)
+                // and read-amp balloon. Keep running passes until one reports
+                // nothing left to merge (`Ok(false)`) or we hit the per-wake cap,
+                // re-acquiring the shared permit each pass so peer tables still
+                // interleave fairly between merges.
+                for _ in 0..MAX_DRAIN_PASSES_PER_WAKE {
+                    // Acquire a permit, gating concurrent background compactions
+                    // across all tables sharing the semaphore. Observe shutdown
+                    // *during* acquisition so a drop fired mid-drain stops the loop
+                    // promptly instead of running up to `MAX_DRAIN_PASSES_PER_WAKE`
+                    // more passes (each a multi-second full-snapshot rewrite at
+                    // scale) before the next outer tick notices. This only gates the
+                    // gap *between* passes: an already in-flight
+                    // `run_compaction_trigger` below is intentionally never
+                    // interrupted, so a pass still drains to completion on drop (see
+                    // `COMPACTOR_SHUTDOWN_DRAIN` and the drain-in-flight test).
+                    let _permit = tokio::select! {
+                        biased;
+                        () = shutdown_task.notified() => break 'wake,
+                        acquired = Arc::clone(&semaphore).acquire_owned() => match acquired {
+                            Ok(permit) => permit,
+                            // Semaphore closed — provider tree shutting down.
+                            Err(_) => break 'wake,
+                        },
+                    };
 
-                match runner.run_compaction_trigger().await {
-                    Ok(true) => {
-                        tracing::debug!(
-                            target: "cayenne::compaction",
-                            table = runner.compaction_target_name(),
-                            "Background compaction pass completed"
-                        );
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "cayenne::compaction",
-                            table = runner.compaction_target_name(),
-                            "Background compaction failed: {e}"
-                        );
+                    match runner.run_compaction_trigger().await {
+                        Ok(true) => {
+                            tracing::debug!(
+                                target: "cayenne::compaction",
+                                table = runner.compaction_target_name(),
+                                "Background compaction pass completed"
+                            );
+                            // Made progress — keep draining. The permit is
+                            // released at the end of this iteration so peers can
+                            // interleave before the next pass re-acquires it.
+                        }
+                        // Caught up (no tier qualifies) — stop draining and wait
+                        // for the next tick rather than spinning on empty passes.
+                        Ok(false) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "cayenne::compaction",
+                                table = runner.compaction_target_name(),
+                                "Background compaction failed: {e}"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -311,17 +461,75 @@ impl BackgroundCompactor {
     }
 }
 
-// Cleanup happens entirely in `Drop`: the shutdown signal is fired and the
-// JoinHandle is aborted. Callers don't need explicit `shutdown` / `join`
-// methods — when the provider's last `Arc` drops, the `OnceLock<BackgroundCompactor>`
-// inside drops too, which runs the impl below.
+/// How long the detached drain thread lets an in-flight compaction finish its
+/// current Vortex write before force-aborting. Bounded so shutdown can never hang.
+///
+/// Sized to outlast a realistic compaction pass: a pass rewrites the whole
+/// current snapshot (see `run_one_compaction_pass` / `rewrite_current_snapshot_for_compaction`),
+/// so its duration scales with table size. At large scale factors that rewrite
+/// can take well over the original 5s, so the abort fired mid-write and vortex-io
+/// panicked ("Runtime dropped task without completing it"). 30s covers a realistic
+/// large-table pass and coincides with the runtime's connection-drain window.
+///
+/// This is a mitigation, not a cure: a pass that still exceeds the window aborts
+/// mid-write and panics on shutdown. The durable fix is incremental (tiered) merge
+/// of the picked candidate files instead of a full-snapshot rewrite, which keeps a
+/// pass short enough to always drain — see the picker's `CompactionCandidate`.
+const COMPACTOR_SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+
+fn drain_and_abort_compactor(handle: &JoinHandle<()>) {
+    // Let an in-flight compaction finish its current write before the
+    // surrounding runtime tears down. vortex-io panics ("Runtime dropped task
+    // without completing it") if a task's runtime is dropped while the task is
+    // still pending, and the sharded encode keeps several such IO tasks in
+    // flight per compaction — so force-aborting mid-write races the runtime
+    // shutdown and panics. Poll `is_finished()` with plain sleeps so this never
+    // depends on the (possibly already-shutting-down) runtime timer and cannot
+    // hang past the deadline.
+    let deadline = Instant::now() + COMPACTOR_SHUTDOWN_DRAIN;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Whether it drained or hit the deadline, ensure the task is gone.
+    handle.abort();
+}
+
+fn spawn_compactor_drain_thread(handle: JoinHandle<()>) {
+    let handle = Arc::new(Mutex::new(Some(handle)));
+    let handle_for_thread = Arc::clone(&handle);
+
+    match std::thread::Builder::new()
+        .name("cayenne-compactor-drain".to_string())
+        .spawn(move || {
+            let Some(handle) = handle_for_thread.lock().take() else {
+                return;
+            };
+            drain_and_abort_compactor(&handle);
+        }) {
+        Ok(join_handle) => drop(join_handle),
+        Err(error) => {
+            if let Some(handle) = handle.lock().take() {
+                handle.abort();
+            }
+            tracing::warn!(target: "cayenne::compaction", "Failed to spawn background compactor drain thread; aborted task immediately: {error}");
+        }
+    }
+}
+
+// Cleanup starts in `Drop`: the shutdown signal is fired, then the current pass
+// is given a bounded window to drain on a detached thread before the
+// `JoinHandle` is aborted. Callers don't need explicit `shutdown` / `join`
+// methods — when the provider's last `Arc` drops, the
+// `OnceLock<BackgroundCompactor>` inside drops too, which runs the impl below.
 
 impl Drop for BackgroundCompactor {
     fn drop(&mut self) {
+        // Signal the loop to stop after its current pass.
         self.shutdown.notify_one();
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        spawn_compactor_drain_thread(handle);
     }
 }
 
@@ -343,6 +551,44 @@ mod tests {
     /// Helper: target file size of 256 MiB, matching the default.
     fn default_cfg() -> CompactionPickerConfig {
         CompactionPickerConfig::new(8, 32, 256 * 1024 * 1024)
+    }
+
+    /// `spawn_on(Some(handle))` runs the task on the provided runtime's worker
+    /// thread — the dedicated-compaction-runtime path. Asserted via the worker
+    /// thread name rather than touching the process-global `COMPACTION_RUNTIME`.
+    #[test]
+    fn spawn_on_uses_provided_handle() {
+        let dedicated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("test-compaction-rt")
+            .enable_all()
+            .build()
+            .expect("build dedicated runtime");
+        let handle = dedicated.handle().clone();
+
+        let thread_name = dedicated.block_on(async move {
+            spawn_on(Some(&handle), async {
+                std::thread::current().name().map(String::from)
+            })
+            .await
+            .expect("spawned task completes")
+        });
+
+        assert_eq!(
+            thread_name.as_deref(),
+            Some("test-compaction-rt"),
+            "task should run on the provided runtime's worker thread"
+        );
+    }
+
+    /// `spawn_on(None)` falls back to the ambient runtime via `tokio::spawn`,
+    /// preserving prior behavior when no dedicated compaction runtime is set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_on_falls_back_to_ambient_runtime() {
+        let value = spawn_on(None, async { 7_u8 })
+            .await
+            .expect("spawned task completes");
+        assert_eq!(value, 7, "fallback path should run and return the value");
     }
 
     #[test]
@@ -552,6 +798,76 @@ mod tests {
         assert!(
             (1..=5).contains(&observed),
             "expected background task to fire between 1 and 5 times, got {observed}"
+        );
+    }
+
+    /// Runner whose compaction takes a beat and records when it *finishes*.
+    struct DrainRunner {
+        name: String,
+        started: Arc<std::sync::atomic::AtomicU32>,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CompactionRunner for DrainRunner {
+        async fn run_compaction_trigger(&self) -> Result<bool, String> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn compaction_target_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    /// Dropping the compactor while a compaction is in flight must let it finish
+    /// (drain) rather than abort it mid-write, while `Drop` itself returns
+    /// promptly from the caller's thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_compactor_drains_in_flight_compaction_on_drop() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let started = Arc::new(AtomicU32::new(0));
+        let completed = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(DrainRunner {
+            name: "drain_test".to_string(),
+            started: Arc::clone(&started),
+            completed: Arc::clone(&completed),
+        });
+        let weak: Weak<dyn CompactionRunner> =
+            Arc::downgrade(&runner) as Weak<dyn CompactionRunner>;
+        let semaphore = Arc::new(Semaphore::new(1));
+        let compactor = BackgroundCompactor::spawn(weak, Duration::from_millis(10), semaphore)
+            .expect("scheduler should spawn with non-zero interval");
+
+        // Wait until a compaction is actually in flight (started, not finished).
+        for _ in 0..400 {
+            if started.load(Ordering::SeqCst) > 0 && !completed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst) > 0 && !completed.load(Ordering::SeqCst),
+            "a compaction should be in flight before we drop the compactor"
+        );
+
+        drop(compactor);
+
+        for _ in 0..400 {
+            if completed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "Drop must drain the in-flight compaction to completion, not abort it mid-write"
         );
     }
 
