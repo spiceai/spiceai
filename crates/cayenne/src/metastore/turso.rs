@@ -651,33 +651,24 @@ impl MetastoreBackend for TursoMetastore {
             loop {
                 match rows.next().await {
                     Ok(Some(row)) => {
-                        let table_id = match row.get_value(0) {
-                            Ok(turso::Value::Text(t)) => t,
-                            _ => {
-                                return Err(CatalogError::Database {
-                                    message: "legacy cayenne_insert_record.table_id is not TEXT"
-                                        .to_string(),
-                                });
-                            }
+                        let Ok(turso::Value::Text(table_id)) = row.get_value(0) else {
+                            return Err(CatalogError::Database {
+                                message: "legacy cayenne_insert_record.table_id is not TEXT"
+                                    .to_string(),
+                            });
                         };
-                        let pk_bytes = match row.get_value(1) {
-                            Ok(turso::Value::Blob(b)) => b,
-                            _ => {
-                                return Err(CatalogError::Database {
-                                    message: "legacy cayenne_insert_record.pk_bytes is not BLOB"
-                                        .to_string(),
-                                });
-                            }
+                        let Ok(turso::Value::Blob(pk_bytes)) = row.get_value(1) else {
+                            return Err(CatalogError::Database {
+                                message: "legacy cayenne_insert_record.pk_bytes is not BLOB"
+                                    .to_string(),
+                            });
                         };
-                        let sequence_number = match row.get_value(2) {
-                            Ok(turso::Value::Integer(i)) => i,
-                            _ => {
-                                return Err(CatalogError::Database {
-                                    message:
-                                        "legacy cayenne_insert_record.sequence_number is not INTEGER"
-                                            .to_string(),
-                                });
-                            }
+                        let Ok(turso::Value::Integer(sequence_number)) = row.get_value(2) else {
+                            return Err(CatalogError::Database {
+                                message:
+                                    "legacy cayenne_insert_record.sequence_number is not INTEGER"
+                                        .to_string(),
+                            });
                         };
                         legacy_rows.push((table_id, pk_bytes, sequence_number));
                     }
