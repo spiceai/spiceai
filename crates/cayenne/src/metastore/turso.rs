@@ -267,6 +267,20 @@ impl TursoMetastore {
     /// `TEXT PRIMARY KEY` (plus a redundant `UNIQUE(table_id, pk_bytes)`) is
     /// dropped (see `init_schema` for the legacy-schema migration).
     ///
+    /// `table_id` stores the 16 raw bytes of the UUID (`BLOB`), not the 36-char
+    /// text — a pure re-encoding (via `cayenne_catalog::insert_record_table_id_value`
+    /// / `metastore::table_id_to_key_bytes`) that cuts the WAL/journal volume of
+    /// hot upsert bursts; see the `SQLite` `INSERT_RECORD_TABLE_DDL` doc for the
+    /// full rationale and correctness contract. The catalog builders bind the
+    /// same `MetastoreValue::Blob` regardless of backend, so this column shape
+    /// must match `SQLite`.
+    ///
+    /// The `cayenne_table(table_id)` foreign key is dropped: under
+    /// `PRAGMA foreign_keys = ON` a `BLOB` child value can never satisfy the
+    /// `TEXT` parent key. The cascade was belt-and-suspenders (the table is
+    /// cleared at every checkpoint/overwrite, `drop_table` deletes it
+    /// explicitly, and `snapshot::import_dataset` now does too).
+    ///
     /// Unlike the `SQLite` backend, this table is NOT declared `WITHOUT ROWID`.
     /// `WITHOUT ROWID` is not currently supported by Turso under the `mvcc`
     /// journal mode that the metastore relies on for `BEGIN CONCURRENT`
@@ -274,10 +288,9 @@ impl TursoMetastore {
     /// supported in MVCC mode").
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            table_id TEXT NOT NULL,
+            table_id BLOB NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, pk_bytes)
         )
     ";
@@ -577,29 +590,39 @@ impl MetastoreBackend for TursoMetastore {
                 })?;
         }
 
-        // Migrate a legacy `cayenne_insert_record` (UUID `insert_record_id` TEXT
-        // PRIMARY KEY + redundant `UNIQUE(table_id, pk_bytes)`) to the composite-PK
-        // schema. The `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing
-        // table untouched, so detect the old layout here and copy its rows
-        // forward. The table is ephemeral (cleared at every checkpoint and
-        // recoverable from the snapshot), but we copy the
-        // (table_id, pk_bytes, sequence_number) rows forward to preserve any
-        // in-flight pre-checkpoint re-insert sequences across the upgrade.
+        // Migrate a legacy `cayenne_insert_record` to the current shape: a
+        // composite PK `(table_id, pk_bytes)` whose `table_id` is the 16 raw
+        // UUID bytes (`BLOB`) and which carries no foreign key (see
+        // `INSERT_RECORD_TABLE_DDL`). Two legacy layouts predate this and both
+        // store `table_id` as `TEXT`: the pre-composite UUID `insert_record_id`
+        // TEXT PK + redundant `UNIQUE(table_id, pk_bytes)`, and the composite-PK
+        // TEXT-`table_id` shape with a `cayenne_table(table_id)` foreign key.
+        // Both are detected by a single check — the declared type of the
+        // `table_id` column is not `BLOB` — and migrated identically: read the
+        // legacy rows out, re-encode each TEXT `table_id` to the raw-bytes key
+        // via `table_id_to_key_bytes` (the same function the write path uses),
+        // recreate the table in the new shape, and re-insert.
+        //
+        // The table is ephemeral (cleared at every checkpoint and recoverable
+        // from the snapshot), but the copy-forward preserves in-flight
+        // pre-checkpoint re-insert sequences across the upgrade at trivial cost.
         let mut ir_cols = conn
             .query("PRAGMA table_info('cayenne_insert_record')", ())
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to read cayenne_insert_record schema for migration: {e}"),
             })?;
-        let mut has_legacy_uuid_column = false;
+        let mut table_id_is_blob = false;
         loop {
             match ir_cols.next().await {
-                // Column name is at index 1 of PRAGMA table_info.
+                // PRAGMA table_info: name at index 1, declared type at index 2.
                 Ok(Some(row)) => {
-                    if let Ok(turso::Value::Text(name)) = row.get_value(1)
-                        && name == "insert_record_id"
+                    if let (Ok(turso::Value::Text(name)), Ok(turso::Value::Text(col_type))) =
+                        (row.get_value(1), row.get_value(2))
+                        && name == "table_id"
+                        && col_type.eq_ignore_ascii_case("BLOB")
                     {
-                        has_legacy_uuid_column = true;
+                        table_id_is_blob = true;
                     }
                 }
                 Ok(None) => break,
@@ -613,28 +636,97 @@ impl MetastoreBackend for TursoMetastore {
             }
         }
         drop(ir_cols);
-        if has_legacy_uuid_column {
+        if !table_id_is_blob {
+            // Read the legacy rows out (TEXT `table_id`) before recreating.
+            let mut legacy_rows: Vec<(String, Vec<u8>, i64)> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record",
+                    (),
+                )
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to read legacy cayenne_insert_record rows: {e}"),
+                })?;
+            loop {
+                match rows.next().await {
+                    Ok(Some(row)) => {
+                        let table_id = match row.get_value(0) {
+                            Ok(turso::Value::Text(t)) => t,
+                            _ => {
+                                return Err(CatalogError::Database {
+                                    message: "legacy cayenne_insert_record.table_id is not TEXT"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let pk_bytes = match row.get_value(1) {
+                            Ok(turso::Value::Blob(b)) => b,
+                            _ => {
+                                return Err(CatalogError::Database {
+                                    message: "legacy cayenne_insert_record.pk_bytes is not BLOB"
+                                        .to_string(),
+                                });
+                            }
+                        };
+                        let sequence_number = match row.get_value(2) {
+                            Ok(turso::Value::Integer(i)) => i,
+                            _ => {
+                                return Err(CatalogError::Database {
+                                    message:
+                                        "legacy cayenne_insert_record.sequence_number is not INTEGER"
+                                            .to_string(),
+                                });
+                            }
+                        };
+                        legacy_rows.push((table_id, pk_bytes, sequence_number));
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(CatalogError::Database {
+                            message: format!(
+                                "Failed to read legacy cayenne_insert_record rows: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+            drop(rows);
+
             // NOTE: not `WITHOUT ROWID` here, intentionally. Turso does not
             // currently support `WITHOUT ROWID` tables under the `mvcc` journal
             // mode this metastore uses for `BEGIN CONCURRENT` (see
             // `INSERT_RECORD_TABLE_DDL`).
             conn.execute_batch(
-                "CREATE TABLE cayenne_insert_record_new (
-                    table_id TEXT NOT NULL,
+                "DROP TABLE cayenne_insert_record;
+                CREATE TABLE cayenne_insert_record (
+                    table_id BLOB NOT NULL,
                     pk_bytes BLOB NOT NULL,
                     sequence_number BIGINT NOT NULL,
-                    FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
                     PRIMARY KEY (table_id, pk_bytes)
-                );
-                INSERT OR REPLACE INTO cayenne_insert_record_new (table_id, pk_bytes, sequence_number)
-                    SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record;
-                DROP TABLE cayenne_insert_record;
-                ALTER TABLE cayenne_insert_record_new RENAME TO cayenne_insert_record;",
+                );",
             )
             .await
             .map_err(|e| CatalogError::Database {
                 message: format!("Failed to migrate cayenne_insert_record to composite PK: {e}"),
             })?;
+
+            for (table_id, pk_bytes, sequence_number) in legacy_rows {
+                let params: Vec<turso::Value> = vec![
+                    turso::Value::Blob(crate::metastore::table_id_to_key_bytes(&table_id)),
+                    turso::Value::Blob(pk_bytes),
+                    turso::Value::Integer(sequence_number),
+                ];
+                conn.execute(
+                    "INSERT OR REPLACE INTO cayenne_insert_record \
+                     (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                    params,
+                )
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to re-insert migrated cayenne_insert_record row: {e}"),
+                })?;
+            }
         }
 
         // Must run AFTER the `published` column migration above: the partial index

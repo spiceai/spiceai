@@ -546,12 +546,32 @@ impl SqliteMetastore {
     /// `TEXT PRIMARY KEY` was never read, filtered, or joined — it added a
     /// second B-tree and a 36-byte text alloc per row for no benefit, so it
     /// is dropped (see `init_schema` for the legacy-schema migration).
+    ///
+    /// `table_id` is stored as the **16 raw bytes of the table's UUID**
+    /// (`BLOB`), not the 36-char hyphenated text. It is the leading field of
+    /// the clustered `WITHOUT ROWID` key and is identical for every row of a
+    /// burst, so the 20-byte/row text→raw-bytes shrink removes ~37% of the WAL
+    /// frames a hot upsert burst writes (it both narrows each cell and packs
+    /// more rows per B-tree leaf). The value is a pure re-encoding of the same
+    /// constant — `cayenne_catalog::table_id_blob` translates the `table_id`
+    /// `&str` once per call at every access path, so the `WHERE table_id = ?`
+    /// prefix scan and the `(table_id, pk_bytes)` upsert conflict target are
+    /// preserved 1:1; the reader (`get_insert_records`) only ever returns
+    /// `pk_bytes` + `sequence_number` and never the key beyond the filter.
+    ///
+    /// The `FOREIGN KEY (table_id) → cayenne_table(table_id)` is intentionally
+    /// **dropped**: under `PRAGMA foreign_keys = ON`, `SQLite` never equates a
+    /// `BLOB` child value to the `TEXT`-affinity parent key, so the FK could
+    /// not be satisfied by the raw-bytes encoding. The cascade it provided was
+    /// belt-and-suspenders — `drop_table` already deletes the insert-records
+    /// explicitly before the parent row, and `metastore::snapshot::import_dataset`
+    /// now clears them explicitly too (it previously leaned on the cascade).
+    /// The table is also fully cleared at every checkpoint/overwrite.
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            table_id TEXT NOT NULL,
+            table_id BLOB NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
             PRIMARY KEY (table_id, pk_bytes)
         ) WITHOUT ROWID
     ";
@@ -822,39 +842,75 @@ impl MetastoreBackend for SqliteMetastore {
                     conn.execute("UPDATE cayenne_inlined_delete SET published = 1", [])?;
                 }
 
-                // Migrate a legacy `cayenne_insert_record` (UUID `insert_record_id`
-                // TEXT PRIMARY KEY + redundant `UNIQUE(table_id, pk_bytes)`) to the
-                // `WITHOUT ROWID` composite-PK schema. The `CREATE TABLE IF NOT
-                // EXISTS` above leaves a pre-existing table untouched, so detect the
-                // old layout here and copy its rows forward into the new shape.
+                // Migrate a legacy `cayenne_insert_record` to the current shape:
+                // a `WITHOUT ROWID` composite PK `(table_id, pk_bytes)` whose
+                // `table_id` is the 16 raw UUID bytes (`BLOB`) and which carries
+                // no foreign key (see `INSERT_RECORD_TABLE_DDL`). Two legacy
+                // layouts predate this and both store `table_id` as `TEXT`:
+                //   (a) the pre-WITHOUT-ROWID UUID `insert_record_id` TEXT PK +
+                //       redundant `UNIQUE(table_id, pk_bytes)`; and
+                //   (b) the WITHOUT-ROWID composite PK with a TEXT `table_id`
+                //       and a `cayenne_table(table_id)` FOREIGN KEY.
+                // Both are detected by a single check — the declared type of the
+                // `table_id` column is not `BLOB` — and migrated identically.
                 //
-                // The table is ephemeral (fully cleared at every checkpoint via
-                // commit_compaction / commit_overwrite, and recoverable from the
-                // snapshot), so dropping it would be safe — but we copy the
-                // (table_id, pk_bytes, sequence_number) rows forward anyway to
-                // preserve any in-flight pre-checkpoint re-insert sequences across
-                // the upgrade at trivial cost. Runs inside the schema-init
-                // transaction so the swap is atomic.
-                let has_legacy_uuid_column = conn
+                // The `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing
+                // table untouched, so we recreate it here in the new shape and
+                // copy its rows forward, re-encoding each TEXT `table_id` to the
+                // raw-bytes key via `table_id_to_key_bytes` (the same function the
+                // write path uses, guaranteeing the migrated key matches what the
+                // reader/upsert produce). The table is ephemeral (cleared at every
+                // checkpoint via commit_compaction / commit_overwrite and
+                // recoverable from the snapshot), so the copy-forward only
+                // preserves in-flight pre-checkpoint re-insert sequences across
+                // the upgrade — but it does so at trivial cost and keeps the
+                // upgrade lossless. Runs inside the schema-init transaction so the
+                // swap is atomic.
+                let table_id_is_blob = conn
                     .prepare("PRAGMA table_info('cayenne_insert_record')")?
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<String>, _>>()?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })?
+                    .collect::<Result<Vec<(String, String)>, _>>()?
                     .iter()
-                    .any(|name| name == "insert_record_id");
-                if has_legacy_uuid_column {
+                    .any(|(name, col_type)| {
+                        name == "table_id" && col_type.eq_ignore_ascii_case("BLOB")
+                    });
+                if !table_id_is_blob {
+                    // Read the legacy rows out (TEXT `table_id`), re-encode the
+                    // `table_id` in Rust, then re-insert into the new BLOB table.
+                    let legacy_rows: Vec<(String, Vec<u8>, i64)> = conn
+                        .prepare(
+                            "SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record",
+                        )?
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+
                     conn.execute_batch(
-                        "CREATE TABLE cayenne_insert_record_new (
-                            table_id TEXT NOT NULL,
+                        "DROP TABLE cayenne_insert_record;
+                        CREATE TABLE cayenne_insert_record (
+                            table_id BLOB NOT NULL,
                             pk_bytes BLOB NOT NULL,
                             sequence_number BIGINT NOT NULL,
-                            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
                             PRIMARY KEY (table_id, pk_bytes)
-                        ) WITHOUT ROWID;
-                        INSERT OR REPLACE INTO cayenne_insert_record_new (table_id, pk_bytes, sequence_number)
-                            SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record;
-                        DROP TABLE cayenne_insert_record;
-                        ALTER TABLE cayenne_insert_record_new RENAME TO cayenne_insert_record;",
+                        ) WITHOUT ROWID;",
                     )?;
+
+                    if !legacy_rows.is_empty() {
+                        let mut stmt = conn.prepare(
+                            "INSERT OR REPLACE INTO cayenne_insert_record \
+                             (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                        )?;
+                        for (table_id_text, pk_bytes, sequence_number) in legacy_rows {
+                            stmt.execute(rusqlite::params![
+                                crate::metastore::table_id_to_key_bytes(&table_id_text),
+                                pk_bytes,
+                                sequence_number,
+                            ])?;
+                        }
+                    }
                 }
 
                 Ok::<_, rusqlite::Error>(())
@@ -1685,6 +1741,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // cycle-11: `cayenne_insert_record` WITHOUT ROWID composite-PK schema.
+    // cycle-12: `table_id` stored as the raw-UUID-bytes BLOB (no FK).
     // ------------------------------------------------------------------
 
     /// Read the ordered column names of a table off a live pooled connection.
@@ -1704,8 +1761,27 @@ mod tests {
             .expect("table_info")
     }
 
+    /// Read the declared type of one column off a live pooled connection.
+    async fn column_type(metastore: &SqliteMetastore, table: &str, column: &str) -> String {
+        let table = table.to_string();
+        let column = column.to_string();
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.conns[0].lock().await;
+        guard
+            .call(move |conn| {
+                conn.query_row(
+                    &format!("SELECT type FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [&column],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .expect("column type")
+    }
+
     /// A fresh `cayenne_insert_record` has exactly the 3 composite-PK columns
-    /// (no `insert_record_id`) and is a `WITHOUT ROWID` table.
+    /// (no `insert_record_id`), is a `WITHOUT ROWID` table, stores `table_id`
+    /// as a `BLOB`, and carries no foreign key.
     #[tokio::test]
     async fn test_insert_record_schema_is_without_rowid_composite_pk() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -1718,6 +1794,33 @@ mod tests {
             cols,
             vec!["table_id", "pk_bytes", "sequence_number"],
             "the never-read insert_record_id UUID column must be gone"
+        );
+
+        // `table_id` is the raw-UUID-bytes BLOB (cycle-12 WAL-volume lever).
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "table_id must be declared BLOB (16 raw UUID bytes, not 36-char text)"
+        );
+
+        // The foreign key was dropped (a BLOB child cannot satisfy the TEXT
+        // parent key under foreign_keys=ON); foreign_key_list must be empty.
+        let fk_count: i64 = {
+            let pool = metastore.pool().await.expect("pool");
+            let g = pool.conns[0].lock().await;
+            g.call(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('cayenne_insert_record')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("fk list")
+        };
+        assert_eq!(
+            fk_count, 0,
+            "cayenne_insert_record must carry no foreign key (BLOB table_id)"
         );
 
         // WITHOUT ROWID tables have no implicit `rowid`; selecting it errors.
@@ -1744,7 +1847,8 @@ mod tests {
 
     /// INSERT OR REPLACE on a duplicate `(table_id, pk_bytes)` updates the
     /// sequence in place and keeps exactly one row (the composite PK is the
-    /// conflict target the catalog relies on).
+    /// conflict target the catalog relies on). The `table_id` is bound as the
+    /// raw-UUID-bytes BLOB, matching the production write path.
     #[tokio::test]
     async fn test_insert_record_duplicate_pk_upserts_sequence() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -1752,15 +1856,10 @@ mod tests {
         let (_dir, metastore) = temp_metastore();
         metastore.init_schema().await.expect("init schema");
 
-        // Parent row so the FK is satisfied.
+        // No FK to satisfy any more, but a realistic UUID table_id is used so
+        // the raw-bytes encoding is exercised.
         let table_id = uuid::Uuid::now_v7().to_string();
-        metastore
-            .execute_batch(&format!(
-                "INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, current_snapshot_id) \
-                 VALUES ('{table_id}', 'dup_pk_t', '/tmp', 1, '{{}}', '[]', '{table_id}')"
-            ))
-            .await
-            .expect("seed parent");
+        let table_id_blob = crate::metastore::table_id_to_key_bytes(&table_id);
 
         for seq in [11_i64, 42] {
             // Second iteration upserts the SAME (table_id, pk_bytes) → REPLACE.
@@ -1768,7 +1867,7 @@ mod tests {
                 .execute(ExecuteParams {
                     sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
                     params: vec![
-                        MetastoreValue::Text(table_id.clone()),
+                        MetastoreValue::Blob(table_id_blob.clone()),
                         MetastoreValue::Blob(b"pk-dup".to_vec()),
                         MetastoreValue::Integer(seq),
                     ],
@@ -1778,13 +1877,13 @@ mod tests {
         }
 
         let (count, seq): (i64, i64) = {
-            let table_id = table_id.clone();
+            let table_id_blob = table_id_blob.clone();
             let pool = metastore.pool().await.expect("pool");
             let g = pool.conns[0].lock().await;
             g.call(move |conn| {
                 conn.query_row(
                     "SELECT COUNT(*), MAX(sequence_number) FROM cayenne_insert_record WHERE table_id = ?1",
-                    [&table_id],
+                    [&table_id_blob],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
             })
@@ -1800,7 +1899,9 @@ mod tests {
 
     /// `DELETE FROM cayenne_insert_record WHERE table_id = ?` (the checkpoint
     /// clear) empties only the target table's rows — still served by the
-    /// leading-prefix of the composite PK.
+    /// leading-prefix of the composite PK with the BLOB `table_id`. Rows seeded
+    /// via a BLOB hex literal (mirroring the `commit_*_in_txn` batch path) and
+    /// a second table's row stays untouched.
     #[tokio::test]
     async fn test_insert_record_checkpoint_clear_by_table_id() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -1809,12 +1910,21 @@ mod tests {
         metastore.init_schema().await.expect("init schema");
 
         let table_id = uuid::Uuid::now_v7().to_string();
+        let other_table_id = uuid::Uuid::now_v7().to_string();
+        let table_id_blob = crate::metastore::table_id_to_key_bytes(&table_id);
+        // Build the `x'..'` BLOB literal of the raw UUID bytes.
+        let blob_lit = |id: &str| {
+            let bytes = crate::metastore::table_id_to_key_bytes(id);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            format!("x'{hex}'")
+        };
+        let tid_lit = blob_lit(&table_id);
+        let other_lit = blob_lit(&other_table_id);
         metastore
             .execute_batch(&format!(
-                "INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, current_snapshot_id) \
-                 VALUES ('{table_id}', 'clear_t', '/tmp', 1, '{{}}', '[]', '{table_id}'); \
-                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ('{table_id}', x'01', 1); \
-                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ('{table_id}', x'02', 2);"
+                "INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({tid_lit}, x'01', 1); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({tid_lit}, x'02', 2); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({other_lit}, x'01', 9);"
             ))
             .await
             .expect("seed rows");
@@ -1822,7 +1932,7 @@ mod tests {
         metastore
             .execute(ExecuteParams {
                 sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
+                params: vec![MetastoreValue::Blob(table_id_blob.clone())],
             })
             .await
             .expect("checkpoint clear");
@@ -1831,7 +1941,7 @@ mod tests {
             .query_row(
                 QueryRowParams {
                     sql: "SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Text(table_id)],
+                    params: vec![MetastoreValue::Blob(table_id_blob)],
                 },
                 |row| row.get_i64(0),
             )
@@ -1841,68 +1951,101 @@ mod tests {
             remaining, 0,
             "checkpoint clear must empty the table's insert records"
         );
+
+        let other_remaining: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Blob(
+                        crate::metastore::table_id_to_key_bytes(&other_table_id),
+                    )],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count other after clear");
+        assert_eq!(
+            other_remaining, 1,
+            "clearing one table_id must not touch another table's insert records"
+        );
     }
 
-    /// A DB created with the legacy schema (UUID `insert_record_id` TEXT PRIMARY
-    /// KEY + redundant `UNIQUE(table_id, pk_bytes)`) and carrying rows is
-    /// migrated by `init_schema` to the `WITHOUT ROWID` composite-PK layout,
-    /// copying the `(table_id, pk_bytes, sequence_number)` rows forward.
-    #[tokio::test]
-    async fn test_insert_record_legacy_schema_migrates_with_rows_present() {
+    /// Drive the legacy→current `cayenne_insert_record` migration for a given
+    /// legacy DDL (which stores `table_id` as TEXT). Asserts the migrated table
+    /// is the BLOB-`table_id` WITHOUT-ROWID composite-PK shape with no FK, and
+    /// that the two seeded rows survive with their `table_id` re-encoded to the
+    /// raw UUID bytes (so the BLOB-keyed reader/clear find them).
+    async fn assert_legacy_insert_record_migrates(legacy_create_sql: &str, with_uuid_pk: bool) {
         let _guard = CONFIG_LOCK.lock().await;
         set_sqlite_metastore_config(SqliteMetastoreConfig::default());
         let (_dir, metastore) = temp_metastore();
 
         // Build a realistic "old deployment": init the current full schema for
         // every OTHER table, then DOWNGRADE only cayenne_insert_record back to
-        // the legacy UUID-PK shape and seed a parent row + two insert records.
-        // Re-running init_schema must then detect & migrate just this table
-        // (and leave every other table matching EXPECTED_TABLES).
+        // a legacy TEXT-`table_id` shape and seed a parent row + two insert
+        // records. Re-running init_schema must then detect & migrate just this
+        // table (leaving every other table matching EXPECTED_TABLES).
         metastore.init_schema().await.expect("baseline init schema");
         let table_id = uuid::Uuid::now_v7().to_string();
-        metastore
-            .execute_batch(&format!(
-                "DROP TABLE cayenne_insert_record; \
-                 CREATE TABLE cayenne_insert_record (\
-                    insert_record_id TEXT PRIMARY KEY, table_id TEXT NOT NULL, \
-                    pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
-                    FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE, \
-                    UNIQUE(table_id, pk_bytes)); \
-                 INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, current_snapshot_id) \
-                    VALUES ('{table_id}', 'legacy_t', '/tmp', 1, '{{}}', '[]', '{table_id}'); \
-                 INSERT INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) \
+
+        let insert_rows = if with_uuid_pk {
+            format!(
+                "INSERT INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) \
                     VALUES ('{u1}', '{table_id}', x'0a', 7); \
                  INSERT INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) \
                     VALUES ('{u2}', '{table_id}', x'0b', 9);",
                 u1 = uuid::Uuid::now_v7(),
                 u2 = uuid::Uuid::now_v7(),
+            )
+        } else {
+            format!(
+                "INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) \
+                    VALUES ('{table_id}', x'0a', 7); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) \
+                    VALUES ('{table_id}', x'0b', 9);"
+            )
+        };
+
+        metastore
+            .execute_batch(&format!(
+                "DROP TABLE cayenne_insert_record; \
+                 {legacy_create_sql} \
+                 INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, current_snapshot_id) \
+                    VALUES ('{table_id}', 'legacy_t', '/tmp', 1, '{{}}', '[]', '{table_id}'); \
+                 {insert_rows}"
             ))
             .await
             .expect("downgrade cayenne_insert_record to legacy schema + seed rows");
 
-        // Sanity: the legacy column is present pre-migration.
-        let before = table_columns(&metastore, "cayenne_insert_record").await;
-        assert!(
-            before.contains(&"insert_record_id".to_string()),
-            "precondition: legacy UUID column present, got {before:?}"
+        // Sanity: the legacy `table_id` column is TEXT pre-migration.
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "TEXT",
+            "precondition: legacy table_id is TEXT"
         );
 
         metastore.init_schema().await.expect("init schema migrates");
 
-        // Post-migration: the new 3-column WITHOUT ROWID schema and both rows
-        // (with their original sequences) survived the copy-forward.
+        // Post-migration: the new 3-column schema with a BLOB table_id.
         let after = table_columns(&metastore, "cayenne_insert_record").await;
         assert_eq!(
             after,
             vec!["table_id", "pk_bytes", "sequence_number"],
             "legacy table must be migrated to the composite-PK schema"
         );
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "migrated table_id must be BLOB"
+        );
 
+        // The rows survived AND are now keyed by the raw-UUID-bytes BLOB — i.e.
+        // a BLOB-encoded lookup (what the production reader does) finds them.
         let rows: Vec<(Vec<u8>, i64)> = metastore
             .query(
                 QueryParams {
                     sql: "SELECT pk_bytes, sequence_number FROM cayenne_insert_record WHERE table_id = ?1 ORDER BY pk_bytes",
-                    params: vec![MetastoreValue::Text(table_id)],
+                    params: vec![MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(&table_id))],
                 },
                 |row| Ok((row.get_blob(0)?, row.get_i64(1)?)),
             )
@@ -1911,15 +2054,48 @@ mod tests {
         assert_eq!(
             rows,
             vec![(vec![0x0a_u8], 7_i64), (vec![0x0b_u8], 9_i64)],
-            "the (table_id, pk_bytes, sequence_number) rows must be copied forward"
+            "the (table_id, pk_bytes, sequence_number) rows must be copied forward and re-encoded"
         );
 
-        // The migrated DB also passes the EXPECTED_TABLES validation that
-        // init_schema runs at the end (no SchemaMismatch was returned above),
-        // and re-running init_schema is idempotent (the column is now gone).
+        // Re-running init_schema is idempotent (table_id is already BLOB).
         metastore
             .init_schema()
             .await
             .expect("second init_schema is a no-op");
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "re-running init_schema must not re-migrate (already BLOB)"
+        );
+    }
+
+    /// Pre-cycle-11 legacy shape: UUID `insert_record_id` TEXT PRIMARY KEY +
+    /// redundant `UNIQUE(table_id, pk_bytes)` + TEXT `table_id` + FK.
+    #[tokio::test]
+    async fn test_insert_record_legacy_uuid_pk_schema_migrates_with_rows_present() {
+        assert_legacy_insert_record_migrates(
+            "CREATE TABLE cayenne_insert_record (\
+                insert_record_id TEXT PRIMARY KEY, table_id TEXT NOT NULL, \
+                pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
+                FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE, \
+                UNIQUE(table_id, pk_bytes));",
+            true,
+        )
+        .await;
+    }
+
+    /// cycle-11 legacy shape: WITHOUT ROWID composite PK with a TEXT `table_id`
+    /// and a `cayenne_table(table_id)` foreign key (the shape this lever
+    /// replaces). The TEXT→BLOB re-encode must still fire.
+    #[tokio::test]
+    async fn test_insert_record_cycle11_text_schema_migrates_with_rows_present() {
+        assert_legacy_insert_record_migrates(
+            "CREATE TABLE cayenne_insert_record (\
+                table_id TEXT NOT NULL, pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
+                FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE, \
+                PRIMARY KEY (table_id, pk_bytes)) WITHOUT ROWID;",
+            false,
+        )
+        .await;
     }
 }

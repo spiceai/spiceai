@@ -48,7 +48,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
-use super::{EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreValue, QueryParams};
+use super::{
+    EXPECTED_TABLES, ExecuteParams, MetastoreBackend, MetastoreValue, QueryParams, QueryRowParams,
+};
 use crate::catalog::{CatalogError, CatalogResult};
 
 /// Current slice format version. Incremented on incompatible format changes.
@@ -289,13 +291,22 @@ pub async fn export_dataset(
                 vec![MetastoreValue::Text(dataset_name.to_string())],
             )
         } else {
+            // `cayenne_insert_record.table_id` is stored as the raw-UUID-bytes
+            // BLOB (see `metastore::table_id_to_key_bytes`), so its filter must
+            // bind a BLOB — a TEXT bind never matches a BLOB column in SQLite.
+            // Every other child table keeps `table_id` as TEXT.
+            let table_id_param = if expected.name == "cayenne_insert_record" {
+                MetastoreValue::Blob(super::table_id_to_key_bytes(&table_id))
+            } else {
+                MetastoreValue::Text(table_id.clone())
+            };
             (
                 format!(
                     "SELECT {} FROM {} WHERE table_id = ?",
                     expected.columns.join(", "),
                     expected.name
                 ),
-                vec![MetastoreValue::Text(table_id.clone())],
+                vec![table_id_param],
             )
         };
 
@@ -379,7 +390,30 @@ pub async fn import_dataset(
 
     let txn = metastore.begin_transaction().await?;
 
-    // Wholesale-replace any existing rows for this dataset.
+    // Wholesale-replace any existing rows for this dataset. `cayenne_table`'s
+    // `ON DELETE CASCADE` clears the dependent rows of every child table whose
+    // foreign key still references it — but `cayenne_insert_record` no longer
+    // has that foreign key (its `table_id` is a raw-bytes BLOB; see
+    // `metastore::table_id_to_key_bytes`), so resolve the existing `table_id`
+    // and clear its insert-records explicitly first, inside the same
+    // transaction, before the parent row is removed.
+    if let Ok(values) = txn
+        .query_row_values(QueryRowParams {
+            sql: "SELECT table_id FROM cayenne_table WHERE table_name = ?",
+            params: vec![MetastoreValue::Text(slice.dataset_name.clone())],
+        })
+        .await
+        && let Some(MetastoreValue::Text(existing_table_id)) = values.into_iter().next()
+    {
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?",
+            params: vec![MetastoreValue::Blob(super::table_id_to_key_bytes(
+                &existing_table_id,
+            ))],
+        })
+        .await?;
+    }
+
     txn.execute(ExecuteParams {
         sql: "DELETE FROM cayenne_table WHERE table_name = ?",
         params: vec![MetastoreValue::Text(slice.dataset_name.clone())],
@@ -668,6 +702,110 @@ mod tests {
             .await
             .expect("q riders");
         assert_eq!(riders, vec!["r1".to_string()]);
+    }
+
+    /// A `cayenne_insert_record` row (BLOB `table_id`) survives an
+    /// export→import round-trip into a fresh metastore — the export filter and
+    /// the verbatim re-insert both handle the BLOB key — and a subsequent
+    /// wholesale-replace import (whose slice carries no insert-records) clears
+    /// the prior insert-record via the explicit delete that replaced the
+    /// dropped `ON DELETE CASCADE`.
+    #[tokio::test]
+    async fn insert_record_blob_round_trips_and_wholesale_replace_clears_it() {
+        let (ms_a, tmp_a) = fresh_metastore().await;
+        let anchor_a = tmp_a.path();
+
+        // Realistic UUID table_id so the 16-byte BLOB encoding path is taken.
+        let table_id = uuid::Uuid::now_v7().to_string();
+        let table_path = anchor_a.join("ds.dir").to_string_lossy().into_owned();
+        ms_a.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, on_conflict_json, current_snapshot_id, partition_column, vortex_config_json, current_sequence_number) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params: sample_table_row(&table_id, "ds", &table_path),
+        })
+        .await
+        .expect("insert table");
+        // Plant an insert-record with the BLOB-encoded table_id (the write path).
+        ms_a.execute(ExecuteParams {
+            sql: "INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?, ?, ?)",
+            params: vec![
+                MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(&table_id)),
+                MetastoreValue::Blob(7_i64.to_be_bytes().to_vec()),
+                MetastoreValue::Integer(13),
+            ],
+        })
+        .await
+        .expect("insert insert_record");
+
+        let slice = export_dataset(ms_a.as_ref(), "ds", anchor_a)
+            .await
+            .expect("export");
+        assert_eq!(
+            slice.tables["cayenne_insert_record"].len(),
+            1,
+            "the BLOB-keyed insert-record must be captured by the export filter"
+        );
+
+        // Import into a fresh metastore; the BLOB table_id round-trips.
+        let (ms_b, tmp_b) = fresh_metastore().await;
+        import_dataset(ms_b.as_ref(), &slice, tmp_b.path())
+            .await
+            .expect("import");
+        let seq: i64 = ms_b
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT sequence_number FROM cayenne_insert_record WHERE table_id = ?",
+                    params: vec![MetastoreValue::Blob(
+                        crate::metastore::table_id_to_key_bytes(&table_id),
+                    )],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read imported insert_record");
+        assert_eq!(
+            seq, 13,
+            "the insert-record sequence must survive the round-trip"
+        );
+
+        // Re-import a slice for the SAME dataset that carries NO insert-records:
+        // the wholesale-replace must clear the prior insert-record explicitly
+        // (the FK + cascade is gone).
+        let mut tables: BTreeMap<String, Vec<SliceRow>> = BTreeMap::new();
+        tables.insert(
+            "cayenne_table".to_string(),
+            vec![
+                sample_table_row(&table_id, "ds", "ds.dir")
+                    .iter()
+                    .map(SliceValue::from)
+                    .collect(),
+            ],
+        );
+        let replace_slice = DatasetMetastoreSlice {
+            format_version: SLICE_FORMAT_VERSION,
+            engine: SLICE_ENGINE.to_string(),
+            dataset_name: "ds".to_string(),
+            exported_at_ms: 0,
+            tables,
+        };
+        import_dataset(ms_b.as_ref(), &replace_slice, tmp_b.path())
+            .await
+            .expect("wholesale-replace import");
+        let remaining: i64 = ms_b
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?",
+                    params: vec![MetastoreValue::Blob(
+                        crate::metastore::table_id_to_key_bytes(&table_id),
+                    )],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count after replace");
+        assert_eq!(
+            remaining, 0,
+            "wholesale-replace import must clear prior insert-records (no cascade)"
+        );
     }
 
     #[tokio::test]
