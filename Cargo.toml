@@ -170,7 +170,7 @@ datafusion-common-runtime = "53.0.0"
 datafusion-datasource = "53.0.0"
 datafusion-execution = "53.0.0"
 datafusion-expr = "53.0.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6433df67b1154c8c3c4779732b1b04c73714ce83", features = ["sql"] } # spiceai fork (v0.5.3 DF53)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "490d3a2f8fb535b1ec76b823abb240e648668a74", features = ["sql"] } # spiceai-53
 datafusion-functions = "53.0.0"
 datafusion-functions-json = "0.53"
 datafusion-physical-expr = "53.0.0"
@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "0bf2a0b99500f0f739d944347ab4d13a0f922356" } # spiceai-53 (merged tip)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "9955a7b961602b9ad54a31265245628e71173edd" } # spiceai-53
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -192,7 +192,7 @@ delta_kernel = { version = "0.23.0", features = [
 derive_builder = "0.20.2"
 dotenvy = "0.15"
 duration-parse = { path = "crates/duration-parse" }
-duckdb = "1.10502" # 1.10502.x corresponds to DuckDB v1.5.2
+duckdb = "1.10503" # 1.10503.x corresponds to DuckDB v1.5.3
 dyn-hash = "1.0.0"
 fundu = "2.0.1"
 futures = "0.3.32"
@@ -443,15 +443,11 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 # workspace uses the spiceai fork (DF53-compatible). Redirect crates.io to the fork so the whole
 # graph shares one `SQLExecutor`/federation crate; otherwise `SqlTable: SQLExecutor` (impl'd in
 # table-providers against crates.io federation) fails to satisfy fork-typed bounds in data_components.
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "6433df67b1154c8c3c4779732b1b04c73714ce83" } # spiceai fork (v0.5.3 DF53)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "490d3a2f8fb535b1ec76b823abb240e648668a74" } # spiceai-53
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "714d64fd5369efc4835109be0fd718db5a3be0aa" } # branch: spiceai-0.23.0
 
-# Single duckdb across the whole graph (direct deps + datafusion-table-providers):
-# the spiceai duckdb-rs fork on DuckDB 1.5.2 + arrow 58. The former second binding
-# (spiceai_duckdb_fork 1.4.4) was retired so runtime and table-providers share one
-# duckdb type set (AccessMode/Error/Connection/Transaction).
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "4387e69564d85a411802e0782bc503b53577c50d" } # branch: spiceai-58-arrow58
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
