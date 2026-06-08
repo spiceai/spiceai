@@ -4306,7 +4306,7 @@ impl CayenneTableProvider {
             let file_name_str = file_name.to_str()?;
             let metadata = tokio::fs::metadata(target_dir.join(file_name)).await.ok()?;
             metas.push(ObjectMeta {
-                location: prefix.child(file_name_str),
+                location: prefix.clone().join(file_name_str),
                 last_modified: metadata.modified().map_or_else(
                     |_| chrono::Utc::now(),
                     chrono::DateTime::<chrono::Utc>::from,
@@ -4360,7 +4360,7 @@ impl CayenneTableProvider {
 
         // The list-files cache keys files by the parsed `ListingTableUrl` prefix
         // (bucket-stripped), so build the delta-apply locations the same way the
-        // scan's LIST would — `prefix.child(relative)` — rather than from the
+        // scan's LIST would — `prefix.clone().join(relative)` — rather than from the
         // object-store move prefix, which may not be byte-identical.
         let cache_prefix = ListingTableUrl::parse(Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -4400,7 +4400,7 @@ impl CayenneTableProvider {
                 ObjectStorePath::from(format!("{}{relative}", target_prefix.as_ref()));
             if let Some(prefix) = &cache_prefix {
                 moved_metas.push(ObjectMeta {
-                    location: prefix.child(relative),
+                    location: prefix.clone().join(relative),
                     last_modified: meta.last_modified,
                     size: meta.size,
                     e_tag: None,
@@ -21816,14 +21816,14 @@ mod tests {
             .expect("list-files cache present");
 
         // Seed an existing listing with one file.
-        let existing_loc = prefix.child("part-0.vortex");
+        let existing_loc = prefix.clone().join("part-0.vortex");
         cache.put(
             &key,
             CachedFileList::new(vec![test_object_meta(existing_loc.as_ref(), 100)]),
         );
 
         // Delta-apply two new files, one of which duplicates the existing one.
-        let new_a = prefix.child("part-1.vortex");
+        let new_a = prefix.join("part-1.vortex");
         let additions = vec![
             test_object_meta(new_a.as_ref(), 200),
             test_object_meta(existing_loc.as_ref(), 100), // duplicate location
@@ -21863,7 +21863,7 @@ mod tests {
             path: prefix.clone(),
         };
 
-        let new_a = prefix.child("part-0.vortex");
+        let new_a = prefix.join("part-0.vortex");
         let additions = vec![test_object_meta(new_a.as_ref(), 200)];
         let applied =
             CayenneTableProvider::apply_list_files_cache_additions(&runtime_env, url, &additions);
@@ -21903,12 +21903,12 @@ mod tests {
     struct StatsOverrideExec {
         inner: Arc<dyn ExecutionPlan>,
         stats: Statistics,
-        properties: datafusion_physical_plan::PlanProperties,
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
     }
 
     impl StatsOverrideExec {
         fn new(inner: Arc<dyn ExecutionPlan>, stats: Statistics) -> Self {
-            let properties = inner.properties().clone();
+            let properties = Arc::clone(inner.properties());
             Self {
                 inner,
                 stats,
@@ -21934,7 +21934,7 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
