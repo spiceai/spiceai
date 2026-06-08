@@ -2106,6 +2106,19 @@ pub struct CayenneTableProviderBuilder {
     maintained_aggregates: Vec<MaintainedAggregateSpec>,
 }
 
+struct PendingMaintainedAggregateInsert {
+    epoch: u64,
+    batches: Vec<RecordBatch>,
+}
+
+struct CayenneTableProviderOpenOptions {
+    retention_filters: Vec<Expr>,
+    time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
+    object_store_config: Option<crate::metadata::ObjectStoreConfig>,
+    context: Option<Arc<CayenneContext>>,
+    maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
+}
+
 impl CayenneTableProviderBuilder {
     /// Create a new builder with the required catalog and shared `RuntimeEnv`.
     #[must_use]
@@ -2177,18 +2190,17 @@ impl CayenneTableProviderBuilder {
     /// Returns an error if the table cannot be found in the catalog or if the listing
     /// table cannot be created.
     pub async fn open(self, table_name: &str) -> Result<CayenneTableProvider> {
-        CayenneTableProvider::new_internal(
-            table_name,
-            self.catalog,
-            self.retention_filters,
-            self.time_retention_filter_builder,
-            self.object_store_config,
-            self.runtime_env,
-            self.context,
-            self.maintained_aggregates,
-        )
-        .await
-        .map_err(Into::into)
+        let options = CayenneTableProviderOpenOptions {
+            retention_filters: self.retention_filters,
+            time_retention_filter_builder: self.time_retention_filter_builder,
+            object_store_config: self.object_store_config,
+            context: self.context,
+            maintained_aggregate_specs: self.maintained_aggregates,
+        };
+
+        CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
+            .await
+            .map_err(Into::into)
     }
 
     /// Create a new table with the given options.
@@ -2199,18 +2211,16 @@ impl CayenneTableProviderBuilder {
     pub async fn create(self, options: CreateTableOptions) -> CatalogResult<CayenneTableProvider> {
         let table_name = options.table_name.clone();
         let _table_id = self.catalog.create_table(options).await?;
+        let options = CayenneTableProviderOpenOptions {
+            retention_filters: self.retention_filters,
+            time_retention_filter_builder: self.time_retention_filter_builder,
+            object_store_config: self.object_store_config,
+            context: self.context,
+            maintained_aggregate_specs: self.maintained_aggregates,
+        };
 
-        CayenneTableProvider::new_internal(
-            &table_name,
-            self.catalog,
-            self.retention_filters,
-            self.time_retention_filter_builder,
-            self.object_store_config,
-            self.runtime_env,
-            self.context,
-            self.maintained_aggregates,
-        )
-        .await
+        CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
+            .await
     }
 }
 
@@ -4730,13 +4740,17 @@ impl CayenneTableProvider {
     async fn new_internal(
         table_name: &str,
         catalog: Arc<dyn MetadataCatalog>,
-        retention_filters: Vec<Expr>,
-        time_retention_filter_builder: Option<super::retention::TimeRetentionFilterBuilder>,
-        object_store_config: Option<crate::metadata::ObjectStoreConfig>,
         runtime_env: Arc<RuntimeEnv>,
-        context: Option<Arc<CayenneContext>>,
-        maintained_aggregate_specs: Vec<MaintainedAggregateSpec>,
+        options: CayenneTableProviderOpenOptions,
     ) -> CatalogResult<Self> {
+        let CayenneTableProviderOpenOptions {
+            retention_filters,
+            time_retention_filter_builder,
+            object_store_config,
+            context,
+            maintained_aggregate_specs,
+        } = options;
+
         let table_metadata = catalog.get_table(table_name).await?;
 
         // Use the provided context (for partition cache sharing) or build a
@@ -10501,23 +10515,57 @@ impl CayenneTableProvider {
         );
     }
 
-    pub(crate) fn apply_maintained_aggregate_insert_batches(&self, batches: &[RecordBatch]) {
-        if self.maintained_aggregates.is_empty() {
-            return;
+    fn prepare_maintained_aggregate_insert_batches(
+        &self,
+        batches: &[RecordBatch],
+    ) -> Option<PendingMaintainedAggregateInsert> {
+        if self.maintained_aggregates.is_empty() || batches.is_empty() {
+            return None;
         }
 
         let epoch = self.next_maintained_aggregate_epoch();
-        if let Err(error) = self
-            .maintained_aggregates
-            .apply_insert_batches(epoch, batches)
-        {
-            self.maintained_aggregates.mark_stale(epoch);
-            tracing::warn!(
-                table = %self.table_metadata.table_name,
-                epoch,
-                error = %error,
-                "Failed to apply maintained aggregate insert delta; queries will fall back to base table scans"
-            );
+        Some(PendingMaintainedAggregateInsert {
+            epoch,
+            batches: batches.to_vec(),
+        })
+    }
+
+    async fn apply_maintained_aggregate_insert_batches(
+        &self,
+        pending: Option<PendingMaintainedAggregateInsert>,
+    ) {
+        let Some(pending) = pending else {
+            return;
+        };
+
+        let epoch = pending.epoch;
+        let registry = Arc::clone(&self.maintained_aggregates);
+        let apply_registry = Arc::clone(&registry);
+        let apply_result = task::spawn_blocking(move || {
+            apply_registry.apply_insert_batches(epoch, &pending.batches)
+        })
+        .await;
+
+        match apply_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                registry.mark_stale(epoch);
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    epoch,
+                    error = %error,
+                    "Failed to apply maintained aggregate insert delta; queries will fall back to base table scans"
+                );
+            }
+            Err(error) => {
+                registry.mark_stale(epoch);
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    epoch,
+                    error = %error,
+                    "Maintained aggregate insert delta task failed; queries will fall back to base table scans"
+                );
+            }
         }
     }
 
@@ -11549,7 +11597,7 @@ impl CayenneTableProvider {
         // file-backed row (deletion cache). Scans capture the (inlined view, deletion view) pair under `scan_state_lock.read()`,
         // so committing both halves here under one `.write()` closes the duplicate-PK window.
         // Only synchronous in-memory work runs under the guard; all durable I/O above is already complete.
-        {
+        let maintained_aggregate_insert = {
             let _visibility = self.visibility_lock_arc().lock_owned().await;
             let _fence = self.lock_listing_fence_write_owned().await;
             let _view_guard = self.scan_state_lock.write().await;
@@ -11575,10 +11623,14 @@ impl CayenneTableProvider {
             }
             if removed_rows > 0 || has_file_deletions {
                 self.mark_maintained_aggregates_stale();
+                None
             } else {
-                self.apply_maintained_aggregate_insert_batches(batches);
+                self.prepare_maintained_aggregate_insert_batches(batches)
             }
-        }
+        };
+
+        self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
+            .await;
 
         tracing::debug!(
             table = self.table_metadata.table_name,
@@ -12497,7 +12549,7 @@ impl CayenneTableProvider {
         let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
 
         let arc_batches = Arc::new(batches);
-        let epoch = {
+        let (epoch, maintained_aggregate_insert) = {
             // Publish the RAM swap under the same listing fence the durable
             // inline publish uses, so readers capture the new tier atomically.
             let _fence = self.listing_fence.write().await;
@@ -12519,10 +12571,13 @@ impl CayenneTableProvider {
             if superseded > 0 || !tombstones.int64_pk.is_empty() || !tombstones.row_keys.is_empty()
             {
                 self.mark_maintained_aggregates_stale();
+                (epoch, None)
             } else {
-                self.apply_maintained_aggregate_insert_batches(arc_batches.as_slice());
+                (
+                    epoch,
+                    self.prepare_maintained_aggregate_insert_batches(arc_batches.as_slice()),
+                )
             }
-            epoch
         };
 
         // Net the live row count by the superseded rows, exactly like the durable
@@ -12530,6 +12585,9 @@ impl CayenneTableProvider {
         let net = i64::try_from(incoming_rows).unwrap_or(i64::MAX)
             - i64::try_from(superseded).unwrap_or(i64::MAX);
         self.inlined_row_count.fetch_add(net, Ordering::Relaxed);
+
+        self.apply_maintained_aggregate_insert_batches(maintained_aggregate_insert)
+            .await;
 
         Ok(epoch)
     }

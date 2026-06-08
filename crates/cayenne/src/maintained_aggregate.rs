@@ -25,6 +25,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, new_empty_array};
@@ -34,8 +35,8 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::Distribution;
 use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::{Distribution, OrderingRequirements};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
 
@@ -177,6 +178,11 @@ struct QueryAggregateExpr {
     column: Option<String>,
 }
 
+enum CountQueryColumn {
+    AllRows,
+    Column(String),
+}
+
 /// Execution plan returned by the maintained aggregate optimizer rewrite.
 #[derive(Debug)]
 pub struct MaintainedAggregateExec {
@@ -223,31 +229,42 @@ impl ExecutionPlan for MaintainedAggregateExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
+        vec![&self.inner]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Internal(
-                "MaintainedAggregateExec expected zero children".to_string(),
-            ));
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "MaintainedAggregateExec expected one child, got {}",
+                children.len()
+            )));
         }
-        Ok(self)
+
+        let Some(inner) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "MaintainedAggregateExec expected one child".to_string(),
+            ));
+        };
+        Ok(Arc::new(Self { inner }))
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        Vec::new()
+        vec![Distribution::UnspecifiedDistribution; self.children().len()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        vec![None; self.children().len()]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        Vec::new()
+        vec![true; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        Vec::new()
+        vec![false; self.children().len()]
     }
 
     fn execute(
@@ -309,6 +326,16 @@ impl MaintainedAggregateRegistry {
         batches: &[RecordBatch],
     ) -> DataFusionResult<()> {
         let mut state = self.state.write();
+
+        // Async write-path maintenance must apply deltas in visibility-epoch
+        // order. If a delayed task observes a skipped or already-advanced epoch,
+        // fail safe and force queries back to the base table.
+        if epoch != state.epoch.saturating_add(1) {
+            state.epoch = state.epoch.max(epoch);
+            state.status = RegistryStatus::Stale;
+            return Ok(());
+        }
+
         state.epoch = epoch;
         if state.status == RegistryStatus::Stale || state.views.is_empty() {
             return Ok(());
@@ -352,12 +379,16 @@ impl MaintainedAggregateRegistry {
     ///
     /// Returns `None` when the aggregate shape is unsupported, no declared view
     /// matches it, or the registry is stale for the scan snapshot epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching maintained view cannot be materialized.
     pub fn batch_for_aggregate(
         &self,
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        let Some(query) = query_spec_for_aggregate(aggregate)? else {
+        let Some(query) = query_spec_for_aggregate(aggregate) else {
             return Ok(None);
         };
 
@@ -400,11 +431,10 @@ impl MaintainedAggregateView {
                 key.push(scalar);
             }
 
-            let spec = &self.spec;
-            let group = self
-                .groups
-                .entry(key)
-                .or_insert_with(|| GroupAccumulator::new(spec));
+            let group = match self.groups.entry(key) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
+            };
             group.apply_insert_row(batch, row)?;
         }
 
@@ -437,7 +467,7 @@ impl MaintainedAggregateView {
 
         let mut rows = Vec::with_capacity(self.groups.len());
         if self.groups.is_empty() && self.spec.group_by.is_empty() {
-            rows.push((Vec::new(), GroupAccumulator::new(&self.spec)));
+            rows.push((Vec::new(), GroupAccumulator::try_new(&self.spec)?));
         } else {
             rows.extend(
                 self.groups
@@ -544,12 +574,10 @@ impl ResolvedAggregateExpr {
             (MaintainedAggregateFunction::Sum, Some(DataType::UInt64)) => {
                 AggregateOutputType::UInt64
             }
-            (MaintainedAggregateFunction::Sum, Some(DataType::Float64)) => {
-                AggregateOutputType::Float64
-            }
-            (MaintainedAggregateFunction::Avg, Some(DataType::Float64)) => {
-                AggregateOutputType::Float64
-            }
+            (
+                MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg,
+                Some(DataType::Float64),
+            ) => AggregateOutputType::Float64,
             (MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg, None) => {
                 return Err(DataFusionError::Plan(format!(
                     "{:?} maintained aggregate requires a column",
@@ -572,13 +600,13 @@ impl ResolvedAggregateExpr {
 }
 
 impl GroupAccumulator {
-    fn new(spec: &ResolvedAggregateSpec) -> Self {
+    fn try_new(spec: &ResolvedAggregateSpec) -> DataFusionResult<Self> {
         let aggregates = spec
             .aggregates
             .iter()
-            .map(AggregateAccumulator::new)
-            .collect();
-        Self { aggregates }
+            .map(AggregateAccumulator::try_new)
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(Self { aggregates })
     }
 
     fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
@@ -603,8 +631,8 @@ impl GroupAccumulator {
 }
 
 impl AggregateAccumulator {
-    fn new(expr: &ResolvedAggregateExpr) -> Self {
-        match (expr.function, expr.output_type, expr.column.as_ref()) {
+    fn try_new(expr: &ResolvedAggregateExpr) -> DataFusionResult<Self> {
+        let accumulator = match (expr.function, expr.output_type, expr.column.as_ref()) {
             (MaintainedAggregateFunction::Count, _, None) => Self::CountAll { value: 0 },
             (MaintainedAggregateFunction::Count, _, Some(column)) => Self::CountColumn {
                 column_index: column.index,
@@ -635,8 +663,13 @@ impl AggregateAccumulator {
                     count: 0,
                 }
             }
-            _ => Self::CountAll { value: 0 },
-        }
+            _ => {
+                return Err(DataFusionError::Internal(format!(
+                    "invalid maintained aggregate accumulator state: {expr:?}"
+                )));
+            }
+        };
+        Ok(accumulator)
     }
 
     fn apply_insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<()> {
@@ -730,19 +763,15 @@ impl AggregateAccumulator {
                 if *count == 0 {
                     scalar_for_field(field, Some(ScalarValue::Float64(None)))
                 } else {
-                    scalar_for_field(
-                        field,
-                        Some(ScalarValue::Float64(Some(*sum / (*count as f64)))),
-                    )
+                    let count_f64 = exact_i64_to_f64(*count)?;
+                    scalar_for_field(field, Some(ScalarValue::Float64(Some(*sum / count_f64))))
                 }
             }
         }
     }
 }
 
-fn query_spec_for_aggregate(
-    aggregate: &AggregateExec,
-) -> DataFusionResult<Option<QueryAggregateSpec>> {
+fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateSpec> {
     if !matches!(
         aggregate.mode(),
         AggregateMode::Single | AggregateMode::SinglePartitioned
@@ -751,14 +780,12 @@ fn query_spec_for_aggregate(
         || aggregate.group_expr().has_grouping_set()
         || aggregate.group_expr().groups().len() != 1
     {
-        return Ok(None);
+        return None;
     }
 
     let mut group_by = Vec::with_capacity(aggregate.group_expr().expr().len());
     for (expr, _) in aggregate.group_expr().expr() {
-        let Some(column) = expr.as_any().downcast_ref::<Column>() else {
-            return Ok(None);
-        };
+        let column = expr.as_any().downcast_ref::<Column>()?;
         group_by.push(column.name().to_string());
     }
 
@@ -768,33 +795,30 @@ fn query_spec_for_aggregate(
             || !aggregate_expr.order_bys().is_empty()
             || aggregate_expr.is_reversed()
         {
-            return Ok(None);
+            return None;
         }
         let function = match aggregate_expr.fun().name().to_ascii_lowercase().as_str() {
             "count" => MaintainedAggregateFunction::Count,
             "sum" => MaintainedAggregateFunction::Sum,
             "avg" => MaintainedAggregateFunction::Avg,
-            _ => return Ok(None),
+            _ => return None,
         };
 
         let expressions = aggregate_expr.expressions();
         let column = match function {
             MaintainedAggregateFunction::Count => {
-                let Some(column) = count_column_for_query(&expressions)? else {
-                    return Ok(None);
-                };
-                column
+                let column = count_column_for_query(&expressions)?;
+                match column {
+                    CountQueryColumn::AllRows => None,
+                    CountQueryColumn::Column(column) => Some(column),
+                }
             }
             MaintainedAggregateFunction::Sum | MaintainedAggregateFunction::Avg => {
                 if expressions.len() != 1 {
-                    return Ok(None);
+                    return None;
                 }
-                let Some(expr) = expressions.first() else {
-                    return Ok(None);
-                };
-                let Some(column) = expr.as_any().downcast_ref::<Column>() else {
-                    return Ok(None);
-                };
+                let expr = expressions.first()?;
+                let column = expr.as_any().downcast_ref::<Column>()?;
                 Some(column.name().to_string())
             }
         };
@@ -802,28 +826,43 @@ fn query_spec_for_aggregate(
         aggregates.push(QueryAggregateExpr { function, column });
     }
 
-    Ok(Some(QueryAggregateSpec {
+    Some(QueryAggregateSpec {
         group_by,
         aggregates,
-    }))
+    })
 }
 
 fn count_column_for_query(
     expressions: &[Arc<dyn datafusion_physical_expr::PhysicalExpr>],
-) -> DataFusionResult<Option<Option<String>>> {
+) -> Option<CountQueryColumn> {
     if expressions.len() > 1 {
-        return Ok(None);
+        return None;
     }
     let Some(expr) = expressions.first() else {
-        return Ok(Some(None));
+        return Some(CountQueryColumn::AllRows);
     };
     if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-        return Ok(Some(Some(column.name().to_string())));
+        return Some(CountQueryColumn::Column(column.name().to_string()));
     }
     if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
-        return Ok((!literal.value().is_null()).then_some(None));
+        return (!literal.value().is_null()).then_some(CountQueryColumn::AllRows);
     }
-    Ok(None)
+    None
+}
+
+fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {
+    const MAX_EXACT_F64_INTEGER: i64 = 1_i64 << f64::MANTISSA_DIGITS;
+    if !(-MAX_EXACT_F64_INTEGER..=MAX_EXACT_F64_INTEGER).contains(&value) {
+        return Err(DataFusionError::Execution(format!(
+            "Maintained aggregate AVG count {value} exceeds the exact Float64 integer range"
+        )));
+    }
+
+    value.to_string().parse::<f64>().map_err(|source| {
+        DataFusionError::Internal(format!(
+            "failed to convert maintained aggregate AVG count {value} to Float64: {source}"
+        ))
+    })
 }
 
 fn resolve_column(schema: &SchemaRef, name: &str) -> DataFusionResult<ResolvedColumn> {
@@ -1140,24 +1179,54 @@ mod tests {
             }],
         };
 
-        assert!(MaintainedAggregateRegistry::try_new(&[spec], &schema).is_err());
+        MaintainedAggregateRegistry::try_new(&[spec], &schema)
+            .expect_err("unsupported group key type should be rejected");
+    }
+
+    #[test]
+    fn maintained_aggregate_exec_exposes_inner_child() -> DataFusionResult<()> {
+        let exec = Arc::new(MaintainedAggregateExec::try_new(batch())?);
+
+        assert_eq!(exec.children().len(), 1);
+        let required_distribution = exec.required_input_distribution();
+        assert_eq!(required_distribution.len(), 1);
+        assert!(matches!(
+            required_distribution.as_slice(),
+            [Distribution::UnspecifiedDistribution]
+        ));
+        let required_ordering = exec.required_input_ordering();
+        assert_eq!(required_ordering.len(), 1);
+        assert!(required_ordering[0].is_none());
+        assert_eq!(exec.maintains_input_order(), vec![true]);
+        assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        Arc::clone(&exec)
+            .with_new_children(Vec::new())
+            .expect_err("missing maintained aggregate child should be rejected");
+
+        let replacement = MemorySourceConfig::try_new_exec(&[vec![batch()]], schema(), None)?;
+        let rewritten = exec.with_new_children(vec![replacement])?;
+        assert_eq!(rewritten.children().len(), 1);
+
+        Ok(())
     }
 
     fn aggregate_exec_for(
-        aggs: &[(&str, MaintainedAggregateFunction, Option<&str>)],
+        aggregate_defs: &[(&str, MaintainedAggregateFunction, Option<&str>)],
     ) -> DataFusionResult<AggregateExec> {
         let schema = schema();
         let input = MemorySourceConfig::try_new_exec(&[vec![batch()]], Arc::clone(&schema), None)?;
-        let group_by = if aggs.len() == 2 && aggs[0].0 == "count(*)" && aggs[1].0 == "sum(u)" {
+        let group_by = if aggregate_defs.len() == 2
+            && aggregate_defs[0].0 == "count(*)"
+            && aggregate_defs[1].0 == "sum(u)"
+        {
             PhysicalGroupBy::new_single(vec![])
         } else {
             PhysicalGroupBy::new_single(vec![(col("name", schema.as_ref())?, "name".to_string())])
         };
-        let aggregate_exprs = aggs
+        let aggregate_exprs = aggregate_defs
             .iter()
             .map(|(alias, function, column)| {
-                let args = match (function, column) {
-                    (MaintainedAggregateFunction::Count, None) => vec![lit(1_i8)],
+                let aggregate_args = match (function, column) {
                     (_, Some(column)) => vec![col(column, schema.as_ref())?],
                     _ => vec![lit(1_i8)],
                 };
@@ -1166,7 +1235,7 @@ mod tests {
                     MaintainedAggregateFunction::Sum => sum_udaf(),
                     MaintainedAggregateFunction::Avg => avg_udaf(),
                 };
-                AggregateExprBuilder::new(udaf, args)
+                AggregateExprBuilder::new(udaf, aggregate_args)
                     .schema(Arc::clone(&schema))
                     .alias((*alias).to_string())
                     .build()

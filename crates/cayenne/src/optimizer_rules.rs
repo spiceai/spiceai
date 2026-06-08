@@ -1313,7 +1313,7 @@ mod tests {
             }],
             &schema,
         )?);
-        registry.apply_insert_batches(1, &[batch.clone()])?;
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
         let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
         let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
             memory, registry, 1,
@@ -1346,7 +1346,7 @@ mod tests {
             }],
             &schema,
         )?);
-        registry.apply_insert_batches(1, &[batch.clone()])?;
+        registry.apply_insert_batches(1, std::slice::from_ref(&batch))?;
         registry.mark_stale(2);
         let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
         let cayenne_scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
