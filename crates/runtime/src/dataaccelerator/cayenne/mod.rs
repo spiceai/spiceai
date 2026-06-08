@@ -875,20 +875,15 @@ impl CayenneAccelerator {
                 );
             }
             config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
-            // `adaptive` depends on extended schema inference: the closed loop's
-            // data-aware warm-start (keyset sized to cardinality, memtable rows to
-            // real row width) needs the inferred `row_count`/`table_bytes`, which
-            // are present only when `schema_inference: extended` ran. Without them
-            // the loop would start blind, so fall back to `auto` (static) and tell
-            // the operator how to enable it. (`row_count`/`table_bytes` come ONLY
-            // from extended inference — unlike PK, which can also come from
-            // constraints — so they are the right signal to gate on.)
-            if config.dynamic_tuning
-                && workload.row_count.is_none()
-                && workload.table_bytes.is_none()
-            {
+            // `adaptive` depends on extended schema inference. Any emitted
+            // metadata counts: row_count/table_bytes refine memory sizing, while
+            // inferred primary key/index/sort metadata is applied upstream and
+            // feeds the same warm-start / query-health surface. Without any
+            // inferred metadata the loop starts blind, so fall back to `auto` and
+            // tell the operator how to enable it.
+            if config.dynamic_tuning && !workload.has_inferred_metadata {
                 tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred cardinality/size for its warm-start), but no inferred schema was found; falling back to 'auto' (static). Set `schema_inference: extended` to enable adaptive tuning."
+                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
             }
@@ -900,6 +895,13 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
+            }
+            if config.dynamic_tuning {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
+                );
             }
             config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
                 inline_flush: autotune::is_pinned(
@@ -961,6 +963,7 @@ impl CayenneAccelerator {
                 // (if requested) was gated off — makes that immediately visible.
                 inferred_row_count = ?workload.row_count,
                 inferred_table_bytes = ?workload.table_bytes,
+                inferred_extended_schema = workload.has_inferred_metadata,
                 has_primary_key = workload.has_primary_key,
                 is_upsert = workload.is_upsert,
                 "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",

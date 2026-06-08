@@ -279,6 +279,10 @@ pub(crate) struct WorkloadProfile {
     pub row_count: Option<u64>,
     /// Estimated source table byte size, if inferred.
     pub table_bytes: Option<u64>,
+    /// Whether the connector emitted any extended schema metadata. Primary key,
+    /// index, and sort metadata are useful adaptive warm-start signals even when
+    /// rough sizing is unavailable.
+    pub has_inferred_metadata: bool,
 }
 
 impl WorkloadProfile {
@@ -311,6 +315,7 @@ impl WorkloadProfile {
             pk_arity: primary_key.len(),
             row_count: inferred.row_count,
             table_bytes: inferred.table_bytes,
+            has_inferred_metadata: !inferred.is_empty(),
         }
     }
 
@@ -571,6 +576,7 @@ mod tests {
             pk_arity,
             row_count: Some(rows),
             table_bytes: None,
+            has_inferred_metadata: true,
         };
 
         // A small upsert table sizes the keyset DOWN to what it needs (saving
@@ -793,6 +799,7 @@ mod tests {
                 pk_arity: 3,
                 row_count: Some(5_000_000_000),
                 table_bytes: Some(2_000_000_000_000),
+                has_inferred_metadata: true,
             },
         ];
 
