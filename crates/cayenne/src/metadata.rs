@@ -477,6 +477,28 @@ impl DeletionMode {
     }
 }
 
+/// Which adaptive-tunable knobs the operator pinned with an explicit value. In
+/// `adaptive` mode the closed-loop controller must not move a pinned knob — its
+/// tuning bounds collapse to a single point so `decide()` naturally skips it and
+/// falls through to another lever. (In `auto` mode there is no loop, so an
+/// explicit value is already frozen.) This is how the "override per config
+/// value" mode composes with `auto`/`adaptive`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent pin flag per adaptive-tunable knob"
+)]
+pub struct PinnedTuningKnobs {
+    /// The inline-memtable flush caps were operator-set (don't adapt them).
+    pub inline_flush: bool,
+    /// `cayenne_compaction_background_interval_ms` was operator-set.
+    pub compaction_interval: bool,
+    /// `cayenne_compaction_trigger_files` was operator-set.
+    pub compaction_trigger: bool,
+    /// `cayenne_write_concurrency` was operator-set.
+    pub write_concurrency: bool,
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -618,6 +640,19 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
+    /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
+    /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
+    /// a per-table controller measures the CDC ingest rate *and the runtime's
+    /// whole-system response* (apply latency vs offered load, read amplification
+    /// that slows queries, cgroup-aware memory pressure) and nudges the safe
+    /// per-operation knobs within the environment-derived `[floor, ceiling]`.
+    #[serde(default)]
+    pub dynamic_tuning: bool,
+    /// Adaptive-tunable knobs the operator pinned with an explicit value; the
+    /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
+    #[serde(default)]
+    pub pinned_tuning_knobs: PinnedTuningKnobs,
 }
 
 fn default_concurrency() -> usize {
@@ -777,6 +812,8 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            dynamic_tuning: false,
+            pinned_tuning_knobs: PinnedTuningKnobs::default(),
         }
     }
 }

@@ -1382,6 +1382,16 @@ impl DataFusion {
             encode_budget,
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
         );
+        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
+        // compute memory pressure (so the control loop closes on memory, not just
+        // ingest/query behavior). Mirrors the encode budget: injected here so the
+        // cayenne crate needs no runtime-specific resource detection of its own.
+        let memory_budget = crate::resource_monitor::get_total_memory();
+        cayenne::set_global_memory_budget(memory_budget);
+        tracing::info!(
+            memory_budget,
+            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
+        );
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
         }
@@ -4568,6 +4578,7 @@ mod tests {
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                schema_inference: crate::component::dataset::SchemaInference::Standard,
             }
         }
 
