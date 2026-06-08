@@ -25,13 +25,11 @@ limitations under the License.
 
 use std::collections::BTreeSet;
 
+use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, RefreshMode};
+use crate::dataaccelerator::UpsertOptions;
 use arrow::datatypes::SchemaRef;
 use data_components::inferred_schema::InferredSchema;
-use datafusion_table_providers::util::{
-    column_reference::ColumnReference, constraints::UpsertOptions,
-};
-
-use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, RefreshMode};
+use datafusion_table_providers::util::column_reference::ColumnReference;
 
 /// Fill acceleration settings the user left unset using `inferred` source metadata.
 ///
