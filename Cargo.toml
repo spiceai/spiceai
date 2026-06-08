@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "f819f9b2f776f50fec2ee4dbd7df24cfbb956fdd" } # spiceai-53 (PR #9: MSRV 1.95 + UInt64 fix for rusqlite 0.40)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "24879749306b0398dcd4ed1da03c1c0afa9caf54" } # spiceai-53 (PR #10: sqlite decimal Utf8 decode for mixed storage classes)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
