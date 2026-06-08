@@ -507,11 +507,15 @@ pub enum CdcDurability {
     /// OPT-IN (experimental). Engages only for the changes/small-write refresh
     /// profile AND a replayable source committer (the runtime arms it lazily on the
     /// first batch whose committer reports `supports_deferral()`); every other
-    /// profile/source falls back to `File`. KNOWN LIMITATION: without a periodic
-    /// background checkpoint the deferred slot ack lets replication lag grow
-    /// unbounded under sustained ingest (the RAM tier never checkpoints mid-run) —
-    /// prefer `File` until that follow-up lands. Correctness is unaffected (the
-    /// source re-streams on restart; convergence verified).
+    /// profile/source falls back to `File`. The RAM tier is bounded on three axes
+    /// so the deferred slot ack keeps advancing and the tier never grows unbounded:
+    /// a per-table byte cap (`cdc_mem_tier_max_bytes`, default 64 MiB) and age cap
+    /// (`cdc_mem_tier_max_age_ms`, default 2 s) that the write path checks per
+    /// burst, plus a periodic background checkpoint task
+    /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s) that flushes idle /
+    /// pure-upsert tables which never trip a write-path cap. Correctness is
+    /// unaffected (a crash discards the un-checkpointed tail; the source re-streams
+    /// on restart and the PK-idempotent apply converges exactly-once).
     Memory,
 }
 
@@ -716,15 +720,25 @@ pub struct VortexConfig {
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill.
-    #[serde(default)]
+    /// the spill. Defaults to 64 MiB so the write path self-spills while the
+    /// tier is small (the per-append clone stays cheap).
+    #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
-    /// trip). `0` disables the age trigger.
-    #[serde(default)]
+    /// trip). `0` disables the age trigger. Defaults to 2 s.
+    #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
+    /// Periodic background mem-tier checkpoint interval in milliseconds, in
+    /// `cdc_durability: memory` mode only. The accelerator spawns a per-table
+    /// background task that checkpoints the RAM tier every interval (mirroring
+    /// the background compactor); this is what advances the deferred source slot
+    /// ack on an idle or pure-upsert stream that never trips a delete/truncate
+    /// event trigger or a write-path cap. `0` disables the periodic task. Defaults
+    /// to 1 s.
+    #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
+    pub cdc_mem_tier_checkpoint_interval_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
     /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
@@ -794,6 +808,35 @@ fn default_inline_flush_max_segments() -> i64 {
 
 fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
+}
+
+/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (64 MiB).
+///
+/// Sized so the write-path spill (`mem_tier_per_table_cap_breached`) self-fires
+/// while the resident tombstone set is still small — frequent small checkpoints
+/// instead of one giant-tier stall. Keeps the per-append clone sub-millisecond
+/// (with the global byte budget as the rarely-hit aggregate backstop).
+fn default_cdc_mem_tier_max_bytes() -> i64 {
+    64 * 1024 * 1024
+}
+
+/// Default RAM-tier age cap for `cdc_durability: memory` (2 s).
+///
+/// Bounds the crash-replay window and forces a checkpoint on a slow-trickle
+/// table that never reaches the byte cap. A fully idle table (zero writes) is
+/// covered by the periodic background checkpoint, not this write-path age check.
+fn default_cdc_mem_tier_max_age_ms() -> u64 {
+    2_000
+}
+
+/// Default periodic mem-tier checkpoint interval for `cdc_durability: memory`
+/// (1 s). The accelerator spawns a per-memory-mode-table background task that
+/// checkpoints the RAM tier every interval (mirroring the background compactor),
+/// which is what advances the deferred source slot ack on an idle/pure-upsert
+/// stream. Set to 0 to disable the periodic task (the write-path caps still
+/// bound hot tables).
+fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
+    1_000
 }
 
 impl VortexConfig {
@@ -898,8 +941,9 @@ impl Default for VortexConfig {
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
             cdc_durability: CdcDurability::default(),
-            cdc_mem_tier_max_bytes: 0,
-            cdc_mem_tier_max_age_ms: 0,
+            cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
+            cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
+            cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_knobs: PinnedTuningKnobs::default(),
         }
@@ -926,6 +970,42 @@ mod tests {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    /// The mem-tier caps + periodic interval must default to NON-ZERO so the
+    /// write-path spill and the periodic checkpoint self-fire (bounding the tier
+    /// and advancing the deferred slot ack). A regression to `0`/`u64::MAX`
+    /// disables both and reopens the unbounded-tier lag gap. Guards both the
+    /// struct default and the serde default (an empty config must inherit them).
+    #[test]
+    fn test_cdc_mem_tier_caps_default_non_zero() {
+        let config = VortexConfig::default();
+        assert!(
+            config.cdc_mem_tier_max_bytes > 0,
+            "cdc_mem_tier_max_bytes must default non-zero so the write-path spill self-fires"
+        );
+        assert!(
+            config.cdc_mem_tier_max_age_ms > 0,
+            "cdc_mem_tier_max_age_ms must default non-zero so cold tables checkpoint"
+        );
+        assert!(
+            config.cdc_mem_tier_checkpoint_interval_ms > 0,
+            "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_bytes, config.cdc_mem_tier_max_bytes,
+            "an empty config must inherit the non-zero byte cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_age_ms, config.cdc_mem_tier_max_age_ms,
+            "an empty config must inherit the non-zero age cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_checkpoint_interval_ms, config.cdc_mem_tier_checkpoint_interval_ms,
+            "an empty config must inherit the non-zero checkpoint interval via serde default"
+        );
     }
 
     #[test]

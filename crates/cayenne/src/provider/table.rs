@@ -2079,6 +2079,14 @@ pub struct CayenneTableProvider {
     /// all clones — when the last `Arc<CayenneTableProvider>` is dropped the
     /// compactor's `JoinHandle::abort` runs and the background task exits.
     background_compactor: Arc<std::sync::OnceLock<super::compaction::BackgroundCompactor>>,
+    /// Per-table periodic mem-tier checkpoint task (`cdc_durability: memory`),
+    /// populated by [`Self::spawn_background_mem_tier_checkpoint`]. Held by
+    /// `Arc<OnceLock<…>>` exactly like [`Self::background_compactor`] so it
+    /// survives [`Self::clone_for_write`] and shares its drop signal across
+    /// clones; when the last `Arc<CayenneTableProvider>` drops, the task aborts.
+    /// `None`/never-spawned in file mode (and when the interval is 0).
+    background_mem_tier_checkpointer:
+        Arc<std::sync::OnceLock<super::compaction::BackgroundMemTierCheckpointer>>,
 }
 
 /// Builder for constructing a `CayenneTableProvider` with optional configuration.
@@ -4958,6 +4966,7 @@ impl CayenneTableProvider {
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
+            background_mem_tier_checkpointer: Arc::new(std::sync::OnceLock::new()),
         };
 
         provider.refresh_deletion_memory_accounting();
@@ -5684,6 +5693,9 @@ impl CayenneTableProvider {
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             background_compactor: Arc::clone(&self.background_compactor),
+            // Shared so the single periodic checkpoint task (spawned on the
+            // original `Arc`) survives writer clones and its drop signal is shared.
+            background_mem_tier_checkpointer: Arc::clone(&self.background_mem_tier_checkpointer),
         }
     }
 
@@ -12300,9 +12312,26 @@ impl CayenneTableProvider {
     fn mem_tier_deletion_maps(
         snapshot: &crate::provider::mem_tier::MemTier,
     ) -> InlinedDeletionMaps {
+        // The tier holds tombstones in persistent (`im::HashMap`) maps; the
+        // merge-on-read filter consumes the std-`HashMap`-backed
+        // `InlinedDeletionMaps`, so materialize a std map by iteration here. This
+        // runs only on the SCAN / CHECKPOINT path (building the removal map), not
+        // per CDC append, so it does not reintroduce the per-append O(tier) tax
+        // the HAMT removed — and the resulting map is identical to the pre-HAMT
+        // representation the filter already expected.
         InlinedDeletionMaps {
-            int64_pk: snapshot.tombstones.int64_pk.clone(),
-            row_keys: snapshot.tombstones.row_keys.clone(),
+            int64_pk: snapshot
+                .tombstones
+                .int64_pk
+                .iter()
+                .map(|(&pk, &seq)| (pk, seq))
+                .collect(),
+            row_keys: snapshot
+                .tombstones
+                .row_keys
+                .iter()
+                .map(|(key, &seq)| (key.clone(), seq))
+                .collect(),
         }
     }
 
@@ -15482,13 +15511,90 @@ impl CayenneTableProvider {
         // the lost compactor drops and aborts its own task.
         self.background_compactor.set(compactor).is_ok()
     }
+
+    /// Spawn the periodic mem-tier checkpoint task for this provider, if memory
+    /// mode is active, the configured interval is non-zero, and no task is
+    /// already spawned. Must be called after the provider is wrapped in an `Arc`
+    /// (the scheduler holds a `Weak<Self>`); the task is owned by the provider
+    /// (stored in `background_mem_tier_checkpointer`) and aborts when the last
+    /// `Arc` drops. A no-op (`false`) for file-mode tables and partitioned
+    /// tables (which are never `is_cdc_memory_mode()`).
+    ///
+    /// Returns `true` if a task was spawned by this call, `false` otherwise.
+    pub fn spawn_background_mem_tier_checkpoint(self: &Arc<Self>) -> bool {
+        if self.background_mem_tier_checkpointer.get().is_some() {
+            return false;
+        }
+        // Gate on memory mode so file-mode and partitioned tables spawn nothing.
+        // The runtime arms the slot advancer lazily on the first replayable
+        // burst, so we do NOT gate on `has_slot_advancer()` here (it would be
+        // false at spawn time and the table would never get a checkpointer);
+        // `run_mem_tier_checkpoint_tick` re-checks the advancer each tick.
+        if !self.is_cdc_memory_mode() {
+            return false;
+        }
+        let Some(interval) = self.context.mem_tier_checkpoint_interval() else {
+            return false;
+        };
+        let Some(checkpointer) = super::compaction::BackgroundMemTierCheckpointer::spawn(
+            Arc::downgrade(self) as std::sync::Weak<dyn super::compaction::MemTierCheckpointRunner>,
+            interval,
+        ) else {
+            return false;
+        };
+        // OnceLock::set fails only if already initialized — race here is fine,
+        // the lost checkpointer drops and aborts its own task.
+        self.background_mem_tier_checkpointer
+            .set(checkpointer)
+            .is_ok()
+    }
+}
+
+#[async_trait::async_trait]
+impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
+    async fn run_mem_tier_checkpoint_tick(&self) {
+        // Only memory-mode tables that the runtime has armed have a deferred
+        // slot ack to advance; everything else has nothing to flush here.
+        if !self.is_cdc_memory_mode() || !self.has_slot_advancer() {
+            return;
+        }
+        // Cheap lock-free early-out: skip taking the checkpoint lock on an idle
+        // tick. `checkpoint_mem_tier` also early-returns `Ok(0)` on an empty
+        // tier, so this is purely to avoid contending the lock with the write
+        // path when there is nothing to do.
+        if self.mem_tier.load().is_empty() {
+            return;
+        }
+        // Serialize against the write-path spill and the event-driven
+        // checkpoints (all take this lock) so two checkpoints for one table can
+        // never run concurrently. A blocking `lock()` (not `try_lock`) is correct:
+        // if a spill is mid-flight, this tick simply waits and then finds an
+        // empty/smaller tier — it never races the clear.
+        let _guard = self.mem_checkpoint_lock.lock().await;
+        if let Err(e) = self.checkpoint_mem_tier().await {
+            // A failed checkpoint must NOT advance the slot — `checkpoint_mem_tier`
+            // already guarantees that (the advancer fires only post-fence). The
+            // deferred committers stay queued and the next tick retries; surface
+            // it as a warning rather than flipping refresh status from a
+            // background task.
+            tracing::warn!(
+                target: "cayenne::mem_tier",
+                table = %self.table_metadata.table_name,
+                "Periodic mem-tier checkpoint failed (deferred slot ack not advanced; will retry next tick): {e}"
+            );
+        }
+    }
+
+    fn mem_tier_checkpoint_target_name(&self) -> &str {
+        &self.table_metadata.table_name
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::CayenneCatalog;
     use crate::metadata::VortexConfig;
-    use crate::provider::compaction::CompactionRunner;
+    use crate::provider::compaction::{CompactionRunner, MemTierCheckpointRunner};
 
     use super::*;
 
@@ -17068,6 +17174,10 @@ mod tests {
     /// and reopening the table from the same durable metastore — exactly what the
     /// runtime does on restart, where the source then re-streams from the slot.
     #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the recording SlotAdvancer is defined inline next to its single use to keep the test self-contained"
+    )]
     async fn mem_tier_crash_before_checkpoint_loses_ram_then_reapply_converges() {
         use arrow::datatypes::{DataType, Field, Schema};
 
@@ -17155,11 +17265,30 @@ mod tests {
             .append_to_mem_tier(vec![int64_id_batch(&[4, 5])], &no_deletions, bytes2, 0)
             .await
             .expect("re-append epoch 2");
-        // This time the epoch is checkpointed durable (the periodic/cap path).
-        reopened
-            .checkpoint_mem_tier()
-            .await
-            .expect("checkpoint succeeds");
+        // This time the epoch is checkpointed durable via the PERIODIC tick path
+        // (`run_mem_tier_checkpoint_tick`), not a manual `checkpoint_mem_tier` —
+        // proving the background task that A1 spawns advances durability
+        // identically to the manual call. The tick gates on `has_slot_advancer()`,
+        // so arm a recording advancer (as the runtime does) and assert it fired
+        // with the flushed epoch.
+        struct TickRecorder(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TickRecorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0
+                    .store(durable_epoch, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        reopened.install_slot_advancer(std::sync::Arc::new(TickRecorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+        reopened.run_mem_tier_checkpoint_tick().await;
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the periodic checkpoint tick fired the slot advancer with the flushed epoch"
+        );
 
         // Converges to the exact set — no loss, no duplicate.
         assert_eq!(
@@ -17177,6 +17306,248 @@ mod tests {
             scan_sorted_ids(&reopened2).await,
             vec![1, 2, 3, 4, 5],
             "checkpointed rows are durable across restart"
+        );
+    }
+
+    /// Build a fresh memory-mode provider (armed-ready) for the periodic-tick /
+    /// cap tests. Returns the provider and the temp dir (keep alive).
+    async fn create_memory_mode_table_with_caps(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        cdc_mem_tier_max_bytes: i64,
+        cdc_mem_tier_max_age_ms: u64,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("init catalog");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::Memory,
+            cdc_mem_tier_max_bytes,
+            cdc_mem_tier_max_age_ms,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, temp_dir)
+    }
+
+    /// A1-T2 — idle/pure-upsert source: the PERIODIC checkpoint tick advances the
+    /// deferred slot ack even though no delete/truncate event trigger ever fires.
+    /// This is the regression guard for the root cause's "0 checkpoints fired on
+    /// pure upserts" finding: appends accumulate in RAM, then a single
+    /// `run_mem_tier_checkpoint_tick()` flushes them and fires the advancer.
+    #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the recording SlotAdvancer is defined inline next to its single use"
+    )]
+    async fn mem_tier_periodic_tick_advances_idle_source_slot() {
+        let runtime_env = SessionContext::new().runtime_env();
+        // Large caps so the WRITE PATH never spills — only the periodic tick can
+        // make this durable, exactly the idle/pure-upsert case under test.
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "idle_periodic",
+            Arc::clone(&runtime_env),
+            i64::MAX,
+            0,
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+
+        struct Recorder(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for Recorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0
+                    .store(durable_epoch, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(Recorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        // A tick on an EMPTY tier is a no-op (no advance, no panic).
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty tier tick advances nothing"
+        );
+
+        // Two pure-upsert bursts (no deletions → no event trigger fires).
+        let no_deletions = OnConflictDeletions::default();
+        let b1 = int64_id_batch(&[1, 2, 3]);
+        let bytes1 = b1.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b1], &no_deletions, bytes1, 0)
+            .await
+            .expect("append epoch 1");
+        let b2 = int64_id_batch(&[4, 5]);
+        let bytes2 = b2.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b2], &no_deletions, bytes2, 0)
+            .await
+            .expect("append epoch 2");
+
+        // The periodic tick flushes the accumulated tier and advances the slot to
+        // the highest flushed epoch (2) — the bug was that nothing ever fired this.
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the periodic tick advanced the deferred slot ack to the flushed epoch"
+        );
+        // Rows are durable: a fresh tier (empty) still scans them back.
+        assert!(provider.mem_tier.load().is_empty(), "tier flushed empty");
+        assert_eq!(
+            scan_sorted_ids(&provider).await,
+            vec![1, 2, 3, 4, 5],
+            "flushed rows are durable and visible after the periodic checkpoint"
+        );
+    }
+
+    /// A1 guard — the periodic tick must NOT fire when the table is memory-mode
+    /// but UNARMED (no slot advancer). An unarmed provider takes the durable
+    /// write path, so it must never have a RAM tier to flush; a tick on it is a
+    /// pure no-op (defensive: the tick re-checks `has_slot_advancer()` so a
+    /// checkpointer spawned at table-open — before the runtime arms — is inert).
+    #[tokio::test]
+    async fn mem_tier_periodic_tick_is_noop_when_unarmed() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "unarmed_periodic",
+            runtime_env,
+            i64::MAX,
+            0,
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode active");
+        assert!(!provider.has_slot_advancer(), "not armed");
+        // Must not panic and must leave the (empty) tier untouched.
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(provider.mem_tier.load().is_empty());
+    }
+
+    /// A2-T1 — write-path BYTE cap self-fires. With a small `cdc_mem_tier_max_bytes`
+    /// the cap predicate trips once accumulated bytes cross it, which on the real
+    /// write path triggers a spill-then-append. Here we drive the predicate +
+    /// append + checkpoint directly to prove the non-zero default actually bounds
+    /// the tier (and the checkpoint advances the slot).
+    #[tokio::test]
+    #[expect(
+        clippy::items_after_statements,
+        reason = "the recording SlotAdvancer is defined inline next to its single use"
+    )]
+    async fn mem_tier_write_path_byte_cap_self_fires() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let one_batch_bytes = int64_id_batch(&[1, 2, 3]).get_array_memory_size() as u64;
+        // Cap at ~1.5 batches so the SECOND append's would-be size breaches it.
+        let cap = one_batch_bytes + one_batch_bytes / 2;
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "byte_cap",
+            runtime_env,
+            i64::try_from(cap).expect("cap fits i64"),
+            0,
+        )
+        .await;
+
+        struct Recorder(std::sync::Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for Recorder {
+            async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+                self.0
+                    .store(durable_epoch, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(std::sync::Arc::new(Recorder(std::sync::Arc::clone(
+            &durable,
+        ))));
+
+        let no_deletions = OnConflictDeletions::default();
+        // First append fits under the cap.
+        assert!(
+            !provider.mem_tier_per_table_cap_breached(one_batch_bytes),
+            "first batch is under the byte cap"
+        );
+        provider
+            .append_to_mem_tier(vec![int64_id_batch(&[1, 2, 3])], &no_deletions, one_batch_bytes, 0)
+            .await
+            .expect("append epoch 1");
+        // A second batch's would-be cumulative size crosses the cap.
+        assert!(
+            provider.mem_tier_per_table_cap_breached(one_batch_bytes),
+            "second batch breaches the byte cap (the write path would spill first)"
+        );
+        // Model the write-path spill: checkpoint, then the tier is durable + slot advanced.
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the spill advanced the deferred slot ack"
+        );
+        assert!(provider.mem_tier.load().is_empty(), "tier spilled empty");
+    }
+
+    /// A2-T2 — write-path AGE cap fires. With a small `cdc_mem_tier_max_age_ms`,
+    /// after one append the tier's age crosses the cap and the predicate trips on
+    /// the next write (even though the byte cap is generous), forcing a spill on a
+    /// slow-trickle table.
+    #[tokio::test]
+    async fn mem_tier_write_path_age_cap_fires() {
+        let runtime_env = SessionContext::new().runtime_env();
+        // Generous byte cap, tiny age cap.
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "age_cap",
+            runtime_env,
+            i64::MAX,
+            10, // 10 ms
+        )
+        .await;
+        struct NoopAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for NoopAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(NoopAdvancer));
+
+        let no_deletions = OnConflictDeletions::default();
+        let b = int64_id_batch(&[1]);
+        let bytes = b.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![b], &no_deletions, bytes, 0)
+            .await
+            .expect("append epoch 1");
+        // Before the age elapses, a small incoming size is NOT cap-breached.
+        assert!(
+            !provider.mem_tier_per_table_cap_breached(bytes),
+            "fresh tier under both byte and age caps"
+        );
+        // Wait past the age cap; now the predicate trips purely on age.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            provider.mem_tier_per_table_cap_breached(bytes),
+            "the age cap fires once the oldest segment is older than the cap"
         );
     }
 
@@ -21903,7 +22274,7 @@ mod tests {
     struct StatsOverrideExec {
         inner: Arc<dyn ExecutionPlan>,
         stats: Statistics,
-        properties: datafusion_physical_plan::PlanProperties,
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
     }
 
     impl StatsOverrideExec {
@@ -21934,7 +22305,7 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn properties(&self) -> &datafusion_physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
