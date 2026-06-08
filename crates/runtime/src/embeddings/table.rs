@@ -770,9 +770,19 @@ impl EmbeddingTable {
                 )),
             ],
             // Scalar + unchunked: one vector per row.
+            //
+            // The inner Float32 field is non-nullable: an embedding vector
+            // never contains null components. A null/empty source string maps
+            // to a null vector via the outer FixedSizeList slot, so the outer
+            // field stays nullable while the inner items do not. This matches
+            // the chunked and multi-vector paths (and the accelerator/index
+            // schemas in `index/duckdb.rs` and `index/elasticsearch`), which
+            // already declare the inner item non-nullable; declaring it
+            // nullable here caused a `FixedSizeList(... nullable: true)` vs
+            // `nullable: false` schema mismatch on the write path (#6911).
             (EmbeddingInputMode::Scalar, false) => vec![Arc::new(Field::new_fixed_size_list(
                 embedding_col!(field.name()),
-                Field::new("item", DataType::Float32, true),
+                Field::new("item", DataType::Float32, false),
                 cfg.vector_size,
                 true,
             ))],
@@ -1558,6 +1568,62 @@ mod tests {
         };
         assert_eq!(*size, 4);
         assert_eq!(leaf.data_type(), &DataType::Float32);
+    }
+
+    /// Regression for #6911: a scalar (unchunked) embedding column produces
+    /// `FixedSizeList<Float32, D>` whose inner `item` field is non-nullable
+    /// (embedding vectors never hold null components). The outer field stays
+    /// nullable so a null source row maps to a null vector. A nullable inner
+    /// field here disagreed with the array the write path actually builds and
+    /// triggered a `nullable: true` vs `nullable: false` schema mismatch.
+    #[test]
+    fn test_embedding_fields_scalar_inner_item_non_nullable() {
+        let c_field = Arc::new(Field::new("c", DataType::Utf8, true));
+        let base_schema = Arc::new(Schema::new(vec![Arc::clone(&c_field)]));
+
+        let embedded_columns = HashMap::from([(
+            "c".to_string(),
+            EmbeddingColumnConfig {
+                model_name: "m".to_string(),
+                vector_size: 4,
+                in_base_table: false,
+                chunker: None,
+                input_mode: EmbeddingInputMode::Scalar,
+            },
+        )]);
+
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
+
+        let table = EmbeddingTable {
+            base_table,
+            embedded_columns,
+            embedding_models: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let fields = table.embedding_fields(&c_field);
+        assert_eq!(
+            fields.len(),
+            1,
+            "scalar unchunked produces no offset column"
+        );
+        let emb = &fields[0];
+        assert_eq!(emb.name(), "c_embedding");
+        assert!(
+            emb.is_nullable(),
+            "outer FixedSizeList field is nullable (null row -> null vector)"
+        );
+        let DataType::FixedSizeList(leaf, size) = emb.data_type() else {
+            panic!("expected FixedSizeList, got {:?}", emb.data_type());
+        };
+        assert_eq!(*size, 4);
+        assert_eq!(leaf.data_type(), &DataType::Float32);
+        assert!(
+            !leaf.is_nullable(),
+            "embedding vector inner item field must be non-nullable"
+        );
     }
 
     #[test]

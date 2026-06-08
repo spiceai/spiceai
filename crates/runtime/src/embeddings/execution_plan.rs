@@ -348,6 +348,23 @@ pub(crate) async fn compute_additional_embedding_columns(
     Ok(embed_arrays)
 }
 
+/// Append a null entry to a `FixedSizeList<Float32>` builder.
+///
+/// The inner Float32 field is non-nullable (an embedding vector never holds
+/// null components), so the fixed-stride placeholder slots are filled with
+/// zeros and only the outer list slot is marked null. The placeholder values
+/// are masked by the parent null and never read at query time.
+#[expect(clippy::cast_sign_loss)]
+fn append_null_vector(
+    builder: &mut FixedSizeListBuilder<PrimitiveBuilder<Float32Type>>,
+    vector_length: i32,
+) {
+    for _ in 0..vector_length as usize {
+        builder.values().append_value(0.0);
+    }
+    builder.append(false);
+}
+
 /// Embed a [`StringArray`] using the provided [`Embed`] model. The output is a [`FixedSizeListArray`],
 /// where each [`String`] gets embedded into a single [`f32`] vector.
 ///
@@ -411,7 +428,7 @@ pub(super) async fn get_vectors(
         vector_length,
         embedded_data.len() + nulls.len(),
     )
-    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
     // Current index into offset of the outputted [`FixedSizeList`].
     let mut output_ptr: usize = 0;
@@ -421,12 +438,13 @@ pub(super) async fn get_vectors(
 
     // Reconstruct correct output order by adding back nulls based on original indexes of nulls.
     for vector in embedded_data {
-        // Keep inserting nulls until we reach the next non-null value.
+        // Keep inserting nulls until we reach the next non-null value. The
+        // inner Float32 field is non-nullable, so a null row appends
+        // placeholder zeros and marks only the outer FixedSizeList slot null.
         while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-            builder.values().append_nulls(vector_length as usize);
+            append_null_vector(&mut builder, vector_length);
             null_ptr += 1;
             output_ptr += 1;
-            builder.append(false);
         }
 
         builder.values().append_slice(&vector);
@@ -436,10 +454,9 @@ pub(super) async fn get_vectors(
 
     // Handle any trailing nulls/empty strings.
     while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-        builder.values().append_nulls(vector_length as usize);
+        append_null_vector(&mut builder, vector_length);
         null_ptr += 1;
         output_ptr += 1;
-        builder.append(false);
     }
 
     Ok(builder.finish())
@@ -460,7 +477,7 @@ pub(super) fn get_vectors_in_process(
         vector_length,
         arr.len(),
     )
-    .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
+    .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
     let pool = build_embedding_pool(model.parallelism())?;
 
@@ -482,8 +499,9 @@ pub(super) fn get_vectors_in_process(
                 builder.values().append_slice(&embedding[0]);
                 builder.append(true);
             } else {
-                builder.values().append_nulls(vector_length as usize);
-                builder.append(false);
+                // Inner Float32 field is non-nullable: append placeholder
+                // zeros and mark only the outer FixedSizeList slot null.
+                append_null_vector(&mut builder, vector_length);
             }
         }
     } else {
@@ -1056,6 +1074,52 @@ mod tests {
         assert_eq!(values.value(3), 0.4);
         assert_eq!(values.value(6), 0.1);
         assert_eq!(values.value(7), 0.2);
+
+        Ok(())
+    }
+
+    /// Regression for #6911: the inner Float32 field of the embedding
+    /// `FixedSizeList` must be non-nullable, and null/empty source rows must
+    /// be encoded only on the outer list slot (with placeholder-zero inner
+    /// values), never as null inner components. A nullable inner field caused
+    /// a `FixedSizeList(... nullable: true)` vs `nullable: false` schema
+    /// mismatch against the accelerator write path.
+    #[tokio::test]
+    async fn test_get_vectors_inner_field_non_nullable()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use arrow::datatypes::DataType;
+
+        let result = get_vectors(
+            vec![None, Some("hello"), Some("")].into_iter(),
+            &MockEmbedder::default().with_pair("hello", vec![0.1, 0.2]),
+            2,
+        )
+        .await?;
+
+        // Inner item field must be declared non-nullable.
+        let DataType::FixedSizeList(inner, size) = result.data_type() else {
+            panic!("expected FixedSizeList, got {:?}", result.data_type());
+        };
+        assert_eq!(*size, 2);
+        assert!(
+            !inner.is_nullable(),
+            "embedding vector inner field must be non-nullable"
+        );
+
+        // Outer slots encode nullness; the inner values buffer holds no nulls.
+        assert_eq!(result.len(), 3);
+        assert!(result.is_null(0));
+        assert!(!result.is_null(1));
+        assert!(result.is_null(2));
+        let values = result.values().as_primitive::<Float32Type>();
+        assert_eq!(values.null_count(), 0, "inner values must contain no nulls");
+        // Null rows are placeholder zeros; the embedded row keeps its values.
+        assert_eq!(values.value(0), 0.0);
+        assert_eq!(values.value(1), 0.0);
+        assert_eq!(values.value(2), 0.1);
+        assert_eq!(values.value(3), 0.2);
+        assert_eq!(values.value(4), 0.0);
+        assert_eq!(values.value(5), 0.0);
 
         Ok(())
     }
