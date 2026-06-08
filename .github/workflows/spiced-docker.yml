@@ -1,5 +1,5 @@
-name: 'spiced docker'
-run-name: 'spiced docker - ${{ github.ref_name }}'
+name: 'build docker'
+run-name: 'build docker - ${{ github.ref_name }}'
 
 on:
   release:

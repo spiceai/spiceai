@@ -1,5 +1,5 @@
-name: 'spiced docker dev'
-run-name: 'spiced docker dev - ${{ github.ref_name }}'
+name: 'build docker dev'
+run-name: 'build docker dev - ${{ github.ref_name }}'
 
 on:
   workflow_dispatch:
