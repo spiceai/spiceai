@@ -2,6 +2,13 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]
 
+# Non-tuned baseline: NO Cayenne/CDC performance tuning — the runtime auto-derives every knob
+# (write concurrency, segment/footer/keyset/metastore caches, compaction triggers, CDC
+# coalescing, file path, metastore backend) from the host. This is the out-of-box reference for
+# the postgres-cayenne[file]-cdc-tuned-* configs. The only non-defaults are the sql_results /
+# task_history toggles below, kept off to match the tuned configs so the comparison isolates the
+# effect of tuning, not caching/history overhead.
+
 postgres_connection_params: &postgres_params
   pg_host: 127.0.0.1
   pg_port: 5432

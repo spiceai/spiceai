@@ -2,21 +2,40 @@ version: v1
 kind: Spicepod
 name: postgres-cayenne[file]-cdc-tuned-sf100
 
-# Target: xlarge-runner — 64 vCPU / 256 GiB RAM, SSD storage.
+# Target: 64 vCPU / 256 GiB RAM, EBS gp3 (m7a.16xlarge-class). Goal: every CDC table under
+# 5s replication lag at SF-100 @ 10K txn/s, with >=5K QPH on the OLAP queries.
 #
-# Key tuning:
-#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384 (runtime max after Lever D
-#     raised CDC_PREFETCH_BUFFER_MAX / CDC_MAX_COALESCED_ENVELOPES_MAX 4096->16384):
-#     larger CDC bursts cut metastore round-trips and keep WAL drain ahead of bursty OLTP.
-#   - target_partitions 64: read-path parallelism matched to vCPU count.
+# Tuning (values validated on the 16-core local SF-100 run — all 7 tables <5s, ~97% of 5K
+# QPH — then scaled to 64c/256GB; the write-path values are core/RAM-invariant because the
+# wall is the single-writer-per-table metastore txn, not CPU or batch size):
+#   - cdc_max_coalesce_age_ms 250 + cdc_max_coalesced_bytes 128 MB: keep CDC applies small and
+#     fresh so they stay inline (4000ms/512 MB regressed — see the note on the linger below).
+#   - cdc_prefetch_buffer / cdc_max_coalesced_envelopes 16384: runtime max; deep prefetch keeps
+#     WAL drain ahead of bursty OLTP without enlarging the per-apply batch.
+#   - target_partitions 64: read-path parallelism matched to vCPU count (drives the QPH goal).
+#   - cayenne_pk_keyset_cache_mb 256 pinned on ALL tables: defeats the backwards memory-aware
+#     auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) and keeps the heavy-update tables
+#     (stock, order_line) on the cheap bloom path (256 = SF-100 sweep optimum).
 #   - per-table cayenne_write_concurrency / segment_cache_mb / compaction_* for the high-volume
-#     upsert tables; reference tables use lighter settings.
+#     upsert tables; reference tables lighter. write_concurrency stays moderate (4/2): lower
+#     fan-out relieves CPU contention for OLAP (validated on the 128-core write-concurrency run).
+#   - metastore/footer caches (1024/1024 MiB, 4096 MiB mmap) are sized to the SF-100 working set,
+#     bounded by catalog/footer size — so 256 GiB adds headroom, not bigger caches.
+#
+# NOTE: validated on 16-core local + the 128-core write-concurrency study; the 64c/256GB
+# end-to-end run is the remaining validation (m7a.16xlarge + gp3).
 runtime:
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
-    cdc_max_coalesced_bytes: '536870912' # 512 MB
-    cdc_max_coalesce_age_ms: '4000'
+    cdc_max_coalesced_bytes: '134217728' # 128 MB
+    # 250ms, NOT 4000: this is a real apply-loop linger (trunk #11196). At 4000ms the caught-up
+    # tables over-coalesce past the 1024-row inline admission cap (customer flips 100%
+    # inline->staged and builds a ~16 GB backlog) while apply-bound tables gain nothing (the
+    # deadline anchors at apply-start). Measured fixed cost ~120-250ms/batch, so ~250ms amortizes
+    # it without overflowing the inline cap. The wall is the single-writer metastore txn (per-row
+    # insert_records WAL), not batch size — bigger bursts don't help; 512 MB/4000ms regressed.
+    cdc_max_coalesce_age_ms: '250'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
     cayenne_footer_cache_mb: '1024'
