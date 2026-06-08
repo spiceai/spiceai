@@ -160,34 +160,6 @@ impl FileOpener for VortexOpener {
         }
 
         Ok(async move {
-            // Create FilePruner when we have a predicate and either dynamic expressions
-            // or file statistics available. The pruner can eliminate files without
-            // opening them based on:
-            // - Partition column values (e.g., date=2024-01-01)
-            // - File-level statistics (min/max values per column)
-            let mut file_pruner = file_pruning_predicate
-                .filter(|p| {
-                    // Only create pruner if we have dynamic expressions or file statistics
-                    // to work with. Static predicates without stats won't benefit from pruning.
-                    is_dynamic_physical_expr(p) || file.has_statistics()
-                })
-                .and_then(|predicate| {
-                    FilePruner::try_new(
-                        Arc::clone(&predicate),
-                        &unified_file_schema,
-                        &file,
-                        Count::default(),
-                    )
-                });
-
-            // Check if this file should be pruned based on statistics/partition values.
-            // Returns empty stream if file can be skipped entirely.
-            if let Some(file_pruner) = file_pruner.as_mut()
-                && file_pruner.should_prune()?
-            {
-                return Ok(stream::empty().boxed());
-            }
-
             let mut open_opts = session
                 .open_options()
                 .with_file_size(file.object_meta.size)
@@ -437,11 +409,7 @@ impl FileOpener for VortexOpener {
                 })
                 .boxed();
 
-            if let Some(file_pruner) = file_pruner {
-                Ok(PrunableStream::new(file_pruner, stream).boxed())
-            } else {
-                Ok(stream)
-            }
+            Ok(stream)
         }
         .in_current_span()
         .boxed())
