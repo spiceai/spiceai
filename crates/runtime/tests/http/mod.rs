@@ -460,7 +460,7 @@ async fn start_runtime_http_server(rt: Arc<Runtime>) -> Result<String, String> {
                 .get(&health_url)
                 .send()
                 .await
-                .map_or(false, |response| response.status().is_success())
+                .is_ok_and(|response| response.status().is_success())
         }
     })
     .await;

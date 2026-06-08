@@ -337,7 +337,7 @@ fn create_test_dataset(
     if let Some(db_file_path) = db_file_path {
         let params = SpicepodParams::from_string_map(
             vec![(
-                format!("{acceleration_engine}_file",),
+                format!("{acceleration_engine}_file"),
                 db_file_path.to_string(),
             )]
             .into_iter()

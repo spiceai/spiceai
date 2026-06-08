@@ -123,7 +123,7 @@ async fn wait_for_mysql_host_port(port: u16) -> Result<(), anyhow::Error> {
 
 #[instrument]
 pub fn get_mysql_conn(port: u16) -> Result<mysql_async::Pool, anyhow::Error> {
-    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb",);
+    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb");
     let opts_builder =
         mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(url.as_str())?);
     let opts = mysql_async::Opts::from(opts_builder);

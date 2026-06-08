@@ -39,7 +39,7 @@ fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
         .output()
-        .map_or(false, |o| o.status.success())
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Initialize a local git repository with a small, deterministic file set so
