@@ -26,7 +26,7 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog, SlotAdvancer};
+use cayenne::{CayenneTableProvider, SlotAdvancer};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -105,13 +105,9 @@ async fn test_listing_file_pruning_disjoint_id_ranges_impl(
     };
 
     let ctx = SessionContext::new();
+    let catalog = Arc::clone(&fixture.catalog);
     let provider = Arc::new(
-        CayenneTableProvider::create_table(
-            fixture.catalog.clone(),
-            table_options,
-            ctx.runtime_env(),
-        )
-        .await?,
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
     );
     ctx.register_table(
         "file_pruning_table",
@@ -190,6 +186,12 @@ async fn test_listing_file_pruning_disjoint_id_ranges_impl(
 async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    struct TestAdvancer;
+    #[async_trait::async_trait]
+    impl SlotAdvancer for TestAdvancer {
+        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+    }
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
@@ -212,7 +214,7 @@ async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
     };
 
     let ctx = SessionContext::new();
-    let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+    let catalog = Arc::clone(&fixture.catalog);
     let provider = Arc::new(
         CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
     );
@@ -233,11 +235,6 @@ async fn test_mem_tier_upsert_point_lookup_not_pruned_by_own_tombstone_impl(
     )
     .await?;
 
-    struct TestAdvancer;
-    #[async_trait::async_trait]
-    impl SlotAdvancer for TestAdvancer {
-        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-    }
     provider.install_slot_advancer(Arc::new(TestAdvancer));
 
     let replacement = RecordBatch::try_new(

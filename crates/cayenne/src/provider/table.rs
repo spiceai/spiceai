@@ -12396,7 +12396,7 @@ impl CayenneTableProvider {
                     visible.statistics.as_ref(),
                     &schema,
                     predicate,
-                )?
+                )
             {
                 continue;
             }
@@ -12424,7 +12424,7 @@ impl CayenneTableProvider {
                     segment.statistics.as_ref(),
                     &schema,
                     predicate,
-                )?
+                )
             {
                 continue;
             }
@@ -14109,8 +14109,9 @@ impl CayenneTableProvider {
             &self.table_metadata.schema,
         ) {
             let num_rows = match statistics.num_rows {
-                DFPrecision::Exact(rows) => i64::try_from(rows).unwrap_or(0),
-                DFPrecision::Inexact(rows) => i64::try_from(rows).unwrap_or(0),
+                DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
+                    i64::try_from(rows).unwrap_or(0)
+                }
                 DFPrecision::Absent => 0,
             };
             if let Err(error) = self
@@ -21435,7 +21436,7 @@ mod tests {
     }
 
     /// When position deletes are pending and the cached aggregate stats are not
-    /// available, `statistics()` must not fall back to raw ListingTable footer
+    /// available, `statistics()` must not fall back to raw `ListingTable` footer
     /// stats. Those stats do not account for the Vortex access-plan deletion
     /// bitmap and can overstate cardinality until maintenance repopulates the
     /// cache.

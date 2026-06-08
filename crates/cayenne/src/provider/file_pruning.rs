@@ -139,31 +139,31 @@ pub(crate) fn should_prune_statistics(
     stats: &Statistics,
     schema: &SchemaRef,
     predicate: &Arc<dyn PhysicalExpr>,
-) -> Result<bool> {
+) -> bool {
     if stats.column_statistics.is_empty() {
-        return Ok(false);
+        return false;
     }
 
     let prunable = PrunableStatistics::new(vec![Arc::new(stats.clone())], Arc::clone(schema));
     let Some(pruning_predicate) =
         build_pruning_predicate(Arc::clone(predicate), schema, &Count::default())
     else {
-        return Ok(false);
+        return false;
     };
 
     match pruning_predicate.prune(&prunable) {
-        Ok(values) => Ok(values.into_iter().all(|matched| !matched)),
+        Ok(values) => values.into_iter().all(|matched| !matched),
         Err(error) => {
             tracing::debug!(
                 error = %error,
                 "Ignoring error building pruning predicate for in-memory segment"
             );
-            Ok(false)
+            false
         }
     }
 }
 
-/// Compute exact min/max/null_count statistics for one or more in-memory batches.
+/// Compute exact min, max, and null-count statistics for one or more in-memory batches.
 #[must_use]
 pub(crate) fn statistics_from_record_batches(
     schema: &SchemaRef,
@@ -183,8 +183,8 @@ pub(crate) fn statistics_from_record_batches(
                 let col = batch.column(col_idx);
                 null_count += col.null_count();
                 let col_stats = ColumnStatsAccumulator::compute_column_stats(col.as_ref());
-                min_value = merge_min(min_value, col_stats.min_value);
-                max_value = merge_max(max_value, col_stats.max_value);
+                min_value = merge_min(&min_value, &col_stats.min_value);
+                max_value = merge_max(&max_value, &col_stats.max_value);
             }
 
             datafusion_common::ColumnStatistics {
@@ -206,13 +206,12 @@ pub(crate) fn statistics_from_record_batches(
 }
 
 fn merge_min(
-    current: datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
-    next: datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
+    current: &datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
+    next: &datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
 ) -> datafusion_common::stats::Precision<datafusion_common::ScalarValue> {
     match (current.get_value(), next.get_value()) {
         (None, None) => datafusion_common::stats::Precision::Absent,
-        (None, Some(v)) => datafusion_common::stats::Precision::Exact(v.clone()),
-        (Some(v), None) => datafusion_common::stats::Precision::Exact(v.clone()),
+        (None, Some(v)) | (Some(v), None) => datafusion_common::stats::Precision::Exact(v.clone()),
         (Some(left), Some(right)) => {
             if left.partial_cmp(right) == Some(std::cmp::Ordering::Greater) {
                 datafusion_common::stats::Precision::Exact(right.clone())
@@ -224,13 +223,12 @@ fn merge_min(
 }
 
 fn merge_max(
-    current: datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
-    next: datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
+    current: &datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
+    next: &datafusion_common::stats::Precision<datafusion_common::ScalarValue>,
 ) -> datafusion_common::stats::Precision<datafusion_common::ScalarValue> {
     match (current.get_value(), next.get_value()) {
         (None, None) => datafusion_common::stats::Precision::Absent,
-        (None, Some(v)) => datafusion_common::stats::Precision::Exact(v.clone()),
-        (Some(v), None) => datafusion_common::stats::Precision::Exact(v.clone()),
+        (None, Some(v)) | (Some(v), None) => datafusion_common::stats::Precision::Exact(v.clone()),
         (Some(left), Some(right)) => {
             if left.partial_cmp(right) == Some(std::cmp::Ordering::Less) {
                 datafusion_common::stats::Precision::Exact(right.clone())
@@ -302,7 +300,7 @@ mod tests {
             .expect("some");
 
         assert!(
-            should_prune_statistics(&stats, &schema, &predicate).expect("prune check"),
+            should_prune_statistics(&stats, &schema, &predicate),
             "segment [1,3] must be pruned for id = 99"
         );
     }
@@ -340,7 +338,7 @@ mod tests {
             .expect("some");
 
         assert!(
-            !should_prune_statistics(&stats, &schema, &predicate).expect("prune check"),
+            !should_prune_statistics(&stats, &schema, &predicate),
             "segment containing id=2 must be kept"
         );
     }
