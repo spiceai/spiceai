@@ -574,7 +574,7 @@ impl JobStore {
         }
 
         // Sort by created_at descending (newest first)
-        jobs.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        jobs.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
 
         Ok(jobs)
     }

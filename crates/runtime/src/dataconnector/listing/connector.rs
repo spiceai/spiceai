@@ -1172,7 +1172,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
-        options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset)?;
+        options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset);
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
@@ -1432,7 +1432,7 @@ fn add_metadata_columns_if_required(
     table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
-) -> DataConnectorResult<ListingOptions> {
+) -> ListingOptions {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
         tracing::debug!(
@@ -1451,10 +1451,10 @@ fn add_metadata_columns_if_required(
                 MetadataColumn::Size => datafusion_datasource::metadata::MetadataColumn::Size,
             })
             .collect();
-        return Ok(options.with_metadata_cols(df_columns));
+        return options.with_metadata_cols(df_columns);
     }
 
-    Ok(options)
+    options
 }
 
 // Returns the prefix of the table URL, e.g. for "s3://mybucket/myfolder" it returns "s3://mybucket/"
@@ -2439,8 +2439,7 @@ mod tests {
             &Url::parse("s3://bucket/prefix/").expect("parse table url"),
             &schema,
             &dataset,
-        )
-        .expect("listing table metadata columns should be accepted");
+        );
 
         assert!(
             !result.metadata_cols.is_empty(),
