@@ -236,7 +236,7 @@ async fn process_single_batch(
     let (schema, arr, _) = updated_record.into_parts();
     let (arrs, fields): (Vec<_>, Vec<_>) = arr
         .into_iter()
-        .zip(&*schema.fields())
+        .zip(schema.fields())
         .sorted_by_key(|(_, f)| f.name())
         .unzip();
 
