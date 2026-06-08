@@ -637,6 +637,18 @@ impl<'a> AppendMutationWriter<'a> {
                 );
                 let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                     .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
+                // Restore the post-validation state consumed by `take_post_validation`
+                // above. The durable fallback path (`try_inline_or_restream`) re-reads
+                // `post_validation`, so without this the on-conflict deletions and
+                // validated-key bookkeeping would be lost — silently skipping conflict
+                // semantics under sustained memory-mode overload (a correctness risk).
+                restore_post_validation(
+                    post_validation,
+                    PostValidationState {
+                        on_conflict_deletions,
+                        validated_keys,
+                    },
+                );
                 return Ok(MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
