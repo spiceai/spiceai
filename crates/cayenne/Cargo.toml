@@ -72,6 +72,7 @@ vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
 duckdb = { workspace = true, features = ["bundled"], optional = true }
+chdb-rust = { version = "1", optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -91,6 +92,7 @@ default = []
 turso = ["dep:turso"]
 partition-table-provider = ["dep:runtime-table-partition"]
 duckdb-bench = ["dep:duckdb"]
+chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }
@@ -108,6 +110,14 @@ tokio-stream = { workspace = true }
 [[bench]]
 harness = false
 name = "metastore_operations"
+
+[[bench]]
+harness = false
+name = "folded_txn_decomposition"
+
+[[bench]]
+harness = false
+name = "insert_record_schema_variants"
 
 [[bench]]
 harness = false
@@ -334,3 +344,23 @@ name = "delta_encoding_sweep"
 [[bench]]
 harness = false
 name = "scan_under_write_attribution"
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_groupby"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_join"
+required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "vs_chdb_scan_under_compaction"
+required-features = ["chdb-bench", "duckdb-bench"]

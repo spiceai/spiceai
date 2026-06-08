@@ -105,6 +105,51 @@ impl std::fmt::Debug for CayenneStagedAppend {
     }
 }
 
+/// RAII guard for the in-flight staging-append registration taken out at the
+/// start of [`CayenneStagedAppend::prepare`].
+///
+/// `prepare` must register the append as in-flight BEFORE awaiting the WAL write
+/// so a concurrent recovery pass cannot treat the not-yet-durable WAL as a crash
+/// leftover. If that `await` is cancelled (the `prepare` future is dropped),
+/// neither the method's error path nor [`PreparedStagedAppend`]'s `Drop` runs —
+/// so without this guard the registration would leak forever, permanently
+/// blocking compaction (`has_inflight_staging_appends`) and skewing recovery
+/// cleanup. The guard unregisters on drop and is [disarmed](Self::disarm) once a
+/// `PreparedStagedAppend` has taken over the registration (its own `Drop` then
+/// owns the unregister).
+struct InflightStagingAppendGuard<'a> {
+    table: &'a CayenneTableProvider,
+    staging_snapshot_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> InflightStagingAppendGuard<'a> {
+    /// Register `staging_snapshot_id` as in-flight and return an armed guard.
+    fn register(table: &'a CayenneTableProvider, staging_snapshot_id: &'a str) -> Self {
+        table.register_inflight_staging_append(staging_snapshot_id);
+        Self {
+            table,
+            staging_snapshot_id,
+            armed: true,
+        }
+    }
+
+    /// Hand the registration off to a constructed `PreparedStagedAppend` so the
+    /// guard no longer unregisters on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightStagingAppendGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.table
+                .unregister_inflight_staging_append(self.staging_snapshot_id);
+        }
+    }
+}
+
 impl CayenneStagedAppend {
     pub(crate) fn from_staged_append_in(
         table: CayenneTableProvider,
@@ -277,10 +322,24 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
-        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+        // Register the in-flight append BEFORE its WAL becomes discoverable on
+        // disk. Recovery treats any committed WAL whose id is not in the
+        // in-flight set as a crash leftover; writing the WAL first opened a
+        // window where a concurrent recovery pass could "recover" — move and
+        // delete — an append that was still being prepared.
+        //
+        // The guard reverts the registration on every early exit that does NOT
+        // hand it to a `PreparedStagedAppend`: a WAL-write error AND cancellation
+        // of this future mid-`await` (when neither the error path below nor
+        // `PreparedStagedAppend::drop` would run, which would otherwise leak the
+        // entry forever and permanently block compaction/recovery cleanup). It is
+        // disarmed once the receipt is built, handing the unregister to its `Drop`.
+        let inflight_guard =
+            InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
+        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .write_staging_wal_for(&self.staging_snapshot_id)
-                .await?;
+                .await
         } else {
             self.table
                 .write_staging_wal_for_target(
@@ -288,10 +347,14 @@ impl CayenneStagedAppend {
                     &self.target_snapshot_id,
                     self.target_kind,
                 )
-                .await?;
-        }
-        self.table
-            .register_inflight_staging_append(&self.staging_snapshot_id);
+                .await
+        };
+        // On a WAL-write error the `?` returns early here and `inflight_guard`
+        // drops, reverting the registration.
+        wal_write?;
+        // WAL is durable; hand the in-flight registration to the receipt, whose
+        // `Drop` now owns the unregister.
+        inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
@@ -1032,6 +1095,21 @@ impl CayenneTableProvider {
             }
         }
 
+        // Exclude the pipelined staged-commit finalize while recovering. The
+        // Stage-B finalize (`apply_under_held_barrier`) moves staged files out
+        // of `_staging/` under `visibility_lock` WITHOUT `write_lock`, while
+        // this recovery runs under `write_lock` only — with no shared lock,
+        // recovery can read a WAL written milliseconds ago by a still-running
+        // finalize and "recover" (move + delete) the staging entries out from
+        // under it (observed live: ENOENT mid-finalize → the changes stream
+        // died permanently with "manual intervention required"). Taking the
+        // visibility lock makes recovery and finalize mutually exclusive.
+        // Lock order is safe: every caller of this function holds `write_lock`
+        // (or runs single-threaded at provider open), matching the staged
+        // publish order `write_lock → visibility_lock`; the finalize task
+        // never takes `write_lock`, so no inversion exists.
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+
         let mut located_wals = self.read_staging_wals().await?;
         // Sort by the staging snapshot id rather than `wal.created_at`. The
         // staging snapshot id is derived from `Uuid::now_v7()` (see
@@ -1315,9 +1393,14 @@ impl CayenneTableProvider {
         // in-flight append is known, clear any orphan pre-WAL staging files
         // and correct the flags so future writes take the fast path. Unparseable
         // committed WALs are errors above; only uncommitted tmp WALs are ignored.
+        //
+        // Cleanup is per-entry (`clear_orphan_staging_dirs`), never a whole-root
+        // delete: an append registering concurrently with this pass must not
+        // lose its staged files (the whole-root variant destroyed a pipelined
+        // finalize's staging dir mid-move — observed live as a permanent
+        // changes-stream failure).
         if !self.has_inflight_staging_appends() {
-            self.staging_may_have_files().store(true, Ordering::Release);
-            self.clear_staging_dir().await?;
+            self.clear_orphan_staging_dirs().await?;
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())

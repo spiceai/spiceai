@@ -2,12 +2,13 @@
 
 ## Supported Versions
 
-Spice.ai has released 1.0-stable 🎉
+Spice.ai has released 2.0-stable 🎉
 
 In the latest major version, the last 2 minor version series are supported for security updates.
 
 | Version | Supported          |
 |---------|--------------------|
+| 2.0.0   | :white_check_mark: |
 | 1.11.6  | :white_check_mark: |
 | 1.11.5  | :white_check_mark: |
 | 1.11.4  | :white_check_mark: |
@@ -15,11 +16,11 @@ In the latest major version, the last 2 minor version series are supported for s
 | 1.11.2  | :white_check_mark: |
 | 1.11.1  | :white_check_mark: |
 | 1.11.0  | :white_check_mark: |
-| 1.10.4  | :white_check_mark: |
-| 1.10.3  | :white_check_mark: |
-| 1.10.2  | :white_check_mark: |
-| 1.10.1  | :white_check_mark: |
-| 1.10.0  | :white_check_mark: |
+| 1.10.4  | :x:                |
+| 1.10.3  | :x:                |
+| 1.10.2  | :x:                |
+| 1.10.1  | :x:                |
+| 1.10.0  | :x:                |
 | 1.9.2   | :x:                |
 | 1.9.1   | :x:                |
 | 1.9.0   | :x:                |

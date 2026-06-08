@@ -157,6 +157,55 @@ impl Default for CayenneAccelerator {
     }
 }
 
+fn parse_u64_aliases_with_hint(
+    acceleration: &Acceleration,
+    keys: &[&str],
+    default: u64,
+    semantic_hint: &str,
+) -> u64 {
+    keys.iter()
+        .find_map(|&key| {
+            acceleration.params.get(key).and_then(|v| {
+                v.parse::<u64>().map_or_else(
+                    |_| {
+                        tracing::warn!(
+                            "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                        );
+                        None
+                    },
+                    Some,
+                )
+            })
+        })
+        .unwrap_or(default)
+}
+
+fn parse_optional_usize<'a>(
+    acceleration: &Acceleration,
+    keys: &'a [&'a str],
+) -> Option<(&'a str, usize)> {
+    keys.iter().find_map(|&key| {
+        acceleration.params.get(key).and_then(|v| {
+            v.parse::<usize>().map_or_else(|_| {
+                tracing::warn!(
+                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+                None
+            }, |value| Some((key, value)))
+            })
+    })
+}
+
+fn parse_usize_aliases(acceleration: &Acceleration, keys: &[&str], default: usize) -> usize {
+    parse_optional_usize(acceleration, keys).map_or(default, |(_, value)| value)
+}
+
+fn parse_usize_aliases_as_i64(acceleration: &Acceleration, keys: &[&str], default: i64) -> i64 {
+    let default_usize = usize::try_from(default).unwrap_or(usize::MAX);
+    let parsed = parse_usize_aliases(acceleration, keys, default_usize);
+    i64::try_from(parsed).unwrap_or(i64::MAX)
+}
+
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
@@ -643,6 +692,42 @@ impl CayenneAccelerator {
                     );
                 }
             }
+
+            // CDC durability mode (file | memory). Memory mode appends CDC
+            // batches to an in-RAM tier and defers the source slot ack to a
+            // checkpoint; it is only meaningful for the small-write/CDC profile,
+            // so it is forced back to `file` for other profiles below. Default
+            // `file` is byte-identical to the pre-feature behavior.
+            if let Some((key, value)) = ["cayenne_cdc_durability", "cdc_durability"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::CdcDurability::parse(value) {
+                    config.cdc_durability = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: file, memory. Defaulting to file."
+                    );
+                }
+            }
+            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
+            {
+                tracing::warn!(
+                    "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; defaulting to `file`."
+                );
+                config.cdc_durability = cayenne::metadata::CdcDurability::File;
+            }
+            config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+                config.cdc_mem_tier_max_bytes,
+            );
+            config.cdc_mem_tier_max_age_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
+                config.cdc_mem_tier_max_age_ms,
+                " (milliseconds)",
+            );
 
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
@@ -1205,8 +1290,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    28,
-    { S3_PARAMS_LEN + 28 },
+    31,
+    { S3_PARAMS_LEN + 31 },
 >(
     S3_PARAMETERS,
     [
@@ -1278,6 +1363,14 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
+        ParameterSpec::component("cdc_durability")
+            .description("Durability mode for the inline CDC write path (refresh_mode: changes). 'file' (default) persists each CDC batch durably before advancing the source slot — byte-identical to the prior behavior. 'memory' appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. Only applies to the small-write/CDC profile and non-partitioned tables.")
+            .one_of(&["file", "memory"])
+            .default("file"),
+        ParameterSpec::component("cdc_mem_tier_max_bytes")
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) disables the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+        ParameterSpec::component("cdc_mem_tier_max_age_ms")
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
@@ -3032,6 +3125,36 @@ mod tests {
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
         );
+    }
+
+    #[tokio::test]
+    async fn test_documented_cdc_mem_tier_params_are_resolved() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: [
+                ("cdc_mem_tier_max_bytes".to_string(), "123456".to_string()),
+                ("cdc_mem_tier_max_age_ms".to_string(), "7890".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+
+        assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
+        assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
     }
 
     #[tokio::test]
