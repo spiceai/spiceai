@@ -263,7 +263,7 @@ impl GithubRestClient {
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()?;
 
         Ok(Self {
@@ -306,7 +306,7 @@ impl GithubRestClient {
 
         let response_status = response.status().as_u16();
         let err_msg =
-            format!("The Github API ({endpoint}) failed with status code {response_status}",);
+            format!("The Github API ({endpoint}) failed with status code {response_status}");
         Err(err_msg.into())
     }
 }

@@ -1737,7 +1737,7 @@ fn scalar_to_json_value(
     value: &ScalarValue,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
-        ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        ScalarValue::Boolean(value) => Ok(value.map_or(Value::Null, Value::Bool)),
         ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
         ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
         ScalarValue::Float64(Some(value)) => number_to_json(*value),

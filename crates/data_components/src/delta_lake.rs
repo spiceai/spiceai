@@ -817,7 +817,7 @@ impl TableProvider for DeltaTable {
             .files
             .iter()
             .flat_map(|file| {
-                file.partition_values.iter().filter_map(|(k, _)| {
+                file.partition_values.keys().filter_map(|k| {
                     let schema = self.schema();
                     // With column mapping, partition value keys use physical names.
                     // Translate to logical name for schema lookup.

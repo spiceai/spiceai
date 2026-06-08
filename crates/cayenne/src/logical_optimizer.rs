@@ -1513,15 +1513,19 @@ fn collect_selective_filter_columns(expr: &Expr, columns: &mut Vec<Column>) {
             collect_literal_comparison_columns(&binary.left, &binary.right, columns);
             collect_literal_comparison_columns(&binary.right, &binary.left, columns);
         }
-        Expr::Between(between) if !between.negated => {
-            if expr_is_literal_like(&between.low) && expr_is_literal_like(&between.high) {
-                collect_columns_from_expr(&between.expr, columns);
-            }
+        Expr::Between(between)
+            if !between.negated
+                && expr_is_literal_like(&between.low)
+                && expr_is_literal_like(&between.high) =>
+        {
+            collect_columns_from_expr(&between.expr, columns);
         }
-        Expr::InList(in_list) if !in_list.negated && !in_list.list.is_empty() => {
-            if in_list.list.iter().all(expr_is_literal_like) {
-                collect_columns_from_expr(&in_list.expr, columns);
-            }
+        Expr::InList(in_list)
+            if !in_list.negated
+                && !in_list.list.is_empty()
+                && in_list.list.iter().all(expr_is_literal_like) =>
+        {
+            collect_columns_from_expr(&in_list.expr, columns);
         }
         Expr::Like(like) if !like.negated && expr_is_literal_like(&like.pattern) => {
             collect_columns_from_expr(&like.expr, columns);

@@ -169,7 +169,7 @@ const SPICE_KEY_PREFIX: &str = "spice_";
 /// Chosen to balance responsiveness to secret rotation against API call volume.
 /// Secret rotation in AWS is typically on the order of hours/days, so a minute
 /// of staleness is acceptable for most workloads.
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(1);
 
 /// Negative-cache TTL for confirmed-missing secrets.
 ///

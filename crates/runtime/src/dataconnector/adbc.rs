@@ -487,7 +487,7 @@ impl AdbcFactory {
         });
         let abort_handle = init_handle.abort_handle();
 
-        let pool = tokio::time::timeout(std::time::Duration::from_secs(120), init_handle)
+        let pool = tokio::time::timeout(std::time::Duration::from_mins(2), init_handle)
             .await
             .map_err(|_elapsed| {
                 abort_handle.abort();

@@ -240,7 +240,7 @@ sudo -u postgres psql -c "CREATE DATABASE {DEFAULT_PG_DATABASE};"
 }
 
 async fn wait_for_instance_running(ec2: &Ec2Client, instance_id: &str) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
 
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -333,7 +333,7 @@ async fn wait_for_postgres(
     password: &str,
     database: &str,
 ) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(10);
 
     loop {
         if tokio::time::Instant::now() > deadline {

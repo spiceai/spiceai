@@ -356,8 +356,7 @@ fn format_timestamp_ms(ms: i64) -> String {
     // Format as RFC3339-like string
     let secs = datetime
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let naive =
         chrono::DateTime::from_timestamp(secs as i64, 0).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     naive.format("%Y-%m-%dT%H:%M:%SZ").to_string()

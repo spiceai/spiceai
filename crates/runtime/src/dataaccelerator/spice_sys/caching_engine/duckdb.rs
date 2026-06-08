@@ -97,6 +97,6 @@ fn list_internal_tables(
         table_names.push((internal_table_name, timestamp));
     }
 
-    table_names.sort_by(|left, right| left.1.cmp(&right.1));
+    table_names.sort_by_key(|left| left.1);
     Ok(table_names)
 }

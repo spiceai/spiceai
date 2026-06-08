@@ -313,7 +313,7 @@ const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
 const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
 const SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS: i64 = 16;
 const SMALL_WRITE_INLINE_FLUSH_MAX_BYTES: i64 = 2 * 1_048_576;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_secs(300);
+const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -396,8 +396,7 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+            .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),

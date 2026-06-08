@@ -1191,7 +1191,7 @@ pub async fn build_s3_object_store_for_validation(
 
     // Use provided settings or defaults
     let effective_unsigned_payload = unsigned_payload.unwrap_or(true);
-    let effective_timeout = timeout.unwrap_or(std::time::Duration::from_secs(120));
+    let effective_timeout = timeout.unwrap_or(std::time::Duration::from_mins(2));
 
     // Configure S3 Express One Zone mode
     tracing::debug!(
@@ -1488,13 +1488,13 @@ async fn build_single_s3_store_for_path(
 
     let retry_config = RetryConfig {
         max_retries: 3,
-        retry_timeout: std::time::Duration::from_secs(600),
+        retry_timeout: std::time::Duration::from_mins(10),
         ..Default::default()
     };
     s3_builder = s3_builder.with_retry(retry_config);
 
     let mut client_options =
-        ClientOptions::default().with_timeout(std::time::Duration::from_secs(120));
+        ClientOptions::default().with_timeout(std::time::Duration::from_mins(2));
 
     s3_builder = s3_builder
         .with_s3_express(true)

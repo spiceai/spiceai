@@ -233,9 +233,7 @@ pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Stat
         .map(|(stats, dtype)| stats_set_to_column_stats(stats, dtype))
         .collect();
 
-    let num_rows = usize::try_from(num_rows)
-        .map(Precision::Exact)
-        .unwrap_or(Precision::Absent);
+    let num_rows = usize::try_from(num_rows).map_or(Precision::Absent, Precision::Exact);
 
     Statistics {
         num_rows,

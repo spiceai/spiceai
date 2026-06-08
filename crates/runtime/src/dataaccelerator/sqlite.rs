@@ -156,7 +156,7 @@ impl SqliteAccelerator {
                 .sqlite_busy_timeout(&acceleration_params)
                 .map_err(|_| InvalidBusyTimeoutValueSnafu.build());
         }
-        Ok(Duration::from_millis(5000))
+        Ok(Duration::from_secs(5))
     }
 
     /// Returns the effective `busy_timeout`, applying storage-profile defaults
@@ -177,8 +177,8 @@ impl SqliteAccelerator {
             return self.sqlite_busy_timeout(source);
         }
         Ok(match storage {
-            ResolvedAccelerationStorage::Ebs => Duration::from_millis(15_000),
-            _ => Duration::from_millis(5_000),
+            ResolvedAccelerationStorage::Ebs => Duration::from_secs(15),
+            _ => Duration::from_secs(5),
         })
     }
 

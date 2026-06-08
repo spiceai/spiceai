@@ -3162,7 +3162,7 @@ impl DataFusion {
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
 
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + Duration::from_mins(1);
             let mut unresolved_dependent_table: Option<TableReference> = None;
 
             for dependent_table_name in &dependent_table_names {

@@ -117,7 +117,7 @@ pub(crate) fn try_extract_in_list_row_keys(
         scalars.push(scalar.clone());
     }
 
-    let array = ScalarValue::iter_to_array(scalars.into_iter()).ok()?;
+    let array = ScalarValue::iter_to_array(scalars).ok()?;
     let array = if array.data_type() == target_type {
         array
     } else {
@@ -264,7 +264,7 @@ fn scalars_to_row_keys(
 ) -> Option<Vec<Box<[u8]>>> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(pk_target_types.len());
     for (pk_idx, values) in pk_column_values.into_iter().enumerate() {
-        let array = ScalarValue::iter_to_array(values.into_iter()).ok()?;
+        let array = ScalarValue::iter_to_array(values).ok()?;
         let target_type = pk_target_types[pk_idx];
         let array = if array.data_type() == target_type {
             array

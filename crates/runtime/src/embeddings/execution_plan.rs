@@ -398,7 +398,7 @@ pub(super) async fn get_vectors(
     // Filter out nulls or empty strings before calling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
         .enumerate()
-        .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
+        .partition(|(_, o)| o.is_none_or(str::is_empty));
     let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
     let column: Vec<String> = values
         .iter()
@@ -908,7 +908,7 @@ async fn get_vectors_with_chunker(
 
     // These are offsets for both the vectors and the content offsets.
     // They tell the [`ListArray`] how many vectors/offsets are in each row of the input/output table.
-    let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
+    let offsets = OffsetBuffer::<i32>::from_lengths(lengths);
 
     let vectors = ListArray::try_new(
         Arc::new(Field::new_fixed_size_list(

@@ -249,8 +249,7 @@ impl ExecutionPlan for SqlServerExecPlan {
             let is_nullable = self
                 .projected_schema
                 .field_with_name(col.name())
-                .map(arrow::datatypes::Field::is_nullable)
-                .unwrap_or(true);
+                .map_or(true, arrow::datatypes::Field::is_nullable);
             if !is_nullable {
                 continue;
             }

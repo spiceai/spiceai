@@ -605,11 +605,11 @@ fn find_top_level_as(s: &str) -> Option<usize> {
                 }
                 depth -= 1;
             }
-            b' ' if depth == 0 => {
+            b' ' if depth == 0
                 // Check for " AS "
-                if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") {
-                    return Some(i);
-                }
+                && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") =>
+            {
+                return Some(i);
             }
             _ => {}
         }

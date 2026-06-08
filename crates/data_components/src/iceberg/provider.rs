@@ -141,7 +141,7 @@ impl IcebergCatalogProvider {
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
             .into_iter()
-            .zip(providers.into_iter())
+            .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
                 (name, provider)
@@ -366,8 +366,7 @@ impl SchemaProvider for IcebergSchemaProvider {
     fn table_exist(&self, name: &str) -> bool {
         self.tables
             .read()
-            .map(|tables| tables.contains_key(name))
-            .unwrap_or(false)
+            .is_ok_and(|tables| tables.contains_key(name))
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {

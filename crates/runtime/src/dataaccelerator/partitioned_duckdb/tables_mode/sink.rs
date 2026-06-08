@@ -473,7 +473,7 @@ impl PartitionTableManager {
             ));
         }
 
-        tables.sort_by(|left, right| left.1.cmp(&right.1));
+        tables.sort_by_key(|left| left.1);
         Ok(tables)
     }
 

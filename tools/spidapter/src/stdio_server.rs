@@ -1202,7 +1202,7 @@ async fn execute_sql_statement(
     statement: &str,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_mins(1))
         .build()?;
 
     let mut attempts = 0;

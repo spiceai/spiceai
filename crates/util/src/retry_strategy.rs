@@ -73,7 +73,7 @@ impl Default for RetryBackoff {
             randomization_factor: 0.3,
             max_retries: None,
             max_duration: None,
-            base_interval: Duration::from_millis(1000),
+            base_interval: Duration::from_secs(1),
         }
     }
 }
@@ -185,7 +185,7 @@ impl Default for RetryBackoffBuilder {
             randomization_factor: 0.3,
             max_retries: None,
             max_duration: None,
-            base_interval: Duration::from_millis(1000),
+            base_interval: Duration::from_secs(1),
         }
     }
 }

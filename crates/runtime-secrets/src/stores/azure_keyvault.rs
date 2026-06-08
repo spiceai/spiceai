@@ -258,7 +258,7 @@ const SPICE_KEY_PREFIX_HYPHEN: &str = "spice-";
 /// Chosen to match the AWS Secrets Manager store — Key Vault secret rotation
 /// is typically manual and on the order of hours/days, so a minute of
 /// staleness is acceptable.
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(1);
 
 /// Negative-cache TTL for confirmed-missing secrets (404 responses).
 ///

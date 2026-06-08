@@ -729,7 +729,7 @@ impl HttpTableProvider {
             ensure!(
                 path.starts_with('/'),
                 ConfigurationSnafu {
-                    message: format!("health_probe path must start with '/'. Got: '{path}'",)
+                    message: format!("health_probe path must start with '/'. Got: '{path}'")
                 }
             );
             ensure!(

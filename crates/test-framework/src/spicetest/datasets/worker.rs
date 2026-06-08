@@ -717,7 +717,7 @@ impl SpiceTestQueryWorker {
                 });
             });
             if result.is_err() {
-                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed");
                 eprintln!("{error_str}");
                 return Err(anyhow::anyhow!(error_str));
             }

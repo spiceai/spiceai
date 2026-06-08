@@ -128,7 +128,7 @@ impl SpiceCloudPlatformCatalogProvider {
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
             .into_iter()
-            .zip(providers.into_iter())
+            .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
                 let name_inner = name.inner();
@@ -253,7 +253,7 @@ impl SpiceCloudPlatformSchemaProvider {
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names
             .into_iter()
-            .zip(table_providers.into_iter())
+            .zip(table_providers)
             .map(|(name, provider)| (name.table().to_string(), provider))
             .collect();
 

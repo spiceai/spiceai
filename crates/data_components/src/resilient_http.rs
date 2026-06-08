@@ -24,11 +24,11 @@ use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
 pub(crate) const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const DEFAULT_HTTP_RETRIES: usize = 3;
-const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
+const MAX_HTTP_BACKOFF: Duration = Duration::from_mins(5);
 pub const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
 
 /// Groups the optional retry, concurrency, and observability knobs accepted by

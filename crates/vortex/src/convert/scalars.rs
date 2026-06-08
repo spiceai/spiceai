@@ -188,42 +188,54 @@ impl FromDataFusion<ScalarValue> for Scalar {
     fn from_df(value: &ScalarValue) -> VortexResult<Scalar> {
         Ok(match value {
             ScalarValue::Null => Scalar::null(DType::Null),
-            ScalarValue::Boolean(b) => b
-                .map(Scalar::from)
-                .unwrap_or_else(|| Scalar::null(DType::Bool(Nullability::Nullable))),
-            ScalarValue::Float16(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F16, Nullability::Nullable))
-            }),
-            ScalarValue::Float32(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F32, Nullability::Nullable))
-            }),
-            ScalarValue::Float64(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F64, Nullability::Nullable))
-            }),
-            ScalarValue::Int8(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I8, Nullability::Nullable))
-            }),
-            ScalarValue::Int16(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I16, Nullability::Nullable))
-            }),
-            ScalarValue::Int32(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable))
-            }),
-            ScalarValue::Int64(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable))
-            }),
-            ScalarValue::UInt8(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U8, Nullability::Nullable))
-            }),
-            ScalarValue::UInt16(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U16, Nullability::Nullable))
-            }),
-            ScalarValue::UInt32(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U32, Nullability::Nullable))
-            }),
-            ScalarValue::UInt64(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable))
-            }),
+            ScalarValue::Boolean(b) => b.map_or_else(
+                || Scalar::null(DType::Bool(Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float16(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float32(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float64(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F64, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int8(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I8, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int16(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int32(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int64(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt8(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U8, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt16(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt32(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt64(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable)),
+                Scalar::from,
+            ),
             ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => {
                 s.as_ref().map_or_else(
                     || Scalar::null(DType::Utf8(Nullability::Nullable)),
