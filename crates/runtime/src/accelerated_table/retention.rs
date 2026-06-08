@@ -195,20 +195,16 @@ impl super::AcceleratedTable {
                 continue;
             };
 
-            match apply_retention_filters_once(&dataset_name, &accelerator, expr, &io_runtime).await
+            if let Ok(num_records) =
+                apply_retention_filters_once(&dataset_name, &accelerator, expr, &io_runtime).await
+                && num_records > 0
+                && let Some(cache_provider) = caching.as_ref()
+                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
             {
-                Ok(num_records) => {
-                    if num_records > 0
-                        && let Some(cache_provider) = caching.as_ref()
-                        && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
-                    {
-                        tracing::error!(
-                            "Failed to invalidate cached results for dataset {}: {e}",
-                            &dataset_name
-                        );
-                    }
-                }
-                Err(_) => {}
+                tracing::error!(
+                    "Failed to invalidate cached results for dataset {}: {e}",
+                    &dataset_name
+                );
             }
         }
     }
