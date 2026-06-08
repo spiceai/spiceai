@@ -57,13 +57,13 @@ use datafusion_table_providers::{
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
     util::{column_reference::ColumnReference, indexes::IndexType},
 };
+use duckdb::AccessMode;
 use futures::StreamExt;
 use itertools::Itertools;
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_table_partition::expression::PartitionedBy;
 use settings::OrderByNonIntegerLiteral;
 use snafu::prelude::*;
-use duckdb::AccessMode;
 use std::collections::HashMap;
 use std::{
     any::Any,

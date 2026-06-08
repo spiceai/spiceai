@@ -35,9 +35,9 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, to_retriable_data_write_error,
 };
+use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
-use duckdb::Transaction;
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 

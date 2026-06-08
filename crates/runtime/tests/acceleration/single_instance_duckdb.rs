@@ -19,8 +19,8 @@ use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use futures::TryStreamExt;
 use duckdb::AccessMode;
+use futures::TryStreamExt;
 
 use anyhow::anyhow;
 use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
