@@ -121,6 +121,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::provider::CayenneAccelerationExec;
+use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
 use crate::provider::scan::{IsCayenneAccelerationExec, ScanDynamicFilter, ScanIdentity};
 
 /// Optimizer rule that rewrites `HashJoinExec` nodes to use `ExactLeftAccumulator`
@@ -983,6 +984,30 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
 
     if let Some(coalesce) = plan.as_any().downcast_ref::<CoalesceBatchesExec>() {
         return flatten_transparent_nodes(coalesce.input());
+    }
+
+    // Deletion-filter execs sit directly above the Cayenne scan whenever
+    // key-deletes are pending. They preserve the child's schema and
+    // partitioning (they only remove deleted rows), so for the purpose of
+    // identifying a Cayenne-backed scan on a join build/probe side they are
+    // transparent — see through them so the dynamic-filter join rewrite still
+    // fires on tables undergoing CDC deletes.
+    if let Some(int64_delete) = plan.as_any().downcast_ref::<Int64PkDeletionFilterExec>() {
+        let children = int64_delete.children();
+        let Some(input) = children.first() else {
+            return plan;
+        };
+
+        return flatten_transparent_nodes(input);
+    }
+
+    if let Some(key_delete) = plan.as_any().downcast_ref::<KeyBasedDeletionFilterExec>() {
+        let children = key_delete.children();
+        let Some(input) = children.first() else {
+            return plan;
+        };
+
+        return flatten_transparent_nodes(input);
     }
 
     if let Some(schema_cast_scan) = plan.as_any().downcast_ref::<SchemaCastScanExec>() {
