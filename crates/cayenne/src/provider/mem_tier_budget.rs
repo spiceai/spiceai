@@ -112,9 +112,11 @@ impl MemTierBudget {
 }
 
 /// Process-wide in-memory CDC tier budget, injected once at startup by the
-/// binary (sized to a fraction of the query memory limit). Replaceable so a
-/// test binary that builds and drops multiple runtimes does not retain a stale
-/// budget (mirrors [`super::write_budget`]).
+/// binary (sized to a fraction of TOTAL system/container memory —
+/// `resource_monitor::get_total_memory() / 8` — and deliberately INDEPENDENT of
+/// the DataFusion query memory pool, since the RAM tier lives off-pool).
+/// Replaceable so a test binary that builds and drops multiple runtimes does not
+/// retain a stale budget (mirrors [`super::write_budget`]).
 static GLOBAL_MEM_TIER_BUDGET: LazyLock<RwLock<Option<MemTierBudget>>> =
     LazyLock::new(|| RwLock::new(None));
 
