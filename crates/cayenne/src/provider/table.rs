@@ -4078,7 +4078,7 @@ impl CayenneTableProvider {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let id = name.to_string_lossy();
-            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
             if is_dir && self.staging_append_is_inflight(&id) {
                 kept_any = true;
                 continue;
