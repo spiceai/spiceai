@@ -33,6 +33,26 @@ use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 const SQLITE_PRAGMA_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
+/// Default WAL-size cap (bytes) for [`SqliteMetastoreConfig::wal_truncate_threshold_bytes`]
+/// — the size above which the background maintenance-tick checkpoint escalates
+/// from PASSIVE to TRUNCATE (cycle-8 TASK A2). See that field for the rationale.
+///
+/// 160 MiB (cycle-10, bracketed by measurement). The sweep at SF-100 @10K txn/s:
+/// at 512 MiB the WAL reached ~370 MB between drains and every writer acquisition
+/// paid the large-WAL overhead (`writer_held` ~219 ms, `wait` 323 ms), each
+/// TRUNCATE costing ~1.9 s (it drained half a gigabyte); at 48 MiB the TRUNCATEs
+/// fired so often their brief writer-lock made writes hostile (`writer_held` rose
+/// to ~307 ms even though the WAL stayed small). 160 MiB sits between the brackets
+/// — TRUNCATEs ~3× rarer than at 48 MiB while the file stays modest for readers —
+/// and the hot COMMIT path still never checkpoints (the A2 invariant).
+const DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 160 * 1024 * 1024;
+// cycle-10 CORRECTION to the 48 MiB rationale above: benchmarked 48 MiB showed the
+// large-WAL acquisition tax was NOT the held-time driver (WAL max 369->77 MB yet
+// writer_held ROSE 219->307 ms) — the frequent TRUNCATEs each briefly block
+// writers, so a tiny cap is read-friendly but write-hostile (QPH 4,261->6,445
+// while CDC lag regressed). 160 MiB sits between the measured brackets:
+// TRUNCATEs ~3x rarer than 48 MiB, WAL stays modest for readers.
+
 /// `auto_vacuum` mode for the metastore DB.
 ///
 /// A high-update upsert table (e.g. `district`) frees pages as it supersedes
@@ -86,8 +106,56 @@ pub struct SqliteMetastoreConfig {
     pub mmap_size_bytes: i64,
     /// `busy_timeout` in milliseconds.
     pub busy_timeout_ms: u64,
-    /// `wal_autocheckpoint` threshold in pages.
+    /// `wal_autocheckpoint` threshold in pages. `0` DISABLES `SQLite`'s inline
+    /// auto-checkpoint entirely (per the `SQLite` docs, a threshold of 0 turns
+    /// auto-checkpointing off).
+    ///
+    /// # WAL-drain contract (cycle-8 TASK A2)
+    ///
+    /// The default is `0` — the inline auto-checkpoint is OFF, so a checkpoint
+    /// (and its blocking main-DB fsync) can NEVER fire from inside a hot CDC
+    /// COMMIT's WAL-write-locked window. This eliminates the invisible inline
+    /// autocheckpoint tax that dominated `writer_held`: a multi-MB tombstone
+    /// payload per txn was tripping the page threshold constantly, folding a
+    /// full checkpoint fsync into the hot COMMIT with no Rust call site for our
+    /// metrics to see.
+    ///
+    /// With the inline checkpoint off, the WAL is drained EXCLUSIVELY off the hot
+    /// path by [`SqliteMetastore::checkpoint_wal`], which runs on a DEDICATED
+    /// connection (never a pool writer slot) on the background maintenance tick
+    /// (`MetadataCatalog::checkpoint_wal`, debounced ~100 ms). That checkpoint is
+    /// PASSIVE by default (never blocks writers, never waits for readers) and
+    /// ESCALATES to TRUNCATE only when the sampled WAL size exceeds
+    /// [`Self::wal_truncate_threshold_bytes`] — a TRUNCATE briefly blocks writers,
+    /// so it is gated behind that size cap and runs ONLY on the maintenance tick, never
+    /// on the hot write path. PASSIVE alone never truncates the WAL file under a
+    /// continuous writer (it cannot reclaim frames past the reader/writer mark),
+    /// so without the size-triggered TRUNCATE the `-wal` file would plateau at its
+    /// high-water mark; the TRUNCATE escalation reclaims it.
+    ///
+    /// Why the WAL cannot grow unbounded with the inline checkpoint off: the
+    /// dedicated-connection checkpoint copies committed frames into the main DB
+    /// every maintenance tick (which fires whenever a write schedules
+    /// maintenance — i.e. continuously under CDC load), and the size-triggered
+    /// TRUNCATE caps the file. A non-zero value here may be set via
+    /// `cayenne_metastore_wal_autocheckpoint_pages` to RE-ENABLE the inline
+    /// backstop (e.g. if the maintenance tick is disabled), but that re-introduces
+    /// the inline-COMMIT fsync tax this default exists to remove.
     pub wal_autocheckpoint_pages: u32,
+    /// WAL-size cap in bytes above which the background maintenance-tick
+    /// checkpoint escalates from PASSIVE to TRUNCATE (cycle-8 TASK A2).
+    ///
+    /// With the inline auto-checkpoint disabled (`wal_autocheckpoint_pages = 0`)
+    /// a PASSIVE checkpoint copies committed frames into the main DB but, under a
+    /// continuous writer, never truncates the `-wal` file — it plateaus at its
+    /// high-water mark. A TRUNCATE reclaims the file but briefly takes the WAL
+    /// write lock, so it is gated behind this cap and runs ONLY on the background
+    /// tick, NEVER on the hot write path. Defaults to
+    /// [`DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES`] (160 MiB — bracketed by
+    /// measurement; see that const's rationale): TRUNCATEs are infrequent enough
+    /// not to tax writers, yet the file stays bounded if a tick lags. `0` makes
+    /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
+    pub wal_truncate_threshold_bytes: u64,
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
     /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
     pub auto_vacuum: SqliteAutoVacuum,
@@ -99,7 +167,19 @@ impl Default for SqliteMetastoreConfig {
             cache_size_mb: 256,
             mmap_size_bytes: 1_073_741_824, // 1 GiB
             busy_timeout_ms: 30_000,
-            wal_autocheckpoint_pages: 10_000,
+            // cycle-8 TASK A2: DISABLE the inline auto-checkpoint (0 = off). The
+            // arc: cycle-5 raised it to 100_000 (~400 MB) to push the inline
+            // checkpoint off the hot path, cycle-6 lowered it to 32_000 (~128 MB)
+            // to bound a measured wal-index-walk tax; cycle-8 MEASURED that even
+            // at 32_000 a multi-MB tombstone payload per txn trips the threshold
+            // constantly, so a checkpoint fsync still landed INSIDE the hot
+            // COMMIT (the dominant, metrics-invisible component of writer_held).
+            // 0 removes that tax entirely: the WAL is drained exclusively by the
+            // dedicated-connection background checkpoint (PASSIVE, escalating to
+            // TRUNCATE past `wal_truncate_threshold_bytes`) on the maintenance
+            // tick. See the field doc for the full drain contract.
+            wal_autocheckpoint_pages: 0,
+            wal_truncate_threshold_bytes: DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES,
             auto_vacuum: SqliteAutoVacuum::None,
         }
     }
@@ -205,6 +285,15 @@ async fn configure_sqlite_connection(
 struct SqliteConnectionPool {
     conns: Vec<Arc<Mutex<tokio_rusqlite::Connection>>>,
     next: AtomicUsize,
+    /// Connection used ONLY by [`SqliteMetastore::checkpoint_wal`] (cycle-8 TASK
+    /// A2). The background maintenance-tick checkpoint runs here so it never
+    /// contends a `conns` slot — a writer that finds every `conns` slot busy
+    /// falls back to `lock_owned()` on `conns[0]`, so reusing `conns[0]` for the
+    /// checkpoint could (rarely) serialize a hot writer behind it. A dedicated
+    /// connection guarantees the off-hot-path drain stays off the hot path even
+    /// under full pool saturation. It still targets the same shared `-wal` file,
+    /// so a single checkpoint here covers the catalog's tables.
+    checkpoint_conn: Arc<Mutex<tokio_rusqlite::Connection>>,
 }
 
 impl SqliteConnectionPool {
@@ -367,9 +456,15 @@ impl SqliteMetastore {
                 for _ in 0..k {
                     conns.push(Arc::new(Mutex::new(self.open_connection().await?)));
                 }
+                // cycle-8 TASK A2: dedicated checkpoint connection (see the field
+                // doc). One extra connection per metastore DB, used only by the
+                // background WAL drain so it never lands on a `conns` slot a hot
+                // writer could fall back to.
+                let checkpoint_conn = Arc::new(Mutex::new(self.open_connection().await?));
                 Ok(Arc::new(SqliteConnectionPool {
                     conns,
                     next: AtomicUsize::new(0),
+                    checkpoint_conn,
                 }))
             })
             .await
@@ -441,15 +536,44 @@ impl SqliteMetastore {
     /// Combined with the delete's sequence number, this enables ordering:
     /// - If `insert_sequence` > `delete_sequence` for a PK, the row is visible
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
+    ///
+    /// The table is keyed directly on `(table_id, pk_bytes)` as a
+    /// `WITHOUT ROWID` composite primary key. The only access paths are
+    /// `WHERE table_id = ?` (a leading-prefix scan, e.g.
+    /// `get_insert_records` / `clear_insert_records`) and the
+    /// `INSERT OR REPLACE` upsert keyed on `(table_id, pk_bytes)`; both are
+    /// served by the composite PK. The previous `insert_record_id` UUID
+    /// `TEXT PRIMARY KEY` was never read, filtered, or joined — it added a
+    /// second B-tree and a 36-byte text alloc per row for no benefit, so it
+    /// is dropped (see `init_schema` for the legacy-schema migration).
+    ///
+    /// `table_id` is stored as the **16 raw bytes of the table's UUID**
+    /// (`BLOB`), not the 36-char hyphenated text. It is the leading field of
+    /// the clustered `WITHOUT ROWID` key and is identical for every row of a
+    /// burst, so the 20-byte/row text→raw-bytes shrink removes ~37% of the WAL
+    /// frames a hot upsert burst writes (it both narrows each cell and packs
+    /// more rows per B-tree leaf). The value is a pure re-encoding of the same
+    /// constant — `cayenne_catalog::table_id_blob` translates the `table_id`
+    /// `&str` once per call at every access path, so the `WHERE table_id = ?`
+    /// prefix scan and the `(table_id, pk_bytes)` upsert conflict target are
+    /// preserved 1:1; the reader (`get_insert_records`) only ever returns
+    /// `pk_bytes` + `sequence_number` and never the key beyond the filter.
+    ///
+    /// The `FOREIGN KEY (table_id) → cayenne_table(table_id)` is intentionally
+    /// **dropped**: under `PRAGMA foreign_keys = ON`, `SQLite` never equates a
+    /// `BLOB` child value to the `TEXT`-affinity parent key, so the FK could
+    /// not be satisfied by the raw-bytes encoding. The cascade it provided was
+    /// belt-and-suspenders — `drop_table` already deletes the insert-records
+    /// explicitly before the parent row, and `metastore::snapshot::import_dataset`
+    /// now clears them explicitly too (it previously leaned on the cascade).
+    /// The table is also fully cleared at every checkpoint/overwrite.
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id TEXT PRIMARY KEY,
-            table_id TEXT NOT NULL,
+            table_id BLOB NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, pk_bytes)
-        )
+            PRIMARY KEY (table_id, pk_bytes)
+        ) WITHOUT ROWID
     ";
 
     /// Schema for the `cayenne_snapshot_sequence` table.
@@ -718,6 +842,77 @@ impl MetastoreBackend for SqliteMetastore {
                     conn.execute("UPDATE cayenne_inlined_delete SET published = 1", [])?;
                 }
 
+                // Migrate a legacy `cayenne_insert_record` to the current shape:
+                // a `WITHOUT ROWID` composite PK `(table_id, pk_bytes)` whose
+                // `table_id` is the 16 raw UUID bytes (`BLOB`) and which carries
+                // no foreign key (see `INSERT_RECORD_TABLE_DDL`). Two legacy
+                // layouts predate this and both store `table_id` as `TEXT`:
+                //   (a) the pre-WITHOUT-ROWID UUID `insert_record_id` TEXT PK +
+                //       redundant `UNIQUE(table_id, pk_bytes)`; and
+                //   (b) the WITHOUT-ROWID composite PK with a TEXT `table_id`
+                //       and a `cayenne_table(table_id)` FOREIGN KEY.
+                // Both are detected by a single check — the declared type of the
+                // `table_id` column is not `BLOB` — and migrated identically.
+                //
+                // The `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing
+                // table untouched, so we recreate it here in the new shape and
+                // copy its rows forward, re-encoding each TEXT `table_id` to the
+                // raw-bytes key via `table_id_to_key_bytes` (the same function the
+                // write path uses, guaranteeing the migrated key matches what the
+                // reader/upsert produce). The table is ephemeral (cleared at every
+                // checkpoint via commit_compaction / commit_overwrite and
+                // recoverable from the snapshot), so the copy-forward only
+                // preserves in-flight pre-checkpoint re-insert sequences across
+                // the upgrade — but it does so at trivial cost and keeps the
+                // upgrade lossless. Runs inside the schema-init transaction so the
+                // swap is atomic.
+                let table_id_is_blob = conn
+                    .prepare("PRAGMA table_info('cayenne_insert_record')")?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })?
+                    .collect::<Result<Vec<(String, String)>, _>>()?
+                    .iter()
+                    .any(|(name, col_type)| {
+                        name == "table_id" && col_type.eq_ignore_ascii_case("BLOB")
+                    });
+                if !table_id_is_blob {
+                    // Read the legacy rows out (TEXT `table_id`), re-encode the
+                    // `table_id` in Rust, then re-insert into the new BLOB table.
+                    let legacy_rows: Vec<(String, Vec<u8>, i64)> = conn
+                        .prepare(
+                            "SELECT table_id, pk_bytes, sequence_number FROM cayenne_insert_record",
+                        )?
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    conn.execute_batch(
+                        "DROP TABLE cayenne_insert_record;
+                        CREATE TABLE cayenne_insert_record (
+                            table_id BLOB NOT NULL,
+                            pk_bytes BLOB NOT NULL,
+                            sequence_number BIGINT NOT NULL,
+                            PRIMARY KEY (table_id, pk_bytes)
+                        ) WITHOUT ROWID;",
+                    )?;
+
+                    if !legacy_rows.is_empty() {
+                        let mut stmt = conn.prepare(
+                            "INSERT OR REPLACE INTO cayenne_insert_record \
+                             (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                        )?;
+                        for (table_id_text, pk_bytes, sequence_number) in legacy_rows {
+                            stmt.execute(rusqlite::params![
+                                crate::metastore::table_id_to_key_bytes(&table_id_text),
+                                pk_bytes,
+                                sequence_number,
+                            ])?;
+                        }
+                    }
+                }
+
                 Ok::<_, rusqlite::Error>(())
             })
             .await
@@ -772,11 +967,21 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+        // METRIC 1: a bare autocommit write statement. Wait = pool-slot acquire
+        // (the WAL writer lock is taken implicitly by the statement itself); held
+        // = the statement's run. Labeled `txn="other"` — this generic path cannot
+        // cheaply know the originating catalog stage.
+        let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
+        telemetry::track_cayenne_metastore_writer_wait(
+            wait_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.into_iter().map(to_sqlite_value).collect();
 
+        let held_start = std::time::Instant::now();
         guard
             .call(move |conn| {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
@@ -788,6 +993,10 @@ impl MetastoreBackend for SqliteMetastore {
             })
             .await
             .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+        telemetry::track_cayenne_metastore_writer_held(
+            held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
         Ok(())
     }
@@ -931,6 +1140,14 @@ impl MetastoreBackend for SqliteMetastore {
     }
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
+        // METRIC 1 (writer wait): wall-clock from the start of acquisition through
+        // a held BEGIN IMMEDIATE. This is the WAL-serialized writer queueing cost —
+        // the pool-slot lock plus SQLite's reserved-lock acquire (the busy-timeout
+        // wait when another writer holds the lock). No `txn` stage label here: the
+        // generic backend `begin_transaction` cannot cheaply know which catalog
+        // stage opened it without threading a parameter through every call site,
+        // so it records `"other"`.
+        let wait_start = std::time::Instant::now();
         let guard = self.pool().await?.acquire().await;
 
         // Defensively clear any leftover transaction state before BEGIN. A
@@ -958,8 +1175,18 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to begin transaction: {e}"),
                 },
             )?;
+        telemetry::track_cayenne_metastore_writer_wait(
+            wait_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
 
-        Ok(Box::new(SqliteTransaction { conn: Some(guard) }))
+        // METRIC 1 (writer held): the reserved write lock is held from this BEGIN
+        // until commit/rollback/drop. Stamp the start so `SqliteTransaction` can
+        // record the hold duration when it releases the guard.
+        Ok(Box::new(SqliteTransaction {
+            conn: Some(guard),
+            held_start: std::time::Instant::now(),
+        }))
     }
 
     async fn shutdown(&self) -> CatalogResult<()> {
@@ -1009,6 +1236,104 @@ impl MetastoreBackend for SqliteMetastore {
 
         Ok(())
     }
+
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
+        // cycle-8 TASK A2: the SOLE WAL drain. With the inline auto-checkpoint
+        // disabled (`wal_autocheckpoint_pages = 0`) no checkpoint ever fires from
+        // a hot CDC COMMIT; this background-tick checkpoint is now the only thing
+        // that copies committed frames into the main DB. It runs on a DEDICATED
+        // connection (never a `conns` writer slot — see the field doc) so it can
+        // never serialize a hot writer.
+        //
+        // Mode: PASSIVE by default (never blocks writers, never waits for
+        // readers; a busy WAL just leaves frames for the next tick). A PASSIVE
+        // checkpoint under a continuous writer copies frames but never TRUNCATEs
+        // the `-wal` file, so the file plateaus at its high-water mark. We
+        // ESCALATE to TRUNCATE only when the sampled size exceeds the configured
+        // `wal_truncate_threshold_bytes` — TRUNCATE briefly takes the WAL write
+        // lock, which is acceptable on this off-hot-path background tick (and
+        // bounds the file) but would be unacceptable on the hot path, which is
+        // exactly why the inline auto-checkpoint is off.
+        let Some(pool) = self.pool.get() else {
+            return Ok(());
+        };
+        let conn = &pool.checkpoint_conn;
+        let guard = conn.lock().await;
+
+        // Sample the -wal size BEFORE the checkpoint to pick the mode (cheap
+        // stat()). Past the cap we TRUNCATE to reclaim the file; otherwise
+        // PASSIVE keeps writers unblocked. The pre-checkpoint sample is the size
+        // the truncate decision must be based on (the post-checkpoint sample
+        // below is the resulting drained size for the gauge).
+        let wal_bytes_before = self.read_wal_bytes().await;
+        let truncate = wal_bytes_before > sqlite_metastore_config().wal_truncate_threshold_bytes;
+        let mode_label = if truncate {
+            "truncate_background"
+        } else {
+            "passive_background"
+        };
+
+        // METRIC 2 (checkpoint duration): time the checkpoint with the chosen
+        // background mode (this IS the off-hot-path background drain).
+        let checkpoint_start = std::time::Instant::now();
+        guard
+            .call(move |conn| {
+                let journal_mode: String =
+                    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                if journal_mode.eq_ignore_ascii_case("wal") {
+                    // wal_checkpoint returns (busy, log, checkpointed). TRUNCATE
+                    // reclaims the file once frames are copied; PASSIVE leaves the
+                    // file in place for reuse. A TRUNCATE that finds the WAL busy
+                    // returns busy=1 and does partial work — never an error, so
+                    // the next tick retries (the cap re-trips).
+                    let pragma = if truncate {
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    } else {
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    };
+                    let _: (i32, i32, i32) = conn.query_row(pragma, [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to checkpoint catalog WAL: {e}"),
+                },
+            )?;
+        telemetry::track_cayenne_metastore_checkpoint(
+            checkpoint_start.elapsed(),
+            &[telemetry::KeyValue::new("mode", mode_label)],
+        );
+        // METRIC 2 (WAL bytes): sample the -wal file size right after the
+        // checkpoint copied as many frames as it could. A cheap stat(); a missing
+        // file (just truncated) reports 0.
+        self.sample_wal_bytes().await;
+        Ok(())
+    }
+}
+
+impl SqliteMetastore {
+    /// Read the current `-wal` file size in bytes (cheap `stat()`), without
+    /// recording it. Best-effort: a missing or unreadable file reports 0 (the WAL
+    /// was truncated or not yet created).
+    ///
+    /// `tokio::fs::metadata` (not `std::fs`): this runs on the async maintenance
+    /// tick, so a blocking stat would stall a Tokio worker thread (PR #11206
+    /// review).
+    async fn read_wal_bytes(&self) -> u64 {
+        let wal_path = format!("{}-wal", self.db_path());
+        tokio::fs::metadata(&wal_path).await.map_or(0, |m| m.len())
+    }
+
+    /// Sample the current `-wal` file size and publish it to the METRIC 2
+    /// `cayenne_metastore_wal_bytes` gauge.
+    async fn sample_wal_bytes(&self) {
+        let bytes = self.read_wal_bytes().await;
+        telemetry::track_cayenne_metastore_wal_bytes(bytes, &[]);
+    }
 }
 
 /// A transaction on a `SQLite` metastore connection.
@@ -1023,11 +1348,27 @@ impl MetastoreBackend for SqliteMetastore {
 pub struct SqliteTransaction {
     /// Exclusive lock on the connection. `None` after commit/rollback.
     conn: Option<OwnedMutexGuard<tokio_rusqlite::Connection>>,
+    /// When the reserved write lock was acquired (BEGIN IMMEDIATE returned), used
+    /// to record METRIC 1 `cayenne_metastore_writer_held_ms` on
+    /// commit/rollback/drop.
+    held_start: std::time::Instant,
 }
 
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // A drop without an explicit commit/rollback still held the write
+            // lock for this long. Recording the held duration HERE (before the
+            // rollback) is correct on this path — unlike the commit/rollback
+            // paths where the metric was moved AFTER the awaited rollback — because
+            // the rollback below is SPAWNED detached (fire-and-forget on the
+            // bg connection thread): this Drop returns immediately and the
+            // synchronous writer-held window genuinely ends now, not when the
+            // detached rollback later completes.
+            telemetry::track_cayenne_metastore_writer_held(
+                self.held_start.elapsed(),
+                &[telemetry::KeyValue::new("txn", "other")],
+            );
             // Best-effort rollback — fire and forget since we're in drop.
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
@@ -1140,8 +1481,21 @@ impl MetastoreTransaction for SqliteTransaction {
             })
             .await;
 
+        // METRIC 1 (writer held): record AFTER the write lock is actually
+        // released. On success that is when COMMIT returns (the BEGIN IMMEDIATE
+        // lock is held through COMMIT's fsync, so a contending writer blocks
+        // until then). On a failed COMMIT the lock persists until the
+        // best-effort ROLLBACK below completes, so that path records after the
+        // rollback instead — recording any earlier under-reports the hold
+        // window the next writer queues behind (PR #11206 review).
         match commit_result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                telemetry::track_cayenne_metastore_writer_held(
+                    self.held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
+                Ok(())
+            }
             Err(e) => {
                 // Best-effort rollback to leave the connection in a clean state.
                 let _ = conn
@@ -1150,6 +1504,11 @@ impl MetastoreTransaction for SqliteTransaction {
                         Ok::<_, rusqlite::Error>(())
                     })
                     .await;
+
+                telemetry::track_cayenne_metastore_writer_held(
+                    self.held_start.elapsed(),
+                    &[telemetry::KeyValue::new("txn", "other")],
+                );
 
                 Err(CatalogError::Database {
                     message: format!("Failed to commit transaction: {e}"),
@@ -1163,17 +1522,584 @@ impl MetastoreTransaction for SqliteTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
-        conn.call(|conn| {
-            conn.execute_batch("ROLLBACK")?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+        let rollback_result = conn
+            .call(|conn| {
+                conn.execute_batch("ROLLBACK")?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await;
+
+        // METRIC 1 (writer held): record AFTER ROLLBACK — the write lock is held
+        // through the rollback statement, so include its duration (PR #11206).
+        telemetry::track_cayenne_metastore_writer_held(
+            self.held_start.elapsed(),
+            &[telemetry::KeyValue::new("txn", "other")],
+        );
+
+        rollback_result.map_err(|e: tokio_rusqlite::Error<rusqlite::Error>| {
+            CatalogError::Database {
                 message: format!("Failed to rollback transaction: {e}"),
-            },
-        )?;
+            }
+        })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metastore::{ExecuteParams, MetastoreValue, QueryParams, QueryRowParams};
+    use std::fmt::Write;
+
+    /// `SQLITE_METASTORE_CONFIG` is process-wide and read at connection-open
+    /// time (and, for the truncate threshold, at `checkpoint_wal` time). The
+    /// cycle-8 TASK A2 tests below mutate it, so they serialize through this lock
+    /// and each sets the exact config it needs while holding it. NOTE: this only
+    /// serializes the tests WITHIN this module — it does NOT prevent a cayenne
+    /// test in another module of the same test binary from observing the global
+    /// override while one of these holds the lock. That is acceptable because the
+    /// other suites don't assert on this config; if one ever did, it would need
+    /// its own coordination. A `tokio` Mutex (not `std`) so the guard can be held
+    /// across the `.await`s in the test body (the writes are tiny) without the
+    /// held-guard-across-await lint.
+    static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn temp_metastore() -> (tempfile::TempDir, SqliteMetastore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cayenne_test.db");
+        let metastore = SqliteMetastore::new(format!("sqlite://{}", db_path.display()));
+        (dir, metastore)
+    }
+
+    /// Create a tiny table and append `n` rows each carrying a ~`blob_kib` KiB
+    /// blob, growing the WAL. With `wal_autocheckpoint = 0` (TASK A2 default) the
+    /// engine never drains it inline, so the `-wal` file accumulates every frame.
+    async fn grow_wal(metastore: &SqliteMetastore, n: usize, blob_kib: usize) {
+        metastore
+            .execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, payload BLOB)")
+            .await
+            .expect("create table");
+        let blob = vec![0xABu8; blob_kib * 1024];
+        for i in 0..i64::try_from(n).unwrap_or(i64::MAX) {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT INTO t (id, payload) VALUES (?1, ?2)",
+                    params: vec![
+                        MetastoreValue::Integer(i),
+                        MetastoreValue::Blob(blob.clone()),
+                    ],
+                })
+                .await
+                .expect("insert row");
+        }
+    }
+
+    /// TASK A2: a connection opened under the default config has the inline WAL
+    /// auto-checkpoint DISABLED (`PRAGMA wal_autocheckpoint` returns 0), so a
+    /// checkpoint can never fire inside a hot COMMIT.
+    #[tokio::test]
+    async fn test_wal_autocheckpoint_disabled_by_default() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        // Read the live pragma off an actual pooled connection (round-trips
+        // through the same open path a writer uses).
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.conns[0].lock().await;
+        let autocheckpoint: i64 = guard
+            .call(|conn| conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0)))
+            .await
+            .expect("read pragma");
+        assert_eq!(
+            autocheckpoint, 0,
+            "inline WAL auto-checkpoint must be disabled (0) by default so no checkpoint fsync lands inside a hot CDC COMMIT"
+        );
+
+        // The dedicated checkpoint connection must also have it disabled.
+        let cp_guard = pool.checkpoint_conn.lock().await;
+        let cp_autocheckpoint: i64 = cp_guard
+            .call(|conn| conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0)))
+            .await
+            .expect("read pragma on checkpoint conn");
+        assert_eq!(cp_autocheckpoint, 0);
+    }
+
+    /// TASK A2: with the inline checkpoint off, the background `checkpoint_wal`
+    /// is the SOLE drain. Force the TRUNCATE escalation (threshold = 0) and
+    /// assert it reclaims a grown `-wal` file — proving the off-hot-path drain
+    /// keeps the WAL bounded without the inline backstop.
+    #[tokio::test]
+    async fn test_background_checkpoint_truncates_grown_wal() {
+        let _guard = CONFIG_LOCK.lock().await;
+        // threshold = 0 → every background checkpoint escalates to TRUNCATE.
+        set_sqlite_metastore_config(SqliteMetastoreConfig {
+            wal_truncate_threshold_bytes: 0,
+            ..SqliteMetastoreConfig::default()
+        });
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        // Grow the WAL: ~64 rows × 64 KiB ≈ 4 MiB of frames that the disabled
+        // inline auto-checkpoint never drained.
+        grow_wal(&metastore, 64, 64).await;
+        let wal_before = metastore.read_wal_bytes().await;
+        assert!(
+            wal_before > 1024 * 1024,
+            "expected the WAL to accumulate (no inline checkpoint); got {wal_before} bytes"
+        );
+
+        metastore.checkpoint_wal().await.expect("checkpoint");
+
+        let wal_after = metastore.read_wal_bytes().await;
+        assert!(
+            wal_after < wal_before,
+            "background checkpoint must drain the WAL: before={wal_before} after={wal_after}"
+        );
+        // TRUNCATE reclaims the file outright in a quiescent DB (no other writer
+        // holds frames), so it should collapse to ~0.
+        assert!(
+            wal_after <= 64 * 1024,
+            "TRUNCATE-mode background checkpoint should reclaim the -wal file; after={wal_after} bytes"
+        );
+
+        // The data survived the drain (frames were copied into the main DB before
+        // truncation) — read it back through a fresh query.
+        let count: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM t",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count rows");
+        assert_eq!(count, 64, "all rows must be durable after the WAL drain");
+
+        // Restore the default so the non-zero threshold does not leak to other
+        // crate tests that open metastores concurrently with the lock released.
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+    }
+
+    /// TASK A2: the default PASSIVE background checkpoint (WAL well under the
+    /// 160 MiB cap, `DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES`) drains the accumulated
+    /// frames into the main DB without requiring TRUNCATE. After it runs, an
+    /// independent TRUNCATE finds nothing left to copy and reclaims the file —
+    /// proving PASSIVE fully checkpointed.
+    #[tokio::test]
+    async fn test_background_passive_checkpoint_drains_into_main_db() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        grow_wal(&metastore, 32, 64).await;
+        let wal_before = metastore.read_wal_bytes().await;
+        assert!(wal_before > 0, "WAL should hold frames before the drain");
+
+        // Default threshold (160 MiB) ⇒ PASSIVE (our ~2 MiB WAL is far below it).
+        metastore
+            .checkpoint_wal()
+            .await
+            .expect("passive checkpoint");
+
+        // PASSIVE copies frames into the main DB but does not truncate the file;
+        // prove the copy happened by checking an independent TRUNCATE on the
+        // dedicated conn now reports `log == checkpointed` (everything already in
+        // the main DB) and the file collapses to ~0.
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.checkpoint_conn.lock().await;
+        let (busy, log, checkpointed): (i64, i64, i64) = guard
+            .call(|conn| {
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+            })
+            .await
+            .expect("follow-up truncate");
+        drop(guard);
+        assert_eq!(
+            busy, 0,
+            "no writer should be blocking the follow-up checkpoint"
+        );
+        assert_eq!(
+            log, checkpointed,
+            "the prior PASSIVE checkpoint should have copied every frame into the main DB (log={log}, checkpointed={checkpointed})"
+        );
+
+        let wal_after = metastore.read_wal_bytes().await;
+        assert!(
+            wal_after <= 64 * 1024,
+            "WAL should be reclaimed after a full drain; after={wal_after} bytes"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // cycle-11: `cayenne_insert_record` WITHOUT ROWID composite-PK schema.
+    // cycle-12: `table_id` stored as the raw-UUID-bytes BLOB (no FK).
+    // ------------------------------------------------------------------
+
+    /// Read the ordered column names of a table off a live pooled connection.
+    async fn table_columns(metastore: &SqliteMetastore, table: &str) -> Vec<String> {
+        let table = table.to_string();
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.conns[0].lock().await;
+        guard
+            .call(move |conn| {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table}')"))?;
+                let cols: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<Vec<String>, rusqlite::Error>(cols)
+            })
+            .await
+            .expect("table_info")
+    }
+
+    /// Read the declared type of one column off a live pooled connection.
+    async fn column_type(metastore: &SqliteMetastore, table: &str, column: &str) -> String {
+        let table = table.to_string();
+        let column = column.to_string();
+        let pool = metastore.pool().await.expect("pool");
+        let guard = pool.conns[0].lock().await;
+        guard
+            .call(move |conn| {
+                conn.query_row(
+                    &format!("SELECT type FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    [&column],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .expect("column type")
+    }
+
+    /// A fresh `cayenne_insert_record` has exactly the 3 composite-PK columns
+    /// (no `insert_record_id`), is a `WITHOUT ROWID` table, stores `table_id`
+    /// as a `BLOB`, and carries no foreign key.
+    #[tokio::test]
+    async fn test_insert_record_schema_is_without_rowid_composite_pk() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        let cols = table_columns(&metastore, "cayenne_insert_record").await;
+        assert_eq!(
+            cols,
+            vec!["table_id", "pk_bytes", "sequence_number"],
+            "the never-read insert_record_id UUID column must be gone"
+        );
+
+        // `table_id` is the raw-UUID-bytes BLOB (cycle-12 WAL-volume lever).
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "table_id must be declared BLOB (16 raw UUID bytes, not 36-char text)"
+        );
+
+        // The foreign key was dropped (a BLOB child cannot satisfy the TEXT
+        // parent key under foreign_keys=ON); foreign_key_list must be empty.
+        let fk_count: i64 = {
+            let pool = metastore.pool().await.expect("pool");
+            let g = pool.conns[0].lock().await;
+            g.call(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_list('cayenne_insert_record')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .expect("fk list")
+        };
+        assert_eq!(
+            fk_count, 0,
+            "cayenne_insert_record must carry no foreign key (BLOB table_id)"
+        );
+
+        // WITHOUT ROWID tables have no implicit `rowid`; selecting it errors.
+        let pool = metastore.pool().await.expect("pool");
+        let g = pool.conns[0].lock().await;
+        let has_rowid = g
+            .call(|conn| {
+                Ok::<bool, rusqlite::Error>(
+                    conn.query_row(
+                        "SELECT rowid FROM cayenne_insert_record LIMIT 1",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .is_ok(),
+                )
+            })
+            .await
+            .expect("rowid probe");
+        assert!(
+            !has_rowid,
+            "cayenne_insert_record must be WITHOUT ROWID (no implicit rowid column)"
+        );
+    }
+
+    /// INSERT OR REPLACE on a duplicate `(table_id, pk_bytes)` updates the
+    /// sequence in place and keeps exactly one row (the composite PK is the
+    /// conflict target the catalog relies on). The `table_id` is bound as the
+    /// raw-UUID-bytes BLOB, matching the production write path.
+    #[tokio::test]
+    async fn test_insert_record_duplicate_pk_upserts_sequence() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        // No FK to satisfy any more, but a realistic UUID table_id is used so
+        // the raw-bytes encoding is exercised.
+        let table_id = uuid::Uuid::now_v7().to_string();
+        let table_id_blob = crate::metastore::table_id_to_key_bytes(&table_id);
+
+        for seq in [11_i64, 42] {
+            // Second iteration upserts the SAME (table_id, pk_bytes) → REPLACE.
+            metastore
+                .execute(ExecuteParams {
+                    sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
+                    params: vec![
+                        MetastoreValue::Blob(table_id_blob.clone()),
+                        MetastoreValue::Blob(b"pk-dup".to_vec()),
+                        MetastoreValue::Integer(seq),
+                    ],
+                })
+                .await
+                .expect("upsert insert record");
+        }
+
+        let (count, seq): (i64, i64) = {
+            let table_id_blob = table_id_blob.clone();
+            let pool = metastore.pool().await.expect("pool");
+            let g = pool.conns[0].lock().await;
+            g.call(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*), MAX(sequence_number) FROM cayenne_insert_record WHERE table_id = ?1",
+                    [&table_id_blob],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .expect("read back")
+        };
+        assert_eq!(
+            count, 1,
+            "duplicate (table_id, pk_bytes) must collapse to one row"
+        );
+        assert_eq!(seq, 42, "the later upsert's sequence must win");
+    }
+
+    /// `DELETE FROM cayenne_insert_record WHERE table_id = ?` (the checkpoint
+    /// clear) empties only the target table's rows — still served by the
+    /// leading-prefix of the composite PK with the BLOB `table_id`. Rows seeded
+    /// via a BLOB hex literal (mirroring the `commit_*_in_txn` batch path) and
+    /// a second table's row stays untouched.
+    #[tokio::test]
+    async fn test_insert_record_checkpoint_clear_by_table_id() {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+        metastore.init_schema().await.expect("init schema");
+
+        let table_id = uuid::Uuid::now_v7().to_string();
+        let other_table_id = uuid::Uuid::now_v7().to_string();
+        let table_id_blob = crate::metastore::table_id_to_key_bytes(&table_id);
+        // Build the `x'..'` BLOB literal of the raw UUID bytes.
+        let blob_lit = |id: &str| {
+            let bytes = crate::metastore::table_id_to_key_bytes(id);
+            let hex = bytes.iter().fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+            format!("x'{hex}'")
+        };
+        let tid_lit = blob_lit(&table_id);
+        let other_lit = blob_lit(&other_table_id);
+        metastore
+            .execute_batch(&format!(
+                "INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({tid_lit}, x'01', 1); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({tid_lit}, x'02', 2); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ({other_lit}, x'01', 9);"
+            ))
+            .await
+            .expect("seed rows");
+
+        metastore
+            .execute(ExecuteParams {
+                sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
+                params: vec![MetastoreValue::Blob(table_id_blob.clone())],
+            })
+            .await
+            .expect("checkpoint clear");
+
+        let remaining: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Blob(table_id_blob)],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count after clear");
+        assert_eq!(
+            remaining, 0,
+            "checkpoint clear must empty the table's insert records"
+        );
+
+        let other_remaining: i64 = metastore
+            .query_row(
+                QueryRowParams {
+                    sql: "SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Blob(
+                        crate::metastore::table_id_to_key_bytes(&other_table_id),
+                    )],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("count other after clear");
+        assert_eq!(
+            other_remaining, 1,
+            "clearing one table_id must not touch another table's insert records"
+        );
+    }
+
+    /// Drive the legacy→current `cayenne_insert_record` migration for a given
+    /// legacy DDL (which stores `table_id` as TEXT). Asserts the migrated table
+    /// is the BLOB-`table_id` WITHOUT-ROWID composite-PK shape with no FK, and
+    /// that the two seeded rows survive with their `table_id` re-encoded to the
+    /// raw UUID bytes (so the BLOB-keyed reader/clear find them).
+    async fn assert_legacy_insert_record_migrates(legacy_create_sql: &str, with_uuid_pk: bool) {
+        let _guard = CONFIG_LOCK.lock().await;
+        set_sqlite_metastore_config(SqliteMetastoreConfig::default());
+        let (_dir, metastore) = temp_metastore();
+
+        // Build a realistic "old deployment": init the current full schema for
+        // every OTHER table, then DOWNGRADE only cayenne_insert_record back to
+        // a legacy TEXT-`table_id` shape and seed a parent row + two insert
+        // records. Re-running init_schema must then detect & migrate just this
+        // table (leaving every other table matching EXPECTED_TABLES).
+        metastore.init_schema().await.expect("baseline init schema");
+        let table_id = uuid::Uuid::now_v7().to_string();
+
+        let insert_rows = if with_uuid_pk {
+            format!(
+                "INSERT INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) \
+                    VALUES ('{u1}', '{table_id}', x'0a', 7); \
+                 INSERT INTO cayenne_insert_record (insert_record_id, table_id, pk_bytes, sequence_number) \
+                    VALUES ('{u2}', '{table_id}', x'0b', 9);",
+                u1 = uuid::Uuid::now_v7(),
+                u2 = uuid::Uuid::now_v7(),
+            )
+        } else {
+            format!(
+                "INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) \
+                    VALUES ('{table_id}', x'0a', 7); \
+                 INSERT INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) \
+                    VALUES ('{table_id}', x'0b', 9);"
+            )
+        };
+
+        metastore
+            .execute_batch(&format!(
+                "DROP TABLE cayenne_insert_record; \
+                 {legacy_create_sql} \
+                 INSERT INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json, primary_key_json, current_snapshot_id) \
+                    VALUES ('{table_id}', 'legacy_t', '/tmp', 1, '{{}}', '[]', '{table_id}'); \
+                 {insert_rows}"
+            ))
+            .await
+            .expect("downgrade cayenne_insert_record to legacy schema + seed rows");
+
+        // Sanity: the legacy `table_id` column is TEXT pre-migration.
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "TEXT",
+            "precondition: legacy table_id is TEXT"
+        );
+
+        metastore.init_schema().await.expect("init schema migrates");
+
+        // Post-migration: the new 3-column schema with a BLOB table_id.
+        let after = table_columns(&metastore, "cayenne_insert_record").await;
+        assert_eq!(
+            after,
+            vec!["table_id", "pk_bytes", "sequence_number"],
+            "legacy table must be migrated to the composite-PK schema"
+        );
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "migrated table_id must be BLOB"
+        );
+
+        // The rows survived AND are now keyed by the raw-UUID-bytes BLOB — i.e.
+        // a BLOB-encoded lookup (what the production reader does) finds them.
+        let rows: Vec<(Vec<u8>, i64)> = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT pk_bytes, sequence_number FROM cayenne_insert_record WHERE table_id = ?1 ORDER BY pk_bytes",
+                    params: vec![MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(&table_id))],
+                },
+                |row| Ok((row.get_blob(0)?, row.get_i64(1)?)),
+            )
+            .await
+            .expect("read migrated rows");
+        assert_eq!(
+            rows,
+            vec![(vec![0x0a_u8], 7_i64), (vec![0x0b_u8], 9_i64)],
+            "the (table_id, pk_bytes, sequence_number) rows must be copied forward and re-encoded"
+        );
+
+        // Re-running init_schema is idempotent (table_id is already BLOB).
+        metastore
+            .init_schema()
+            .await
+            .expect("second init_schema is a no-op");
+        assert_eq!(
+            column_type(&metastore, "cayenne_insert_record", "table_id").await,
+            "BLOB",
+            "re-running init_schema must not re-migrate (already BLOB)"
+        );
+    }
+
+    /// Pre-cycle-11 legacy shape: UUID `insert_record_id` TEXT PRIMARY KEY +
+    /// redundant `UNIQUE(table_id, pk_bytes)` + TEXT `table_id` + FK.
+    #[tokio::test]
+    async fn test_insert_record_legacy_uuid_pk_schema_migrates_with_rows_present() {
+        assert_legacy_insert_record_migrates(
+            "CREATE TABLE cayenne_insert_record (\
+                insert_record_id TEXT PRIMARY KEY, table_id TEXT NOT NULL, \
+                pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
+                FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE, \
+                UNIQUE(table_id, pk_bytes));",
+            true,
+        )
+        .await;
+    }
+
+    /// cycle-11 legacy shape: WITHOUT ROWID composite PK with a TEXT `table_id`
+    /// and a `cayenne_table(table_id)` foreign key (the shape this lever
+    /// replaces). The TEXT→BLOB re-encode must still fire.
+    #[tokio::test]
+    async fn test_insert_record_cycle11_text_schema_migrates_with_rows_present() {
+        assert_legacy_insert_record_migrates(
+            "CREATE TABLE cayenne_insert_record (\
+                table_id TEXT NOT NULL, pk_bytes BLOB NOT NULL, sequence_number BIGINT NOT NULL, \
+                FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE, \
+                PRIMARY KEY (table_id, pk_bytes)) WITHOUT ROWID;",
+            false,
+        )
+        .await;
     }
 }
