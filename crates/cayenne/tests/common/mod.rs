@@ -96,7 +96,7 @@ impl TestFixture {
     /// Connection string for this fixture's backend, matching the scheme used
     /// in [`TestFixture::new`]. Tests that simulate a restart (reopen the
     /// catalog from disk) must use this rather than hardcoding `sqlite://`,
-    /// otherwise the Turso variant reopens a Turso-format file with the SQLite
+    /// otherwise the Turso variant reopens a Turso-format file with the `SQLite`
     /// backend and fails with "file is not a database".
     pub fn connection_string(&self) -> String {
         let db_path = self.db_path();

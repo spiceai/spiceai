@@ -1550,6 +1550,7 @@ impl MetastoreTransaction for SqliteTransaction {
 mod tests {
     use super::*;
     use crate::metastore::{ExecuteParams, MetastoreValue, QueryParams, QueryRowParams};
+    use std::fmt::Write;
 
     /// `SQLITE_METASTORE_CONFIG` is process-wide and read at connection-open
     /// time (and, for the truncate threshold, at `checkpoint_wal` time). The
@@ -1915,7 +1916,10 @@ mod tests {
         // Build the `x'..'` BLOB literal of the raw UUID bytes.
         let blob_lit = |id: &str| {
             let bytes = crate::metastore::table_id_to_key_bytes(id);
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = bytes.iter().fold(String::new(), |mut acc, b| {
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
             format!("x'{hex}'")
         };
         let tid_lit = blob_lit(&table_id);
