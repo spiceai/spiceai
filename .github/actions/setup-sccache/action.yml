@@ -13,7 +13,7 @@ runs:
   using: 'composite'
   steps:
     - name: Set sccache environment variables
-      if: runner.os == 'macOS' || inputs.minio_endpoint != ''
+      if: inputs.minio_endpoint != '' || (runner.os == 'macOS' && inputs.spiceio_endpoint != '')
       shell: bash
       run: |
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
@@ -40,7 +40,7 @@ runs:
         printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
 
     - name: Set up sccache (macOS)
-      if: runner.os == 'macOS'
+      if: runner.os == 'macOS' && (inputs.minio_endpoint != '' || inputs.spiceio_endpoint != '')
       shell: bash
       run: |
         if ! command -v sccache &> /dev/null; then
@@ -54,15 +54,19 @@ runs:
         SCCACHE_NO_CREDS="false"
 
         # Use spiceio if its endpoint was provided
-        if [ -n "${{ inputs.spiceio_endpoint }}" ]; then
+        if [[ -n "${{ inputs.spiceio_endpoint }}" ]]; then
           SCCACHE_ENDPOINT="${{ inputs.spiceio_endpoint }}"
           SCCACHE_REGION="us-west-1"
           SCCACHE_NO_CREDS="true"
           echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
           echo "Using spiceio at $SCCACHE_ENDPOINT"
-        else
+        elif [[ -n "${{ inputs.minio_endpoint }}" ]]; then
+          SCCACHE_ENDPOINT="${{ inputs.minio_endpoint }}"
           echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
-          echo "spiceio not available, using local MinIO"
+          echo "Using MinIO at $SCCACHE_ENDPOINT"
+        else
+          echo "sccache endpoint not configured"
+          exit 0
         fi
 
         rm -rf ~/.config/sccache/config
