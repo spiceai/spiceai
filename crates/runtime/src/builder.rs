@@ -57,6 +57,25 @@ use util::{in_tracing_context, in_tracing_context_async};
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 const CAYENNE_FOOTER_CACHE_MB_PARAM: &str = "cayenne_footer_cache_mb";
+const CAYENNE_SORT_MERGE_MIN_ROWS_PARAM: &str = "cayenne_sort_merge_min_rows";
+const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
+    "cayenne_sort_merge_memory_pool_fraction";
+const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
+const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
+
+/// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
+/// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
+/// `build_internal`; declared here so they're part of the recognized
+/// `runtime.params` vocabulary and don't false-warn as unknown.
+const CAYENNE_METASTORE_CACHE_MB_PARAM: &str = "cayenne_metastore_cache_mb";
+const CAYENNE_METASTORE_MMAP_MB_PARAM: &str = "cayenne_metastore_mmap_mb";
+const CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM: &str = "cayenne_metastore_busy_timeout_ms";
+const CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM: &str =
+    "cayenne_metastore_wal_autocheckpoint_pages";
+const CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM: &str =
+    "cayenne_metastore_wal_truncate_threshold_mb";
+const CAYENNE_METASTORE_AUTO_VACUUM_PARAM: &str = "cayenne_metastore_auto_vacuum";
+
 /// Runtime param: fraction of `runtime.query.memory_limit` carved into a
 /// dedicated Cayenne compaction memory pool when Cayenne acceleration is
 /// configured on a dataset and dedicated thread pools are enabled.
@@ -66,6 +85,58 @@ const CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM: &str = "cayenne_compaction_memor
 const DEFAULT_COMPACTION_MEMORY_FRACTION: f64 = 0.2;
 const MIN_COMPACTION_MEMORY_FRACTION: f64 = 0.05;
 const MAX_COMPACTION_MEMORY_FRACTION: f64 = 0.9;
+
+/// `runtime.params` keys with a `cayenne_` prefix that the runtime recognizes.
+const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
+    CAYENNE_FOOTER_CACHE_MB_PARAM,
+    CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
+    CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+    CAYENNE_FILTER_PROPAGATION_PARAM,
+    CAYENNE_OPTIMIZER_RULES_PARAM,
+    CAYENNE_COMPACTION_MEMORY_FRACTION_PARAM,
+    CAYENNE_METASTORE_CACHE_MB_PARAM,
+    CAYENNE_METASTORE_MMAP_MB_PARAM,
+    CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM,
+    CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
+    CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
+    CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
+];
+
+/// Recognized `runtime.params` keys that don't belong to a larger prefix
+/// family (the family lists live next to the code that consumes them:
+/// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
+/// `http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS`).
+const MISC_RUNTIME_PARAMS: &[&str] = &[
+    "url_tables",
+    "geo",
+    "parquet_page_index",
+    "dedicated_thread_pool",
+    "shuffle_location",
+    "shuffle_format",
+    "github_max_concurrent_connections",
+];
+
+/// The complete set of `runtime.params` keys the runtime recognizes, gathered
+/// from every consuming subsystem's authoritative list. Used to validate the
+/// `runtime.params` section at startup: any key not in this set is a typo or
+/// unsupported option and gets a "did you mean" warning scoped to this
+/// section's vocabulary. See spiceai/spiceai#10970.
+///
+/// When adding a new `runtime.params` key, extend the owning family's list
+/// (or `MISC_RUNTIME_PARAMS`) so it is recognized here.
+fn known_runtime_params() -> Vec<&'static str> {
+    let mut known = Vec::with_capacity(
+        KNOWN_CAYENNE_RUNTIME_PARAMS.len()
+            + crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
+            + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
+            + MISC_RUNTIME_PARAMS.len(),
+    );
+    known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS);
+    known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
+    known.extend_from_slice(MISC_RUNTIME_PARAMS);
+    known
+}
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -252,14 +323,25 @@ impl RuntimeBuilder {
         // URL tables are opt-in via `runtime.params.url_tables=enabled`
         let url_tables_enabled =
             spicepod_rt.params.get("url_tables").map(String::as_str) == Some("enabled");
+        warn_on_unknown_runtime_params(&spicepod_rt.params);
         let cayenne_sort_merge_min_rows =
-            parse_usize_runtime_param(&spicepod_rt.params, "cayenne_sort_merge_min_rows");
+            parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_SORT_MERGE_MIN_ROWS_PARAM);
+        log_applied_cayenne_param(
+            CAYENNE_SORT_MERGE_MIN_ROWS_PARAM,
+            cayenne_sort_merge_min_rows,
+        );
         let cayenne_sort_merge_memory_pool_fraction = parse_f64_runtime_param(
             &spicepod_rt.params,
-            "cayenne_sort_merge_memory_pool_fraction",
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+        );
+        log_applied_cayenne_param(
+            CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM,
+            cayenne_sort_merge_memory_pool_fraction,
         );
         let cayenne_footer_cache_mb =
             parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_FOOTER_CACHE_MB_PARAM);
+        log_applied_cayenne_param(CAYENNE_FOOTER_CACHE_MB_PARAM, cayenne_footer_cache_mb);
+        let cayenne_filter_propagation = parse_cayenne_filter_propagation(&spicepod_rt.params);
 
         // Process-global SQLite metastore pragma tuning (cache, mmap, busy
         // timeout, WAL autocheckpoint, auto_vacuum). Applied once at startup;
@@ -268,30 +350,39 @@ impl RuntimeBuilder {
         {
             let mut metastore_cfg = cayenne::SqliteMetastoreConfig::default();
             if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_cache_mb")
+                parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_METASTORE_CACHE_MB_PARAM)
             {
                 metastore_cfg.cache_size_mb = v;
             }
             if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_mmap_mb")
+                parse_usize_runtime_param(&spicepod_rt.params, CAYENNE_METASTORE_MMAP_MB_PARAM)
             {
                 metastore_cfg.mmap_size_bytes = i64::try_from(v.saturating_mul(1024 * 1024))
                     .unwrap_or(metastore_cfg.mmap_size_bytes);
             }
-            if let Some(v) =
-                parse_usize_runtime_param(&spicepod_rt.params, "cayenne_metastore_busy_timeout_ms")
-            {
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                CAYENNE_METASTORE_BUSY_TIMEOUT_MS_PARAM,
+            ) {
                 metastore_cfg.busy_timeout_ms =
                     u64::try_from(v).unwrap_or(metastore_cfg.busy_timeout_ms);
             }
             if let Some(v) = parse_usize_runtime_param(
                 &spicepod_rt.params,
-                "cayenne_metastore_wal_autocheckpoint_pages",
+                CAYENNE_METASTORE_WAL_AUTOCHECKPOINT_PAGES_PARAM,
             ) {
                 metastore_cfg.wal_autocheckpoint_pages =
                     u32::try_from(v).unwrap_or(metastore_cfg.wal_autocheckpoint_pages);
             }
-            if let Some(av) = spicepod_rt.params.get("cayenne_metastore_auto_vacuum") {
+            if let Some(v) = parse_usize_runtime_param(
+                &spicepod_rt.params,
+                CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
+            ) {
+                metastore_cfg.wal_truncate_threshold_bytes =
+                    u64::try_from(v.saturating_mul(1024 * 1024))
+                        .unwrap_or(metastore_cfg.wal_truncate_threshold_bytes);
+            }
+            if let Some(av) = spicepod_rt.params.get(CAYENNE_METASTORE_AUTO_VACUUM_PARAM) {
                 metastore_cfg.auto_vacuum = match av.to_lowercase().as_str() {
                     "none" => cayenne::SqliteAutoVacuum::None,
                     "incremental" => cayenne::SqliteAutoVacuum::Incremental,
@@ -308,7 +399,19 @@ impl RuntimeBuilder {
         }
 
         let cayenne_filter_propagation_enabled =
-            parse_cayenne_filter_propagation(&spicepod_rt.params).is_enabled();
+            cayenne_filter_propagation.is_some_and(CayenneFilterPropagation::is_enabled);
+        // Only log "applied" for a value the user validly set; an unset or
+        // invalid value yields `None` (and an invalid value already warned).
+        log_applied_cayenne_param(
+            CAYENNE_FILTER_PROPAGATION_PARAM,
+            cayenne_filter_propagation.map(|propagation| {
+                if propagation.is_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            }),
+        );
         let cayenne_optimizer_rules =
             parse_cayenne_optimizer_rules(&spicepod_rt.params, cayenne_filter_propagation_enabled);
 
@@ -770,6 +873,39 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     }
 }
 
+/// Emit an INFO log when a `cayenne_*` runtime tunable parsed successfully so
+/// operators see at startup which override actually took effect. Only logs
+/// when `value` is `Some` (the parser already emits a warning for malformed
+/// values). See spiceai/spiceai#10970.
+fn log_applied_cayenne_param<V: std::fmt::Display>(key: &str, value: Option<V>) {
+    if let Some(value) = value {
+        tracing::info!("Cayenne runtime tunable applied: runtime.params.{key}={value}");
+    }
+}
+
+/// Warn (with a "did you mean" suggestion when close) on any key in the
+/// `runtime.params` section the runtime doesn't recognize, so typos like
+/// `cayenne_footer_cach_mb` or `shuffle_locatin` don't silently leave the
+/// runtime on defaults. Candidates are scoped to the `runtime.params`
+/// section's full vocabulary ([`known_runtime_params`]) so suggestions only
+/// ever point at another valid `runtime.params` key. See
+/// spiceai/spiceai#10970.
+fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
+    let known = known_runtime_params();
+    for key in params.keys() {
+        if known.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
+            tracing::warn!(
+                "runtime.params.{key} is not a recognized runtime parameter; did you mean '{suggestion}'? Ignoring."
+            );
+        } else {
+            tracing::warn!("runtime.params.{key} is not a recognized runtime parameter; ignoring.");
+        }
+    }
+}
+
 fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Option<usize> {
     let raw = params.get(key)?;
     if raw.eq_ignore_ascii_case("usize::MAX") || raw.eq_ignore_ascii_case("max") {
@@ -819,9 +955,6 @@ fn clamp_cayenne_compaction_memory_fraction(value: f64) -> f64 {
     clamped
 }
 
-const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
-const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CayenneFilterPropagation {
     Disabled,
@@ -834,19 +967,24 @@ impl CayenneFilterPropagation {
     }
 }
 
-fn parse_cayenne_filter_propagation(params: &HashMap<String, String>) -> CayenneFilterPropagation {
-    let Some(raw) = params.get(CAYENNE_FILTER_PROPAGATION_PARAM) else {
-        return CayenneFilterPropagation::Disabled;
-    };
+/// Parse the Cayenne filter-propagation tunable. Returns `None` when the key is
+/// unset or holds an invalid value (in which case the effective behavior is
+/// `Disabled` and an invalid value warns) — mirroring [`parse_usize_runtime_param`]
+/// /[`parse_f64_runtime_param`], so callers only log "applied" for a value the
+/// user validly set.
+fn parse_cayenne_filter_propagation(
+    params: &HashMap<String, String>,
+) -> Option<CayenneFilterPropagation> {
+    let raw = params.get(CAYENNE_FILTER_PROPAGATION_PARAM)?;
 
     match raw.trim().to_ascii_lowercase().as_str() {
-        "enabled" => CayenneFilterPropagation::Enabled,
-        "disabled" => CayenneFilterPropagation::Disabled,
+        "enabled" => Some(CayenneFilterPropagation::Enabled),
+        "disabled" => Some(CayenneFilterPropagation::Disabled),
         _ => {
             tracing::warn!(
                 "runtime.params.{CAYENNE_FILTER_PROPAGATION_PARAM}={raw:?} must be 'enabled' or 'disabled'; using disabled"
             );
-            CayenneFilterPropagation::Disabled
+            None
         }
     }
 }
@@ -1021,6 +1159,55 @@ mod test {
     }
 
     #[test]
+    fn known_runtime_params_covers_every_family() {
+        // The section vocabulary must include *every* key from *every* family
+        // that feeds it — not just a representative key — so a future addition
+        // to any family list (e.g. a new `cayenne_*` tunable) can't silently
+        // fall out of the merged vocabulary and false-warn on a valid key.
+        let known = known_runtime_params();
+        let family_keys = KNOWN_CAYENNE_RUNTIME_PARAMS
+            .iter()
+            .chain(crate::accelerated_table::refresh_task::changes::CDC_RUNTIME_PARAMS)
+            .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(MISC_RUNTIME_PARAMS);
+        for key in family_keys {
+            assert!(
+                known.contains(key),
+                "known_runtime_params() missing `{key}`; a valid runtime param would false-warn"
+            );
+        }
+        // No accidental duplicates across the merged family lists.
+        let mut deduped = known.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            known.len(),
+            "duplicate keys in known_runtime_params()"
+        );
+    }
+
+    #[test]
+    fn runtime_param_typos_suggest_within_section() {
+        // A typo resolves to the intended key, and the suggestion is drawn from
+        // the whole `runtime.params` section vocabulary — across families.
+        let known = known_runtime_params();
+        assert_eq!(
+            util::levenshtein::closest_match("cayenne_footer_cach_mb", &known).as_deref(),
+            Some("cayenne_footer_cache_mb"),
+        );
+        assert_eq!(
+            util::levenshtein::closest_match("shuffle_locatin", &known).as_deref(),
+            Some("shuffle_location"),
+        );
+        // A wholly unrelated key gets no misleading suggestion.
+        assert_eq!(
+            util::levenshtein::closest_match("totally_unrelated_key", &known),
+            None,
+        );
+    }
+
+    #[test]
     fn test_clamp_cayenne_compaction_memory_fraction() {
         for (input, expected) in [(0.0, 0.05), (0.2, 0.2), (1.0, 0.9)] {
             let actual = clamp_cayenne_compaction_memory_fraction(input);
@@ -1040,26 +1227,26 @@ mod test {
 
         assert_eq!(
             parse_cayenne_filter_propagation(&params),
-            CayenneFilterPropagation::Enabled
+            Some(CayenneFilterPropagation::Enabled)
         );
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "disabled".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            Some(CayenneFilterPropagation::Disabled)
         );
+        // An invalid value warns and yields `None` (effective behavior is
+        // disabled, but nothing was validly applied so callers won't log it).
         assert_eq!(
             parse_cayenne_filter_propagation(&HashMap::from([(
                 CAYENNE_FILTER_PROPAGATION_PARAM.to_string(),
                 "true".to_string(),
             )])),
-            CayenneFilterPropagation::Disabled
+            None
         );
-        assert_eq!(
-            parse_cayenne_filter_propagation(&HashMap::new()),
-            CayenneFilterPropagation::Disabled
-        );
+        // An unset key also yields `None`.
+        assert_eq!(parse_cayenne_filter_propagation(&HashMap::new()), None);
     }
 
     #[test]

@@ -356,6 +356,102 @@ pub trait MetadataCatalog: Send + Sync {
         snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()>;
 
+    /// Stage-A fold for a pipelined CDC upsert: commit the on-conflict deletion
+    /// metadata (delete files + insert records + protected-snapshot sequence)
+    /// AND INSERT the inline tombstone (Option D, `published = false`) for any
+    /// inlined rows the upsert replaces. Backends that override this method fold
+    /// both into the SAME backend transaction (one writer acquisition); the
+    /// trait's DEFAULT implementation below preserves the equivalent
+    /// two-transaction behavior (`commit_on_conflict_deletions` then
+    /// `add_inlined_delete`).
+    ///
+    /// This is the single-transaction equivalent of calling
+    /// [`Self::commit_on_conflict_deletions`] immediately followed by
+    /// [`Self::add_inlined_delete`] with `published = false`: it preserves the
+    /// exact statement order (delete files → insert records → snapshot sequence →
+    /// tombstone INSERT) but acquires the process-wide metastore writer **once**
+    /// instead of twice. On a serialized backend (the embedded `SQLite` metastore
+    /// WAL-serializes every writer across all tables) this halves the writer
+    /// round-trips a heavy-upsert table's staged batch pays, which is the
+    /// dominant per-batch metastore-queueing term under sustained CDC load.
+    ///
+    /// `inline_tombstone` carries the already-serialized deletion IPC and key
+    /// count; its `inlined_id` (if empty) is generated inside the transaction and
+    /// returned so the owning snapshot's finalize can flip exactly that tombstone
+    /// to `published = true` via [`Self::mark_inlined_delete_published`]. Returns
+    /// `None` when no inline tombstone was supplied.
+    ///
+    /// Durability ordering is unchanged versus the two-call form: the staging WAL
+    /// (which lists the replacement files) is written by the caller BEFORE this
+    /// method runs, and the Stage-B `published` flip runs strictly AFTER, so the
+    /// Option-D exactly-once crash matrix holds. Folding the two writes into one
+    /// transaction is strictly safer than the prior two-transaction form — it
+    /// removes the intermediate crash state where the snapshot sequence was
+    /// durable but the tombstone was not.
+    ///
+    /// `pending_durable_flips` carries `inlined_id`s of PREVIOUSLY-finalized
+    /// tombstones (cycle-4 lever b1★) whose owning Stage-B activated them in
+    /// memory but deferred their durable `published = 1` flip. They are applied as
+    /// extra `UPDATE … SET published = 1` statements inside this SAME transaction,
+    /// so the deferred flips cost NO additional metastore-writer acquisition —
+    /// they ride this batch's commit. Idempotent: an id whose row was already
+    /// flipped or cleared by a checkpoint is a no-op UPDATE. They are applied
+    /// LAST (after the tombstone INSERT) and only durably take effect on commit,
+    /// so a rollback leaves them un-flipped — and the caller only removes them
+    /// from its in-memory pending queue on commit success, so a failed commit
+    /// re-defers them to the next batch (or the maintenance drain). Their durable
+    /// `published = 0` state is independently crash-healed by
+    /// `publish_orphan_inlined_deletes` on reopen, so a never-committed flip never
+    /// resurfaces a row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be opened, any statement fails,
+    /// or the commit fails. In the single-transaction override (`CayenneCatalog`)
+    /// a failure rolls back the whole transaction, leaving the catalog unchanged
+    /// (no partial delete-file / insert-record / snapshot-sequence / tombstone /
+    /// pending-flip state). The trait DEFAULT implementation below is NOT atomic
+    /// across its steps — it runs `commit_on_conflict_deletions`, then the
+    /// deferred `published = 1` flips, then the tombstone INSERT as separate
+    /// calls, so a failure in a later step can leave earlier writes already
+    /// committed. Exactly-once still holds: the caller only clears its in-memory
+    /// pending-flip queue on overall success, and any orphaned `published = 0`
+    /// tombstone is crash-healed on reopen by `publish_orphan_inlined_deletes`.
+    #[expect(clippy::too_many_arguments)]
+    async fn commit_on_conflict_deletions_with_tombstone(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+        inline_tombstone: Option<InlinedDelete>,
+        pending_durable_flips: &[String],
+    ) -> CatalogResult<Option<String>> {
+        // Default: preserve the previous two-transaction behavior for any
+        // implementor without a single-transaction primitive. `CayenneCatalog`
+        // overrides this to fold all writes into one transaction.
+        self.commit_on_conflict_deletions(
+            delete_files,
+            table_id,
+            insert_pk_bytes_list,
+            insert_sequence,
+            snapshot_sequence,
+        )
+        .await?;
+        // Apply the deferred durable flips (b1★). Not transactional in the default
+        // path, but each is an idempotent single-row UPDATE and the caller only
+        // clears its in-memory queue on overall success.
+        for inlined_id in pending_durable_flips {
+            self.mark_inlined_delete_published(table_id, inlined_id)
+                .await?;
+        }
+        match inline_tombstone {
+            Some(tombstone) => Ok(Some(self.add_inlined_delete(tombstone).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get all insert records for a table.
     ///
     /// Returns a map of PK bytes to their sequence numbers.
@@ -495,6 +591,33 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all inlined data entries for a table.
     async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>>;
 
+    /// Get the inlined data entries for a table whose `sequence_number` is
+    /// strictly greater than `after_sequence`, ordered by `sequence_number`.
+    ///
+    /// This is the incremental read path's variant of [`get_inlined_data`]: the
+    /// inline-memtable cache (`CayenneTableProvider::populate_inlined_cache`)
+    /// uses it to fetch ONLY the rows appended since the last materialized view
+    /// instead of re-reading and re-decoding the entire `cayenne_inlined_data`
+    /// corpus on every cache miss under sustained CDC. Callers only route the
+    /// query here when they have proven (via a structural-epoch check) that the
+    /// generation delta was an append-only mutation — no rewrite, removal, or
+    /// newly published tombstone — so the previously materialized entries remain
+    /// byte-for-byte valid and the appended rows can simply be merged on top.
+    ///
+    /// The default implementation reads the full corpus and filters in memory so
+    /// every [`MetadataCatalog`] impl keeps compiling; production implementors
+    /// SHOULD override it to push the `sequence_number > ?` predicate into SQL
+    /// so the expensive `data_ipc` blobs of older entries are never shipped.
+    async fn get_inlined_data_above_sequence(
+        &self,
+        table_id: &str,
+        after_sequence: i64,
+    ) -> CatalogResult<Vec<InlinedData>> {
+        let mut all = self.get_inlined_data(table_id).await?;
+        all.retain(|entry| entry.sequence_number > after_sequence);
+        Ok(all)
+    }
+
     /// Get inlined data entries for a specific partition of a table.
     async fn get_inlined_data_for_partition(
         &self,
@@ -522,31 +645,110 @@ pub trait MetadataCatalog: Send + Sync {
     }
 
     /// Add a small batch of delete identifiers inlined in the metastore.
+    ///
+    /// Returns the `inlined_id` of the written row so the caller can later flip
+    /// its activation flag with [`Self::mark_inlined_delete_published`]. A
+    /// staged inline-conflict tombstone is written with [`InlinedDelete::published`]
+    /// = `false` and stays inert (the read filter skips it) until its owning
+    /// snapshot publishes.
     async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
+
+    /// Durably flip a single inline tombstone's activation flag to `published =
+    /// true`, identified by `(table_id, inlined_id)`.
+    ///
+    /// Called from the staged on-conflict finalize (under the listing fence,
+    /// before the replacement files are moved into the target snapshot) so the
+    /// tombstone becomes active exactly when — and never before — its
+    /// replacement rows become discoverable. Idempotent: flipping an
+    /// already-published row is a no-op.
+    async fn mark_inlined_delete_published(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Durably revert a single inline tombstone's activation flag back to
+    /// `published = false`, identified by `(table_id, inlined_id)`. The exact
+    /// inverse of [`Self::mark_inlined_delete_published`].
+    ///
+    /// Called from the staged on-conflict finalize ERROR path: if the file move
+    /// / publish fails AFTER the flag was flipped, the tombstone would otherwise
+    /// be left active (`published = true`) with its replacement still absent from
+    /// the listing, so a concurrent inline insert (which bumps
+    /// `inlined_generation` and rebuilds the cache) would apply the tombstone and
+    /// hide the old row while the replacement is unlisted — a transient vanish
+    /// that heals only on reopen. Reverting restores self-consistency
+    /// immediately. Re-published exactly-once on the next open by
+    /// [`Self::publish_orphan_inlined_deletes`] after the interrupted move is
+    /// recovered. Idempotent: reverting an already-unpublished row is a no-op.
+    async fn mark_inlined_delete_unpublished(
+        &self,
+        table_id: &str,
+        inlined_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Durably flip EVERY currently-unpublished inline tombstone for a table to
+    /// `published = true`, returning how many rows were flipped.
+    ///
+    /// Called once at table open, AFTER `ensure_no_incomplete_write` has
+    /// recovered any interrupted staged append (which moves the replacement files
+    /// into their snapshot — completing the upsert without data loss). At that
+    /// point every `published = false` tombstone corresponds to staged work whose
+    /// replacement is now durable, so activating them makes the upsert apply
+    /// exactly once across the crash (replacement visible, old inline copy
+    /// hidden) rather than leaving a duplicate. There are no in-flight runtime
+    /// writers at open time, so this never races a live stage.
+    async fn publish_orphan_inlined_deletes(&self, table_id: &str) -> CatalogResult<u64>;
 
     /// Atomically rewrite existing inline data rows, remove emptied inline data rows,
     /// and append new inline data rows.
     ///
     /// Inline mutations rewrite row-store metadata entries in place instead of adding
-    /// delete-marker side records. Newly appended inline data rows receive a fresh
-    /// sequence number when present; rewritten rows retain their original sequence.
+    /// delete-marker side records. Newly appended inline data rows are stamped with
+    /// the caller-supplied `assigned_sequence` (all appended rows in one call share
+    /// that sequence); rewritten rows retain their original sequence.
     ///
-    /// Returns `Some(sequence_number)` with the sequence assigned to the newly
-    /// appended `data` rows (all appended rows in one call share that sequence),
-    /// or `None` when no new data rows were appended. Callers use this to gate
-    /// the in-memory visibility of the appended rows behind a published
-    /// watermark so concurrent scans never observe them before their paired
-    /// in-memory changes (e.g. a file deletion-cache update) are published.
+    /// `assigned_sequence` is reserved by the caller from the per-table in-memory
+    /// sequence allocator (lever B2) — strictly above any other sequence the
+    /// caller allocated for the same logical operation (e.g. a paired file
+    /// `delete_seq`). This call performs NO counter mutation: the allocator owns
+    /// allocation and keeps `cayenne_table.current_sequence_number` at-or-ahead
+    /// via its reserve-ahead refill, so stamping the row from a bound parameter
+    /// (instead of bumping + reading back the DB counter) keeps the inlined-row
+    /// sequence strictly above every value the allocator has handed out.
+    ///
+    /// Returns `Some(assigned_sequence)` when new `data` rows were appended (so
+    /// the caller can advance its published-visibility watermark), or `None` when
+    /// no new data rows were appended.
     async fn commit_inlined_mutation(
         &self,
         table_id: &str,
         updated_data: Vec<InlinedData>,
         deleted_inlined_ids: Vec<String>,
         data: Vec<InlinedData>,
+        assigned_sequence: i64,
     ) -> CatalogResult<Option<i64>>;
 
     /// Get all inlined delete entries for a table.
     async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
+
+    /// Get only the *published* inlined delete entries for a table.
+    ///
+    /// This is the hot read path's variant of [`get_inlined_deletes`]: it pushes
+    /// the `published = 1` predicate into SQL so the expensive `delete_ipc` blobs
+    /// of in-flight (`published = 0`) tombstones are never materialised or
+    /// shipped only to be discarded in memory. The `published = 1` SQL filter is
+    /// exactly equivalent to skipping `!delete.published` rows in Rust, so it
+    /// preserves the per-tombstone activation gate that
+    /// `load_inlined_deletion_maps` relies on for the no-transient-PK-vanish
+    /// invariant — it returns every published tombstone and no unpublished one.
+    ///
+    /// Diagnostic/test callers that must inspect unpublished rows continue to use
+    /// [`get_inlined_deletes`].
+    async fn get_published_inlined_deletes(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<InlinedDelete>>;
 
     /// Remove all inlined deletes for a table (called after checkpoint).
     async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()>;
@@ -554,6 +756,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.
     async fn shutdown(&self) -> CatalogResult<()> {
+        Ok(())
+    }
+
+    /// Run a NON-BLOCKING WAL checkpoint off the hot commit path (cycle-5 TASK
+    /// 2b). Called from the background maintenance tick so the WAL is drained on
+    /// a timer instead of relying on the inline `wal_autocheckpoint` firing a
+    /// passive checkpoint on a CDC commit/UPDATE — which lands an fsync inside
+    /// the WAL-write-locked Stage-A/Stage-B window. The checkpoint must NOT block
+    /// writers or wait for readers (`SQLite` `PASSIVE`), so a failure or a busy WAL
+    /// is a no-op the next tick retries. Default implementation does nothing.
+    async fn checkpoint_wal(&self) -> CatalogResult<()> {
         Ok(())
     }
 

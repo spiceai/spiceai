@@ -200,3 +200,142 @@ async fn test_live_num_rows_and_ndv_under_upsert(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for inline num_rows double-counting (40a6ffa3dd)
+// ---------------------------------------------------------------------------
+//
+// `add_inlined_rows_to_statistics` in `cached_table_statistics_for_optimizer`
+// folded `inlined_row_count` into the optimizer's `num_rows`, but `num_rows`
+// was already updated via `live_rows_delta` through `schedule_post_write_maintenance`
+// on the inline write path — double-counting every inline row.
+//
+// Test A: inline upsert superseding file-backed rows — `live_rows_delta` is 0
+//         but `inlined_row_count` grew, so `num_rows` overcounted.
+// Test B: fresh inline insert (no supersedes) — `live_rows_delta` is N and
+//         `inlined_row_count` also grew by N, so `num_rows` overcounted by N.
+
+test_with_backends!(test_inline_upsert_superseding_file_rows);
+test_with_backends!(test_fresh_inline_after_staged_no_double_count);
+
+/// Regression test A: an inline upsert that supersedes file-backed rows
+/// must not inflate `num_rows` — `live_rows_delta` nets the supersedes.
+async fn test_inline_upsert_superseding_file_rows(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = CayenneTableProvider::create_table(
+        catalog,
+        CreateTableOptions {
+            table_name: "upsert_file_supersede".to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: fixture.data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        },
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table = Arc::new(table);
+    ctx.register_table(
+        "upsert_file_supersede",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // 1. Insert 2000 rows — exceeds DEFAULT_INLINE_MAX_ROWS (1024) → staged path.
+    common::insert_batch(&table, batch(1, 2000, 10)).await?;
+    table.flush_pending_maintenance().await?;
+
+    let stats = table
+        .optimizer_table_statistics()
+        .expect("stats after staged insert");
+    assert_eq!(stats.num_rows.get_value().copied(), Some(2000));
+
+    // 2. Upsert 500 rows (ids 1..=500) — fits inline (500 ≤ 1024),
+    //    supersedes 500 FILE-BACKED rows. Net delta = 0.
+    common::insert_batch(&table, batch(1, 500, 100)).await?;
+    table.flush_pending_maintenance().await?;
+
+    assert_eq!(
+        count_star(&ctx, "upsert_file_supersede").await,
+        2000,
+        "COUNT(*) must stay 2000 after upsert"
+    );
+    let stats = table
+        .optimizer_table_statistics()
+        .expect("stats after inline upsert");
+    assert_eq!(
+        stats.num_rows.get_value().copied(),
+        Some(2000),
+        "num_rows must stay 2000 — inline upsert supersedes must be netted"
+    );
+
+    Ok(())
+}
+
+/// Regression test B: a fresh inline insert (no supersedes) after a
+/// staged insert must not double-count the new rows.
+async fn test_fresh_inline_after_staged_no_double_count(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = SessionContext::new();
+    let catalog: Arc<dyn MetadataCatalog> =
+        Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+    let table = CayenneTableProvider::create_table(
+        catalog,
+        CreateTableOptions {
+            table_name: "fresh_inline_no_dbl".to_string(),
+            schema: schema(),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: fixture.data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig::default(),
+        },
+        ctx.runtime_env(),
+    )
+    .await?;
+    let table = Arc::new(table);
+    ctx.register_table(
+        "fresh_inline_no_dbl",
+        Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
+    )?;
+
+    // 1. Insert 2000 rows — staged path.
+    common::insert_batch(&table, batch(1, 2000, 10)).await?;
+    table.flush_pending_maintenance().await?;
+
+    let stats = table
+        .optimizer_table_statistics()
+        .expect("stats after staged insert");
+    assert_eq!(stats.num_rows.get_value().copied(), Some(2000));
+
+    // 2. Insert 200 brand-new rows (ids 2001..=2200) — fits inline (200 ≤ 1024),
+    //    no supersedes. num_rows must be 2200, not 2400.
+    common::insert_batch(&table, batch(2001, 200, 10)).await?;
+    table.flush_pending_maintenance().await?;
+
+    assert_eq!(
+        count_star(&ctx, "fresh_inline_no_dbl").await,
+        2200,
+        "COUNT(*) must be 2200"
+    );
+    let stats = table
+        .optimizer_table_statistics()
+        .expect("stats after fresh inline insert");
+    assert_eq!(
+        stats.num_rows.get_value().copied(),
+        Some(2200),
+        "num_rows must be 2200 — fresh inline insert must not be double-counted"
+    );
+
+    Ok(())
+}

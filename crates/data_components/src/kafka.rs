@@ -1258,21 +1258,29 @@ fn payloads_to_change_batch<'a>(
     payloads: impl Iterator<Item = &'a [u8]>,
     schema: &Arc<Schema>,
 ) -> Result<ChangeBatch, cdc::StreamError> {
-    let values = payloads
-        .map(|payload| {
-            serde_json::from_slice::<Value>(payload).map_err(|e| {
-                cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Fast path (no flatten): feed the raw JSON payload bytes straight to the
+    // Arrow NDJSON reader, skipping the serde_json::Value tree + the
+    // re-serialization round-trip that values_to_change_batch performs.
+    // arrow-json accepts both newline-delimited and whitespace-separated JSON
+    // values, so joining payloads with '\n' is safe even when a producer emits
+    // pretty-printed (multi-line) objects.
+    let mut joined: Vec<u8> = Vec::new();
+    let mut count: usize = 0;
+    for payload in payloads {
+        if !joined.is_empty() {
+            joined.push(b'\n');
+        }
+        joined.extend_from_slice(payload);
+        count += 1;
+    }
 
-    if values.is_empty() {
+    if count == 0 {
         return Err(cdc::StreamError::Arrow(
             "No Kafka message payload found in batch".to_string(),
         ));
     }
 
-    values_to_change_batch(values.iter(), None, schema)
+    json_bytes_to_change_batch(&joined, schema)
 }
 
 fn values_to_change_batch<'a>(
@@ -1318,6 +1326,39 @@ fn json_bytes_to_change_batch(
 
     cdc::wrap_data_as_change_batch(schema, &rb)
         .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
+}
+
+// Public wrappers for benchmarking the two JSON decode paths head-to-head.
+#[cfg(feature = "bench")]
+pub mod bench_wrappers {
+    use super::{
+        Arc, ChangeBatch, Error, Schema, Value, cdc, payloads_to_change_batch,
+        values_to_change_batch,
+    };
+
+    /// Direct path (production): raw payload bytes -> Arrow NDJSON reader.
+    pub fn decode_direct(
+        payloads: &[&[u8]],
+        schema: &Arc<Schema>,
+    ) -> Result<ChangeBatch, cdc::StreamError> {
+        payloads_to_change_batch(payloads.iter().copied(), schema)
+    }
+
+    /// Legacy round-trip path: bytes -> serde_json::Value -> to_string() -> Arrow.
+    pub fn decode_roundtrip(
+        payloads: &[&[u8]],
+        schema: &Arc<Schema>,
+    ) -> Result<ChangeBatch, cdc::StreamError> {
+        let values = payloads
+            .iter()
+            .map(|p| {
+                serde_json::from_slice::<Value>(p).map_err(|e| {
+                    cdc::StreamError::Kafka(Error::UnableToDeserializeJsonMessage { source: e })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        values_to_change_batch(values.iter(), None, schema)
+    }
 }
 
 #[async_trait]
@@ -1509,6 +1550,61 @@ mod tests {
             }
             _ => panic!("Expected Arrow error"),
         }
+    }
+
+    #[test]
+    fn decimal_precision_roundtrip_vs_direct() {
+        use arrow::array::Decimal128Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amt", DataType::Decimal128(38, 18), false),
+        ]));
+        // 18 fractional digits → exact scaled i128 = 1234567890123456789
+        let exact: i128 = 1_234_567_890_123_456_789;
+        let raw_num = br#"{"id":1,"amt":1.234567890123456789}"#;
+        let raw_str = br#"{"id":1,"amt":"1.234567890123456789"}"#;
+
+        // ChangeBatch.record is [op, primary_keys, data:Struct{table fields}];
+        // amt is field 1 of the nested data struct (col 2).
+        let amt = |b: &ChangeBatch| -> i128 {
+            b.record
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .expect("data struct")
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal col")
+                .value(0)
+        };
+
+        // direct (this PR's fast path), number form
+        let direct_num = payloads_to_change_batch([raw_num.as_slice()].into_iter(), &schema)
+            .expect("direct num");
+        // current round-trip path, number form
+        let v_num = serde_json::from_slice::<Value>(raw_num).expect("parse num");
+        let rt_num = values_to_change_batch([v_num].iter(), None, &schema).expect("roundtrip num");
+        // direct, string form (decimal-as-string control)
+        let direct_str = payloads_to_change_batch([raw_str.as_slice()].into_iter(), &schema)
+            .expect("direct str");
+
+        eprintln!("[decimal-precision] exact          = {exact}");
+        eprintln!("[decimal-precision] direct(num)     = {}", amt(&direct_num));
+        eprintln!("[decimal-precision] roundtrip(num)  = {}", amt(&rt_num));
+        eprintln!("[decimal-precision] direct(str)     = {}", amt(&direct_str));
+
+        // The direct byte path preserves full Decimal128 precision for both
+        // number- and string-form JSON.
+        assert_eq!(amt(&direct_num), exact, "direct number-form must be exact");
+        assert_eq!(amt(&direct_str), exact, "direct string-form must be exact");
+        // The old serde_json::Value -> to_string() round-trip widens the number
+        // to f64 first and is therefore lossy beyond ~16 significant digits.
+        assert_ne!(
+            amt(&rt_num),
+            exact,
+            "round-trip via serde_json::Value is lossy through f64"
+        );
     }
 
     #[test]

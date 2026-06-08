@@ -238,14 +238,121 @@ impl PartitionMetadata {
     }
 }
 
-/// Which compression strategy to use for the Vortex layout.
+/// Which compression strategy the table's FULL encoding tier uses — i.e.
+/// maintenance writes (compaction outputs, rewrites, overwrites) and delta
+/// writes that resolve to a full level (`7..=10`, or `auto` on large /
+/// unknown-size writes). Light delta levels (`0..=6`) are a fixed
+/// `BtrBlocks`-subset effort ladder and are not affected by this choice.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionStrategy {
-    /// Uses the default Vortex Btrblocks compression.
+    /// The default Vortex `BtrBlocks` cascading scheme search.
     #[default]
     Btrblocks,
-    /// Uses the Vortex `CompactCompressor` with Zstd compression.
+    /// The default cascade PLUS the Zstd string schemes
+    /// (`StringCode::Zstd` / `ZstdBuffers`) in the search — the encoder picks
+    /// them when they beat FSST/dict on a column. Integer/float columns are
+    /// unchanged (Vortex has no zstd schemes for them at this revision).
+    /// Trades encode CPU and string-decode speed for better ratios on
+    /// long/high-entropy strings.
     Zstd,
+}
+
+/// Encoding effort for *delta* writes — fresh CDC/append snapshot files that
+/// the tiered compactor later folds into properly-encoded files.
+///
+/// zstd-style level scale (`cayenne_delta_encoding` param):
+///
+/// - `auto` (default) — size-gated: a write smaller than a quarter of the
+///   target file size encodes at a light level (the file is transient by
+///   definition — compaction exists to fold it); larger or unknown-size
+///   writes use the full default encoding.
+/// - `0` — no compression (canonical arrays; cheapest encode).
+/// - `1`–`6` — progressively richer scheme sets. The cheap levels skip the
+///   per-file encoder-strategy search and FSST symbol-table training.
+/// - `7`–`10` — the full default `BtrBlocks` cascade: byte-for-byte the
+///   pre-feature write behavior (`7` is the explicit opt-out of `auto`;
+///   `8`–`10` are reserved for future heavier-effort search).
+///
+/// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
+/// NOT affected by this setting — they always use the full default encoding,
+/// because their output is the long-lived artifact whose encoding quality
+/// pays for scan throughput and storage footprint.
+///
+/// The exact level → scheme-set mapping lives in
+/// `provider::delta_encoding::strategy_builder_for_level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum DeltaEncoding {
+    /// Size-gated: light for small deltas, full for large writes.
+    Auto,
+    /// Fixed encoding level `0..=10` applied to every delta write.
+    Level(u8),
+}
+
+impl Default for DeltaEncoding {
+    /// `Auto` — size-gated light encoding for small deltas. This is also what
+    /// pre-feature stored table configs deserialize to via
+    /// `#[serde(default)]`, so existing tables pick up the policy on upgrade
+    /// (write-time only; existing data files are unaffected and a level
+    /// change never forces a table re-create). Set the
+    /// `cayenne_delta_encoding` param to `7` to opt out (the full default
+    /// cascade, byte-for-byte the pre-feature behavior).
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Maximum supported [`DeltaEncoding`] level.
+pub const DELTA_ENCODING_MAX_LEVEL: u8 = 10;
+
+/// First level that maps to the full default `BtrBlocks` cascade (levels
+/// `7..=10` are all "full" today). Shared with
+/// `provider::delta_encoding::FULL_LEVEL` so the two can't drift.
+pub const DELTA_ENCODING_FULL_LEVEL: u8 = 7;
+
+impl std::fmt::Display for DeltaEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Level(level) => write!(f, "{level}"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeltaEncoding {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        let level: u8 = trimmed.parse().map_err(|_| {
+            format!(
+                "invalid delta encoding '{value}': expected 'auto' or a level 0..={DELTA_ENCODING_MAX_LEVEL}"
+            )
+        })?;
+        if level > DELTA_ENCODING_MAX_LEVEL {
+            return Err(format!(
+                "invalid delta encoding level {level}: maximum is {DELTA_ENCODING_MAX_LEVEL}"
+            ));
+        }
+        Ok(Self::Level(level))
+    }
+}
+
+impl TryFrom<String> for DeltaEncoding {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<DeltaEncoding> for String {
+    fn from(value: DeltaEncoding) -> Self {
+        value.to_string()
+    }
 }
 
 /// Primary-key conflict detection behavior for Cayenne inserts.
@@ -370,6 +477,93 @@ impl DeletionMode {
     }
 }
 
+/// Durability mode for the inline CDC write path (`refresh_mode: changes`).
+///
+/// In [`Self::File`] (the default — byte-identical to the pre-feature behavior)
+/// every CDC batch persists a durable metastore entry / staged Vortex write
+/// before the source slot ack advances. In [`Self::Memory`] the inline path
+/// appends each batch to an in-RAM tier and DEFERS the source slot ack until a
+/// periodic/cap-triggered checkpoint flushes the tier to a durable Vortex file —
+/// collapsing per-batch durability cost at the price of replaying the
+/// un-checkpointed tail from the source slot on crash (the apply is
+/// PK-idempotent, so this is exactly-once). Memory mode is bounded by a
+/// per-table byte cap AND a process-global byte budget so it can never OOM; on
+/// cap breach it spills (checkpoints) and, under sustained overload, falls back
+/// to the durable path for the breaching batch.
+///
+/// Memory mode only applies to the small-write CDC profile; it is forced to
+/// [`Self::File`] for full/snapshot/append-without-fast-refresh profiles (no
+/// inline write path to invert) and for partitioned tables (their visibility
+/// flip cannot be deferred).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CdcDurability {
+    /// Per-batch durable metastore/Vortex persist before the slot ack. The DEFAULT:
+    /// the proven path that holds CDC replication lag at zero across all tables
+    /// under sustained load.
+    #[default]
+    File,
+    /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
+    /// OPT-IN (experimental). Engages only for the changes/small-write refresh
+    /// profile AND a replayable source committer (the runtime arms it lazily on the
+    /// first batch whose committer reports `supports_deferral()`); every other
+    /// profile/source falls back to `File`. KNOWN LIMITATION: without a periodic
+    /// background checkpoint the deferred slot ack lets replication lag grow
+    /// unbounded under sustained ingest (the RAM tier never checkpoints mid-run) —
+    /// prefer `File` until that follow-up lands. Correctness is unaffected (the
+    /// source re-streams on restart; convergence verified).
+    Memory,
+}
+
+impl CdcDurability {
+    /// Parse a spicepod parameter value (`file` | `memory`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
+
+    /// Return the spicepod/config string for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Memory => "memory",
+        }
+    }
+
+    /// Whether this is the in-memory deferred-ack mode.
+    #[must_use]
+    pub const fn is_memory(self) -> bool {
+        matches!(self, Self::Memory)
+    }
+}
+
+/// Which adaptive-tunable knobs the operator pinned with an explicit value. In
+/// `adaptive` mode the closed-loop controller must not move a pinned knob — its
+/// tuning bounds collapse to a single point so `decide()` naturally skips it and
+/// falls through to another lever. (In `auto` mode there is no loop, so an
+/// explicit value is already frozen.) This is how the "override per config
+/// value" mode composes with `auto`/`adaptive`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent pin flag per adaptive-tunable knob"
+)]
+pub struct PinnedTuningKnobs {
+    /// The inline-memtable flush caps were operator-set (don't adapt them).
+    pub inline_flush: bool,
+    /// `cayenne_compaction_background_interval_ms` was operator-set.
+    pub compaction_interval: bool,
+    /// `cayenne_compaction_trigger_files` was operator-set.
+    pub compaction_trigger: bool,
+    /// `cayenne_write_concurrency` was operator-set.
+    pub write_concurrency: bool,
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -391,6 +585,14 @@ pub struct VortexConfig {
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
+    /// Encoding effort for delta writes (fresh CDC/append snapshot files).
+    /// `auto` (default) size-gates: small deltas encode light and are folded
+    /// into properly-encoded files by compaction; explicit `0..=10` pins the
+    /// level (`7` = the full default cascade, the pre-feature behavior).
+    /// Maintenance writes (compaction, rewrites) always use the full default
+    /// encoding. See [`DeltaEncoding`].
+    #[serde(default)]
+    pub delta_encoding: DeltaEncoding,
     /// Maximum number of concurrent file uploads when writing multiple Vortex files.
     /// Each file uses multipart uploads internally via `object_store`.
     /// Defaults to the available CPU parallelism.
@@ -503,6 +705,39 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Durability mode for the inline CDC write path. [`CdcDurability::File`]
+    /// (default) persists each batch durably before advancing the source slot;
+    /// [`CdcDurability::Memory`] appends to an in-RAM tier and defers the slot
+    /// ack to a periodic/cap-triggered checkpoint. Default is byte-identical to
+    /// the pre-feature behavior (zero regression when not opted in).
+    #[serde(default)]
+    pub cdc_durability: CdcDurability,
+    /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
+    /// advance, in `cdc_durability: memory` mode only. `0` disables the
+    /// per-table cap; the process-global byte budget still bounds aggregate
+    /// resident memory. When both are set, whichever is breached first triggers
+    /// the spill.
+    #[serde(default)]
+    pub cdc_mem_tier_max_bytes: i64,
+    /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
+    /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
+    /// window for cold/low-traffic tables (whose byte cap would otherwise never
+    /// trip). `0` disables the age trigger.
+    #[serde(default)]
+    pub cdc_mem_tier_max_age_ms: u64,
+    /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
+    /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
+    /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
+    /// a per-table controller measures the CDC ingest rate *and the runtime's
+    /// whole-system response* (apply latency vs offered load, read amplification
+    /// that slows queries, cgroup-aware memory pressure) and nudges the safe
+    /// per-operation knobs within the environment-derived `[floor, ceiling]`.
+    #[serde(default)]
+    pub dynamic_tuning: bool,
+    /// Adaptive-tunable knobs the operator pinned with an explicit value; the
+    /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
+    #[serde(default)]
+    pub pinned_tuning_knobs: PinnedTuningKnobs,
 }
 
 fn default_concurrency() -> usize {
@@ -638,6 +873,12 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
+            // `auto`: size-gated light encoding for small deltas (re-encoded
+            // by compaction). Local micro A/B (2026-06-06) was neutral on the
+            // upsert/bulk lanes; the aggregate CPU-per-delta benefit targets
+            // production-scale CDC and is to be validated there. Set the
+            // param to `7` to opt out (pre-feature behavior).
+            delta_encoding: DeltaEncoding::default(),
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
@@ -656,6 +897,11 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            cdc_durability: CdcDurability::default(),
+            cdc_mem_tier_max_bytes: 0,
+            cdc_mem_tier_max_age_ms: 0,
+            dynamic_tuning: false,
+            pinned_tuning_knobs: PinnedTuningKnobs::default(),
         }
     }
 }
@@ -909,6 +1155,20 @@ pub struct InlinedDelete {
     pub sequence_number: i64,
     /// ISO 8601 timestamp
     pub created_at: String,
+    /// Durable per-tombstone activation flag.
+    ///
+    /// A staged inline-conflict upsert writes its tombstone with `published =
+    /// false` at a `sequence_number` reserved below the staged snapshot's
+    /// `snapshot_sequence`. The read filter (`load_inlined_deletion_maps`)
+    /// applies the tombstone ONLY when this is `true`, so a durable-but-inactive
+    /// tombstone observed by an inline-cache rebuild (which a concurrent
+    /// same-table inline INSERT can trigger) before the owning snapshot
+    /// publishes cannot hide the old inline row — eliminating the transient
+    /// vanish that a global watermark could not (advance ⇒ HIDE polarity). The
+    /// owning snapshot's finalize flips this durably to `true`
+    /// (`MetadataCatalog::mark_inlined_delete_published`) before its replacement
+    /// rows become discoverable, and only the inline checkpoint clears it.
+    pub published: bool,
 }
 
 /// Configuration for an external object store (e.g., S3).

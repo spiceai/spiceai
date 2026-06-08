@@ -39,6 +39,7 @@ use datafusion::{
 };
 use datafusion_federation::sql::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use flight_client::{
     Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
 };
@@ -83,6 +84,7 @@ pub struct FlightFactory {
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
     extra_compute_context: Option<Arc<str>>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for FlightFactory {
@@ -103,12 +105,21 @@ impl FlightFactory {
             client,
             dialect,
             extra_compute_context: None,
+            function_support: None,
         }
     }
 
     #[must_use]
     pub fn client(&self) -> FlightClient {
         self.client.clone()
+    }
+
+    /// Install the federation function deny-list so Spice-only UDFs are evaluated
+    /// locally instead of pushed into the Flight server (#10703).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 
     #[must_use]
@@ -135,7 +146,8 @@ impl FlightFactory {
                 Arc::clone(&self.dialect),
                 self.extra_compute_context.as_ref().map(Arc::clone),
             )
-            .await?,
+            .await?
+            .with_function_support(self.function_support.clone()),
         );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
@@ -177,6 +189,10 @@ pub struct FlightTable {
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
     table_reference: MultiPartTableReference,
+    /// Federation function deny-list. Functions on the list (Spice-only UDFs such
+    /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
+    /// sent to the Flight server. See issue #10703.
+    function_support: Option<FunctionSupport>,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -213,6 +229,7 @@ impl FlightTable {
             schema,
             dialect,
             table_reference,
+            function_support: None,
         })
     }
 
@@ -238,7 +255,15 @@ impl FlightTable {
             schema,
             dialect,
             table_reference,
+            function_support: None,
         }
+    }
+
+    /// Install the federation function deny-list (see [`FunctionSupport`]).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
     }
 
     async fn get_schema(

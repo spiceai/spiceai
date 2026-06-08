@@ -21,10 +21,12 @@ use std::sync::Arc;
 use datafusion_execution::{config::SessionConfig, runtime_env::RuntimeEnv};
 use tokio::sync::Semaphore;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions};
+use vortex::file::WriteStrategyBuilder;
+use vortex_datafusion::{ProjectionPushdown, VortexFormat, VortexTableOptions, WriteShardConfig};
 use vortex_session::VortexSession;
 
-use crate::metadata::{DeletionMode, PkConflictDetection, VortexConfig};
+use super::tuning::{self, IngestStats, KnobValues, LiveKnobs, TuningBounds};
+use crate::metadata::{DeletionMode, DeltaEncoding, PkConflictDetection, VortexConfig};
 
 /// Shared context for Cayenne table operations.
 ///
@@ -43,6 +45,10 @@ pub struct CayenneContext {
     vortex_format: Arc<VortexFormat>,
     /// Configuration for encoding, compression, and file sizing.
     config: VortexConfig,
+    /// Dataset label the formats are tagged with (metrics attribution).
+    /// Retained so per-write format variants (e.g. delta-encoding strategy
+    /// overrides) carry the same label as the shared base format.
+    dataset: String,
     /// Session configuration for `DataFusion` listing options.
     session_config: SessionConfig,
     /// Shared semaphore for limiting concurrent file writes / uploads across all partitions.
@@ -53,6 +59,27 @@ pub struct CayenneContext {
     /// creation, ensuring that the `list_files_cache` (and other caches/object stores)
     /// are shared with the main query engine.
     runtime_env: Arc<RuntimeEnv>,
+    /// Live, runtime-tunable copies of the per-operation knobs. Initialized from
+    /// `config`, so reads are identical to the static config until the dynamic
+    /// controller (if enabled) adjusts them. The hot-path accessors below read
+    /// from here, making them the single choke point for dynamic tuning.
+    live_knobs: Arc<LiveKnobs>,
+    /// Rolling CDC ingest accounting (input rate + runtime response) feeding the
+    /// dynamic controller. Always recorded (cheap); only acted on when
+    /// `dynamic_tuning` is enabled.
+    ingest_stats: Arc<IngestStats>,
+    /// Static `[floor, ceiling]` the controller may move each live knob within.
+    tuning_bounds: TuningBounds,
+    /// Whether the closed-loop controller may mutate `live_knobs` (off by
+    /// default; the accounting still records regardless).
+    dynamic_tuning: bool,
+    /// Wall-clock of the last applied dynamic adjustment, for the controller's
+    /// dwell-time hysteresis. `None` until the first adjustment.
+    last_adjust: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Wall-clock of the previous recorded CDC write, used to derive the
+    /// inter-batch arrival interval (the offered-load signal). `None` until the
+    /// first write.
+    last_write: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 /// Default byte budget for the in-memory PK keyset cache when
@@ -76,13 +103,120 @@ impl CayenneContext {
     #[must_use]
     pub fn new(config: &VortexConfig, runtime_env: Arc<RuntimeEnv>, dataset: &str) -> Arc<Self> {
         let vortex_format = Self::create_vortex_format(config, dataset);
+        // Seed the live knobs from the static config so every hot-path accessor
+        // reads exactly the static value until (and unless) the controller moves
+        // it — enabling dynamic tuning is therefore a strict, bounded refinement,
+        // never a behavior change on its own.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // When `write_concurrency` is unset, seed the live knob to the SAME value
+        // the write path resolves to (`DEFAULT_WRITE_CONCURRENCY` capped by host
+        // cores), not 0. The controller grows from this real current value; a 0
+        // seed (which the accessor and `decide()` both treat as 1) would make the
+        // first "raise under backpressure" actually DECREASE effective concurrency
+        // (e.g. default 4 → 2). Equivalent to unset for the write path, so this is
+        // not a behavior change when dynamic tuning is off.
+        let default_write_concurrency = super::table::DEFAULT_WRITE_CONCURRENCY.min(cores);
+        let wc_init = config
+            .write_concurrency
+            .unwrap_or(default_write_concurrency);
+        let live_knobs = Arc::new(LiveKnobs::new(KnobValues {
+            inline_flush_max_bytes: config.inline_flush_max_bytes,
+            inline_flush_max_rows: config.inline_flush_max_rows,
+            inline_flush_max_segments: config.inline_flush_max_segments,
+            compaction_background_interval_ms: config.compaction_background_interval_ms,
+            compaction_trigger_files: config.compaction_trigger_files,
+            write_concurrency: wc_init,
+        }));
+        // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
+        // memtable may grow up to 4× the static value (ingest-lag relief) but
+        // never past 256 MiB (the largest static memory ceiling); concurrency is
+        // capped at the core count (the global encode budget caps the aggregate).
+        let min_flush_bytes: i64 = 2 * 1024 * 1024;
+        let max_flush_bytes = config
+            .inline_flush_max_bytes
+            .max(min_flush_bytes)
+            .saturating_mul(4)
+            .clamp(min_flush_bytes, 256 * 1024 * 1024);
+        // A pinned (operator-set) knob's bounds collapse to a single point so the
+        // controller can never move it — that is how an explicit per-value
+        // override is respected even in `adaptive` mode (`decide()` finds no room
+        // and falls through to another, un-pinned lever).
+        let pins = config.pinned_tuning_knobs;
+        let tuning_bounds = TuningBounds {
+            inline_flush_max_bytes: if pins.inline_flush {
+                (config.inline_flush_max_bytes, config.inline_flush_max_bytes)
+            } else {
+                (min_flush_bytes, max_flush_bytes)
+            },
+            compaction_background_interval_ms: if pins.compaction_interval {
+                (
+                    config.compaction_background_interval_ms,
+                    config.compaction_background_interval_ms,
+                )
+            } else {
+                (2_000, 60_000)
+            },
+            compaction_trigger_files: if pins.compaction_trigger {
+                (
+                    config.compaction_trigger_files,
+                    config.compaction_trigger_files,
+                )
+            } else {
+                (2, 32)
+            },
+            write_concurrency: if pins.write_concurrency {
+                (wc_init, wc_init)
+            } else {
+                (1, cores)
+            },
+        };
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
+            dataset: dataset.to_string(),
             session_config: SessionConfig::default(),
             upload_semaphore: Arc::new(Semaphore::new(config.upload_concurrency.max(1))),
             runtime_env,
+            live_knobs,
+            ingest_stats: Arc::new(IngestStats::new()),
+            tuning_bounds,
+            dynamic_tuning: config.dynamic_tuning,
+            last_adjust: parking_lot::Mutex::new(None),
+            last_write: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Encoding effort configured for delta writes (`cayenne_delta_encoding`).
+    #[must_use]
+    pub fn delta_encoding(&self) -> DeltaEncoding {
+        self.config.delta_encoding
+    }
+
+    /// Build a write-only `VortexFormat` whose session carries a
+    /// [`WriteStrategyBuilder`] override — used by light delta-encoding levels
+    /// (see `provider::delta_encoding`). The format mirrors the shared base
+    /// format's table options and dataset label; `shard` optionally enables
+    /// intra-write sharding exactly like
+    /// `CayenneTableProvider::write_shard_format` does on the default path.
+    ///
+    /// Scans never observe these formats: the scan path keeps using
+    /// [`Self::file_format`], so the strategy override affects only the files
+    /// this write produces.
+    #[must_use]
+    pub(crate) fn write_format_with_strategy(
+        &self,
+        strategy: WriteStrategyBuilder,
+        shard: Option<WriteShardConfig>,
+    ) -> Arc<VortexFormat> {
+        let session = VortexSession::default().set(strategy);
+        let format =
+            VortexFormat::new_with_options(session, Self::vortex_table_options(&self.config))
+                .with_dataset_label(self.dataset.as_str());
+        let format = match shard {
+            Some(config) => format.with_write_shard(config),
+            None => format,
+        };
+        Arc::new(format)
     }
 
     /// Get the Vortex file format for creating listing tables.
@@ -135,10 +269,13 @@ impl CayenneContext {
         self.config.upload_concurrency.max(1)
     }
 
-    /// Get the configured writer partition override for unsorted snapshot writes.
+    /// Get the writer partition override for unsorted snapshot writes (live:
+    /// dynamic-tunable). `0` in the live knob means "unset" (use the session
+    /// default), mirroring `config.write_concurrency == None`.
     #[must_use]
     pub fn write_concurrency(&self) -> Option<usize> {
-        self.config.write_concurrency.map(|v| v.max(1))
+        let wc = self.live_knobs.write_concurrency();
+        (wc != 0).then(|| wc.max(1))
     }
 
     /// Maximum rows in one write that may be inlined into the metastore.
@@ -159,22 +296,22 @@ impl CayenneContext {
         self.config.inline_max_buffer_bytes
     }
 
-    /// Maximum inline rows before checkpointing to Vortex.
+    /// Maximum inline rows before checkpointing to Vortex (live: dynamic-tunable).
     #[must_use]
     pub(crate) fn inline_flush_max_rows(&self) -> i64 {
-        self.config.inline_flush_max_rows.max(0)
+        self.live_knobs.inline_flush_max_rows().max(0)
     }
 
-    /// Maximum inline entries before checkpointing to Vortex.
+    /// Maximum inline entries before checkpointing to Vortex (live).
     #[must_use]
     pub(crate) fn inline_flush_max_segments(&self) -> i64 {
-        self.config.inline_flush_max_segments.max(0)
+        self.live_knobs.inline_flush_max_segments().max(0)
     }
 
-    /// Maximum inline IPC bytes before checkpointing to Vortex.
+    /// Maximum inline IPC bytes before checkpointing to Vortex (live).
     #[must_use]
     pub(crate) fn inline_flush_max_bytes(&self) -> i64 {
-        self.config.inline_flush_max_bytes.max(0)
+        self.live_knobs.inline_flush_max_bytes().max(0)
     }
 
     /// Primary-key conflict detection behavior for inserts.
@@ -215,7 +352,7 @@ impl CayenneContext {
         // picker only ever asks "is bucket size < threshold".
         let target_bytes = u64::try_from(self.target_file_size_bytes()).unwrap_or(u64::MAX);
         super::compaction::CompactionPickerConfig::new(
-            self.config.compaction_trigger_files,
+            self.live_knobs.compaction_trigger_files(),
             self.config.compaction_max_files_per_pick,
             target_bytes,
         )
@@ -245,15 +382,15 @@ impl CayenneContext {
         }
     }
 
-    /// Background compaction interval. Returns `None` when disabled (interval = 0).
+    /// Background compaction interval (live: dynamic-tunable). Returns `None`
+    /// when disabled (interval = 0).
     #[must_use]
     pub(crate) fn compaction_background_interval(&self) -> Option<std::time::Duration> {
-        if self.config.compaction_background_interval_ms == 0 {
+        let ms = self.live_knobs.compaction_background_interval_ms();
+        if ms == 0 {
             None
         } else {
-            Some(std::time::Duration::from_millis(
-                self.config.compaction_background_interval_ms,
-            ))
+            Some(std::time::Duration::from_millis(ms))
         }
     }
 
@@ -263,17 +400,108 @@ impl CayenneContext {
         &self.upload_semaphore
     }
 
+    /// Record one CDC write's measurements into the rolling ingest accounting.
+    /// Always on (cheap: a few atomics + a short-held mutex per *batch*); feeds
+    /// the dynamic controller and observability. The inter-batch arrival interval
+    /// (offered-load signal) is derived here from the previous write's timestamp,
+    /// so callers pass only what the write path already measures.
+    pub(crate) fn record_ingest(&self, rows: u64, bytes: u64, apply: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let arrival_gap = {
+            let mut last = self.last_write.lock();
+            let gap = last.map(|t| now.saturating_duration_since(t));
+            *last = Some(now);
+            gap
+        };
+        self.ingest_stats.record_write(tuning::WriteSample {
+            rows,
+            bytes,
+            apply,
+            arrival_gap,
+        });
+    }
+
+    /// A snapshot of the current ingest accounting (rate + response), for
+    /// observability/logging.
+    #[must_use]
+    pub(crate) fn ingest_snapshot(&self) -> tuning::IngestSnapshot {
+        self.ingest_stats.snapshot()
+    }
+
+    /// Current live knob values (after any dynamic adjustments), for metrics.
+    #[must_use]
+    pub(crate) fn live_knob_values(&self) -> tuning::KnobValues {
+        self.live_knobs.values()
+    }
+
+    /// Refresh the externally-observed environment/response signals (read amp +
+    /// cgroup memory pressure) so the next snapshot/control step sees fresh data.
+    /// Called on the background tick regardless of whether tuning is enabled, so
+    /// the accounting gauges stay live for observability.
+    pub(crate) fn observe_environment(&self, read_amp: usize) {
+        self.ingest_stats.set_read_amp(read_amp);
+        tuning::sample_mem_pressure(&self.ingest_stats);
+    }
+
+    /// Run one dynamic-tuning control step from the current accounting, applying
+    /// at most one bounded knob change to [`Self::live_knobs`]. Returns the
+    /// adjustment made (for logging) or `None` when tuning is disabled or no
+    /// change is warranted. Owns the dwell clock: `min_dwell` is the minimum
+    /// spacing enforced between applied changes.
+    pub(crate) fn retune(&self, min_dwell: std::time::Duration) -> Option<tuning::Adjustment> {
+        if !self.dynamic_tuning {
+            return None;
+        }
+        // Detect the environment (cgroup-aware memory usage) and fold it in, so
+        // the loop closes on memory as well as ingest/query behavior.
+        tuning::sample_mem_pressure(&self.ingest_stats);
+        let now = std::time::Instant::now();
+        let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
+            now.saturating_duration_since(t)
+        });
+        let snapshot = self.ingest_stats.snapshot();
+        let adj = tuning::decide(
+            &snapshot,
+            &self.live_knobs.values(),
+            &self.tuning_bounds,
+            since_last,
+            min_dwell,
+        )?;
+        self.live_knobs.apply(&adj);
+        *self.last_adjust.lock() = Some(now);
+        Some(adj)
+    }
+
     /// Create a `VortexFormat` from configuration.
     ///
     /// The format carries Vortex scan/write options, including the shared
     /// segment-cache capacity for scans created from this context.
     fn create_vortex_format(config: &VortexConfig, dataset: &str) -> Arc<VortexFormat> {
-        // Create a Vortex session with default encodings
-        // Note: Write strategy configuration (e.g., compression) is applied at write time via
-        // `session.write_options().with_strategy(...)`, not at the VortexFormat level
-        let vortex_session = VortexSession::default();
+        // Create a Vortex session with default encodings. The session's write
+        // strategy is the table's FULL encoding tier: the BtrBlocks cascade by
+        // default, optionally extended with the Zstd string scheme when
+        // `cayenne_compression_strategy=zstd` (this wiring is what makes that
+        // param real — see `delta_encoding::full_strategy_builder_for`).
+        // Maintenance writes and full-level delta writes inherit it; light
+        // delta-encoding levels override it per write via
+        // `write_format_with_strategy` (see `provider::delta_encoding`).
+        let mut vortex_session = VortexSession::default();
+        if let Some(full_strategy) =
+            super::delta_encoding::full_strategy_builder_for(&config.compression_strategy)
+        {
+            vortex_session = vortex_session.set(full_strategy);
+        }
 
-        // Configure VortexFormat.
+        Arc::new(
+            VortexFormat::new_with_options(vortex_session, Self::vortex_table_options(config))
+                .with_dataset_label(dataset),
+        )
+    }
+
+    /// Table options shared by the base format and any per-write format
+    /// variants (delta-encoding strategy overrides) so write-only formats
+    /// behave identically apart from the encoding strategy.
+    fn vortex_table_options(config: &VortexConfig) -> VortexTableOptions {
         let segment_cache_size_bytes =
             config
                 .segment_cache_mb
@@ -286,16 +514,12 @@ impl CayenneContext {
                     None
                 });
 
-        let vortex_opts = VortexTableOptions {
+        VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
-        };
-
-        Arc::new(
-            VortexFormat::new_with_options(vortex_session, vortex_opts).with_dataset_label(dataset),
-        )
+        }
     }
 }
 

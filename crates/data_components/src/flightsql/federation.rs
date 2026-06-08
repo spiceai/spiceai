@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
 use std::sync::Arc;
 
 use datafusion::{
@@ -70,6 +71,15 @@ impl SQLExecutor for FlightSQLTable {
     }
 
     fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+        // Don't federate plans referencing a deny-listed Spice-only function
+        // (e.g. json_get_str); the Flight SQL server has no such function, so
+        // evaluate those locally instead.
+        if let Some(func_supp) = self.function_support.as_ref()
+            && contains_unsupported_functions(logical_plan, func_supp).unwrap_or(false)
+        {
+            return false;
+        }
+
         // FlightSQL federation currently cannot safely unparse arbitrary custom
         // extension nodes. If any are present in the subtree — including inside
         // subquery expressions (IN, EXISTS, scalar subqueries) — do not federate.

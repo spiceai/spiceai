@@ -26,6 +26,7 @@ mod chat;
 mod embed;
 mod metrics;
 mod model_context;
+pub(crate) mod nsql;
 pub mod params;
 pub(crate) mod provider_models;
 pub(crate) mod rate_limit;

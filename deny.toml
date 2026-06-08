@@ -40,6 +40,8 @@ ignore = [
   "RUSTSEC-2026-0099",
   # Legacy `rustls` 0.21 dependencies pull `rustls-webpki` 0.101.x; newer 0.103.x is updated in Cargo.lock. Owner: AWS/MSSQL integrations.
   "RUSTSEC-2026-0104",
+  # `proc-macro-error2` (pulled transitively via derive-macro crates) is unmaintained with no safe drop-in replacement published yet. Owner: workspace (transitive).
+  "RUSTSEC-2026-0173",
 ]
 
 [bans]

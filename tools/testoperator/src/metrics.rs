@@ -553,3 +553,11 @@ pub static OLTP_TPMC: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("txn/min")
         .build()
 });
+
+pub static QPH: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("qph")
+        .with_description("Queries completed per hour (QPH).")
+        .with_unit("queries/hour")
+        .build()
+});

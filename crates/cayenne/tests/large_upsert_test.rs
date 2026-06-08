@@ -17,13 +17,14 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-//! Regression test: upserting more than `SQLITE_MAX_VARIABLE_NUMBER` / 4 rows
+//! Regression test: upserting more than `SQLITE_MAX_VARIABLE_NUMBER` / 3 rows
 //! must not fail with a `SQLite` "too many SQL variables" error.
 //!
-//! `add_insert_records_batch` builds an INSERT with 4 params per row.
-//! `SQLite`'s default `SQLITE_MAX_VARIABLE_NUMBER` is 32 766, so batches with
-//! more than ~8 000 rows would exceed the limit without the inline-SQL
-//! fallback path.
+//! `add_insert_records_batch` builds an INSERT with 3 params per row
+//! (`table_id`, `pk_bytes`, `sequence_number`). `SQLite`'s default
+//! `SQLITE_MAX_VARIABLE_NUMBER` is 32 766, so batches with more than 10 922
+//! rows (32 766 / 3, floored) would exceed the limit without the multi-chunk
+//! transaction path.
 
 mod common;
 
@@ -48,9 +49,11 @@ test_with_backends!(test_large_sharded_upsert_preserves_pk_and_row_count);
 async fn test_large_upsert_exceeds_sqlite_param_limit(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 10 000 conflicting PKs → 40 000 SQL parameters in add_insert_records_batch.
-    // This exceeds SQLITE_MAX_VARIABLE_NUMBER (32 766) if the INSERT is unbatched.
-    const ROW_COUNT: usize = 10_000;
+    // 15 000 conflicting PKs → 45 000 SQL parameters in add_insert_records_batch
+    // (3 params/row: table_id, pk_bytes, sequence_number). This exceeds
+    // SQLITE_MAX_VARIABLE_NUMBER (32 766) if the INSERT is unbatched, so it
+    // exercises the multi-chunk transaction path.
+    const ROW_COUNT: usize = 15_000;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),

@@ -1369,18 +1369,56 @@ impl DataFusion {
         // (this runtime's threads) and memory (the carved pool).
         cayenne::set_compaction_runtime_handle(tokio_handle);
         // Install the process-global encode-concurrency budget: cap the aggregate
-        // number of concurrent Vortex encode shards across ALL Cayenne tables at
-        // the host core count. Per-table `cayenne_write_concurrency` is sized in
-        // isolation — its unset default is conservative, but it can be raised per
-        // table — so without this a fleet of tables receiving CDC at once would
-        // sum their per-table shard counts and oversubscribe the machine. CPU-bound encode past the core count buys no
-        // throughput, only contention — so the core count is the natural ceiling.
-        let encode_budget =
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // number of concurrent Vortex encode shards across ALL Cayenne tables.
+        // Per-table `cayenne_write_concurrency` is sized in isolation — its unset
+        // default is conservative, but it can be raised per table — so without
+        // this a fleet of tables receiving CDC at once would sum their per-table
+        // shard counts and oversubscribe the machine. CPU-bound encode past the
+        // core count buys no throughput, only contention.
+        //
+        // The ceiling is the core count MINUS a query reserve (a quarter of the
+        // cores, at least 2, never reducing the budget below 1): encode shards
+        // run on the same runtime as OLAP query threads, and an HTAP burst that
+        // takes every core measurably starves concurrent scans (the validated
+        // #11170 mechanism — lowering write fan-out yielded 3-11x OLAP latency
+        // wins from CPU-contention relief alone). Compaction is unaffected: it
+        // has its own dedicated runtime and memory carve-out.
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let query_reserve = (cores / 4).max(2);
+        let encode_budget = cores.saturating_sub(query_reserve).max(1);
         cayenne::set_global_encode_concurrency(encode_budget);
         tracing::info!(
             encode_budget,
             "Cayenne global encode-concurrency budget active (caps aggregate write-encode shards across all tables)"
+        );
+
+        // Install the process-global in-memory CDC tier byte budget: the hard
+        // aggregate RAM ceiling for `cdc_durability: memory` across ALL Cayenne
+        // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
+        // isolation; without this global cap a fleet of memory-mode tables would
+        // sum their per-table caps and blow the box (the no-global-cap lesson,
+        // applied to memory). Sized to one eighth of total system/container
+        // memory, independent of DataFusion's query memory pool; an
+        // over-budget append spills to durable Vortex (and, under sustained
+        // overload, falls back to the durable path) rather than
+        // growing the tier, so memory mode can never OOM. File-mode tables never
+        // touch this budget.
+        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 8;
+        cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
+        tracing::info!(
+            mem_tier_budget_bytes,
+            "Cayenne global in-memory CDC tier byte budget active (caps aggregate RAM for cdc_durability: memory across all tables)"
+        );
+
+        // Install the cgroup-aware memory budget the dynamic auto-tuner uses to
+        // compute memory pressure (so the control loop closes on memory, not just
+        // ingest/query behavior). Mirrors the encode budget: injected here so the
+        // cayenne crate needs no runtime-specific resource detection of its own.
+        let memory_budget = crate::resource_monitor::get_total_memory();
+        cayenne::set_global_memory_budget(memory_budget);
+        tracing::info!(
+            memory_budget,
+            "Cayenne dynamic-tuning memory budget active (cgroup-aware)"
         );
         if let Some(env) = &self.compaction_runtime_env {
             cayenne::set_compaction_runtime_env(Arc::clone(env));
@@ -4568,6 +4606,7 @@ mod tests {
                 full_text_search: None,
                 check_availability: crate::component::dataset::CheckAvailability::Disabled,
                 on_schema_change: crate::component::dataset::OnSchemaChange::default(),
+                schema_inference: crate::component::dataset::SchemaInference::Standard,
             }
         }
 
