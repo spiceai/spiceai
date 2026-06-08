@@ -282,13 +282,16 @@ fn parse_u64_aliases_with_hint(
 ) -> u64 {
     keys.iter()
         .find_map(|&key| {
-            acceleration.params.get(key).map(|v| {
-                v.parse::<u64>().unwrap_or_else(|_| {
-                    tracing::warn!(
-                        "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                    );
-                    default
-                })
+            acceleration.params.get(key).and_then(|v| {
+                v.parse::<u64>().map_or_else(
+                    |_| {
+                        tracing::warn!(
+                            "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                        );
+                        None
+                    },
+                    Some,
+                )
             })
         })
         .unwrap_or(default)

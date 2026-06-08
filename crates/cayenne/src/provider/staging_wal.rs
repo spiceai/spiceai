@@ -104,6 +104,51 @@ impl std::fmt::Debug for CayenneStagedAppend {
     }
 }
 
+/// RAII guard for the in-flight staging-append registration taken out at the
+/// start of [`CayenneStagedAppend::prepare`].
+///
+/// `prepare` must register the append as in-flight BEFORE awaiting the WAL write
+/// so a concurrent recovery pass cannot treat the not-yet-durable WAL as a crash
+/// leftover. If that `await` is cancelled (the `prepare` future is dropped),
+/// neither the method's error path nor [`PreparedStagedAppend`]'s `Drop` runs —
+/// so without this guard the registration would leak forever, permanently
+/// blocking compaction (`has_inflight_staging_appends`) and skewing recovery
+/// cleanup. The guard unregisters on drop and is [disarmed](Self::disarm) once a
+/// `PreparedStagedAppend` has taken over the registration (its own `Drop` then
+/// owns the unregister).
+struct InflightStagingAppendGuard<'a> {
+    table: &'a CayenneTableProvider,
+    staging_snapshot_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> InflightStagingAppendGuard<'a> {
+    /// Register `staging_snapshot_id` as in-flight and return an armed guard.
+    fn register(table: &'a CayenneTableProvider, staging_snapshot_id: &'a str) -> Self {
+        table.register_inflight_staging_append(staging_snapshot_id);
+        Self {
+            table,
+            staging_snapshot_id,
+            armed: true,
+        }
+    }
+
+    /// Hand the registration off to a constructed `PreparedStagedAppend` so the
+    /// guard no longer unregisters on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightStagingAppendGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.table
+                .unregister_inflight_staging_append(self.staging_snapshot_id);
+        }
+    }
+}
+
 impl CayenneStagedAppend {
     pub(crate) fn from_staged_append_in(
         table: CayenneTableProvider,
@@ -280,11 +325,16 @@ impl CayenneStagedAppend {
         // disk. Recovery treats any committed WAL whose id is not in the
         // in-flight set as a crash leftover; writing the WAL first opened a
         // window where a concurrent recovery pass could "recover" — move and
-        // delete — an append that was still being prepared. Registration is
-        // reverted if the WAL write fails, so a failed prepare leaves no
-        // permanent in-flight entry masking genuine recovery.
-        self.table
-            .register_inflight_staging_append(&self.staging_snapshot_id);
+        // delete — an append that was still being prepared.
+        //
+        // The guard reverts the registration on every early exit that does NOT
+        // hand it to a `PreparedStagedAppend`: a WAL-write error AND cancellation
+        // of this future mid-`await` (when neither the error path below nor
+        // `PreparedStagedAppend::drop` would run, which would otherwise leak the
+        // entry forever and permanently block compaction/recovery cleanup). It is
+        // disarmed once the receipt is built, handing the unregister to its `Drop`.
+        let inflight_guard =
+            InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
         let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
                 .write_staging_wal_for(&self.staging_snapshot_id)
@@ -298,11 +348,12 @@ impl CayenneStagedAppend {
                 )
                 .await
         };
-        if let Err(e) = wal_write {
-            self.table
-                .unregister_inflight_staging_append(&self.staging_snapshot_id);
-            return Err(e);
-        }
+        // On a WAL-write error the `?` returns early here and `inflight_guard`
+        // drops, reverting the registration.
+        wal_write?;
+        // WAL is durable; hand the in-flight registration to the receipt, whose
+        // `Drop` now owns the unregister.
+        inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
