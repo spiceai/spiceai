@@ -135,8 +135,8 @@ use datafusion::{
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
     sql::{
-        AstAnalyzer, LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider,
-        SQLTableSource,
+        AstAnalyzer, AstAnalyzerRule, LogicalOptimizer, RemoteTableRef, SQLExecutor,
+        SQLFederationProvider, SQLTableSource,
     },
 };
 use datafusion_table_providers::sqlite::sqlite_interval::SQLiteIntervalVisitor;
@@ -1110,7 +1110,7 @@ impl TursoTableProvider {
     /// Also applies `TursoBetweenVisitor` to rewrite numeric `BETWEEN` expressions
     /// into explicit `CAST(... AS REAL)` comparisons, since Turso does not have the
     /// `decimal_cmp()` extension available in standard SQLite.
-    fn turso_ast_analyzer() -> AstAnalyzer {
+    fn turso_ast_analyzer() -> AstAnalyzerRule {
         Box::new(|mut ast| {
             let mut interval_visitor = SQLiteIntervalVisitor::default();
             let _ = ast.visit(&mut interval_visitor);
@@ -1282,7 +1282,7 @@ impl SQLExecutor for TursoTableProvider {
     }
 
     fn ast_analyzer(&self) -> Option<AstAnalyzer> {
-        Some(Self::turso_ast_analyzer())
+        Some(AstAnalyzer::new(vec![Self::turso_ast_analyzer()]))
     }
 
     fn logical_optimizer(&self) -> Option<LogicalOptimizer> {

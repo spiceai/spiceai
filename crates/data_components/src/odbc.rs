@@ -21,7 +21,8 @@ use datafusion::{
     sql::{TableReference, unparser::dialect::Dialect},
 };
 use datafusion_table_providers::sql::{
-    db_connection_pool as db_connection_pool_datafusion, sql_provider_datafusion::SqlTable,
+    db_connection_pool as db_connection_pool_datafusion,
+    sql_provider_datafusion::{SqlTable, expr::Engine},
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
@@ -97,9 +98,14 @@ where
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
 
-        let table = SqlTable::new("odbc", &dyn_pool, table_reference.clone())
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let table = SqlTable::new(
+            "odbc",
+            &dyn_pool,
+            table_reference.clone(),
+            Some(Engine::ODBC),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         let table = if let Some(dialect) = &self.dialect {
             table.with_dialect(Arc::clone(dialect))

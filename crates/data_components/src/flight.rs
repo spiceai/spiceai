@@ -38,7 +38,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
-use datafusion_federation::sql::RemoteTableRef;
+use datafusion_federation::sql::{MultiPartTableReference, RemoteTableRef};
 use flight_client::{
     Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
 };
@@ -271,16 +271,21 @@ impl FlightTable {
     ) -> Result<SchemaRef> {
         let table_reference = table_reference.into();
         let table_paths = match table_reference.table_ref() {
-            TableReference::Bare { table } => vec![table.to_string()],
-            TableReference::Partial { schema, table } => {
-                vec![schema.to_string(), table.to_string()]
-            }
-            TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => {
-                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+            MultiPartTableReference::TableReference(table_reference) => match table_reference {
+                TableReference::Bare { table } => vec![table.to_string()],
+                TableReference::Partial { schema, table } => {
+                    vec![schema.to_string(), table.to_string()]
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } => {
+                    vec![catalog.to_string(), schema.to_string(), table.to_string()]
+                }
+            },
+            MultiPartTableReference::Multi(parts) => {
+                parts.iter().map(ToString::to_string).collect::<Vec<_>>()
             }
         };
 

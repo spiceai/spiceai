@@ -35,7 +35,7 @@ use super::{SparkConnect, SparkConnectTableProvider};
 
 impl SparkConnectTableProvider {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
-        let table_name = self.table_reference.clone().into();
+        let table_name = self.table_reference.clone();
         tracing::trace!(
             %self.table_reference,
             "create_federated_table_source"
