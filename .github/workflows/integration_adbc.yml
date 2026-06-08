@@ -95,7 +95,7 @@ jobs:
       - name: Run ADBC integration tests
         env:
           CARGO_INCREMENTAL: 0
-          RUSTC_WRAPPER: sccache
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |

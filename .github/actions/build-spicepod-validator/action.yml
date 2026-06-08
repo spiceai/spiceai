@@ -86,7 +86,7 @@ runs:
     - name: Cache spicepod-validator binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-validator
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}
@@ -139,7 +139,7 @@ runs:
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           target/release/spicepod-validator${{ steps.detect-os.outputs.ext }}

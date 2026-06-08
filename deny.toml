@@ -20,10 +20,6 @@ ignore = [
   "RUSTSEC-2021-0141",
   # Local model search dependencies pull `fxhash`; no safe upgrade is available yet. Owner: llms.
   "RUSTSEC-2025-0057",
-  # DNS dependencies pull `hickory-proto` 0.25.x through upstream crates pinned below 0.26. Owner: data connectors/runtime.
-  "RUSTSEC-2026-0118",
-  # DNS dependencies pull `hickory-proto` 0.25.x through upstream crates pinned below 0.26. Owner: data connectors/runtime.
-  "RUSTSEC-2026-0119",
   # `instant` is pulled through `backoff`; no safe upgrade is available yet. Owner: runtime/llms.
   "RUSTSEC-2024-0384",
   # Progress-display dependencies pull `number_prefix`; no safe upgrade is available yet. Owner: llms.
@@ -32,7 +28,7 @@ ignore = [
   "RUSTSEC-2024-0436",
   # Object store signing dependencies pull `rsa`; no safe upgrade is available yet. Owner: data components/runtime.
   "RUSTSEC-2023-0071",
-  # Legacy TLS dependencies pull `rustls-pemfile` 1.x; no safe upgrade is available yet. Owner: connector-mssql/runtime.
+  # TLS dependencies pull `rustls-pemfile`; no safe upgrade is available yet. Owner: data components/runtime.
   "RUSTSEC-2025-0134",
   # Legacy `rustls` 0.21 dependencies pull `rustls-webpki` 0.101.x; newer 0.103.x is updated in Cargo.lock. Owner: AWS/MSSQL integrations.
   "RUSTSEC-2026-0098",
@@ -40,7 +36,7 @@ ignore = [
   "RUSTSEC-2026-0099",
   # Legacy `rustls` 0.21 dependencies pull `rustls-webpki` 0.101.x; newer 0.103.x is updated in Cargo.lock. Owner: AWS/MSSQL integrations.
   "RUSTSEC-2026-0104",
-  # `headers` crate `Authorization::value`/`WwwAuthenticate::value` can violate ASCII invariants; notice-level, pulled transitively, no safe upgrade yet. Owner: runtime/data connectors.
+  # Azure storage dependencies pull `http-types` through `azure_core` 0.21; no safe upgrade is available yet. Owner: data connectors/runtime.
   "RUSTSEC-2026-0174",
 ]
 
