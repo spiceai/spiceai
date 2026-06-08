@@ -244,7 +244,7 @@ impl DataSink for DuckDBPartitionedDataSink {
                             .with_remove_duplicates(upsert_options.remove_duplicates)
                             .with_last_write_wins(upsert_options.last_write_wins);
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        std::slice::from_ref(&deduped_batch).to_vec(),
+                        vec![deduped_batch.clone()],
                         constraints,
                         &tp_upsert_options,
                     )

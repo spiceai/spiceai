@@ -1605,15 +1605,13 @@ impl RefreshTask {
         let mut extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
             vec![Arc::new(IndexTableScanExtensionPlanner::new())];
 
-        // Federation is implemented as the `FederationAnalyzerRule` (prepended by
-        // `AnalyzerRulesBuilder::with_federation`) plus the `FederatedPlanner` extension planner as
-        // of datafusion-federation `sgrebnov/spiceai-53` (it was an optimizer rule prior to the
-        // DF53 update). Only wire them up when federation is enabled; when disabled, leave them out
-        // so the query plans against the accelerator only.
-        let analyzer_rules_builder =
-            AnalyzerRulesBuilder::default().with_federation(!disable_federation);
+        let mut analyzer_rules_builder = AnalyzerRulesBuilder::default();
 
-        if !disable_federation {
+        // If federation is disabled, disable the federation analyzer rule and don't include the federated planner.
+        if disable_federation {
+            analyzer_rules_builder = analyzer_rules_builder.include_federation(false);
+        } else {
+            analyzer_rules_builder = analyzer_rules_builder.include_federation(true);
             extension_planners.push(Arc::new(FederatedPlanner::new()));
         }
 
