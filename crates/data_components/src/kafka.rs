@@ -49,6 +49,11 @@ use crate::cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange,
 
 pub use rdkafka;
 
+// Number of messages to fetch in a single burst when scanning backward
+// past tombstones. One network round-trip pulls this many records into
+// the local buffer, eliminating per-tombstone seek overhead.
+const TOMBSTONE_SCAN_WINDOW: usize = 100;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Kafka consumer: {source}"))]
@@ -672,13 +677,6 @@ impl KafkaConsumer {
         kafka_config: &KafkaConfig,
         timeout: Duration,
     ) -> Result<Option<(Option<K>, V)>> {
-        // Number of messages to fetch in a single burst when scanning backward
-        // past tombstones. One network round-trip pulls this many records into
-        // the local buffer, eliminating per-tombstone seek overhead.
-        const TOMBSTONE_SCAN_WINDOW: usize = 100;
-        let scan_window_i64 = i64::try_from(TOMBSTONE_SCAN_WINDOW)
-            .unwrap_or_else(|_| unreachable!("TOMBSTONE_SCAN_WINDOW is a small positive constant"));
-
         let deadline = Instant::now() + timeout;
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
@@ -742,7 +740,7 @@ impl KafkaConsumer {
                     break;
                 }
 
-                let window_start = std::cmp::max(low, window_end - scan_window_i64 + 1);
+                let window_start = std::cmp::max(low, window_end - TOMBSTONE_SCAN_WINDOW + 1);
 
                 // Assign consumer to the start of the current window.
                 let mut tpl = rdkafka::TopicPartitionList::new();
