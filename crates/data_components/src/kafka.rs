@@ -778,9 +778,6 @@ impl KafkaConsumer {
     ) -> Result<Vec<rdkafka::message::OwnedMessage>> {
         let mut stream = Box::pin(consumer.stream());
         let mut burst = Vec::new();
-
-        let mut stream = Box::pin(consumer.stream());
-        let mut burst = Vec::new();
         let window_limit = usize::try_from(TOMBSTONE_SCAN_WINDOW).unwrap_or(0);
 
         while burst.len() < window_limit {
