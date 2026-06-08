@@ -379,8 +379,9 @@ impl<'a> AppendMutationWriter<'a> {
         // merge-on-read shape on a non-partitioned table (`is_cdc_memory_mode`) AND
         // the runtime has armed deferral for a replayable source (`has_slot_advancer`);
         // every other table/source keeps the durable path below, byte-identical.
-        let (mut prepared_stream, write_guard) =
-            if self.table.is_cdc_memory_mode() && self.table.has_slot_advancer() {
+        let (mut prepared_stream, write_guard) = if self.table.is_cdc_memory_mode()
+            && self.table.has_slot_advancer()
+        {
             match self
                 .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
                 .await?
