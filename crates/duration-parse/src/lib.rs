@@ -583,14 +583,8 @@ mod tests {
         assert_eq!(parse_duration("10s").expect("10s"), Duration::from_secs(10));
         assert_eq!(parse_duration("5m").expect("5m"), Duration::from_mins(5));
         assert_eq!(parse_duration("2h").expect("2h"), Duration::from_hours(2));
-        assert_eq!(
-            parse_duration("1d").expect("1d"),
-            Duration::from_hours(24)
-        );
-        assert_eq!(
-            parse_duration("1w").expect("1w"),
-            Duration::from_hours(168)
-        );
+        assert_eq!(parse_duration("1d").expect("1d"), Duration::from_hours(24));
+        assert_eq!(parse_duration("1w").expect("1w"), Duration::from_hours(168));
         assert_eq!(
             parse_duration("500ms").expect("500ms"),
             Duration::from_millis(500)
@@ -735,10 +729,7 @@ mod tests {
     #[test]
     fn test_format_weeks() {
         assert_eq!(format_duration(Duration::from_hours(168)), "1w");
-        assert_eq!(
-            format_duration(Duration::from_hours(192)),
-            "1w 1d"
-        );
+        assert_eq!(format_duration(Duration::from_hours(192)), "1w 1d");
     }
 
     #[test]

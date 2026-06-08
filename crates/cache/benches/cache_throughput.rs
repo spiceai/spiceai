@@ -188,9 +188,7 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
                             HashBuilder,
                             Box<dyn Hasher + Send + Sync>,
                         >::new(
-                            CACHE_WEIGHT,
-                            Duration::from_mins(1),
-                            hash_builder.clone(),
+                            CACHE_WEIGHT, Duration::from_mins(1), hash_builder.clone()
                         ))
                     },
                     |cache| {

@@ -423,10 +423,7 @@ mod tests {
             ],
         );
         BallistaStageMiddleware.transform(&mut span);
-        assert_eq!(
-            span.start_time,
-            UNIX_EPOCH + Duration::from_secs(1_000)
-        );
+        assert_eq!(span.start_time, UNIX_EPOCH + Duration::from_secs(1_000));
         assert_eq!(span.end_time, UNIX_EPOCH + Duration::from_secs(1_005));
     }
 
