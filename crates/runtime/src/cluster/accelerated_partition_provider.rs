@@ -24,11 +24,11 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
 use datafusion_expr::TableScan;
-use datafusion_federation::FederatedTableProviderAdaptor;
 use runtime_cluster::{ExecutorRegistry, PartitionValue};
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::search::util::find_concrete_table_provider;
 
 /// Wraps an [`ExecutorRegistry`] with the `AcceleratedTable`-specific
 /// `should_partition` logic so it can be installed as a `TablePartitionProvider`.
@@ -42,27 +42,18 @@ impl AcceleratedPartitionProvider {
     }
 }
 
+/// Whether `table_provider` is (or wraps) an [`AcceleratedTable`].
+///
+/// The registered provider for an accelerated dataset is decorated depending on its
+/// configuration: a `FederatedTableProviderAdaptor` (`PolyTableProvider` engines),
+/// a `MetadataEnrichedTableProvider` (datasets with column/table metadata such as
+/// descriptions), an `IndexedTableProvider` / `EmbeddingTable` (embedding or
+/// full-text-search columns), or any nesting of these. We must see through all of
+/// them — otherwise the coordinator skips partition distribution and silently
+/// federates the read to the source. [`find_concrete_table_provider`] already knows
+/// how to unwrap every such decorator.
 fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    if table_provider
-        .as_any()
-        .downcast_ref::<AcceleratedTable>()
-        .is_some()
-    {
-        return true;
-    }
-
-    if let Some(adaptor) = table_provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-        && let Some(inner_provider) = adaptor.table_provider.as_ref()
-    {
-        return inner_provider
-            .as_any()
-            .downcast_ref::<AcceleratedTable>()
-            .is_some();
-    }
-
-    false
+    find_concrete_table_provider::<AcceleratedTable>(table_provider).is_some()
 }
 
 impl TablePartitionProvider for AcceleratedPartitionProvider {
