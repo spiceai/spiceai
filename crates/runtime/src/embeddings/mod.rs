@@ -16,6 +16,7 @@ limitations under the License.
 pub mod common;
 pub mod connector;
 pub mod execution_plan;
+pub mod params;
 
 pub mod index;
 pub mod metrics;
