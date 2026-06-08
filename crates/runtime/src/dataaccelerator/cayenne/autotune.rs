@@ -282,7 +282,30 @@ pub(crate) struct WorkloadProfile {
     /// Whether the connector emitted any extended schema metadata. Primary key,
     /// index, and sort metadata are useful adaptive warm-start signals even when
     /// rough sizing is unavailable.
-    pub has_inferred_metadata: bool,
+    pub inferred_metadata: InferredMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum InferredMetadata {
+    #[default]
+    Absent,
+    Present,
+}
+
+impl InferredMetadata {
+    #[must_use]
+    pub(crate) fn from_schema(inferred: &InferredSchema) -> Self {
+        if inferred.is_empty() {
+            Self::Absent
+        } else {
+            Self::Present
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_present(self) -> bool {
+        matches!(self, Self::Present)
+    }
 }
 
 impl WorkloadProfile {
@@ -315,7 +338,7 @@ impl WorkloadProfile {
             pk_arity: primary_key.len(),
             row_count: inferred.row_count,
             table_bytes: inferred.table_bytes,
-            has_inferred_metadata: !inferred.is_empty(),
+            inferred_metadata: InferredMetadata::from_schema(inferred),
         }
     }
 
@@ -576,7 +599,7 @@ mod tests {
             pk_arity,
             row_count: Some(rows),
             table_bytes: None,
-            has_inferred_metadata: true,
+            inferred_metadata: InferredMetadata::Present,
         };
 
         // A small upsert table sizes the keyset DOWN to what it needs (saving
@@ -799,7 +822,7 @@ mod tests {
                 pk_arity: 3,
                 row_count: Some(5_000_000_000),
                 table_bytes: Some(2_000_000_000_000),
-                has_inferred_metadata: true,
+                inferred_metadata: InferredMetadata::Present,
             },
         ];
 

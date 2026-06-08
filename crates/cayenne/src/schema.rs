@@ -203,10 +203,6 @@ fn handle_unsupported_type(
             );
             Some(DataType::Utf8)
         }
-        (true, UnsupportedTypeAction::Error) => {
-            unsupported_fields.push(unsupported_field_detail(path, data_type));
-            Some(data_type.clone())
-        }
         (true, UnsupportedTypeAction::Ignore) => {
             tracing::warn!(
                 "Ignoring unsupported type {:?} for field '{}'",
@@ -223,7 +219,7 @@ fn handle_unsupported_type(
             );
             Some(data_type.clone())
         }
-        (false, _) => {
+        (true, UnsupportedTypeAction::Error) | (false, _) => {
             unsupported_fields.push(unsupported_field_detail(path, data_type));
             Some(data_type.clone())
         }

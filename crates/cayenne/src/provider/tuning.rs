@@ -47,7 +47,10 @@ limitations under the License.
 //! [`LiveKnobs`] at the use sites, running [`decide`] on the per-table
 //! background task) lives in the provider.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -115,6 +118,12 @@ const INLINE_FLUSH_BUDGET_FRACTION: u64 = 32;
 /// without the memory rule. Process-wide because RAM is shared across tables.
 static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
+
 /// Install the process memory budget (cgroup-aware total) the dynamic tuner uses
 /// to compute memory pressure. Called once at startup by the runtime, mirroring
 /// the encode-concurrency budget.
@@ -178,9 +187,27 @@ fn current_memory_bytes() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn cgroup_v2_memory_current() -> Option<u64> {
+    read_u64_file(
+        CGROUP_V2_MEMORY_CURRENT_PATH
+            .get_or_init(resolve_cgroup_v2_memory_current_path)
+            .as_deref()?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v1_memory_current() -> Option<u64> {
+    read_u64_file(
+        CGROUP_V1_MEMORY_USAGE_PATH
+            .get_or_init(resolve_cgroup_v1_memory_usage_path)
+            .as_deref()?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
     let cgroup_path = process_cgroup_v2_path()?;
     let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
-    read_u64_file(&cgroup_file_path(
+    Some(cgroup_file_path(
         &mountpoint,
         &cgroup_path,
         "memory.current",
@@ -188,11 +215,11 @@ fn cgroup_v2_memory_current() -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_v1_memory_current() -> Option<u64> {
+fn resolve_cgroup_v1_memory_usage_path() -> Option<String> {
     let cgroup_path = process_cgroup_v1_path("memory")?;
     let mountpoint =
         cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
-    read_u64_file(&cgroup_file_path(
+    Some(cgroup_file_path(
         &mountpoint,
         &cgroup_path,
         "memory.usage_in_bytes",

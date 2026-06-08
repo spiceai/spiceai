@@ -881,7 +881,7 @@ impl CayenneAccelerator {
             // feeds the same warm-start / query-health surface. Without any
             // inferred metadata the loop starts blind, so fall back to `auto` and
             // tell the operator how to enable it.
-            if config.dynamic_tuning && !workload.has_inferred_metadata {
+            if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
                 tracing::warn!(
                     "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
                 );
@@ -963,7 +963,7 @@ impl CayenneAccelerator {
                 // (if requested) was gated off — makes that immediately visible.
                 inferred_row_count = ?workload.row_count,
                 inferred_table_bytes = ?workload.table_bytes,
-                inferred_extended_schema = workload.has_inferred_metadata,
+                inferred_extended_schema = workload.inferred_metadata.is_present(),
                 has_primary_key = workload.has_primary_key,
                 is_upsert = workload.is_upsert,
                 "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
