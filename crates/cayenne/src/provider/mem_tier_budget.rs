@@ -47,7 +47,7 @@ limitations under the License.
 //! opted into without the budget installed) is gated only by the per-table cap.
 //! The runtime binary installs the budget once at startup, sized from total
 //! system/container memory (`resource_monitor::get_total_memory() / 8`). This
-//! budget is independent of DataFusion's query memory pool.
+//! budget is independent of `DataFusion`'s query memory pool.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -114,7 +114,7 @@ impl MemTierBudget {
 /// Process-wide in-memory CDC tier budget, injected once at startup by the
 /// binary (sized to a fraction of TOTAL system/container memory —
 /// `resource_monitor::get_total_memory() / 8` — and deliberately INDEPENDENT of
-/// the DataFusion query memory pool, since the RAM tier lives off-pool).
+/// the `DataFusion` query memory pool, since the RAM tier lives off-pool).
 /// Replaceable so a test binary that builds and drops multiple runtimes does not
 /// retain a stale budget (mirrors [`super::write_budget`]).
 static GLOBAL_MEM_TIER_BUDGET: LazyLock<RwLock<Option<MemTierBudget>>> =

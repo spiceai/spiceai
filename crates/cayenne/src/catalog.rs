@@ -358,8 +358,12 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Stage-A fold for a pipelined CDC upsert: commit the on-conflict deletion
     /// metadata (delete files + insert records + protected-snapshot sequence)
-    /// AND, in the SAME backend transaction, INSERT the inline tombstone (Option
-    /// D, `published = false`) for any inlined rows the upsert replaces.
+    /// AND INSERT the inline tombstone (Option D, `published = false`) for any
+    /// inlined rows the upsert replaces. Backends that override this method fold
+    /// both into the SAME backend transaction (one writer acquisition); the
+    /// trait's DEFAULT implementation below preserves the equivalent
+    /// two-transaction behavior (`commit_on_conflict_deletions` then
+    /// `add_inlined_delete`).
     ///
     /// This is the single-transaction equivalent of calling
     /// [`Self::commit_on_conflict_deletions`] immediately followed by

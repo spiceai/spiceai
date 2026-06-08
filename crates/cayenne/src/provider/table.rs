@@ -7621,7 +7621,7 @@ impl CayenneTableProvider {
                                 .extend(results.iter().map(|result| result.delete_file.clone()));
                         }
                         updated = updated.extend_max_conflicts(
-                            row_keys.iter().map(|key| key.as_ref()),
+                            row_keys.iter().map(|key| &**key),
                             delete_sequence,
                             snapshot_sequence,
                         );
@@ -12224,7 +12224,7 @@ impl CayenneTableProvider {
         &self,
         deletions: &OnConflictDeletions,
         delete_sequence: i64,
-    ) -> Result<crate::provider::mem_tier::InMemTombstones> {
+    ) -> crate::provider::mem_tier::InMemTombstones {
         let mut tombstones = crate::provider::mem_tier::InMemTombstones::default();
         if self.pk_deletion_strategy.is_int64_pk() {
             for &pk in deletions
@@ -12251,7 +12251,7 @@ impl CayenneTableProvider {
                     .or_insert(delete_sequence);
             }
         }
-        Ok(tombstones)
+        tombstones
     }
 
     /// Append a validated CDC batch to the in-memory tier (`cdc_durability:
@@ -12287,7 +12287,7 @@ impl CayenneTableProvider {
         let delete_sequence = base_sequence;
         let data_sequence = base_sequence + 1;
 
-        let tombstones = self.build_mem_tombstones(deletions, delete_sequence)?;
+        let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
 
         let arc_batches = Arc::new(batches);
         let epoch = {

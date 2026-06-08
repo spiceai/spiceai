@@ -202,8 +202,7 @@ impl MemTier {
     #[must_use]
     pub(crate) fn age_ms(&self) -> u64 {
         self.oldest_append
-            .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0)
+            .map_or(0, |t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 }
 

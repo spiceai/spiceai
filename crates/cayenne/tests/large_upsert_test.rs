@@ -22,8 +22,9 @@ limitations under the License.
 //!
 //! `add_insert_records_batch` builds an INSERT with 3 params per row
 //! (`table_id`, `pk_bytes`, `sequence_number`). `SQLite`'s default
-//! `SQLITE_MAX_VARIABLE_NUMBER` is 32 766, so batches with more than ~10 666
-//! rows would exceed the limit without the multi-chunk transaction path.
+//! `SQLITE_MAX_VARIABLE_NUMBER` is 32 766, so batches with more than 10 922
+//! rows (32 766 / 3, floored) would exceed the limit without the multi-chunk
+//! transaction path.
 
 mod common;
 
