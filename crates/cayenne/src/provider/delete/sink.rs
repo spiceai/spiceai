@@ -117,6 +117,11 @@ pub struct CayenneDeletionSink {
     /// `None` when the caller already holds the write lock (e.g. retention filters applied
     /// during `write_all_append`).
     write_lock: Option<Arc<TokioMutex<()>>>,
+    /// Shared in-memory sequence allocator (lever B2) of the owning
+    /// `CayenneTableProvider`. The DML `DELETE` sink routes its sequence
+    /// allocations through the SAME allocator as every other writer of this
+    /// table, so memory and the DB `current_sequence_number` never diverge.
+    seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
 }
 
 impl CayenneDeletionSink {
@@ -135,6 +140,7 @@ impl CayenneDeletionSink {
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
+        seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -149,6 +155,7 @@ impl CayenneDeletionSink {
             protected_snapshot_tables,
             runtime_env,
             write_lock,
+            seq_allocator,
         }
     }
 
@@ -593,10 +600,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
@@ -617,10 +628,14 @@ impl CayenneDeletionSink {
         let sequence = if let Some(sequence) = delete_sequence {
             *sequence
         } else {
-            let sequence = self
-                .catalog
-                .increment_sequence_number(&self.table_metadata.table_id)
-                .await?;
+            let sequence = super::super::table::reserve_sequences_in(
+                &self.seq_allocator,
+                &self.catalog,
+                &self.table_metadata.table_id,
+                &self.table_metadata.table_name,
+                1,
+            )
+            .await?;
             *delete_sequence = Some(sequence);
             sequence
         };
