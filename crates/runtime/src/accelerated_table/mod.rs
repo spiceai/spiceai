@@ -147,6 +147,15 @@ pub enum Error {
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
+        "Failed to apply retention_sql to accelerated dataset {dataset_name} after refresh data was written: {}. The accelerated dataset may contain rows that should have been retained away.",
+        format_datafusion_error(source)
+    ))]
+    FailedToApplyRetentionSql {
+        dataset_name: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display(
         "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratedTableDoesntSupportDelete {},

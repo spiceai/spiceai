@@ -728,6 +728,15 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_max_age_ms,
                 " (milliseconds)",
             );
+            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_checkpoint_interval_ms",
+                    "cdc_mem_tier_checkpoint_interval_ms",
+                ],
+                config.cdc_mem_tier_checkpoint_interval_ms,
+                " (milliseconds)",
+            );
 
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
@@ -1211,6 +1220,14 @@ impl CayenneAccelerator {
         if spawned {
             tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
         }
+        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+        // file-mode tables. This is what advances the deferred source slot ack on
+        // an idle/pure-upsert stream so replication lag stays bounded.
+        if provider.spawn_background_mem_tier_checkpoint() {
+            tracing::debug!(
+                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+            );
+        }
         Ok(provider)
     }
 }
@@ -1290,8 +1307,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    31,
-    { S3_PARAMS_LEN + 31 },
+    32,
+    { S3_PARAMS_LEN + 32 },
 >(
     S3_PARAMETERS,
     [
@@ -1368,9 +1385,11 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["file", "memory"])
             .default("file"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) disables the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 67108864 (64 MiB) so the write path self-spills while the tier is small. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
-            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. Default 2000 (2 s). Set 0 to disable the age trigger."),
+        ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
+            .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])

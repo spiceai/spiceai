@@ -3867,6 +3867,69 @@ mod tests {
         assert_eq!(queue[1].0, 6);
     }
 
+    /// A1-T3 — the checkpoint↔push ordering seam. A periodic mem-tier checkpoint
+    /// can fire `on_checkpoint_durable(N)` AFTER the tier reached epoch N but
+    /// BEFORE the apply loop has pushed batch N's committers onto the queue (the
+    /// push at `changes.rs` happens after `append_to_mem_tier` returns the epoch).
+    /// The advancer must only DELAY such a committer's ack — draining whatever is
+    /// present at or below the durable epoch and leaving the rest for a later
+    /// drain — never advance the slot for an unqueued epoch and never double-ack.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_slot_advancer_delays_committers_pushed_after_checkpoint() {
+        let log = CommitLog::new();
+        let queue: DeferredCommitQueue = Arc::new(TokioMutex::new(VecDeque::new()));
+        let advancer = CayenneSlotAdvancer {
+            queue: Arc::clone(&queue),
+            dataset_name: TableReference::bare("test"),
+            runtime_status: crate::status::RuntimeStatus::new(),
+        };
+
+        // Epoch 1's committers ARE queued; epoch 2's are not yet (the apply loop
+        // hasn't pushed them). A checkpoint that snapshotted `flushed_epoch = 2`
+        // fires ahead of the push.
+        queue.lock().await.push_back((
+            1,
+            vec![Box::new(DeferrableTrackingCommitter {
+                id: 1,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            })],
+        ));
+        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 2).await;
+
+        // Only epoch 1 acked (it was present and <= 2); epoch 2 is NOT acked early
+        // because its committers were not yet queued.
+        assert_eq!(
+            log.ids().await,
+            vec![1],
+            "only the queued, durable-covered committer acks; the unqueued epoch is not advanced early"
+        );
+        assert!(
+            queue.lock().await.is_empty(),
+            "the drained prefix is removed; nothing was invented for the unqueued epoch"
+        );
+
+        // Now the apply loop pushes epoch 2's committers (after its data became
+        // durable). The NEXT checkpoint (or queue-non-empty re-check) drains them —
+        // exactly-once, no double-ack of epoch 1.
+        queue.lock().await.push_back((
+            2,
+            vec![Box::new(DeferrableTrackingCommitter {
+                id: 2,
+                log: Arc::clone(&log),
+                outcome: Ok(()),
+            })],
+        ));
+        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 2).await;
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2],
+            "the late-pushed committer acks on the next drain; epoch 1 is not re-acked"
+        );
+        assert!(queue.lock().await.is_empty(), "queue fully drained");
+    }
+
     fn make_tracked_envelope(id: i32, log: Arc<CommitLog>, is_ready: bool) -> ChangeEnvelope {
         let batch = create_test_change_batch(vec!["c"], &[vec!["id"]], vec![id], vec![Some("row")]);
         ChangeEnvelope::new(
