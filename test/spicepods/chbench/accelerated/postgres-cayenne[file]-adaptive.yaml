@@ -1,0 +1,200 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive
+
+# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
+# within the environment-derived [floor, ceiling] as the workload shifts.
+#
+# Two requirements the adaptive loop gates on (both satisfied here):
+#   - `schema_inference: extended` per dataset — the data-aware warm-start needs the inferred
+#     row_count/table_bytes (PostgreSQL emits them); without it adaptive silently falls back to auto.
+#   - background compaction enabled — the controller rides the per-table compaction tick. Left at
+#     the auto-derived (non-zero) default here; NOT pinned, so the loop is free to move it.
+# No per-knob value is set anywhere: an explicit knob would *pin* it under adaptive (collapsing its
+# tuning bounds to a point), so basing this off the un-pinned baseline gives the loop full freedom.
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+      params:
+        <<: *cayenne_params
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+      params:
+        <<: *cayenne_params
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+      params:
+        <<: *cayenne_params
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert
+      params:
+        <<: *cayenne_params
