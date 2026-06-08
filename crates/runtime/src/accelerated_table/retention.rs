@@ -38,6 +38,60 @@ use runtime_object_store::registry::default_runtime_env;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
+pub(crate) async fn apply_retention_filters_once(
+    dataset_name: &TableReference,
+    accelerator: &Arc<dyn TableProvider>,
+    expr: Expr,
+    io_runtime: &Handle,
+) -> datafusion::error::Result<u64> {
+    tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+    let original_expr = format!("{expr:?}");
+    let expr = match util::expr::simplify_expr(expr, &accelerator.schema()) {
+        Ok(expr) => expr,
+        Err(e) => {
+            tracing::error!(
+                "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{original_expr}'. Error: {e}"
+            );
+            return Err(e);
+        }
+    };
+
+    tracing::debug!("[retention] Expr: {expr:?}");
+
+    let ctx = SessionContext::new_with_config_rt(
+        get_df_default_config(),
+        default_runtime_env(io_runtime.clone()),
+    );
+
+    let plan = match accelerator.delete_from(&ctx.state(), vec![expr]).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!("[retention] Error running retention check: {e}");
+            return Err(e);
+        }
+    };
+
+    let deleted = match collect(plan, ctx.task_ctx()).await {
+        Ok(deleted) => deleted,
+        Err(e) => {
+            tracing::error!("[retention] Error running retention check: {e}");
+            return Err(e);
+        }
+    };
+
+    let num_records = deleted.first().map_or(0, |f| {
+        f.column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map_or(0, |v| v.values().first().copied().unwrap_or(0))
+    });
+
+    log_retention_result(dataset_name, num_records);
+
+    Ok(num_records)
+}
+
 impl super::AcceleratedTable {
     #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn start_retention_check(
@@ -141,56 +195,16 @@ impl super::AcceleratedTable {
                 continue;
             };
 
-            tracing::trace!("[retention] Expr before simplification: {expr:?}");
-
-            let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
-                Ok(simplified) => simplified,
-                Err(e) => {
-                    tracing::error!(
-                        "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            tracing::debug!("[retention] Expr: {expr:?}");
-
-            let ctx = SessionContext::new_with_config_rt(
-                get_df_default_config(),
-                default_runtime_env(io_runtime.clone()),
-            );
-
-            let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
-            match plan {
-                Ok(plan) => match collect(plan, ctx.task_ctx()).await {
-                    Err(e) => {
-                        tracing::error!("[retention] Error running retention check: {e}");
-                    }
-                    Ok(deleted) => {
-                        let num_records = deleted.first().map_or(0, |f| {
-                            f.column(0)
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .map_or(0, |v| v.values().first().map_or(0, |f| *f))
-                        });
-
-                        log_retention_result(&dataset_name, num_records);
-
-                        if num_records > 0
-                            && let Some(cache_provider) = caching.as_ref()
-                            && let Err(e) =
-                                cache_provider.invalidate_for_table(dataset_name.clone())
-                        {
-                            tracing::error!(
-                                "Failed to invalidate cached results for dataset {}: {e}",
-                                &dataset_name
-                            );
-                        }
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("[retention] Error running retention check: {e}");
-                }
+            if let Ok(num_records) =
+                apply_retention_filters_once(&dataset_name, &accelerator, expr, &io_runtime).await
+                && num_records > 0
+                && let Some(cache_provider) = caching.as_ref()
+                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone())
+            {
+                tracing::error!(
+                    "Failed to invalidate cached results for dataset {}: {e}",
+                    &dataset_name
+                );
             }
         }
     }
