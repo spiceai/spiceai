@@ -394,10 +394,14 @@ impl CayenneCatalog {
         }
 
         let table_id_literal = sql_text_literal(table_id);
+        // `cayenne_insert_record.table_id` is a raw-UUID-bytes BLOB, so it must
+        // be matched with a BLOB literal, not the TEXT literal the other tables
+        // use (a TEXT literal never equals a BLOB in SQLite).
+        let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
             "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal}; \
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
@@ -537,10 +541,14 @@ impl CayenneCatalog {
         }
 
         let table_id_literal = sql_text_literal(table_id);
+        // `cayenne_insert_record.table_id` is a raw-UUID-bytes BLOB, so it must
+        // be matched with a BLOB literal, not the TEXT literal the other tables
+        // use (a TEXT literal never equals a BLOB in SQLite).
+        let insert_record_table_id_literal = insert_record_table_id_blob_literal(table_id);
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
             "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
-             DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_insert_record WHERE table_id = {insert_record_table_id_literal}; \
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
@@ -625,7 +633,7 @@ impl CayenneCatalog {
             }
             // `write!` into a `String` is infallible.
             let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
-            params.push(MetastoreValue::Text(table_id.to_string()));
+            params.push(insert_record_table_id_value(table_id));
             params.push(MetastoreValue::Blob(pk_bytes.clone()));
             params.push(MetastoreValue::Integer(sequence_number));
         }
@@ -1386,7 +1394,7 @@ impl MetadataCatalog for CayenneCatalog {
             .execute_helper(ExecuteParams {
                 sql: "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES (?1, ?2, ?3)",
                 params: vec![
-                    MetastoreValue::Text(table_id.to_string()),
+                    insert_record_table_id_value(table_id),
                     MetastoreValue::Blob(pk_bytes),
                     MetastoreValue::Integer(sequence_number),
                 ],
@@ -1469,7 +1477,7 @@ impl MetadataCatalog for CayenneCatalog {
             .query_helper(
                 QueryParams {
                     sql: "SELECT pk_bytes, sequence_number FROM cayenne_insert_record WHERE table_id = ?1",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                    params: vec![insert_record_table_id_value(table_id)],
                 },
                 |row| {
                     let pk_bytes = row.get_blob(0)?;
@@ -1497,7 +1505,7 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.to_string())],
+                params: vec![insert_record_table_id_value(table_id)],
             })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
@@ -3143,12 +3151,15 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(false); // Table doesn't exist
         };
 
-        // Delete all related metadata in order (respect foreign key constraints)
+        // Delete all related metadata in order. `cayenne_insert_record` no
+        // longer has a foreign key (its `table_id` is a raw-bytes BLOB; see
+        // `insert_record_table_id_value`), so it must be cleared explicitly
+        // here rather than via ON DELETE CASCADE.
         // 1. Delete insert records
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
+                params: vec![insert_record_table_id_value(&table_id)],
             })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
@@ -3424,6 +3435,32 @@ fn constraint_violation_message_contains_all(message: &str, required_parts: &[&s
 
 fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Encode a `table_id` UUID string as the compact `BLOB` key value bound into
+/// `cayenne_insert_record` (the 16 raw UUID bytes, not the 36-char text). See
+/// [`crate::metastore::table_id_to_key_bytes`] for the encoding contract and
+/// why this cuts WAL volume on hot upsert bursts.
+fn insert_record_table_id_value(table_id: &str) -> MetastoreValue {
+    MetastoreValue::Blob(crate::metastore::table_id_to_key_bytes(table_id))
+}
+
+/// SQL `BLOB` literal (`x'<hex>'`) of the `cayenne_insert_record` `table_id`
+/// key for the batch paths that interpolate it (`commit_compaction_in_txn`,
+/// `commit_overwrite_in_txn`) rather than binding a parameter. The bytes are
+/// the same raw-UUID encoding as [`insert_record_table_id_value`]; the callers
+/// already validate `table_id` is a well-formed UUID before interpolating.
+fn insert_record_table_id_blob_literal(table_id: &str) -> String {
+    use std::fmt::Write as _;
+    let bytes = crate::metastore::table_id_to_key_bytes(table_id);
+    let mut hex = String::with_capacity(bytes.len() * 2 + 3);
+    hex.push_str("x'");
+    for b in bytes {
+        // Writing to a String is infallible.
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex.push('\'');
+    hex
 }
 
 async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResult<()> {
@@ -5215,6 +5252,124 @@ mod tests {
         }
 
         // Cleanup
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Delete-then-reinsert visibility round-trips through the raw-UUID-bytes
+    /// `table_id` BLOB encoding: an insert-record written for a re-inserted PK
+    /// is read back verbatim (`pk_bytes` + `sequence_number`), a checkpoint
+    /// clear (`clear_insert_records`) empties it, and a fresh re-insert lands
+    /// again. This exercises the full catalog write→BLOB→read→clear cycle the
+    /// deletion-visibility ordering depends on (insert_seq > delete_seq ⇒ the
+    /// PK is resurrected). Uses a real `now_v7()` `table_id` from `create_table`
+    /// so the 16-byte encoding path (not the non-UUID fallback) is taken.
+    #[tokio::test]
+    async fn test_insert_record_delete_reinsert_visibility_roundtrip_blob_key() {
+        let test_db = format!(
+            "sqlite://./.test_insert_record_vis_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let db_path = test_db.strip_prefix("sqlite://").expect("test db path");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        let catalog = CayenneCatalog::new(&test_db).expect("create catalog");
+        catalog.init().await.expect("init");
+
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "vis_roundtrip".to_string(),
+                schema,
+                primary_key: vec!["id".to_string()],
+                on_conflict: None,
+                base_path: "/tmp/vis_roundtrip".to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create table");
+
+        // The table_id minted by create_table is a well-formed UUID, so the
+        // compact 16-byte encoding (not the fallback) is what gets stored.
+        assert!(
+            uuid::Uuid::parse_str(&table_id).is_ok(),
+            "create_table must mint a UUID table_id"
+        );
+
+        // A PK that was deleted (at some delete_seq) is re-inserted at seq=5.
+        let pk: Vec<u8> = 7_i64.to_be_bytes().to_vec();
+        catalog
+            .add_insert_record(&table_id, pk.clone(), 5)
+            .await
+            .expect("add insert record");
+
+        // Read back: the reader returns pk_bytes + sequence_number, keyed by
+        // the BLOB table_id WHERE filter.
+        let records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("get insert records");
+        let key: Box<[u8]> = pk.clone().into_boxed_slice();
+        assert_eq!(
+            records.get(&key),
+            Some(&5_i64),
+            "the re-inserted PK's insert sequence (5) must round-trip through the BLOB key"
+        );
+
+        // Re-insert the SAME PK with a newer sequence → INSERT OR REPLACE
+        // collapses to one row with the latest seq (the conflict target is
+        // still (table_id, pk_bytes) with the BLOB table_id).
+        catalog
+            .add_insert_record(&table_id, pk.clone(), 9)
+            .await
+            .expect("re-add insert record");
+        let records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("get insert records 2");
+        assert_eq!(records.len(), 1, "same PK must not duplicate");
+        assert_eq!(
+            records.get(&key),
+            Some(&9_i64),
+            "the later insert sequence must win the upsert"
+        );
+
+        // Checkpoint clear empties the insert-records for this table_id.
+        catalog
+            .clear_insert_records(&table_id)
+            .await
+            .expect("clear insert records");
+        let records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("get insert records after clear");
+        assert!(
+            records.is_empty(),
+            "clear_insert_records must empty the BLOB-keyed rows"
+        );
+
+        // A fresh re-insert after the clear lands again (post-clear rebuild).
+        catalog
+            .add_insert_record(&table_id, pk.clone(), 12)
+            .await
+            .expect("add after clear");
+        let records = catalog
+            .get_insert_records(&table_id)
+            .await
+            .expect("get after re-add");
+        assert_eq!(
+            records.get(&key),
+            Some(&12_i64),
+            "re-insert after a checkpoint clear must be visible again"
+        );
+
+        catalog.shutdown().await.expect("shutdown");
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));
         let _ = std::fs::remove_file(format!("{db_path}-wal"));

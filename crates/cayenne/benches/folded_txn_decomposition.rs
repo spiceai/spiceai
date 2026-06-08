@@ -106,7 +106,10 @@ const MAX_INSERT_RECORD_ROWS_PER_CHUNK: usize = MAX_PARAMS / INSERT_RECORD_PARAM
 const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
 const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
-const TABLE_ID: &str = "bench-table-id";
+/// A realistic UUIDv7 `table_id` so the `cayenne_insert_record` BLOB
+/// `table_id` encoding stores the 16 raw bytes (matching production), not the
+/// non-UUID fallback.
+const TABLE_ID: &str = "0197e8a0-1234-7890-abcd-ef0123456789";
 
 /// Apply the SAME pragmas the bench pod / runtime uses
 /// (`cayenne_metastore_cache_mb = 1024`, `cayenne_metastore_mmap_mb = 4096`),
@@ -181,7 +184,11 @@ fn build_insert_records_chunk_sql(
             sql.push_str(", ");
         }
         let _ = write!(sql, "(?{}, ?{}, ?{})", base, base + 1, base + 2);
-        params.push(MetastoreValue::Text(TABLE_ID.to_string()));
+        // `cayenne_insert_record.table_id` is the raw-UUID-bytes BLOB in the
+        // production schema; mirror that encoding here.
+        params.push(MetastoreValue::Blob(
+            cayenne::metastore::table_id_to_key_bytes(TABLE_ID),
+        ));
         params.push(MetastoreValue::Blob(pk_bytes.clone()));
         params.push(MetastoreValue::Integer(sequence_number));
     }
@@ -323,7 +330,12 @@ async fn run_one_closure_batch(
     }
 
     // insert-record rows — ONE multi-VALUES statement (no chunking needed:
-    // literals carry no bind-param budget), matching the fix's intent.
+    // literals carry no bind-param budget), matching the fix's intent. The
+    // `table_id` is a raw-UUID-bytes BLOB literal (`x'..'`) in production.
+    let table_id_hex: String = cayenne::metastore::table_id_to_key_bytes(TABLE_ID)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     sql.push_str(
         "INSERT OR REPLACE INTO cayenne_insert_record (table_id, pk_bytes, sequence_number) VALUES ",
     );
@@ -331,7 +343,7 @@ async fn run_one_closure_batch(
         if i > 0 {
             sql.push_str(", ");
         }
-        let _ = write!(sql, "('{TABLE_ID}', x'");
+        let _ = write!(sql, "(x'{table_id_hex}', x'");
         for b in key {
             let _ = write!(sql, "{b:02x}");
         }
@@ -369,7 +381,9 @@ async fn clear_table(metastore: &SqliteMetastore) {
     metastore
         .execute(ExecuteParams {
             sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1",
-            params: vec![MetastoreValue::Text(TABLE_ID.to_string())],
+            params: vec![MetastoreValue::Blob(
+                cayenne::metastore::table_id_to_key_bytes(TABLE_ID),
+            )],
         })
         .await
         .expect("clear insert_record");
@@ -726,7 +740,9 @@ fn bench_index_growth(c: &mut Criterion) {
                     .execute(ExecuteParams {
                         sql: "DELETE FROM cayenne_insert_record WHERE table_id = ?1 AND sequence_number = ?2",
                         params: vec![
-                            MetastoreValue::Text(TABLE_ID.to_string()),
+                            MetastoreValue::Blob(cayenne::metastore::table_id_to_key_bytes(
+                                TABLE_ID,
+                            )),
                             MetastoreValue::Integer(seq),
                         ],
                     })
