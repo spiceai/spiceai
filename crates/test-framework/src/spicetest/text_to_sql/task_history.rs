@@ -300,8 +300,15 @@ async fn retry_query_until_llm_found(
         async move {
             // Back off on transient query errors so we don't hot-loop at the
             // `wait_until_true` poll interval (matches the empty-result backoff below).
-            let Ok(rbs) =
-                crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await
+            let Ok(rbs) = async {
+                let mut stream = spice_client.sql(&query).await?;
+                let mut batches = Vec::new();
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    batches.push(batch?);
+                }
+                anyhow::Ok(batches)
+            }
+            .await
             else {
                 sleep(Duration::from_secs(1)).await;
                 return false;
@@ -352,8 +359,15 @@ async fn retry_query_expecting_results(
         async move {
             // Back off on transient query errors so we don't hot-loop at the
             // `wait_until_true` poll interval (matches the empty-result backoff below).
-            let Ok(rbs) =
-                crate::spice_client_arrow_compat::query_to_batches(&spice_client, &query).await
+            let Ok(rbs) = async {
+                let mut stream = spice_client.sql(&query).await?;
+                let mut batches = Vec::new();
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    batches.push(batch?);
+                }
+                anyhow::Ok(batches)
+            }
+            .await
             else {
                 sleep(Duration::from_secs(1)).await;
                 return false;

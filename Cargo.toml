@@ -182,7 +182,7 @@ datafusion-proto-common = "53.0.0"
 datafusion-pruning = "53.0.0"
 datafusion-spark = "53.0.0"
 datafusion-substrait = "53.0.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "5eb7c5d38ed44c0aaf41f1552449f641b7ea2622" } # spiceai-53 (PRs #6+#7+#8 merged: DF53 + with_function_support seam, Engine model, sqlite between/decimal(p,s) NUMERIC affinity, rusqlite 0.40 + UInt64 read-as-i64)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "1b5804004f877c4d7f5ddfbf3fc13d662378cbfd" } # spiceai-53 (PR #9: MSRV 1.95 + UInt64 fix for rusqlite 0.40)
 
 delta_kernel = { version = "0.23.0", features = [
     "default-engine-rustls",
@@ -284,7 +284,7 @@ reqwest = { version = "=0.12.24", features = ["json", "rustls-tls", "gzip", "bro
 reqsign-core = "3.0.0"
 rmcp = { version = "1.5.0", default-features = false }
 roaring = "0.11"
-rusqlite = { version = "0.40.0", features = ["bundled-decimal", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled-decimal", "chrono"] }
 rustls = "0.23"
 rustls-pemfile = "2.1.3"
 schemars = "1.2.1"
@@ -295,7 +295,7 @@ serde_json = "1"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 spice-cloud-client = { path = "crates/spice-cloud-client" }
-snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "94bd751f86872321e90d6f9be0c890b98a480cbb" } # spiceai-58 (PR #9 merged: arrow 58 + object_store 0.13 + ObjectStoreExt)
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", rev = "94bd751f86872321e90d6f9be0c890b98a480cbb" } # spiceai-58 @ tip (PR #9 merged: ObjectStoreExt import fix for object_store 0.13)
 sqlparser = "0.59.0"
 ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
@@ -444,8 +444,8 @@ delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "
 # (spiceai_duckdb_fork 1.4.4) was retired so runtime and table-providers share one
 # duckdb type set (AccessMode/Error/Connection/Transaction).
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "eb4b02bf310474639d2bbb1b2337519cfa5748b9" } # branch: lukim/spiceai-58-arrow58 (DuckDB 1.5.2 + arrow 58)
-rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" }       # 0.40.1 + bundled-decimal (PR #2)
-tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" } # allow rusqlite 0.40 (PR #1)
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
+tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }

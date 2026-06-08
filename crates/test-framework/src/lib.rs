@@ -31,7 +31,6 @@ pub mod pki;
 pub mod process;
 pub mod queries;
 pub mod snapshot;
-mod spice_client_arrow_compat;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod spicetest;

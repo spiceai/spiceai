@@ -297,7 +297,14 @@ impl TableProvider for LocationPruningListingTable {
                 datafusion::error::DataFusionError::Internal(format!(
                     "Failed to apply projection indices: {e}"
                 ))
-            })?;
+            })?
+            .with_metadata_cols(self.inner.options().metadata_cols.clone())
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to apply metadata columns: {e}"
+                ))
+            })?
+            .with_object_versioning_type(self.inner.options().object_versioning_type.clone());
 
         if let Some(constraints) = self.inner.constraints() {
             builder = builder.with_constraints(constraints.clone());
@@ -1142,12 +1149,12 @@ pub trait ListingTableConnector: DataConnector {
             .with_file_extension(extension)
             .with_session_config_options(session_state.config());
 
-        if self.object_versioning_type().is_some() {
-            tracing::warn!(
-                "Object versioning is not supported by DataFusion 53 listing tables; proceeding without object version filtering for dataset '{}'",
-                dataset.name
-            );
-        }
+        options =
+            options.with_object_versioning_type(self.object_versioning_type().map(|v| match v {
+                ObjectVersionType::Version => {
+                    datafusion::parquet::arrow::async_reader::ObjectVersionType::Version
+                }
+            }));
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
@@ -1165,13 +1172,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let expanded_schema = Arc::new(expand_views_schema(&resolved_schema));
 
-        options = add_metadata_columns_if_required(
-            options,
-            url,
-            &expanded_schema,
-            dataset,
-            &format!("{self}"),
-        )?;
+        options = add_metadata_columns_if_required(options, url, &expanded_schema, dataset)?;
 
         // If we should infer partitions and the path is a folder, infer the partitions from the folder structure.
         if dataset.get_param("hive_partitioning_enabled", false) && table_path.is_collection() {
@@ -1184,8 +1185,7 @@ pub trait ListingTableConnector: DataConnector {
             match inferred_partitions {
                 Ok(partitions) => {
                     tracing::debug!(
-                        "Inferred partitions for {:?}: {:?}",
-                        table_path,
+                        "Inferred partitions for {table_path:?}: {:?}",
                         partitions
                             .iter()
                             .map(|(k, _)| k.as_str())
@@ -1195,7 +1195,7 @@ pub trait ListingTableConnector: DataConnector {
                 }
                 Err(e) => {
                     // This might not be an error, it could be that the table is not partitioned.
-                    tracing::debug!("Failed to infer partitions for {:?}: {e}", table_path);
+                    tracing::debug!("Failed to infer partitions for {table_path:?}: {e}");
                 }
             }
         }
@@ -1432,27 +1432,26 @@ fn add_metadata_columns_if_required(
     table_url: &Url,
     schema: &Schema,
     dataset: &Dataset,
-    dataconnector: &str,
 ) -> DataConnectorResult<ListingOptions> {
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
-        let column_names = columns
-            .iter()
-            .map(MetadataColumn::name)
-            .collect::<Vec<_>>()
-            .join(", ");
         tracing::debug!(
-            "Enabling metadata columns for '{}': {:?}",
+            "Enabling metadata columns for '{}': {columns:?}",
             dataset.name,
-            columns
         );
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: dataconnector.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
-            message: format!(
-                "Listing table metadata columns ({column_names}) are not supported with the current DataFusion dependency. Remove these metadata columns from the dataset configuration or use object metadata tables instead."
-            ),
-        });
+        let df_columns = columns
+            .into_iter()
+            .map(|c| match c {
+                MetadataColumn::Location(prefix) => {
+                    datafusion_datasource::metadata::MetadataColumn::Location(prefix)
+                }
+                MetadataColumn::LastModified => {
+                    datafusion_datasource::metadata::MetadataColumn::LastModified
+                }
+                MetadataColumn::Size => datafusion_datasource::metadata::MetadataColumn::Size,
+            })
+            .collect();
+        return Ok(options.with_metadata_cols(df_columns));
     }
 
     Ok(options)
@@ -1566,8 +1565,7 @@ async fn get_last_modified(
         #[expect(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
-                "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
-                file_count,
+                "Continuing to process {table_path} metadata... {file_count} objects processed so far, representing a total size of: {:.2} GiB",
                 total_size as f64 / BYTES_PER_GIB
             );
         }
@@ -1787,8 +1785,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
         },
         _ => {
             tracing::warn!(
-                "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
-                parquet_page_index_param
+                "Invalid value '{parquet_page_index_param}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
             );
             ParquetPageIndexOptions::default()
         }
@@ -2415,7 +2412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_listing_table_metadata_columns_are_rejected() {
+    async fn test_listing_table_metadata_columns_are_applied() {
         let app = app::AppBuilder::new("test").build();
         let rt = crate::Runtime::builder().build().await;
         let dataset = DatasetBuilder::try_new("s3://bucket/prefix/".to_string(), "test")
@@ -2437,25 +2434,18 @@ mod tests {
             true,
         )]);
 
-        let err = add_metadata_columns_if_required(
+        let result = add_metadata_columns_if_required(
             options,
             &Url::parse("s3://bucket/prefix/").expect("parse table url"),
             &schema,
             &dataset,
-            "TestListingConnector",
         )
-        .expect_err("listing table metadata columns should be rejected");
+        .expect("listing table metadata columns should be accepted");
 
-        match err {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message
-                        .contains("Listing table metadata columns (_location) are not supported"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+        assert!(
+            !result.metadata_cols.is_empty(),
+            "metadata columns should be set on listing options"
+        );
     }
 
     #[tokio::test]
