@@ -27,9 +27,11 @@ use super::compare;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use chbench_driver::ChBenchDriver;
-use datafusion::datasource::MemTable;
 use datafusion::functions_aggregate::expr_fn::{count, max, min};
-use datafusion::prelude::{SessionContext, col, lit};
+use datafusion::logical_expr::{
+    Expr, LogicalPlanBuilder, TableSource, builder::LogicalTableSource,
+};
+use datafusion::prelude::{col, lit};
 use datafusion::sql::unparser::Unparser;
 use test_framework::anyhow;
 use test_framework::opentelemetry::KeyValue;
@@ -300,7 +302,7 @@ async fn table_fingerprint(
         Err(e) => return ContentCheck::Skipped(format!("schema probe failed: {e}")),
     };
 
-    let sql = match build_fingerprint_sql(table, &schema).await {
+    let sql = match build_fingerprint_sql(table, &schema) {
         Ok(sql) => sql,
         Err(e) => return ContentCheck::Skipped(format!("fingerprint SQL build failed: {e}")),
     };
@@ -377,20 +379,16 @@ fn first_non_empty(batches: &[RecordBatch]) -> Option<&RecordBatch> {
 }
 
 /// Build the engine-agnostic fingerprint aggregate SQL for `table` from its
-/// Arrow `schema`, via the `DataFrame` API + unparser so the generated SQL is
-/// well-formed on both the source and Spice.
+/// Arrow `schema`, via [`LogicalPlanBuilder`] + the unparser so the generated
+/// SQL is well-formed on both the source and Spice.
 ///
 /// A `COUNT(*)`, a non-null `COUNT` for every column (catches column swaps /
 /// nulled values) and `MIN`/`MAX` for numeric columns. Each aggregate is aliased
 /// (`count_<col>`, `min_<col>`, `max_<col>`) so a divergence reported by
 /// [`compare::numeric_delta`] names the offending column.
-async fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<String> {
-    // An empty MemTable is just a schema carrier here — the DataFrame is only
-    // ever unparsed, never executed.
-    let ctx = SessionContext::new();
-    let provider = MemTable::try_new(Arc::clone(schema), vec![vec![]])?;
-    ctx.register_table(table, Arc::new(provider))?;
-    let df = ctx.table(table).await?;
+fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<String> {
+    // The table source only carries the schema — the plan is unparsed, never run.
+    let source = Arc::new(LogicalTableSource::new(Arc::clone(schema))) as Arc<dyn TableSource>;
 
     let mut aggs = vec![count(lit(1_i64)).alias("count_star")];
     for field in schema.fields() {
@@ -402,10 +400,10 @@ async fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Resul
         }
     }
 
-    let plan = df.aggregate(vec![], aggs)?;
-    let sql = Unparser::default()
-        .plan_to_sql(plan.logical_plan())?
-        .to_string();
+    let plan = LogicalPlanBuilder::scan(table, source, None)?
+        .aggregate(Vec::<Expr>::new(), aggs)?
+        .build()?;
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
     Ok(sql)
 }
 
@@ -414,8 +412,8 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-    #[tokio::test]
-    async fn fingerprint_sql_counts_all_columns_minmax_only_numerics() {
+    #[test]
+    fn fingerprint_sql_counts_all_columns_minmax_only_numerics() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("ol_amount", DataType::Decimal128(38, 2), true),
             Field::new("ol_quantity", DataType::Int32, true),
@@ -427,7 +425,6 @@ mod tests {
             ),
         ]));
         let sql = build_fingerprint_sql("order_line", &schema)
-            .await
             .expect("builds fingerprint SQL")
             .to_lowercase();
 
