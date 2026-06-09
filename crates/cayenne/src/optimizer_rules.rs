@@ -140,7 +140,7 @@ use crate::provider::scan::{ScanDynamicFilter, ScanIdentity};
 ///
 /// Opt-in: this rule is only registered when the runtime
 /// `cayenne_optimizer_rules.exact_join_filter` flag is enabled. By default the
-/// ordinary inner-join probe filter is handled by DataFusion 53's native
+/// ordinary inner-join probe filter is handled by `DataFusion` 53's native
 /// hash-join dynamic-filter pushdown (whose `InList` budget is raised in the
 /// runtime session builder's `configure_hash_join_memory_limits`).
 #[derive(Default)]
