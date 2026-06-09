@@ -509,8 +509,8 @@ pub enum CdcDurability {
     /// first batch whose committer reports `supports_deferral()`); every other
     /// profile/source falls back to `File`. The RAM tier is bounded on three axes
     /// so the deferred slot ack keeps advancing and the tier never grows unbounded:
-    /// a per-table byte cap (`cdc_mem_tier_max_bytes`, default 64 MiB) and age cap
-    /// (`cdc_mem_tier_max_age_ms`, default 2 s) that the write path checks per
+    /// a per-table byte cap (`cdc_mem_tier_max_bytes`, default 256 MiB) and age cap
+    /// (`cdc_mem_tier_max_age_ms`, default 10 s) that the write path checks per
     /// burst, plus a periodic background checkpoint task
     /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s) that flushes idle /
     /// pure-upsert tables which never trip a write-path cap. Correctness is
@@ -816,23 +816,34 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
-/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (64 MiB).
+/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB).
 ///
-/// Sized so the write-path spill (`mem_tier_per_table_cap_breached`) self-fires
-/// while the resident tombstone set is still small — frequent small checkpoints
-/// instead of one giant-tier stall. Keeps the per-append clone sub-millisecond
-/// (with the global byte budget as the rarely-hit aggregate backstop).
+/// This is the SYNCHRONOUS write-path spill threshold (`mem_tier_per_table_cap_breached`),
+/// which blocks the refresh-task's next batch while it flushes — so it should be
+/// a rare backstop, not the primary flush. The primary flush is the periodic
+/// background checkpointer, which (since the two-phase `checkpoint_mem_tier`
+/// moved the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence) no
+/// longer stalls appends — so a larger tier is cheap. 256 MiB gives the 1 s
+/// background tick time to drain the tier before this cap is reached at typical
+/// CDC rates, while staying small enough that ~N memory-mode tables sum well
+/// under the process-global budget (`get_total_memory()/8`), which remains the
+/// RAM-scaling aggregate backstop. (Was 64 MiB, sized for the old fence-blocking
+/// checkpoint where frequent tiny spills minimized each per-stall duration; that
+/// trade-off is obsolete now that checkpoints don't hold the fence.)
 fn default_cdc_mem_tier_max_bytes() -> i64 {
-    64 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
-/// Default RAM-tier age cap for `cdc_durability: memory` (2 s).
+/// Default RAM-tier age cap for `cdc_durability: memory` (10 s).
 ///
-/// Bounds the crash-replay window and forces a checkpoint on a slow-trickle
-/// table that never reaches the byte cap. A fully idle table (zero writes) is
-/// covered by the periodic background checkpoint, not this write-path age check.
+/// Bounds the crash-replay window and forces a synchronous checkpoint on a
+/// slow-trickle table that never reaches the byte cap. Raised from 2 s now that
+/// the background checkpointer (1 s tick) is the primary, non-fence-blocking
+/// flush path: an actively-written table is drained by the background tick long
+/// before 10 s, so this age cap only catches genuinely slow tables and no longer
+/// needs to fire aggressively on the hot write path.
 fn default_cdc_mem_tier_max_age_ms() -> u64 {
-    2_000
+    10_000
 }
 
 /// Default periodic mem-tier checkpoint interval for `cdc_durability: memory`
