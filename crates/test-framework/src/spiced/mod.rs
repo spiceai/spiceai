@@ -150,12 +150,24 @@ impl SpicedInstance {
         // Spice Cloud has a dedicated HTTP endpoint
         let http_base_url = if flight_url.contains("flight.spiceai.io") {
             "https://data.spiceai.io".to_string()
-        } else if let Some(last_colon) = flight_url.rfind(':') {
-            // Derive HTTP URL from Flight URL by replacing port
-            // e.g., "http://localhost:50051" -> "http://localhost:8090"
-            format!("{}:8090", &flight_url[..last_colon])
         } else {
-            format!("{flight_url}:8090")
+            // Derive the HTTP URL from the Flight URL by swapping the port for
+            // 8090, e.g. "http://localhost:50051" -> "http://localhost:8090".
+            // Split the scheme off first so the "://" separator is not mistaken
+            // for the port separator — otherwise a URL without an explicit port
+            // (e.g. "http://host") would incorrectly yield "http:8090".
+            let (scheme, authority) = match flight_url.split_once("://") {
+                Some((scheme, authority)) => (Some(scheme), authority),
+                None => (None, flight_url.as_str()),
+            };
+            // Strip an explicit ":port" if present; otherwise use the whole host.
+            let host = authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _port)| host);
+            match scheme {
+                Some(scheme) => format!("{scheme}://{host}:8090"),
+                None => format!("{host}:8090"),
+            }
         };
 
         Self::External {
@@ -485,6 +497,35 @@ mod tests {
             SpicedInstance::external("http://localhost:50051")
                 .process()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn external_derives_http_base_url_with_and_without_port() {
+        // Explicit port -> swap to the HTTP port.
+        assert_eq!(
+            SpicedInstance::external("http://localhost:50051").http_base_url(),
+            "http://localhost:8090"
+        );
+        // No explicit port: the scheme separator must not be treated as the
+        // port separator (regression — previously produced "http:8090").
+        assert_eq!(
+            SpicedInstance::external("http://myhost").http_base_url(),
+            "http://myhost:8090"
+        );
+        assert_eq!(
+            SpicedInstance::external("https://myhost").http_base_url(),
+            "https://myhost:8090"
+        );
+        // No scheme, explicit port.
+        assert_eq!(
+            SpicedInstance::external("myhost:50051").http_base_url(),
+            "myhost:8090"
+        );
+        // Spice Cloud keeps its dedicated HTTP endpoint.
+        assert_eq!(
+            SpicedInstance::external("https://flight.spiceai.io").http_base_url(),
+            "https://data.spiceai.io"
         );
     }
 }
