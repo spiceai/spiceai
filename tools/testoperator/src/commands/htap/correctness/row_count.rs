@@ -22,27 +22,53 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, AsArray};
-use arrow::datatypes::Int64Type;
+use super::super::spice::SpiceClients;
+use super::compare;
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use chbench_driver::ChBenchDriver;
-use futures::TryStreamExt;
+use datafusion::functions_aggregate::expr_fn::{count, max, min};
+use datafusion::logical_expr::{
+    Expr, LogicalPlanBuilder, TableSource, builder::LogicalTableSource,
+};
+use datafusion::prelude::{col, lit};
+use datafusion::sql::unparser::Unparser;
 use test_framework::anyhow;
 use test_framework::opentelemetry::KeyValue;
 use tokio::time::sleep;
 
-use super::super::staleness::query_max_bench_ts_spice;
+/// Result of the per-column content fingerprint for one table.
+#[derive(Debug, Clone)]
+pub enum ContentCheck {
+    /// Every compared aggregate agreed; `max_rel_delta` is the largest numeric
+    /// drift seen (a fraction, e.g. `0.0` for an exact match).
+    Match { max_rel_delta: f64 },
+    /// At least one per-column aggregate diverged source↔Spice.
+    Mismatch { detail: String },
+    /// The fingerprint could not be computed (schema unavailable, counts
+    /// already differ, or a probe error); the table is judged on counts alone.
+    Skipped(String),
+}
 
-/// Per-table source-vs-Spice row-count comparison.
+/// Per-table source-vs-Spice comparison: row counts plus a per-column content
+/// fingerprint (non-null counts + numeric MIN/MAX) so a corruption that
+/// preserves `COUNT(*)` + `MAX(_bench_ts)` — a wrong upsert value, a
+/// stale/missed update, a column swap — is still caught.
 #[derive(Debug, Clone)]
 pub struct TableCorrectness {
     pub table: String,
     pub source_count: i64,
     pub spice_count: i64,
+    pub content: ContentCheck,
 }
 
 impl TableCorrectness {
-    fn matched(&self) -> bool {
+    fn counts_matched(&self) -> bool {
         self.source_count == self.spice_count
+    }
+
+    fn matched(&self) -> bool {
+        self.counts_matched() && !matches!(self.content, ContentCheck::Mismatch { .. })
     }
 }
 
@@ -71,8 +97,8 @@ impl CorrectnessReport {
             );
         }
         println!(
-            "  {:<14} {:>14} {:>14} {:>8}",
-            "dataset", "source_count", "spice_count", "match"
+            "  {:<14} {:>14} {:>14} {:>8} {:>16}",
+            "dataset", "source_count", "spice_count", "count", "content"
         );
 
         let mut mismatches: u64 = 0;
@@ -81,13 +107,24 @@ impl CorrectnessReport {
             if !matched {
                 mismatches += 1;
             }
+            let content = match &t.content {
+                ContentCheck::Match { max_rel_delta } => format!("Δ{:.4}%", max_rel_delta * 100.0),
+                ContentCheck::Mismatch { .. } => "MISMATCH".to_string(),
+                ContentCheck::Skipped(_) => "skipped".to_string(),
+            };
             println!(
-                "  {:<14} {:>14} {:>14} {:>8}",
+                "  {:<14} {:>14} {:>14} {:>8} {:>16}",
                 t.table,
                 t.source_count,
                 t.spice_count,
-                if matched { "ok" } else { "MISMATCH" },
+                if t.counts_matched() { "ok" } else { "MISMATCH" },
+                content,
             );
+            match &t.content {
+                ContentCheck::Mismatch { detail } => println!("    └─ content: {detail}"),
+                ContentCheck::Skipped(reason) => println!("    └─ content: skipped — {reason}"),
+                ContentCheck::Match { .. } => {}
+            }
             crate::metrics::ROW_COUNT.record(
                 t.spice_count.max(0).cast_unsigned(),
                 &[KeyValue::new("dataset", t.table.clone())],
@@ -124,13 +161,19 @@ impl CorrectnessReport {
             ));
         }
         for t in &self.tables {
-            if !t.matched() {
+            if !t.counts_matched() {
                 problems.push(format!(
                     "{}: source={} spice={} (diff {})",
                     t.table,
                     t.source_count,
                     t.spice_count,
                     t.source_count - t.spice_count,
+                ));
+            }
+            if let ContentCheck::Mismatch { detail } = &t.content {
+                problems.push(format!(
+                    "{}: content fingerprint diverged — {detail}",
+                    t.table
                 ));
             }
         }
@@ -152,7 +195,7 @@ impl CorrectnessReport {
 /// out) a final count comparison is taken for the report.
 pub async fn verify_after_drain(
     driver: Arc<dyn ChBenchDriver>,
-    spice_client: &spiceai::Client,
+    spice: &SpiceClients,
     tables: &[String],
     max_wait: Duration,
 ) -> anyhow::Result<CorrectnessReport> {
@@ -170,9 +213,9 @@ pub async fn verify_after_drain(
         for table in tables {
             let (src_ts, spice_ts, src_n, spice_n) = tokio::join!(
                 driver.max_bench_ts(table),
-                query_max_bench_ts_spice(spice_client, table),
+                spice.max_bench_ts(table),
                 driver.row_count(table),
-                query_count_spice(spice_client, table),
+                spice.count(table),
             );
 
             // A transient error (e.g. a momentary connection blip while replication is still draining) should not fail
@@ -201,17 +244,29 @@ pub async fn verify_after_drain(
         sleep(poll).await;
     };
 
-    // Final count snapshot for the report.
+    // Final snapshot for the report: counts plus a per-column content
+    // fingerprint. The fingerprint runs once here (not every poll) — a
+    // full-table aggregate scan per probe table is too costly to repeat each
+    // second. Counts converging means replication caught up; the fingerprint
+    // then answers the distinct question "is the content actually correct?",
+    // catching value-level corruption that COUNT(*) + MAX(_bench_ts) miss.
     let mut table_results = Vec::with_capacity(tables.len());
     for table in tables {
-        let (source_count, spice_count) = tokio::join!(
-            driver.row_count(table),
-            query_count_spice(spice_client, table)
-        );
+        let (source_count, spice_count) = tokio::join!(driver.row_count(table), spice.count(table));
+        let source_count = source_count?;
+        let spice_count = spice_count?;
+        // Only fingerprint when counts already agree — comparing content over a
+        // differing row set adds no signal (the count mismatch is the finding).
+        let content = if source_count == spice_count {
+            table_fingerprint(&driver, spice, table).await
+        } else {
+            ContentCheck::Skipped("row counts differ".to_string())
+        };
         table_results.push(TableCorrectness {
             table: table.clone(),
-            source_count: source_count?,
-            spice_count: spice_count?,
+            source_count,
+            spice_count,
+            content,
         });
     }
 
@@ -222,23 +277,184 @@ pub async fn verify_after_drain(
     })
 }
 
-/// Query `COUNT(*)` from Spice via Flight SQL.
-async fn query_count_spice(client: &spiceai::Client, table: &str) -> anyhow::Result<i64> {
-    let query = format!("SELECT COUNT(*) FROM {table}");
-    let mut stream = client.sql(&query).await?;
+/// Compute and compare a per-column content fingerprint for `table`.
+///
+/// The fingerprint is engine-agnostic: `COUNT(*)`, a non-null `COUNT(col)` for
+/// every column, and `MIN(col)`/`MAX(col)` for numeric columns. `SUM` is
+/// deliberately excluded (floating sums are order-dependent and legitimately
+/// differ across engines); text/temporal `MIN`/`MAX` are excluded (collation
+/// and timestamp precision differ across engines). The identical SQL runs
+/// against the source and Spice and the single result rows are compared with
+/// [`compare::numeric_delta`] (exact for integer/decimal, 0.1% for float).
+///
+/// Probe errors are retried a bounded number of times before degrading to
+/// [`ContentCheck::Skipped`] — a momentary connection/Flight blip after drain
+/// must not weaken a value-level check into a false pass.
+async fn table_fingerprint(
+    driver: &Arc<dyn ChBenchDriver>,
+    spice: &SpiceClients,
+    table: &str,
+) -> ContentCheck {
+    // Ask Spice for the table schema via the FlightSQL GetSchema RPC rather than
+    // running a SELECT against the source purely to recover the column list.
+    let schema = match spice.table_schema(table).await {
+        Ok(schema) => schema,
+        Err(e) => return ContentCheck::Skipped(format!("schema probe failed: {e}")),
+    };
 
-    while let Some(batch) = stream.try_next().await? {
-        if batch.num_rows() == 0 {
-            continue;
+    let sql = match build_fingerprint_sql(table, &schema) {
+        Ok(sql) => sql,
+        Err(e) => return ContentCheck::Skipped(format!("fingerprint SQL build failed: {e}")),
+    };
+
+    let (src, spc) = match fetch_fingerprint_rows(driver, spice, &sql).await {
+        Ok(rows) => rows,
+        Err(e) => return ContentCheck::Skipped(e.to_string()),
+    };
+
+    // Arrow/Flight streams can include leading empty batches; the aggregate
+    // result is a single row, so take the first non-empty batch on each side.
+    let (Some(expected_row), Some(actual_row)) = (first_non_empty(&src), first_non_empty(&spc))
+    else {
+        return ContentCheck::Skipped("empty fingerprint result".to_string());
+    };
+
+    // Identical SQL must project identically on both engines; a differing column
+    // count is a real disagreement, so fail rather than letting `numeric_delta`
+    // silently compare only the overlapping prefix.
+    if expected_row.num_columns() != actual_row.num_columns() {
+        return ContentCheck::Mismatch {
+            detail: format!(
+                "fingerprint column count differs — source {}, spice {}",
+                expected_row.num_columns(),
+                actual_row.num_columns(),
+            ),
+        };
+    }
+
+    let delta = compare::numeric_delta(expected_row, actual_row);
+    if delta.exceeded {
+        ContentCheck::Mismatch {
+            detail: delta
+                .worst
+                .unwrap_or_else(|| "numeric aggregate diverged".to_string()),
         }
-        let col = batch
-            .column(0)
-            .as_primitive_opt::<Int64Type>()
-            .ok_or_else(|| anyhow::anyhow!("unexpected array type for COUNT(*) on {table}"))?;
-        if !col.is_null(0) {
-            return Ok(col.value(0));
+    } else {
+        ContentCheck::Match {
+            max_rel_delta: delta.max_rel_delta,
+        }
+    }
+}
+
+/// Number of times the fingerprint probe is attempted before degrading to
+/// [`ContentCheck::Skipped`].
+const FINGERPRINT_MAX_ATTEMPTS: u32 = 3;
+
+/// Run the fingerprint SQL against the source and Spice, retrying transient
+/// probe failures a bounded number of times before giving up.
+async fn fetch_fingerprint_rows(
+    driver: &Arc<dyn ChBenchDriver>,
+    spice: &SpiceClients,
+    sql: &str,
+) -> anyhow::Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+    let mut last_err = String::new();
+    for attempt in 1..=FINGERPRINT_MAX_ATTEMPTS {
+        let (src, spc) = tokio::join!(driver.query_arrow(sql), spice.query_arrow(sql));
+        last_err = match (src, spc) {
+            (Ok(src), Ok(spc)) => return Ok((src, spc)),
+            (Err(e), _) => format!("source fingerprint failed: {e}"),
+            (_, Err(e)) => format!("spice fingerprint failed: {e}"),
+        };
+        if attempt < FINGERPRINT_MAX_ATTEMPTS {
+            eprintln!("fingerprint probe attempt {attempt} failed ({last_err}); retrying");
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+    anyhow::bail!(last_err)
+}
+
+/// First batch with at least one row, or `None` if every batch is empty.
+fn first_non_empty(batches: &[RecordBatch]) -> Option<&RecordBatch> {
+    batches.iter().find(|b| b.num_rows() > 0)
+}
+
+/// Build the engine-agnostic fingerprint aggregate SQL for `table` from its
+/// Arrow `schema`, via [`LogicalPlanBuilder`] + the unparser so the generated
+/// SQL is well-formed on both the source and Spice.
+///
+/// A `COUNT(*)`, a non-null `COUNT` for every column (catches column swaps /
+/// nulled values) and `MIN`/`MAX` for numeric columns. Each aggregate is aliased
+/// (`count_<col>`, `min_<col>`, `max_<col>`) so a divergence reported by
+/// [`compare::numeric_delta`] names the offending column.
+fn build_fingerprint_sql(table: &str, schema: &SchemaRef) -> anyhow::Result<String> {
+    // The table source only carries the schema — the plan is unparsed, never run.
+    let source = Arc::new(LogicalTableSource::new(Arc::clone(schema))) as Arc<dyn TableSource>;
+
+    let mut aggs = vec![count(lit(1_i64)).alias("count_star")];
+    for field in schema.fields() {
+        let name = field.name();
+        aggs.push(count(col(name.as_str())).alias(format!("count_{name}")));
+        if compare::is_numeric(field.data_type()) {
+            aggs.push(min(col(name.as_str())).alias(format!("min_{name}")));
+            aggs.push(max(col(name.as_str())).alias(format!("max_{name}")));
         }
     }
 
-    Ok(0)
+    let plan = LogicalPlanBuilder::scan(table, source, None)?
+        .aggregate(Vec::<Expr>::new(), aggs)?
+        .build()?;
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    Ok(sql)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn fingerprint_sql_counts_all_columns_minmax_only_numerics() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("ol_amount", DataType::Decimal128(38, 2), true),
+            Field::new("ol_quantity", DataType::Int32, true),
+            Field::new("ol_dist_info", DataType::Utf8, true),
+            Field::new(
+                "ol_delivery_d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let sql = build_fingerprint_sql("order_line", &schema)
+            .expect("builds fingerprint SQL")
+            .to_lowercase();
+
+        // COUNT(*) and a non-null COUNT alias for every column.
+        assert!(sql.contains("count_star"), "missing COUNT(*): {sql}");
+        for col in ["ol_amount", "ol_quantity", "ol_dist_info", "ol_delivery_d"] {
+            assert!(
+                sql.contains(&format!("count_{col}")),
+                "missing COUNT for {col}: {sql}"
+            );
+        }
+        // MIN/MAX only for numeric columns.
+        assert!(
+            sql.contains("min_ol_amount") && sql.contains("max_ol_amount"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("min_ol_quantity") && sql.contains("max_ol_quantity"),
+            "{sql}"
+        );
+        // Not for text or temporal (cross-engine collation / precision differ).
+        assert!(
+            !sql.contains("min_ol_dist_info") && !sql.contains("max_ol_dist_info"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("min_ol_delivery_d") && !sql.contains("max_ol_delivery_d"),
+            "{sql}"
+        );
+        // The source table is referenced.
+        assert!(sql.contains("order_line"), "{sql}");
+    }
 }
