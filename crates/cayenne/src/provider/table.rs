@@ -7413,6 +7413,73 @@ impl CayenneTableProvider {
         }
     }
 
+    /// After `checkpoint_inlined_data` flushes inline rows to a Vortex file at
+    /// `flush_sequence`, walk the supplied PKs and upgrade any pre-existing
+    /// delete-only tombstone (`insert_seq=None`) to record `insert_seq=flush_sequence`.
+    ///
+    /// Without this upgrade, listing-time pruning via
+    /// `vortex_key_delete_pushdown_filter` and the runtime
+    /// `Int64PkDeletionFilterExec` keep treating those PKs as fully hidden and
+    /// drop the brand-new checkpoint file's rows. The upgrade is also persisted
+    /// to the catalog as paired insert records so the same state is rebuilt on
+    /// restart.
+    async fn upgrade_tombstones_for_flushed_pks(
+        &self,
+        flushed_pks: &[i64],
+        flush_sequence: i64,
+    ) -> Result<()> {
+        if flushed_pks.is_empty() {
+            return Ok(());
+        }
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return Ok(());
+        };
+
+        let current = deletion_snapshot.load_full();
+        // Group PKs needing an upgrade by their existing delete_sequence so we
+        // can do one `extend_max_conflicts` call per group.
+        let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for &pk in flushed_pks {
+            if let Some(t) = current.tombstones.get(pk)
+                && t.insert_sequence.is_none()
+            {
+                by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
+            }
+        }
+        if by_delete_seq.is_empty() {
+            return Ok(());
+        }
+
+        let insert_pk_bytes: Vec<Vec<u8>> = by_delete_seq
+            .values()
+            .flatten()
+            .map(|pk| pk.to_be_bytes().to_vec())
+            .collect();
+
+        self.catalog
+            .commit_on_conflict_deletions(
+                Vec::new(),
+                &self.table_metadata.table_id,
+                insert_pk_bytes,
+                flush_sequence,
+                None,
+            )
+            .await
+            .map_err(|err| Error::Catalog { source: err })?;
+
+        let mut updated = current.tombstones.as_ref().clone();
+        for (delete_seq, pks) in &by_delete_seq {
+            updated =
+                updated.extend_max_conflicts(pks.iter().copied(), *delete_seq, flush_sequence);
+        }
+        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
+        self.refresh_deletion_memory_accounting();
+        Ok(())
+    }
+
     async fn commit_inlined_data_mutation(
         &self,
         rewrite: InlinedDataRewrite,
@@ -8964,8 +9031,6 @@ impl CayenneTableProvider {
 
         // Commit delete files only — no insert records (inline data bypasses
         // the deletion filter, so no protected insert sequence is needed).
-        // The in-memory deletion cache is published separately by the caller
-        // under `scan_state_lock.write()`.
         self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0)
             .await?;
 
@@ -12908,6 +12973,33 @@ impl CayenneTableProvider {
                 .map(|b| b.get_array_memory_size() as u64)
                 .fold(0u64, u64::saturating_add),
         );
+
+        // Extract Int64 PKs from the batches before they're moved into the
+        // `MemorySource` below. After the flush, these PKs live in the new
+        // Vortex file at `sequence_number` (assigned later inside the fence).
+        // Any pending tombstone with `insert_seq=None` for one of these PKs
+        // would otherwise cause `vortex_key_delete_pushdown_filter` to add the
+        // PK to its `pk NOT IN (...)` filter and prune the brand-new file.
+        let flushed_int64_pks: Vec<i64> = if matches!(
+            self.pk_deletion_strategy,
+            PkDeletionStrategyWithCache::Int64Pk { .. }
+        ) && self.pk_column_indices.len() == 1
+        {
+            let pk_idx = self.pk_column_indices[0];
+            let mut pks: Vec<i64> = Vec::new();
+            for batch in &batches {
+                if let Some(arr) = batch.column(pk_idx).as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            pks.push(arr.value(i));
+                        }
+                    }
+                }
+            }
+            pks
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
@@ -12959,6 +13051,12 @@ impl CayenneTableProvider {
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                     )
+                    .await?;
+                // Pair every PK now in the new file with `sequence_number` on
+                // any pre-existing delete-only tombstone, so listing-time
+                // pruning and the runtime deletion filter stop hiding rows
+                // from the just-written checkpoint file.
+                self.upgrade_tombstones_for_flushed_pks(&flushed_int64_pks, sequence_number)
                     .await?;
                 stats
             };
