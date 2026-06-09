@@ -10582,13 +10582,25 @@ impl CayenneTableProvider {
             <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None).await?;
         let batches = collect(plan, session_state.task_ctx()).await?;
         let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-        self.maintained_aggregates
-            .rebuild_from_batches(epoch, &batches)?;
+        // Capture stats before `batches` is moved into the blocking task.
+        let batch_count = batches.len();
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        // Rebuilding iterates every visible row and extracts scalars — CPU-heavy.
+        // Run it on the blocking pool so it cannot stall the async runtime
+        // (mirrors `apply_maintained_aggregate_insert_batches`).
+        let registry = Arc::clone(&self.maintained_aggregates);
+        task::spawn_blocking(move || registry.rebuild_from_batches(epoch, &batches))
+            .await
+            .map_err(|error| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "maintained aggregate rebuild task failed: {error}"
+                ))
+            })??;
         tracing::debug!(
             table = %self.table_metadata.table_name,
             epoch,
-            batches = batches.len(),
-            rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            batches = batch_count,
+            rows = row_count,
             "Initialized maintained aggregate state from visible table snapshot"
         );
         Ok(())

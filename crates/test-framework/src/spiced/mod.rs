@@ -161,9 +161,17 @@ impl SpicedInstance {
                 None => (None, flight_url.as_str()),
             };
             // Strip an explicit ":port" if present; otherwise use the whole host.
-            let host = authority
-                .rsplit_once(':')
-                .map_or(authority, |(host, _port)| host);
+            // A bracketed IPv6 literal ("[::1]" / "[::1]:port") is treated as an
+            // atomic host so its internal colons aren't read as a port separator.
+            let host = if authority.starts_with('[') {
+                authority
+                    .find(']')
+                    .map_or(authority, |close| &authority[..=close])
+            } else {
+                authority
+                    .rsplit_once(':')
+                    .map_or(authority, |(host, _port)| host)
+            };
             match scheme {
                 Some(scheme) => format!("{scheme}://{host}:8090"),
                 None => format!("{host}:8090"),
@@ -521,6 +529,15 @@ mod tests {
         assert_eq!(
             SpicedInstance::external("myhost:50051").http_base_url(),
             "myhost:8090"
+        );
+        // Bracketed IPv6 literal: internal colons must not be read as a port.
+        assert_eq!(
+            SpicedInstance::external("http://[::1]:50051").http_base_url(),
+            "http://[::1]:8090"
+        );
+        assert_eq!(
+            SpicedInstance::external("http://[::1]").http_base_url(),
+            "http://[::1]:8090"
         );
         // Spice Cloud keeps its dedicated HTTP endpoint.
         assert_eq!(
