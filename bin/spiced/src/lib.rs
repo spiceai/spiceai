@@ -638,8 +638,20 @@ pub async fn run(args: Args) -> Result<()> {
     // Configure the CPU runtime for DataFusion by default. Opt-out via `runtime.params.dedicated_thread_pool=disabled`
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
+            // The dedicated SQL-engine (query execution) runtime runs at a
+            // slightly lower OS priority (nice 5) than the default-priority
+            // (nice 0) primary runtime that serves HTTP/health and request
+            // handling. Under a CPU-saturated query workload this keeps query
+            // *execution* from starving the latency-sensitive liveness probe
+            // and request-serving threads, while staying *above* the background
+            // refresh/compaction runtimes (nice 10) so query work is still
+            // favored over background maintenance.
+            const SQL_ENGINE_NICE: i32 = 5;
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
-            let cpu_runtime = ManagedTokioRuntime::try_new()
+            let cpu_runtime = ManagedTokioRuntime::builder()
+                .with_nice(SQL_ENGINE_NICE)
+                .with_thread_name("sql-worker")
+                .build()
                 .boxed()
                 .context(UnableToInitializeDatafusionTokioRuntimeSnafu)?;
 

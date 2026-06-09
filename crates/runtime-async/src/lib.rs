@@ -88,9 +88,17 @@ impl ManagedTokioRuntime {
     }
 }
 
+/// `nice` value for background runtimes (refresh, compaction): clearly
+/// deprioritized so background maintenance yields to query and control-plane
+/// work, while still making forward progress on otherwise-idle cores.
+const BACKGROUND_NICE: i32 = 10;
+
 /// Builder for [`ManagedTokioRuntime`] with configuration options.
 pub struct ManagedTokioRuntimeBuilder {
-    low_priority: bool,
+    /// Worker-thread `nice` value on Unix. `None` leaves the OS default
+    /// (nice 0). Positive values lower priority; we never set a negative
+    /// (higher-priority) value because that would require `CAP_SYS_NICE`.
+    nice: Option<i32>,
     thread_name: Option<String>,
 }
 
@@ -105,16 +113,29 @@ impl ManagedTokioRuntimeBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            low_priority: false,
+            nice: None,
             thread_name: None,
         }
     }
 
-    /// Set worker threads to run at lower priority (nice value 10 on Unix).
-    /// This is useful for background tasks that shouldn't compete with latency-sensitive work.
+    /// Set worker threads to run at low priority (nice value 10 on Unix).
+    /// This is useful for background tasks (refresh, compaction) that shouldn't
+    /// compete with latency-sensitive query and control-plane work.
     #[must_use]
-    pub fn with_low_priority(mut self) -> Self {
-        self.low_priority = true;
+    pub fn with_low_priority(self) -> Self {
+        self.with_nice(BACKGROUND_NICE)
+    }
+
+    /// Set an explicit worker-thread `nice` value (Unix only).
+    ///
+    /// Higher values mean lower scheduling priority. Only non-negative values
+    /// are meaningful here: lowering the nice value below the default (raising
+    /// priority) requires `CAP_SYS_NICE`, which the runtime does not assume.
+    /// Use this to place a runtime *between* the default-priority (nice 0)
+    /// primary runtime and the background runtimes (nice 10).
+    #[must_use]
+    pub fn with_nice(mut self, nice: i32) -> Self {
+        self.nice = Some(nice);
         self
     }
 
@@ -144,14 +165,20 @@ impl ManagedTokioRuntimeBuilder {
             builder.thread_name(name);
         }
 
-        // Set low priority on worker threads if requested (Unix only)
+        // Apply a worker-thread nice value if one was requested (Unix only).
+        // A positive nice lowers this runtime's scheduling priority relative to
+        // the default-priority (nice 0) primary runtime, without starving it:
+        // CFS keeps scheduling these threads, just with a smaller CPU-time
+        // weight when cores are contended.
         #[cfg(unix)]
-        if self.low_priority {
-            builder.on_thread_start(|| {
-                // Set nice value to 10 (lower priority than default 0, range is -20 to 19)
-                // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0 (current thread)
+        if let Some(nice) = self.nice {
+            builder.on_thread_start(move || {
+                // `who = 0` targets the calling thread on Linux (niceness is
+                // per-task there), so each worker thread sets its own nice value
+                // as it starts. Range is -20 (highest) to 19 (lowest priority).
+                // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0.
                 unsafe {
-                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                 }
             });
         }
