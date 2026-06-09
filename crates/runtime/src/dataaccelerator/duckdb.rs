@@ -1093,7 +1093,7 @@ mod tests {
 
     use crate::component::dataset::builder::DatasetBuilder;
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray},
+        array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
     use datafusion::{
@@ -1557,7 +1557,7 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let delete_error = table
+        let plan = table
             .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");

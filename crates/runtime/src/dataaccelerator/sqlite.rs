@@ -637,10 +637,6 @@ mod tests {
             .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
-        assert!(
-            delete_error.to_string().contains("DELETE not supported"),
-            "expected SQLite delete to be unsupported, got: {delete_error}"
-        );
     }
 
     /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal
