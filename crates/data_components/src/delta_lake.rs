@@ -241,6 +241,7 @@ impl DeltaTable {
     }
 
     /// Builds the default (non-SDK) object store and delta-kernel engine from `storage_options`.
+    #[expect(clippy::type_complexity)]
     fn build_default_stores(
         table_url: &Url,
         storage_options: HashMap<String, String>,
