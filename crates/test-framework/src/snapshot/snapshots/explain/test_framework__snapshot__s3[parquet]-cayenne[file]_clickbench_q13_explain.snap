@@ -17,7 +17,7 @@ description: "Query: clickbench_q13"
 |               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                                |
 |               |           AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                                                  |
 |               |             SchemaCastScanExec                                                                                                                       |
-|               |               CayenneAccelerationExec                                                                                                                |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=82                                                                         |
 |               |                 BytesProcessedExec                                                                                                                   |
 |               |                   DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[SearchPhrase], file_type=vortex, predicate: SearchPhrase@39 !=  |
 |               |                                                                                                                                                      |

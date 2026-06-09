@@ -8,7 +8,7 @@ description: "Query: clickbench_q20"
 | logical_plan  | Filter: hits.UserID = Int64(435090932899640449)                                                                                              |
 |               |   TableScan: hits projection=[UserID], partial_filters=[hits.UserID = Int64(435090932899640449)]                                             |
 | physical_plan | SchemaCastScanExec                                                                                                                           |
-|               |   CayenneAccelerationExec                                                                                                                    |
+|               |   CayenneAccelerationExec: snapshots_scanned=1, files_scanned=82                                                                             |
 |               |     BytesProcessedExec                                                                                                                       |
 |               |       DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[UserID], file_type=vortex, predicate: UserID@9 = 435090932899640449 |
 |               |                                                                                                                                              |

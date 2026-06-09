@@ -13,8 +13,8 @@ description: "Query: clickbench_q7"
 |               |     AggregateExec: mode=Partial, gby=[], aggr=[min(to_timestamp(hits.EventDate * Int64(86400))), max(to_timestamp(hits.EventDate * Int64(86400)))]                         |
 |               |       ProjectionExec: expr=[to_timestamp(CAST(EventDate@0 AS Int64) * 86400) as __common_expr_1]                                                                           |
 |               |         SchemaCastScanExec                                                                                                                                                 |
-|               |           CayenneAccelerationExec                                                                                                                                          |
+|               |           CayenneAccelerationExec: snapshots_scanned=1, files_scanned=82                                                                                                   |
 |               |             BytesProcessedExec                                                                                                                                             |
-|               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[EventDate], file_type=vortex                                                              |
+|               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[EventDate], file_type=vortex, predicate: DynamicFilter [ empty ]                          |
 |               |                                                                                                                                                                            |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

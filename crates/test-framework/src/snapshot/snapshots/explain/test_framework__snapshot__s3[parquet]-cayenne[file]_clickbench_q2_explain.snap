@@ -16,7 +16,7 @@ description: "Query: clickbench_q2"
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]                                                                                 |
 |               |         ProjectionExec: expr=[]                                                                                                                   |
 |               |           SchemaCastScanExec                                                                                                                      |
-|               |             CayenneAccelerationExec                                                                                                               |
+|               |             CayenneAccelerationExec: snapshots_scanned=1, files_scanned=82                                                                        |
 |               |               BytesProcessedExec                                                                                                                  |
 |               |                 DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[AdvEngineID], file_type=vortex, predicate: AdvEngineID@40 != 0 |
 |               |                                                                                                                                                   |

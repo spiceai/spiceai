@@ -13,7 +13,7 @@ description: "Query: clickbench_q3"
 |               |     CoalescePartitionsExec                                                                                                                                       |
 |               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(hits.AdvEngineID), count(Int64(1)), avg(hits.ResolutionWidth)]                                              |
 |               |         SchemaCastScanExec                                                                                                                                       |
-|               |           CayenneAccelerationExec                                                                                                                                |
+|               |           CayenneAccelerationExec: snapshots_scanned=1, files_scanned=82                                                                                         |
 |               |             BytesProcessedExec                                                                                                                                   |
 |               |               DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[ResolutionWidth, AdvEngineID], file_type=vortex                                 |
 |               |                                                                                                                                                                  |
