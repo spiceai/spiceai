@@ -394,7 +394,7 @@ impl MaintainedAggregateRegistry {
     /// Materialize a maintained aggregate batch by matching `query_aggregate`
     /// while using `output_aggregate` as the returned batch schema.
     ///
-    /// This is used for DataFusion's split aggregate plans: the partial
+    /// This is used for `DataFusion`'s split aggregate plans: the partial
     /// aggregate still names the original input columns, while the final
     /// aggregate carries the user-visible output schema.
     ///
@@ -878,7 +878,7 @@ fn input_column_name(input_schema: &SchemaRef, column: &Column) -> Option<String
     input_schema
         .fields()
         .get(column.index())
-        .map(|field| field.name().to_string())
+        .map(|field| field.name().clone())
 }
 
 fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {
