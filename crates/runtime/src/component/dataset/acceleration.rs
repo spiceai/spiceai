@@ -350,7 +350,7 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
-    pub maintained_aggregates: Vec<spicepod_acceleration::MaintainedAggregate>,
+    pub maintained_aggregates: spicepod_acceleration::MaintainedAggregates,
 
     pub write_mode: spicepod_acceleration::WriteMode,
 
@@ -603,7 +603,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            maintained_aggregates: Vec::new(),
+            maintained_aggregates: spicepod_acceleration::MaintainedAggregates::default(),
             write_mode: spicepod_acceleration::WriteMode::default(),
             storage_profile: StorageProfile::default(),
             disable_federation: false,
@@ -816,11 +816,15 @@ mod tests {
             }],
         };
         let acceleration = spicepod_acceleration::Acceleration {
-            maintained_aggregates: vec![maintained.clone()],
+            maintained_aggregates: spicepod_acceleration::MaintainedAggregates::new(
+                spicepod_acceleration::MaintainAggregates::Disabled,
+                vec![maintained.clone()],
+            ),
             ..Default::default()
         };
 
         let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
-        assert_eq!(parsed.maintained_aggregates, vec![maintained]);
+        assert_eq!(parsed.maintained_aggregates.as_slice(), &[maintained]);
+        assert!(!parsed.maintained_aggregates.is_enabled());
     }
 }

@@ -126,7 +126,8 @@ fn maintained_aggregate_specs_for_cayenne(
         return Ok(Vec::new());
     };
 
-    if acceleration.maintained_aggregates.is_empty() {
+    let maintained_aggregates = acceleration.maintained_aggregates.enabled_aggregates();
+    if maintained_aggregates.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -138,8 +139,7 @@ fn maintained_aggregate_specs_for_cayenne(
         });
     }
 
-    Ok(acceleration
-        .maintained_aggregates
+    Ok(maintained_aggregates
         .iter()
         .map(
             |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
@@ -150,19 +150,19 @@ fn maintained_aggregate_specs_for_cayenne(
                     .map(
                         |expr| {
                             cayenne::maintained_aggregate::MaintainedAggregateExpr {
-                    function: match expr.function {
-                        spicepod_acceleration::MaintainedAggregateFunction::Count => {
-                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
-                        }
-                        spicepod_acceleration::MaintainedAggregateFunction::Sum => {
-                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
-                        }
-                        spicepod_acceleration::MaintainedAggregateFunction::Avg => {
-                            cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
-                        }
-                    },
-                    column: expr.column.clone(),
-                }
+                        function: match expr.function {
+                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                            }
+                        },
+                        column: expr.column.clone(),
+                    }
                         },
                     )
                     .collect(),
@@ -2601,7 +2601,8 @@ mod tests {
                     function: spicepod_acceleration::MaintainedAggregateFunction::Count,
                     column: None,
                 }],
-            }],
+            }]
+            .into(),
             ..Default::default()
         }
     }
@@ -2621,6 +2622,20 @@ mod tests {
             cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
         );
         assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
+            spicepod_acceleration::MaintainAggregates::Disabled,
+            acceleration.maintained_aggregates.as_slice().to_vec(),
+        );
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("disabled maintained aggregate config should parse");
+
+        assert!(specs.is_empty());
     }
 
     #[test]
