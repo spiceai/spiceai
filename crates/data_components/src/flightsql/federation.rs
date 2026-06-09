@@ -15,18 +15,14 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion_federation::sql::{
-    LogicalOptimizer, RemoteTableRef, SQLExecutor, SQLFederationProvider, SQLTableSource,
-};
-use datafusion_federation::{
-    FederatedPlanNode, FederatedTableProviderAdaptor, FederatedTableSource,
-};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
+use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
+use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
 use std::sync::Arc;
 
-use crate::function_support::{FunctionSupport, contains_unsupported_functions};
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    common::tree_node::TreeNodeRecursion,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
@@ -36,50 +32,11 @@ use datafusion::{
     },
 };
 
-/// Unwrap a federated plan that Flight SQL cannot safely push down: plans
-/// referencing a deny-listed Spice-only function (e.g. `json_get_str` — the
-/// Flight SQL server has no such function), and plans containing custom
-/// extension nodes anywhere in the subtree (including inside IN/EXISTS/scalar
-/// subqueries), which the unparser cannot safely render. Unwrapping returns
-/// the inner plan so `DataFusion` evaluates it locally instead.
-fn unfederate_unsupported_flightsql_plan(
-    plan: LogicalPlan,
-    function_support: Option<&FunctionSupport>,
-) -> DataFusionResult<LogicalPlan> {
-    let LogicalPlan::Extension(extension) = &plan else {
-        return Ok(plan);
-    };
-    let Some(federated) = extension.node.as_any().downcast_ref::<FederatedPlanNode>() else {
-        return Ok(plan);
-    };
-
-    if let Some(func_supp) = function_support
-        && contains_unsupported_functions(federated.plan(), func_supp)?
-    {
-        return Ok(federated.plan().clone());
-    }
-
-    let mut found_extension = false;
-    federated.plan().apply_with_subqueries(|p| {
-        if matches!(p, LogicalPlan::Extension(_)) {
-            found_extension = true;
-            Ok(TreeNodeRecursion::Stop)
-        } else {
-            Ok(TreeNodeRecursion::Continue)
-        }
-    })?;
-    if found_extension {
-        return Ok(federated.plan().clone());
-    }
-
-    Ok(plan)
-}
-
 use super::{FlightSQLTable, query_to_stream};
 
 impl FlightSQLTable {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
-        let table_name = RemoteTableRef::from(self.table_reference.clone());
+        let table_name = self.table_reference.clone();
         tracing::trace!(
             %self.table_reference,
             "create_federated_table_source"
@@ -113,14 +70,29 @@ impl SQLExecutor for FlightSQLTable {
         Arc::new(DefaultDialect {})
     }
 
-    fn logical_optimizer(&self) -> Option<LogicalOptimizer> {
-        // v0.5.3 federation has no `can_execute_plan` veto; instead, install a
-        // logical optimizer that unwraps federated plans Flight SQL cannot
-        // safely push down (deny-listed functions, custom extension nodes).
-        let function_support = self.function_support.clone();
-        Some(Box::new(move |plan| {
-            unfederate_unsupported_flightsql_plan(plan, function_support.as_ref())
-        }))
+    fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+        // Don't federate plans referencing a deny-listed Spice-only function
+        // (e.g. json_get_str); the Flight SQL server has no such function, so
+        // evaluate those locally instead.
+        if let Some(func_supp) = self.function_support.as_ref()
+            && contains_unsupported_functions(logical_plan, func_supp).unwrap_or(false)
+        {
+            return false;
+        }
+
+        // FlightSQL federation currently cannot safely unparse arbitrary custom
+        // extension nodes. If any are present in the subtree — including inside
+        // subquery expressions (IN, EXISTS, scalar subqueries) — do not federate.
+        let mut found = false;
+        let _ = logical_plan.apply_with_subqueries(|p| {
+            if matches!(p, LogicalPlan::Extension(_)) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        });
+        !found
     }
 
     fn execute(
