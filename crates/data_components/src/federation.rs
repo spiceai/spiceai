@@ -194,6 +194,7 @@ mod tests {
             &pool,
             schema,
             TableReference::bare("t"),
+            None,
         ))
     }
 
