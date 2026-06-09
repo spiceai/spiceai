@@ -12552,20 +12552,31 @@ impl CayenneTableProvider {
             .map(|b| b.num_rows() as u64)
             .fold(0, u64::saturating_add);
 
-        // Two sequences: delete below data so the new rows survive their own
-        // tombstones. From the shared durable allocator so cross-checkpoint
-        // ordering against the file-backed deletion snapshot is monotone.
-        let base_sequence = self.reserve_sequences_local(2).await?;
-        let delete_sequence = base_sequence;
-        let data_sequence = base_sequence + 1;
-
-        let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
-
         let arc_batches = Arc::new(batches);
         let epoch = {
             // Publish the RAM swap under the same listing fence the durable
             // inline publish uses, so readers capture the new tier atomically.
             let _fence = self.listing_fence.write().await;
+
+            // Reserve the (delete, data) sequence pair INSIDE the fence so append
+            // sequence assignment is mutually exclusive with a checkpoint's
+            // snapshot-sequence reservation (which also runs under this fence).
+            // This guarantees the ordering invariant the off-fence checkpoint
+            // relies on: a checkpoint's `snapshot_sequence` is strictly below
+            // every sequence an append reserves AFTER the checkpoint captured its
+            // flush set — so a later upsert that supersedes a just-flushed key
+            // always outranks the durable copy on merge-on-read, and its tombstone
+            // (delete_sequence > snapshot_sequence) correctly hides the file. Were
+            // the reserve OUTSIDE the fence, an append could reserve a sequence
+            // BELOW a concurrent checkpoint's snapshot_sequence yet append AFTER
+            // it, inverting the order and orphaning the stale durable copy (a
+            // permanent over-count). delete below data so new rows survive their
+            // own tombstones; from the shared durable allocator for monotonicity.
+            let base_sequence = self.reserve_sequences_local(2).await?;
+            let delete_sequence = base_sequence;
+            let data_sequence = base_sequence + 1;
+            let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
+
             let cur = self.mem_tier.load();
             let next = cur.append_segment(
                 arc_batches,
@@ -12612,12 +12623,27 @@ impl CayenneTableProvider {
     /// (correctness item #4 — a failed checkpoint never advances).
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        // Snapshot the epoch + corpus to flush. Captured outside the fence; the
-        // store below is CAS-free because this table serializes checkpoints via
-        // `mem_checkpoint_lock` (held by the caller), so no concurrent checkpoint
-        // races the clear, and appends only ever GROW the tier (a concurrent
-        // append between this load and the clear is preserved — see the clear).
-        let snapshot = self.mem_tier.load_full();
+        // Capture the corpus to flush AND reserve this checkpoint's
+        // snapshot_sequence ATOMICALLY under a brief listing-fence write, so the
+        // capture+reservation is mutually exclusive with append sequence
+        // assignment (appends reserve under the same fence). This pins the
+        // ordering invariant: `snapshot_sequence` is strictly above every flushed
+        // row's sequence and strictly below every sequence an append reserves
+        // after this point — so the off-fence encode/commit below cannot be
+        // overtaken by a concurrent upsert (which would orphan the stale durable
+        // copy as a permanent over-count). The fence is held only for the cheap
+        // load + reserve, NOT the encode/commit. Checkpoints are serialized by
+        // `mem_checkpoint_lock` (caller-held) so no concurrent checkpoint races.
+        let (snapshot, reserved_snapshot_sequence) = {
+            let _fence = self.listing_fence.write().await;
+            let snapshot = self.mem_tier.load_full();
+            let seq = if snapshot.is_empty() || self.pk_deletion_strategy.is_position_based() {
+                None
+            } else {
+                Some(self.reserve_sequences_local(1).await?)
+            };
+            (snapshot, seq)
+        };
         if snapshot.is_empty() {
             return Ok(0);
         }
@@ -12715,7 +12741,11 @@ impl CayenneTableProvider {
             // PHASE 1 — durable, OUTSIDE the fence (does not block appends). The
             // new file is unreferenced and the RAM tier still holds the rows, so a
             // concurrent scan sees the RAM rows (correct) and never the file yet.
-            let sequence_number = self.reserve_sequences_local(1).await?;
+            // The snapshot_sequence was reserved UNDER the fence at capture time
+            // (serialized with appends) — it is strictly below every later append's
+            // sequence, so the durable file never outranks a concurrent supersede.
+            let sequence_number = reserved_snapshot_sequence
+                .expect("non-position checkpoint reserved its snapshot_sequence at capture");
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
             let (_rows, _ops, stats) = self
@@ -19377,6 +19407,122 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_ckpt_concurrent").await,
             6,
             "the off-fence durable checkpoint is reload-stable"
+        );
+    }
+
+    /// Stress regression for the heavy-upsert OVER-COUNT the off-fence checkpoint
+    /// surfaced at SF-100 (customer/stock ended with MORE rows than the source).
+    /// Repeatedly upserts a FIXED keyspace (so every write after the first round
+    /// supersedes a prior copy) while interleaving checkpoints, then quiesces and
+    /// asserts the final durable state has EXACTLY one row per key — no surplus
+    /// (over-count) and no deficit (vanish). This reproduces the production race
+    /// (an upsert's tombstone vs. the checkpoint that flushes the row it must hide)
+    /// deterministically and in-process, without a 40-minute SF-100 run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_checkpoint_no_overcount_under_interleaved_upserts() {
+        const KEYS: i64 = 64;
+        const ROUNDS: i64 = 40; // 40 upserts per key — heavy supersession
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_overcount",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        let provider = Arc::new(provider);
+
+        // Writer: upsert all KEYS each round (value = round, so the last round's
+        // value must win). Serialized writes (one provider write lock) but each
+        // round's batch interleaves with the concurrent checkpoint loop's off-fence
+        // encode window — the exact production interleaving.
+        let writer_provider = Arc::clone(&provider);
+        let writer_schema = Arc::clone(&schema);
+        let writer_ctx = ctx.task_ctx();
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::clone(&done);
+        let writer = tokio::spawn(async move {
+            let ids: Vec<i64> = (0..KEYS).collect();
+            for round in 0..ROUNDS {
+                let values: Vec<i64> = (0..KEYS).map(|_| round).collect();
+                let write = writer_provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(
+                            Arc::clone(&writer_schema),
+                            &ids,
+                            &values,
+                        )),
+                        &writer_ctx,
+                    )
+                    .await
+                    .expect("interleaved upsert round succeeds");
+                drop(write); // memory-mode append publishes via the RAM tier; nothing to finalize
+                tokio::task::yield_now().await;
+            }
+            writer_done.store(true, Ordering::Relaxed);
+        });
+
+        // Checkpoint loop: flush concurrently with the writer until it finishes.
+        let ckpt_provider = Arc::clone(&provider);
+        let checkpointer = tokio::spawn(async move {
+            let mut ticks = 0u32;
+            while !done.load(Ordering::Relaxed) && ticks < 10_000 {
+                ckpt_provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("interleaved checkpoint succeeds");
+                ticks += 1;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        writer.await.expect("join writer");
+        checkpointer.await.expect("join checkpointer");
+
+        // Quiesce: a final checkpoint flushes any survivor segments.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("final quiescent checkpoint");
+
+        // EXACTLY one row per key — no over-count (the SF-100 surplus), no vanish.
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_overcount").await,
+            KEYS,
+            "interleaved upsert+checkpoint must leave exactly one row per key (no over-count)"
+        );
+        // And the last round's value won for every key (no stale-copy resurrection).
+        let pairs = collect_id_value_pairs(&ctx, &provider, "mem_overcount").await;
+        let expected: Vec<(i64, i64)> = (0..KEYS).map(|id| (id, ROUNDS - 1)).collect();
+        assert_eq!(
+            pairs, expected,
+            "every key must show the LAST upserted value, exactly once"
+        );
+
+        // Durable + reload-stable.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("mem_overcount")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            query_count_star(&ctx, &reopened, "mem_overcount").await,
+            KEYS,
+            "reopened durable state has exactly one row per key"
         );
     }
 
