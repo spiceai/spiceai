@@ -144,6 +144,19 @@ pub(crate) struct MemSegment {
     pub(crate) data_sequence: i64,
     /// Exact min/max over this segment's batches for predicate-based pruning.
     pub(crate) statistics: Arc<Statistics>,
+    /// This segment's OWN tombstone delta (the on-conflict deletions of the batch
+    /// that produced it), kept per-segment — not just folded into the tier-level
+    /// aggregate — so a partial checkpoint ([`MemTier::retain_after`]) can rebuild
+    /// the survivors' aggregate tombstones without re-flushing the durable prefix.
+    /// Cheap to carry: [`InMemTombstones`] is an `im::HashMap` (O(1) structural clone).
+    pub(crate) tombstones: InMemTombstones,
+    /// This segment's measured byte cost (`get_array_memory_size`), for budget
+    /// release accounting on a partial clear.
+    pub(crate) bytes: u64,
+    /// This segment's row count.
+    pub(crate) rows: u64,
+    /// Rows this segment's upsert superseded (carried, not recomputed).
+    pub(crate) superseded: u64,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -234,6 +247,10 @@ impl MemTier {
             batches,
             data_sequence,
             statistics,
+            tombstones: tombstones.clone(),
+            bytes: incoming_bytes,
+            rows: incoming_rows,
+            superseded,
         });
 
         // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
@@ -259,6 +276,48 @@ impl MemTier {
         self.oldest_append.map_or(0, |t| {
             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
         })
+    }
+
+    /// The tier that REMAINS after a checkpoint durably flushed the first
+    /// `flushed_segment_count` segments (an append-ordered prefix — appends only
+    /// ever push to the end, so the flushed snapshot is always a prefix of the
+    /// live tier). Survivor segments (appended after the flushed snapshot, e.g.
+    /// while the off-fence encode/commit ran) are re-folded onto an empty tier so
+    /// the aggregate tombstones / bytes / rows / superseded reflect ONLY the
+    /// survivors. This is what prevents a double-count: keeping the whole tier
+    /// would re-flush the already-durable prefix into a second file on the next
+    /// checkpoint. The monotone `epoch` is preserved so a later append never
+    /// reuses a flushed epoch.
+    #[must_use]
+    pub(crate) fn retain_after(&self, flushed_segment_count: usize) -> Self {
+        if flushed_segment_count >= self.segments.len() {
+            // Nothing newer survived — empty tier, epoch preserved.
+            let mut empty = Self::empty();
+            empty.epoch = self.epoch;
+            return empty;
+        }
+        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
+        let mut tombstones = InMemTombstones::default();
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        for segment in &survivors {
+            tombstones.merge_from(&segment.tombstones);
+            bytes = bytes.saturating_add(segment.bytes);
+            rows = rows.saturating_add(segment.rows);
+            superseded = superseded.saturating_add(segment.superseded);
+        }
+        Self {
+            segments: Arc::new(survivors),
+            tombstones,
+            bytes,
+            rows,
+            superseded,
+            epoch: self.epoch,
+            // Reset the age clock: the flushed segments are gone, so the survivor
+            // age is measured from now (the next age-cap window starts here).
+            oldest_append: Some(Instant::now()),
+        }
     }
 }
 

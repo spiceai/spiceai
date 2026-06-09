@@ -85,7 +85,7 @@ limitations under the License.
 
 use std::hint::black_box;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
@@ -158,5 +158,118 @@ fn bench_checkpoint_fence_stall(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_checkpoint_fence_stall);
+// ---------------------------------------------------------------------------
+// Moonshot lever 1+2: mem-tier checkpoint encode + BEGIN IMMEDIATE commit moved
+// OUTSIDE the listing fence.
+//
+// `checkpoint_mem_tier` (cdc_durability: memory) previously held
+// `listing_fence.write()` across the Vortex ENCODE and the metastore COMMIT, so
+// every concurrent CDC append (which also takes `listing_fence.write()`) stalled
+// for that full duration. The two-phase rewrite runs encode + commit off the
+// fence and takes the fence only for the in-memory swap.
+//
+// This bench measures the FENCE-HELD duration — the exact stall a concurrent
+// append sees — under each model. Work is modeled by `sleep`: an encode (~8 ms
+// for a small delta) plus a metastore commit round-trip at three deployment
+// RTTs. Single-task and deterministic (no inter-task race): the timed span is
+// purely the fence-held section.
+//
+//   - `encode_commit_under_fence/<rtt>` (OLD): fence held across encode + commit
+//     + swap  ⇒ stall ≈ encode + commit.
+//   - `swap_only_under_fence/<rtt>`     (NEW): encode + commit happen first, off
+//     the fence; fence held for the swap only  ⇒ stall ≈ µs.
+//
+// The ratio of the two lanes is the per-checkpoint append-stall reduction, which
+// recurs at the background checkpoint cadence (default 1 s) for every memory-mode
+// table — so a 10–30 ms stall removed per checkpoint is 10–30 ms of ingest
+// throughput reclaimed per table per second.
+const ENCODE: Duration = Duration::from_millis(8);
+
+#[inline(never)]
+fn swap_no_op() {
+    // Stand-in for the under-fence work the new path keeps: ArcSwap publish of
+    // the snapshot pointer + deletion cache, clear the flushed epoch, refresh the
+    // listing table. All in-process; real cost is sub-millisecond.
+    black_box(0u64);
+}
+
+async fn encode_commit_under_fence(fence: &RwLock<()>, commit_rtt: Duration) -> Duration {
+    let started = Instant::now();
+    let _guard = fence.write().await;
+    tokio::time::sleep(ENCODE).await; // Vortex encode — UNDER the fence (old)
+    tokio::time::sleep(commit_rtt).await; // BEGIN IMMEDIATE commit — UNDER the fence (old)
+    swap_no_op();
+    started.elapsed()
+}
+
+async fn swap_only_under_fence(fence: &RwLock<()>, commit_rtt: Duration) -> Duration {
+    tokio::time::sleep(ENCODE).await; // encode — OUTSIDE the fence (new)
+    tokio::time::sleep(commit_rtt).await; // commit — OUTSIDE the fence (new)
+    let started = Instant::now();
+    let _guard = fence.write().await; // fence taken ONLY for the swap
+    swap_no_op();
+    started.elapsed()
+}
+
+fn bench_mem_tier_checkpoint_fence_stall(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let fence = Arc::new(RwLock::new(()));
+
+    let mut group = c.benchmark_group("mem_tier_checkpoint_fence_stall");
+    for &(label, rtt) in RTTS {
+        let fence_a = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("encode_commit_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_a);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += encode_commit_under_fence(&fence, rtt).await;
+                        }
+                        // The fence-held span must cover at least the encode +
+                        // commit it serializes — guards against the model silently
+                        // measuring nothing.
+                        assert!(
+                            held >= ENCODE.saturating_mul(
+                                u32::try_from(iters).unwrap_or(u32::MAX)
+                            ),
+                            "under-fence lane must hold the fence across the encode"
+                        );
+                        held
+                    }
+                });
+            },
+        );
+
+        let fence_b = Arc::clone(&fence);
+        group.bench_with_input(
+            BenchmarkId::new("swap_only_under_fence", label),
+            &rtt,
+            |b, &rtt| {
+                let fence = Arc::clone(&fence_b);
+                b.to_async(&rt).iter_custom(|iters| {
+                    let fence = Arc::clone(&fence);
+                    async move {
+                        let mut held = Duration::ZERO;
+                        for _ in 0..iters {
+                            held += swap_only_under_fence(&fence, rtt).await;
+                        }
+                        held
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_checkpoint_fence_stall,
+    bench_mem_tier_checkpoint_fence_stall
+);
 criterion_main!(benches);

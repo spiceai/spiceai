@@ -12617,20 +12617,31 @@ impl CayenneTableProvider {
             .map(|b| b.num_rows() as u64)
             .fold(0, u64::saturating_add);
 
-        // Two sequences: delete below data so the new rows survive their own
-        // tombstones. From the shared durable allocator so cross-checkpoint
-        // ordering against the file-backed deletion snapshot is monotone.
-        let base_sequence = self.reserve_sequences_local(2).await?;
-        let delete_sequence = base_sequence;
-        let data_sequence = base_sequence + 1;
-
-        let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
-
         let arc_batches = Arc::new(batches);
         let epoch = {
             // Publish the RAM swap under the same listing fence the durable
             // inline publish uses, so readers capture the new tier atomically.
             let _fence = self.listing_fence.write().await;
+
+            // Reserve the (delete, data) sequence pair INSIDE the fence so append
+            // sequence assignment is mutually exclusive with a checkpoint's
+            // snapshot-sequence reservation (which also runs under this fence).
+            // This guarantees the ordering invariant the off-fence checkpoint
+            // relies on: a checkpoint's `snapshot_sequence` is strictly below
+            // every sequence an append reserves AFTER the checkpoint captured its
+            // flush set — so a later upsert that supersedes a just-flushed key
+            // always outranks the durable copy on merge-on-read, and its tombstone
+            // (delete_sequence > snapshot_sequence) correctly hides the file. Were
+            // the reserve OUTSIDE the fence, an append could reserve a sequence
+            // BELOW a concurrent checkpoint's snapshot_sequence yet append AFTER
+            // it, inverting the order and orphaning the stale durable copy (a
+            // permanent over-count). delete below data so new rows survive their
+            // own tombstones; from the shared durable allocator for monotonicity.
+            let base_sequence = self.reserve_sequences_local(2).await?;
+            let delete_sequence = base_sequence;
+            let data_sequence = base_sequence + 1;
+            let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
+
             let cur = self.mem_tier.load();
             let next = cur.append_segment(
                 arc_batches,
@@ -12663,11 +12674,13 @@ impl CayenneTableProvider {
     /// [`SlotAdvancer`] callback so the runtime advances the source slot to cover
     /// every batch in the flushed epoch (the slot-deferral correctness contract).
     ///
-    /// Mirrors [`Self::checkpoint_inlined_data`] (same durable fence section: a
-    /// `MemorySourceConfig` exec → `insert_to_new_snapshot_with_sequence` /
-    /// `write_to_snapshot` under `listing_fence.write()`), but the corpus comes
-    /// from the RAM tier and the post-fence tail advances the slot rather than
-    /// clearing inline metastore rows.
+    /// For the key/Int64 strategies this runs the durable encode + metastore
+    /// commit OUTSIDE the listing fence and takes the fence only for the cheap
+    /// in-memory visibility swap (two-phase; see the body), so concurrent CDC
+    /// appends do not stall on the checkpoint. The position-based strategy keeps
+    /// encode+swap under one held fence (it appends to the current snapshot). The
+    /// corpus comes from the RAM tier and the post-fence tail advances the slot
+    /// rather than clearing inline metastore rows.
     ///
     /// On ANY error before the durable fence commits, the slot is NOT advanced
     /// (the deferred committers stay queued) and the error propagates up so the
@@ -12675,12 +12688,27 @@ impl CayenneTableProvider {
     /// (correctness item #4 — a failed checkpoint never advances).
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
-        // Snapshot the epoch + corpus to flush. Captured outside the fence; the
-        // store below is CAS-free because this table serializes checkpoints via
-        // `mem_checkpoint_lock` (held by the caller), so no concurrent checkpoint
-        // races the clear, and appends only ever GROW the tier (a concurrent
-        // append between this load and the clear is preserved — see the clear).
-        let snapshot = self.mem_tier.load_full();
+        // Capture the corpus to flush AND reserve this checkpoint's
+        // snapshot_sequence ATOMICALLY under a brief listing-fence write, so the
+        // capture+reservation is mutually exclusive with append sequence
+        // assignment (appends reserve under the same fence). This pins the
+        // ordering invariant: `snapshot_sequence` is strictly above every flushed
+        // row's sequence and strictly below every sequence an append reserves
+        // after this point — so the off-fence encode/commit below cannot be
+        // overtaken by a concurrent upsert (which would orphan the stale durable
+        // copy as a permanent over-count). The fence is held only for the cheap
+        // load + reserve, NOT the encode/commit. Checkpoints are serialized by
+        // `mem_checkpoint_lock` (caller-held) so no concurrent checkpoint races.
+        let (snapshot, reserved_snapshot_sequence) = {
+            let _fence = self.listing_fence.write().await;
+            let snapshot = self.mem_tier.load_full();
+            let seq = if snapshot.is_empty() || self.pk_deletion_strategy.is_position_based() {
+                None
+            } else {
+                Some(self.reserve_sequences_local(1).await?)
+            };
+            (snapshot, seq)
+        };
         if snapshot.is_empty() {
             return Ok(0);
         }
@@ -12694,7 +12722,7 @@ impl CayenneTableProvider {
         if batches.is_empty() {
             // Tombstones-only tier (every appended row already superseded): clear
             // and still advance the slot for the flushed epoch.
-            self.clear_mem_tier_up_to_epoch(flushed_epoch);
+            self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
             if !inlined_view.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
                 self.flip_inlined_keyset_entries_to_file_unlocated();
@@ -12733,59 +12761,36 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
-        // Durable barrier: encode + commit the snapshot pointer + clear the RAM
-        // tier under one held listing fence, so a reader sees either the RAM
-        // rows or the durable file, never both and never neither.
-        let stats = {
+        // Two-phase checkpoint (moonshot lever 1+2): for the key/Int64 strategies
+        // the expensive durable work — the Vortex ENCODE (`write_to_snapshot`) and
+        // the `BEGIN IMMEDIATE` metastore COMMIT (`commit_mem_tier_checkpoint_metadata`,
+        // ~98% of publish cost) — runs OUTSIDE the listing fence, then a tiny
+        // fence-held section performs only the in-memory visibility swap (publish
+        // the snapshot pointer + deletion cache, clear the flushed epoch, refresh
+        // the listing table). This is safe because the encoded file lands under a
+        // FRESH `new_snapshot_id` that no reader references until the under-fence
+        // `refresh_listing_table_under_held_fence`, and the source slot is advanced
+        // only AFTER the fence (`fire_slot_advancer` below) — so on a crash in the
+        // gap the durable file + metastore pointer exist and the un-acked tail
+        // replays PK-idempotently. The win: concurrent CDC appends (which also take
+        // `listing_fence.write()`) no longer stall on the encode/commit, so the
+        // background checkpointer can keep the RAM tier drained without throttling
+        // ingest. The position-based strategy appends to the CURRENT snapshot and
+        // therefore must keep encode+swap atomic under one held fence (unchanged).
+        let stats = if self.pk_deletion_strategy.is_position_based() {
             let _fence = self.listing_fence.write().await;
-            let stats = if self.pk_deletion_strategy.is_position_based() {
-                let target_size_bytes = self.context.target_file_size_bytes();
-                let (_rows, _ops, stats) = self
-                    .write_to_snapshot(
-                        stream,
-                        target_size_bytes,
-                        &self.get_current_snapshot_id(),
-                        ctx.state().config().target_partitions(),
-                        estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
-                    )
-                    .await?;
-                stats
-            } else {
-                let sequence_number = self.reserve_sequences_local(1).await?;
-                let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-                let target_size_bytes = self.context.target_file_size_bytes();
-                let (_rows, _ops, stats) = self
-                    .write_to_snapshot(
-                        stream,
-                        target_size_bytes,
-                        &new_snapshot_id,
-                        ctx.state().config().target_partitions(),
-                        estimated_bytes,
-                        super::delta_encoding::WriteClass::Delta,
-                    )
-                    .await?;
-
-                let is_s3 = self.table_metadata.path.starts_with("s3://");
-                if !is_s3 {
-                    let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
-                    Self::sync_snapshot_dir(&snapshot_dir).await?;
-                }
-
-                let update = self
-                    .commit_mem_tier_checkpoint_metadata(
-                        &snapshot,
-                        &new_snapshot_id,
-                        sequence_number,
-                    )
-                    .await?;
-                self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
-                    .await;
-                stats
-            };
-            // Clear the flushed epoch from the RAM tier WHILE holding the fence,
-            // so the swap-out is indivisible with the file becoming visible.
-            self.clear_mem_tier_up_to_epoch(flushed_epoch);
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let (_rows, _ops, stats) = self
+                .write_to_snapshot(
+                    stream,
+                    target_size_bytes,
+                    &self.get_current_snapshot_id(),
+                    ctx.state().config().target_partitions(),
+                    estimated_bytes,
+                    super::delta_encoding::WriteClass::Delta,
+                )
+                .await?;
+            self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
             if !inlined_view.is_empty() {
                 self.clear_inlined_metadata_after_checkpoint().await?;
                 self.flip_inlined_keyset_entries_to_file_unlocated();
@@ -12796,6 +12801,59 @@ impl CayenneTableProvider {
                 Ordering::Relaxed,
             );
             self.refresh_listing_table_under_held_fence().await?;
+            stats
+        } else {
+            // PHASE 1 — durable, OUTSIDE the fence (does not block appends). The
+            // new file is unreferenced and the RAM tier still holds the rows, so a
+            // concurrent scan sees the RAM rows (correct) and never the file yet.
+            // The snapshot_sequence was reserved UNDER the fence at capture time
+            // (serialized with appends) — it is strictly below every later append's
+            // sequence, so the durable file never outranks a concurrent supersede.
+            let sequence_number = reserved_snapshot_sequence
+                .expect("non-position checkpoint reserved its snapshot_sequence at capture");
+            let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+            let target_size_bytes = self.context.target_file_size_bytes();
+            let (_rows, _ops, stats) = self
+                .write_to_snapshot(
+                    stream,
+                    target_size_bytes,
+                    &new_snapshot_id,
+                    ctx.state().config().target_partitions(),
+                    estimated_bytes,
+                    super::delta_encoding::WriteClass::Delta,
+                )
+                .await?;
+
+            let is_s3 = self.table_metadata.path.starts_with("s3://");
+            if !is_s3 {
+                let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+                Self::sync_snapshot_dir(&snapshot_dir).await?;
+            }
+
+            let update = self
+                .commit_mem_tier_checkpoint_metadata(&snapshot, &new_snapshot_id, sequence_number)
+                .await?;
+
+            // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
+            // ArcSwap publish, a tier clear, and a listing-table refresh — no
+            // encode, no metastore round-trip. Indivisible w.r.t. scans, so the
+            // file becoming visible and the RAM rows clearing happen atomically.
+            {
+                let _fence = self.listing_fence.write().await;
+                self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
+                    .await;
+                self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
+                if !inlined_view.is_empty() {
+                    self.clear_inlined_metadata_after_checkpoint().await?;
+                    self.flip_inlined_keyset_entries_to_file_unlocated();
+                }
+                let remaining_mem_rows = self.mem_tier.load().rows;
+                self.inlined_row_count.store(
+                    i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
+                    Ordering::Relaxed,
+                );
+                self.refresh_listing_table_under_held_fence().await?;
+            }
             stats
         };
 
@@ -12812,36 +12870,29 @@ impl CayenneTableProvider {
     }
 
     /// Swap the mem tier to its remainder after a checkpoint flushed every
-    /// segment up to and including `flushed_epoch`. A concurrent append that
-    /// raised the live epoch ABOVE `flushed_epoch` is preserved: we drop only the
-    /// segments at/below the flushed epoch and keep the bytes/rows accounting for
-    /// the survivors. Because appends only grow and checkpoints are serialized by
-    /// `mem_checkpoint_lock`, the only writer that can interleave is an append
-    /// (which adds a higher-epoch segment); a CAS-free store is safe under the
-    /// listing fence the caller holds (appends also take that fence to swap).
-    fn clear_mem_tier_up_to_epoch(&self, flushed_epoch: u64) {
-        use crate::provider::mem_tier::MemTier;
+    /// segment in the flushed snapshot (its first `flushed_segment_count`
+    /// segments — an append-ordered prefix). A concurrent append that grew the
+    /// tier ABOVE the snapshot (which the two-phase checkpoint now allows, since
+    /// its encode/commit run OUTSIDE the listing fence) is preserved: we drop the
+    /// flushed prefix and KEEP ONLY the survivor segments, re-folding their
+    /// tombstones/bytes/rows via [`MemTier::retain_after`]. Keeping the whole tier
+    /// instead would re-flush the already-durable prefix into a second file on the
+    /// next checkpoint — a double-count (the bug the off-fence move exposed).
+    /// Checkpoints are serialized by `mem_checkpoint_lock`, so the only interleaving
+    /// writer is an append (push-only); this store runs under the listing fence the
+    /// caller holds (appends also take it to swap), so the prefix is stable.
+    fn clear_mem_tier_up_to_epoch(&self, flushed_epoch: u64, flushed_segment_count: usize) {
         let cur = self.mem_tier.load_full();
-        if cur.epoch <= flushed_epoch {
-            // Nothing newer survived — reset to empty but PRESERVE the monotone
-            // epoch counter so a later append's epoch never reuses a flushed one.
-            let mut empty = MemTier::empty();
-            empty.epoch = cur.epoch;
-            self.mem_tier.store(Arc::new(empty));
-            // Release the flushed bytes back to the process-global budget so
-            // other memory-mode tables can reuse them.
-            crate::provider::mem_tier_budget::release_bytes(cur.bytes);
-        } else {
-            // Survivors exist (a higher-epoch append interleaved). The live
-            // append path holds the listing fence across its swap and this clear
-            // also runs under that fence, so they never interleave mid-swap; keep
-            // the full current tier (re-flushing already-durable rows on the next
-            // checkpoint is idempotent and safe) and release NOTHING — the bytes
-            // are still resident. Only the age clock is reset.
-            let mut kept = (*cur).clone();
-            kept.oldest_append = Some(std::time::Instant::now());
-            self.mem_tier.store(Arc::new(kept));
-        }
+        let survivors = cur.retain_after(flushed_segment_count);
+        // Release exactly the flushed segments' bytes (cur − survivors) back to
+        // the process-global budget; survivor bytes stay resident.
+        let released = cur.bytes.saturating_sub(survivors.bytes);
+        debug_assert!(
+            survivors.epoch >= flushed_epoch,
+            "survivor tier must preserve the monotone epoch at/above the flushed one"
+        );
+        self.mem_tier.store(Arc::new(survivors));
+        crate::provider::mem_tier_budget::release_bytes(released);
         self.bump_inlined_structural_epoch();
     }
 
@@ -19343,6 +19394,233 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_tier_cross_tier").await,
             3,
             "reopened disk-tier state must preserve exact COUNT(*)"
+        );
+    }
+
+    /// Moonshot lever 1+2 correctness guard: the two-phase `checkpoint_mem_tier`
+    /// runs the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence and
+    /// takes the fence only for the in-memory swap. A CDC append that interleaves
+    /// with that off-fence window must be NEITHER lost (vanish) NOR re-materialized
+    /// (double-count): `clear_mem_tier_up_to_epoch` preserves any segment whose
+    /// epoch is above the flushed one, and the fresh `new_snapshot_id` is invisible
+    /// to readers until the under-fence listing swap. Runs the checkpoint and a
+    /// fresh-key append concurrently and asserts the exact final row set across
+    /// the RAM→file boundary and after reopen (durable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_checkpoint_off_fence_preserves_concurrent_append() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_ckpt_concurrent",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Arm the RAM tier (the runtime does this on the first replayable committer).
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+
+        // Append batch A → RAM (epoch 1).
+        let write_a = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("append A to RAM tier");
+        assert_eq!(write_a.in_memory_epoch(), Some(1), "batch A lands in RAM epoch 1");
+
+        // Concurrently: checkpoint (flushes epoch 1 with encode+commit OFF the
+        // fence) AND append batch B with fresh keys (a higher epoch that must
+        // survive `clear_mem_tier_up_to_epoch`).
+        let provider = Arc::new(provider);
+        let checkpoint_provider = Arc::clone(&provider);
+        let append_provider = Arc::clone(&provider);
+        let append_schema = Arc::clone(&schema);
+        let append_task_ctx = ctx.task_ctx();
+
+        let checkpoint = tokio::spawn(async move { checkpoint_provider.checkpoint_mem_tier().await });
+        let append = tokio::spawn(async move {
+            append_provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(
+                        append_schema,
+                        &[4, 5, 6],
+                        &[40, 50, 60],
+                    )),
+                    &append_task_ctx,
+                )
+                .await
+        });
+
+        checkpoint
+            .await
+            .expect("join checkpoint task")
+            .expect("off-fence checkpoint of epoch 1 succeeds");
+        let write_b = append
+            .await
+            .expect("join append task")
+            .expect("concurrent append B succeeds");
+        assert!(
+            write_b.in_memory_epoch().is_some(),
+            "batch B engages the RAM tier (a higher epoch that must survive the clear)"
+        );
+
+        // Flush whatever epoch survived the first checkpoint's clear.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("second checkpoint flushes the survivor epoch");
+
+        // No vanish (all six present) AND no double-count (each exactly once).
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "mem_ckpt_concurrent").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
+            "a concurrent append during the off-fence checkpoint must neither vanish nor double-count"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_ckpt_concurrent").await,
+            6,
+            "COUNT(*) is exact after the concurrent checkpoint + append"
+        );
+
+        // The flushed rows are durable: a reopened table sees the same set.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("mem_ckpt_concurrent")
+            .await
+            .expect("reopen checkpointed memory-mode table");
+        assert_eq!(
+            query_count_star(&ctx, &reopened, "mem_ckpt_concurrent").await,
+            6,
+            "the off-fence durable checkpoint is reload-stable"
+        );
+    }
+
+    /// Stress regression for the heavy-upsert OVER-COUNT the off-fence checkpoint
+    /// surfaced at SF-100 (customer/stock ended with MORE rows than the source).
+    /// Repeatedly upserts a FIXED keyspace (so every write after the first round
+    /// supersedes a prior copy) while interleaving checkpoints, then quiesces and
+    /// asserts the final durable state has EXACTLY one row per key — no surplus
+    /// (over-count) and no deficit (vanish). This reproduces the production race
+    /// (an upsert's tombstone vs. the checkpoint that flushes the row it must hide)
+    /// deterministically and in-process, without a 40-minute SF-100 run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_checkpoint_no_overcount_under_interleaved_upserts() {
+        const KEYS: i64 = 64;
+        const ROUNDS: i64 = 40; // 40 upserts per key — heavy supersession
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_overcount",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        let provider = Arc::new(provider);
+
+        // Writer: upsert all KEYS each round (value = round, so the last round's
+        // value must win). Serialized writes (one provider write lock) but each
+        // round's batch interleaves with the concurrent checkpoint loop's off-fence
+        // encode window — the exact production interleaving.
+        let writer_provider = Arc::clone(&provider);
+        let writer_schema = Arc::clone(&schema);
+        let writer_ctx = ctx.task_ctx();
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::clone(&done);
+        let writer = tokio::spawn(async move {
+            let ids: Vec<i64> = (0..KEYS).collect();
+            for round in 0..ROUNDS {
+                let values: Vec<i64> = (0..KEYS).map(|_| round).collect();
+                let write = writer_provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(
+                            Arc::clone(&writer_schema),
+                            &ids,
+                            &values,
+                        )),
+                        &writer_ctx,
+                    )
+                    .await
+                    .expect("interleaved upsert round succeeds");
+                drop(write); // memory-mode append publishes via the RAM tier; nothing to finalize
+                tokio::task::yield_now().await;
+            }
+            writer_done.store(true, Ordering::Relaxed);
+        });
+
+        // Checkpoint loop: flush concurrently with the writer until it finishes.
+        let ckpt_provider = Arc::clone(&provider);
+        let checkpointer = tokio::spawn(async move {
+            let mut ticks = 0u32;
+            while !done.load(Ordering::Relaxed) && ticks < 10_000 {
+                ckpt_provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("interleaved checkpoint succeeds");
+                ticks += 1;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        writer.await.expect("join writer");
+        checkpointer.await.expect("join checkpointer");
+
+        // Quiesce: a final checkpoint flushes any survivor segments.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("final quiescent checkpoint");
+
+        // EXACTLY one row per key — no over-count (the SF-100 surplus), no vanish.
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_overcount").await,
+            KEYS,
+            "interleaved upsert+checkpoint must leave exactly one row per key (no over-count)"
+        );
+        // And the last round's value won for every key (no stale-copy resurrection).
+        let pairs = collect_id_value_pairs(&ctx, &provider, "mem_overcount").await;
+        let expected: Vec<(i64, i64)> = (0..KEYS).map(|id| (id, ROUNDS - 1)).collect();
+        assert_eq!(
+            pairs, expected,
+            "every key must show the LAST upserted value, exactly once"
+        );
+
+        // Durable + reload-stable.
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("mem_overcount")
+            .await
+            .expect("reopen");
+        assert_eq!(
+            query_count_star(&ctx, &reopened, "mem_overcount").await,
+            KEYS,
+            "reopened durable state has exactly one row per key"
         );
     }
 
