@@ -12809,8 +12809,13 @@ impl CayenneTableProvider {
             // The snapshot_sequence was reserved UNDER the fence at capture time
             // (serialized with appends) — it is strictly below every later append's
             // sequence, so the durable file never outranks a concurrent supersede.
-            let sequence_number = reserved_snapshot_sequence
-                .expect("non-position checkpoint reserved its snapshot_sequence at capture");
+            let Some(sequence_number) = reserved_snapshot_sequence else {
+                return Err(Error::DataValidation {
+                    table: self.table_name().to_string(),
+                    message: "non-position checkpoint reserved its snapshot_sequence at capture"
+                        .to_string(),
+                });
+            };
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
             let (_rows, _ops, stats) = self
@@ -12824,8 +12829,7 @@ impl CayenneTableProvider {
                 )
                 .await?;
 
-            let is_s3 = self.table_metadata.path.starts_with("s3://");
-            if !is_s3 {
+            if !self.table_metadata.path.starts_with("s3://") {
                 let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
