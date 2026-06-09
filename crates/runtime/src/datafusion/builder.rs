@@ -93,6 +93,7 @@ use datafusion_optimizer_rules::{
     physical_plan::{
         EmptyHashJoinExecPhysicalOptimization, HttpParamsPushdown,
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
+        flightsql::broadcast_join::{ExecutorAddressProvider, FlightSQLBroadcastJoinPushdown},
     },
 };
 #[cfg(not(windows))]
@@ -715,6 +716,24 @@ impl DataFusionBuilder {
             Some(ClusterRole::Scheduler)
         ) {
             state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
+
+            // Distribute small-dimension joins onto executors (broadcast the
+            // dim via `executor_table`, join each fact partition locally) so the
+            // scheduler stops pulling whole fact tables up to join centrally.
+            // Gated on the dim's row-count stats; only fires for genuinely small
+            // dimensions. Live executor addresses are read sync at plan time.
+            if let Some(registry) = &self.executor_registry {
+                let reg = Arc::clone(registry);
+                let addresses: ExecutorAddressProvider =
+                    Arc::new(move || reg.ready_executor_ids_sync());
+                // The primary gate is the scale-invariant cost test
+                // (dim_rows × executors < fact_rows); this is the absolute cap
+                // on the broadcast dimension's row count to bound per-executor
+                // memory regardless of that comparison.
+                state = state.with_physical_optimizer_rule(FlightSQLBroadcastJoinPushdown::new(
+                    addresses, /* max_broadcast_dim_rows */ 25_000_000,
+                ));
+            }
         }
 
         let mut state = state.build();
