@@ -388,7 +388,26 @@ impl MaintainedAggregateRegistry {
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        let Some(query) = query_spec_for_aggregate(aggregate) else {
+        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch)
+    }
+
+    /// Materialize a maintained aggregate batch by matching `query_aggregate`
+    /// while using `output_aggregate` as the returned batch schema.
+    ///
+    /// This is used for DataFusion's split aggregate plans: the partial
+    /// aggregate still names the original input columns, while the final
+    /// aggregate carries the user-visible output schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matching maintained view cannot be materialized.
+    pub fn batch_for_aggregate_with_output(
+        &self,
+        query_aggregate: &AggregateExec,
+        output_aggregate: &AggregateExec,
+        scan_epoch: u64,
+    ) -> DataFusionResult<Option<RecordBatch>> {
+        let Some(query) = query_spec_for_aggregate(query_aggregate) else {
             return Ok(None);
         };
 
@@ -399,7 +418,7 @@ impl MaintainedAggregateRegistry {
 
         for view in &state.views {
             if view.matches_query(&query) {
-                return view.materialize(aggregate.schema());
+                return view.materialize(output_aggregate.schema());
             }
         }
 
@@ -774,7 +793,7 @@ impl AggregateAccumulator {
 fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateSpec> {
     if !matches!(
         aggregate.mode(),
-        AggregateMode::Single | AggregateMode::SinglePartitioned
+        AggregateMode::Single | AggregateMode::SinglePartitioned | AggregateMode::Partial
     ) || aggregate.limit().is_some()
         || aggregate.filter_expr().iter().any(Option::is_some)
         || aggregate.group_expr().has_grouping_set()
@@ -783,10 +802,11 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
         return None;
     }
 
+    let input_schema = aggregate.input().schema();
     let mut group_by = Vec::with_capacity(aggregate.group_expr().expr().len());
     for (expr, _) in aggregate.group_expr().expr() {
         let column = expr.as_any().downcast_ref::<Column>()?;
-        group_by.push(column.name().to_string());
+        group_by.push(input_column_name(&input_schema, column)?);
     }
 
     let mut aggregates = Vec::with_capacity(aggregate.aggr_expr().len());
@@ -807,7 +827,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
         let expressions = aggregate_expr.expressions();
         let column = match function {
             MaintainedAggregateFunction::Count => {
-                let column = count_column_for_query(&expressions)?;
+                let column = count_column_for_query(&input_schema, &expressions)?;
                 match column {
                     CountQueryColumn::AllRows => None,
                     CountQueryColumn::Column(column) => Some(column),
@@ -819,7 +839,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
                 }
                 let expr = expressions.first()?;
                 let column = expr.as_any().downcast_ref::<Column>()?;
-                Some(column.name().to_string())
+                Some(input_column_name(&input_schema, column)?)
             }
         };
 
@@ -833,6 +853,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
 }
 
 fn count_column_for_query(
+    input_schema: &SchemaRef,
     expressions: &[Arc<dyn datafusion_physical_expr::PhysicalExpr>],
 ) -> Option<CountQueryColumn> {
     if expressions.len() > 1 {
@@ -842,12 +863,22 @@ fn count_column_for_query(
         return Some(CountQueryColumn::AllRows);
     };
     if let Some(column) = expr.as_any().downcast_ref::<Column>() {
-        return Some(CountQueryColumn::Column(column.name().to_string()));
+        return Some(CountQueryColumn::Column(input_column_name(
+            input_schema,
+            column,
+        )?));
     }
     if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
         return (!literal.value().is_null()).then_some(CountQueryColumn::AllRows);
     }
     None
+}
+
+fn input_column_name(input_schema: &SchemaRef, column: &Column) -> Option<String> {
+    input_schema
+        .fields()
+        .get(column.index())
+        .map(|field| field.name().to_string())
 }
 
 fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {

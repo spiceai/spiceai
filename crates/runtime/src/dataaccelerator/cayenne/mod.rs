@@ -147,10 +147,8 @@ fn maintained_aggregate_specs_for_cayenne(
                 aggregates: aggregate
                     .aggregates
                     .iter()
-                    .map(
-                        |expr| {
-                            cayenne::maintained_aggregate::MaintainedAggregateExpr {
-                        function: match expr.function {
+                    .map(|expr| {
+                        let function = match expr.function {
                             spicepod_acceleration::MaintainedAggregateFunction::Count => {
                                 cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
                             }
@@ -160,11 +158,13 @@ fn maintained_aggregate_specs_for_cayenne(
                             spicepod_acceleration::MaintainedAggregateFunction::Avg => {
                                 cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
                             }
-                        },
-                        column: expr.column.clone(),
-                    }
-                        },
-                    )
+                        };
+
+                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                            function,
+                            column: expr.column.clone(),
+                        }
+                    })
                     .collect(),
             },
         )

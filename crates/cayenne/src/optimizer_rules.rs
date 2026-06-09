@@ -104,7 +104,7 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
@@ -327,10 +327,14 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
             let Some(aggregate) = node.as_any().downcast_ref::<AggregateExec>() else {
                 return Ok(Transformed::no(node));
             };
-            let Some((source, scan_epoch)) = maintained_aggregate_source(aggregate.input()) else {
+            let Some((source, scan_epoch, query_aggregate)) =
+                maintained_aggregate_source_for_aggregate(aggregate)
+            else {
                 return Ok(Transformed::no(node));
             };
-            let Some(batch) = source.batch_for_aggregate(aggregate, scan_epoch)? else {
+            let Some(batch) =
+                source.batch_for_aggregate_with_output(query_aggregate, aggregate, scan_epoch)?
+            else {
                 return Ok(Transformed::no(node));
             };
 
@@ -340,6 +344,56 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
         })
         .data()
     }
+}
+
+fn maintained_aggregate_source_for_aggregate(
+    aggregate: &AggregateExec,
+) -> Option<(&Arc<MaintainedAggregateRegistry>, u64, &AggregateExec)> {
+    match aggregate.mode() {
+        AggregateMode::Single | AggregateMode::SinglePartitioned => {
+            maintained_aggregate_source(aggregate.input())
+                .map(|(source, scan_epoch)| (source, scan_epoch, aggregate))
+        }
+        AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            let partial = maintained_aggregate_partial_input(aggregate.input())?;
+            if !is_simple_partial_aggregate(partial) {
+                return None;
+            }
+            maintained_aggregate_source(partial.input())
+                .map(|(source, scan_epoch)| (source, scan_epoch, partial))
+        }
+        AggregateMode::Partial => None,
+    }
+}
+
+fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+    if let Some(aggregate) = plan.as_any().downcast_ref::<AggregateExec>() {
+        return Some(aggregate);
+    }
+
+    let any = plan.as_any();
+    if any.downcast_ref::<RepartitionExec>().is_none()
+        && any.downcast_ref::<CoalesceBatchesExec>().is_none()
+        && any
+            .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
+            .is_none()
+    {
+        return None;
+    }
+
+    let children = plan.children();
+    if children.len() != 1 {
+        return None;
+    }
+    maintained_aggregate_partial_input(children[0])
+}
+
+fn is_simple_partial_aggregate(aggregate: &AggregateExec) -> bool {
+    matches!(aggregate.mode(), AggregateMode::Partial)
+        && aggregate.limit().is_none()
+        && aggregate.filter_expr().iter().all(Option::is_none)
+        && !aggregate.group_expr().has_grouping_set()
+        && aggregate.group_expr().groups().len() == 1
 }
 
 fn maintained_aggregate_source(
@@ -352,6 +406,7 @@ fn maintained_aggregate_source(
     let any = plan.as_any();
     if any.downcast_ref::<RepartitionExec>().is_none()
         && any.downcast_ref::<CoalesceBatchesExec>().is_none()
+        && any.downcast_ref::<SchemaCastScanExec>().is_none()
         && any
             .downcast_ref::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
             .is_none()

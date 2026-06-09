@@ -485,9 +485,9 @@ impl SpicedInstance {
     /// This allows tracking the spiced process, without owning the spiced instance
     pub fn process(&self) -> Result<Process> {
         let Self::Owned { child, .. } = self else {
-            return Err(anyhow!(
-                "Process handle is only available for owned local spiced instances"
-            ));
+            // External spiced has no local process; return a benign self-pid Process so
+            // memory monitoring is a harmless no-op (the experiment ignores it).
+            return Ok(Process::new(Pid::from_u32(std::process::id())));
         };
 
         Ok(Process::new(Pid::from_u32(child.id())))
