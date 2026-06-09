@@ -1513,11 +1513,7 @@ mod tests {
 
         let duckdb_accelerator = DuckDBAccelerator::new();
         let table =
-            super::create_table_provider(
-                &duckdb_accelerator.duckdb_factory,
-                &external_table,
-                None,
-            )
+            super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table, None)
                 .await
                 .expect("table should be created");
 
