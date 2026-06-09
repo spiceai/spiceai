@@ -237,8 +237,7 @@ pub async fn verify_analytical_results(
                         // and surface the magnitude either way.
                         match (expected_sorted.first(), actual_sorted.first()) {
                             (Some(e0), Some(a0)) => {
-                                let delta =
-                                    compare::numeric_delta(e0, a0, &actual_source_floats);
+                                let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
                                 if delta.exceeded {
                                     (
                                         Outcome::Fail(format!(

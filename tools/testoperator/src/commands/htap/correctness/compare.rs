@@ -347,8 +347,18 @@ mod tests {
         // so both compared columns are now decimal. A tiny rounding drift
         // (1000.0000001 vs 1000.0000002, rel 1e-10) must NOT fail when the
         // pre-alignment actual type was float...
-        let e = batch(vec![decimal_col("avg_qty", vec![10_000_000_001_i128], 38, 7)]);
-        let a = batch(vec![decimal_col("avg_qty", vec![10_000_000_002_i128], 38, 7)]);
+        let e = batch(vec![decimal_col(
+            "avg_qty",
+            vec![10_000_000_001_i128],
+            38,
+            7,
+        )]);
+        let a = batch(vec![decimal_col(
+            "avg_qty",
+            vec![10_000_000_002_i128],
+            38,
+            7,
+        )]);
 
         let approx = numeric_delta(&e, &a, &[true]);
         assert!(
