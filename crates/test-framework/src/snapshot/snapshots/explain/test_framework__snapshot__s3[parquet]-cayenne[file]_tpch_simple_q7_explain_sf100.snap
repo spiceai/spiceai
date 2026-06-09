@@ -11,7 +11,7 @@ description: "Query: tpch_simple_q7"
 |               |       TableScan: orders projection=[o_orderkey], fetch=10                                                            |
 | physical_plan | ProjectionExec: expr=[o_orderkey@0 as key]                                                                           |
 |               |   SchemaCastScanExec                                                                                                 |
-|               |     CayenneAccelerationExec                                                                                          |
+|               |     CayenneAccelerationExec: snapshots_scanned=1, files_scanned=16                                                   |
 |               |       CoalescePartitionsExec: fetch=10                                                                               |
 |               |         BytesProcessedExec                                                                                           |
 |               |           DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[o_orderkey], limit=10, file_type=vortex |
