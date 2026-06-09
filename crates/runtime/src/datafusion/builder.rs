@@ -70,9 +70,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 
-use datafusion_federation::{
-    FederatedPlanner, FederationAnalyzerRule, sql::federation_analyzer_rule,
-};
+use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
@@ -1102,7 +1100,7 @@ impl AnalyzerRulesBuilder {
         self
     }
 
-    /// Enable query federation by prepending the `FederationAnalyzerRule`.
+    /// Enable query federation by prepending the [`datafusion_federation::FederationAnalyzerRule`].
     ///
     /// As of datafusion-federation `sgrebnov/spiceai-53`, federation is implemented as an
     /// analyzer rule (it was an optimizer rule prior to the DF53 update). It must run before the
