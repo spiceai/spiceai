@@ -388,6 +388,15 @@ impl From<Vec<MaintainedAggregate>> for MaintainedAggregates {
     }
 }
 
+impl<'a> IntoIterator for &'a MaintainedAggregates {
+    type Item = &'a MaintainedAggregate;
+    type IntoIter = std::slice::Iter<'a, MaintainedAggregate>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 impl MaintainedAggregates {
     #[must_use]
     pub fn new(mode: MaintainAggregates, views: Vec<MaintainedAggregate>) -> Self {
@@ -422,7 +431,6 @@ impl MaintainedAggregates {
         self.as_slice().len()
     }
 
-    #[must_use]
     pub fn iter(&self) -> std::slice::Iter<'_, MaintainedAggregate> {
         self.as_slice().iter()
     }
