@@ -14978,10 +14978,6 @@ impl TableProvider for CayenneTableProvider {
             );
         }
 
-        let segment_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
-            &self.table_metadata.schema,
-            scan_filters,
-        )?;
         let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
             &self.table_metadata.schema,
             &mem_tier_pruning_filters,
@@ -14990,7 +14986,7 @@ impl TableProvider for CayenneTableProvider {
             .pruned_inlined_batches(
                 &inlined_view,
                 &mem_tier_snapshot,
-                segment_pruning_predicate.as_ref(),
+                mem_tier_pruning_predicate.as_ref(),
             )
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(
