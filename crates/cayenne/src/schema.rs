@@ -127,7 +127,12 @@ fn transform_data_type_for_vortex(
             unsupported_fields,
         ))),
         DataType::Map(field, sorted) => Some(DataType::Map(
-            transform_nested_field(field, path, unsupported_type_action, unsupported_fields),
+            transform_nested_field(
+                field,
+                &format!("{path}.{}", field.name()),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
             *sorted,
         )),
         DataType::Struct(fields) => {
@@ -165,7 +170,12 @@ fn transform_data_type_for_vortex(
         )),
         DataType::RunEndEncoded(run_ends, values) => Some(DataType::RunEndEncoded(
             Arc::clone(run_ends),
-            transform_nested_field(values, path, unsupported_type_action, unsupported_fields),
+            transform_nested_field(
+                values,
+                &format!("{path}.{}", values.name()),
+                unsupported_type_action,
+                unsupported_fields,
+            ),
         )),
         _ => Some(data_type.clone()),
     }
@@ -460,5 +470,67 @@ mod tests {
         let out = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect("map with supported children should be preserved");
         assert_eq!(out, schema);
+    }
+
+    #[test]
+    fn map_nested_unsupported_type_errors_with_entries_path() {
+        let schema = Schema::new(vec![Field::new(
+            "headers",
+            DataType::Map(
+                Arc::new(Field::new_struct(
+                    "entries",
+                    vec![
+                        Arc::new(Field::new("keys", DataType::Utf8, false)),
+                        Arc::new(Field::new(
+                            "values",
+                            DataType::Duration(TimeUnit::Second),
+                            true,
+                        )),
+                    ],
+                    false,
+                )),
+                false,
+            ),
+            true,
+        )]);
+
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("nested map values duration should be unsupported");
+        let message = err.to_string();
+        assert!(
+            message.contains("headers.entries.values"),
+            "error should include map entries field path, got: {message}"
+        );
+    }
+
+    #[test]
+    fn run_end_encoded_nested_unsupported_type_errors_with_values_path() {
+        let schema = Schema::new(vec![Field::new(
+            "encoded",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Struct(
+                        vec![Field::new(
+                            "duration",
+                            DataType::Duration(TimeUnit::Second),
+                            true,
+                        )]
+                        .into(),
+                    ),
+                    true,
+                )),
+            ),
+            true,
+        )]);
+
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+            .expect_err("nested run-end encoded values duration should be unsupported");
+        let message = err.to_string();
+        assert!(
+            message.contains("encoded.values.duration"),
+            "error should include run-end encoded values field path, got: {message}"
+        );
     }
 }

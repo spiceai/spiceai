@@ -47,10 +47,9 @@ limitations under the License.
 //! [`LiveKnobs`] at the use sites, running [`decide`] on the per-table
 //! background task) lives in the provider.
 
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
-};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
