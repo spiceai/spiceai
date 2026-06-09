@@ -47,6 +47,8 @@ limitations under the License.
 //! [`LiveKnobs`] at the use sites, running [`decide`] on the per-table
 //! background task) lives in the provider.
 
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -90,6 +92,21 @@ const MEM_PRESSURE_HIGH: f64 = 0.85;
 /// [`MEM_PRESSURE_HIGH`] avoids grow/shrink flapping near the limit.
 const MEM_PRESSURE_OK: f64 = 0.75;
 
+const MIB: i64 = 1024 * 1024;
+
+/// Minimum live inline-memtable budget the adaptive loop may target.
+const INLINE_FLUSH_MIN_BYTES: i64 = 2 * MIB;
+
+/// Historical fallback ceiling when the runtime has not installed a memory budget.
+const INLINE_FLUSH_FALLBACK_MAX_BYTES: i64 = 256 * MIB;
+
+/// Absolute per-table ceiling when memory is known. This keeps adaptive from
+/// turning a memory-rich host into one giant inlined snapshot, while still giving
+/// it more room than the static warm start on SF-scale ingest.
+const INLINE_FLUSH_ADAPTIVE_MAX_BYTES: i64 = 1024 * MIB;
+
+const INLINE_FLUSH_BUDGET_FRACTION: u64 = 32;
+
 // ---------------------------------------------------------------------------
 // Environment detection: process memory budget + cgroup-aware usage
 // ---------------------------------------------------------------------------
@@ -99,6 +116,12 @@ const MEM_PRESSURE_OK: f64 = 0.75;
 /// which case memory pressure is reported as unknown and the controller runs
 /// without the memory rule. Process-wide because RAM is shared across tables.
 static GLOBAL_MEMORY_BUDGET: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
 
 /// Install the process memory budget (cgroup-aware total) the dynamic tuner uses
 /// to compute memory pressure. Called once at startup by the runtime, mirroring
@@ -114,23 +137,199 @@ fn global_memory_budget() -> Option<u64> {
     }
 }
 
+/// Compute the dynamic inline-memtable movement bounds for the table's static
+/// warm-start value. The adaptive ceiling is intentionally memory-budgeted rather
+/// than fixed: on memory-rich hosts the controller can grow far enough to reduce
+/// small-file churn; under pressure, the memory rule still shrinks first.
+#[must_use]
+pub(crate) fn adaptive_inline_flush_bounds(initial_bytes: i64) -> (i64, i64) {
+    adaptive_inline_flush_bounds_for_budget(initial_bytes, global_memory_budget())
+}
+
+fn adaptive_inline_flush_bounds_for_budget(
+    initial_bytes: i64,
+    memory_budget: Option<u64>,
+) -> (i64, i64) {
+    let initial = initial_bytes.max(INLINE_FLUSH_MIN_BYTES);
+    let fallback_ceiling = initial
+        .saturating_mul(4)
+        .clamp(INLINE_FLUSH_MIN_BYTES, INLINE_FLUSH_FALLBACK_MAX_BYTES);
+
+    let ceiling = memory_budget.map_or(fallback_ceiling, |budget| {
+        let budget_ceiling = budget
+            .checked_div(INLINE_FLUSH_BUDGET_FRACTION)
+            .and_then(|bytes| i64::try_from(bytes).ok())
+            .unwrap_or(i64::MAX)
+            .clamp(INLINE_FLUSH_MIN_BYTES, INLINE_FLUSH_ADAPTIVE_MAX_BYTES);
+        initial
+            .saturating_mul(8)
+            .min(budget_ceiling)
+            .max(fallback_ceiling.min(budget_ceiling))
+    });
+
+    // Keep the upper bound at least at the warm start. If the process is already
+    // over budget, the memory-pressure branch will make an explicit shrink move;
+    // a behind/read-amp growth rule must never accidentally shrink because the
+    // ceiling was below the current value.
+    (INLINE_FLUSH_MIN_BYTES, ceiling.max(initial))
+}
+
 /// Current process/cgroup memory usage in bytes — cgroup v2 (`memory.current`)
 /// then v1 (`memory.usage_in_bytes`); `None` when unavailable. This is the
 /// "detect the environment and adjust" read that closes the loop on memory.
 #[cfg(target_os = "linux")]
 fn current_memory_bytes() -> Option<u64> {
-    use std::fs;
-    for path in [
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    ] {
-        if let Ok(s) = fs::read_to_string(path)
-            && let Ok(v) = s.trim().parse::<u64>()
-        {
-            return Some(v);
-        }
+    cgroup_v2_memory_current()
+        .or_else(cgroup_v1_memory_current)
+        .or_else(proc_self_rss_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_memory_current() -> Option<u64> {
+    read_u64_file(
+        CGROUP_V2_MEMORY_CURRENT_PATH
+            .get_or_init(resolve_cgroup_v2_memory_current_path)
+            .as_deref()?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v1_memory_current() -> Option<u64> {
+    read_u64_file(
+        CGROUP_V1_MEMORY_USAGE_PATH
+            .get_or_init(resolve_cgroup_v1_memory_usage_path)
+            .as_deref()?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_memory_current_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v2_path()?;
+    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    Some(cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.current",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v1_memory_usage_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v1_path("memory")?;
+    let mountpoint =
+        cgroup_v1_mountpoint("memory").unwrap_or_else(|| "/sys/fs/cgroup/memory".to_string());
+    Some(cgroup_file_path(
+        &mountpoint,
+        &cgroup_path,
+        "memory.usage_in_bytes",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_u64_file(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_file_path(mountpoint: &str, cgroup_path: &str, filename: &str) -> String {
+    if cgroup_path == "/" || cgroup_path.is_empty() {
+        format!("{mountpoint}/{filename}")
+    } else {
+        format!("{mountpoint}{cgroup_path}/{filename}")
     }
-    None
+}
+
+#[cfg(target_os = "linux")]
+fn process_cgroup_v2_path() -> Option<String> {
+    parse_proc_cgroup_v2_path(&std::fs::read_to_string("/proc/self/cgroup").ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn process_cgroup_v1_path(controller: &str) -> Option<String> {
+    parse_proc_cgroup_v1_path(
+        &std::fs::read_to_string("/proc/self/cgroup").ok()?,
+        controller,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_cgroup_v2_path(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix("0::").map(|path| {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                "/".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_cgroup_v1_path(contents: &str, controller: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let mut parts = line.splitn(3, ':');
+        let _hierarchy = parts.next()?;
+        let controllers = parts.next()?;
+        let path = parts.next()?.trim();
+        controllers.split(',').any(|c| c == controller).then(|| {
+            if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.to_string()
+            }
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup2_mountpoint() -> Option<String> {
+    parse_mountinfo_cgroup2(&std::fs::read_to_string("/proc/self/mountinfo").ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v1_mountpoint(controller: &str) -> Option<String> {
+    parse_mountinfo_cgroup_v1(
+        &std::fs::read_to_string("/proc/self/mountinfo").ok()?,
+        controller,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mountinfo_cgroup2(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (mount, fs) = line.split_once(" - ")?;
+        (fs.split_whitespace().next()? == "cgroup2")
+            .then(|| mount.split_whitespace().nth(4).map(ToString::to_string))?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mountinfo_cgroup_v1(contents: &str, controller: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (mount, fs) = line.split_once(" - ")?;
+        let mut fs_parts = fs.split_whitespace();
+        if fs_parts.next()? != "cgroup" {
+            return None;
+        }
+        let _source = fs_parts.next()?;
+        let super_options = fs_parts.next()?;
+        super_options
+            .split(',')
+            .any(|opt| opt == controller)
+            .then(|| mount.split_whitespace().nth(4).map(ToString::to_string))?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn proc_self_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let rest = line.strip_prefix("VmRSS:")?.trim();
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        kb.checked_mul(1024)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1142,5 +1341,52 @@ mod tests {
         // Rows track the inferred 256 B/row ratio (65536), NOT the 1 KiB fallback.
         assert_eq!(v.inline_flush_max_rows, 16 * 1024 * 1024 / 256);
         assert_ne!(v.inline_flush_max_rows, 16 * 1024 * 1024 / 1024);
+    }
+
+    #[test]
+    fn adaptive_inline_flush_ceiling_uses_memory_budget() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let initial = 128 * MIB;
+
+        assert_eq!(
+            adaptive_inline_flush_bounds_for_budget(initial, None),
+            (INLINE_FLUSH_MIN_BYTES, INLINE_FLUSH_FALLBACK_MAX_BYTES)
+        );
+        assert_eq!(
+            adaptive_inline_flush_bounds_for_budget(initial, Some(64 * gib)),
+            (INLINE_FLUSH_MIN_BYTES, INLINE_FLUSH_ADAPTIVE_MAX_BYTES)
+        );
+        assert_eq!(
+            adaptive_inline_flush_bounds_for_budget(8 * MIB, Some(64 * gib)),
+            (INLINE_FLUSH_MIN_BYTES, 64 * MIB)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_cgroup_paths_and_mounts() {
+        assert_eq!(
+            parse_proc_cgroup_v2_path("0::/kubepods.slice/pod123\n"),
+            Some("/kubepods.slice/pod123".to_string())
+        );
+        assert_eq!(
+            parse_proc_cgroup_v1_path("7:cpu,cpuacct:/x\n8:memory:/mem\n", "memory"),
+            Some("/mem".to_string())
+        );
+        assert_eq!(
+            parse_mountinfo_cgroup2("29 28 0:25 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"),
+            Some("/sys/fs/cgroup".to_string())
+        );
+        assert_eq!(
+            parse_mountinfo_cgroup_v1(
+                "32 29 0:28 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+                "memory"
+            ),
+            Some("/sys/fs/cgroup/memory".to_string())
+        );
+        assert_eq!(
+            cgroup_file_path("/sys/fs/cgroup", "/", "memory.current"),
+            "/sys/fs/cgroup/memory.current"
+        );
     }
 }

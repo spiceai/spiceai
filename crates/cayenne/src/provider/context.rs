@@ -128,15 +128,12 @@ impl CayenneContext {
             write_concurrency: wc_init,
         }));
         // Bounds keep the controller within sane, memory-/cpu-safe ranges. The
-        // memtable may grow up to 4× the static value (ingest-lag relief) but
-        // never past 256 MiB (the largest static memory ceiling); concurrency is
-        // capped at the core count (the global encode budget caps the aggregate).
-        let min_flush_bytes: i64 = 2 * 1024 * 1024;
-        let max_flush_bytes = config
-            .inline_flush_max_bytes
-            .max(min_flush_bytes)
-            .saturating_mul(4)
-            .clamp(min_flush_bytes, 256 * 1024 * 1024);
+        // memtable ceiling is derived from the runtime-installed memory budget so
+        // adaptive can use more RAM on large hosts while still shrinking first
+        // under observed memory pressure; concurrency is capped at the core count
+        // (the global encode budget caps the aggregate).
+        let inline_flush_bounds =
+            tuning::adaptive_inline_flush_bounds(config.inline_flush_max_bytes);
         // A pinned (operator-set) knob's bounds collapse to a single point so the
         // controller can never move it — that is how an explicit per-value
         // override is respected even in `adaptive` mode (`decide()` finds no room
@@ -146,7 +143,7 @@ impl CayenneContext {
             inline_flush_max_bytes: if pins.inline_flush {
                 (config.inline_flush_max_bytes, config.inline_flush_max_bytes)
             } else {
-                (min_flush_bytes, max_flush_bytes)
+                inline_flush_bounds
             },
             compaction_background_interval_ms: if pins.compaction_interval {
                 (
@@ -532,6 +529,7 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
+            file_pruning: config.file_pruning,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
@@ -551,5 +549,25 @@ mod tests {
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
         );
+    }
+
+    #[test]
+    fn cayenne_enables_file_pruning_by_default() {
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
+
+        assert!(context.file_format().options().file_pruning);
+    }
+
+    #[test]
+    fn cayenne_file_pruning_config_flows_to_table_options() {
+        let config = VortexConfig {
+            file_pruning: false,
+            ..VortexConfig::default()
+        };
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let context = CayenneContext::new(&config, runtime_env, "test");
+
+        assert!(!context.file_format().options().file_pruning);
     }
 }

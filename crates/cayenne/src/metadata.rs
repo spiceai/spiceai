@@ -752,6 +752,12 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
     #[serde(default)]
     pub pinned_tuning_knobs: PinnedTuningKnobs,
+    /// Whether scans may build `DataFusion`'s `FilePruner` to skip whole Vortex
+    /// files using statistics and partition values before opening them. Passed
+    /// through to `vortex-datafusion` as a per-format boolean. Defaults to
+    /// `true` (pruning enabled).
+    #[serde(default = "default_file_pruning")]
+    pub file_pruning: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -837,6 +843,10 @@ fn default_cdc_mem_tier_max_age_ms() -> u64 {
 /// bound hot tables).
 fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
     1_000
+}
+
+fn default_file_pruning() -> bool {
+    true
 }
 
 impl VortexConfig {
@@ -946,6 +956,7 @@ impl Default for VortexConfig {
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_knobs: PinnedTuningKnobs::default(),
+            file_pruning: default_file_pruning(),
         }
     }
 }

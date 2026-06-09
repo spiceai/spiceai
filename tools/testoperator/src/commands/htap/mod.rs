@@ -18,6 +18,7 @@ limitations under the License.
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
 mod correctness;
+mod spice;
 mod staleness;
 
 use std::sync::Arc;
@@ -278,11 +279,21 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .iter()
         .map(|t| (*t).to_string())
         .collect();
-    let correctness_result = {
-        let spice_client = spiced_instance.spice_client(None, true).await?;
-        correctness::verify_after_drain(Arc::clone(&driver), &spice_client, &probe_tables, duration)
-            .await
+    // One handle over both the query client and the low-level Flight client,
+    // reused by the correctness and analytical gates below.
+    let spice_clients = {
+        let query = spiced_instance.spice_client(None, true).await?;
+        let flight = spiced_instance.flight_client(None).await?;
+        spice::SpiceClients::new(query, flight)
     };
+
+    let correctness_result = correctness::verify_after_drain(
+        Arc::clone(&driver),
+        &spice_clients,
+        &probe_tables,
+        duration,
+    )
+    .await;
 
     let health_report = health_monitor.stop().await;
 
@@ -317,15 +328,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
                     .query_overrides
                     .clone()
                     .map(test_framework::queries::QueryOverrides::from);
-                let analytical_result = {
-                    let spice_client = spiced_instance.spice_client(None, true).await?;
-                    correctness::verify_analytical_results(
-                        Arc::clone(&driver),
-                        &spice_client,
-                        query_overrides,
-                    )
-                    .await
-                };
+                let analytical_result = correctness::verify_analytical_results(
+                    Arc::clone(&driver),
+                    &spice_clients,
+                    query_overrides,
+                )
+                .await;
 
                 match analytical_result {
                     Ok(analytical) => {
