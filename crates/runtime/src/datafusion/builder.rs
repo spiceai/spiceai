@@ -722,12 +722,7 @@ impl DataFusionBuilder {
             // scheduler stops pulling whole fact tables up to join centrally.
             // Gated on the dim's row-count stats; only fires for genuinely small
             // dimensions. Live executor addresses are read sync at plan time.
-            // Enabled by default; set SPICE_BROADCAST_JOIN=0 (or false) to
-            // disable it for an A/B perf comparison.
-            let broadcast_enabled = std::env::var("SPICE_BROADCAST_JOIN")
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or(true);
-            if broadcast_enabled && let Some(registry) = &self.executor_registry {
+            if let Some(registry) = &self.executor_registry {
                 let reg = Arc::clone(registry);
                 let addresses: ExecutorAddressProvider =
                     Arc::new(move || reg.ready_executor_ids_sync());
