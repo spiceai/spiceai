@@ -18,6 +18,7 @@ use arrow::array::{Array, ArrayData, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
@@ -174,7 +175,7 @@ impl DeltaTable {
     pub fn from(
         table_location: String,
         options: HashMap<String, SecretString>,
-        _io_runtime: &Handle,
+        io_runtime: &Handle,
     ) -> Result<Self> {
         let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
             .map_err(handle_delta_error)?;
@@ -192,8 +193,62 @@ impl DeltaTable {
             }
         }
 
-        let (parquet_object_store, _) = object_store::parse_url_opts(
-            &table_url,
+        // For S3 tables without explicit credentials, use the AWS SDK credential bridge so that
+        // IAM roles, environment-variable chains, and other SDK-managed auth sources are available
+        // for both the delta-kernel engine (log reads) and the parquet reader (data reads).
+        let (parquet_object_store, engine) = if table_url.scheme() == "s3" {
+            let region = storage_options
+                .get("delta_lake_aws_region")
+                .or_else(|| storage_options.get("aws_region"))
+                .map(ToString::to_string);
+
+            if let Some(sdk_config) = aws_sdk_credential_bridge::should_use_sdk_credentials(
+                &storage_options,
+                "aws_access_key_id",
+                "aws_secret_access_key",
+            ) {
+                match aws_sdk_credential_bridge::from_s3_url_and_config(
+                    &table_url,
+                    region,
+                    sdk_config.as_ref(),
+                    io_runtime.clone(),
+                ) {
+                    Ok(sdk_store) => {
+                        tracing::trace!(
+                            "Using AWS SDK credentials provider for Delta Lake table at {table_url}"
+                        );
+                        let sdk_store: Arc<dyn object_store::ObjectStore> = sdk_store.into();
+                        let engine = Arc::new(
+                            DefaultEngine::builder(Arc::clone(&sdk_store)).build(),
+                        );
+                        (sdk_store, engine)
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "Unable to build AWS SDK object store for Delta Lake table at {table_url}: {err}; falling back to delta_kernel credential resolution"
+                        );
+                        Self::build_default_stores(&table_url, storage_options)?
+                    }
+                }
+            } else {
+                // Explicit credentials present — pass them through delta_kernel's built-in resolution.
+                Self::build_default_stores(&table_url, storage_options)?
+            }
+        } else {
+            Self::build_default_stores(&table_url, storage_options)?
+        };
+
+        Self::with_engine(table_url, engine, parquet_object_store)
+    }
+
+    /// Builds the default (non-SDK) object store and delta-kernel engine from `storage_options`.
+    fn build_default_stores(
+        table_url: &Url,
+        storage_options: HashMap<String, String>,
+    ) -> Result<(Arc<dyn object_store::ObjectStore>, Arc<DefaultEngine<TokioBackgroundExecutor>>)>
+    {
+        let (parquet_store, _) = object_store::parse_url_opts(
+            table_url,
             storage_options
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
@@ -201,17 +256,16 @@ impl DeltaTable {
         .context(ObjectStoreSnafu {
             table_url: table_url.to_string(),
         })?;
-        let parquet_object_store: Arc<dyn object_store::ObjectStore> =
-            Arc::from(parquet_object_store);
+        let parquet_store: Arc<dyn object_store::ObjectStore> = Arc::from(parquet_store);
 
         let engine = Arc::new(
             DefaultEngine::builder(
-                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
+                store_from_url_opts(table_url, storage_options).map_err(handle_delta_error)?,
             )
             .build(),
         );
 
-        Self::with_engine(table_url, engine, parquet_object_store)
+        Ok((parquet_store, engine))
     }
 
     /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
