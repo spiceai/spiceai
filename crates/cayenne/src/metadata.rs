@@ -730,6 +730,15 @@ pub struct VortexConfig {
     /// trip). `0` disables the age trigger. Defaults to 2 s.
     #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
+    /// Minimum resident tier bytes before the PERIODIC background tick durably
+    /// checkpoints, in `cdc_durability: memory` mode only. Bounds snapshot /
+    /// delete-file churn: below this size a tick is a no-op unless the tier's
+    /// age has reached `cdc_mem_tier_max_age_ms` (which still bounds the
+    /// deferred slot ack and crash-replay window). The write-path cap spill and
+    /// explicit checkpoints are NOT gated. `0` disables the gate. Defaults to
+    /// 32 MiB.
+    #[serde(default = "default_cdc_mem_tier_min_flush_bytes")]
+    pub cdc_mem_tier_min_flush_bytes: i64,
     /// Periodic background mem-tier checkpoint interval in milliseconds, in
     /// `cdc_durability: memory` mode only. The accelerator spawns a per-table
     /// background task that checkpoints the RAM tier every interval (mirroring
@@ -832,6 +841,21 @@ fn default_inline_flush_max_bytes() -> i64 {
 /// trade-off is obsolete now that checkpoints don't hold the fence.)
 fn default_cdc_mem_tier_max_bytes() -> i64 {
     256 * 1024 * 1024
+}
+
+/// Default minimum tier size before the PERIODIC tick durably checkpoints
+/// (32 MiB). Every durable checkpoint costs a new snapshot + delete-vector
+/// files + a listing refresh under the fence; at a 1 s tick a high-rate table
+/// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
+/// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
+/// accumulated churn degrades scans and the apply path. Gating the tick on
+/// min-flush-bytes OR the age cap caps churn at ~max_bytes/min_flush files per
+/// flush window while leaving freshness untouched (RAM rows are visible to
+/// queries immediately; only the deferred source-slot ack waits, bounded by
+/// `cdc_mem_tier_max_age_ms`). The write-path cap spill and explicit
+/// checkpoints bypass the gate. `0` disables the gate (every tick flushes).
+fn default_cdc_mem_tier_min_flush_bytes() -> i64 {
+    32 * 1024 * 1024
 }
 
 /// Default RAM-tier age cap for `cdc_durability: memory` (10 s).
@@ -964,6 +988,7 @@ impl Default for VortexConfig {
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
+            cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_knobs: PinnedTuningKnobs::default(),

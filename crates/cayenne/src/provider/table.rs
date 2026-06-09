@@ -12858,6 +12858,12 @@ impl CayenneTableProvider {
                 );
                 self.refresh_listing_table_under_held_fence().await?;
             }
+            // Reclaim the superseded snapshot dirs (graceful, backgrounded —
+            // same as every other publish path). Without this every checkpoint
+            // leaked its predecessor's dir: measured at SF-100, order_line
+            // ended with 408 on-disk snapshot dirs while the catalog referenced
+            // 2 (≈406 orphans; 89G footprint vs ~live bytes).
+            self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
             stats
         };
 
@@ -16029,8 +16035,33 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
         // tick. `checkpoint_mem_tier` also early-returns `Ok(0)` on an empty
         // tier, so this is purely to avoid contending the lock with the write
         // path when there is nothing to do.
-        if self.mem_tier.load().is_empty() {
-            return;
+        {
+            let tier = self.mem_tier.load();
+            if tier.is_empty() {
+                return;
+            }
+            // Churn gate: each durable checkpoint costs a new snapshot dir,
+            // delete-vector files, and a listing refresh under the fence — at a
+            // 1 s tick a high-rate table would otherwise emit hundreds of tiny
+            // snapshots per run (measured at SF-100: 408–676 dirs/table), whose
+            // accumulated churn degrades scans and the apply path. Skip the
+            // tick until the tier is worth a file (`cdc_mem_tier_min_flush_bytes`)
+            // or its age reached `cdc_mem_tier_max_age_ms` (which keeps the
+            // deferred slot ack and crash-replay window bounded; freshness is
+            // unaffected — RAM rows are query-visible immediately on append).
+            // The write-path cap spill and explicit checkpoints bypass this.
+            let min_flush = self
+                .table_metadata
+                .vortex_config
+                .cdc_mem_tier_min_flush_bytes;
+            if min_flush > 0 {
+                let age_ready =
+                    self.mem_tier_max_age_ms > 0 && tier.age_ms() >= self.mem_tier_max_age_ms;
+                let size_ready = i64::try_from(tier.bytes).unwrap_or(i64::MAX) >= min_flush;
+                if !size_ready && !age_ready {
+                    return;
+                }
+            }
         }
         // Serialize against the write-path spill and the event-driven
         // checkpoints (all take this lock) so two checkpoints for one table can
@@ -17663,6 +17694,9 @@ mod tests {
         let vortex_config = VortexConfig {
             // Memory mode — the path under test.
             cdc_durability: crate::metadata::CdcDurability::Memory,
+            // Gate off: this test ticks tiny appends and asserts the flush/ack
+            // semantics, not the churn policy.
+            cdc_mem_tier_min_flush_bytes: 0,
             ..VortexConfig::default()
         };
         let options = CreateTableOptions {
@@ -17783,6 +17817,7 @@ mod tests {
         runtime_env: Arc<RuntimeEnv>,
         cdc_mem_tier_max_bytes: i64,
         cdc_mem_tier_max_age_ms: u64,
+        cdc_mem_tier_min_flush_bytes: i64,
     ) -> (CayenneTableProvider, tempfile::TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -17799,6 +17834,7 @@ mod tests {
             cdc_durability: crate::metadata::CdcDurability::Memory,
             cdc_mem_tier_max_bytes,
             cdc_mem_tier_max_age_ms,
+            cdc_mem_tier_min_flush_bytes,
             ..VortexConfig::default()
         };
         let options = CreateTableOptions {
@@ -17836,6 +17872,7 @@ mod tests {
             Arc::clone(&runtime_env),
             i64::MAX,
             0,
+            0, // min-flush gate off: this test exercises tick-flush semantics
         )
         .await;
         assert!(provider.is_cdc_memory_mode(), "memory mode active");
@@ -17902,7 +17939,7 @@ mod tests {
     async fn mem_tier_periodic_tick_is_noop_when_unarmed() {
         let runtime_env = SessionContext::new().runtime_env();
         let (provider, _tmp) =
-            create_memory_mode_table_with_caps("unarmed_periodic", runtime_env, i64::MAX, 0).await;
+            create_memory_mode_table_with_caps("unarmed_periodic", runtime_env, i64::MAX, 0, 0).await;
         assert!(provider.is_cdc_memory_mode(), "memory mode active");
         assert!(!provider.has_slot_advancer(), "not armed");
         // Must not panic and must leave the (empty) tier untouched.
@@ -17929,6 +17966,7 @@ mod tests {
             "byte_cap",
             runtime_env,
             i64::try_from(cap).expect("cap fits i64"),
+            0,
             0,
         )
         .await;
@@ -17993,6 +18031,7 @@ mod tests {
             runtime_env,
             i64::MAX,
             10, // 10 ms
+            0,
         )
         .await;
         struct NoopAdvancer;
@@ -19514,6 +19553,147 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_ckpt_concurrent").await,
             6,
             "the off-fence durable checkpoint is reload-stable"
+        );
+    }
+
+    /// Churn-gate behavior: a periodic tick on a SMALL, YOUNG tier is a no-op
+    /// (no snapshot churn for a few-KB delta), while the age cap still forces a
+    /// flush so the deferred slot ack stays bounded. The write-path spill and
+    /// explicit `checkpoint_mem_tier` calls bypass the gate (covered by the
+    /// byte-cap/age-cap tests above, which run with the gate disabled).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_periodic_tick_gates_small_young_tier() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = create_memory_mode_table_with_caps(
+            "gated_tick",
+            ctx.runtime_env(),
+            i64::MAX, // write-path byte cap never trips
+            200,      // age cap 200 ms — bounds the gated slot ack
+            i64::MAX, // min-flush gate effectively "size never ready"
+        )
+        .await;
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+
+        let batch = int64_id_batch(&[1, 2, 3]);
+        let bytes = batch.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![batch], &OnConflictDeletions::default(), bytes, 0)
+            .await
+            .expect("append to RAM tier");
+
+        // Immediately ticking a small, young tier must be a no-op (gated).
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            !provider.mem_tier.load().is_empty(),
+            "the churn gate must skip a tick on a small tier younger than the age cap"
+        );
+
+        // Past the age cap the gate yields: the tick flushes and clears the tier.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            provider.mem_tier.load().is_empty(),
+            "once the tier age reaches the cap, the tick must flush (bounded slot ack)"
+        );
+    }
+
+    /// Timed local repro for the SF-100 apply-throughput collapse (run3: stock
+    /// drained at ~3.5 MB/s with zero query traffic). Sustained fixed-keyspace
+    /// upserts against a memory-mode table with the production-shaped background
+    /// checkpoint loop, reporting rows/s per window. FAILS if the last window
+    /// drops below 40% of the first (a decay curve = the repro; flat = the
+    /// collapse is emergent, look at interactions instead). `#[ignore]`d: run
+    /// explicitly with `cargo test -p cayenne --lib --release -- --ignored
+    /// mem_tier_apply_throughput --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "timed perf repro; run explicitly with --ignored --nocapture"]
+    async fn mem_tier_apply_throughput_stays_flat_under_checkpoint_loop() {
+        const KEYS: i64 = 100_000; // fixed keyspace — every round supersedes
+        const ROUNDS: usize = 48;
+        const WINDOW: usize = 8; // report rows/s per 8-round window
+        const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_throughput",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        let provider = Arc::new(provider);
+
+        // Production-shaped background checkpoint loop (the 1s tick, compressed).
+        let done = Arc::new(AtomicBool::new(false));
+        let ckpt_provider = Arc::clone(&provider);
+        let ckpt_done = Arc::clone(&done);
+        let checkpointer = tokio::spawn(async move {
+            let mut ticks = 0u32;
+            while !ckpt_done.load(Ordering::Relaxed) && ticks < 100_000 {
+                tokio::time::sleep(CHECKPOINT_EVERY).await;
+                ckpt_provider
+                    .checkpoint_mem_tier()
+                    .await
+                    .expect("background checkpoint succeeds");
+                ticks += 1;
+            }
+        });
+
+        let ids: Vec<i64> = (0..KEYS).collect();
+        let mut window_rates: Vec<f64> = Vec::with_capacity(ROUNDS / WINDOW);
+        let mut window_start = std::time::Instant::now();
+        for round in 0..ROUNDS {
+            let values: Vec<i64> = (0..KEYS).map(|_| round as i64).collect();
+            let write = provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch(Arc::clone(&schema), &ids, &values)),
+                    &ctx.task_ctx(),
+                )
+                .await
+                .expect("sustained upsert round succeeds");
+            drop(write);
+            if (round + 1) % WINDOW == 0 {
+                let secs = window_start.elapsed().as_secs_f64();
+                let rate = (WINDOW as f64 * KEYS as f64) / secs;
+                eprintln!(
+                    "window {:>2}: {:>10.0} rows/s ({} rounds in {:.2}s)",
+                    (round + 1) / WINDOW,
+                    rate,
+                    WINDOW,
+                    secs
+                );
+                window_rates.push(rate);
+                window_start = std::time::Instant::now();
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        checkpointer.await.expect("join checkpointer");
+
+        let first = *window_rates.first().expect("at least one window");
+        let last = *window_rates.last().expect("at least one window");
+        assert!(
+            last >= 0.4 * first,
+            "apply throughput decayed: first window {first:.0} rows/s -> last window {last:.0} rows/s \
+             (<40% of initial) — the SF-100 apply collapse reproduces locally"
         );
     }
 
