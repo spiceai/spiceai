@@ -171,10 +171,47 @@ struct CayenneLogicalOptimizerRules {
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CayennePhysicalOptimizerRules {
-    dynamic_filter_sharing: bool,
-    maintained_aggregate: bool,
-    anti_join_sort_merge: bool,
-    exact_join_filter: bool,
+    enabled_rules: u8,
+}
+
+impl CayennePhysicalOptimizerRules {
+    const DYNAMIC_FILTER_SHARING: u8 = 1 << 0;
+    const MAINTAINED_AGGREGATE: u8 = 1 << 1;
+    const ANTI_JOIN_SORT_MERGE: u8 = 1 << 2;
+    const EXACT_JOIN_FILTER: u8 = 1 << 3;
+
+    const fn auto_enabled() -> Self {
+        Self {
+            enabled_rules: Self::DYNAMIC_FILTER_SHARING
+                | Self::MAINTAINED_AGGREGATE
+                | Self::ANTI_JOIN_SORT_MERGE,
+        }
+    }
+
+    const fn all_enabled() -> Self {
+        Self {
+            enabled_rules: Self::DYNAMIC_FILTER_SHARING
+                | Self::MAINTAINED_AGGREGATE
+                | Self::ANTI_JOIN_SORT_MERGE
+                | Self::EXACT_JOIN_FILTER,
+        }
+    }
+
+    const fn none() -> Self {
+        Self { enabled_rules: 0 }
+    }
+
+    const fn is_enabled(self, rule: u8) -> bool {
+        self.enabled_rules & rule != 0
+    }
+
+    fn set(&mut self, rule: u8, enabled: bool) {
+        if enabled {
+            self.enabled_rules |= rule;
+        } else {
+            self.enabled_rules &= !rule;
+        }
+    }
 }
 
 impl CayenneOptimizerRules {
@@ -187,12 +224,7 @@ impl CayenneOptimizerRules {
                 inlist_to_range: false,
                 semi_join_pushdown: true,
             },
-            physical: CayennePhysicalOptimizerRules {
-                dynamic_filter_sharing: true,
-                maintained_aggregate: true,
-                anti_join_sort_merge: true,
-                exact_join_filter: false,
-            },
+            physical: CayennePhysicalOptimizerRules::auto_enabled(),
         }
     }
 
@@ -205,12 +237,7 @@ impl CayenneOptimizerRules {
                 inlist_to_range: true,
                 semi_join_pushdown: true,
             },
-            physical: CayennePhysicalOptimizerRules {
-                dynamic_filter_sharing: true,
-                maintained_aggregate: true,
-                anti_join_sort_merge: true,
-                exact_join_filter: true,
-            },
+            physical: CayennePhysicalOptimizerRules::all_enabled(),
         }
     }
 
@@ -223,12 +250,7 @@ impl CayenneOptimizerRules {
                 inlist_to_range: false,
                 semi_join_pushdown: false,
             },
-            physical: CayennePhysicalOptimizerRules {
-                dynamic_filter_sharing: false,
-                maintained_aggregate: false,
-                anti_join_sort_merge: false,
-                exact_join_filter: false,
-            },
+            physical: CayennePhysicalOptimizerRules::none(),
         }
     }
 
@@ -270,38 +292,48 @@ impl CayenneOptimizerRules {
 
     #[must_use]
     pub const fn dynamic_filter_sharing(self) -> bool {
-        self.physical.dynamic_filter_sharing
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::DYNAMIC_FILTER_SHARING)
     }
 
     pub fn set_dynamic_filter_sharing(&mut self, enabled: bool) {
-        self.physical.dynamic_filter_sharing = enabled;
+        self.physical.set(
+            CayennePhysicalOptimizerRules::DYNAMIC_FILTER_SHARING,
+            enabled,
+        );
     }
 
     #[must_use]
     pub const fn maintained_aggregate(self) -> bool {
-        self.physical.maintained_aggregate
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::MAINTAINED_AGGREGATE)
     }
 
     pub fn set_maintained_aggregate(&mut self, enabled: bool) {
-        self.physical.maintained_aggregate = enabled;
+        self.physical
+            .set(CayennePhysicalOptimizerRules::MAINTAINED_AGGREGATE, enabled);
     }
 
     #[must_use]
     pub const fn anti_join_sort_merge(self) -> bool {
-        self.physical.anti_join_sort_merge
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::ANTI_JOIN_SORT_MERGE)
     }
 
     pub fn set_anti_join_sort_merge(&mut self, enabled: bool) {
-        self.physical.anti_join_sort_merge = enabled;
+        self.physical
+            .set(CayennePhysicalOptimizerRules::ANTI_JOIN_SORT_MERGE, enabled);
     }
 
     #[must_use]
     pub const fn exact_join_filter(self) -> bool {
-        self.physical.exact_join_filter
+        self.physical
+            .is_enabled(CayennePhysicalOptimizerRules::EXACT_JOIN_FILTER)
     }
 
     pub fn set_exact_join_filter(&mut self, enabled: bool) {
-        self.physical.exact_join_filter = enabled;
+        self.physical
+            .set(CayennePhysicalOptimizerRules::EXACT_JOIN_FILTER, enabled);
     }
 }
 
