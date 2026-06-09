@@ -332,7 +332,10 @@ async fn table_fingerprint(
         };
     }
 
-    let delta = compare::numeric_delta(expected_row, actual_row);
+    // The fingerprint gate runs identical SQL on both engines (no schema
+    // alignment), so the actual row's own types are its pre-alignment types.
+    let delta =
+        compare::numeric_delta(expected_row, actual_row, &compare::float_columns(actual_row));
     if delta.exceeded {
         ContentCheck::Mismatch {
             detail: delta
