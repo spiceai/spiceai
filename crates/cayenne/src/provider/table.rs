@@ -19429,6 +19429,7 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         // Arm the RAM tier (the runtime does this on the first replayable committer).
+        #[expect(clippy::items_after_statements)]
         struct TestAdvancer;
         #[async_trait::async_trait]
         impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
@@ -19546,6 +19547,7 @@ mod tests {
         assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
         let schema = Arc::clone(&provider.table_metadata.schema);
 
+        #[expect(clippy::items_after_statements)]
         struct TestAdvancer;
         #[async_trait::async_trait]
         impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
