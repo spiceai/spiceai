@@ -18,15 +18,12 @@
 set -euo pipefail
 
 CARGO_TOML="${1:-Cargo.toml}"
-# datafusion-table-providers is maintained on the Spice org fork (aligned with the
-# other Spice forks: snowflake-rs, duckdb-rs). The spiceai-<df-version> branches
-# live here; CI validates the pinned commit is on the expected branch of this repo.
-REPO_URL="https://github.com/spiceai/datafusion-table-providers.git"
+REPO_URL="https://github.com/datafusion-contrib/datafusion-table-providers.git"
 BRANCH="${BRANCH:-spiceai}"
 
 # Extract the commit hash from the datafusion-table-providers line in [patch.crates-io]
 # Use portable regex (BSD sed on macOS doesn't support \s)
-COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'spiceai/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
+COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'datafusion-contrib/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
 
 if [[ -z "$COMMIT" ]]; then
     echo "Error: Could not find datafusion-table-providers commit in $CARGO_TOML"
