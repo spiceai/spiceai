@@ -499,12 +499,16 @@ mod tests {
     use super::SpicedInstance;
 
     #[test]
-    fn process_is_unavailable_for_non_owned_instances() {
-        assert!(SpicedInstance::empty().process().is_err());
+    fn process_is_a_noop_self_pid_for_non_owned_instances() {
+        // Non-owned (Existing / External) instances have no local child process,
+        // so `process()` returns a benign self-pid `Process`: memory monitoring
+        // against it is a harmless no-op the caller ignores, rather than an error
+        // that would break commands run against an external/remote spiced.
+        assert!(SpicedInstance::empty().process().is_ok());
         assert!(
             SpicedInstance::external("http://localhost:50051")
                 .process()
-                .is_err()
+                .is_ok()
         );
     }
 
