@@ -1170,22 +1170,39 @@ fn hash_join_inlist_memory_limit_per_partition(
     }
 }
 
-/// Sizes `DataFusion`'s native hash-join `InList` dynamic-filter budget
-/// (`optimizer.hash_join_inlist_pushdown_max_size`) down to the runtime memory
-/// limit divided across `target_partitions`, never raising `DataFusion`'s own
-/// default. This bounds the per-partition memory the native inner-join dynamic
-/// filter can spend materializing build-side keys as an `InList`; larger build
-/// sides automatically fall back to the hash-table membership strategy.
+/// Per-partition byte ceiling + distinct-key ceiling for DataFusion's native
+/// hash-join `InList` dynamic filter on analytical (Cayenne) joins. DF's defaults
+/// (`hash_join_inlist_pushdown_max_size` 128 KiB, `_max_distinct_values` 150) are
+/// tuned for PK point-lookups and DISABLE the in-list for the dimension->fact
+/// joins Cayenne targets, leaving only min/max range bounds — a QPH regression vs
+/// the forked `ExactLeftAccumulator` that the DF53 reconciliation dropped. These
+/// match that accumulator's budget so the exact-membership in-list is pushed into
+/// the Cayenne probe scan for analytical build sides; genuinely huge builds still
+/// fall back to hash-table membership.
+const ANALYTICAL_INLIST_PUSHDOWN_MAX_BYTES: usize = 128 * 1024 * 1024; // 128 MiB / partition
+const ANALYTICAL_INLIST_PUSHDOWN_MAX_DISTINCT: usize = 32 * 1024 * 1024; // ~32M keys (byte cap governs)
+
+/// RAISES (never lowers) DataFusion's native hash-join `InList` dynamic-filter
+/// budget so analytical dimension->fact joins push an exact-membership in-list
+/// into the Cayenne probe scan instead of degrading to min/max bounds. Bounded by
+/// the runtime memory limit per partition; larger build sides fall back to the
+/// hash-table membership strategy.
 fn configure_hash_join_memory_limits(config: &mut SessionConfig, effective_memory_limit: u64) {
     let runtime_memory_limit_per_partition = hash_join_inlist_memory_limit_per_partition(
         effective_memory_limit,
         config.options().execution.target_partitions,
     );
 
+    let analytical_max_bytes =
+        runtime_memory_limit_per_partition.min(ANALYTICAL_INLIST_PUSHDOWN_MAX_BYTES);
+
     let optimizer = &mut config.options_mut().optimizer;
     optimizer.hash_join_inlist_pushdown_max_size = optimizer
         .hash_join_inlist_pushdown_max_size
-        .min(runtime_memory_limit_per_partition);
+        .max(analytical_max_bytes);
+    optimizer.hash_join_inlist_pushdown_max_distinct_values = optimizer
+        .hash_join_inlist_pushdown_max_distinct_values
+        .max(ANALYTICAL_INLIST_PUSHDOWN_MAX_DISTINCT);
 }
 
 fn runtime_env_with_effective_memory_limit_and_object_store_registry(
