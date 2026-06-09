@@ -1560,11 +1560,105 @@ mod tests {
         let delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
-            .expect_err("DuckDB delete should fail safely while provider DML is unavailable");
-        assert!(
-            delete_error.to_string().contains("DELETE not supported"),
-            "expected DuckDB delete to be unsupported, got: {delete_error}"
-        );
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
+
+        let filter = col("time_int").lt(lit(1354360273));
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![1]);
+        assert_eq!(actual, &expected);
+
+        let insertion = table
+            .insert_into(
+                &ctx.state(),
+                Arc::<MockExec>::clone(&exec),
+                InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
+
+        let insertion = table
+            .insert_into(&ctx.state(), exec, InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
+        let plan = table
+            .delete_from(&ctx.state(), vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
     }
 
     #[tokio::test]

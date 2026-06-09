@@ -636,7 +636,7 @@ mod tests {
         let delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
-            .expect_err("SQLite delete should fail safely while provider DML is unavailable");
+            .expect("deletion should be successful");
         assert!(
             delete_error.to_string().contains("DELETE not supported"),
             "expected SQLite delete to be unsupported, got: {delete_error}"

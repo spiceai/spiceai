@@ -7,7 +7,7 @@ expression: explain_pretty
 | plan_type     | plan                                                                                                                                    |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | TableScan: test_table projection=[id, region], full_filters=[test_table.region = Utf8("us-east-1")]                                     |
-| physical_plan | CooperativeExec                                                                                                                         |
-|               |   DuckSqlExec sql= SELECT "region=us-east-1/test_table"."id", "region=us-east-1/test_table"."region" FROM "region=us-east-1/test_table" |
-|               |                                                                                                                                         |
+| physical_plan | CooperativeExec                                                                                     |
+|               |   DuckSqlExec sql= SELECT "id", "region" FROM "region=us-east-1/test_table"                         |
+|               |                                                                                                     |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------+

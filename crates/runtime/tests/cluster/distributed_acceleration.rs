@@ -267,7 +267,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
             // Give the executor time to finish loading + acking its assigned partitions.
             sleep(Duration::from_secs(8)).await;
 
@@ -357,7 +357,7 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
             sleep(Duration::from_secs(5)).await;
 
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
