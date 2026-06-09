@@ -34,6 +34,7 @@ use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::job_status;
 use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
+use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
@@ -53,8 +54,21 @@ const MAX_PARTITION_RETRIEVAL_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Block transfer is more efficient for large result sets within a cluster.
 const USE_FLIGHT_TRANSFER: bool = false;
 
-/// Delay between scheduler status polls while waiting for a distributed job.
+/// Number of polls to retry when a Completed event arrives before terminal status persistence.
+const COMPLETED_STATUS_MAX_POLLS: usize = 20;
+
+/// Delay between scheduler status polls after receiving a Completed event.
 const COMPLETED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn describe_job_status(status: Option<&job_status::Status>) -> &'static str {
+    match status {
+        Some(job_status::Status::Queued(_)) => "queued",
+        Some(job_status::Status::Running(_)) => "running",
+        Some(job_status::Status::Successful(_)) => "successful",
+        Some(job_status::Status::Failed(_)) => "failed",
+        None => "unknown",
+    }
+}
 
 /// Status of a distributed query job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,34 +277,168 @@ impl QueryHandle {
         self.cache_key.as_ref()
     }
 
-    /// Requests cancellation for this query.
+    /// Returns the cancellation token for this job.
+    #[must_use]
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// Polls the current status of the job.
+    ///
+    /// Returns the job status or an error if the status cannot be retrieved.
+    /// For cached results, always returns `DistributedJobStatus::Succeeded`.
+    pub async fn poll_status(&self) -> Result<DistributedJobStatus> {
+        let QueryHandleState::Running { scheduler } = &self.state else {
+            // Cached results are always "succeeded"
+            return Ok(DistributedJobStatus::Succeeded);
+        };
+
+        let status = scheduler
+            .state
+            .task_manager
+            .get_job_status(&self.ballista_job_id)
+            .await
+            .map_err(|e| QueryHandleError::StatusError {
+                message: e.to_string(),
+            })?;
+
+        let Some(job_status) = status else {
+            return Ok(DistributedJobStatus::Queued);
+        };
+
+        match job_status.status {
+            Some(job_status::Status::Successful(_)) => Ok(DistributedJobStatus::Succeeded),
+            Some(job_status::Status::Failed(failed)) => {
+                Ok(DistributedJobStatus::Failed(failed.error))
+            }
+            Some(job_status::Status::Queued(_)) | None => Ok(DistributedJobStatus::Queued),
+            Some(job_status::Status::Running(_)) => Ok(DistributedJobStatus::Running),
+        }
+    }
+
+    /// Cancels the job.
+    ///
+    /// Signals the cancellation token and requests cancellation from the Ballista scheduler.
+    /// For cached results, this is a no-op since there's no job to cancel.
+    ///
+    /// Also finalizes the `task_history` row with `JobCancelled` error so
+    /// the recorded `error_message` reflects an explicit user cancel — not
+    /// the `Drop` guard's "client disconnected before completion" — when
+    /// callers `cancel()` and then drop the handle without ever draining
+    /// the result stream. `finish_tracker_with_error` is a no-op if some
+    /// other terminal path (e.g., `wait_for_complete` reacting to the
+    /// cancel token) raced ahead and already finalized.
     pub async fn cancel(&self) -> Result<()> {
         self.cancel_token.cancel();
+
         if let QueryHandleState::Running { scheduler } = &self.state {
             scheduler
                 .cancel_job(self.ballista_job_id.clone())
                 .await
                 .map_err(|e| QueryHandleError::StatusError {
-                    message: e.to_string(),
+                    message: format!("Failed to cancel job: {e}"),
                 })?;
         }
         self.finish_tracker_with_error(&QueryHandleError::JobCancelled);
         Ok(())
     }
 
+    /// Waits for the job to complete and returns the output partition locations.
+    ///
+    /// This method polls the scheduler until the job reaches a terminal state.
+    /// If the job succeeds, it returns the partition locations where results are stored.
+    /// If the job fails or is cancelled, it returns an appropriate error.
+    ///
+    /// For cached results, this returns an empty vec (results are already available).
+    pub async fn wait_for_completion(&self) -> Result<Vec<PartitionLocation>> {
+        match &self.state {
+            QueryHandleState::Running { scheduler } => {
+                self.wait_for_complete(scheduler, &self.cancel_token).await
+            }
+            QueryHandleState::Cached { .. } => {
+                // Cached results don't need to wait for completion
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Waits for the job to complete using the broadcast channel for notifications.
+    ///
+    /// This subscribes to job state events from the scheduler and waits for a terminal
+    /// state (completed, failed, or cancelled) for this job. This is more efficient than
+    /// polling as it only wakes when state changes occur.
     async fn wait_for_complete(
         &self,
         scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
         cancel: &CancellationToken,
     ) -> Result<Vec<PartitionLocation>> {
+        // Subscribe to job state events from the scheduler's broadcast channel
+        let mut receiver = scheduler.subscribe_job_updates();
+
+        // Check if the job is already complete before subscribing
+        // This handles the race condition where the job completes before we subscribe
+        if let Some(locations) = self.check_job_completed(scheduler).await? {
+            return Ok(locations);
+        }
+
         loop {
             tokio::select! {
-                result = self.check_job_completed(scheduler) => {
-                    if let Some(locations) = result? {
-                        return Ok(locations);
+                // Wait for job state events from the broadcast channel
+                event_result = receiver.recv() => {
+                    match event_result {
+                        Ok(event) => {
+                            // Only process events for our job
+                            if event.job_id != self.ballista_job_id {
+                                continue;
+                            }
+
+                            match event.state {
+                                BallistaJobState::Completed => {
+                                    // Job completed - fetch the partition locations from the scheduler
+                                    return self.fetch_completed_job_locations(scheduler).await;
+                                }
+                                BallistaJobState::Failed(error_message) => {
+                                    let err = QueryHandleError::JobFailed {
+                                        message: error_message,
+                                    };
+                                    self.finish_tracker_with_error(&err);
+                                    return Err(err);
+                                }
+                                BallistaJobState::Cancelled => {
+                                    let err = QueryHandleError::JobCancelled;
+                                    self.finish_tracker_with_error(&err);
+                                    return Err(err);
+                                }
+                                BallistaJobState::Queued | BallistaJobState::Running => {
+                                    // Job still in progress, continue waiting for terminal state
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Receiver fell behind - some events were dropped.
+                            // Check current job status to see if we missed a terminal state.
+                            tracing::debug!(
+                                job_id = %self.ballista_job_id,
+                                skipped_events = skipped,
+                                "Job state event receiver lagged behind, checking current job status"
+                            );
+
+                            if let Some(locations) = self.check_job_completed(scheduler).await? {
+                                return Ok(locations);
+                            }
+                            // Job still in progress, continue listening for events
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Channel closed - scheduler is shutting down
+                            let err = QueryHandleError::StatusError {
+                                message: "Job state event channel closed".to_string(),
+                            };
+                            self.finish_tracker_with_error(&err);
+                            return Err(err);
+                        }
                     }
-                    sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
                 }
+                // Check for cancellation
                 () = cancel.cancelled() => {
                     let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
                     let err = QueryHandleError::JobCancelled;
@@ -345,6 +493,88 @@ impl QueryHandle {
                 Ok(None)
             }
         }
+    }
+
+    /// Fetches partition locations for a completed job.
+    async fn fetch_completed_job_locations(
+        &self,
+        scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
+    ) -> Result<Vec<PartitionLocation>> {
+        for attempt in 1..=COMPLETED_STATUS_MAX_POLLS {
+            let status = scheduler
+                .state
+                .task_manager
+                .get_job_status(&self.ballista_job_id)
+                .await
+                .map_err(|e| {
+                    let err = QueryHandleError::StatusError {
+                        message: e.to_string(),
+                    };
+                    self.finish_tracker_with_error(&err);
+                    err
+                })?;
+
+            let Some(job_status) = status else {
+                if attempt < COMPLETED_STATUS_MAX_POLLS {
+                    tracing::debug!(
+                        job_id = %self.ballista_job_id,
+                        attempt,
+                        max_attempts = COMPLETED_STATUS_MAX_POLLS,
+                        "Job reported as completed before status became visible; retrying status poll"
+                    );
+                    sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                let err = QueryHandleError::JobNotFound {
+                    ballista_job_id: self.ballista_job_id.clone(),
+                };
+                self.finish_tracker_with_error(&err);
+                return Err(err);
+            };
+
+            match job_status.status {
+                Some(job_status::Status::Successful(success)) => {
+                    let locations = self.convert_partition_locations(success.partition_location)?;
+                    self.finish_tracker_success();
+                    return Ok(locations);
+                }
+                Some(job_status::Status::Failed(failed)) => {
+                    let err = QueryHandleError::JobFailed {
+                        message: failed.error,
+                    };
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
+                }
+                status @ (Some(job_status::Status::Queued(_) | job_status::Status::Running(_))
+                | None) => {
+                    if attempt < COMPLETED_STATUS_MAX_POLLS {
+                        tracing::debug!(
+                            job_id = %self.ballista_job_id,
+                            attempt,
+                            max_attempts = COMPLETED_STATUS_MAX_POLLS,
+                            status = describe_job_status(status.as_ref()),
+                            "Job reported as completed before terminal status was persisted; retrying status poll"
+                        );
+                        sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
+                        continue;
+                    }
+
+                    let err = QueryHandleError::StatusError {
+                        message: format!(
+                            "Job {} reported as completed but status remained {} after {} polls",
+                            self.ballista_job_id,
+                            describe_job_status(status.as_ref()),
+                            COMPLETED_STATUS_MAX_POLLS
+                        ),
+                    };
+                    self.finish_tracker_with_error(&err);
+                    return Err(err);
+                }
+            }
+        }
+
+        unreachable!("status poll loop should always return");
     }
 
     /// Converts protobuf partition locations to core types.
@@ -443,6 +673,7 @@ impl QueryHandle {
             QueryHandleState::Cached { .. } => None,
         };
         let ballista_job_id = self.ballista_job_id.clone();
+
         let Some(scheduler) = scheduler else {
             // Cached path — nothing to walk. Synchronous finalize is fine
             // because there's no async fetch to do. The span drops at
@@ -477,6 +708,12 @@ impl QueryHandle {
         // explicitly propagate the dispatcher through the test future
         // (see `crates/runtime/tests/cluster/distributed_task_history.rs`).
         let span_for_record = parent_span.clone();
+        // Snapshot the active-job cache entry before spawning. The new ballista pin's
+        // `get_job_execution_graph` is `pub(crate)` and gated on the `rest-api` feature,
+        // so it is no longer reachable from this crate. `get_running_job_cache` is the
+        // public alternative — capture the `JobInfoCache` (which holds an
+        // `Arc<RwLock<ExecutionGraphBox>>`) here so the cloned RwLock stays live even
+        // after the entry is evicted by the time the spawned task runs.
         let graph_for_record = scheduler
             .state
             .task_manager
@@ -484,7 +721,7 @@ impl QueryHandle {
             .get(&job_id)
             .cloned();
         let scheduler_for_cancel = Arc::clone(&scheduler);
-        let cancel_job_id = job_id;
+        let cancel_job_id = job_id.clone();
         handle.spawn(
             async move {
                 let mut final_error = error;
@@ -536,8 +773,9 @@ impl QueryHandle {
                         }
                     }
                 }
-                if let Some(graph) = graph_for_record {
-                    let graph = graph.execution_graph.read().await;
+                let graph = graph_for_record;
+                if let Some(job_cache) = graph.as_ref() {
+                    let graph = job_cache.execution_graph.read().await;
                     crate::datafusion::query::stage_history::record_stage_history(
                         &span_for_record,
                         &ballista_job_id,
