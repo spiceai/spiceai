@@ -1003,9 +1003,9 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(repartitioned.input());
     }
 
-    if let Some(coalesce) = plan
-        .as_any()
-        .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+    if let Some(coalesce) =
+        plan.as_any()
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
     {
         return flatten_transparent_nodes(coalesce.input());
     }
