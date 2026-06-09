@@ -24,6 +24,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use super::compare;
 use arrow::array::RecordBatch;
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{Field, Schema};
@@ -65,6 +66,10 @@ impl Outcome {
 pub struct AnalyticalQueryResult {
     pub name: String,
     pub outcome: Outcome,
+    /// Largest relative numeric delta vs the source for this query, as a
+    /// fraction (e.g. `0.012` = 1.2%). `None` when the query errored or
+    /// produced no rows to compare. Surfaced so sub-tolerance drift is visible.
+    pub max_rel_delta: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -75,12 +80,15 @@ pub struct AnalyticalReport {
 impl AnalyticalReport {
     pub fn emit(&self) {
         println!("\nAnalytical Query Correctness");
-        println!("  {:<14} {:>12}", "query", "outcome");
+        println!("  {:<14} {:>12} {:>10}", "query", "outcome", "max Δ%");
 
         let mut passed: u64 = 0;
         let mut failed: u64 = 0;
         for r in &self.results {
-            println!("  {:<14} {:>12}", r.name, r.outcome.label());
+            let delta = r
+                .max_rel_delta
+                .map_or_else(|| "-".to_string(), |d| format!("{:.4}", d * 100.0));
+            println!("  {:<14} {:>12} {:>10}", r.name, r.outcome.label(), delta);
             if let Some(detail) = r.outcome.detail() {
                 println!("    └─ {detail}");
             }
@@ -131,13 +139,13 @@ pub async fn verify_analytical_results(
     spice_client: &spiceai::Client,
     query_overrides: Option<QueryOverrides>,
 ) -> anyhow::Result<AnalyticalReport> {
+    // All 22 CH-benCH analytical queries are gated, including q15. q15's
+    // `total_revenue = (SELECT MAX(total_revenue) ...)` is a knife-edge equality
+    // over a floating SUM (https://github.com/spiceai/spiceai/issues/11212): if
+    // the source and Spice compute that SUM in a different order, the predicate
+    // can select a different number of rows. That is a *real* divergence the
+    // gate now reports rather than hiding — watch it on the first live SF-N run.
     let queries = get_chbench_test_queries(query_overrides);
-    // q15 compares `total_revenue = (SELECT MAX(total_revenue) ...)` over a SUM
-    // of DOUBLE PRECISION values might return 0 rows: https://github.com/spiceai/spiceai/issues/11212
-    let queries: Vec<_> = queries
-        .into_iter()
-        .filter(|q| q.name.as_ref() != "chbench_q15")
-        .collect();
     println!(
         "\nRunning analytical-query gate over {} queries",
         queries.len()
@@ -153,6 +161,7 @@ pub async fn verify_analytical_results(
                 results.push(AnalyticalQueryResult {
                     name: query.name.to_string(),
                     outcome: Outcome::SourceError(e.to_string()),
+                    max_rel_delta: None,
                 });
                 continue;
             }
@@ -164,6 +173,7 @@ pub async fn verify_analytical_results(
                 results.push(AnalyticalQueryResult {
                     name: query.name.to_string(),
                     outcome: Outcome::SpiceError(e.to_string()),
+                    max_rel_delta: None,
                 });
                 continue;
             }
@@ -181,6 +191,7 @@ pub async fn verify_analytical_results(
                 results.push(AnalyticalQueryResult {
                     name: query.name.to_string(),
                     outcome: Outcome::Fail(format!("schema align error: {e}")),
+                    max_rel_delta: None,
                 });
                 continue;
             }
@@ -193,32 +204,61 @@ pub async fn verify_analytical_results(
                 results.push(AnalyticalQueryResult {
                     name: query.name.to_string(),
                     outcome: Outcome::Fail(format!("sort error: {e}")),
+                    max_rel_delta: None,
                 });
                 continue;
             }
         };
 
-        let outcome = if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
-            Outcome::Pass
+        let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
+            && total_rows(&actual_sorted) == 0
+        {
+            (Outcome::Pass, None)
         } else {
             match validate_with_expected_batches(
                 query.name.as_ref(),
                 &actual_sorted,
                 &expected_sorted,
             ) {
-                Ok(QueryValidationResult::Pass) => Outcome::Pass,
-                Ok(QueryValidationResult::Fail(reason)) => Outcome::Fail(format!(
-                    "{reason:?} (source rows={}, spice rows={})",
-                    total_rows(&expected_sorted),
-                    total_rows(&actual_sorted),
-                )),
-                Err(e) => Outcome::Fail(e.to_string()),
+                Ok(QueryValidationResult::Pass) => {
+                    // Structure, schema and row set agree within the string
+                    // comparator's tolerance. Now apply the tight, type-aware
+                    // numeric check (exact for integer/decimal, 0.1% for float)
+                    // and surface the magnitude either way.
+                    match (expected_sorted.first(), actual_sorted.first()) {
+                        (Some(e0), Some(a0)) => {
+                            let delta = compare::numeric_delta(e0, a0);
+                            if delta.exceeded {
+                                (
+                                    Outcome::Fail(format!(
+                                        "numeric drift exceeds tolerance — {}",
+                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                    )),
+                                    Some(delta.max_rel_delta),
+                                )
+                            } else {
+                                (Outcome::Pass, Some(delta.max_rel_delta))
+                            }
+                        }
+                        _ => (Outcome::Pass, None),
+                    }
+                }
+                Ok(QueryValidationResult::Fail(reason)) => (
+                    Outcome::Fail(format!(
+                        "{reason:?} (source rows={}, spice rows={})",
+                        total_rows(&expected_sorted),
+                        total_rows(&actual_sorted),
+                    )),
+                    None,
+                ),
+                Err(e) => (Outcome::Fail(e.to_string()), None),
             }
         };
 
         results.push(AnalyticalQueryResult {
             name: query.name.to_string(),
             outcome,
+            max_rel_delta,
         });
     }
 
