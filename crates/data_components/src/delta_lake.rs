@@ -218,9 +218,8 @@ impl DeltaTable {
                             "Using AWS SDK credentials provider for Delta Lake table at {table_url}"
                         );
                         let sdk_store: Arc<dyn object_store::ObjectStore> = sdk_store.into();
-                        let engine = Arc::new(
-                            DefaultEngine::builder(Arc::clone(&sdk_store)).build(),
-                        );
+                        let engine =
+                            Arc::new(DefaultEngine::builder(Arc::clone(&sdk_store)).build());
                         (sdk_store, engine)
                     }
                     Err(err) => {
@@ -245,8 +244,10 @@ impl DeltaTable {
     fn build_default_stores(
         table_url: &Url,
         storage_options: HashMap<String, String>,
-    ) -> Result<(Arc<dyn object_store::ObjectStore>, Arc<DefaultEngine<TokioBackgroundExecutor>>)>
-    {
+    ) -> Result<(
+        Arc<dyn object_store::ObjectStore>,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    )> {
         let (parquet_store, _) = object_store::parse_url_opts(
             table_url,
             storage_options
