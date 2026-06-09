@@ -84,6 +84,27 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
+/// Per-column float-ness of a batch's schema, for the `actual_source_floats`
+/// argument of [`numeric_delta`].
+///
+/// The analytical gate casts Spice's output to the *source* (Postgres) schema
+/// before comparison, which turns an `avg()` that Spice computed as `Float64`
+/// into the `Decimal128` the PG arrow connector returns for `NUMERIC`. Captured
+/// from the pre-alignment actual batch, this lets [`numeric_delta`] keep the
+/// relative float tolerance for those approximate columns instead of demoting
+/// them to the exact integer/decimal path. The fingerprint gate runs identical
+/// SQL on both engines (no alignment), so it passes its engine-native batch and
+/// this is simply the actual types.
+#[must_use]
+pub fn float_columns(batch: &RecordBatch) -> Vec<bool> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| is_float(f.data_type()))
+        .collect()
+}
+
 /// Cast both columns to `Float64` for value comparison. Returns `None` if either
 /// cast (or the subsequent downcast) fails — the caller fails safe rather than
 /// silently skipping the column.
@@ -107,8 +128,20 @@ fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Arra
 /// (analytical) and per-column non-null counts (fingerprint) cover those, and
 /// cross-engine text collation / timestamp precision make their MIN/MAX
 /// unreliable to compare directly.
+///
+/// `actual_source_floats[i]` flags columns the actual engine produced as
+/// floating point *before* any schema alignment (see [`float_columns`]). A
+/// column is compared with the relative float tolerance when either side's
+/// compared type is float *or* its pre-alignment actual type was — so an
+/// `avg()` that Spice computed in `Float64` but the gate cast to the source's
+/// `Decimal128` keeps its tolerance, while money sums and counts (decimal /
+/// integer on both sides, and never float pre-alignment) stay exact.
 #[must_use]
-pub fn numeric_delta(expected: &RecordBatch, actual: &RecordBatch) -> NumericDelta {
+pub fn numeric_delta(
+    expected: &RecordBatch,
+    actual: &RecordBatch,
+    actual_source_floats: &[bool],
+) -> NumericDelta {
     let mut out = NumericDelta::default();
     let mut worst_rel = 0.0_f64;
     let n_rows = expected.num_rows().min(actual.num_rows());
@@ -116,16 +149,19 @@ pub fn numeric_delta(expected: &RecordBatch, actual: &RecordBatch) -> NumericDel
     // Zip the two column slices (truncating to the shorter) alongside the
     // expected schema's fields for the column name used in the failure message.
     let e_schema = expected.schema();
-    for ((e_col, a_col), field) in expected
+    for (c, ((e_col, a_col), field)) in expected
         .columns()
         .iter()
         .zip(actual.columns().iter())
         .zip(e_schema.fields().iter())
+        .enumerate()
     {
         if !is_numeric(e_col.data_type()) || !is_numeric(a_col.data_type()) {
             continue;
         }
-        let float_col = is_float(e_col.data_type()) || is_float(a_col.data_type());
+        let float_col = is_float(e_col.data_type())
+            || is_float(a_col.data_type())
+            || actual_source_floats.get(c).copied().unwrap_or(false);
         let col_name = field.name();
 
         // Both columns are numeric, so casting to f64 should always succeed.
@@ -208,7 +244,7 @@ mod tests {
     fn identical_integers_have_no_drift() {
         let e = batch(vec![int_col("count_order", vec![10, 20, 30])]);
         let a = batch(vec![int_col("count_order", vec![10, 20, 30])]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(!d.exceeded);
         assert!(d.max_rel_delta.abs() < f64::EPSILON);
         assert!(d.worst.is_none());
@@ -219,7 +255,7 @@ mod tests {
         // A single-row count off by one — the wrong-upsert / stale-update class.
         let e = batch(vec![int_col("c", vec![1_000_000])]);
         let a = batch(vec![int_col("c", vec![999_999])]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "any integer diff must exceed (exact tolerance)");
         assert!(d.worst.is_some());
     }
@@ -229,7 +265,7 @@ mod tests {
         // 0.05% drift: under the 0.1% float tolerance, but must still be visible.
         let e = batch(vec![float_col("avg_amount", vec![1000.0])]);
         let a = batch(vec![float_col("avg_amount", vec![1000.5])]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(!d.exceeded, "0.05% < 0.1% tolerance");
         assert!(d.max_rel_delta > 0.0 && d.max_rel_delta < FLOAT_REL_TOLERANCE);
     }
@@ -239,7 +275,7 @@ mod tests {
         // 1% drift — passed the old 5% gate silently, must now fail.
         let e = batch(vec![float_col("revenue", vec![1000.0])]);
         let a = batch(vec![float_col("revenue", vec![1010.0])]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded);
         assert!(d.max_rel_delta > FLOAT_REL_TOLERANCE);
     }
@@ -260,7 +296,7 @@ mod tests {
                     .with_data_type(DataType::Decimal128(38, 2)),
             ) as ArrayRef,
         )]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(d.exceeded, "a one-cent decimal diff must fail (exact)");
     }
 
@@ -274,7 +310,7 @@ mod tests {
             "name",
             Arc::new(StringArray::from(vec!["alice", "carol"])) as ArrayRef,
         )]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(
             !d.exceeded,
             "text divergence is the string comparator's job"
@@ -291,7 +327,53 @@ mod tests {
             "c",
             Arc::new(Int64Array::from(vec![Some(5), None])) as ArrayRef,
         )]);
-        let d = numeric_delta(&e, &a);
+        let d = numeric_delta(&e, &a, &float_columns(&a));
         assert!(!d.exceeded);
+    }
+
+    fn decimal_col(name: &str, raw: Vec<i128>, precision: u8, scale: i8) -> (&str, ArrayRef) {
+        (
+            name,
+            Arc::new(
+                Decimal128Array::from(raw).with_data_type(DataType::Decimal128(precision, scale)),
+            ) as ArrayRef,
+        )
+    }
+
+    #[test]
+    fn aligned_avg_keeps_float_tolerance_when_actual_was_float() {
+        // Reproduces the analytical gate after alignment: Spice computed avg()
+        // as Float64, but the gate cast it to the source's Decimal128(NUMERIC),
+        // so both compared columns are now decimal. A tiny rounding drift
+        // (1000.0000001 vs 1000.0000002, rel 1e-10) must NOT fail when the
+        // pre-alignment actual type was float...
+        let e = batch(vec![decimal_col(
+            "avg_qty",
+            vec![10_000_000_001_i128],
+            38,
+            7,
+        )]);
+        let a = batch(vec![decimal_col(
+            "avg_qty",
+            vec![10_000_000_002_i128],
+            38,
+            7,
+        )]);
+
+        let approx = numeric_delta(&e, &a, &[true]);
+        assert!(
+            !approx.exceeded,
+            "sub-tolerance avg drift must pass when actual was float pre-alignment: {:?}",
+            approx.worst
+        );
+        assert!(approx.max_rel_delta > 0.0 && approx.max_rel_delta < FLOAT_REL_TOLERANCE);
+
+        // ...but the same decimal cells stay exact when neither side was float
+        // (a money sum / count), so a one-unit drift is still a defect.
+        let exact = numeric_delta(&e, &a, &[false]);
+        assert!(
+            exact.exceeded,
+            "decimal money/count must stay exact regardless of magnitude"
+        );
     }
 }
