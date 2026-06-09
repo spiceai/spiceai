@@ -19,13 +19,18 @@ use std::time::Duration;
 
 use app::AppBuilder;
 use arrow::array::{Int64Array, UInt64Array};
+use data_components::kafka::{KafkaConfig, KafkaConsumer, SslIdentification};
 use futures::TryStreamExt;
 use runtime::Runtime;
+use serde_json::json;
 
 pub mod bootstrap;
 mod full_text;
 
-use bootstrap::{make_kafka_dataset, send_messages_to_kafka, start_kafka_docker_container};
+use bootstrap::{
+    create_kafka_topic_with_partitions, make_kafka_dataset, send_message_to_kafka_partition,
+    send_messages_to_kafka, send_tombstone_to_kafka, start_kafka_docker_container,
+};
 
 use crate::configure_test_datafusion;
 use crate::utils::runtime_ready_check;
@@ -134,6 +139,228 @@ async fn kafka_sasl_connect_test() -> anyhow::Result<()> {
                 tracing::error!("running_container.remove: {e}");
                 anyhow::Error::msg(e.to_string())
             })?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies that `fetch_latest_message` correctly returns the latest non-tombstone
+/// message when the tail of the partition contains tombstones.
+#[tokio::test]
+async fn kafka_fetch_latest_message_with_tombstone_test() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const TEST_PORT: u16 = 19096;
+            let (running_container, producer) =
+                start_kafka_docker_container(TEST_PORT, &["fetch_latest_tombstone_test"]).await?;
+            // Send two normal messages followed by a tombstone on the tail.
+            let messages: Vec<serde_json::Value> = vec![
+                json!({"id": 1, "schema": "v1"}),
+                json!({"id": 2, "schema": "v2"}),
+            ];
+            send_messages_to_kafka(&producer, "fetch_latest_tombstone_test", &messages).await?;
+            send_tombstone_to_kafka(&producer, "fetch_latest_tombstone_test", 0, "key3").await?;
+
+            let kafka_config = KafkaConfig {
+                brokers: format!("localhost:{TEST_PORT}"),
+                security_protocol: "SASL_PLAINTEXT".to_string(),
+                sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
+                sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
+                sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
+                ssl_ca_location: None,
+                enable_ssl_certificate_verification: true,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            };
+
+            let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_tombstone_test",
+                &kafka_config,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            // Clean up container after test
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            assert!(
+                result.is_some(),
+                "fetch_latest_message should return a message"
+            );
+            let (key, value) = result.expect("fetch_latest_message should return the latest value");
+            assert!(key.is_none(), "normal messages have no key");
+            assert_eq!(
+                value,
+                json!({"id": 2, "schema": "v2"}),
+                "latest non-tombstone should be the second message"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies backward scan skips a longer tombstone run at the partition tail.
+#[tokio::test]
+async fn kafka_fetch_latest_message_many_tombstones_test() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            const TEST_PORT: u16 = 19097;
+            let (running_container, producer) =
+                start_kafka_docker_container(TEST_PORT, &["fetch_latest_many_tombstones_test"])
+                    .await?;
+
+            let messages: Vec<serde_json::Value> = vec![
+                json!({"id": 1, "schema": "v1"}),
+                json!({"id": 2, "schema": "v2"}),
+            ];
+            send_messages_to_kafka(&producer, "fetch_latest_many_tombstones_test", &messages)
+                .await?;
+
+            for i in 0..5 {
+                send_tombstone_to_kafka(
+                    &producer,
+                    "fetch_latest_many_tombstones_test",
+                    0,
+                    &format!("tombstone-{i}"),
+                )
+                .await?;
+            }
+
+            let kafka_config = KafkaConfig {
+                brokers: format!("localhost:{TEST_PORT}"),
+                security_protocol: "SASL_PLAINTEXT".to_string(),
+                sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
+                sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
+                sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
+                ssl_ca_location: None,
+                enable_ssl_certificate_verification: true,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            };
+
+            let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_many_tombstones_test",
+                &kafka_config,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            let (key, value) = result.expect(
+                "fetch_latest_message should skip multiple trailing tombstones and return a value",
+            );
+            assert!(key.is_none());
+            assert_eq!(value, json!({"id": 2, "schema": "v2"}));
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies that `fetch_latest_message` inspects every partition and returns
+/// the latest non-tombstone message by timestamp across all partitions.
+#[tokio::test]
+async fn kafka_fetch_latest_message_multi_partition_test() -> anyhow::Result<()> {
+    const TEST_PORT: u16 = 19095;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (running_container, producer) =
+                start_kafka_docker_container(TEST_PORT, &[]).await?;
+
+            // Create a 2-partition topic explicitly.
+            create_kafka_topic_with_partitions(
+                &running_container,
+                TEST_PORT,
+                "fetch_latest_multi_partition_test",
+                2,
+            )
+            .await?;
+
+            // Send message to partition 0 with timestamp 1000.
+            send_message_to_kafka_partition(
+                &producer,
+                "fetch_latest_multi_partition_test",
+                0,
+                1000,
+                &json!({"id": 1, "schema": "v1"}),
+            )
+            .await?;
+
+            // Send message to partition 1 with timestamp 2000.
+            send_message_to_kafka_partition(
+                &producer,
+                "fetch_latest_multi_partition_test",
+                1,
+                2000,
+                &json!({"id": 2, "schema": "v2"}),
+            )
+            .await?;
+
+            // Send tombstone to partition 1 (timestamp uses the default broker/producer time).
+            send_tombstone_to_kafka(
+                &producer,
+                "fetch_latest_multi_partition_test",
+                1,
+                "tombstone-key",
+            )
+            .await?;
+
+            let kafka_config = KafkaConfig {
+                brokers: format!("localhost:{TEST_PORT}"),
+                security_protocol: "SASL_PLAINTEXT".to_string(),
+                sasl_mechanism: bootstrap::KAFKA_SASL_MECHANISM.to_string(),
+                sasl_username: Some(bootstrap::KAFKA_SASL_USERNAME.to_string()),
+                sasl_password: Some(bootstrap::KAFKA_SASL_PASSWORD.to_string()),
+                ssl_ca_location: None,
+                enable_ssl_certificate_verification: true,
+                ssl_endpoint_identification_algorithm: SslIdentification::None,
+                consumer_group_id: None,
+                metrics_store: None,
+            };
+
+            let result = KafkaConsumer::fetch_latest_message::<String, serde_json::Value>(
+                "fetch_latest_multi_partition_test",
+                &kafka_config,
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            // Clean up container after test
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            assert!(
+                result.is_some(),
+                "fetch_latest_message should return a message across partitions"
+            );
+            let (key, value) = result.expect(
+                "fetch_latest_message should return the newest non-tombstone across partitions",
+            );
+            assert!(key.is_none(), "normal messages have no key");
+            assert_eq!(
+                value,
+                json!({"id": 2, "schema": "v2"}),
+                "latest non-tombstone across all partitions should be the message with timestamp 2000"
+            );
 
             Ok(())
         })
