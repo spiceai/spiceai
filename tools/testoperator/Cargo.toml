@@ -19,7 +19,9 @@ aws-sdk-dynamodb.workspace = true
 bollard = "0.18.1"
 chbench-driver = { path = "../chbench-driver" }
 clap.workspace = true
+datafusion.workspace = true
 duckdb = { workspace = true, features = ["bundled"] }
+flight_client = { path = "../../crates/flight_client" }
 futures.workspace = true
 itertools.workspace = true
 hf-hub = { workspace = true }

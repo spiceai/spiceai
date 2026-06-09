@@ -693,6 +693,25 @@ impl CayenneAccelerator {
                 }
             }
 
+            // File pruning (enabled | disabled | true | false). Controls whether
+            // scans build DataFusion's `FilePruner` to skip whole Vortex files
+            // using statistics and partition values before opening them. Defaults
+            // to enabled; flows through to the Vortex session context as a bool.
+            if let Some((key, value)) = ["cayenne_file_pruning", "file_pruning"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "enabled" | "true" => config.file_pruning = true,
+                    "disabled" | "false" => config.file_pruning = false,
+                    _ => {
+                        tracing::warn!(
+                            "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: enabled, disabled, true, false. Defaulting to enabled."
+                        );
+                    }
+                }
+            }
+
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
             // checkpoint; it is only meaningful for the small-write/CDC profile,
@@ -883,20 +902,15 @@ impl CayenneAccelerator {
                 );
             }
             config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
-            // `adaptive` depends on extended schema inference: the closed loop's
-            // data-aware warm-start (keyset sized to cardinality, memtable rows to
-            // real row width) needs the inferred `row_count`/`table_bytes`, which
-            // are present only when `schema_inference: extended` ran. Without them
-            // the loop would start blind, so fall back to `auto` (static) and tell
-            // the operator how to enable it. (`row_count`/`table_bytes` come ONLY
-            // from extended inference — unlike PK, which can also come from
-            // constraints — so they are the right signal to gate on.)
-            if config.dynamic_tuning
-                && workload.row_count.is_none()
-                && workload.table_bytes.is_none()
-            {
+            // `adaptive` depends on extended schema inference. Any emitted
+            // metadata counts: row_count/table_bytes refine memory sizing, while
+            // inferred primary key/index/sort metadata is applied upstream and
+            // feeds the same warm-start / query-health surface. Without any
+            // inferred metadata the loop starts blind, so fall back to `auto` and
+            // tell the operator how to enable it.
+            if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
                 tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred cardinality/size for its warm-start), but no inferred schema was found; falling back to 'auto' (static). Set `schema_inference: extended` to enable adaptive tuning."
+                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
             }
@@ -908,6 +922,13 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
+            }
+            if config.dynamic_tuning {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
+                );
             }
             config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
                 inline_flush: autotune::is_pinned(
@@ -969,6 +990,7 @@ impl CayenneAccelerator {
                 // (if requested) was gated off — makes that immediately visible.
                 inferred_row_count = ?workload.row_count,
                 inferred_table_bytes = ?workload.table_bytes,
+                inferred_extended_schema = workload.inferred_metadata.is_present(),
                 has_primary_key = workload.has_primary_key,
                 is_upsert = workload.is_upsert,
                 "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
@@ -1394,6 +1416,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
+        ParameterSpec::component("file_pruning")
+            .description("Whether scans build DataFusion's FilePruner to skip whole Vortex files using file-level statistics (min/max) and partition values before opening them. 'enabled' (default) prunes non-matching files without reading them. 'disabled' opens and scans every candidate file. Accepts: enabled, disabled, true, false.")
+            .one_of(&["enabled", "disabled", "true", "false"])
+            .default("enabled"),
     ],
 );
 
@@ -3288,6 +3314,47 @@ mod tests {
         assert_eq!(config.compaction_max_levels, 5);
         assert_eq!(config.compaction_max_files_per_pick, 64);
         assert_eq!(config.compaction_background_interval_ms, 45_000);
+    }
+
+    #[tokio::test]
+    async fn test_file_pruning_param_parses() {
+        async fn file_pruning_for(value: Option<&str>) -> bool {
+            let app = Arc::new(AppBuilder::new("test").build());
+            let rt = Arc::new(crate::Runtime::builder().build().await);
+            let mut dataset = DatasetBuilder::try_new("fp".to_string(), "fp")
+                .expect("dataset builder")
+                .with_app(app)
+                .with_runtime(rt)
+                .build()
+                .expect("dataset");
+            let params: HashMap<String, String> = value
+                .map(|v| {
+                    [("cayenne_file_pruning".to_string(), v.to_string())]
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default();
+            dataset.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                params,
+                ..Default::default()
+            });
+            CayenneAccelerator::get_vortex_config("fp", &dataset)
+                .await
+                .file_pruning
+        }
+
+        // Defaults to enabled when unset.
+        assert!(file_pruning_for(None).await);
+        // `enabled` / `true` keep it on.
+        assert!(file_pruning_for(Some("enabled")).await);
+        assert!(file_pruning_for(Some("TRUE")).await);
+        // `disabled` / `false` turn it off.
+        assert!(!file_pruning_for(Some("disabled")).await);
+        assert!(!file_pruning_for(Some("false")).await);
+        // Invalid values fall back to the default (enabled).
+        assert!(file_pruning_for(Some("nonsense")).await);
     }
 
     #[test]
