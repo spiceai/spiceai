@@ -411,6 +411,21 @@ pub(crate) async fn teardown_local_run(local_state: &mut LocalRunState) -> anyho
         "[stdio] teardown: stopping local process(es) (sql endpoint: {})",
         local_state.sql_url
     );
+    // Diagnostic hold: keep the loaded cluster alive for SPIDAPTER_HOLD_SECS so
+    // an operator can run EXPLAIN ANALYZE / inspect state before teardown
+    // SIGKILLs it. No-op when unset or zero.
+    if let Ok(raw) = std::env::var("SPIDAPTER_HOLD_SECS")
+        && let Ok(secs) = raw.trim().parse::<u64>()
+        && secs > 0
+    {
+        eprintln!(
+            "[stdio] teardown: HOLDING cluster {secs}s before teardown. sql_endpoint={} api_key={}",
+            local_state.sql_url,
+            local_state.flight_api_key.as_deref().unwrap_or("<none>")
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        eprintln!("[stdio] teardown: hold elapsed, proceeding with teardown");
+    }
     match &mut local_state.processes {
         LocalProcesses::SingleNode { child } => {
             stop_child_process(child, "spiced").await?;

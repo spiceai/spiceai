@@ -28,6 +28,7 @@ use crate::datafusion::udtf::json_properties::{
 };
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
+use crate::executor_table::{EXECUTOR_TABLE_UDTF_NAME, ExecutorTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
 use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
@@ -89,6 +90,13 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(
         TEXT_SEARCH_UDTF_NAME,
         Arc::new(TextSearchTableFunc::new(Arc::downgrade(&runtime.df))),
+    );
+
+    // `executor_table('endpoint','table')` — fetch a peer executor's partition
+    // of a table over Flight SQL (the distributed broadcast-join primitive).
+    ctx.register_udtf(
+        EXECUTOR_TABLE_UDTF_NAME,
+        Arc::new(ExecutorTableFunc::new(Arc::downgrade(&runtime.df))),
     );
 
     let explicit_pks = parse_explicit_primary_keys(runtime.app()).await;
