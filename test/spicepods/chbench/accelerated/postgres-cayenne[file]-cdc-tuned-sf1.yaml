@@ -74,7 +74,6 @@ datasets:
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
         cayenne_compaction_background_interval_ms: '3000'
-        cayenne_file_pruning: disabled
 
   - from: postgres:customer
     name: customer
@@ -205,7 +204,6 @@ datasets:
         cayenne_segment_cache_mb: '64'
         # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '1024'
-        cayenne_file_pruning: disabled
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh).
@@ -246,7 +244,6 @@ datasets:
         cayenne_segment_cache_mb: '16'
         # Pin 1 GiB explicitly (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '1024'
-        cayenne_file_pruning: disabled
 
   - from: postgres:nation
     name: nation
