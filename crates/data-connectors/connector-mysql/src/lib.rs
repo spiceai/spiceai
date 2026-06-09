@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::dialect::MySqlDialect;
 use datafusion_table_providers::mysql::MySQLTableFactory;
+use datafusion_table_providers::sql::arrow_sql_gen::mysql::MysqlZeroDateBehavior;
 use datafusion_table_providers::sql::db_connection_pool::{
     Error as DbConnectionPoolError, dbconnection,
     mysqlpool::{self, MySQLConnectionPool},
@@ -31,6 +32,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_functions_for_mysql_table_providers;
 use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -190,22 +192,18 @@ impl DataConnectorFactory for MySQLFactory {
                 );
             }
 
-            if matches!(
-                params
-                    .parameters
-                    .get("zero_date_behavior")
-                    .ok()
-                    .map(|s| s.expose_secret().to_ascii_lowercase())
-                    .as_deref(),
-                Some("error")
-            ) {
-                return Err(DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "mysql".to_string(),
-                    connector_component: params.component.clone(),
-                    message: "The mysql zero_date_behavior=error mode is unavailable with datafusion-table-providers 0.11; zero dates are coerced to NULL by the upstream MySQL reader".to_string(),
-                }
-                .into());
-            }
+            let zero_date_behavior = match params
+                .parameters
+                .get("zero_date_behavior")
+                .ok()
+                .map(|s| s.expose_secret().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("error") => MysqlZeroDateBehavior::Error,
+                // `one_of_ignore_ascii_case` validation has already rejected anything other
+                // than "null" / "error"; default + any other value falls through to Null.
+                _ => MysqlZeroDateBehavior::Null,
+            };
 
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
                 // "LOCAL_SYSTEM" value must be replaced with the actual system time zone information.
@@ -227,7 +225,7 @@ impl DataConnectorFactory for MySQLFactory {
             }
 
             let pool = match MySQLConnectionPool::new(params.parameters.to_secret_map()).await {
-                Ok(pool) => Arc::new(pool),
+                Ok(pool) => Arc::new(pool.with_zero_date_behavior(zero_date_behavior)),
                 Err(error) => match error {
                     mysqlpool::Error::InvalidUsernameOrPassword => {
                         return Err(
@@ -263,13 +261,13 @@ impl DataConnectorFactory for MySQLFactory {
                     }
                 },
             };
-            // TODO(#10703): table-providers v0.11 removed the upstream
-            // `function_support` deny-list seam, so the Spice-only-UDF
-            // deny-list (json_get_str, embedding/distance UDFs) cannot be
-            // installed on the MySQL factory yet. Restore once the fork
-            // carries a v0.11 deny-list seam or the connector routes through
-            // the shared DenyFunctionsSqlExecutor wrapper.
-            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool));
+            // Install the Spice function deny-list so federation evaluates
+            // Spice-only UDFs (`json_get_str`, the embedding/distance UDFs, etc.)
+            // locally instead of pushing them into the SQL sent to MySQL, where
+            // those functions don't exist and the query would fail with an
+            // "unknown function" error. See issue #10703.
+            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_functions_for_mysql_table_providers());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,
