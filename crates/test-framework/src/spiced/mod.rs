@@ -485,9 +485,13 @@ impl SpicedInstance {
     /// This allows tracking the spiced process, without owning the spiced instance
     pub fn process(&self) -> Result<Process> {
         let Self::Owned { child, .. } = self else {
-            // External spiced has no local process; return a benign self-pid Process so
-            // memory monitoring is a harmless no-op (the experiment ignores it).
-            return Ok(Process::new(Pid::from_u32(std::process::id())));
+            // Non-owned (Existing/External) instances have no local child process
+            // to monitor. Error here so callers — which all use `.ok()` — skip
+            // memory monitoring, rather than recording the test runner's own PID
+            // (a self-pid would silently skew the reported memory metric).
+            return Err(anyhow!(
+                "Process handle is only available for owned local spiced instances"
+            ));
         };
 
         Ok(Process::new(Pid::from_u32(child.id())))
@@ -499,16 +503,15 @@ mod tests {
     use super::SpicedInstance;
 
     #[test]
-    fn process_is_a_noop_self_pid_for_non_owned_instances() {
-        // Non-owned (Existing / External) instances have no local child process,
-        // so `process()` returns a benign self-pid `Process`: memory monitoring
-        // against it is a harmless no-op the caller ignores, rather than an error
-        // that would break commands run against an external/remote spiced.
-        assert!(SpicedInstance::empty().process().is_ok());
+    fn process_is_unavailable_for_non_owned_instances() {
+        // Non-owned (Existing/External) instances have no local child process, so
+        // `process()` errors; every caller uses `.ok()` to skip memory monitoring
+        // rather than record the runner's PID.
+        assert!(SpicedInstance::empty().process().is_err());
         assert!(
             SpicedInstance::external("http://localhost:50051")
                 .process()
-                .is_ok()
+                .is_err()
         );
     }
 
