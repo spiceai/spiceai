@@ -29,7 +29,10 @@ use crate::{
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::dialect::new_duckdb_dialect,
+    datafusion::{
+        dialect::new_duckdb_dialect,
+        sort_columns::{SortColumn, parse_sort_columns},
+    },
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -49,12 +52,20 @@ use datafusion::{
         coalesce_partitions::CoalescePartitionsExec, stream::RecordBatchStreamAdapter,
     },
     scalar::ScalarValue,
+    sql::sqlparser::ast::{
+        Delete, FromTable, Ident, ObjectName, ObjectNamePart, Statement as SQLStatement,
+        TableFactor,
+    },
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory, write::DuckDBTableWriter,
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        write::{DuckDBTableWriter, WriteCompletionHandler},
     },
-    sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    sql::db_connection_pool::{
+        self as db_connection_pool,
+        duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
+    },
     util::{column_reference::ColumnReference, indexes::IndexType},
 };
 use duckdb::AccessMode;
@@ -609,36 +620,64 @@ impl DataAccelerator for DuckDBAccelerator {
             }
         }
 
-        if let Some(acceleration) = source.and_then(AccelerationSource::acceleration) {
-            if acceleration
+        let write_completion_handler = source.and_then(|src| {
+            let acceleration = src.acceleration()?;
+            let dataset_name = src.name().to_string();
+            let schema = Arc::new(cmd.schema.as_arrow().clone());
+
+            let mut config = OnRefreshConfig::empty();
+
+            // Parse retention SQL if configured
+            if let Some(retention_sql) = acceleration
                 .retention_sql
                 .as_deref()
                 .map(str::trim)
-                .is_some_and(|retention_sql| !retention_sql.is_empty())
+                .filter(|sql| !sql.is_empty())
             {
-                return Err(DataFusionError::NotImplemented(
-                    "DuckDB retention_sql is unavailable because datafusion-table-providers 0.11 no longer exposes a pre-commit write hook"
-                        .to_string(),
-                )
-                .into());
+                match crate::datafusion::retention_sql::parse_retention_sql(
+                    src.name(),
+                    retention_sql,
+                    Arc::clone(&schema),
+                ) {
+                    Ok(parsed_sql) => {
+                        config = config.with_retention(parsed_sql.delete_statement);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse retention_sql for dataset {dataset_name}: {e}. Retention SQL will not be applied.");
+                    }
+                }
             }
 
-            if acceleration
+            // Parse on_refresh_sort_columns if configured
+            if let Some(sort_columns_str) = acceleration
                 .params
                 .get("on_refresh_sort_columns")
                 .map(String::as_str)
                 .map(str::trim)
-                .is_some_and(|sort_columns| !sort_columns.is_empty())
+                .filter(|s| !s.is_empty())
             {
-                return Err(DataFusionError::NotImplemented(
-                    "DuckDB on_refresh_sort_columns is unavailable because datafusion-table-providers 0.11 no longer exposes a pre-commit write hook"
-                        .to_string(),
-                )
-                .into());
+                match parse_sort_columns(sort_columns_str, &schema) {
+                    Ok(sort_columns) => {
+                        tracing::debug!(
+                            dataset = %dataset_name,
+                            sort_columns = ?sort_columns,
+                            "Parsed on_refresh_sort_columns"
+                        );
+                        config = config.with_sort(sort_columns);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to parse on_refresh_sort_columns for dataset {dataset_name}: {e}. Sorting will not be applied."
+                        );
+                    }
+                }
             }
-        }
 
-        Ok(create_table_provider(&self.duckdb_factory, &cmd).await?)
+            Some(make_on_refresh_write_handler(dataset_name, config))
+        });
+
+        Ok(create_table_provider(&self.duckdb_factory, &cmd, write_completion_handler).await?)
     }
 
     fn prefix(&self) -> &'static str {
@@ -650,7 +689,7 @@ impl DataAccelerator for DuckDBAccelerator {
     }
 
     fn supports_snapshot_reload(&self) -> bool {
-        false
+        true
     }
 
     /// Reloads the `DuckDB`-backed table provider from the snapshot file
@@ -666,12 +705,34 @@ impl DataAccelerator for DuckDBAccelerator {
     /// even after the file has been atomically replaced on disk.
     async fn reload_from_snapshot(
         &self,
-        _source: &dyn AccelerationSource,
+        source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        _provider_factory: super::ReloadProviderFactory,
+        provider_factory: super::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // Drop the caller's clone first so the only remaining strong refs to
+        // the prior pool are the registry entry (which we are about to evict)
+        // and any in-flight queries (which will drain naturally).
         drop(previous_provider);
-        Err("DuckDB snapshot reload is unavailable because datafusion-table-providers 0.11 no longer exposes safe connection-pool invalidation".into())
+
+        let acceleration =
+            source
+                .acceleration()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "acceleration not configured for snapshot reload".into()
+                })?;
+        match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+                let path = self.duckdb_file_path(source).boxed()?;
+                self.duckdb_factory.invalidate_file_instance(path).await;
+            }
+            Mode::Memory => {
+                self.duckdb_factory
+                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
+                    .await;
+            }
+        }
+
+        provider_factory().await
     }
 
     async fn drop_table(
@@ -721,6 +782,7 @@ fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_change
 pub(crate) async fn create_table_provider(
     duckdb_factory: &DuckDBTableProviderFactory,
     cmd: &CreateExternalTable,
+    on_data_written: Option<WriteCompletionHandler>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
     let ctx = SessionContext::new();
 
@@ -735,7 +797,10 @@ pub(crate) async fn create_table_provider(
     };
 
     let read_provider = Arc::clone(&duckdb_writer.read_provider);
-    let duckdb_writer: Arc<DuckDBTableWriter> = Arc::new(duckdb_writer.clone());
+    let duckdb_writer: Arc<DuckDBTableWriter> = match on_data_written {
+        Some(handler) => Arc::new(duckdb_writer.clone().with_on_data_written_handler(handler)),
+        None => Arc::new(duckdb_writer.clone()),
+    };
 
     // Wrap with upsert deduplication if needed
     let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
@@ -769,6 +834,141 @@ pub(crate) async fn create_table_provider(
     ));
 
     Ok(table_provider)
+}
+
+/// Reconstruct the DELETE statement with the internal `DuckDB` table name.
+fn reconstruct_retention_sql_with_table_name(
+    delete: &Delete,
+    internal_table_name: &str,
+) -> Result<String, String> {
+    let mut modified_delete = delete.clone();
+
+    let FromTable::WithFromKeyword(from_tables) = &mut modified_delete.from else {
+        return Err("DELETE statement must use FROM keyword".to_string());
+    };
+
+    let Some(table_relation) = from_tables.first_mut() else {
+        return Err("No table specified in DELETE statement".to_string());
+    };
+
+    if let TableFactor::Table { name, .. } = &mut table_relation.relation {
+        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            internal_table_name,
+        ))]);
+    } else {
+        return Err("DELETE statement must reference a simple table".to_string());
+    }
+
+    let statement = SQLStatement::Delete(modified_delete);
+    Ok(statement.to_string())
+}
+
+/// Configuration for on-refresh operations that run after data is written but before commit.
+#[derive(Clone, Default)]
+struct OnRefreshConfig {
+    retention_delete: Option<Delete>,
+    sort_columns: Vec<SortColumn>,
+}
+
+impl OnRefreshConfig {
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    fn with_retention(mut self, delete: Delete) -> Self {
+        self.retention_delete = Some(delete);
+        self
+    }
+
+    #[must_use]
+    fn with_sort(mut self, columns: Vec<SortColumn>) -> Self {
+        self.sort_columns = columns;
+        self
+    }
+}
+
+fn make_on_refresh_write_handler(
+    dataset_name: String,
+    config: OnRefreshConfig,
+) -> WriteCompletionHandler {
+    Arc::new(move |tx, table_manager, _schema, inserted_rows| {
+        let internal_table_name = table_manager.table_name().to_string();
+
+        if let Some(ref parsed_delete) = config.retention_delete {
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                "Applying retention SQL before commit"
+            );
+
+            let reconstructed_sql = match reconstruct_retention_sql_with_table_name(
+                parsed_delete,
+                &internal_table_name,
+            ) {
+                Ok(sql) => sql,
+                Err(e) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to reconstruct retention SQL for dataset {dataset_name}: {e}"
+                    )));
+                }
+            };
+
+            match tx.execute(reconstructed_sql.as_str(), []) {
+                Ok(affected_rows) => {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        table = %internal_table_name,
+                        affected_rows,
+                        "Retention SQL applied before commit"
+                    );
+                }
+                Err(err) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to apply retention SQL for dataset {dataset_name} (table {internal_table_name}): {err}"
+                    )));
+                }
+            }
+        }
+
+        // Sorting recreates the table from scratch via CREATE OR REPLACE; primary
+        // keys, indexes, and FK constraints are not preserved by this path.
+        if !config.sort_columns.is_empty() {
+            let order_by_clause: String = config
+                .sort_columns
+                .iter()
+                .map(|sc| format!("\"{}\" {}", sc.column, sc.direction))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sort_sql = format!(
+                "CREATE OR REPLACE TABLE \"{internal_table_name}\" AS SELECT * FROM \"{internal_table_name}\" ORDER BY {order_by_clause}"
+            );
+
+            tracing::debug!(
+                dataset = %dataset_name,
+                table = %internal_table_name,
+                inserted_rows,
+                sql = %sort_sql,
+                "Applying on-refresh sort before commit"
+            );
+
+            if let Err(err) = tx.execute(sort_sql.as_str(), []) {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to apply on-refresh sort for dataset {dataset_name} (table {internal_table_name}): {err}"
+                )));
+            }
+        }
+
+        table_manager.create_indexes(tx).map_err(|err| {
+            DataFusionError::Execution(format!(
+                "Failed to create DuckDB indexes for dataset {dataset_name} (table {internal_table_name}) before refresh commit: {err}"
+            ))
+        })?;
+
+        Ok(())
+    })
 }
 
 fn guard_unique_index_overwrites(
@@ -1136,65 +1336,6 @@ mod tests {
         }
     }
 
-    async fn dataset_with_acceleration(
-        name: &str,
-        acceleration: Acceleration,
-    ) -> crate::component::dataset::Dataset {
-        let app = app::AppBuilder::new("test").build();
-        let rt = crate::Runtime::builder().build().await;
-
-        let mut dataset = DatasetBuilder::try_new(name.to_string(), name)
-            .expect("to create builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(rt))
-            .build()
-            .expect("to build dataset");
-
-        dataset.acceleration = Some(acceleration);
-        dataset
-    }
-
-    async fn duckdb_create_external_table_error(acceleration: Acceleration) -> String {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
-        let external_table = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("unsupported_config_table"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::new(),
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-        let dataset = dataset_with_acceleration("unsupported_config_table", acceleration).await;
-
-        let result = DuckDBAccelerator::new()
-            .create_external_table(
-                external_table,
-                Some(&dataset as &dyn AccelerationSource),
-                vec![],
-                None,
-            )
-            .await;
-
-        match result {
-            Ok(_) => panic!("unsupported DuckDB acceleration config should fail"),
-            Err(error) => error.to_string(),
-        }
-    }
-
     #[test]
     fn duckdb_write_settings_changes_refresh_disables_recompute_statistics_by_default() {
         let mut external_table = external_table_with_options(HashMap::new());
@@ -1234,21 +1375,6 @@ mod tests {
             !external_table
                 .options
                 .contains_key("recompute_statistics_on_write")
-        );
-    }
-
-    #[tokio::test]
-    async fn retention_sql_configuration_is_rejected() {
-        let error_msg = duckdb_create_external_table_error(Acceleration {
-            engine: Engine::DuckDB,
-            retention_sql: Some("DELETE FROM unsupported_config_table WHERE value < 5".to_string()),
-            ..Default::default()
-        })
-        .await;
-
-        assert!(
-            error_msg.contains("DuckDB retention_sql is unavailable"),
-            "expected retention_sql unsupported error, got: {error_msg}"
         );
     }
 
@@ -1387,7 +1513,11 @@ mod tests {
 
         let duckdb_accelerator = DuckDBAccelerator::new();
         let table =
-            super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table)
+            super::create_table_provider(
+                &duckdb_accelerator.duckdb_factory,
+                &external_table,
+                None,
+            )
                 .await
                 .expect("table should be created");
 
@@ -1446,21 +1576,6 @@ mod tests {
         values.sort_unstable();
 
         assert_eq!(values, vec![1, 2]);
-    }
-
-    #[tokio::test]
-    async fn retention_sql_fails_with_internal_tables() {
-        let error_msg = duckdb_create_external_table_error(Acceleration {
-            engine: Engine::DuckDB,
-            retention_sql: Some("DELETE FROM taxi_trips WHERE value < 5".to_string()),
-            ..Default::default()
-        })
-        .await;
-
-        assert!(
-            error_msg.contains("DuckDB retention_sql is unavailable"),
-            "expected retention_sql unsupported error, got: {error_msg}"
-        );
     }
 
     #[tokio::test]
@@ -1697,42 +1812,6 @@ mod tests {
 
         // cleanup
         std::fs::remove_file(&path).expect("file should be removed");
-    }
-
-    #[tokio::test]
-    async fn test_retention_sql_with_duckdb_accelerator() {
-        let error_msg = duckdb_create_external_table_error(Acceleration {
-            engine: Engine::DuckDB,
-            retention_sql: Some("DELETE FROM retention_test_dataset WHERE value < 5".to_string()),
-            ..Default::default()
-        })
-        .await;
-
-        assert!(
-            error_msg.contains("DuckDB retention_sql is unavailable"),
-            "expected retention_sql unsupported error, got: {error_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn on_refresh_sort_columns_configuration_is_rejected() {
-        let mut params = HashMap::new();
-        params.insert(
-            "on_refresh_sort_columns".to_string(),
-            "value DESC".to_string(),
-        );
-
-        let error_msg = duckdb_create_external_table_error(Acceleration {
-            engine: Engine::DuckDB,
-            params,
-            ..Default::default()
-        })
-        .await;
-
-        assert!(
-            error_msg.contains("DuckDB on_refresh_sort_columns is unavailable"),
-            "expected on_refresh_sort_columns unsupported error, got: {error_msg}"
-        );
     }
 
     /// Regression test for <https://github.com/spiceai/spiceai/issues/2889>.
