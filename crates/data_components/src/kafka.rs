@@ -29,7 +29,8 @@ use rdkafka::{
     ClientConfig, Message, Offset,
     config::RDKafkaLogLevel,
     consumer::{BaseConsumer, CommitMode, Consumer, Rebalance, StreamConsumer},
-    message::BorrowedMessage,
+    message::{BorrowedMessage, Timestamp},
+    metadata::MetadataPartition,
     topic_partition_list::TopicPartitionList,
     util::get_rdkafka_version,
 };
@@ -38,7 +39,7 @@ use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{any::Any, sync::Arc};
 use tokio::sync::Notify;
 use tokio_stream::StreamExt;
@@ -47,6 +48,11 @@ use tonic::async_trait;
 use crate::cdc::{self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError};
 
 pub use rdkafka;
+
+// Number of messages to fetch in a single burst when scanning backward
+// past tombstones. One network round-trip pulls this many records into
+// the local buffer, eliminating per-tombstone seek overhead.
+const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -377,6 +383,90 @@ pub struct KafkaConsumer {
     metrics: Arc<KafkaMetrics>,
 }
 
+/// How a polled offset relates to the current backward-scan window end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCollectAction {
+    /// Offset is past the window; stop collecting.
+    StopBeforePush,
+    /// Offset is inside the window; keep collecting.
+    Push,
+    /// Offset is the window end; push and stop collecting.
+    PushAndStop,
+}
+
+#[must_use]
+fn window_collect_action(offset: i64, window_end: i64) -> WindowCollectAction {
+    match offset.cmp(&window_end) {
+        std::cmp::Ordering::Greater => WindowCollectAction::StopBeforePush,
+        std::cmp::Ordering::Equal => WindowCollectAction::PushAndStop,
+        std::cmp::Ordering::Less => WindowCollectAction::Push,
+    }
+}
+
+/// Whether a burst read finished the `[fetch_start, window_end]` segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurstScanContinuation {
+    /// No messages were returned for the assigned segment.
+    NoMessages,
+    /// All offsets through `window_end` in this segment were consumed.
+    SegmentComplete,
+    /// Poll stopped before `window_end`; resume assigning at this offset.
+    ResumeFrom(i64),
+}
+
+#[must_use]
+fn burst_scan_continuation(last_offset: Option<i64>, window_end: i64) -> BurstScanContinuation {
+    match last_offset {
+        None => BurstScanContinuation::NoMessages,
+        Some(last) if last >= window_end => BurstScanContinuation::SegmentComplete,
+        Some(last) => BurstScanContinuation::ResumeFrom(last.saturating_add(1)),
+    }
+}
+
+#[must_use]
+fn kafka_record_timestamp(timestamp: Timestamp) -> i64 {
+    match timestamp {
+        Timestamp::CreateTime(ts) | Timestamp::LogAppendTime(ts) => ts,
+        // Prefer any timestamped record over unknown timestamps when comparing candidates.
+        Timestamp::NotAvailable => i64::MIN,
+    }
+}
+
+fn merge_latest_by_timestamp<K, V>(
+    best: Option<(Option<K>, V, i64)>,
+    candidate: (Option<K>, V, i64),
+) -> Option<(Option<K>, V, i64)> {
+    let (key, value, timestamp) = candidate;
+    match &best {
+        Some((_, _, best_ts)) if timestamp <= *best_ts => best,
+        _ => Some((key, value, timestamp)),
+    }
+}
+
+fn deserialize_kafka_json<K: DeserializeOwned, V: DeserializeOwned>(
+    key: Option<&[u8]>,
+    payload: &[u8],
+) -> Result<(Option<K>, V)> {
+    let key = match key {
+        Some(key_bytes) => {
+            Some(serde_json::from_slice(key_bytes).context(UnableToDeserializeJsonMessageSnafu)?)
+        }
+        None => None,
+    };
+    let value = serde_json::from_slice(payload).context(UnableToDeserializeJsonMessageSnafu)?;
+    Ok((key, value))
+}
+
+fn parse_non_tombstone_message<K: DeserializeOwned, V: DeserializeOwned>(
+    msg: &rdkafka::message::OwnedMessage,
+) -> Result<Option<(Option<K>, V, i64)>> {
+    let Some(payload) = msg.payload() else {
+        return Ok(None);
+    };
+    let (key, value) = deserialize_kafka_json(msg.key(), payload)?;
+    Ok(Some((key, value, kafka_record_timestamp(msg.timestamp()))))
+}
+
 impl KafkaConsumer {
     /// Construct a consumer for an existing consumer group, restoring partition
     /// offsets from the sidecar before any rebalance can fire. Pass an empty
@@ -660,25 +750,155 @@ impl KafkaConsumer {
         })
     }
 
-    /// Fetch the latest message from a Kafka topic without affecting any existing
-    /// consumer group state.
+    fn assign_partition_for_peek(
+        consumer: &StreamConsumer<KafkaConsumerContext>,
+        topic: &str,
+        partition_id: i32,
+        offset: i64,
+    ) -> Result<()> {
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        tpl.add_partition_offset(topic, partition_id, Offset::Offset(offset))
+            .context(UnableToRestartTopicSnafu {
+                message: format!(
+                    "Failed to configure partition offset for partition {partition_id}"
+                ),
+            })?;
+        consumer.assign(&tpl).context(UnableToRestartTopicSnafu {
+            message: format!("Failed to assign partition {partition_id}"),
+        })
+    }
+
+    /// Poll messages after assigning to `fetch_start` until `window_end` is reached.
+    async fn collect_burst_in_window(
+        consumer: &StreamConsumer<KafkaConsumerContext>,
+        topic: &str,
+        partition_id: i32,
+        window_end: i64,
+        deadline: Instant,
+    ) -> Result<Vec<rdkafka::message::OwnedMessage>> {
+        let mut stream = Box::pin(consumer.stream());
+        let mut burst = Vec::new();
+        let window_limit = usize::try_from(TOMBSTONE_SCAN_WINDOW).unwrap_or(0);
+
+        while burst.len() < window_limit {
+            let poll_timeout = std::cmp::min(
+                Duration::from_secs(5),
+                deadline.saturating_duration_since(Instant::now()),
+            );
+
+            match tokio::time::timeout(poll_timeout, stream.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    if msg.topic() != topic || msg.partition() != partition_id {
+                        continue;
+                    }
+
+                    match window_collect_action(msg.offset(), window_end) {
+                        WindowCollectAction::StopBeforePush => break,
+                        WindowCollectAction::Push => burst.push(msg.detach()),
+                        WindowCollectAction::PushAndStop => {
+                            burst.push(msg.detach());
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    return Err(Error::UnableToReceiveMessage { source: e });
+                }
+                Err(_) if Instant::now() < deadline => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        Ok(burst)
+    }
+
+    async fn scan_partition_for_latest_non_tombstone<K: DeserializeOwned, V: DeserializeOwned>(
+        consumer: &StreamConsumer<KafkaConsumerContext>,
+        topic: &str,
+        partition_id: i32,
+        low: i64,
+        high: i64,
+        deadline: Instant,
+    ) -> Result<Option<(Option<K>, V, i64)>> {
+        let mut window_end = high.saturating_sub(1);
+
+        while window_end >= low {
+            if Instant::now() >= deadline {
+                tracing::debug!(
+                    "Schema peek timeout budget exhausted for partition {partition_id}"
+                );
+                break;
+            }
+
+            let window_start = std::cmp::max(low, window_end - TOMBSTONE_SCAN_WINDOW + 1);
+            let mut fetch_start = window_start;
+            let mut window_burst = Vec::new();
+
+            while fetch_start <= window_end {
+                if Instant::now() >= deadline {
+                    break;
+                }
+
+                Self::assign_partition_for_peek(consumer, topic, partition_id, fetch_start)?;
+                let segment = Self::collect_burst_in_window(
+                    consumer,
+                    topic,
+                    partition_id,
+                    window_end,
+                    deadline,
+                )
+                .await?;
+
+                let continuation = burst_scan_continuation(
+                    segment.last().map(rdkafka::Message::offset),
+                    window_end,
+                );
+                window_burst.extend(segment);
+
+                match continuation {
+                    BurstScanContinuation::ResumeFrom(next) => fetch_start = next,
+                    BurstScanContinuation::SegmentComplete | BurstScanContinuation::NoMessages => {
+                        break;
+                    }
+                }
+            }
+
+            for msg in window_burst.iter().rev() {
+                if let Some(candidate) = parse_non_tombstone_message::<K, V>(msg)? {
+                    return Ok(Some(candidate));
+                }
+            }
+
+            if window_start <= low {
+                break;
+            }
+            window_end = window_start.saturating_sub(1);
+        }
+
+        Ok(None)
+    }
+
+    /// Fetch the latest non-tombstone message from a Kafka topic without affecting
+    /// any existing consumer group state.
     ///
-    /// Creates a temporary consumer, seeks to the latest available message across
-    /// all partitions, reads it, and returns the owned key/value pair.
+    /// Creates a temporary consumer, inspects the latest available message on each
+    /// partition (skipping tombstones by seeking backward), and returns the message
+    /// with the newest record timestamp across all partitions.
     pub async fn fetch_latest_message<K: DeserializeOwned, V: DeserializeOwned>(
         topic: &str,
         kafka_config: &KafkaConfig,
         timeout: Duration,
     ) -> Result<Option<(Option<K>, V)>> {
+        let deadline = Instant::now() + timeout;
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
         let mut peek_config = kafka_config.clone();
         peek_config.metrics_store = None; // Avoid skewing real consumer metrics
         let temp_consumer = Self::create(temp_group_id, &peek_config, None)?;
 
-        // Fetch topic metadata to discover partitions
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let metadata = temp_consumer
             .consumer
-            .fetch_metadata(Some(topic), timeout)
+            .fetch_metadata(Some(topic), remaining)
             .context(UnableToRestartTopicSnafu {
                 message: "Failed to fetch topic metadata".to_string(),
             })?;
@@ -691,51 +911,50 @@ impl KafkaConsumer {
                 topic: topic.to_string(),
             })?;
 
-        // Find the partition with the highest watermark (most recent data)
-        let mut best_partition: Option<(i32, i64)> = None;
-        for partition in topic_metadata.partitions() {
+        let mut best_message: Option<(Option<K>, V, i64)> = None;
+
+        // Collect partition IDs up-front so the `MetadataPartition` iterator
+        // (which is not `Send` because it contains `*mut i32`) is dropped before
+        // any await points inside the loop body.
+        let partition_ids: Vec<i32> = topic_metadata
+            .partitions()
+            .iter()
+            .map(MetadataPartition::id)
+            .collect();
+
+        for partition_id in partition_ids {
+            if Instant::now() >= deadline {
+                tracing::debug!("Schema peek timeout budget exhausted");
+                break;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
             let (low, high) = temp_consumer
                 .consumer
-                .fetch_watermarks(topic, partition.id(), timeout)
+                .fetch_watermarks(topic, partition_id, remaining)
                 .context(UnableToRestartTopicSnafu {
-                    message: format!(
-                        "Failed to fetch watermarks for partition {}",
-                        partition.id()
-                    ),
+                    message: format!("Failed to fetch watermarks for partition {partition_id}"),
                 })?;
 
-            if high > low {
-                match &best_partition {
-                    Some((_, best_high)) if high <= *best_high => {}
-                    _ => best_partition = Some((partition.id(), high)),
-                }
+            if high <= low {
+                continue;
+            }
+
+            if let Some(candidate) = Self::scan_partition_for_latest_non_tombstone::<K, V>(
+                &temp_consumer.consumer,
+                topic,
+                partition_id,
+                low,
+                high,
+                deadline,
+            )
+            .await?
+            {
+                best_message = merge_latest_by_timestamp(best_message, candidate);
             }
         }
 
-        let Some((partition_id, high_watermark)) = best_partition else {
-            return Ok(None); // No messages available
-        };
-
-        // Manually assign the consumer to read from the latest offset
-        let mut tpl = rdkafka::TopicPartitionList::new();
-        tpl.add_partition_offset(topic, partition_id, Offset::Offset(high_watermark - 1))
-            .context(UnableToRestartTopicSnafu {
-                message: "Failed to configure partition offset".to_string(),
-            })?;
-
-        temp_consumer
-            .consumer
-            .assign(&tpl)
-            .context(UnableToRestartTopicSnafu {
-                message: "Failed to assign partition".to_string(),
-            })?;
-
-        // Read the message with a timeout
-        match tokio::time::timeout(timeout, temp_consumer.next_json::<K, V>()).await {
-            Ok(Ok(Some(msg))) => Ok(Some(msg.into_key_value())),
-            Ok(Ok(None)) | Err(_) => Ok(None),
-            Ok(Err(e)) => Err(e),
-        }
+        Ok(best_message.map(|(k, v, _)| (k, v)))
     }
 
     fn generate_group_id(dataset: &str) -> String {
@@ -1574,6 +1793,84 @@ mod tests {
             res.is_err(),
             "no ready envelope must be emitted before stats are received"
         );
+    }
+
+    #[test]
+    fn window_collect_action_orders_offsets() {
+        assert_eq!(
+            window_collect_action(12, 10),
+            WindowCollectAction::StopBeforePush
+        );
+        assert_eq!(window_collect_action(9, 10), WindowCollectAction::Push);
+        assert_eq!(
+            window_collect_action(10, 10),
+            WindowCollectAction::PushAndStop
+        );
+    }
+
+    #[test]
+    fn burst_scan_continuation_handles_partial_and_complete_segments() {
+        assert_eq!(
+            burst_scan_continuation(None, 100),
+            BurstScanContinuation::NoMessages
+        );
+        assert_eq!(
+            burst_scan_continuation(Some(80), 100),
+            BurstScanContinuation::ResumeFrom(81)
+        );
+        assert_eq!(
+            burst_scan_continuation(Some(100), 100),
+            BurstScanContinuation::SegmentComplete
+        );
+        assert_eq!(
+            burst_scan_continuation(Some(150), 100),
+            BurstScanContinuation::SegmentComplete
+        );
+    }
+
+    #[test]
+    fn kafka_record_timestamp_prefers_real_timestamps_over_not_available() {
+        assert_eq!(
+            kafka_record_timestamp(Timestamp::CreateTime(1_700_000_000_000)),
+            1_700_000_000_000
+        );
+        assert_eq!(kafka_record_timestamp(Timestamp::NotAvailable), i64::MIN);
+    }
+
+    #[test]
+    fn merge_latest_by_timestamp_keeps_newest_record() {
+        let older =
+            merge_latest_by_timestamp(None, (Some("k1".to_string()), json!({"v": 1}), 1_000))
+                .expect("first candidate");
+        assert_eq!(older.2, 1_000);
+
+        let newer = merge_latest_by_timestamp(Some(older), (None, json!({"v": 2}), 2_000))
+            .expect("newer candidate");
+        assert_eq!(newer.1, json!({"v": 2}));
+
+        let unchanged = merge_latest_by_timestamp(Some(newer), (None, json!({"v": 3}), 1_500))
+            .expect("older candidate ignored");
+        assert_eq!(unchanged.1, json!({"v": 2}));
+    }
+
+    #[test]
+    fn deserialize_kafka_json_parses_key_and_value() {
+        let (key, value): (Option<String>, serde_json::Value) =
+            deserialize_kafka_json(Some(br#""pk""#), br#"{"id":1}"#).expect("deserialize");
+        assert_eq!(key.as_deref(), Some("pk"));
+        assert_eq!(value, json!({"id": 1}));
+
+        let (no_key, value): (Option<String>, serde_json::Value) =
+            deserialize_kafka_json(None, br#"{"id":2}"#).expect("deserialize");
+        assert!(no_key.is_none());
+        assert_eq!(value, json!({"id": 2}));
+    }
+
+    #[test]
+    fn deserialize_kafka_json_rejects_invalid_payload() {
+        let err = deserialize_kafka_json::<String, serde_json::Value>(None, b"not-json")
+            .expect_err("invalid json");
+        assert!(matches!(err, Error::UnableToDeserializeJsonMessage { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
