@@ -827,11 +827,8 @@ impl DataFusionBuilder {
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
-        // Federation runs as the first of these (see `AnalyzerRulesBuilder::with_federation`).
-        for rule in AnalyzerRulesBuilder::default()
-            .with_federation(true)
-            .build()
-        {
+        // Federation runs as the first of these (see `AnalyzerRulesBuilder::include_federation`).
+        for rule in AnalyzerRulesBuilder::default().build() {
             ctx.add_analyzer_rule(rule);
         }
         for rule in self.additional_analyzer_rules {
@@ -1072,11 +1069,9 @@ fn has_cayenne_accelerator_metadata(provider: &dyn TableProvider) -> bool {
         .is_some_and(|accelerator| accelerator == "cayenne")
 }
 
-#[derive(Default)]
 pub struct AnalyzerRulesBuilder {
     include_federation: bool,
     extra_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
-    federation: bool,
 }
 
 impl AnalyzerRulesBuilder {
@@ -1100,20 +1095,6 @@ impl AnalyzerRulesBuilder {
         self
     }
 
-    /// Enable query federation by prepending the [`datafusion_federation::FederationAnalyzerRule`].
-    ///
-    /// As of datafusion-federation `sgrebnov/spiceai-53`, federation is implemented as an
-    /// analyzer rule (it was an optimizer rule prior to the DF53 update). It must run before the
-    /// other analyzer rules (`ResolveGroupingFunction`/`TypeCoercion`), which only affect internal
-    /// `DataFusion` execution, so that the federated query engines see the un-rewritten plan. This
-    /// matches `datafusion_federation::default_analyzer_rules()`, which lists the federation rule
-    /// first. Callers must also register the `FederatedPlanner` extension planner.
-    #[must_use]
-    pub fn with_federation(mut self, federation: bool) -> Self {
-        self.federation = federation;
-        self
-    }
-
     /// Spice customizes the order of the analyzer rules, since some of them are only relevant when `DataFusion` is executing the query,
     /// as opposed to when underlying federated query engines will execute the query.
     ///
@@ -1130,6 +1111,15 @@ impl AnalyzerRulesBuilder {
             Arc::new(TypeCoercion::new()) as Arc<dyn AnalyzerRule + Send + Sync>,
         ]);
         rules.into_iter().chain(self.extra_rules).collect()
+    }
+}
+
+impl Default for AnalyzerRulesBuilder {
+    fn default() -> Self {
+        Self {
+            include_federation: true,
+            extra_rules: vec![],
+        }
     }
 }
 
@@ -1605,6 +1595,7 @@ mod tests {
             rule_names,
             vec![
                 "spice_ddl_rewrite",
+                "federation_optimizer_rule",
                 "resolve_grouping_function",
                 "type_coercion",
                 "spice_ddl_rewrite",
