@@ -1307,7 +1307,7 @@ mod tests {
 
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::dataaccelerator::{AccelerationSource, DataAccelerator, duckdb::DuckDBAccelerator};
+    use crate::dataaccelerator::{DataAccelerator, duckdb::DuckDBAccelerator};
 
     fn external_table_with_options(options: HashMap<String, String>) -> CreateExternalTable {
         let schema = Arc::new(Schema::new(vec![Field::new(
