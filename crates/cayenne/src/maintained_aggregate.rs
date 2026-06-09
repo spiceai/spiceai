@@ -858,23 +858,13 @@ fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {
         )));
     }
 
-    let magnitude = value.unsigned_abs();
-    let high = u32::try_from(magnitude >> 32).map_err(|source| {
-        DataFusionError::Internal(format!(
-            "failed to convert maintained aggregate AVG count {value} high bits to Float64: {source}"
-        ))
-    })?;
-    let low = u32::try_from(magnitude & u64::from(u32::MAX)).map_err(|source| {
-        DataFusionError::Internal(format!(
-            "failed to convert maintained aggregate AVG count {value} low bits to Float64: {source}"
-        ))
-    })?;
-    let converted = f64::from(high).mul_add(4_294_967_296.0, f64::from(low));
-    Ok(if value.is_negative() {
-        -converted
-    } else {
-        converted
-    })
+    // `value` is now within ±2^53 (`f64::MANTISSA_DIGITS`), the range over which
+    // every integer is exactly representable as `f64`, so the cast is lossless.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "value is range-checked to ±2^53 above, where i64 -> f64 is exact"
+    )]
+    Ok(value as f64)
 }
 
 fn resolve_column(schema: &SchemaRef, name: &str) -> DataFusionResult<ResolvedColumn> {

@@ -43,7 +43,7 @@ use test_framework::{
 
 use crate::{
     args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
-    spiced_metrics::MetricsScraper, wait_test_and_memory,
+    spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {

@@ -166,6 +166,9 @@ struct CayenneLogicalOptimizerRules {
     semi_join_pushdown: bool,
 }
 
+// Each field toggles one Cayenne physical optimizer rule; a flag bag is the
+// natural shape here, so the >3-bools pedantic lint does not apply.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CayennePhysicalOptimizerRules {
     dynamic_filter_sharing: bool,
