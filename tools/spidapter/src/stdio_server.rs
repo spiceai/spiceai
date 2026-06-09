@@ -1415,7 +1415,19 @@ async fn generate_initial_spicepod(
     scp: &ScpConfig,
     cayenne: Option<&CayenneConfig>,
 ) -> anyhow::Result<SpicepodDefinition> {
-    let scheduler_state_location = scp.scheduler_state_location.as_deref();
+    // Local-bench fallback: when no scenario `compute.scp` block provides a
+    // scheduler state location, honor the SCHEDULER_STATE_LOCATION env var
+    // (passed by `spicebench run` via --system-adapter-env). spiced refuses to
+    // start in scheduler mode without `runtime.scheduler.state_location`, and
+    // the local backend otherwise leaves it unset.
+    let scheduler_state_location_env = std::env::var("SCHEDULER_STATE_LOCATION")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let scheduler_state_location = scp
+        .scheduler_state_location
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(scheduler_state_location_env.as_deref());
 
     let mut spicepod = if let Some(path) = setup_config.spicepod_path.as_deref() {
         load_spicepod_from_path(path, run_id).await?

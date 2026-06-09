@@ -182,6 +182,9 @@ async fn main() -> Result<()> {
                 inline_flush_max_segments: None,
                 inline_flush_max_bytes: None,
                 pk_conflict_detection: None,
+                dynamic_tuning: false,
+                compaction_background_interval_ms: None,
+                compaction_trigger_files: None,
             },
             ctx.runtime_env(),
         )
@@ -390,6 +393,9 @@ mod tests {
                     inline_flush_max_segments: None,
                     inline_flush_max_bytes: None,
                     pk_conflict_detection: None,
+                    dynamic_tuning: false,
+                    compaction_background_interval_ms: None,
+                    compaction_trigger_files: None,
                 },
                 ctx.runtime_env(),
             )
