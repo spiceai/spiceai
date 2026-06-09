@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Local Cayenne DML handler plus MERGE logical-input preparation helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
