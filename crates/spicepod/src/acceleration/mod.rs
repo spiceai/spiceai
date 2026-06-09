@@ -324,8 +324,8 @@ pub enum MaintainedAggregateFunction {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MaintainAggregates {
-    Disabled,
     #[default]
+    Disabled,
     Enabled,
 }
 
@@ -355,7 +355,7 @@ pub struct MaintainedAggregatesConfig {
 impl Default for MaintainedAggregatesConfig {
     fn default() -> Self {
         Self {
-            mode: MaintainAggregates::Enabled,
+            mode: MaintainAggregates::Disabled,
             views: Vec::new(),
         }
     }
@@ -378,7 +378,7 @@ pub enum MaintainedAggregates {
 
 impl Default for MaintainedAggregates {
     fn default() -> Self {
-        Self::List(Vec::new())
+        Self::Mode(MaintainAggregates::Disabled)
     }
 }
 
@@ -406,7 +406,7 @@ impl MaintainedAggregates {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         match self {
-            Self::List(_) => true,
+            Self::List(aggregates) => !aggregates.is_empty(),
             Self::Config(config) => config.mode.is_enabled(),
             Self::Mode(mode) => mode.is_enabled(),
         }
@@ -437,7 +437,11 @@ impl MaintainedAggregates {
 
     #[must_use]
     pub fn is_default(&self) -> bool {
-        self.is_enabled() && self.is_empty()
+        match self {
+            Self::List(aggregates) => aggregates.is_empty(),
+            Self::Config(config) => !config.mode.is_enabled() && config.views.is_empty(),
+            Self::Mode(mode) => !mode.is_enabled(),
+        }
     }
 
     #[must_use]
@@ -759,6 +763,65 @@ mod tests {
                     column: Some("latency_ms".to_string()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_maintained_aggregates_disabled_by_default() {
+        let acceleration: Acceleration =
+            yaml::from_str("{}").expect("Failed to parse Acceleration");
+
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_config_defaults_disabled() {
+        let yaml = concat!(
+            "maintained_aggregates:\n",
+            "  views:\n",
+            "    - group_by: [customer_id]\n",
+            "      aggregates:\n",
+            "        - function: count\n",
+        );
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+
+        assert!(!acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(acceleration.maintained_aggregates.len(), 1);
+        assert!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_deserialize_maintained_aggregates_enabled_config() {
+        let yaml = concat!(
+            "maintained_aggregates:\n",
+            "  mode: enabled\n",
+            "  views:\n",
+            "    - group_by: [customer_id]\n",
+            "      aggregates:\n",
+            "        - function: count\n",
+        );
+        let acceleration: Acceleration =
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
+
+        assert!(acceleration.maintained_aggregates.is_enabled());
+        assert_eq!(
+            acceleration
+                .maintained_aggregates
+                .enabled_aggregates()
+                .len(),
+            1
         );
     }
 
