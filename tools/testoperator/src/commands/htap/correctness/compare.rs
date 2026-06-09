@@ -54,7 +54,11 @@ pub struct NumericDelta {
     pub worst: Option<String>,
 }
 
-fn is_numeric(dt: &DataType) -> bool {
+/// Whether a column's values are compared numerically by [`numeric_delta`]
+/// (integers, decimals, floats). Public so the fingerprint gate can decide
+/// which columns get a `MIN`/`MAX` aggregate.
+#[must_use]
+pub fn is_numeric(dt: &DataType) -> bool {
     matches!(
         dt,
         DataType::Int8
@@ -80,12 +84,15 @@ fn is_float(dt: &DataType) -> bool {
     )
 }
 
-/// Whether a column's values are compared numerically by [`numeric_delta`]
-/// (integers, decimals, floats). Exposed so the fingerprint gate can decide
-/// which columns get a `MIN`/`MAX` aggregate.
-#[must_use]
-pub fn is_numeric_type(dt: &DataType) -> bool {
-    is_numeric(dt)
+/// Cast both columns to `Float64` for value comparison. Returns `None` if either
+/// cast (or the subsequent downcast) fails — the caller fails safe rather than
+/// silently skipping the column.
+fn cast_pair_to_f64(e_col: &dyn Array, a_col: &dyn Array) -> Option<(Float64Array, Float64Array)> {
+    let e = arrow::compute::cast(e_col, &DataType::Float64).ok()?;
+    let a = arrow::compute::cast(a_col, &DataType::Float64).ok()?;
+    let e = e.as_any().downcast_ref::<Float64Array>()?.clone();
+    let a = a.as_any().downcast_ref::<Float64Array>()?.clone();
+    Some((e, a))
 }
 
 /// Compare the numeric columns of `expected` and `actual` position-by-position.
@@ -101,35 +108,40 @@ pub fn is_numeric_type(dt: &DataType) -> bool {
 /// cross-engine text collation / timestamp precision make their MIN/MAX
 /// unreliable to compare directly.
 #[must_use]
-#[allow(clippy::needless_range_loop)] // parallel index into two arrays — idiomatic here
 pub fn numeric_delta(expected: &RecordBatch, actual: &RecordBatch) -> NumericDelta {
     let mut out = NumericDelta::default();
     let mut worst_rel = 0.0_f64;
-    let n_cols = expected.num_columns().min(actual.num_columns());
     let n_rows = expected.num_rows().min(actual.num_rows());
 
-    for c in 0..n_cols {
-        let e_col = expected.column(c);
-        let a_col = actual.column(c);
+    // Zip the two column slices (truncating to the shorter) alongside the
+    // expected schema's fields for the column name used in the failure message.
+    let e_schema = expected.schema();
+    for ((e_col, a_col), field) in expected
+        .columns()
+        .iter()
+        .zip(actual.columns().iter())
+        .zip(e_schema.fields().iter())
+    {
         if !is_numeric(e_col.data_type()) || !is_numeric(a_col.data_type()) {
             continue;
         }
         let float_col = is_float(e_col.data_type()) || is_float(a_col.data_type());
+        let col_name = field.name();
 
-        let (Ok(e_f64), Ok(a_f64)) = (
-            arrow::compute::cast(e_col, &DataType::Float64),
-            arrow::compute::cast(a_col, &DataType::Float64),
-        ) else {
-            continue; // un-castable numeric — leave it to the string comparator
-        };
-        let (Some(e_arr), Some(a_arr)) = (
-            e_f64.as_any().downcast_ref::<Float64Array>(),
-            a_f64.as_any().downcast_ref::<Float64Array>(),
-        ) else {
+        // Both columns are numeric, so casting to f64 should always succeed.
+        // If it somehow doesn't, fail safe: in the fingerprint gate this is the
+        // *only* comparator, so silently skipping the column could let a real
+        // numeric divergence pass.
+        let Some((e_arr, a_arr)) = cast_pair_to_f64(e_col, a_col) else {
+            out.exceeded = true;
+            if out.worst.is_none() {
+                out.worst = Some(format!(
+                    "{col_name}: numeric column could not be cast to f64 for comparison"
+                ));
+            }
             continue;
         };
 
-        let col_name = expected.schema().field(c).name().clone();
         for r in 0..n_rows {
             // Null-pattern differences are caught by the string comparator;
             // here we only compare two present numeric values.
@@ -198,7 +210,7 @@ mod tests {
         let a = batch(vec![int_col("count_order", vec![10, 20, 30])]);
         let d = numeric_delta(&e, &a);
         assert!(!d.exceeded);
-        assert_eq!(d.max_rel_delta, 0.0);
+        assert!(d.max_rel_delta.abs() < f64::EPSILON);
         assert!(d.worst.is_none());
     }
 
@@ -237,17 +249,15 @@ mod tests {
         let e = batch(vec![(
             "money",
             Arc::new(
-                Decimal128Array::from(vec![123_456_i128, 999_i128]).with_data_type(
-                    DataType::Decimal128(38, 2),
-                ),
+                Decimal128Array::from(vec![123_456_i128, 999_i128])
+                    .with_data_type(DataType::Decimal128(38, 2)),
             ) as ArrayRef,
         )]);
         let a = batch(vec![(
             "money",
             Arc::new(
-                Decimal128Array::from(vec![123_457_i128, 999_i128]).with_data_type(
-                    DataType::Decimal128(38, 2),
-                ),
+                Decimal128Array::from(vec![123_457_i128, 999_i128])
+                    .with_data_type(DataType::Decimal128(38, 2)),
             ) as ArrayRef,
         )]);
         let d = numeric_delta(&e, &a);
@@ -265,7 +275,10 @@ mod tests {
             Arc::new(StringArray::from(vec!["alice", "carol"])) as ArrayRef,
         )]);
         let d = numeric_delta(&e, &a);
-        assert!(!d.exceeded, "text divergence is the string comparator's job");
+        assert!(
+            !d.exceeded,
+            "text divergence is the string comparator's job"
+        );
     }
 
     #[test]

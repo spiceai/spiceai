@@ -24,13 +24,13 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use super::super::spice::SpiceClients;
 use super::compare;
 use arrow::array::RecordBatch;
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{Field, Schema};
 use arrow_tools::record_batch::try_cast_to;
 use chbench_driver::ChBenchDriver;
-use futures::TryStreamExt;
 use test_framework::anyhow;
 use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
 use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
@@ -136,7 +136,7 @@ impl AnalyticalReport {
 /// comparing results.
 pub async fn verify_analytical_results(
     driver: Arc<dyn ChBenchDriver>,
-    spice_client: &spiceai::Client,
+    spice: &SpiceClients,
     query_overrides: Option<QueryOverrides>,
 ) -> anyhow::Result<AnalyticalReport> {
     // All 22 CH-benCH analytical queries are gated, including q15. q15's
@@ -167,7 +167,7 @@ pub async fn verify_analytical_results(
             }
         };
 
-        let actual = match run_spice_query(spice_client, sql.as_ref()).await {
+        let actual = match spice.query_arrow(sql.as_ref()).await {
             Ok(batches) => batches,
             Err(e) => {
                 results.push(AnalyticalQueryResult {
@@ -210,50 +210,49 @@ pub async fn verify_analytical_results(
             }
         };
 
-        let (outcome, max_rel_delta) = if total_rows(&expected_sorted) == 0
-            && total_rows(&actual_sorted) == 0
-        {
-            (Outcome::Pass, None)
-        } else {
-            match validate_with_expected_batches(
-                query.name.as_ref(),
-                &actual_sorted,
-                &expected_sorted,
-            ) {
-                Ok(QueryValidationResult::Pass) => {
-                    // Structure, schema and row set agree within the string
-                    // comparator's tolerance. Now apply the tight, type-aware
-                    // numeric check (exact for integer/decimal, 0.1% for float)
-                    // and surface the magnitude either way.
-                    match (expected_sorted.first(), actual_sorted.first()) {
-                        (Some(e0), Some(a0)) => {
-                            let delta = compare::numeric_delta(e0, a0);
-                            if delta.exceeded {
-                                (
-                                    Outcome::Fail(format!(
-                                        "numeric drift exceeds tolerance — {}",
-                                        delta.worst.as_deref().unwrap_or("(unknown cell)")
-                                    )),
-                                    Some(delta.max_rel_delta),
-                                )
-                            } else {
-                                (Outcome::Pass, Some(delta.max_rel_delta))
+        let (outcome, max_rel_delta) =
+            if total_rows(&expected_sorted) == 0 && total_rows(&actual_sorted) == 0 {
+                (Outcome::Pass, None)
+            } else {
+                match validate_with_expected_batches(
+                    query.name.as_ref(),
+                    &actual_sorted,
+                    &expected_sorted,
+                ) {
+                    Ok(QueryValidationResult::Pass) => {
+                        // Structure, schema and row set agree within the string
+                        // comparator's tolerance. Now apply the tight, type-aware
+                        // numeric check (exact for integer/decimal, 0.1% for float)
+                        // and surface the magnitude either way.
+                        match (expected_sorted.first(), actual_sorted.first()) {
+                            (Some(e0), Some(a0)) => {
+                                let delta = compare::numeric_delta(e0, a0);
+                                if delta.exceeded {
+                                    (
+                                        Outcome::Fail(format!(
+                                            "numeric drift exceeds tolerance — {}",
+                                            delta.worst.as_deref().unwrap_or("(unknown cell)")
+                                        )),
+                                        Some(delta.max_rel_delta),
+                                    )
+                                } else {
+                                    (Outcome::Pass, Some(delta.max_rel_delta))
+                                }
                             }
+                            _ => (Outcome::Pass, None),
                         }
-                        _ => (Outcome::Pass, None),
                     }
+                    Ok(QueryValidationResult::Fail(reason)) => (
+                        Outcome::Fail(format!(
+                            "{reason:?} (source rows={}, spice rows={})",
+                            total_rows(&expected_sorted),
+                            total_rows(&actual_sorted),
+                        )),
+                        None,
+                    ),
+                    Err(e) => (Outcome::Fail(e.to_string()), None),
                 }
-                Ok(QueryValidationResult::Fail(reason)) => (
-                    Outcome::Fail(format!(
-                        "{reason:?} (source rows={}, spice rows={})",
-                        total_rows(&expected_sorted),
-                        total_rows(&actual_sorted),
-                    )),
-                    None,
-                ),
-                Err(e) => (Outcome::Fail(e.to_string()), None),
-            }
-        };
+            };
 
         results.push(AnalyticalQueryResult {
             name: query.name.to_string(),
@@ -263,12 +262,6 @@ pub async fn verify_analytical_results(
     }
 
     Ok(AnalyticalReport { results })
-}
-
-async fn run_spice_query(client: &spiceai::Client, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
-    let stream = client.sql(sql).await?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await?;
-    Ok(batches)
 }
 
 /// Build a target schema by taking each field from `actual` and replacing its
