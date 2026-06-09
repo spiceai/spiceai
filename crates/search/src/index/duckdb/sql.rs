@@ -22,8 +22,8 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::TableProviderFilterPushDown,
     prelude::Expr,
-    sql::unparser::{Unparser, dialect::DuckDBDialect},
 };
+use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engine};
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 
@@ -135,7 +135,7 @@ fn duckdb_vector_sql_flat(
 
     let filter_exprs: Vec<String> = filters
         .iter()
-        .map(duckdb_filter_to_sql)
+        .map(|filter| expr::to_sql_with_engine(filter, Some(Engine::DuckDB)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DataFusionError::Plan(e.to_string()))?;
     let mut predicates = Vec::with_capacity(filter_exprs.len() + 1);
@@ -194,17 +194,10 @@ pub(super) fn duckdb_filter_pushdown(
         return TableProviderFilterPushDown::Unsupported;
     }
 
-    match duckdb_filter_to_sql(filter) {
+    match expr::to_sql_with_engine(filter, Some(Engine::DuckDB)) {
         Ok(_) => TableProviderFilterPushDown::Exact,
         Err(_) => TableProviderFilterPushDown::Unsupported,
     }
-}
-
-fn duckdb_filter_to_sql(filter: &Expr) -> DataFusionResult<String> {
-    let dialect = DuckDBDialect::new();
-    Unparser::new(&dialect)
-        .expr_to_sql(filter)
-        .map(|sql| sql.to_string())
 }
 
 #[cfg(test)]
@@ -346,7 +339,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT id, CAST(1.0 - array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) AS DOUBLE) AS _score \
-                    FROM docs WHERE body_embedding IS NOT NULL AND (\"id\" > 10) \
+               FROM docs WHERE body_embedding IS NOT NULL AND \"id\" > 10 \
              ORDER BY array_cosine_distance(body_embedding, [1.0, 0.0]::FLOAT[2]) ASC LIMIT 10"
         );
     }

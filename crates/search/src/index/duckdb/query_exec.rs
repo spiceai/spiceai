@@ -198,7 +198,9 @@ fn run_duckdb_vector_query(
         .connect_sync()
         .map_err(to_execution_error)?;
     let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
-    let table_name = resolve_current_table_name(context.table_definition.name(), duckdb_conn)?;
+    let conn = &duckdb_conn.conn;
+
+    let table_name = resolve_current_table_name(context.table_definition.name(), conn)?;
     let sql = exec.sql(&table_name, query_vector)?;
     tracing::debug!(
         table_name = %table_name,
@@ -208,7 +210,7 @@ fn run_duckdb_vector_query(
     );
     tracing::trace!("DuckDB vector query SQL: {sql}");
 
-    let mut stmt = duckdb_conn.conn.prepare(&sql).map_err(to_execution_error)?;
+    let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
     let result = stmt.query_arrow([]).map_err(to_execution_error)?;
     let batches = result.collect::<Vec<_>>();
     if exec.projected_columns.is_empty() {

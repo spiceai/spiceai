@@ -413,7 +413,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
 
         tracing::debug!("creating partition at {duckdb_path}");
 
-        let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
+        let table_provider = create_table_provider(&self.duckdb_factory, &cmd, None)
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e })?;
 
@@ -459,7 +459,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
             .await
             .map_err(|e| creator::Error::CreatePartition { source: e.into() })?;
 
-            let table_provider = create_table_provider(&self.duckdb_factory, &cmd)
+            let table_provider = create_table_provider(&self.duckdb_factory, &cmd, None)
                 .await
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
