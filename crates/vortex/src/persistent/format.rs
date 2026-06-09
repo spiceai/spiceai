@@ -291,6 +291,12 @@ config_namespace! {
         /// push safe projection expressions into the scan while keeping unsafe
         /// fragments above the scan.
         pub projection_pushdown: ProjectionPushdown, default = ProjectionPushdown::Off
+        /// Whether the underlying scan may build a `FilePruner` to skip whole files
+        /// using statistics and partition values before opening them.
+        ///
+        /// Defaults to `true` (pruning enabled). When `false`, pruning is disabled
+        /// and every candidate file is opened and scanned.
+        pub file_pruning: bool, default = true
         /// The intra-file scan concurrency, controlling the number of row splits to process
         /// concurrently within each file.
         ///
@@ -927,6 +933,7 @@ impl FileFormat for VortexFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = VortexSource::new(table_schema, self.session.clone())
             .with_projection_pushdown(self.opts.projection_pushdown)
+            .with_file_pruning(self.opts.file_pruning)
             .with_scan_concurrency(self.opts.scan_concurrency);
 
         if let Some(segment_cache) = self.segment_cache.clone() {
@@ -1134,6 +1141,24 @@ mod tests {
             .expect("setting projection_pushdown to off should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::Off);
         assert!(!opts.projection_pushdown.enabled());
+    }
+
+    #[test]
+    fn format_file_pruning_default_is_on() {
+        let opts = VortexTableOptions::default();
+        assert!(opts.file_pruning);
+    }
+
+    #[test]
+    fn format_plumbs_file_pruning() {
+        let mut opts = VortexTableOptions::default();
+        opts.set("file_pruning", "false")
+            .expect("setting file_pruning to false should succeed");
+        assert!(!opts.file_pruning);
+
+        opts.set("file_pruning", "true")
+            .expect("setting file_pruning to true should succeed");
+        assert!(opts.file_pruning);
     }
 
     #[test]

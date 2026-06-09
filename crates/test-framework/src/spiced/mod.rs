@@ -18,10 +18,13 @@ use std::{
     fmt::Display,
     path::PathBuf,
     process::{Child, Command},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Result, anyhow};
+use flight_client::{Credentials, FlightClient};
+use secrecy::SecretString;
 use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
 use sysinfo::Pid;
@@ -313,6 +316,42 @@ impl SpicedInstance {
             .map_err(|e| anyhow!("{e}"))?;
 
         Ok(spice_client)
+    }
+
+    /// Build a low-level Flight client for this instance.
+    ///
+    /// Used for Flight SQL metadata calls the higher-level [`spice_client`] does
+    /// not surface — notably `GetSchema`, which returns a dataset's Arrow schema
+    /// without scanning any rows.
+    ///
+    /// [`spice_client`]: Self::spice_client
+    ///
+    /// # Errors
+    ///
+    /// - If the Flight client cannot connect to the instance.
+    pub async fn flight_client(&self, api_key: Option<String>) -> Result<FlightClient> {
+        // Caller-supplied key wins; otherwise fall back to whatever was stashed
+        // on the External variant (matching `spice_client`).
+        let effective_key = api_key.or_else(|| match self {
+            Self::External {
+                api_key: Some(key), ..
+            } => Some(key.clone()),
+            _ => None,
+        });
+
+        let credentials = match effective_key {
+            Some(key) => Credentials::new("", SecretString::new(key.into())),
+            None => Credentials::anonymous(),
+        };
+
+        let flight_url = match self {
+            Self::External { flight_url, .. } => flight_url.as_str(),
+            Self::Existing | Self::Owned { .. } => FLIGHT_URL,
+        };
+
+        FlightClient::try_new(Arc::from(flight_url), credentials, None, None)
+            .await
+            .map_err(|e| anyhow!("{e}"))
     }
 
     /// Get an http client for the spiced instance
