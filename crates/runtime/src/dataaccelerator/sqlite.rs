@@ -633,7 +633,7 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let delete_error = table
+        let _delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
