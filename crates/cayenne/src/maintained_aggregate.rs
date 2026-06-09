@@ -858,10 +858,22 @@ fn exact_i64_to_f64(value: i64) -> DataFusionResult<f64> {
         )));
     }
 
-    value.to_string().parse::<f64>().map_err(|source| {
+    let magnitude = value.unsigned_abs();
+    let high = u32::try_from(magnitude >> 32).map_err(|source| {
         DataFusionError::Internal(format!(
-            "failed to convert maintained aggregate AVG count {value} to Float64: {source}"
+            "failed to convert maintained aggregate AVG count {value} high bits to Float64: {source}"
         ))
+    })?;
+    let low = u32::try_from(magnitude & u64::from(u32::MAX)).map_err(|source| {
+        DataFusionError::Internal(format!(
+            "failed to convert maintained aggregate AVG count {value} low bits to Float64: {source}"
+        ))
+    })?;
+    let converted = f64::from(high).mul_add(4_294_967_296.0, f64::from(low));
+    Ok(if value.is_negative() {
+        -converted
+    } else {
+        converted
     })
 }
 

@@ -121,23 +121,24 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
 
 fn maintained_aggregate_specs_for_cayenne(
     acceleration: Option<&Acceleration>,
-) -> Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec> {
+) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
     let Some(acceleration) = acceleration else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     if acceleration.maintained_aggregates.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     if !acceleration.partition_by.is_empty() {
-        tracing::warn!(
-            "Cayenne maintained_aggregates is not yet supported on partitioned tables; base table scans will be used for aggregate queries"
-        );
-        return Vec::new();
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
     }
 
-    acceleration
+    Ok(acceleration
         .maintained_aggregates
         .iter()
         .map(
@@ -167,7 +168,7 @@ fn maintained_aggregate_specs_for_cayenne(
                     .collect(),
             },
         )
-        .collect()
+        .collect())
 }
 
 /// Transform schema according to `unsupported_type_action` policy.
@@ -1170,7 +1171,7 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
-        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration);
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -2567,6 +2568,54 @@ mod tests {
             ),
             true,
         )
+    }
+
+    fn maintained_aggregate_acceleration() -> Acceleration {
+        Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
+        let acceleration = maintained_aggregate_acceleration();
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("unpartitioned maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
+        assert_eq!(specs[0].aggregates.len(), 1);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+        );
+        assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_error_for_partitioned_cayenne() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.partition_by = vec![spicepod::partitioning::PartitionedBy {
+            name: "region".to_string(),
+            expression: "region".to_string(),
+        }];
+
+        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect_err("partitioned maintained aggregate config should be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("maintained_aggregates"));
+        assert!(detail.contains("partitioned"));
     }
 
     #[test]
