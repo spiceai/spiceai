@@ -185,6 +185,16 @@ pub async fn verify_analytical_results(
         // expressions return Int32 vs Decimal128(38,0)). Cast Spice columns
         // to the source's per-column type so the string-based row comparator
         // sees consistent encodings before comparing values.
+        // Remember which columns Spice produced as floating point *before*
+        // alignment casts them to the source schema (Float64 avg() → Decimal128
+        // NUMERIC), so the numeric check below keeps the relative float
+        // tolerance for those approximate columns instead of demoting them to
+        // the exact integer/decimal path.
+        let actual_source_floats = actual
+            .first()
+            .map(compare::float_columns)
+            .unwrap_or_default();
+
         let actual = match align_to_expected_schema(&actual, &expected) {
             Ok(batches) => batches,
             Err(e) => {
@@ -222,11 +232,12 @@ pub async fn verify_analytical_results(
                     Ok(QueryValidationResult::Pass) => {
                         // Structure, schema and row set agree within the string
                         // comparator's tolerance. Now apply the tight, type-aware
-                        // numeric check (exact for integer/decimal, 0.1% for float)
+                        // numeric check (exact for integer/decimal, 0.1% for
+                        // float — including avg() that alignment cast to decimal)
                         // and surface the magnitude either way.
                         match (expected_sorted.first(), actual_sorted.first()) {
                             (Some(e0), Some(a0)) => {
-                                let delta = compare::numeric_delta(e0, a0);
+                                let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
                                 if delta.exceeded {
                                     (
                                         Outcome::Fail(format!(
