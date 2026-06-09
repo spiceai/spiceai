@@ -22,6 +22,7 @@ pub mod dialect;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;
+pub mod join_accumulator;
 pub mod managed_runtime;
 pub mod optimizer_rule;
 pub mod param_utils;

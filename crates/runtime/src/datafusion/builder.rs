@@ -35,7 +35,8 @@ use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SC
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::optimizer_rules::{
-    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneOptimizerConfig,
+    CayenneAntiJoinSortMergeRewriter, CayenneDynamicFilterSharing, CayenneJoinRewriter,
+    CayenneOptimizerConfig,
 };
 #[cfg(not(windows))]
 use cayenne::{
@@ -95,6 +96,8 @@ use datafusion_optimizer_rules::{
         flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
     },
 };
+#[cfg(not(windows))]
+use runtime_datafusion::join_accumulator::clamp_maximum_shared_inlist_memory_bytes;
 use runtime_datafusion::{
     extension::{
         ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer,
@@ -166,6 +169,7 @@ struct CayenneLogicalOptimizerRules {
 struct CayennePhysicalOptimizerRules {
     dynamic_filter_sharing: bool,
     anti_join_sort_merge: bool,
+    exact_join_filter: bool,
 }
 
 impl CayenneOptimizerRules {
@@ -181,6 +185,7 @@ impl CayenneOptimizerRules {
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
                 anti_join_sort_merge: true,
+                exact_join_filter: false,
             },
         }
     }
@@ -197,6 +202,7 @@ impl CayenneOptimizerRules {
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: true,
                 anti_join_sort_merge: true,
+                exact_join_filter: true,
             },
         }
     }
@@ -213,6 +219,7 @@ impl CayenneOptimizerRules {
             physical: CayennePhysicalOptimizerRules {
                 dynamic_filter_sharing: false,
                 anti_join_sort_merge: false,
+                exact_join_filter: false,
             },
         }
     }
@@ -269,6 +276,15 @@ impl CayenneOptimizerRules {
 
     pub fn set_anti_join_sort_merge(&mut self, enabled: bool) {
         self.physical.anti_join_sort_merge = enabled;
+    }
+
+    #[must_use]
+    pub const fn exact_join_filter(self) -> bool {
+        self.physical.exact_join_filter
+    }
+
+    pub fn set_exact_join_filter(&mut self, enabled: bool) {
+        self.physical.exact_join_filter = enabled;
     }
 }
 
@@ -608,12 +624,19 @@ impl DataFusionBuilder {
         // forked `ExactLeftAccumulator` seam.
         configure_hash_join_memory_limits(&mut config, effective_memory_limit);
 
+        // Per-query budget for the opt-in `CayenneJoinRewriter` exact in-list
+        // accumulator. Independent of the default-path
+        // `configure_hash_join_memory_limits` cap-raise above; only consumed when
+        // the `exact_join_filter` rule is registered below.
+        let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
+
         #[cfg(not(windows))]
         {
             config = config.with_option_extension(cayenne_optimizer_config(
                 self.cayenne_sort_merge_min_rows,
                 self.cayenne_sort_merge_memory_pool_fraction,
                 effective_memory_limit,
+                exact_join_filter_memory_limit,
             ));
         }
 
@@ -668,11 +691,14 @@ impl DataFusionBuilder {
         #[cfg(not(windows))]
         {
             // Cayenne is not built on Windows, so its physical optimizer rules
-            // are only configured for supported targets. The ordinary inner-join
-            // probe filter is handled by DataFusion 53's native hash-join
-            // dynamic-filter pushdown (no Cayenne-specific physical rule); the
-            // InList budget for it is sized in `configure_hash_join_memory_limits`
-            // above. Windows keeps DataFusion's standard hash-join dynamic filters.
+            // are only configured for supported targets. By default the ordinary
+            // inner-join probe filter is handled by DataFusion 53's native
+            // hash-join dynamic-filter pushdown (no Cayenne-specific physical
+            // rule); the InList budget for it is sized in
+            // `configure_hash_join_memory_limits` above. The opt-in
+            // `CayenneJoinRewriter` below (gated on `exact_join_filter`) restores
+            // the forked exact in-list accumulator path on top of that default.
+            // Windows keeps DataFusion's standard hash-join dynamic filters.
             state = with_cayenne_logical_optimizers(state, self.cayenne_optimizer_rules);
             if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
                 state = state
@@ -683,7 +709,22 @@ impl DataFusionBuilder {
                     CayenneAntiJoinSortMergeRewriter::new(),
                 ));
             }
+            // Opt-in: restores the forked exact in-list join accumulator seam
+            // (`ExactLeftAccumulator`). Off by default — the default path uses
+            // DataFusion 53's native hash-join dynamic-filter pushdown sized by
+            // `configure_hash_join_memory_limits` above. When enabled, clamp the
+            // process-wide shared in-list reservation and register the rewriter
+            // after the sort-merge rewrite so it only touches remaining
+            // `HashJoinExec` nodes.
+            if self.cayenne_optimizer_rules.exact_join_filter() {
+                clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
+                state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+            } else {
+                let _ = exact_join_filter_memory_limit;
+            }
         }
+        #[cfg(windows)]
+        let _ = exact_join_filter_memory_limit;
 
         state = state
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
@@ -1142,6 +1183,7 @@ fn cayenne_optimizer_config(
     sort_merge_min_rows: Option<usize>,
     sort_merge_memory_pool_fraction: Option<f64>,
     effective_memory_limit: u64,
+    exact_join_filter_memory_limit: usize,
 ) -> CayenneOptimizerConfig {
     let mut config = CayenneOptimizerConfig::default();
     if let Some(sort_merge_min_rows) = sort_merge_min_rows {
@@ -1154,7 +1196,25 @@ fn cayenne_optimizer_config(
         Ok(limit) => limit,
         Err(_) => usize::MAX,
     });
+    config.exact_join_filter_max_bytes = exact_join_filter_memory_limit;
     config
+}
+
+/// Fraction (1/N) of the runtime memory limit budgeted for the opt-in
+/// `CayenneJoinRewriter` exact in-list join accumulator.
+const EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR: u64 = 8;
+
+/// Per-query byte budget for the opt-in exact in-list join accumulator, derived
+/// from the runtime memory limit. Only consumed when the `exact_join_filter`
+/// rule is enabled; the default-path native-pushdown cap is sized separately in
+/// `configure_hash_join_memory_limits`.
+fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
+    let limit = effective_memory_limit / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR;
+
+    match usize::try_from(limit) {
+        Ok(limit) => limit,
+        Err(_) => usize::MAX,
+    }
 }
 
 fn hash_join_inlist_memory_limit_per_partition(
@@ -1502,6 +1562,8 @@ mod tests {
         assert_eq!(config.sort_merge_min_rows, 100_000_000);
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
+        // memory_limit 1_024 / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR (8) = 128.
+        assert_eq!(config.exact_join_filter_max_bytes, 128);
     }
 
     #[test]
@@ -1747,6 +1809,8 @@ mod tests {
         dynamic_filter_sharing.set_dynamic_filter_sharing(true);
         let mut anti_join_sort_merge = CayenneOptimizerRules::none();
         anti_join_sort_merge.set_anti_join_sort_merge(true);
+        let mut exact_join_filter = CayenneOptimizerRules::none();
+        exact_join_filter.set_exact_join_filter(true);
 
         let cases = [
             (
@@ -1779,6 +1843,7 @@ mod tests {
                 vec![],
                 vec!["CayenneAntiJoinSortMergeRewriter"],
             ),
+            (exact_join_filter, vec![], vec!["CayenneJoinRewriter"]),
         ];
 
         for (rules, expected_logical_rules, expected_physical_rules) in cases {
@@ -2237,6 +2302,10 @@ mod tests {
             .iter()
             .position(|name| *name == "CayenneAntiJoinSortMergeRewriter")
             .expect("Cayenne anti join sort-merge rewriter should be registered");
+        let cayenne_join_rewriter_position = rule_names
+            .iter()
+            .position(|name| *name == "CayenneJoinRewriter")
+            .expect("Cayenne join rewriter should be registered when exact_join_filter is on");
 
         assert!(
             sanity_check_position < cayenne_filter_sharing_position,
@@ -2245,6 +2314,10 @@ mod tests {
         assert!(
             cayenne_filter_sharing_position < cayenne_anti_sort_merge_position,
             "CayenneDynamicFilterSharing must run before CayenneAntiJoinSortMergeRewriter so same-source joins can receive shared scan filters before any sort-merge rewrite"
+        );
+        assert!(
+            cayenne_anti_sort_merge_position < cayenne_join_rewriter_position,
+            "CayenneJoinRewriter must run after same-source sort-merge rewrites so it only touches remaining HashJoinExec nodes"
         );
     }
 
