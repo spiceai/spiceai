@@ -818,7 +818,7 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
 /// `datafusion-table-providers` [`TpFunctionSupport`] type that
 /// `MySQLTableFactory::with_function_support` expects.
 ///
-/// MySQL's unparser dialect has no Spice-function carve-out (unlike `DuckDB`),
+/// `MySQL`'s unparser dialect has no Spice-function carve-out (unlike `DuckDB`),
 /// so this is the full default deny-list: every built-in Spice UDF plus any
 /// user-registered function. See issue #10703.
 #[must_use]
