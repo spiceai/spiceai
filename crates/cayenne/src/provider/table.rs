@@ -19435,12 +19435,20 @@ mod tests {
         // Append batch A → RAM (epoch 1).
         let write_a = provider
             .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30])),
+                single_batch_stream(id_value_batch(
+                    Arc::clone(&schema),
+                    &[1, 2, 3],
+                    &[10, 20, 30],
+                )),
                 &ctx.task_ctx(),
             )
             .await
             .expect("append A to RAM tier");
-        assert_eq!(write_a.in_memory_epoch(), Some(1), "batch A lands in RAM epoch 1");
+        assert_eq!(
+            write_a.in_memory_epoch(),
+            Some(1),
+            "batch A lands in RAM epoch 1"
+        );
 
         // Concurrently: checkpoint (flushes epoch 1 with encode+commit OFF the
         // fence) AND append batch B with fresh keys (a higher epoch that must
@@ -19451,15 +19459,12 @@ mod tests {
         let append_schema = Arc::clone(&schema);
         let append_task_ctx = ctx.task_ctx();
 
-        let checkpoint = tokio::spawn(async move { checkpoint_provider.checkpoint_mem_tier().await });
+        let checkpoint =
+            tokio::spawn(async move { checkpoint_provider.checkpoint_mem_tier().await });
         let append = tokio::spawn(async move {
             append_provider
                 .write_cdc_append_stream(
-                    single_batch_stream(id_value_batch(
-                        append_schema,
-                        &[4, 5, 6],
-                        &[40, 50, 60],
-                    )),
+                    single_batch_stream(id_value_batch(append_schema, &[4, 5, 6], &[40, 50, 60])),
                     &append_task_ctx,
                 )
                 .await
