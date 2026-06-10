@@ -491,16 +491,19 @@ fn cayenne_compaction_duration_ms() -> &'static Histogram<f64> {
     CAYENNE_COMPACTION_DURATION_MS.get_or_init(|| {
         cayenne_operational_meter()
             .f64_histogram("cayenne_compaction_duration_ms")
-            .with_description("Wall-clock time of Cayenne background compaction passes.")
+            .with_description(
+                "Wall-clock time of Cayenne compaction passes (kind=full current-snapshot rewrite | subset protected-snapshot merge).",
+            )
             .with_unit("ms")
             .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
             .build()
     })
 }
 
-/// Records the wall-clock duration of a Cayenne background compaction pass.
-/// `dimensions` should carry `table` and `result` (`"completed"` | `"failed"`).
-/// The histogram's count doubles as the compaction-pass counter.
+/// Records the wall-clock duration of a Cayenne compaction pass. `dimensions`
+/// should carry `table`, `kind` (`"full"` current-snapshot rewrite | `"subset"`
+/// protected-snapshot merge), and `result` (`"completed"` | `"failed"`). The
+/// histogram's count doubles as the per-kind compaction-pass counter.
 pub fn track_cayenne_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
     cayenne_compaction_duration_ms().record(duration.as_secs_f64() * 1000.0, dimensions);
 }
@@ -543,6 +546,7 @@ fn cayenne_compaction_memory_exhausted() -> &'static Counter<u64> {
 /// Counts compaction passes that failed because the dedicated compaction memory
 /// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
 /// means the carve fraction is too small for the rewrite working set.
+/// `dimensions` should carry `table` and `kind` (`"full"` | `"subset"`).
 pub fn track_cayenne_compaction_memory_exhausted(dimensions: &[KeyValue]) {
     cayenne_compaction_memory_exhausted().add(1, dimensions);
 }
@@ -880,7 +884,9 @@ static CAYENNE_COMPACTION_MERGED_BYTES: OnceLock<Histogram<u64>> = OnceLock::new
 /// output (≈ the resulting compacted file size). Compare its distribution
 /// against `cayenne_autotune_target_file_size_mb` to see whether compaction is
 /// trending to the target file size or stalling below it (a read-amplification
-/// signal the adaptive tuner cares about). `dimensions` should carry `table`.
+/// signal the adaptive tuner cares about). `dimensions` should carry `table`
+/// and `kind` (currently always `"subset"` — the full current-snapshot rewrite
+/// path does not yet emit this metric).
 pub fn track_cayenne_compaction_merged_bytes(bytes: u64, dimensions: &[KeyValue]) {
     const MIB: f64 = 1024.0 * 1024.0;
     CAYENNE_COMPACTION_MERGED_BYTES
