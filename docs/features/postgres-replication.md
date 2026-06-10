@@ -124,6 +124,8 @@ All replication-specific parameters live under `params:` on the dataset and star
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
 
+Connection footprint: a `refresh_mode: changes` dataset uses its regular connection pool only for schema probes at initialization — replication itself runs over dedicated connections (setup, snapshot, and the WAL stream). The pool therefore defaults to `pg_connection_pool_size: 2` with `pg_connection_pool_min_idle: 0` for changes-mode datasets, so N CDC datasets hold no idle pool connections at steady state. Set either parameter explicitly to override.
+
 ### Runtime CDC apply tuning
 
 For high-throughput catch-up workloads, the runtime CDC apply loop can be tuned under `runtime.params`:
