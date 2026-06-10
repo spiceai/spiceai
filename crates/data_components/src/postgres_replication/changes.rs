@@ -24,11 +24,12 @@ use arrow::{
     array::{
         ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
         Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder,
-        ListArray, RecordBatch, StringArray, StringBuilder, StructArray, Time64NanosecondBuilder,
-        TimestampMicrosecondBuilder, TimestampNanosecondBuilder, UInt32Builder,
+        ListArray, RecordBatch, StringArray, StringBuilder, StringDictionaryBuilder, StructArray,
+        Time64NanosecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
+        UInt32Builder,
     },
     buffer::OffsetBuffer,
-    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, Int8Type, Int16Type, Int32Type, Schema, SchemaRef, TimeUnit},
 };
 use async_trait::async_trait;
 
@@ -302,7 +303,10 @@ impl CommitChange for LsnCommitter {
 /// Type coverage matches what `datafusion-table-providers`' Postgres provider
 /// exposes via `read_provider()` — the dataset's Arrow schema flows through
 /// that path, so mismatches here would fail `StructArray` validation.
-enum FieldBuilder {
+///
+/// `pub(super)` so the bootstrap path can reuse it for array columns (which it
+/// fetches as `::text` literals — the same representation pgoutput delivers).
+pub(super) enum FieldBuilder {
     Utf8(StringBuilder),
     LargeUtf8(LargeStringBuilder),
     Binary(BinaryBuilder),
@@ -320,10 +324,28 @@ enum FieldBuilder {
     TimestampNanos(TimestampNanosecondBuilder, Option<Arc<str>>),
     /// `Decimal128(precision, scale)`
     Decimal128(Decimal128Builder, u8, i8),
+    /// Dictionary-encoded string column — the Postgres provider maps ENUM
+    /// columns to `Dictionary(Int8, Utf8)`. Values arrive as the enum's text
+    /// label (pgoutput text format / `::text` on bootstrap).
+    DictUtf8Int8(StringDictionaryBuilder<Int8Type>),
+    DictUtf8Int16(StringDictionaryBuilder<Int16Type>),
+    DictUtf8Int32(StringDictionaryBuilder<Int32Type>),
+    /// Postgres array column (e.g. `text[]`, `int4[]`). Values arrive as
+    /// Postgres array literals (`{a,"b c",NULL}`) — pgoutput's text format on
+    /// the WAL path, and an explicit `::text` cast on the bootstrap path —
+    /// and are parsed element-wise into the inner scalar builder.
+    List {
+        /// The dataset schema's exact element field — `ListArray` validation
+        /// requires the produced child to match it precisely.
+        item_field: Arc<Field>,
+        inner: Box<FieldBuilder>,
+        offsets: Vec<i32>,
+        validity: Vec<bool>,
+    },
 }
 
 impl FieldBuilder {
-    fn new(data_type: &DataType) -> Result<Self> {
+    pub(super) fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
             DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
@@ -351,16 +373,52 @@ impl FieldBuilder {
                 *precision,
                 *scale,
             ),
-            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            DataType::List(item_field) => {
+                if matches!(
+                    item_field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+                ) {
+                    return PgOutputDecodeSnafu {
+                        message: format!(
+                            "postgres_replication: multidimensional arrays are not supported \
+                             ({data_type}). Cast the column to a scalar type on the source, \
+                             or exclude the column from the dataset schema."
+                        ),
+                    }
+                    .fail();
+                }
+                Self::List {
+                    item_field: Arc::clone(item_field),
+                    inner: Box::new(Self::new(item_field.data_type())?),
+                    offsets: vec![0],
+                    validity: Vec::new(),
+                }
+            }
+            DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
                 return PgOutputDecodeSnafu {
                     message: format!(
-                        "postgres_replication: array/list types are not supported yet \
-                         ({data_type}). Cast the column to a scalar type on the source, \
-                         or exclude the column from the dataset schema."
+                        "postgres_replication: list type {data_type} is not supported yet. \
+                         Cast the column to a scalar type on the source, or exclude the \
+                         column from the dataset schema."
                     ),
                 }
                 .fail();
             }
+            // The Postgres provider maps ENUM columns to Dictionary(Int8, Utf8).
+            DataType::Dictionary(key, value) if **value == DataType::Utf8 => match **key {
+                DataType::Int8 => Self::DictUtf8Int8(StringDictionaryBuilder::new()),
+                DataType::Int16 => Self::DictUtf8Int16(StringDictionaryBuilder::new()),
+                DataType::Int32 => Self::DictUtf8Int32(StringDictionaryBuilder::new()),
+                ref other => {
+                    return PgOutputDecodeSnafu {
+                        message: format!(
+                            "postgres_replication: unsupported dictionary key type {other} \
+                             (only Int8/Int16/Int32 keys with Utf8 values are supported)"
+                        ),
+                    }
+                    .fail();
+                }
+            },
             DataType::Interval(_) => {
                 return PgOutputDecodeSnafu {
                     message: "postgres_replication: INTERVAL columns are not supported yet. \
@@ -380,7 +438,7 @@ impl FieldBuilder {
         })
     }
 
-    fn append(&mut self, value: Option<&Value>, op: ChangeOp) -> Result<()> {
+    pub(super) fn append(&mut self, value: Option<&Value>, op: ChangeOp) -> Result<()> {
         let Some(v) = value else {
             self.append_null();
             return Ok(());
@@ -506,11 +564,59 @@ impl FieldBuilder {
                 let val = parse_pg_numeric_to_i128(s, *precision, *scale)?;
                 b.append_value(val);
             }
+            Self::DictUtf8Int8(b) => {
+                b.append(s).map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("dictionary append '{s}': {e}"),
+                })?;
+            }
+            Self::DictUtf8Int16(b) => {
+                b.append(s).map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("dictionary append '{s}': {e}"),
+                })?;
+            }
+            Self::DictUtf8Int32(b) => {
+                b.append(s).map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("dictionary append '{s}': {e}"),
+                })?;
+            }
+            Self::List {
+                item_field,
+                inner,
+                offsets,
+                validity,
+            } => {
+                let elements = parse_pg_array_literal(s)?;
+                for element in &elements {
+                    match element {
+                        Some(text) => {
+                            let value = Value::Text(text.clone());
+                            inner.append(Some(&value), op)?;
+                        }
+                        None if item_field.is_nullable() => inner.append(None, op)?,
+                        None => {
+                            return PgOutputDecodeSnafu {
+                                message: format!(
+                                    "NULL array element for non-nullable list item field \
+                                     `{}`",
+                                    item_field.name()
+                                ),
+                            }
+                            .fail();
+                        }
+                    }
+                }
+                let end = offsets.last().copied().unwrap_or(0)
+                    + i32::try_from(elements.len()).map_err(|e| super::Error::PgOutputDecode {
+                        message: format!("array too large: {e}"),
+                    })?;
+                offsets.push(end);
+                validity.push(true);
+            }
         }
         Ok(())
     }
 
-    fn append_null(&mut self) {
+    pub(super) fn append_null(&mut self) {
         match self {
             Self::Utf8(b) => b.append_null(),
             Self::LargeUtf8(b) => b.append_null(),
@@ -528,10 +634,20 @@ impl FieldBuilder {
             Self::TimestampMicros(b, _) => b.append_null(),
             Self::TimestampNanos(b, _) => b.append_null(),
             Self::Decimal128(b, _, _) => b.append_null(),
+            Self::DictUtf8Int8(b) => b.append_null(),
+            Self::DictUtf8Int16(b) => b.append_null(),
+            Self::DictUtf8Int32(b) => b.append_null(),
+            Self::List {
+                offsets, validity, ..
+            } => {
+                // NULL array: empty slot, validity false.
+                offsets.push(offsets.last().copied().unwrap_or(0));
+                validity.push(false);
+            }
         }
     }
 
-    fn finish(mut self) -> ArrayRef {
+    pub(super) fn finish(mut self) -> ArrayRef {
         match &mut self {
             Self::Utf8(b) => Arc::new(b.finish()),
             Self::LargeUtf8(b) => Arc::new(b.finish()),
@@ -561,8 +677,111 @@ impl FieldBuilder {
                 })
             }
             Self::Decimal128(b, _, _) => Arc::new(b.finish()),
+            Self::DictUtf8Int8(b) => Arc::new(b.finish()),
+            Self::DictUtf8Int16(b) => Arc::new(b.finish()),
+            Self::DictUtf8Int32(b) => Arc::new(b.finish()),
+            Self::List {
+                item_field,
+                inner,
+                offsets,
+                validity,
+            } => {
+                let values =
+                    std::mem::replace(inner, Box::new(FieldBuilder::Utf8(StringBuilder::new())))
+                        .finish();
+                let nulls = if validity.iter().all(|v| *v) {
+                    None
+                } else {
+                    Some(arrow::buffer::NullBuffer::from(std::mem::take(validity)))
+                };
+                Arc::new(ListArray::new(
+                    Arc::clone(item_field),
+                    OffsetBuffer::new(std::mem::take(offsets).into()),
+                    values,
+                    nulls,
+                ))
+            }
         }
     }
+}
+
+/// Parse a Postgres array literal (the text representation pgoutput emits and
+/// `::text` produces), e.g. `{a,"b c",NULL,"quo\"te"}`, into its elements.
+/// `None` represents a NULL element.
+///
+/// Handles: empty arrays (`{}`), double-quoted elements with `\"` / `\\`
+/// escapes, unquoted `NULL` (case-insensitive), and a dimension-bounds prefix
+/// (`[0:1]={...}`). Multidimensional arrays (nested `{`) are rejected — the
+/// Arrow side only supports single-level lists.
+fn parse_pg_array_literal(s: &str) -> Result<Vec<Option<String>>> {
+    let err = |reason: &str| super::Error::PgOutputDecode {
+        message: format!("postgres array literal parse '{s}': {reason}"),
+    };
+
+    // Arrays with non-default lower bounds are prefixed: `[0:1]={a,b}`.
+    let trimmed = s.trim();
+    let body = if let Some(rest) = trimmed.strip_prefix('[') {
+        let eq = rest
+            .find("]=")
+            .ok_or_else(|| err("unterminated bounds prefix"))?;
+        &rest[eq + 2..]
+    } else {
+        trimmed
+    };
+    let body = body
+        .strip_prefix('{')
+        .and_then(|b| b.strip_suffix('}'))
+        .ok_or_else(|| err("expected {...}"))?;
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut chars = body.chars();
+    let mut in_quotes = false;
+    let mut was_quoted = false;
+
+    let finish_element =
+        |current: &mut String, was_quoted: bool, elements: &mut Vec<Option<String>>| {
+            let text = std::mem::take(current);
+            if !was_quoted && text.eq_ignore_ascii_case("NULL") {
+                elements.push(None);
+            } else {
+                elements.push(Some(text));
+            }
+        };
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            match ch {
+                '\\' => {
+                    let escaped = chars.next().ok_or_else(|| err("dangling escape"))?;
+                    current.push(escaped);
+                }
+                '"' => in_quotes = false,
+                other => current.push(other),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_quotes = true;
+                was_quoted = true;
+            }
+            ',' => {
+                finish_element(&mut current, was_quoted, &mut elements);
+                was_quoted = false;
+            }
+            '{' => return Err(err("multidimensional arrays are not supported")),
+            other => current.push(other),
+        }
+    }
+    if in_quotes {
+        return Err(err("unterminated quoted element"));
+    }
+    finish_element(&mut current, was_quoted, &mut elements);
+    Ok(elements)
 }
 
 fn parse_pg_date_days_since_epoch(s: &str) -> Result<i32> {
@@ -1340,20 +1559,178 @@ mod tests {
     }
 
     #[test]
-    fn fieldbuilder_rejects_arrays_with_actionable_error() {
-        let field = Field::new(
-            "v",
+    fn fieldbuilder_rejects_nested_arrays_with_actionable_error() {
+        // Single-level arrays are supported; multidimensional ones are not.
+        let nested = DataType::List(Arc::new(Field::new(
+            "item",
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
-        );
-        let Err(err) = FieldBuilder::new(field.data_type()) else {
-            panic!("expected List rejection");
+        )));
+        let Err(err) = FieldBuilder::new(&nested) else {
+            panic!("expected nested-List rejection");
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("array/list types are not supported"),
+            msg.contains("multidimensional arrays are not supported"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn pg_array_literal_parses_standard_cases() {
+        assert_eq!(
+            parse_pg_array_literal("{}").expect("empty"),
+            Vec::<Option<String>>::new()
+        );
+        assert_eq!(
+            parse_pg_array_literal("{a,b,c}").expect("plain"),
+            vec![
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("c".to_string())
+            ]
+        );
+        // Quoted elements: embedded commas, escaped quotes/backslashes, and a
+        // literal "NULL" string (quoted ⇒ not a NULL element).
+        assert_eq!(
+            parse_pg_array_literal(r#"{"b c","quo\"te","back\\slash",NULL,"NULL"}"#)
+                .expect("quoted"),
+            vec![
+                Some("b c".to_string()),
+                Some("quo\"te".to_string()),
+                Some("back\\slash".to_string()),
+                None,
+                Some("NULL".to_string())
+            ]
+        );
+        // Dimension-bounds prefix.
+        assert_eq!(
+            parse_pg_array_literal("[0:1]={x,y}").expect("bounds"),
+            vec![Some("x".to_string()), Some("y".to_string())]
+        );
+    }
+
+    #[test]
+    fn pg_array_literal_rejects_malformed() {
+        for bad in [
+            "not-an-array",
+            "{unterminated",
+            r#"{"open}"#,
+            "{{1,2},{3,4}}",
+        ] {
+            parse_pg_array_literal(bad).expect_err(bad);
+        }
+    }
+
+    #[test]
+    fn fieldbuilder_builds_text_and_int_arrays() {
+        let rel = single_col_relation("v");
+        // text[] → List(Utf8)
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+        let batch = build_change_batch(
+            &schema,
+            &rel,
+            &[single_col_change(
+                ChangeOp::Create,
+                "v",
+                r#"{red,"b c",NULL}"#,
+            )],
+        )
+        .expect("build text[]");
+        let col = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("v")
+            .expect("v")
+            .as_list::<i32>()
+            .value(0);
+        let items = col.as_string::<i32>();
+        assert_eq!(items.value(0), "red");
+        assert_eq!(items.value(1), "b c");
+        assert!(items.is_null(2));
+
+        // int4[] → List(Int32)
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]));
+        let batch = build_change_batch(
+            &schema,
+            &rel,
+            &[
+                single_col_change(ChangeOp::Create, "v", "{1,2,3}"),
+                // NULL array (whole column value).
+                DecodedChange {
+                    op: ChangeOp::Create,
+                    row: TupleData {
+                        columns: vec![None],
+                    },
+                },
+            ],
+        )
+        .expect("build int[]");
+        let lists = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("v")
+            .expect("v")
+            .as_list::<i32>()
+            .clone();
+        let first = lists.value(0);
+        let ints = first.as_primitive::<arrow::datatypes::Int32Type>();
+        assert_eq!(ints.values(), &[1, 2, 3]);
+        assert!(lists.is_null(1), "NULL array value must be a null list");
+    }
+
+    #[test]
+    fn fieldbuilder_builds_dictionary_enum_column() {
+        // Postgres ENUM columns map to Dictionary(Int8, Utf8) in the dataset
+        // schema; pgoutput delivers the enum's text label.
+        let rel = single_col_relation("v");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = build_change_batch(
+            &schema,
+            &rel,
+            &[
+                single_col_change(ChangeOp::Create, "v", "active"),
+                single_col_change(ChangeOp::Create, "v", "paused"),
+                DecodedChange {
+                    op: ChangeOp::Create,
+                    row: TupleData {
+                        columns: vec![None],
+                    },
+                },
+                single_col_change(ChangeOp::Create, "v", "active"),
+            ],
+        )
+        .expect("build enum dictionary");
+        let dict = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("v")
+            .expect("v")
+            .as_dictionary::<Int8Type>()
+            .clone();
+        let values = dict.values().as_string::<i32>();
+        assert_eq!(values.value(dict.key(0).expect("key 0")), "active");
+        assert_eq!(values.value(dict.key(1).expect("key 1")), "paused");
+        assert!(dict.is_null(2));
+        assert_eq!(values.value(dict.key(3).expect("key 3")), "active");
     }
 
     #[test]

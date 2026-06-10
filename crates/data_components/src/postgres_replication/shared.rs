@@ -631,14 +631,19 @@ async fn attach_member(
         "dataset joined shared replication slot"
     );
 
-    if source.pump_started.swap(true, Ordering::AcqRel) {
-        // Pump already running: it must reconnect so Postgres re-sends
-        // Relation messages for (and, on rejoin, replays held WAL to) the new
-        // member. Joins coalesce — the flag is cleared once per reconnect.
-        source.restart_requested.store(true, Ordering::Release);
-    } else {
+    if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
         tokio::spawn(run_pump(pump_source));
+    } else if !snapshotting {
+        // A resuming/rejoining member needs the pump to reconnect so Postgres
+        // re-sends Relation messages (and replays its held WAL) — joins
+        // coalesce; the flag is cleared once per reconnect. A snapshotting
+        // member does NOT: it stays held until its snapshot completes, and
+        // the completion hook requests the reconnect then. Skipping the
+        // join-time reconnect also keeps a crash-looping member (e.g. a
+        // snapshot that keeps failing on an unsupported column) from forcing
+        // a reconnect storm on the healthy members.
+        source.restart_requested.store(true, Ordering::Release);
     }
 
     // Head of the member's stream: initial snapshot (its last envelope flips

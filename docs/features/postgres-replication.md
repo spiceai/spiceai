@@ -473,6 +473,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 - **One table per dataset.** Each Spice dataset replicates exactly one source table. By default each dataset gets its own slot and publication; datasets that name the same `pg_replication_slot` share one slot, publication, and replication connection (see [Sharing one slot across multiple datasets](#sharing-one-slot-across-multiple-datasets)).
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
+- **Multidimensional arrays are not supported.** Single-level arrays (`text[]`, `int4[]`, ...), enums, `uuid`, and `json`/`jsonb` columns replicate fine; nested arrays (`text[][]`) must be cast to a scalar on the source or excluded from the dataset.
 - **Arrow engine** supports `on_conflict` upserts when a primary key is configured. Without a primary key, `UPDATE`s appear as additional inserts rather than replacing existing rows. `DELETE` and `TRUNCATE` are applied.
 
 ## Comparison with Debezium + Kafka

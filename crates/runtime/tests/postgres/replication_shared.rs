@@ -78,15 +78,107 @@ fn shared_params(port: u16) -> ReplicationParams {
 }
 
 fn input_for(port: u16, table: &str) -> ReplicationStreamInput {
+    input_with_schema(port, table, dataset_schema())
+}
+
+fn input_with_schema(port: u16, table: &str, schema: SchemaRef) -> ReplicationStreamInput {
     ReplicationStreamInput {
         dataset_name: table.to_string(),
         params: shared_params(port),
-        schema: dataset_schema(),
+        schema,
         primary_keys: vec!["id".into()],
         schema_name: "public".into(),
         table_name: table.to_string(),
         metrics: ReplicationMetricsCollector::new(),
     }
+}
+
+/// Schema for the late-added table, exercising the non-scalar column support:
+/// a `text[]` array (List), a Postgres ENUM (Dictionary), a `uuid` (Arrow
+/// Utf8 but a non-text wire type), and a `numeric` (Decimal128).
+fn rich_dataset_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new(
+            "status",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        ),
+        Field::new("uid", DataType::Utf8, true),
+        Field::new("score", DataType::Decimal128(10, 2), true),
+    ]))
+}
+
+fn string_col_of(envelope: &ChangeEnvelope, column: &str, row: usize) -> String {
+    envelope
+        .change_batch
+        .record
+        .column_by_name("data")
+        .expect("data column")
+        .as_struct()
+        .column_by_name(column)
+        .unwrap_or_else(|| panic!("{column} column"))
+        .as_string::<i32>()
+        .value(row)
+        .to_string()
+}
+
+fn score_of(envelope: &ChangeEnvelope, row: usize) -> i128 {
+    envelope
+        .change_batch
+        .record
+        .column_by_name("data")
+        .expect("data column")
+        .as_struct()
+        .column_by_name("score")
+        .expect("score column")
+        .as_primitive::<arrow::datatypes::Decimal128Type>()
+        .value(row)
+}
+
+fn tags_of(envelope: &ChangeEnvelope, row: usize) -> Vec<Option<String>> {
+    let data = envelope
+        .change_batch
+        .record
+        .column_by_name("data")
+        .expect("data column");
+    let list = data
+        .as_struct()
+        .column_by_name("tags")
+        .expect("tags column")
+        .as_list::<i32>()
+        .value(row);
+    let items = list.as_string::<i32>();
+    (0..items.len())
+        .map(|i| {
+            if items.is_null(i) {
+                None
+            } else {
+                Some(items.value(i).to_string())
+            }
+        })
+        .collect()
+}
+
+fn status_of(envelope: &ChangeEnvelope, row: usize) -> String {
+    let data = envelope
+        .change_batch
+        .record
+        .column_by_name("data")
+        .expect("data column");
+    let dict = data
+        .as_struct()
+        .column_by_name("status")
+        .expect("status column")
+        .as_dictionary::<arrow::datatypes::Int8Type>();
+    let values = dict.values().as_string::<i32>();
+    values.value(dict.key(row).expect("status key")).to_string()
 }
 
 async fn pg_client(port: u16) -> Result<tokio_postgres::Client, anyhow::Error> {
@@ -321,11 +413,42 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     expect_single_change(&mut stream_b, "cross-txn b", "c", 21).await?;
 
     // --- 5. Late-added dataset: publication gains the table + snapshot. ---
-    create_table(&source, "shared_repl_c", &[(100, "c100")]).await?;
-    let mut stream_c = start_replication_stream(input_for(port, "shared_repl_c"));
+    // The table also carries a `text[]` array and an ENUM column — the
+    // non-scalar types the replication path must handle on both the snapshot
+    // (`::text` fetch) and WAL (pgoutput text format) sides.
+    source
+        .simple_query(
+            "DROP TABLE IF EXISTS public.shared_repl_c; \
+             DROP TYPE IF EXISTS shared_repl_mood; \
+             CREATE TYPE shared_repl_mood AS ENUM ('active', 'paused'); \
+             CREATE TABLE public.shared_repl_c (\
+                 id int PRIMARY KEY, name text, tags text[], status shared_repl_mood, \
+                 uid uuid, score numeric(10,2)); \
+             INSERT INTO public.shared_repl_c \
+                 VALUES (100, 'c100', '{x,\"y z\"}', 'active', \
+                         '11111111-2222-3333-4444-555555555555', 10.50);",
+        )
+        .await?;
+    let mut stream_c = start_replication_stream(input_with_schema(
+        port,
+        "shared_repl_c",
+        rich_dataset_schema(),
+    ));
     let boot_c = next_envelope(&mut stream_c, "bootstrap c").await?;
     assert_eq!(boot_c.change_batch.record.num_rows(), 1, "bootstrap c rows");
     assert!(boot_c.is_dataset_ready(), "bootstrap c must mark ready");
+    assert_eq!(
+        tags_of(&boot_c, 0),
+        vec![Some("x".to_string()), Some("y z".to_string())],
+        "bootstrap c array column"
+    );
+    assert_eq!(status_of(&boot_c, 0), "active", "bootstrap c enum column");
+    assert_eq!(
+        string_col_of(&boot_c, "uid", 0),
+        "11111111-2222-3333-4444-555555555555",
+        "bootstrap c uuid column (non-text wire type → Utf8)"
+    );
+    assert_eq!(score_of(&boot_c, 0), 1050, "bootstrap c numeric column");
     boot_c.commit().await?;
 
     assert_eq!(slot_count(&source).await?, 1, "still exactly one slot");
@@ -336,9 +459,28 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     );
 
     source
-        .simple_query("INSERT INTO public.shared_repl_c VALUES (101, 'c101')")
+        .simple_query(
+            "INSERT INTO public.shared_repl_c \
+             VALUES (101, 'c101', ARRAY['blue', NULL], 'paused', \
+                     'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 99.99)",
+        )
         .await?;
-    expect_single_change(&mut stream_c, "insert c", "c", 101).await?;
+    let live_c = next_envelope(&mut stream_c, "insert c").await?;
+    assert_eq!(ops_of(&live_c), vec!["c".to_string()], "insert c: op");
+    assert_eq!(ids_of(&live_c), vec![101], "insert c: id");
+    assert_eq!(
+        tags_of(&live_c, 0),
+        vec![Some("blue".to_string()), None],
+        "WAL-path array column (with NULL element)"
+    );
+    assert_eq!(status_of(&live_c, 0), "paused", "WAL-path enum column");
+    assert_eq!(
+        string_col_of(&live_c, "uid", 0),
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "WAL-path uuid column"
+    );
+    assert_eq!(score_of(&live_c, 0), 9999, "WAL-path numeric column");
+    live_c.commit().await?;
 
     // No cross-routing: the next change for `a` arrives on stream_a with only
     // `a` rows, despite the c-traffic in between.
