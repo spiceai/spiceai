@@ -112,11 +112,14 @@ pub enum RuntimePriority {
 }
 
 impl RuntimePriority {
-    /// Translate the tier to a Unix `nice` value, or `None` to leave the OS
+    /// Translate the tier to a Linux `nice` value, or `None` to leave the OS
     /// default untouched. `nice` ranges from -20 (highest) to 19 (lowest); we
     /// only ever lower priority (non-negative values), so no `CAP_SYS_NICE` is
     /// required.
-    #[cfg(unix)]
+    ///
+    /// Linux-only because the priority is applied per worker *thread*, which
+    /// only `nice` semantics on Linux provide (see [`ManagedTokioRuntimeBuilder::build`]).
+    #[cfg(target_os = "linux")]
     fn nice_value(self) -> Option<i32> {
         match self {
             Self::Normal => None,
@@ -128,6 +131,7 @@ impl RuntimePriority {
 
 /// Builder for [`ManagedTokioRuntime`] with configuration options.
 pub struct ManagedTokioRuntimeBuilder {
+    // Only consumed on Linux, where worker-thread priority is applied; see `build`.
     priority: RuntimePriority,
     thread_name: Option<String>,
 }
@@ -182,18 +186,22 @@ impl ManagedTokioRuntimeBuilder {
             builder.thread_name(name);
         }
 
-        // Apply the worker-thread priority tier (Unix only). A Reduced/Background
-        // tier lowers this runtime's scheduling priority relative to the
-        // default-priority (nice 0) primary runtime without starving it: CFS
-        // keeps scheduling these threads, just with a smaller CPU-time weight
-        // when cores are contended.
-        #[cfg(unix)]
+        // Apply the worker-thread priority tier. A Reduced/Background tier lowers
+        // this runtime's scheduling priority relative to the default-priority
+        // (nice 0) primary runtime without starving it: CFS keeps scheduling
+        // these threads, just with a smaller CPU-time weight when cores are
+        // contended.
+        //
+        // Linux only: there `nice` is per-task, so calling `setpriority` with
+        // `who = 0` from `on_thread_start` lowers only THIS worker thread. On
+        // macOS/BSD `PRIO_PROCESS` is process-wide, so the first worker to start
+        // would renice the entire `spiced` process — including the primary
+        // HTTP/health runtime — defeating the isolation. We therefore leave
+        // priority at the OS default on non-Linux platforms.
+        #[cfg(target_os = "linux")]
         if let Some(nice) = self.priority.nice_value() {
             builder.on_thread_start(move || {
-                // `who = 0` targets the calling thread on Linux (niceness is
-                // per-task there), so each worker thread sets its own nice value
-                // as it starts.
-                // SAFETY: setpriority is safe to call with PRIO_PROCESS and 0.
+                // SAFETY: setpriority is safe to call with PRIO_PROCESS and who = 0.
                 unsafe {
                     libc::setpriority(libc::PRIO_PROCESS, 0, nice);
                 }
