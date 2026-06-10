@@ -65,7 +65,13 @@ runs:
       id: commit-sha
       shell: bash
       run: |
-        echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+        # Key the cache/MinIO artifact by the actually checked-out commit, not
+        # github.sha. The scheduled dispatch builds a branch matrix (trunk +
+        # release/x.y) where every leg shares one github.sha (the trigger SHA),
+        # so keying by github.sha makes the release/x.y leg publish its binary
+        # under trunk's SHA
+        sha="$(git rev-parse HEAD 2>/dev/null || echo "${{ github.sha }}")"
+        echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Download spicepod-validator from MinIO
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
