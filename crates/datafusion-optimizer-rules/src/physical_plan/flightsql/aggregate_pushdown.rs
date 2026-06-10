@@ -36,7 +36,6 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -225,12 +224,18 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 /// Walk through single-input pass-through nodes to find a `FlightSqlExec`.
 ///
 /// Recognised pass-through nodes (single input, no semantic change for pushdown):
-/// - `FilterExec` — the underlying `FlightSqlExec` already carries the filter in
-///   its SQL; the `FilterExec` is a redundant safety layer added by `DataFusion`.
 /// - `RepartitionExec` — only shuffles partitions, no data change.
 /// - Name-identified nodes in [`PASS_THROUGH_EXEC_NAMES`] (`CooperativeExec`,
 ///   `BytesProcessedExec`) — defined in upstream crates, not available for
 ///   downcasting.
+///
+/// `FilterExec` is deliberately NOT pass-through. `FlightSQLTable` reports
+/// filter pushdown as `Exact` (predicate absorbed into the scan SQL, no
+/// `FilterExec` planned) or `Unsupported` (predicate stays in the plan as a
+/// `FilterExec` and is NOT in the scan SQL) — it never reports `Inexact`. A
+/// `FilterExec` here therefore always carries a predicate the pushed-down
+/// aggregation SQL would lose, and the rewrite would silently aggregate over
+/// unfiltered rows. Bail and keep the local partial aggregate instead.
 ///
 /// Returns `None` if the chain contains a multi-input node or an unrecognised
 /// node, or terminates at a non-`FlightSqlExec`.
@@ -246,8 +251,7 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
             return None;
         }
 
-        if current.as_any().downcast_ref::<FilterExec>().is_some()
-            || current.as_any().downcast_ref::<RepartitionExec>().is_some()
+        if current.as_any().downcast_ref::<RepartitionExec>().is_some()
             || PASS_THROUGH_EXEC_NAMES.contains(&current.name())
         {
             current = children[0];
@@ -1052,6 +1056,40 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
             Arc::new(MockNonFlightExec::new(Arc::clone(&schema))),
         ]);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+        )?);
+        Ok(())
+    }
+
+    /// A `FilterExec` above a federated scan holds a predicate that is NOT in
+    /// the scan's SQL (`FlightSQLTable` pushdown is `Exact` or `Unsupported`,
+    /// never `Inexact`). Pushing the partial aggregate through it would
+    /// silently aggregate over unfiltered rows, so the rule must bail.
+    #[tokio::test]
+    async fn test_no_pushdown_filter_exec_above_scan() -> Result<()> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = lineitem_schema();
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("l_returnflag", 3)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8View(Some("A".to_string())))),
+        ));
+        let filtered_scan = Arc::new(FilterExec::try_new(
+            predicate,
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        )?) as Arc<dyn ExecutionPlan>;
+        let input = make_union(vec![filtered_scan]);
         assert_no_pushdown(partial_aggregate(
             input,
             &[(3, "l_returnflag")],
