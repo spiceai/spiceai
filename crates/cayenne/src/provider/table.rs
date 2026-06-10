@@ -4715,14 +4715,7 @@ impl CayenneTableProvider {
         runtime_env: Arc<RuntimeEnv>,
         context: Option<Arc<CayenneContext>>,
     ) -> CatalogResult<Self> {
-        let mut table_metadata = catalog.get_table(table_name).await?;
-        // Extended-inference hints (`spice.inferred_*`) are consumed once, at
-        // acceleration setup, to fill unspecified settings and seed tuning;
-        // retaining them on the metadata would lead to schema mismatch errors
-        // during joins on tables with varying inference states.
-        table_metadata.schema = data_components::inferred_schema::schema_without_inferred_metadata(
-            &table_metadata.schema,
-        );
+        let table_metadata = catalog.get_table(table_name).await?;
 
         // Use the provided context (for partition cache sharing) or build a
         // fresh one from this table's VortexConfig and the shared RuntimeEnv.
