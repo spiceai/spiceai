@@ -43,6 +43,10 @@ pub struct WalStreamInput {
     pub start_lsn: u64,
     pub schema: SchemaRef,
     pub primary_keys: Vec<String>,
+    /// `GENERATED` columns of the source table — absent from pgoutput
+    /// `Relation` messages by Postgres design; tolerated during schema
+    /// validation and applied as NULL.
+    pub generated_columns: Vec<String>,
     pub dataset_name: String,
     /// When `true`, the first envelope emitted will signal the dataset as
     /// ready — used when we skip bootstrap (existing slot resume path).
@@ -136,11 +140,17 @@ fn wal_stream(
     let schema = input.schema;
     let dataset_name = input.dataset_name;
     let primary_keys = input.primary_keys;
+    let generated_columns = input.generated_columns;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
     let mark_ready_on_first = input.is_dataset_ready_on_first_event;
     let metrics = input.metrics;
 
     try_stream! {
+        // Capture the CDC shutdown epoch at stream start: this stream stops
+        // when the epoch advances (this Runtime began shutting down), while
+        // streams started by a later Runtime in the same process capture the
+        // newer epoch and are unaffected.
+        let shutdown_epoch = crate::cdc::shutdown_epoch();
         let mut first_emitted = !mark_ready_on_first;
         // If the caller passed `None`, the upfront connect failed transiently
         // (see `start_wal_stream`) — count it as a prior failure so the next
@@ -162,7 +172,7 @@ fn wal_stream(
         // reaches a natural end (rare — Postgres replication slots are
         // indefinite). Transient errors drop the current client and restart.
         'reconnect: loop {
-            if crate::cdc::is_shutting_down() {
+            if crate::cdc::shutdown_epoch() != shutdown_epoch {
                 tracing::info!(
                     dataset = %dataset_name,
                     "runtime shutdown; releasing replication connection and slot"
@@ -216,7 +226,7 @@ fn wal_stream(
             let mut txn: Option<TransactionBuffer> = None;
 
         'recv: loop {
-            if crate::cdc::is_shutting_down() {
+            if crate::cdc::shutdown_epoch() != shutdown_epoch {
                 // Release the walsender (and the slot it holds) now rather
                 // than at process exit — the shutdown drain phase can keep
                 // the process alive for tens of seconds. Checked per event,
@@ -275,6 +285,7 @@ fn wal_stream(
                                 &schema,
                                 &rel,
                                 &primary_keys,
+                                &generated_columns,
                             ) {
                                 metrics.inc_schema_mismatch_error();
                                 Err(StreamError::External(format!(
@@ -543,9 +554,17 @@ pub(crate) fn validate_relation_against_schema(
     dataset_schema: &SchemaRef,
     rel: &super::pgoutput::Relation,
     declared_pks: &[String],
+    generated_columns: &[String],
 ) -> Result<()> {
     for field in dataset_schema.fields() {
         if !rel.columns.iter().any(|c| c.name == *field.name()) {
+            // GENERATED columns are absent from pgoutput Relation messages by
+            // Postgres design — they're catalog-confirmed at setup, so their
+            // absence here is expected (applied as NULL downstream). Any
+            // OTHER missing column means the source schema really changed.
+            if generated_columns.iter().any(|g| g == field.name()) {
+                continue;
+            }
             return SchemaMismatchSnafu {
                 message: format!(
                     "column `{}` from dataset schema is missing in source relation {}.{}",
@@ -612,6 +631,47 @@ mod tests {
 
         assert_eq!(applied, 100);
         assert_eq!(confirmed.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn validation_tolerates_generated_columns_but_not_dropped_ones() {
+        use crate::postgres_replication::pgoutput::{Column, Relation};
+        let schema: SchemaRef = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, false),
+            arrow::datatypes::Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("name_lower", arrow::datatypes::DataType::Utf8, true),
+        ]));
+        // pgoutput omits GENERATED columns: the relation carries only id+name.
+        let rel = Relation {
+            relation_id: 7,
+            namespace: "public".into(),
+            name: "apps".into(),
+            replica_identity: b'd',
+            columns: vec![
+                Column {
+                    is_key: true,
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                Column {
+                    is_key: false,
+                    name: "name".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let pks = vec!["id".to_string()];
+
+        // Catalog-confirmed generated column → tolerated.
+        validate_relation_against_schema(&schema, &rel, &pks, &["name_lower".to_string()])
+            .expect("generated column absence must validate");
+
+        // Same absence WITHOUT catalog confirmation = a real schema change.
+        let err = validate_relation_against_schema(&schema, &rel, &pks, &[])
+            .expect_err("non-generated missing column must fail validation");
+        assert!(err.to_string().contains("name_lower"), "got: {err}");
     }
 
     #[test]

@@ -113,6 +113,9 @@ fn rich_dataset_schema() -> SchemaRef {
         ),
         Field::new("uid", DataType::Utf8, true),
         Field::new("score", DataType::Decimal128(10, 2), true),
+        // GENERATED column: captured by the snapshot, omitted by pgoutput on
+        // the WAL path (applied as NULL).
+        Field::new("name_upper", DataType::Utf8, true),
     ]))
 }
 
@@ -424,8 +427,9 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
              CREATE TYPE shared_repl_mood AS ENUM ('active', 'paused'); \
              CREATE TABLE public.shared_repl_c (\
                  id int PRIMARY KEY, name text, tags text[], status shared_repl_mood, \
-                 uid uuid, score numeric(10,2)); \
-             INSERT INTO public.shared_repl_c \
+                 uid uuid, score numeric(10,2), \
+                 name_upper text GENERATED ALWAYS AS (upper(name)) STORED); \
+             INSERT INTO public.shared_repl_c (id, name, tags, status, uid, score) \
                  VALUES (100, 'c100', '{x,\"y z\"}', 'active', \
                          '11111111-2222-3333-4444-555555555555', 10.50);",
         )
@@ -450,6 +454,11 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         "bootstrap c uuid column (non-text wire type → Utf8)"
     );
     assert_eq!(score_of(&boot_c, 0), 1050, "bootstrap c numeric column");
+    assert_eq!(
+        string_col_of(&boot_c, "name_upper", 0),
+        "C100",
+        "bootstrap captures GENERATED column values"
+    );
     boot_c.commit().await?;
 
     assert_eq!(slot_count(&source).await?, 1, "still exactly one slot");
@@ -461,7 +470,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
 
     source
         .simple_query(
-            "INSERT INTO public.shared_repl_c \
+            "INSERT INTO public.shared_repl_c (id, name, tags, status, uid, score) \
              VALUES (101, 'c101', ARRAY['blue', NULL], 'paused', \
                      'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 99.99)",
         )
@@ -481,6 +490,25 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         "WAL-path uuid column"
     );
     assert_eq!(score_of(&live_c, 0), 9999, "WAL-path numeric column");
+    {
+        // pgoutput omits GENERATED columns; the change applies them as NULL
+        // (instead of fatally detaching the member, which is the bug this
+        // covers).
+        let data = live_c
+            .change_batch
+            .record
+            .column_by_name("data")
+            .expect("data column");
+        let name_upper = data
+            .as_struct()
+            .column_by_name("name_upper")
+            .expect("name_upper column")
+            .as_string::<i32>();
+        assert!(
+            name_upper.is_null(0),
+            "GENERATED column must be NULL on replicated changes"
+        );
+    }
     live_c.commit().await?;
 
     // No cross-routing: the next change for `a` arrives on stream_a with only

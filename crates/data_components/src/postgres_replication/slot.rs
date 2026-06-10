@@ -36,6 +36,12 @@ pub struct SlotInfo {
     pub consistent_lsn: u64,
     pub snapshot_name: Option<String>,
     pub created_fresh: bool,
+    /// `GENERATED` columns of the source table. Postgres does not publish
+    /// generated columns over logical replication (they are absent from
+    /// pgoutput `Relation` messages), so the WAL path must tolerate their
+    /// absence — the initial snapshot still captures their values, but
+    /// replicated changes apply them as NULL.
+    pub generated_columns: Vec<String>,
 }
 
 pub type SlotSetupOutcome = SlotInfo;
@@ -80,6 +86,9 @@ pub struct SharedMemberSetup {
     /// member's table has no WAL history on this slot before now and needs an
     /// initial snapshot.
     pub table_added: bool,
+    /// `GENERATED` columns of this member's table — see
+    /// [`SlotInfo::generated_columns`].
+    pub generated_columns: Vec<String>,
 }
 
 /// Idempotent setup for one member of a shared slot: validates the table's
@@ -103,11 +112,17 @@ pub async fn setup_shared_member(
             let (client, conn_task) = connect_setup(params).await?;
             let outcome = async {
                 validate_replica_identity(&client, schema_name, table_name).await?;
+                let generated_columns =
+                    fetch_generated_columns(&client, schema_name, table_name).await?;
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
                 let slot = ensure_slot(&client, params).await?;
-                Ok(SharedMemberSetup { slot, table_added })
+                Ok(SharedMemberSetup {
+                    slot,
+                    table_added,
+                    generated_columns,
+                })
             }
             .await;
             drop(client);
@@ -181,8 +196,35 @@ async fn do_setup(
     table_name: &str,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
+    let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
-    ensure_slot(client, params).await
+    let mut slot = ensure_slot(client, params).await?;
+    slot.generated_columns = generated_columns;
+    Ok(slot)
+}
+
+/// List the table's `GENERATED` columns (`pg_attribute.attgenerated`).
+/// Postgres omits these from pgoutput `Relation` messages, so the WAL path
+/// needs to know which dataset columns to expect to be absent.
+async fn fetch_generated_columns(
+    client: &tokio_postgres::Client,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "SELECT a.attname \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND a.attgenerated::text <> ''",
+            &[&schema_name, &table_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]
@@ -214,6 +256,7 @@ async fn ensure_slot(
                 publication_name: params.publication_name.clone(),
                 consistent_lsn: confirmed_flush_lsn,
                 snapshot_name: None,
+                generated_columns: Vec::new(),
                 created_fresh: false,
             });
         }
@@ -230,6 +273,7 @@ async fn ensure_slot(
                 publication_name: params.publication_name.clone(),
                 consistent_lsn: 0,
                 snapshot_name: None,
+                generated_columns: Vec::new(),
                 created_fresh: true,
             });
         }
@@ -259,6 +303,7 @@ async fn ensure_slot(
                     snapshot_name: None,
                     // A raced slot with no durable checkpoint yet still needs
                     // a bootstrap (same reasoning as the Some(0) path above).
+                    generated_columns: Vec::new(),
                     created_fresh: confirmed == 0,
                 });
             }
@@ -278,6 +323,7 @@ async fn ensure_slot(
         publication_name: params.publication_name.clone(),
         consistent_lsn,
         snapshot_name: Some(snapshot_name),
+        generated_columns: Vec::new(),
         created_fresh: true,
     })
 }

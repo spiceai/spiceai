@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
-/// Process-wide CDC shutdown signal.
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
 ///
 /// Raised by the runtime at the *start* of graceful shutdown — before the
 /// (potentially long) connection-drain phase — so CDC sources can release
@@ -34,19 +34,25 @@ use snafu::prelude::*;
 /// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
 /// process exit) lets a replacement instance attach during a rolling deploy
 /// rather than retrying against "replication slot is active".
-static CDC_SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Signal every CDC source in the process to stop and release its upstream
-/// resources. Idempotent; there is no way back.
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
 pub fn begin_shutdown() {
-    CDC_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
-/// Whether [`begin_shutdown`] has been called. Long-running CDC sources check
-/// this in their receive/reconnect loops.
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
 #[must_use]
-pub fn is_shutting_down() -> bool {
-    CDC_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
+pub fn shutdown_epoch() -> u64 {
+    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.

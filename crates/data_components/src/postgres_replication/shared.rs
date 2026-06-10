@@ -152,6 +152,10 @@ struct MemberHandle {
     dataset_name: String,
     schema: SchemaRef,
     primary_keys: Vec<String>,
+    /// `GENERATED` columns of the member's source table — absent from
+    /// pgoutput `Relation` messages by Postgres design; tolerated during
+    /// schema validation and applied as NULL.
+    generated_columns: Vec<String>,
     sender: mpsc::Sender<std::result::Result<ChangeEnvelope, StreamError>>,
     metrics: Arc<ReplicationMetricsCollector>,
 }
@@ -620,6 +624,7 @@ async fn attach_member(
             dataset_name: dataset_name.clone(),
             schema: Arc::clone(&schema),
             primary_keys: primary_keys.clone(),
+            generated_columns: setup.generated_columns.clone(),
             sender,
             metrics: Arc::clone(&metrics),
         }),
@@ -635,6 +640,16 @@ async fn attach_member(
         members = source.live_member_count(),
         "dataset joined shared replication slot"
     );
+    if !setup.generated_columns.is_empty() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            columns = ?setup.generated_columns,
+            "source table has GENERATED column(s): Postgres does not publish generated \
+             columns over logical replication, so they are populated by the initial \
+             snapshot but will be NULL on replicated changes. Exclude them from the \
+             dataset schema if NULLs are unacceptable."
+        );
+    }
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
@@ -796,6 +811,10 @@ async fn try_finish_if_empty(source: &Arc<SharedSource>) -> bool {
 /// [`AckTable`] floor instead of a single atomic, and member joins trigger a
 /// reconnect instead of a new connection.
 async fn run_pump(source: Arc<SharedSource>) {
+    // Captured at pump start: the pump stops when the epoch advances (this
+    // Runtime began shutting down); a pump started by a later Runtime in the
+    // same process captures the newer epoch and is unaffected.
+    let shutdown_epoch = crate::cdc::shutdown_epoch();
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();
@@ -803,7 +822,7 @@ async fn run_pump(source: Arc<SharedSource>) {
     let mut reconnect_attempts: u32 = 0;
 
     'reconnect: loop {
-        if crate::cdc::is_shutting_down() {
+        if crate::cdc::shutdown_epoch() != shutdown_epoch {
             tracing::info!(
                 slot = %slot_name,
                 "runtime shutdown; releasing shared replication connection and slot"
@@ -871,7 +890,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut txn_open = false;
 
         'recv: loop {
-            if crate::cdc::is_shutting_down() {
+            if crate::cdc::shutdown_epoch() != shutdown_epoch {
                 // Drop the client now (releasing the walsender + slot) rather
                 // than at process exit — the graceful-shutdown drain phase
                 // can hold the process alive for tens of seconds.
@@ -1050,9 +1069,12 @@ async fn handle_decoded(
                 );
                 return;
             }
-            if let Err(e) =
-                client::validate_relation_against_schema(&member.schema, &rel, &member.primary_keys)
-            {
+            if let Err(e) = client::validate_relation_against_schema(
+                &member.schema,
+                &rel,
+                &member.primary_keys,
+                &member.generated_columns,
+            ) {
                 member.metrics.inc_schema_mismatch_error();
                 routes.remove(&rel.relation_id);
                 member_fatal(

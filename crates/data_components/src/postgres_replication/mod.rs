@@ -299,6 +299,17 @@ async fn start_inner(
         None
     };
 
+    if !outcome.generated_columns.is_empty() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            columns = ?outcome.generated_columns,
+            "source table has GENERATED column(s): Postgres does not publish generated \
+             columns over logical replication, so they are populated by the initial \
+             snapshot but will be NULL on replicated changes. Exclude them from the \
+             dataset schema if NULLs are unacceptable."
+        );
+    }
+
     // 3. Start the WAL stream.
     let wal_stream = client::start_wal_stream(client::WalStreamInput {
         params,
@@ -307,6 +318,7 @@ async fn start_inner(
         start_lsn: outcome.consistent_lsn,
         schema: Arc::clone(&schema),
         primary_keys,
+        generated_columns: outcome.generated_columns.clone(),
         dataset_name,
         // The dataset is already marked ready by `skip_bootstrap_ready` (if
         // bootstrap was skipped) or by the final bootstrap envelope.

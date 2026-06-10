@@ -156,8 +156,13 @@ pub fn build_change_batch(
         .collect::<Result<Vec<_>>>()?;
 
     // Precompute dataset_field_idx → relation_column_idx once per batch so the
-    // hot path is O(rows × fields) rather than O(rows × fields²).
-    let column_map: Vec<usize> = dataset_schema
+    // hot path is O(rows × fields) rather than O(rows × fields²). A dataset
+    // column absent from the relation maps to `None` and is applied as NULL:
+    // schema validation (run on every Relation message, before any change is
+    // buffered) has already established that only expected-absent columns —
+    // Postgres GENERATED columns, which pgoutput never publishes — can be
+    // missing here.
+    let column_map: Vec<Option<usize>> = dataset_schema
         .fields()
         .iter()
         .map(|field| {
@@ -165,16 +170,8 @@ pub fn build_change_batch(
                 .columns
                 .iter()
                 .position(|c| c.name == *field.name())
-                .ok_or_else(|| super::Error::SchemaMismatch {
-                    message: format!(
-                        "dataset column {} not present in source relation {}.{}",
-                        field.name(),
-                        relation.namespace,
-                        relation.name
-                    ),
-                })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
 
     for change in changes {
         op_builder.append_value(change.op.as_str());
@@ -185,9 +182,14 @@ pub fn build_change_batch(
             }
         })?);
 
-        for (col_idx, &source_idx) in column_map.iter().enumerate() {
-            let value = change.row.columns.get(source_idx).and_then(Option::as_ref);
-            data_builders[col_idx].append(value, change.op)?;
+        for (col_idx, source_idx) in column_map.iter().enumerate() {
+            match source_idx {
+                Some(source_idx) => {
+                    let value = change.row.columns.get(*source_idx).and_then(Option::as_ref);
+                    data_builders[col_idx].append(value, change.op)?;
+                }
+                None => data_builders[col_idx].append_null(),
+            }
         }
     }
 
