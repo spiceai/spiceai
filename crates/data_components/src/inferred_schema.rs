@@ -28,7 +28,9 @@ limitations under the License.
 //! the consumer (runtime) always agree on the wire format.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -36,6 +38,48 @@ use crate::{
     INFERRED_ROW_COUNT_METADATA_KEY, INFERRED_SORT_COLUMNS_METADATA_KEY,
     INFERRED_TABLE_BYTES_METADATA_KEY,
 };
+
+/// Every Arrow schema-metadata key written by [`InferredSchema::to_metadata`].
+///
+/// Centralized here so a consumer can strip the extended-inference hints from a
+/// table's live, queryable schema in one place — see
+/// [`schema_without_inferred_metadata`].
+pub const INFERRED_METADATA_KEYS: [&str; 5] = [
+    INFERRED_PRIMARY_KEY_METADATA_KEY,
+    INFERRED_INDEXES_METADATA_KEY,
+    INFERRED_SORT_COLUMNS_METADATA_KEY,
+    INFERRED_ROW_COUNT_METADATA_KEY,
+    INFERRED_TABLE_BYTES_METADATA_KEY,
+];
+
+/// Return `schema` with every extended-inference hint ([`INFERRED_METADATA_KEYS`])
+/// removed from its schema-level metadata, cloning the `Arc` unchanged when it
+/// carries none (the common case, so the hot path allocates nothing). Field-level
+/// metadata (e.g. `source_type`) and all other schema-level keys are preserved.
+///
+/// These hints are produced by extended schema inference and consumed *once*, at
+/// acceleration setup, to fill unspecified acceleration settings and seed tuning.
+/// They must not ride on the live, queryable table schema: their values vary per
+/// table, and DataFusion builds a join's output schema by merging its inputs'
+/// schema-level metadata in input order. When `join_selection` swaps a hash
+/// join's build/probe sides, that merge order flips and the surviving values
+/// change, so the rule's output schema no longer equals its input schema and the
+/// physical-optimizer schema-invariant check fails.
+#[must_use]
+pub fn schema_without_inferred_metadata(schema: &SchemaRef) -> SchemaRef {
+    if !INFERRED_METADATA_KEYS
+        .iter()
+        .any(|key| schema.metadata().contains_key(*key))
+    {
+        return Arc::clone(schema);
+    }
+
+    let mut metadata = schema.metadata().clone();
+    for key in INFERRED_METADATA_KEYS {
+        metadata.remove(key);
+    }
+    Arc::new(schema.as_ref().clone().with_metadata(metadata))
+}
 
 /// A secondary index inferred from the source table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +317,62 @@ mod tests {
         // Bad PK ignored, good indexes preserved.
         assert!(parsed.primary_key.is_empty());
         assert_eq!(parsed.indexes, sample().indexes);
+    }
+
+    #[test]
+    fn strip_removes_inferred_keys_preserving_fields_and_other_metadata() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let mut field_md = HashMap::new();
+        field_md.insert("source_type".to_string(), "integer".to_string());
+        let field = Field::new("id", DataType::Int32, false).with_metadata(field_md);
+
+        let mut schema_md = sample().to_metadata();
+        schema_md.insert("spice.accelerator".to_string(), "cayenne".to_string());
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(vec![field], schema_md));
+
+        let stripped = schema_without_inferred_metadata(&schema);
+
+        for key in INFERRED_METADATA_KEYS {
+            assert!(
+                !stripped.metadata().contains_key(key),
+                "inferred key {key} should be stripped"
+            );
+        }
+        // Unrelated schema-level metadata is kept.
+        assert_eq!(
+            stripped
+                .metadata()
+                .get("spice.accelerator")
+                .map(String::as_str),
+            Some("cayenne")
+        );
+        // Fields and their (field-level) metadata are untouched.
+        assert_eq!(stripped.fields().len(), 1);
+        assert_eq!(
+            stripped
+                .field(0)
+                .metadata()
+                .get("source_type")
+                .map(String::as_str),
+            Some("integer")
+        );
+    }
+
+    #[test]
+    fn strip_is_a_noop_arc_clone_without_inferred_metadata() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let mut schema_md = HashMap::new();
+        schema_md.insert("spice.accelerator".to_string(), "cayenne".to_string());
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int32, false)],
+            schema_md,
+        ));
+
+        let stripped = schema_without_inferred_metadata(&schema);
+        // Nothing to strip → same allocation returned, no rebuild.
+        assert!(Arc::ptr_eq(&schema, &stripped));
     }
 
     #[test]
