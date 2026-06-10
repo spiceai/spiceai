@@ -737,6 +737,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         )
