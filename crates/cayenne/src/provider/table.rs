@@ -2522,26 +2522,12 @@ enum PkExistenceRef<'a> {
 }
 
 /// Key -> max delete sequence maps the read path probes to hide superseded
-/// rows. Held as structurally-shared persistent maps (the same shape as
-/// [`crate::provider::mem_tier::InMemTombstones`]) so building this view from
-/// the in-memory CDC tier is an O(1) HAMT-root clone per scan, NOT an
-/// O(tier-tombstones) rebuild — the per-scan rebuild was the dominant query
-/// tax under memory mode once the resident tier grew (q20's correlated rescans
-/// paid it per outer group).
-struct InlinedDeletionMaps {
-    int64_pk: im::HashMap<i64, i64, hash_index::XxHash3BuildHasher>,
-    row_keys: im::HashMap<Box<[u8]>, i64, hash_index::XxHash3BuildHasher>,
-}
-
-impl Default for InlinedDeletionMaps {
-    fn default() -> Self {
-        // `im::HashMap` cannot derive `Default` with a non-`Default` hasher.
-        Self {
-            int64_pk: im::HashMap::with_hasher(hash_index::XxHash3BuildHasher),
-            row_keys: im::HashMap::with_hasher(hash_index::XxHash3BuildHasher),
-        }
-    }
-}
+/// rows. An alias of the tier's own [`InMemTombstones`] (same persistent maps,
+/// same hasher), so building this view from the in-memory CDC tier is an O(1)
+/// HAMT-root clone per scan, NOT an O(tier-tombstones) rebuild — the per-scan
+/// rebuild was the dominant query tax under memory mode once the resident tier
+/// grew (q20's correlated rescans paid it per outer group).
+type InlinedDeletionMaps = crate::provider::mem_tier::InMemTombstones;
 
 /// One published inline tombstone's removal effect, recorded so the inline-cache
 /// delta path can apply it to the structurally-shared base entries WITHOUT a
@@ -12310,24 +12296,6 @@ impl CayenneTableProvider {
         Ok(maps)
     }
 
-    /// Closed `[min,max]` over the keys of an in-RAM `Int64Pk` deletion map, or
-    /// `None` when empty. The disjoint-skip superset for the in-memory
-    /// (inline/mem-tier) tombstones, mirroring `DeletionIndex::deleted_key_range`
-    /// for the file-backed snapshot.
-    fn int64_map_key_range(
-        map: &im::HashMap<i64, i64, hash_index::XxHash3BuildHasher>,
-    ) -> Option<(i64, i64)> {
-        let mut iter = map.keys().copied();
-        let first = iter.next()?;
-        let mut lo = first;
-        let mut hi = first;
-        for k in iter {
-            lo = lo.min(k);
-            hi = hi.max(k);
-        }
-        Some((lo, hi))
-    }
-
     fn row_key_to_i64(row_key: &[u8], table_name: &str) -> Result<i64> {
         if row_key.len() != 8 {
             return Err(Error::DataValidation {
@@ -12399,7 +12367,8 @@ impl CayenneTableProvider {
                     let file_disjoint = deleted_pk
                         .deleted_key_range()
                         .is_none_or(|(del_lo, del_hi)| batch_hi < del_lo || batch_lo > del_hi);
-                    let inline_disjoint = Self::int64_map_key_range(&inlined_deletions.int64_pk)
+                    let inline_disjoint = inlined_deletions
+                        .int64_deleted_key_range()
                         .is_none_or(|(del_lo, del_hi)| batch_hi < del_lo || batch_lo > del_hi);
                     if file_disjoint && inline_disjoint {
                         return Ok(Some(batch));
@@ -12473,19 +12442,53 @@ impl CayenneTableProvider {
         Ok(Some(arrow::compute::filter_record_batch(&batch, &filter)?))
     }
 
+    /// Merge the mem-tier tombstones into the file-side deletion index for one
+    /// scan, memoized. The raw `with_mem_tier_tombstones` extend is
+    /// O(tier-tombstones) (plus bloom inserts) and a correlated plan re-scans —
+    /// and would re-merge — per outer group. The memo key is (file-index `Arc`
+    /// ptr, tier content `version`, structural epoch): a hit requires all three,
+    /// so any append/clear/publish forces a rebuild and a stale pairing can never
+    /// be served; quiescent re-scans pay one `ArcSwap` load. When there is no
+    /// file-side index (position-based) or no tier tombstones the merge is the
+    /// identity and the memo is skipped.
+    fn merged_deletion_snapshot(
+        &self,
+        deletion_snapshot: PkDeletionSnapshot,
+        mem_tier_snapshot: &crate::provider::mem_tier::MemTier,
+    ) -> PkDeletionSnapshot {
+        let Some(file_index_ptr) = deletion_snapshot.index_ptr() else {
+            return deletion_snapshot;
+        };
+        if !Self::mem_tier_has_tombstones(mem_tier_snapshot) {
+            return deletion_snapshot;
+        }
+        let tier_version = mem_tier_snapshot.version;
+        let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
+        if let Some(memo) = self.merged_scan_deletions.load_full()
+            && memo.file_index_ptr == file_index_ptr
+            && memo.tier_version == tier_version
+            && memo.structural_epoch == structural_epoch
+        {
+            return memo.merged.clone();
+        }
+        let merged = deletion_snapshot.with_mem_tier_tombstones(mem_tier_snapshot);
+        self.merged_scan_deletions.store(Some(Arc::new(MergedScanDeletions {
+            file_index_ptr,
+            tier_version,
+            structural_epoch,
+            merged: merged.clone(),
+        })));
+        merged
+    }
+
     fn mem_tier_deletion_maps(
         snapshot: &crate::provider::mem_tier::MemTier,
     ) -> InlinedDeletionMaps {
-        // Both the tier and `InlinedDeletionMaps` hold tombstones in the SAME
-        // persistent (`im::HashMap`) representation, so this view is an O(1)
-        // HAMT-root clone — never an O(tier-tombstones) materialization. That
-        // matters because this runs per SCAN (and correlated plans re-scan per
-        // outer group): with a 128MiB resident tier the old per-scan std-map
-        // rebuild was the dominant memory-mode query tax (q20 322ms -> 74s).
-        InlinedDeletionMaps {
-            int64_pk: snapshot.tombstones.int64_pk.clone(),
-            row_keys: snapshot.tombstones.row_keys.clone(),
-        }
+        // `InlinedDeletionMaps` IS `InMemTombstones`, so the per-scan view is an
+        // O(1) HAMT-root clone — never an O(tier-tombstones) materialization
+        // (the old per-scan std-map rebuild was the dominant memory-mode query
+        // tax: q20 322ms -> 74s with a 128MiB resident tier).
+        snapshot.tombstones.clone()
     }
 
     fn mem_tier_has_tombstones(snapshot: &crate::provider::mem_tier::MemTier) -> bool {
@@ -12584,8 +12587,15 @@ impl CayenneTableProvider {
         let cur = self.mem_tier.load();
         let would_be = cur.bytes.saturating_add(incoming_bytes);
         let byte_breach = would_be >= self.mem_tier_max_bytes;
-        let age_breach = self.mem_tier_max_age_ms > 0 && cur.age_ms() >= self.mem_tier_max_age_ms;
-        byte_breach || age_breach
+        byte_breach || self.mem_tier_age_cap_reached(&cur)
+    }
+
+    /// The ONE definition of "the tier's age cap has been reached" — shared by
+    /// the write-path forced spill and the periodic tick's churn gate, because
+    /// the documented bound on the deferred slot ack / crash-replay window holds
+    /// only while both compute the identical predicate. `0` disables the cap.
+    fn mem_tier_age_cap_reached(&self, tier: &crate::provider::mem_tier::MemTier) -> bool {
+        self.mem_tier_max_age_ms > 0 && tier.age_ms() >= self.mem_tier_max_age_ms
     }
 
     /// Build the in-RAM tombstone map for a mem-tier append from the upsert's
@@ -12661,20 +12671,13 @@ impl CayenneTableProvider {
             // inline publish uses, so readers capture the new tier atomically.
             let _fence = self.listing_fence.write().await;
 
-            // Reserve the (delete, data) sequence pair INSIDE the fence so append
-            // sequence assignment is mutually exclusive with a checkpoint's
-            // snapshot-sequence reservation (which also runs under this fence).
-            // This guarantees the ordering invariant the off-fence checkpoint
-            // relies on: a checkpoint's `snapshot_sequence` is strictly below
-            // every sequence an append reserves AFTER the checkpoint captured its
-            // flush set — so a later upsert that supersedes a just-flushed key
-            // always outranks the durable copy on merge-on-read, and its tombstone
-            // (delete_sequence > snapshot_sequence) correctly hides the file. Were
-            // the reserve OUTSIDE the fence, an append could reserve a sequence
-            // BELOW a concurrent checkpoint's snapshot_sequence yet append AFTER
-            // it, inverting the order and orphaning the stale durable copy (a
-            // permanent over-count). delete below data so new rows survive their
-            // own tombstones; from the shared durable allocator for monotonicity.
+            // Reserve the (delete, data) pair INSIDE the fence: append sequence
+            // assignment must be mutually exclusive with a checkpoint's
+            // snapshot-sequence reservation — see the capture block in
+            // `checkpoint_mem_tier` for the full ordering invariant (an off-fence
+            // reserve permanently over-counts). delete below data so new rows
+            // survive their own tombstones; shared durable allocator for
+            // monotonicity.
             let base_sequence = self.reserve_sequences_local(2).await?;
             let delete_sequence = base_sequence;
             let data_sequence = base_sequence + 1;
@@ -12760,16 +12763,11 @@ impl CayenneTableProvider {
         if batches.is_empty() {
             // Tombstones-only tier (every appended row already superseded): clear
             // and still advance the slot for the flushed epoch.
-            self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
-            if !inlined_view.is_empty() {
-                self.clear_inlined_metadata_after_checkpoint().await?;
-                self.flip_inlined_keyset_entries_to_file_unlocated();
-            }
-            let remaining_mem_rows = self.mem_tier.load().rows;
-            self.inlined_row_count.store(
-                i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
-                Ordering::Relaxed,
-            );
+            self.clear_flushed_mem_tier_state_under_held_fence(
+                snapshot.segments.len(),
+                !inlined_view.is_empty(),
+            )
+            .await?;
             self.fire_slot_advancer(flushed_epoch).await;
             return Ok(0);
         }
@@ -12828,25 +12826,19 @@ impl CayenneTableProvider {
                     super::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
-            self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
-            if !inlined_view.is_empty() {
-                self.clear_inlined_metadata_after_checkpoint().await?;
-                self.flip_inlined_keyset_entries_to_file_unlocated();
-            }
-            let remaining_mem_rows = self.mem_tier.load().rows;
-            self.inlined_row_count.store(
-                i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
-                Ordering::Relaxed,
-            );
+            self.clear_flushed_mem_tier_state_under_held_fence(
+                snapshot.segments.len(),
+                !inlined_view.is_empty(),
+            )
+            .await?;
             self.refresh_listing_table_under_held_fence().await?;
             stats
         } else {
             // PHASE 1 — durable, OUTSIDE the fence (does not block appends). The
             // new file is unreferenced and the RAM tier still holds the rows, so a
             // concurrent scan sees the RAM rows (correct) and never the file yet.
-            // The snapshot_sequence was reserved UNDER the fence at capture time
-            // (serialized with appends) — it is strictly below every later append's
-            // sequence, so the durable file never outranks a concurrent supersede.
+            // snapshot_sequence was reserved under the fence at capture time —
+            // see the capture block for the ordering invariant.
             let Some(sequence_number) = reserved_snapshot_sequence else {
                 return Err(Error::DataValidation {
                     table: self.table_name().to_string(),
@@ -12884,16 +12876,11 @@ impl CayenneTableProvider {
                 let _fence = self.listing_fence.write().await;
                 self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
                     .await;
-                self.clear_mem_tier_up_to_epoch(flushed_epoch, snapshot.segments.len());
-                if !inlined_view.is_empty() {
-                    self.clear_inlined_metadata_after_checkpoint().await?;
-                    self.flip_inlined_keyset_entries_to_file_unlocated();
-                }
-                let remaining_mem_rows = self.mem_tier.load().rows;
-                self.inlined_row_count.store(
-                    i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
-                    Ordering::Relaxed,
-                );
+                self.clear_flushed_mem_tier_state_under_held_fence(
+                    snapshot.segments.len(),
+                    !inlined_view.is_empty(),
+                )
+                .await?;
                 self.refresh_listing_table_under_held_fence().await?;
             }
             // Reclaim the superseded snapshot dirs (graceful, backgrounded —
@@ -12918,30 +12905,49 @@ impl CayenneTableProvider {
     }
 
     /// Swap the mem tier to its remainder after a checkpoint flushed every
-    /// segment in the flushed snapshot (its first `flushed_segment_count`
-    /// segments — an append-ordered prefix). A concurrent append that grew the
-    /// tier ABOVE the snapshot (which the two-phase checkpoint now allows, since
-    /// its encode/commit run OUTSIDE the listing fence) is preserved: we drop the
-    /// flushed prefix and KEEP ONLY the survivor segments, re-folding their
-    /// tombstones/bytes/rows via [`MemTier::retain_after`]. Keeping the whole tier
-    /// instead would re-flush the already-durable prefix into a second file on the
-    /// next checkpoint — a double-count (the bug the off-fence move exposed).
-    /// Checkpoints are serialized by `mem_checkpoint_lock`, so the only interleaving
-    /// writer is an append (push-only); this store runs under the listing fence the
-    /// caller holds (appends also take it to swap), so the prefix is stable.
-    fn clear_mem_tier_up_to_epoch(&self, flushed_epoch: u64, flushed_segment_count: usize) {
+    /// segments — an append-ordered prefix of the flushed snapshot. A concurrent
+    /// append that grew the tier ABOVE the snapshot (which the two-phase
+    /// checkpoint allows, since its encode/commit run OUTSIDE the listing fence)
+    /// is preserved: we drop the flushed prefix and KEEP ONLY the survivor
+    /// segments, re-folding their tombstones/bytes/rows via
+    /// [`MemTier::retain_after`]. Keeping the whole tier instead would re-flush
+    /// the already-durable prefix into a second file on the next checkpoint — a
+    /// double-count (the bug the off-fence move exposed). Checkpoints are
+    /// serialized by `mem_checkpoint_lock`, so the only interleaving writer is an
+    /// append (push-only); this store runs under the listing fence the caller
+    /// holds (appends also take it to swap), so the prefix is stable.
+    fn clear_mem_tier_flushed_prefix(&self, flushed_segment_count: usize) {
         let cur = self.mem_tier.load_full();
         let survivors = cur.retain_after(flushed_segment_count);
         // Release exactly the flushed segments' bytes (cur − survivors) back to
         // the process-global budget; survivor bytes stay resident.
         let released = cur.bytes.saturating_sub(survivors.bytes);
-        debug_assert!(
-            survivors.epoch >= flushed_epoch,
-            "survivor tier must preserve the monotone epoch at/above the flushed one"
-        );
         self.mem_tier.store(Arc::new(survivors));
         crate::provider::mem_tier_budget::release_bytes(released);
         self.bump_inlined_structural_epoch();
+    }
+
+    /// The shared under-fence tail of every mem-tier checkpoint arm: drop the
+    /// flushed prefix, clear any flushed inline-metastore state, and re-derive
+    /// the live inlined row count from the survivor tier. Must run while the
+    /// caller holds `listing_fence.write()` so the swap-out is indivisible with
+    /// the durable file becoming visible.
+    async fn clear_flushed_mem_tier_state_under_held_fence(
+        &self,
+        flushed_segment_count: usize,
+        inlined_view_nonempty: bool,
+    ) -> Result<()> {
+        self.clear_mem_tier_flushed_prefix(flushed_segment_count);
+        if inlined_view_nonempty {
+            self.clear_inlined_metadata_after_checkpoint().await?;
+            self.flip_inlined_keyset_entries_to_file_unlocated();
+        }
+        let remaining_mem_rows = self.mem_tier.load().rows;
+        self.inlined_row_count.store(
+            i64::try_from(remaining_mem_rows).unwrap_or(i64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(())
     }
 
     /// Fire the installed [`SlotAdvancer`] for `durable_epoch`, if one is wired
@@ -15076,41 +15082,8 @@ impl TableProvider for CayenneTableProvider {
                 ))
             })?;
         };
-        // Memoized merge of the mem-tier tombstones into the file-side index.
-        // The raw `with_mem_tier_tombstones` extend is O(tier-tombstones) and a
-        // correlated plan re-scans (and re-merged) per outer group; the memo key
-        // (file index ptr, tier content version, structural epoch) makes a hit
-        // serve the identical inputs' identical output, so repeated scans within
-        // one quiescent window pay O(1).
-        let deletion_snapshot = match (
-            deletion_snapshot.index_ptr(),
-            Self::mem_tier_has_tombstones(&mem_tier_snapshot),
-        ) {
-            (Some(file_index_ptr), true) => {
-                let tier_version = mem_tier_snapshot.version;
-                let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
-                let memo = self.merged_scan_deletions.load_full();
-                if let Some(memo) = memo
-                    && memo.file_index_ptr == file_index_ptr
-                    && memo.tier_version == tier_version
-                    && memo.structural_epoch == structural_epoch
-                {
-                    memo.merged.clone()
-                } else {
-                    let merged = deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot);
-                    self.merged_scan_deletions.store(Some(Arc::new(MergedScanDeletions {
-                        file_index_ptr,
-                        tier_version,
-                        structural_epoch,
-                        merged: merged.clone(),
-                    })));
-                    merged
-                }
-            }
-            // No file index (position-based) or no tier tombstones: the merge is
-            // the identity; skip the memo entirely.
-            _ => deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot),
-        };
+        let deletion_snapshot =
+            self.merged_deletion_snapshot(deletion_snapshot, &mem_tier_snapshot);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
@@ -16127,10 +16100,8 @@ impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
                 .vortex_config
                 .cdc_mem_tier_min_flush_bytes;
             if min_flush > 0 {
-                let age_ready =
-                    self.mem_tier_max_age_ms > 0 && tier.age_ms() >= self.mem_tier_max_age_ms;
                 let size_ready = i64::try_from(tier.bytes).unwrap_or(i64::MAX) >= min_flush;
-                if !size_ready && !age_ready {
+                if !size_ready && !self.mem_tier_age_cap_reached(&tier) {
                     return;
                 }
             }
@@ -18200,12 +18171,7 @@ mod tests {
 
         // Arm it (as the runtime does on the first replayable committer); the next
         // write engages the RAM tier.
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         assert!(provider.has_slot_advancer(), "armed");
 
         let b2 = int64_id_batch(&[4, 5]);
@@ -19442,12 +19408,7 @@ mod tests {
         // replayable committer; a direct provider test must arm it explicitly, or
         // the engagement gate (`is_cdc_memory_mode() && has_slot_advancer()`) keeps
         // the durable path and the mem-tier tombstone logic under test never runs.
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
         let write = provider
             .write_cdc_append_stream(
@@ -19516,7 +19477,7 @@ mod tests {
     /// runs the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence and
     /// takes the fence only for the in-memory swap. A CDC append that interleaves
     /// with that off-fence window must be NEITHER lost (vanish) NOR re-materialized
-    /// (double-count): `clear_mem_tier_up_to_epoch` preserves any segment whose
+    /// (double-count): `clear_mem_tier_flushed_prefix` (via `MemTier::retain_after`) preserves any segment whose
     /// epoch is above the flushed one, and the fresh `new_snapshot_id` is invisible
     /// to readers until the under-fence listing swap. Runs the checkpoint and a
     /// fresh-key append concurrently and asserts the exact final row set across
@@ -19540,12 +19501,7 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         // Arm the RAM tier (the runtime does this on the first replayable committer).
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
         // Append batch A → RAM (epoch 1).
         let write_a = provider
@@ -19567,7 +19523,7 @@ mod tests {
 
         // Concurrently: checkpoint (flushes epoch 1 with encode+commit OFF the
         // fence) AND append batch B with fresh keys (a higher epoch that must
-        // survive `clear_mem_tier_up_to_epoch`).
+        // survive the flushed-prefix clear).
         let provider = Arc::new(provider);
         let checkpoint_provider = Arc::clone(&provider);
         let append_provider = Arc::clone(&provider);
@@ -19644,12 +19600,7 @@ mod tests {
             i64::MAX, // min-flush gate effectively "size never ready"
         )
         .await;
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
         let batch = int64_id_batch(&[1, 2, 3]);
         let bytes = batch.get_array_memory_size() as u64;
@@ -19694,12 +19645,7 @@ mod tests {
         )
         .await;
         let schema = Arc::clone(&provider.table_metadata.schema);
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
 
         // Durable rows first (a file-side index exists), then a RAM upsert that
         // tombstones one of them — the scan must merge file ∪ tier deletions.
@@ -19799,12 +19745,7 @@ mod tests {
         assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
         let schema = Arc::clone(&provider.table_metadata.schema);
 
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         let provider = Arc::new(provider);
 
         // Production-shaped background checkpoint loop (the 1s tick, compressed).
@@ -19862,6 +19803,14 @@ mod tests {
         );
     }
 
+    /// Shared no-op slot advancer for memory-mode tests that need the RAM tier
+    /// armed but don't assert on the ack (the recording variants stay fn-local).
+    struct NoopSlotAdvancer;
+    #[async_trait::async_trait]
+    impl crate::provider::mem_tier::SlotAdvancer for NoopSlotAdvancer {
+        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+    }
+
     /// Stress regression for the heavy-upsert OVER-COUNT the off-fence checkpoint
     /// surfaced at SF-100 (customer/stock ended with MORE rows than the source).
     /// Repeatedly upserts a FIXED keyspace (so every write after the first round
@@ -19891,12 +19840,7 @@ mod tests {
         assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
         let schema = Arc::clone(&provider.table_metadata.schema);
 
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
-        provider.install_slot_advancer(Arc::new(TestAdvancer));
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         let provider = Arc::new(provider);
 
         // Writer: upsert all KEYS each round (value = round, so the last round's
