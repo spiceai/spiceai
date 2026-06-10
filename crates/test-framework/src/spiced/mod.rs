@@ -243,6 +243,20 @@ let client = reqwest::Client::new();
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
 
+        // Optionally expose the Prometheus `/metrics` endpoint on the spawned
+        // spiced. Off by default so concurrent spiced instances in the test
+        // suite don't contend a fixed port; opt in by exporting
+        // `SPICED_METRICS_ADDR` (e.g. `0.0.0.0:9090`) for profiling/benchmark
+        // runs that scrape per-phase metrics. Without it the spawned spiced runs
+        // with a no-op meter provider and `/metrics` is unavailable — the blind
+        // spot that hid the CDC write-phase breakdown on the co-located
+        // (testoperator-spawns-spiced) benchmark topology.
+        if let Ok(metrics_addr) = std::env::var("SPICED_METRICS_ADDR")
+            && !metrics_addr.is_empty()
+        {
+            cmd.arg("--metrics").arg(metrics_addr);
+        }
+
         // Add any additional arguments
         for arg in start_request.additional_args {
             cmd.arg(arg);

@@ -594,6 +594,7 @@ impl<'a> AppendMutationWriter<'a> {
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut incoming_bytes: u64 = 0;
         let mut incoming_rows: u64 = 0;
+        let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
@@ -601,6 +602,11 @@ impl<'a> AppendMutationWriter<'a> {
             batches.push(batch);
         }
         drop(prepared_stream);
+        // Decompose `cdc_path_inmemory`: draining the prepared stream RUNS the
+        // deferred PK-conflict validation and decodes the upstream CDC batches,
+        // so this is the "produce + validate the batch" slice — separating
+        // upstream-bound cost from the fence + append cost that follows.
+        record_cayenne_write_phase(self.table.table_name(), "inmemory_stream_drain", drain_start);
 
         let PostValidationState {
             on_conflict_deletions,

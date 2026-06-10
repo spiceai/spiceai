@@ -12902,7 +12902,21 @@ impl CayenneTableProvider {
         let epoch = {
             // Publish the RAM swap under the same listing fence the durable
             // inline publish uses, so readers capture the new tier atomically.
+            //
+            // Decompose the dominant `cdc_path_inmemory` phase: the time spent
+            // WAITING to acquire the fence (contended by OLAP plan-build
+            // read-fences and checkpoint publishes) is reported separately from
+            // the fence-held swap work itself. Without this split the 168ms-avg
+            // in-memory append was a black box — fence contention and real work
+            // were indistinguishable.
+            let fence_wait_start = Instant::now();
             let _fence = self.listing_fence.write().await;
+            record_cayenne_write_phase(
+                &self.table_metadata.table_name,
+                "inmemory_fence_wait",
+                fence_wait_start,
+            );
+            let fence_work_start = Instant::now();
 
             // Reserve the (delete, data) pair INSIDE the fence: append sequence
             // assignment must be mutually exclusive with a checkpoint's
@@ -12974,6 +12988,11 @@ impl CayenneTableProvider {
                         merged: memo.merged.extended_by_delta(&tombstones),
                     })));
             }
+            record_cayenne_write_phase(
+                &self.table_metadata.table_name,
+                "inmemory_fence_work",
+                fence_work_start,
+            );
             epoch
         };
 
