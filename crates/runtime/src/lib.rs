@@ -1688,6 +1688,14 @@ impl Runtime {
 
         self.status.mark_shutdown();
 
+        // Tell CDC sources to release their upstream resources NOW, before
+        // the connection-drain phase below: a Postgres replication connection
+        // holds a single-consumer slot, and releasing it at shutdown start
+        // (instead of at process exit) lets a replacement instance attach
+        // during a rolling deploy instead of retrying against "slot is
+        // active".
+        data_components::cdc::begin_shutdown();
+
         let shutdown_timeout: Duration = self.read_app().await.and_then(|app| {
             app.runtime.shutdown_timeout().unwrap_or_else(|err| {
                 tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
