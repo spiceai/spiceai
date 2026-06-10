@@ -514,7 +514,6 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
-            file_pruning: config.file_pruning,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
@@ -534,25 +533,5 @@ mod tests {
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
         );
-    }
-
-    #[test]
-    fn cayenne_enables_file_pruning_by_default() {
-        let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
-
-        assert!(context.file_format().options().file_pruning);
-    }
-
-    #[test]
-    fn cayenne_file_pruning_config_flows_to_table_options() {
-        let config = VortexConfig {
-            file_pruning: false,
-            ..VortexConfig::default()
-        };
-        let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&config, runtime_env, "test");
-
-        assert!(!context.file_format().options().file_pruning);
     }
 }
