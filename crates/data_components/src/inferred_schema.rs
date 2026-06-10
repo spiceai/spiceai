@@ -37,6 +37,40 @@ use crate::{
     INFERRED_TABLE_BYTES_METADATA_KEY,
 };
 
+/// Every Arrow schema-metadata key written by [`InferredSchema::to_metadata`].
+///
+/// Centralized so the inference hints can be located — and removed from a query
+/// scan's output schema — in one place; see [`strip_inferred_metadata`].
+pub const INFERRED_METADATA_KEYS: [&str; 5] = [
+    INFERRED_PRIMARY_KEY_METADATA_KEY,
+    INFERRED_INDEXES_METADATA_KEY,
+    INFERRED_SORT_COLUMNS_METADATA_KEY,
+    INFERRED_ROW_COUNT_METADATA_KEY,
+    INFERRED_TABLE_BYTES_METADATA_KEY,
+];
+
+/// Remove every extended-inference hint ([`INFERRED_METADATA_KEYS`]) from a
+/// schema-metadata map, in place.
+///
+/// These hints stay useful on a table provider's *advertised* schema: the runtime
+/// surfaces the inferred row-count / byte-size as table statistics (see
+/// `MetadataEnrichedTableProvider`) and seeds the accelerator's tuning warm-start
+/// from them. They must not, however, ride on a query scan's *output* schema.
+/// Their values vary per table, and `DataFusion` builds a join's output schema by
+/// merging its inputs' schema-level metadata in input order; when the
+/// `join_selection` physical-optimizer rule swaps a hash join's build/probe
+/// sides, that merge order flips and the surviving values change, so the rule's
+/// output schema no longer equals its input schema and the schema-invariant
+/// check fails. Strip them from the scan schema (only) to keep join schemas
+/// stable while leaving the statistics/tuning consumers untouched.
+pub fn strip_inferred_metadata<S: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, S>,
+) {
+    for key in INFERRED_METADATA_KEYS {
+        metadata.remove(key);
+    }
+}
+
 /// A secondary index inferred from the source table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferredIndex {
@@ -273,6 +307,43 @@ mod tests {
         // Bad PK ignored, good indexes preserved.
         assert!(parsed.primary_key.is_empty());
         assert_eq!(parsed.indexes, sample().indexes);
+    }
+
+    #[test]
+    fn strip_inferred_metadata_removes_only_inferred_keys() {
+        // Every key `to_metadata` can emit, plus unrelated schema-level metadata.
+        let mut metadata = sample().to_metadata();
+        metadata.insert("spice.accelerator".to_string(), "cayenne".to_string());
+        metadata.insert("description".to_string(), "orders".to_string());
+
+        strip_inferred_metadata(&mut metadata);
+
+        for key in INFERRED_METADATA_KEYS {
+            assert!(!metadata.contains_key(key), "{key} should be stripped");
+        }
+        // Unrelated schema-level metadata is preserved.
+        assert_eq!(
+            metadata.get("spice.accelerator").map(String::as_str),
+            Some("cayenne")
+        );
+        assert_eq!(
+            metadata.get("description").map(String::as_str),
+            Some("orders")
+        );
+    }
+
+    #[test]
+    fn strip_inferred_metadata_is_a_noop_when_absent() {
+        let mut metadata = HashMap::new();
+        metadata.insert("spice.accelerator".to_string(), "cayenne".to_string());
+
+        strip_inferred_metadata(&mut metadata);
+
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata.get("spice.accelerator").map(String::as_str),
+            Some("cayenne")
+        );
     }
 
     #[test]
