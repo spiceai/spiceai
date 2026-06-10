@@ -13214,7 +13214,7 @@ impl CayenneTableProvider {
                 .expect("non-position checkpoint reserved its snapshot_sequence at capture");
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
-            let (_rows, _ops, stats) = self
+            let (_rows, checkpoint_file_count, stats) = self
                 .write_to_snapshot(
                     stream,
                     target_size_bytes,
@@ -13256,6 +13256,17 @@ impl CayenneTableProvider {
             // ended with 408 on-disk snapshot dirs while the catalog referenced
             // 2 (≈406 orphans; 89G footprint vs ~live bytes).
             self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+            // [read-amp] Feed this checkpoint's file count into the compaction
+            // file-count trigger. A memory-mode checkpoint writes ~target_partitions
+            // small files into the new (protected) snapshot, but that fan-out never
+            // reached `new_files_since_last_compaction` — it is fed only by the
+            // durable current-snapshot file-move paths, which the off-fence
+            // checkpoint bypasses. So file fragmentation across a handful of
+            // protected snapshots stayed invisible to compaction whenever the
+            // snapshot count sat below the maintenance trigger (count/age only),
+            // leaving the read-amp uncollapsed. Recording it lets accumulated small
+            // files trigger a consolidating rewrite independent of the snapshot count.
+            self.record_current_snapshot_files_added(checkpoint_file_count);
             stats
         };
 
