@@ -69,8 +69,13 @@ runs:
         # github.sha. The scheduled dispatch builds a branch matrix (trunk +
         # release/x.y) where every leg shares one github.sha (the trigger SHA),
         # so keying by github.sha makes the release/x.y leg publish its binary
-        # under trunk's SHA
-        sha="$(git rev-parse HEAD 2>/dev/null || echo "${{ github.sha }}")"
+        # under trunk's SHA and overwrite the trunk build (last-writer-wins).
+        # Fail fast rather than falling back to github.sha: the fallback would
+        # silently reintroduce the cross-branch collision this fix prevents.
+        sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)" || {
+          echo "Failed to determine checked-out commit SHA. Ensure actions/checkout has run before build-spicepod-validator." >&2
+          exit 1
+        }
         echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Download spicepod-validator from MinIO
