@@ -28,9 +28,13 @@ env:
 jobs:
   generate_schema:
     runs-on: self-hosted
+    # Bound the blast radius: without this, a hung step runs until GitHub's
+    # default 6h job timeout. The Create PR step previously hung for ~5.5h on an
+    # interactive git credential prompt before being auto-cancelled.
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 
@@ -80,13 +84,21 @@ jobs:
           if [[ $(git diff --exit-code .schema/spicepod.schema.json) ]]; then
             git add .schema/spicepod.schema.json
             git commit -m "Update spicepod.schema.json"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
+            # Disable any credential helper configured on the (self-hosted) runner
+            # so git authenticates with the URL-embedded token only. Otherwise a
+            # helper (osxkeychain / git-credential-manager) can intercept the push
+            # and block on an interactive credential prompt, hanging the job.
+            git -c credential.helper='' -c credential.interactive=false \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" HEAD:schema/${GITHUB_RUN_ID}
             gh pr create --title "Update spicepod.schema.json" --body "Updated Spicepod Schema" --base trunk --head schema/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Never fall back to an interactive prompt; fail fast if auth is rejected.
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: 'never'
 
       - name: Validate schema against test files
         continue-on-error: true

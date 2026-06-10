@@ -147,6 +147,15 @@ pub enum Error {
     FailedToWriteData { source: DataFusionError },
 
     #[snafu(display(
+        "Failed to apply retention_sql to accelerated dataset {dataset_name} after refresh data was written: {}. The accelerated dataset may contain rows that should have been retained away.",
+        format_datafusion_error(source)
+    ))]
+    FailedToApplyRetentionSql {
+        dataset_name: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display(
         "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratedTableDoesntSupportDelete {},
@@ -1613,19 +1622,32 @@ impl TableProvider for AcceleratedTable {
         // Compute the target schema based on user's original projection.
         // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
         // and casts types. The schema should match what the user requested.
+        //
+        // Drop the extended-inference hints (`spice.inferred_*`) from this physical
+        // scan-output schema. They stay on the logical `TableProvider::schema()`
+        // chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
+        // row-count/byte-size as table statistics and an accelerator keeps its
+        // tuning warm-start — but their values vary per table, and DataFusion
+        // builds a join's output schema by merging its inputs' schema-level
+        // metadata in input order. Leaving them here lets `join_selection`'s
+        // build/probe swap flip the surviving values, so the rule's output schema
+        // no longer equals its input and the physical-optimizer schema invariant
+        // fails. See `data_components::inferred_schema`.
+        let full_schema = self.schema();
+        let mut metadata = full_schema.metadata().clone();
+        data_components::inferred_schema::strip_inferred_metadata(&mut metadata);
         let target_schema = match projection {
             Some(indices) => {
-                let full_schema = self.schema();
                 let projected_fields: Vec<_> = indices
                     .iter()
                     .filter_map(|&i| full_schema.fields().get(i).cloned())
                     .collect();
-                Arc::new(Schema::new_with_metadata(
-                    projected_fields,
-                    full_schema.metadata().clone(),
-                ))
+                Arc::new(Schema::new_with_metadata(projected_fields, metadata))
             }
-            None => self.schema(),
+            None => Arc::new(Schema::new_with_metadata(
+                full_schema.fields().clone(),
+                metadata,
+            )),
         };
 
         Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))

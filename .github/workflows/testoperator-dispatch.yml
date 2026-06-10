@@ -5,14 +5,14 @@ on:
   schedule:
     # daily-main, 0900 UTC / 0200 PDT  — full bench suite + HTAP CH-benCHmark SF1
     - cron: '0 9 * * *'
-    # htap-sf1, 0100/1700 UTC — extra HTAP CH-benCHmark SF1 runs so SF1 fires
-    # every 8 hours (0100, 0900 via daily-main, 1700) without re-running the
-    # full daily-main suite three times a day.
-    - cron: '0 1,17 * * *'
-    # htap-sf10, every 8h anchored on the original 1200 UTC — HTAP CH-benCHmark SF10
-    - cron: '0 4,12,20 * * *'
-    # htap-sf100, every 8h anchored on the original 1600 UTC — HTAP CH-benCHmark SF100
-    - cron: '0 0,8,16 * * *'
+    # htap-sf1, every 4h — extra HTAP CH-benCHmark SF1 runs so SF1 fires every 4
+    # hours (0100, 0500, 0900 via daily-main, 1300, 1700, 2100) without
+    # re-running the full daily-main suite six times a day.
+    - cron: '0 1,5,13,17,21 * * *'
+    # htap-sf10, every 4h (0000, 0400, 0800, 1200, 1600, 2000) — HTAP CH-benCHmark SF10
+    - cron: '0 0,4,8,12,16,20 * * *'
+    # htap-sf100, every 4h (0200, 0600, 1000, 1400, 1800, 2200) — HTAP CH-benCHmark SF100
+    - cron: '0 2,6,10,14,18,22 * * *'
 
   workflow_dispatch:
     inputs:
@@ -59,10 +59,10 @@ jobs:
           - 'trunk'
           - 'release/2.0'
     concurrency:
-      group: testoperator-dispatch-scheduled
+      group: testoperator-dispatch-scheduled-${{ matrix.branch }}-${{ github.event.schedule || github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
           ref: ${{ matrix.branch }}
@@ -107,11 +107,11 @@ jobs:
         id: sched
         run: |
           case "${{ github.event.schedule }}" in
-            '0 9 * * *')        NAME=daily-main ;;
-            '0 1,17 * * *')     NAME=htap-sf1   ;;
-            '0 4,12,20 * * *')  NAME=htap-sf10  ;;
-            '0 0,8,16 * * *')   NAME=htap-sf100 ;;
-            *)                  NAME=           ;;   # manual / unrecognized cron — match nothing
+            '0 9 * * *')               NAME=daily-main ;;
+            '0 1,5,13,17,21 * * *')    NAME=htap-sf1   ;;
+            '0 0,4,8,12,16,20 * * *')  NAME=htap-sf10  ;;
+            '0 2,6,10,14,18,22 * * *') NAME=htap-sf100 ;;
+            *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
@@ -241,11 +241,11 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # HTAP CH-benCHmark — every SF runs 3x/day (every 8 hours). SF1 rides
-      # with daily-main at 0900 plus the htap-sf1 extras at 0100/1700;
-      # SF10 / SF100 each fire on their own every-8h cron.
+      # HTAP CH-benCHmark — every SF runs 6x/day (every 4 hours). SF1 rides
+      # with daily-main at 0900 plus the htap-sf1 extras at 0100/0500/1300/1700/2100;
+      # SF10 / SF100 each fire on their own every-4h cron.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
-        if: ${{ steps.sched.outputs.name == 'daily-main' || steps.sched.outputs.name == 'htap-sf1' }}
+        if: ${{ matrix.branch == 'trunk' && (steps.sched.outputs.name == 'daily-main' || steps.sched.outputs.name == 'htap-sf1') }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1 --workflow htap
         env:
@@ -254,7 +254,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF10
-        if: ${{ steps.sched.outputs.name == 'htap-sf10' }}
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf10' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf10 --workflow htap
         env:
@@ -263,7 +263,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF100
-        if: ${{ steps.sched.outputs.name == 'htap-sf100' }}
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf100' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow htap
         env:
@@ -279,7 +279,7 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
 

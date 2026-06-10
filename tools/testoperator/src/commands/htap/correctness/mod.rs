@@ -21,6 +21,7 @@ limitations under the License.
 //! and compares the results.
 
 pub mod analytical;
+pub mod compare;
 pub mod row_count;
 
 pub use analytical::verify_analytical_results;

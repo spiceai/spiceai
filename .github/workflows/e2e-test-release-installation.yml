@@ -53,7 +53,7 @@ jobs:
         run: uname -m
 
       - name: checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: install Spice (https://install.spiceai.org)
         if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
@@ -66,9 +66,19 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
+          # For the PR/push "from branch" case (no explicit input), fetch using the PR head's repo (to support forks)
+          # + sha (immutable, safe characters, no risk of shell injection via branch name in the URL).
+          # This ensures we test the *exact commit's* version of install.sh, gets clean LF endings from raw.githubusercontent,
+          # and works even if the branch doesn't exist on the upstream repo.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          if [ -n "${INSTALL_SCRIPT_BRANCH}" ]; then
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+          else
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
+          fi
 
       - name: add Spice bin to PATH
         run: |
@@ -251,7 +261,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Setup WSL
         uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
@@ -272,9 +282,22 @@ jobs:
         shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INSTALL_SCRIPT_BRANCH: ${{ inputs.install_script_branch }}
+          # For the PR/push "from branch" case (no explicit input), fetch using the PR head's repo (to support forks)
+          # + sha (immutable, safe characters, no risk of shell injection via branch name in the URL).
+          # This ensures we test the *exact commit's* version of install.sh, gets clean LF endings from raw.githubusercontent,
+          # and works even if the branch doesn't exist on the upstream repo. (Also avoids any CRLF issues from Windows checkout in the WSL mount.)
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The runtime runs inside WSL, which does not inherit Windows-side env vars by default.
+          # WSLENV lists which vars to forward across the interop boundary so the script below can read them.
+          WSLENV: INSTALL_SCRIPT_BRANCH:HEAD_REPO:HEAD_SHA
         run: |
-          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          if [ -n "${INSTALL_SCRIPT_BRANCH:-}" ]; then
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${INSTALL_SCRIPT_BRANCH}/install/install.sh" | /bin/bash
+          else
+            curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/${HEAD_REPO}/${HEAD_SHA}/install/install.sh" | /bin/bash
+          fi
 
       - name: check installation
         shell: wsl-bash {0}

@@ -51,6 +51,7 @@ mod partition_by_cayenne;
 #[cfg(feature = "postgres-accel")]
 mod query_push_down;
 mod refresh;
+mod retention_arrow;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 #[cfg(feature = "snapshots")]
