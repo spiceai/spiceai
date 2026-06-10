@@ -1874,6 +1874,13 @@ pub struct CayenneTableProvider {
     /// cached view with just the new rows instead of rebuilding it from the
     /// whole corpus. See the [`InlinedCache`] "Incremental maintenance contract".
     inlined_structural_epoch: Arc<AtomicU64>,
+    /// Memo for the per-scan merged (file ∪ mem-tier) deletion snapshot. Keyed
+    /// by (file-index `Arc` ptr, tier content `version`, structural epoch) — a
+    /// hit requires all three, so any concurrent append/clear/publish forces a
+    /// rebuild and a stale pairing can never be served. Kills the per-scan
+    /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
+    /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
+    merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -2514,10 +2521,26 @@ enum PkExistenceRef<'a> {
     Bloom(&'a PkBloom),
 }
 
-#[derive(Default)]
+/// Key -> max delete sequence maps the read path probes to hide superseded
+/// rows. Held as structurally-shared persistent maps (the same shape as
+/// [`crate::provider::mem_tier::InMemTombstones`]) so building this view from
+/// the in-memory CDC tier is an O(1) HAMT-root clone per scan, NOT an
+/// O(tier-tombstones) rebuild — the per-scan rebuild was the dominant query
+/// tax under memory mode once the resident tier grew (q20's correlated rescans
+/// paid it per outer group).
 struct InlinedDeletionMaps {
-    int64_pk: HashMap<i64, i64>,
-    row_keys: HashMap<Box<[u8]>, i64>,
+    int64_pk: im::HashMap<i64, i64, hash_index::XxHash3BuildHasher>,
+    row_keys: im::HashMap<Box<[u8]>, i64, hash_index::XxHash3BuildHasher>,
+}
+
+impl Default for InlinedDeletionMaps {
+    fn default() -> Self {
+        // `im::HashMap` cannot derive `Default` with a non-`Default` hasher.
+        Self {
+            int64_pk: im::HashMap::with_hasher(hash_index::XxHash3BuildHasher),
+            row_keys: im::HashMap::with_hasher(hash_index::XxHash3BuildHasher),
+        }
+    }
 }
 
 /// One published inline tombstone's removal effect, recorded so the inline-cache
@@ -2913,7 +2936,29 @@ enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
+/// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
+/// See the `merged_scan_deletions` field docs for the key's torn-state proof.
+struct MergedScanDeletions {
+    /// `Arc::as_ptr` identity of the FILE-side index the merge was built from.
+    file_index_ptr: usize,
+    /// [`crate::provider::mem_tier::MemTier::version`] of the tier merged in.
+    tier_version: u64,
+    /// Structural epoch observed when the memo was built.
+    structural_epoch: u64,
+    merged: PkDeletionSnapshot,
+}
+
 impl PkDeletionSnapshot {
+    /// Identity of the inner index allocation, for the merged-scan memo key.
+    /// `None` for `PositionBased` (no index; the merge is a no-op there anyway).
+    fn index_ptr(&self) -> Option<usize> {
+        match self {
+            Self::PositionBased => None,
+            Self::Int64Pk { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
+            Self::RowConverterBased { tombstones } => Some(Arc::as_ptr(tombstones) as usize),
+        }
+    }
+
     fn has_deletions(&self) -> bool {
         match self {
             Self::PositionBased => false,
@@ -4945,6 +4990,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
+            merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5685,6 +5731,7 @@ impl CayenneTableProvider {
             inlined_row_count: Arc::clone(&self.inlined_row_count),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
+            merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -12202,7 +12249,9 @@ impl CayenneTableProvider {
     /// `None` when empty. The disjoint-skip superset for the in-memory
     /// (inline/mem-tier) tombstones, mirroring `DeletionIndex::deleted_key_range`
     /// for the file-backed snapshot.
-    fn int64_map_key_range(map: &HashMap<i64, i64>) -> Option<(i64, i64)> {
+    fn int64_map_key_range(
+        map: &im::HashMap<i64, i64, hash_index::XxHash3BuildHasher>,
+    ) -> Option<(i64, i64)> {
         let mut iter = map.keys().copied();
         let first = iter.next()?;
         let mut lo = first;
@@ -12362,26 +12411,15 @@ impl CayenneTableProvider {
     fn mem_tier_deletion_maps(
         snapshot: &crate::provider::mem_tier::MemTier,
     ) -> InlinedDeletionMaps {
-        // The tier holds tombstones in persistent (`im::HashMap`) maps; the
-        // merge-on-read filter consumes the std-`HashMap`-backed
-        // `InlinedDeletionMaps`, so materialize a std map by iteration here. This
-        // runs only on the SCAN / CHECKPOINT path (building the removal map), not
-        // per CDC append, so it does not reintroduce the per-append O(tier) tax
-        // the HAMT removed — and the resulting map is identical to the pre-HAMT
-        // representation the filter already expected.
+        // Both the tier and `InlinedDeletionMaps` hold tombstones in the SAME
+        // persistent (`im::HashMap`) representation, so this view is an O(1)
+        // HAMT-root clone — never an O(tier-tombstones) materialization. That
+        // matters because this runs per SCAN (and correlated plans re-scan per
+        // outer group): with a 128MiB resident tier the old per-scan std-map
+        // rebuild was the dominant memory-mode query tax (q20 322ms -> 74s).
         InlinedDeletionMaps {
-            int64_pk: snapshot
-                .tombstones
-                .int64_pk
-                .iter()
-                .map(|(&pk, &seq)| (pk, seq))
-                .collect(),
-            row_keys: snapshot
-                .tombstones
-                .row_keys
-                .iter()
-                .map(|(key, &seq)| (key.clone(), seq))
-                .collect(),
+            int64_pk: snapshot.tombstones.int64_pk.clone(),
+            row_keys: snapshot.tombstones.row_keys.clone(),
         }
     }
 
@@ -14936,7 +14974,41 @@ impl TableProvider for CayenneTableProvider {
                 ))
             })?;
         };
-        let deletion_snapshot = deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot);
+        // Memoized merge of the mem-tier tombstones into the file-side index.
+        // The raw `with_mem_tier_tombstones` extend is O(tier-tombstones) and a
+        // correlated plan re-scans (and re-merged) per outer group; the memo key
+        // (file index ptr, tier content version, structural epoch) makes a hit
+        // serve the identical inputs' identical output, so repeated scans within
+        // one quiescent window pay O(1).
+        let deletion_snapshot = match (
+            deletion_snapshot.index_ptr(),
+            Self::mem_tier_has_tombstones(&mem_tier_snapshot),
+        ) {
+            (Some(file_index_ptr), true) => {
+                let tier_version = mem_tier_snapshot.version;
+                let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
+                let memo = self.merged_scan_deletions.load_full();
+                if let Some(memo) = memo
+                    && memo.file_index_ptr == file_index_ptr
+                    && memo.tier_version == tier_version
+                    && memo.structural_epoch == structural_epoch
+                {
+                    memo.merged.clone()
+                } else {
+                    let merged = deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot);
+                    self.merged_scan_deletions.store(Some(Arc::new(MergedScanDeletions {
+                        file_index_ptr,
+                        tier_version,
+                        structural_epoch,
+                        merged: merged.clone(),
+                    })));
+                    merged
+                }
+            }
+            // No file index (position-based) or no tier tombstones: the merge is
+            // the identity; skip the memo entirely.
+            _ => deletion_snapshot.with_mem_tier_tombstones(&mem_tier_snapshot),
+        };
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
         // For PK-based deletion, we need to ensure PK columns are included in the projection
@@ -19492,6 +19564,99 @@ mod tests {
         assert!(
             provider.mem_tier.load().is_empty(),
             "once the tier age reaches the cap, the tick must flush (bounded slot ack)"
+        );
+    }
+
+    /// Merged-scan-deletions memo: repeated scans in a quiescent window reuse
+    /// ONE merged (file ∪ mem-tier) deletion snapshot (the q20 correlated-rescan
+    /// fix), and any append invalidates it (new tier version ⇒ rebuild). Also
+    /// re-asserts visibility correctness across the memoized path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merged_scan_deletions_memo_reuses_and_invalidates() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "merge_memo",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        struct TestAdvancer;
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+        }
+        provider.install_slot_advancer(Arc::new(TestAdvancer));
+
+        // Durable rows first (a file-side index exists), then a RAM upsert that
+        // tombstones one of them — the scan must merge file ∪ tier deletions.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])).await;
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush inline rows to the file tier");
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM upsert");
+        assert!(write.in_memory_epoch().is_some(), "upsert engaged the RAM tier");
+
+        // First scan builds + stores the memo; the result must be merge-correct.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
+            vec![(1, 100), (2, 20)],
+            "tier tombstone must hide the durable copy of PK 1"
+        );
+        let first = provider
+            .merged_scan_deletions
+            .load_full()
+            .expect("first scan stored the merged-deletions memo");
+
+        // Second scan (no writes in between) must REUSE the same memo entry.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
+            vec![(1, 100), (2, 20)],
+            "memoized merge returns identical visibility"
+        );
+        let second = provider
+            .merged_scan_deletions
+            .load_full()
+            .expect("memo still present");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a quiescent re-scan must HIT the memo (same entry), not rebuild it"
+        );
+
+        // An append invalidates: the next scan rebuilds (a different entry).
+        let write2 = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[200])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("second RAM upsert");
+        assert!(write2.in_memory_epoch().is_some(), "second upsert engaged RAM");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
+            vec![(1, 100), (2, 200)],
+            "post-append scan reflects the new tombstone"
+        );
+        let third = provider
+            .merged_scan_deletions
+            .load_full()
+            .expect("memo rebuilt after append");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "an append must invalidate the memo (tier version changed)"
         );
     }
 

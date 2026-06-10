@@ -192,6 +192,11 @@ pub(crate) struct MemTier {
     /// by the age cap to bound the crash-replay window for cold tables. `None`
     /// when the tier is empty.
     pub(crate) oldest_append: Option<Instant>,
+    /// Monotonic CONTENT version: bumped on every construction that changes the
+    /// tier's contents (append AND the post-checkpoint retain), unlike `epoch`
+    /// which is preserved across a clear. Cache keys that must distinguish "same
+    /// epoch, different tombstones" (the merged-scan-deletions memo) key on this.
+    pub(crate) version: u64,
 }
 
 impl MemTier {
@@ -206,6 +211,7 @@ impl MemTier {
             superseded: 0,
             epoch: 0,
             oldest_append: None,
+            version: 0,
         }
     }
 
@@ -267,6 +273,7 @@ impl MemTier {
             superseded: self.superseded.saturating_add(superseded),
             epoch: self.epoch + 1,
             oldest_append: self.oldest_append.or_else(|| Some(Instant::now())),
+            version: self.version + 1,
         }
     }
 
@@ -294,6 +301,7 @@ impl MemTier {
             // Nothing newer survived — empty tier, epoch preserved.
             let mut empty = Self::empty();
             empty.epoch = self.epoch;
+            empty.version = self.version + 1;
             return empty;
         }
         let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
@@ -317,6 +325,7 @@ impl MemTier {
             // Reset the age clock: the flushed segments are gone, so the survivor
             // age is measured from now (the next age-cap window starts here).
             oldest_append: Some(Instant::now()),
+            version: self.version + 1,
         }
     }
 }
