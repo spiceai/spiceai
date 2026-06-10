@@ -246,8 +246,49 @@ async fn append_overlay(
     );
 }
 
+
+/// Background value-identical upsert stream: rewrites existing pks with their
+/// SAME values at a steady cadence, so every query result stays byte-identical
+/// while the tier version / structural epoch churn at live-CDC rates. Returns
+/// a stop flag; the task exits within one cadence of it being set (bounded:
+/// also hard-capped at MAX_APPEND_TICKS).
+fn spawn_append_load(
+    rt: &tokio::runtime::Runtime,
+    table: Arc<CayenneTableProvider>,
+    schema: Arc<Schema>,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    const APPEND_ROWS: i64 = 2_000;
+    const CADENCE: std::time::Duration = std::time::Duration::from_millis(50);
+    const MAX_APPEND_TICKS: u32 = 10_000;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_task = Arc::clone(&stop);
+    rt.spawn(async move {
+        let ctx = SessionContext::new();
+        let mut tick = 0u32;
+        let mut start_pk = 0i64;
+        while !stop_task.load(std::sync::atomic::Ordering::Relaxed) && tick < MAX_APPEND_TICKS {
+            let batch = fact_batch(&schema, start_pk, APPEND_ROWS, 0);
+            start_pk = (start_pk + APPEND_ROWS) % (OLINE_ROWS / 2);
+            let stream_schema = batch.schema();
+            let stream = datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                stream_schema,
+                futures::stream::iter([Ok::<_, datafusion_common::DataFusionError>(batch)]),
+            );
+            table
+                .write_cdc_append_stream(Box::pin(stream), &ctx.task_ctx())
+                .await
+                .expect("background value-identical upsert");
+            tokio::time::sleep(CADENCE).await;
+            tick += 1;
+        }
+    });
+    stop
+}
+
 struct Lane {
     ctx: SessionContext,
+    oline: Arc<CayenneTableProvider>,
+    oline_schema: Arc<Schema>,
     expected_single: Vec<RecordBatch>,
     expected_semi: Vec<RecordBatch>,
     expected_triple: Vec<RecordBatch>,
@@ -291,6 +332,7 @@ async fn setup_lane(state: TierState, expected: Option<&Lane>) -> (Lane, tempfil
     append_overlay(&stock, &stock_schema, state, ITEMS).await;
 
     let ctx = SessionContext::new();
+    let oline_handle = Arc::clone(&oline);
     ctx.register_table("oline_b", oline).expect("register oline");
     ctx.register_table("stock_b", stock).expect("register stock");
     let supp_schema = Arc::new(Schema::new(vec![Field::new("su_key", DataType::Int64, false)]));
@@ -306,6 +348,8 @@ async fn setup_lane(state: TierState, expected: Option<&Lane>) -> (Lane, tempfil
     .expect("register supp");
 
     let lane = Lane {
+        oline: oline_handle,
+        oline_schema,
         expected_single: run_sql(&ctx, SINGLE_SCAN_SQL).await,
         expected_semi: run_sql(&ctx, SEMI_JOIN_SQL).await,
         expected_triple: run_sql(&ctx, TRIPLE_SCAN_SQL).await,
@@ -394,6 +438,41 @@ fn bench_mem_tier_join_shapes(c: &mut Criterion) {
         }
     }
     group.finish();
+
+    // ---- live-load lanes: the SAME queries while value-identical upserts
+    // stream into oline_b (tier-version churn at live-CDC cadence). Results
+    // remain byte-identical, so the correctness gate still applies. This is
+    // the in-process probe for the LOAD-COUPLED component of the SF-100
+    // slow-set (q20 322ms -> 65s reproduced nowhere at rest).
+    let stop = spawn_append_load(
+        &rt,
+        Arc::clone(&upsert_lane.oline),
+        Arc::clone(&upsert_lane.oline_schema),
+    );
+    let mut live = c.benchmark_group("mem_tier_join_shapes_under_appends");
+    live.sample_size(10);
+    for (shape, sql) in [("single_scan", SINGLE_SCAN_SQL), ("semi_join", SEMI_JOIN_SQL)] {
+        let expected = match shape {
+            "single_scan" => &upsert_lane.expected_single,
+            _ => &upsert_lane.expected_semi,
+        };
+        live.bench_with_input(
+            BenchmarkId::new(shape, "overlay_upsert_live"),
+            &sql,
+            |bencher, &sql| {
+                bencher.to_async(&rt).iter(|| async {
+                    let batches = run_sql(&upsert_lane.ctx, sql).await;
+                    assert!(
+                        batches_equal(&batches, expected),
+                        "{shape}/overlay_upsert_live returned a different result mid-bench"
+                    );
+                    black_box(batches);
+                });
+            },
+        );
+    }
+    live.finish();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 criterion_group!(benches, bench_mem_tier_join_shapes);
