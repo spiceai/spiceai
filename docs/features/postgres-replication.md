@@ -115,14 +115,16 @@ All replication-specific parameters live under `params:` on the dataset and star
 
 | Parameter                             | Default                                          | Description                                                                                                                                                                                                                            |
 | ------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pg_replication_slot`                 | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names.                                                                                          |
-| `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix.                                                                                    |
-| `pg_replication_initial_snapshot`     | `true`                                           | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself.                                                                                     |
+| `pg_replication_slot`                 | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names. Datasets on the same connection that name the **same** slot share it — see [Sharing one slot across multiple datasets](#sharing-one-slot-across-multiple-datasets). |
+| `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. When `pg_replication_slot` is set explicitly, the default becomes `<slot>_pub` so datasets sharing a slot land on the same publication.                       |
+| `pg_replication_initial_snapshot`     | `true`                                           | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. Non-persistent accelerators (`arrow`, or `duckdb`/`sqlite` with `mode: memory`/`file_create`) snapshot on **every** start — including slot resume — since they boot empty.            |
 | `pg_replication_temporary_slot`       | `false`                                          | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps.                                                                                                                                                    |
 | `pg_replication_status_interval`      | `10s`                                            | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
 | `pg_replication_bootstrap_batch_size` | `8192`                                           | Rows per batch emitted by the initial snapshot stream. Increase for large tables to reduce per-batch write/planning overhead; decrease to reduce peak memory. Maximum: `1048576`.                                                      |
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
+
+Connection footprint: a `refresh_mode: changes` dataset uses its regular connection pool only for schema probes at initialization — replication itself runs over dedicated connections (setup, snapshot, and the WAL stream). The pool therefore defaults to `pg_connection_pool_size: 2` with `pg_connection_pool_min_idle: 0` for changes-mode datasets, so N CDC datasets hold no idle pool connections at steady state. Set either parameter explicitly to override.
 
 ### Runtime CDC apply tuning
 
@@ -175,6 +177,53 @@ Note: `prefer` behaves as plaintext here because the replication transport does 
 | `arrow`    |    ✅     | ✅ (upsert with primary key) |    ✅     | Arrow's in-memory engine uses a hash index for primary-key upserts. Without a primary key, updates are appended as new rows. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
 For Arrow workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), configure a primary key. DuckDB, SQLite, Postgres, and Cayenne also support upsert behavior.
+
+## Sharing one slot across multiple datasets
+
+Each logical replication slot runs its own walsender + decoder over the **entire** WAL stream on the source server (the publication filter applies after decoding), and each slot independently pins WAL retention. Postgres also defaults to `max_replication_slots = 10` (restart required to raise it). A spiced instance that mirrors several small tables from one database therefore should not burn one slot per table.
+
+To share, give the datasets the same explicit `pg_replication_slot` (and the same connection parameters):
+
+```yaml
+datasets:
+  - from: postgres:public.users
+    name: users
+    params: &repl
+      pg_host: db.internal
+      pg_db: app
+      pg_user: spice
+      pg_pass: ${secrets:pg_pass}
+      pg_replication_slot: spice_app_cdc
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: changes
+      primary_key: id
+      on_conflict:
+        id: upsert
+
+  - from: postgres:public.orders
+    name: orders
+    params: *repl
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: changes
+      primary_key: id
+      on_conflict:
+        id: upsert
+```
+
+Spice runs **one replication connection, one slot, and one publication** (`spice_app_cdc_pub`, covering both tables) and routes decoded changes by `(schema, table)` to each dataset's accelerator. A slot named by only one dataset behaves exactly like a dedicated slot. Datasets that don't set `pg_replication_slot` keep their own per-dataset slot as before.
+
+Sharing semantics worth knowing:
+
+- **Same consistency model as dedicated slots.** At-least-once across the snapshot/WAL boundary, made convergent by the required `primary_key` + `on_conflict: upsert`. Each member table is snapshotted when the slot is first created, or when the table is later added to the publication (e.g. a dataset added via Spicepod reload — the publication is extended with `ALTER PUBLICATION ... ADD TABLE` and just that table is snapshotted).
+- **Acknowledgement is collective.** `confirmed_flush_lsn` is per-slot, so Spice acknowledges the *minimum* LSN durably applied across all member datasets. A dataset whose accelerator stalls or whose stream fails **pins WAL retention for the whole slot** — deliberately, because acking past it would permanently lose its changes. This is visible as a growing `dataset_postgres_replication_lag_bytes` and a WARN log naming the detached dataset; restarting spiced (or the dataset rejoining) replays from the held LSN and every member re-applies the overlap idempotently.
+- **One dataset per source table per slot.** Two datasets replicating the same table must use different slots.
+- **All members must use the same publication.** Leave `pg_publication` unset (the `<slot>_pub` default agrees automatically) or set it identically on every member.
+- **Removing a dataset** stops routing its changes but does not remove its table from the publication, and its last-applied LSN keeps pinning WAL until spiced restarts. After a restart the remaining members resume and the slot acknowledges freely again. If you later **re-add a previously removed dataset**, drop its table from the publication first (`ALTER PUBLICATION spice_app_cdc_pub DROP TABLE public.users;`) so Spice re-adds it and takes a fresh snapshot — changes that committed while the dataset was absent across a restart are not replayable from the slot.
+- **Replicas still need distinct slots.** Slots are single-consumer: sharing happens *within* a spiced instance, never across replicas. With explicit slot names, include the replica identity in the name (see [Multi-replica deployments](#multi-replica-deployments)); a second consumer of the same slot fails loudly with "replication slot is active".
 
 ## Multi-replica deployments
 
@@ -397,6 +446,8 @@ SELECT pg_drop_replication_slot('spice_users_<instance-hash>');
 
 On next start, Spice will create a fresh slot, snapshot the table, and resume streaming.
 
+This is only necessary for **persistent** accelerators (`mode: file`, or external engines like `postgres`/`cayenne`), where deleting the storage desynchronizes it from the slot's checkpoint. Non-persistent accelerators (`arrow`, or `duckdb`/`sqlite` with `mode: memory`/`file_create`) start empty on every boot, so Spice automatically re-runs the initial snapshot on each start — resuming WAL from the existing slot afterwards — and no manual slot intervention is needed.
+
 ### Changing the source schema
 
 pgoutput re-emits a `Relation` message whenever the source table's schema changes. Spice validates it against the declared accelerator schema on every change; an incompatible change (e.g. a required column disappears) becomes a fatal error for that dataset. The recommended workflow:
@@ -417,15 +468,16 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |
 | `pg_replication_slots.active` is `true` but the accelerator isn't updating | Check the Spice logs for schema-mismatch errors. The replication task will still hold the slot even after a failure — restart Spice after fixing the schema to advance. |
-| `wal` on the source disk growing forever                                   | An abandoned slot. Drop it with `pg_drop_replication_slot`.                                                                                                             |
+| `wal` on the source disk growing forever                                   | An abandoned slot — drop it with `pg_drop_replication_slot`. On a shared slot, also check the logs for a "shared replication member detached" WARN: one failed/removed dataset holds the slot's `confirmed_flush_lsn` until spiced restarts.             |
 | `UPDATE`s on Arrow-engine dataset don't replace rows                       | Configure a `primary_key` so Arrow can use its hash index for upserts, or switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`.                                       |
 | Huge `TEXT`/`JSONB` columns show as `NULL` after `UPDATE`                  | Unchanged TOASTed columns are omitted by pgoutput. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` if you need them in every event.                                        |
 | Logged *`TRUNCATE from postgres replication queued for accelerator`*       | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied.                                                                            |
 
 ## Limitations (current release)
 
-- **One table per dataset.** Each Spice dataset replicates exactly one source table; each dataset gets its own slot and publication.
+- **One table per dataset.** Each Spice dataset replicates exactly one source table. By default each dataset gets its own slot and publication; datasets that name the same `pg_replication_slot` share one slot, publication, and replication connection (see [Sharing one slot across multiple datasets](#sharing-one-slot-across-multiple-datasets)).
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
+- **Multidimensional arrays are not supported.** Single-level arrays (`text[]`, `int4[]`, ...), enums, `uuid`, and `json`/`jsonb` columns replicate fine; nested arrays (`text[][]`) must be cast to a scalar on the source or excluded from the dataset.
 - **Arrow engine** supports `on_conflict` upserts when a primary key is configured. Without a primary key, `UPDATE`s appear as additional inserts rather than replacing existing rows. `DELETE` and `TRUNCATE` are applied.
 
 ## Comparison with Debezium + Kafka
