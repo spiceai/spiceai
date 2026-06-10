@@ -44,7 +44,7 @@ use runtime::podswatcher::PodsWatcher;
 use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
-use runtime_async::ManagedTokioRuntime;
+use runtime_async::{ManagedTokioRuntime, RuntimePriority};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -639,17 +639,15 @@ pub async fn run(args: Args) -> Result<()> {
     match App::get_runtime_param_opt::<String>(&app, "dedicated_thread_pool").as_deref() {
         Some("sql_engine") | None => {
             // The dedicated SQL-engine (query execution) runtime runs at a
-            // slightly lower OS priority (nice 5) than the default-priority
-            // (nice 0) primary runtime that serves HTTP/health and request
-            // handling. Under a CPU-saturated query workload this keeps query
-            // *execution* from starving the latency-sensitive liveness probe
-            // and request-serving threads, while staying *above* the background
-            // refresh/compaction runtimes (nice 10) so query work is still
-            // favored over background maintenance.
-            const SQL_ENGINE_NICE: i32 = 5;
+            // Reduced priority — below the default-priority primary runtime that
+            // serves HTTP/health and request handling, but above the Background
+            // refresh/compaction runtimes. Under a CPU-saturated query workload
+            // this keeps query *execution* from starving the latency-sensitive
+            // liveness probe and request-serving threads, while still favoring
+            // query work over background maintenance.
             // This needs to be created after tracing is set up, or else task_history events aren't emitted.
             let cpu_runtime = ManagedTokioRuntime::builder()
-                .with_nice(SQL_ENGINE_NICE)
+                .with_priority(RuntimePriority::Reduced)
                 .with_thread_name("sql-worker")
                 .build()
                 .boxed()
@@ -663,7 +661,7 @@ pub async fn run(args: Args) -> Result<()> {
             // impacting query latency.
             // Uses low thread priority to minimize impact on latency-sensitive operations.
             let refresh_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
+                .with_priority(RuntimePriority::Background)
                 .with_thread_name("refresh-worker")
                 .build()
                 .boxed()
@@ -679,7 +677,7 @@ pub async fn run(args: Args) -> Result<()> {
             // spicepod. `set_compaction_runtime` injects the carved memory
             // environment only when one is available.
             let compaction_runtime = ManagedTokioRuntime::builder()
-                .with_low_priority()
+                .with_priority(RuntimePriority::Background)
                 .with_thread_name("compaction-worker")
                 .build()
                 .boxed()
