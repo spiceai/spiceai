@@ -13073,7 +13073,7 @@ impl CayenneTableProvider {
         let ctx = self.create_session_context();
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
-        // Two-phase checkpoint (moonshot lever 1+2): for the key/Int64 strategies
+        // Two-phase off-fence checkpoint: for the key/Int64 strategies
         // the expensive durable work — the Vortex ENCODE (`write_to_snapshot`) and
         // the `BEGIN IMMEDIATE` metastore COMMIT (`commit_mem_tier_checkpoint_metadata`,
         // ~98% of publish cost) — runs OUTSIDE the listing fence, then a tiny
@@ -19883,7 +19883,7 @@ mod tests {
         );
     }
 
-    /// Moonshot lever 1+2 correctness guard: the two-phase `checkpoint_mem_tier`
+    /// Off-fence checkpoint correctness guard: the two-phase `checkpoint_mem_tier`
     /// runs the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence and
     /// takes the fence only for the in-memory swap. A CDC append that interleaves
     /// with that off-fence window must be NEITHER lost (vanish) NOR re-materialized

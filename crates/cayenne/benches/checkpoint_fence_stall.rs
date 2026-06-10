@@ -159,7 +159,7 @@ fn bench_checkpoint_fence_stall(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Moonshot lever 1+2: mem-tier checkpoint encode + BEGIN IMMEDIATE commit moved
+// Off-fence checkpoint: mem-tier checkpoint encode + BEGIN IMMEDIATE commit moved
 // OUTSIDE the listing fence.
 //
 // `checkpoint_mem_tier` (cdc_durability: memory) previously held
