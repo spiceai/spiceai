@@ -229,13 +229,13 @@ fn collect_flight_execs(plan: &Arc<dyn ExecutionPlan>) -> Option<Vec<&FlightSqlE
 ///   `BytesProcessedExec`) — defined in upstream crates, not available for
 ///   downcasting.
 ///
-/// `FilterExec` is deliberately NOT a pass-through. `FlightSQLTable` classifies
-/// every filter as `Exact` (removed from the plan, embedded in the scan SQL) or
-/// `Unsupported` (kept in a `FilterExec`, absent from the scan SQL) — never
-/// `Inexact`. So a `FilterExec` above the scan always carries a predicate the
-/// scan SQL does NOT apply; pushing the aggregate past it would compute the
-/// aggregate over unfiltered rows. Bail and keep the local partial aggregate,
-/// which runs above the `FilterExec`.
+/// `FilterExec` is deliberately NOT pass-through. `FlightSQLTable` reports
+/// filter pushdown as `Exact` (predicate absorbed into the scan SQL, no
+/// `FilterExec` planned) or `Unsupported` (predicate stays in the plan as a
+/// `FilterExec` and is NOT in the scan SQL) — it never reports `Inexact`. A
+/// `FilterExec` here therefore always carries a predicate the pushed-down
+/// aggregation SQL would lose, and the rewrite would silently aggregate over
+/// unfiltered rows. Bail and keep the local partial aggregate instead.
 ///
 /// Returns `None` if the chain contains a multi-input node or an unrecognised
 /// node, or terminates at a non-`FlightSqlExec`.
@@ -1090,6 +1090,40 @@ mod tests {
             make_flight_exec(&schema, "foo.foo.lineitem", &[]),
             Arc::new(MockNonFlightExec::new(Arc::clone(&schema))),
         ]);
+        assert_no_pushdown(partial_aggregate(
+            input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                    .schema(Arc::clone(&schema))
+                    .alias("sum")
+                    .build()?,
+            )],
+        )?);
+        Ok(())
+    }
+
+    /// A `FilterExec` above a federated scan holds a predicate that is NOT in
+    /// the scan's SQL (`FlightSQLTable` pushdown is `Exact` or `Unsupported`,
+    /// never `Inexact`). Pushing the partial aggregate through it would
+    /// silently aggregate over unfiltered rows, so the rule must bail.
+    #[tokio::test]
+    async fn test_no_pushdown_filter_exec_above_scan() -> Result<()> {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = lineitem_schema();
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("l_returnflag", 3)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8View(Some("A".to_string())))),
+        ));
+        let filtered_scan = Arc::new(FilterExec::try_new(
+            predicate,
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        )?) as Arc<dyn ExecutionPlan>;
+        let input = make_union(vec![filtered_scan]);
         assert_no_pushdown(partial_aggregate(
             input,
             &[(3, "l_returnflag")],

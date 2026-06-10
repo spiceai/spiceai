@@ -886,4 +886,38 @@ mod tests {
             "a residual FilterExec must block the broadcast rewrite"
         );
     }
+
+    #[tokio::test]
+    async fn bails_on_filter_exec_inside_fact_union_leg() {
+        // The residual FilterExec can also hide inside one leg of the fact's
+        // partition UNION rather than directly above a scan. `resolve_federated_side`
+        // must still refuse to walk through it, so the rewrite bails and the
+        // un-pushed predicate is preserved by the central join.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("f_val", 1))));
+        let filtered_leg: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(predicate, flight_exec(&fact_schema, "cat.sch.fact", 1_000))
+                .expect("valid FilterExec"),
+        );
+        let fact = UnionExec::try_new(vec![
+            filtered_leg,
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+        ])
+        .expect("valid UnionExec");
+        let join = inner_hash_join(
+            fact,
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "a FilterExec inside a fact union leg must block the broadcast rewrite"
+        );
+    }
 }
