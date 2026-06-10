@@ -33,7 +33,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_datafusion::IcebergTableProvider;
 use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
@@ -63,20 +63,17 @@ async fn create_iceberg_table_provider(
     table_name: &str,
     table_state: &str,
 ) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
-    let table_ident = TableIdent::new(namespace.clone(), table_name.to_string());
-    let table = catalog.load_table(&table_ident).await.map_err(|e| {
+    let provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog),
+        namespace.clone(),
+        table_name.to_string(),
+    )
+    .await
+    .map_err(|e| {
         DataFusionError::Execution(format!(
-            "Failed to load {table_state} Iceberg table '{table_name}': {e}"
+            "Failed to create table provider for {table_state} Iceberg table '{table_name}': {e}"
         ))
     })?;
-
-    let provider = IcebergStaticTableProvider::try_new_from_table(table)
-        .await
-        .map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to create table provider for {table_state} Iceberg table: {e}"
-            ))
-        })?;
 
     Ok(Arc::new(provider))
 }

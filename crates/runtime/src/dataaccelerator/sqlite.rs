@@ -508,7 +508,7 @@ impl DataAccelerator for SqliteAccelerator {
     }
 
     fn supports_snapshot_reload(&self) -> bool {
-        false
+        true
     }
 
     /// `SQLite` snapshot reload is disabled until the upstream factory exposes

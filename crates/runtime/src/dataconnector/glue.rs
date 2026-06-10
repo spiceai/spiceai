@@ -28,7 +28,7 @@ use iceberg_catalog_glue::{
     AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
     GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
-use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_datafusion::IcebergTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -448,38 +448,33 @@ async fn create_iceberg_provider(
             customized_credential_load: None,
         });
 
-    let catalog = GlueCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .load("glue", props)
-        .await
-        .map_err(|e| {
-            super::DataConnectorError::InvalidConfiguration {
+    let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+        GlueCatalogBuilder::default()
+            .with_storage_factory(storage_factory)
+            .load("glue", props)
+            .await
+            .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                 dataconnector: PREFIX.to_string(),
                 connector_component: dataset.into(),
                 message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
                 source: e.into(),
-            }
-    })?;
+            })?,
+    );
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
 
-    let loaded_table = catalog.load_table(&identifier).await.map_err(|e| {
-        super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-            source: e.into(),
-        }
+    let table_provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog),
+        identifier.namespace().clone(),
+        identifier.name().to_string(),
+    )
+    .await
+    .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+        dataconnector: PREFIX.to_string(),
+        connector_component: dataset.into(),
+        message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+        source: e.into(),
     })?;
-
-    let table_provider = IcebergStaticTableProvider::try_new_from_table(loaded_table)
-        .await
-        .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot create table provider for Iceberg table '{}' for dataset '{} (glue)'. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
-            source: e.into(),
-        })?;
 
     Ok(Arc::new(table_provider))
 }

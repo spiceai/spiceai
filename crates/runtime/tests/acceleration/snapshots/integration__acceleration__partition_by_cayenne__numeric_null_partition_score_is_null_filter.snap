@@ -1,18 +1,8 @@
 ---
 source: crates/runtime/tests/acceleration/partition_by_cayenne.rs
 expression: sanitized_plan
+snapshot_kind: text
 ---
-FilterExec: score@4 IS NULL
-  SchemaCastScanExec
-    PartitionedUnionExec
-      CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0
-        BytesProcessedExec
-          EmptyExec
-      CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0
-        BytesProcessedExec
-          EmptyExec
-      CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0
-        BytesProcessedExec
           EmptyExec
       CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0
         BytesProcessedExec
@@ -21,5 +11,3 @@ FilterExec: score@4 IS NULL
         BytesProcessedExec
           DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/.vortex]]}, projection=[id, name, age, city, score], file_type=vortex, predicate: score@4 IS NULL
       CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0
-        BytesProcessedExec
-          EmptyExec

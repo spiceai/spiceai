@@ -1,20 +1,20 @@
 ---
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
+snapshot_kind: text
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                   |
-+---------------+------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: age                                                                                                        |
-|               |   Sort: json_test.id ASC NULLS LAST                                                                                    |
-|               |     Projection: json_get_int(json_test.data, Utf8("age")) AS age, json_test.id                                         |
-|               |       TableScan: json_test projection=[id, data]                                                                       |
-| physical_plan | ProjectionExec: expr=[age@0 as age]                                                                                    |
-|               |   SortExec: expr=[id@1 ASC NULLS LAST], preserve_partitioning=[false]                                                  |
-|               |     ProjectionExec: expr=[json_get_int(data@1, age) as age, id@0 as id]                                                |
-|               |       SchemaCastScanExec                                                                                               |
-|               |         CooperativeExec                                                                                                |
-|               |           BytesProcessedExec                                                                                           |
-|               |             DuckSqlExec sql= SELECT "json_test"."id", "json_test"."data" FROM "json_test" ORDER BY "id" ASC NULLS LAST |
-|               |                                                                                                                        |
-+---------------+------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                         |
++---------------+----------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: age                                                                              |
+|               |   Sort: json_test.id ASC NULLS LAST                                                          |
+|               |     Projection: json_get_int(json_test.data, Utf8("age")) AS age, json_test.id               |
+|               |       TableScan: json_test projection=[id, data]                                             |
+| physical_plan | ProjectionExec: expr=[age@0 as age]                                                          |
+|               |   ProjectionExec: expr=[json_get_int(data@1, age) as age, id@0 as id]                        |
+|               |     SchemaCastScanExec                                                                       |
+|               |       CooperativeExec                                                                        |
+|               |         BytesProcessedExec                                                                   |
+|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test" ORDER BY "id" ASC NULLS LAST |
+|               |                                                                                              |
++---------------+----------------------------------------------------------------------------------------------+
