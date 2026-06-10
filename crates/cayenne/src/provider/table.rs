@@ -16083,6 +16083,13 @@ mod tests {
 
     use test_framework::arrow_record_batch_gen::*;
 
+    struct TestAdvancer;
+
+    #[async_trait::async_trait]
+    impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
+        async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
+    }
+
     fn protected_snapshot_id_at_unix_time(seconds: u64) -> String {
         uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, 0)).to_string()
     }
@@ -18089,11 +18096,6 @@ mod tests {
 
         // Arm it (as the runtime does on the first replayable committer); the next
         // write engages the RAM tier.
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
         provider.install_slot_advancer(Arc::new(TestAdvancer));
         assert!(provider.has_slot_advancer(), "armed");
 
@@ -19331,11 +19333,6 @@ mod tests {
         // replayable committer; a direct provider test must arm it explicitly, or
         // the engagement gate (`is_cdc_memory_mode() && has_slot_advancer()`) keeps
         // the durable path and the mem-tier tombstone logic under test never runs.
-        struct TestAdvancer;
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
         provider.install_slot_advancer(Arc::new(TestAdvancer));
 
         let write = provider
@@ -19429,13 +19426,6 @@ mod tests {
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         // Arm the RAM tier (the runtime does this on the first replayable committer).
-        #[expect(clippy::items_after_statements)]
-        struct TestAdvancer;
-        #[expect(clippy::items_after_statements)]
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
         provider.install_slot_advancer(Arc::new(TestAdvancer));
 
         // Append batch A → RAM (epoch 1).
@@ -19548,13 +19538,6 @@ mod tests {
         assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
         let schema = Arc::clone(&provider.table_metadata.schema);
 
-        #[expect(clippy::items_after_statements)]
-        struct TestAdvancer;
-        #[expect(clippy::items_after_statements)]
-        #[async_trait::async_trait]
-        impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
-            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
-        }
         provider.install_slot_advancer(Arc::new(TestAdvancer));
         let provider = Arc::new(provider);
 
