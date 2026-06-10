@@ -603,8 +603,13 @@ async fn attach_member(
     // the publication), or a slot created fresh this process (regardless of
     // leftover publication membership). A plain rejoin skips it — the held
     // ack floor guarantees the gap is still in WAL and will be replayed.
-    let need_snapshot =
-        setup.table_added || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
+    //
+    // `snapshot_on_resume` overrides all of that: a non-persistent
+    // accelerator starts empty every boot, so WAL replay alone can never
+    // reconstruct it — snapshot-then-replay is the only correct sequence.
+    let need_snapshot = params.snapshot_on_resume
+        || setup.table_added
+        || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
     let snapshotting = need_snapshot && params.initial_snapshot;
     let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
@@ -798,6 +803,14 @@ async fn run_pump(source: Arc<SharedSource>) {
     let mut reconnect_attempts: u32 = 0;
 
     'reconnect: loop {
+        if crate::cdc::is_shutting_down() {
+            tracing::info!(
+                slot = %slot_name,
+                "runtime shutdown; releasing shared replication connection and slot"
+            );
+            finish_pump(&source);
+            return;
+        }
         source.reap_closed_members();
         if source.live_member_count() == 0 && try_finish_if_empty(&source).await {
             tracing::info!(
@@ -858,6 +871,18 @@ async fn run_pump(source: Arc<SharedSource>) {
         let mut txn_open = false;
 
         'recv: loop {
+            if crate::cdc::is_shutting_down() {
+                // Drop the client now (releasing the walsender + slot) rather
+                // than at process exit — the graceful-shutdown drain phase
+                // can hold the process alive for tens of seconds.
+                tracing::info!(
+                    slot = %slot_name,
+                    "runtime shutdown; releasing shared replication connection and slot"
+                );
+                drop(client);
+                finish_pump(&source);
+                return;
+            }
             if source.restart_requested.swap(false, Ordering::AcqRel) {
                 tracing::debug!(
                     slot = %slot_name,

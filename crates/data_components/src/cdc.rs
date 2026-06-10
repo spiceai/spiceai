@@ -26,6 +26,29 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+static CDC_SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Signal every CDC source in the process to stop and release its upstream
+/// resources. Idempotent; there is no way back.
+pub fn begin_shutdown() {
+    CDC_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether [`begin_shutdown`] has been called. Long-running CDC sources check
+/// this in their receive/reconnect loops.
+#[must_use]
+pub fn is_shutting_down() -> bool {
+    CDC_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
 ///
 /// # Readiness contract

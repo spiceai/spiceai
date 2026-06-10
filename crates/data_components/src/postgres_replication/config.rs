@@ -40,6 +40,16 @@ pub struct ReplicationParams {
     pub slot_name: String,
     pub publication_name: String,
     pub initial_snapshot: bool,
+    /// Take the initial snapshot even when resuming from an existing slot.
+    ///
+    /// Set by the connector when the dataset's accelerator does not persist
+    /// across restarts (in-memory engines, `mode: memory`, `mode: file_create`):
+    /// the accelerator starts empty every boot, so a plain slot resume would
+    /// leave it serving only rows touched after startup — silently missing
+    /// all history. Snapshot-then-resume is correct for an empty accelerator:
+    /// the WAL overlap from `confirmed_flush_lsn` replays idempotently via
+    /// the PK upsert. `initial_snapshot: false` still disables all snapshots.
+    pub snapshot_on_resume: bool,
     pub temporary_slot: bool,
     pub status_interval: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
@@ -66,6 +76,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("slot_name", &self.slot_name)
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
+            .field("snapshot_on_resume", &self.snapshot_on_resume)
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)

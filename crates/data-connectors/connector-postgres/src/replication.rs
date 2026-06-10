@@ -54,15 +54,33 @@ pub fn build_changes_stream(
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
 
-    let params_for_stream = match replication_params_from_connector_params(params, &dataset_name) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("postgres replication: {e}");
-            return Box::pin(futures::stream::once(async move {
-                Err(StreamError::External(msg))
-            }));
-        }
-    };
+    let mut params_for_stream =
+        match replication_params_from_connector_params(params, &dataset_name) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("postgres replication: {e}");
+                return Box::pin(futures::stream::once(async move {
+                    Err(StreamError::External(msg))
+                }));
+            }
+        };
+
+    // A non-persistent accelerator starts empty on every boot, so resuming
+    // from an existing slot without a snapshot would silently serve only the
+    // rows touched after startup. Force the snapshot on every start for such
+    // accelerators (snapshot + WAL resume converges via the PK upsert).
+    if dataset
+        .acceleration
+        .as_ref()
+        .is_some_and(accelerator_is_ephemeral)
+    {
+        params_for_stream.snapshot_on_resume = true;
+        tracing::info!(
+            dataset = %dataset_name,
+            "non-persistent accelerator with `refresh_mode: changes`: the initial snapshot \
+             will run on every start, including replication-slot resume"
+        );
+    }
 
     // Prefer the dataset's explicitly-declared acceleration `primary_key` —
     // that's what the accelerator write path uses for upsert/delete, and it's
@@ -435,6 +453,28 @@ impl MetricsProvider for PostgresMetricsProvider {
     }
 }
 
+/// Whether the accelerator's state survives a process restart. Non-persistent
+/// accelerators must re-snapshot on every start — WAL replay from the slot's
+/// checkpoint can never reconstruct an accelerator that booted empty.
+fn accelerator_is_ephemeral(
+    acceleration: &runtime::component::dataset::acceleration::Acceleration,
+) -> bool {
+    use runtime::component::dataset::acceleration::{Engine, Mode};
+    match acceleration.engine.to_unpartitioned() {
+        // Always in-memory.
+        Engine::Arrow => true,
+        // In-memory unless file-backed; `file_create` truncates on startup,
+        // which is just as empty as memory from replication's point of view.
+        Engine::DuckDB | Engine::Sqlite | Engine::Turso => {
+            matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
+        }
+        // External storage (another Postgres, object-store-backed Cayenne)
+        // persists independently of this process. `to_unpartitioned` already
+        // folded the partitioned variants into their base engines.
+        _ => false,
+    }
+}
+
 fn replication_params_from_connector_params(
     params: &Parameters,
     dataset_name: &str,
@@ -494,6 +534,8 @@ fn replication_params_from_connector_params(
         slot_name,
         publication_name,
         initial_snapshot,
+        // Set by the caller from the dataset's acceleration config.
+        snapshot_on_resume: false,
         temporary_slot,
         status_interval,
         bootstrap_batch_size,

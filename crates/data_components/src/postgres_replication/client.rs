@@ -162,6 +162,13 @@ fn wal_stream(
         // reaches a natural end (rare — Postgres replication slots are
         // indefinite). Transient errors drop the current client and restart.
         'reconnect: loop {
+            if crate::cdc::is_shutting_down() {
+                tracing::info!(
+                    dataset = %dataset_name,
+                    "runtime shutdown; releasing replication connection and slot"
+                );
+                break 'reconnect;
+            }
             // Ensure we have an open client. Reconnect with backoff on
             // transient failures.
             let mut client = match client_slot.take() {
@@ -209,6 +216,18 @@ fn wal_stream(
             let mut txn: Option<TransactionBuffer> = None;
 
         'recv: loop {
+            if crate::cdc::is_shutting_down() {
+                // Release the walsender (and the slot it holds) now rather
+                // than at process exit — the shutdown drain phase can keep
+                // the process alive for tens of seconds. Checked per event,
+                // so the bound is one keepalive interval on a quiet source.
+                drop(client);
+                tracing::info!(
+                    dataset = %dataset_name,
+                    "runtime shutdown; released replication connection and slot"
+                );
+                break 'reconnect;
+            }
             let event = match client.recv().await {
                 Ok(Some(e)) => e,
                 Ok(None) => break 'reconnect, // server closed cleanly

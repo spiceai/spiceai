@@ -255,23 +255,34 @@ async fn start_inner(
         metrics.set_confirmed_flush_lsn(outcome.consistent_lsn);
     }
 
-    // 2. If the slot was just created and bootstrap is enabled, run snapshot.
-    let bootstrap_stream = if outcome.created_fresh && params.initial_snapshot {
-        Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
-            params: params.clone(),
-            schema_name: schema_name.clone(),
-            table_name: table_name.clone(),
-            dataset_schema: Arc::clone(&schema),
-            primary_keys: primary_keys.clone(),
-            dataset_name: dataset_name.clone(),
-            metrics: Arc::clone(&metrics),
-        })?)
-    } else {
-        // No bootstrap this run — if the slot already existed, consider the
-        // accelerator "already populated" so operators see bootstrap_complete=1.
-        metrics.mark_bootstrap_complete();
-        None
-    };
+    // 2. Run the snapshot if the slot was just created — or on every start
+    //    when the accelerator doesn't persist across restarts
+    //    (`snapshot_on_resume`) — provided bootstrap is enabled at all.
+    if !outcome.created_fresh && params.snapshot_on_resume && params.initial_snapshot {
+        tracing::info!(
+            dataset = %dataset_name,
+            slot = %outcome.slot_name,
+            "accelerator does not persist across restarts; running the initial snapshot \
+             despite resuming from an existing replication slot"
+        );
+    }
+    let bootstrap_stream =
+        if (outcome.created_fresh || params.snapshot_on_resume) && params.initial_snapshot {
+            Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
+                params: params.clone(),
+                schema_name: schema_name.clone(),
+                table_name: table_name.clone(),
+                dataset_schema: Arc::clone(&schema),
+                primary_keys: primary_keys.clone(),
+                dataset_name: dataset_name.clone(),
+                metrics: Arc::clone(&metrics),
+            })?)
+        } else {
+            // No bootstrap this run — if the slot already existed, consider the
+            // accelerator "already populated" so operators see bootstrap_complete=1.
+            metrics.mark_bootstrap_complete();
+            None
+        };
 
     // When we skip bootstrap (slot resume or `initial_snapshot: false`), emit
     // an immediate empty `is_dataset_ready=true` envelope so the runtime marks

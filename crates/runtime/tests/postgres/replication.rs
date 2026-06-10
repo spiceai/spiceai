@@ -62,6 +62,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         slot_name: slot_name.into(),
         publication_name: publication_name.into(),
         initial_snapshot: true,
+        snapshot_on_resume: false,
         temporary_slot: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
@@ -191,6 +192,40 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         .expect("op")
         .as_string::<i32>();
     assert_eq!(ops.value(0), "d");
+    committer.commit().await?;
+
+    // --- 5. Non-persistent accelerator: snapshot forced on slot resume. ---
+    // Dropping the stream and re-subscribing with `snapshot_on_resume` (set
+    // by the connector for memory-mode accelerators) must re-deliver the full
+    // table as a snapshot instead of resuming snapshot-less over an empty
+    // accelerator. Current rows: {1 (Alicia), 3 (Charlie)}.
+    drop(stream);
+    let mut params = params_for(
+        u16::try_from(port).expect("port fits in u16"),
+        "spice_itest_slot_a",
+        "spice_itest_pub_a",
+    );
+    params.snapshot_on_resume = true;
+    let input = ReplicationStreamInput {
+        dataset_name: "repl_users".into(),
+        params,
+        schema: dataset_schema(),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: "repl_users".into(),
+        metrics: ReplicationMetricsCollector::new(),
+    };
+    let mut stream = start_replication_stream(input);
+    let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("forced resume snapshot missing"))??;
+    let (committer, change_batch, is_ready) = envelope.into_parts();
+    assert_eq!(
+        change_batch.record.num_rows(),
+        2,
+        "snapshot_on_resume must deliver the full table on an existing slot"
+    );
+    assert!(is_ready, "forced resume snapshot must mark dataset ready");
     committer.commit().await?;
 
     Ok(())

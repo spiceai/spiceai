@@ -70,6 +70,7 @@ fn shared_params(port: u16) -> ReplicationParams {
         slot_name: SLOT.into(),
         publication_name: PUBLICATION.into(),
         initial_snapshot: true,
+        snapshot_on_resume: false,
         temporary_slot: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
@@ -531,6 +532,29 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
         envelope.commit().await?;
     }
 
+    // --- 6b. Non-persistent accelerator: snapshot forced on slot resume. ---
+    // With `snapshot_on_resume` (set by the connector for memory-mode
+    // accelerators), a rejoin must take a full snapshot instead of the
+    // resume-ready signal — the accelerator booted empty and WAL replay
+    // alone cannot reconstruct it.
+    drop(stream_a2);
+    let mut ephemeral = input_for(port, "shared_repl_a");
+    ephemeral.params.snapshot_on_resume = true;
+    let mut stream_a3 = start_replication_stream(ephemeral);
+    let boot_a3 = next_envelope(&mut stream_a3, "forced resume snapshot").await?;
+    // shared_repl_a currently holds ids {1, 2, 10, 11, 12, 13}.
+    assert_eq!(
+        boot_a3.change_batch.record.num_rows(),
+        6,
+        "snapshot_on_resume must deliver the full table on rejoin"
+    );
+    assert!(boot_a3.is_dataset_ready());
+    assert!(
+        ops_of(&boot_a3).iter().all(|op| op == "c"),
+        "forced resume snapshot rows are op=c"
+    );
+    boot_a3.commit().await?;
+
     // --- 7. Misconfiguration is rejected with clear errors. ---
     // Duplicate table on the same slot:
     let mut dup = start_replication_stream(input_for(port, "shared_repl_a"));
@@ -561,7 +585,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     }
 
     // --- Cleanup ---
-    drop(stream_a2);
+    drop(stream_a3);
     drop(dup);
     drop(mismatch);
     drop_replication_slot_when_inactive(&source, SLOT).await?;
