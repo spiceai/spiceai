@@ -652,11 +652,15 @@ impl CayenneCatalog {
     ) -> (String, Vec<MetastoreValue>) {
         use std::fmt::Write as _;
 
-        const PARAMS_PER_ROW: usize = 9;
+        const PARAMS_PER_ROW: usize = 10;
         const PREFIX: &str = "INSERT INTO cayenne_delete_file (\
                  delete_file_id, table_id, path, path_is_relative, \
-                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number, \
+                 reinsert_sequence\
              ) VALUES ";
+        // The idempotent re-commit equality list includes `reinsert_sequence` so a
+        // replayed publish with the SAME per-commit reinsert sequence is a no-op,
+        // while a genuinely conflicting metadata change still trips the NULL guard.
         const SUFFIX: &str = " \
              ON CONFLICT(table_id, path) DO UPDATE SET \
                  path = CASE \
@@ -666,11 +670,12 @@ impl CayenneCatalog {
                          AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
                          AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
                          AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                         AND cayenne_delete_file.reinsert_sequence IS excluded.reinsert_sequence \
                      THEN cayenne_delete_file.path \
                      ELSE NULL \
                  END";
-        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~64 bytes.
-        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
+        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~70 bytes.
+        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 70);
         sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
 
@@ -681,7 +686,7 @@ impl CayenneCatalog {
             }
             let _ = write!(
                 sql,
-                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
                 base + 2,
@@ -691,6 +696,7 @@ impl CayenneCatalog {
                 base + 6,
                 base + 7,
                 base + 8,
+                base + 9,
             );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(delete_file.table_id.clone()));
@@ -706,6 +712,11 @@ impl CayenneCatalog {
                     .map_or(MetastoreValue::Null, MetastoreValue::Text),
             );
             params.push(MetastoreValue::Integer(delete_file.sequence_number));
+            params.push(
+                delete_file
+                    .reinsert_sequence
+                    .map_or(MetastoreValue::Null, MetastoreValue::Integer),
+            );
         }
 
         sql.push_str(SUFFIX);
@@ -1201,9 +1212,10 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT delete_file_id, table_id, path, path_is_relative, 
-                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number 
-                 FROM cayenne_delete_file 
+                    sql: "SELECT delete_file_id, table_id, path, path_is_relative,
+                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                        reinsert_sequence
+                 FROM cayenne_delete_file
                  WHERE table_id = ?1",
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
@@ -1221,6 +1233,9 @@ impl MetadataCatalog for CayenneCatalog {
                         // based on the schema (row_id = position-based, row_key = key-based)
                         deletion_type: crate::metadata::DeletionType::default(),
                         sequence_number: row.get_optional_i64(8)?.unwrap_or(0),
+                        // Lever L1: NULL on legacy rows / pure deletes → the
+                        // merge-on-read load falls back to `cayenne_insert_record`.
+                        reinsert_sequence: row.get_optional_i64(9)?,
                     })
                 },
             )
@@ -2596,13 +2611,10 @@ impl MetadataCatalog for CayenneCatalog {
         insert_sequence: i64,
         snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
-        // SQLite param limit chunking (mirrors add_insert_records_batch).
-        const PARAMS_PER_ROW: usize = 4;
+        // SQLite param limit chunking. Delete-file rows use 10 params each
+        // (lever L1 added `reinsert_sequence`); keep the same total budget.
         const MAX_PARAMS: usize = 32_000;
-        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
-
-        // Delete-file rows use 9 params each; keep the same budget.
-        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
         const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
         // Atomic replacement for the legacy `add_delete_file × N` +
@@ -2639,6 +2651,19 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+        }
+
+        // Lever L1 (metadata-only publish): stamp the per-commit reinsert sequence
+        // on the upsert's delete-file rows. The keys this file deletes are exactly
+        // the keys re-inserted at `insert_sequence` (the on-conflict upsert
+        // contract validated above), so one column per file reconstructs the
+        // per-key insert map on read — the per-key `cayenne_insert_record` chunks
+        // below are no longer written. `None` when nothing is re-inserted (a pure
+        // delete) and harmless on position-based files (their DV carries no keys).
+        let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
+        let mut delete_files = delete_files;
+        for delete_file in &mut delete_files {
+            delete_file.reinsert_sequence = reinsert_sequence;
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2730,30 +2755,13 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             }
 
-            // Chunked INSERTs for the insert_record rows.
-            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-                let (sql, params) =
-                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
-                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "insert insert-record chunk inside on-conflict transaction",
-                        )
-                        .await;
-                        continue 'attempts;
-                    }
-                    drop(tx);
-                    return Err(CatalogError::InvalidOperation {
-                        message:
-                            "Failed to insert insert-record chunk inside on-conflict transaction"
-                                .to_string(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+            // Lever L1 (metadata-only publish): the per-key `cayenne_insert_record`
+            // chunks that used to be written here are GONE — the re-insert side is
+            // now carried by the per-commit `reinsert_sequence` column stamped on
+            // the delete-file rows above, and reconstructed per-key on read from
+            // each delete vector's keys. This eliminates the O(N-keys) WAL payload
+            // that was ~98% of the publish-commit cost (see `publish_metadata_wall`
+            // bench). `insert_pk_bytes_list` now only gates the reinsert stamp.
 
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
@@ -2838,11 +2846,9 @@ impl MetadataCatalog for CayenneCatalog {
         // losing the re-`begin_transaction` semantics.
 
         // SQLite param limit chunking (mirrors commit_on_conflict_deletions).
-        const PARAMS_PER_ROW: usize = 4;
+        // Delete-file rows use 10 params each (lever L1 added `reinsert_sequence`).
         const MAX_PARAMS: usize = 32_000;
-        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
-
-        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
         const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
         // cycle-8 TASK D4: deferred-flip UPDATE chunking. The batched UPDATE binds
@@ -2896,6 +2902,15 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+        }
+
+        // Lever L1: stamp the per-commit reinsert sequence on the delete-file rows
+        // (see `commit_on_conflict_deletions`). Replaces the per-key insert-record
+        // chunks dropped below.
+        let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
+        let mut delete_files = delete_files;
+        for delete_file in &mut delete_files {
+            delete_file.reinsert_sequence = reinsert_sequence;
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2980,29 +2995,8 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             }
 
-            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-                let (sql, params) =
-                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
-                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "insert insert-record chunk inside on-conflict (with tombstone) transaction",
-                        )
-                        .await;
-                        continue 'attempts;
-                    }
-                    drop(tx);
-                    return Err(CatalogError::InvalidOperation {
-                        message:
-                            "Failed to insert insert-record chunk inside on-conflict (with tombstone) transaction"
-                                .to_string(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+            // Lever L1 (metadata-only publish): per-key insert-record chunks GONE
+            // here too — carried by the delete-file `reinsert_sequence` column.
 
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
@@ -3990,6 +3984,7 @@ mod tests {
                     file_size_bytes: 512,
                     deletion_type: DeletionType::default(),
                     sequence_number: 1, // Test sequence number
+                    reinsert_sequence: None,
                 };
 
                 catalog_clone.add_delete_file(delete_file).await
@@ -4079,6 +4074,7 @@ mod tests {
                     file_size_bytes: 512,
                     deletion_type: DeletionType::default(),
                     sequence_number: 1,
+                    reinsert_sequence: None,
                 };
 
                 catalog_clone.add_delete_file(delete_file).await
@@ -4158,6 +4154,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         let first_id = catalog
@@ -4241,6 +4238,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         catalog
@@ -4264,12 +4262,20 @@ mod tests {
             .expect("Failed to get delete files");
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        // Lever L1: the re-insert (insert_sequence = 2) is carried by the delete
+        // file's `reinsert_sequence` column, NOT a per-key insert_record. The
+        // replayed commit re-stamps the SAME value, so the ON CONFLICT equality
+        // (which now includes `reinsert_sequence`) keeps the row idempotent.
+        assert_eq!(delete_files[0].reinsert_sequence, Some(2));
 
         let insert_records = catalog
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
+        assert!(
+            insert_records.is_empty(),
+            "lever L1 writes the re-insert via reinsert_sequence, no per-key insert_record"
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -4317,6 +4323,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         catalog
@@ -4370,13 +4377,20 @@ mod tests {
             .expect("Failed to get delete files");
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        // Lever L1: the surviving (first) commit's re-insert rides on
+        // `reinsert_sequence`; the rejected conflicting commit rolled its whole
+        // transaction back, so the original value (insert_sequence = 2) stands and
+        // no per-key insert_record exists for either key.
+        assert_eq!(delete_files[0].reinsert_sequence, Some(2));
 
         let insert_records = catalog
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
-        assert!(!insert_records.contains_key([2_u8].as_slice()));
+        assert!(
+            insert_records.is_empty(),
+            "lever L1 writes no per-key insert_record; the re-insert is on reinsert_sequence"
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -4427,6 +4441,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         let delete_files: Vec<DeleteFile> = (0..5).map(make_delete_file).collect();
@@ -4512,6 +4527,7 @@ mod tests {
             file_size_bytes: 256,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         let snapshot_id = uuid::Uuid::now_v7().to_string();
         let tombstone = InlinedDelete {
@@ -4779,6 +4795,7 @@ mod tests {
             file_size_bytes: 128,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         let returned = catalog
@@ -4992,6 +5009,7 @@ mod tests {
                 file_size_bytes: 256,
                 deletion_type: DeletionType::default(),
                 sequence_number: 1,
+                reinsert_sequence: None,
             };
             catalog
                 .add_delete_file(delete_file)
@@ -5124,6 +5142,7 @@ mod tests {
                     file_size_bytes: 100,
                     deletion_type: DeletionType::default(),
                     sequence_number: i + 1,
+                    reinsert_sequence: None,
                 };
                 catalog
                     .add_delete_file(delete_file)
@@ -5806,6 +5825,7 @@ mod tests {
             file_size_bytes: 256,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         catalog
             .add_delete_file(delete_file)
@@ -5919,6 +5939,7 @@ mod tests {
             file_size_bytes: 256,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         catalog
             .add_delete_file(delete_file)

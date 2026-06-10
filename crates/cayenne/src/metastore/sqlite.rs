@@ -504,6 +504,7 @@ impl SqliteMetastore {
             file_size_bytes BIGINT NOT NULL,
             source_data_file_path TEXT,
             sequence_number BIGINT NOT NULL DEFAULT 0,
+            reinsert_sequence BIGINT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -834,6 +835,20 @@ impl MetastoreBackend for SqliteMetastore {
                 );
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
+                    [],
+                );
+
+                // Lever L1 (metadata-only publish): per-commit reinsert sequence on
+                // delete-file rows replaces the per-key `cayenne_insert_record`
+                // chunks. NULL on legacy rows → the merge-on-read load falls back to
+                // `cayenne_insert_record` for those, so adding the column is
+                // back-compatible for a forward upgrade. (DOWNGRADE is NOT safe: an
+                // older binary on a post-L1 catalog reads an empty insert-record
+                // table for new commits and would drop the re-inserts — rebuild the
+                // catalog before downgrading. A `user_version` gate is the
+                // productionization follow-up.)
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
                     [],
                 );
 

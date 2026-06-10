@@ -78,6 +78,9 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "file_size_bytes",
             "source_data_file_path",
             "sequence_number",
+            // Lever L1: per-commit reinsert sequence (added last, matching the
+            // DDL column order + the ALTER backfill for existing deployments).
+            "reinsert_sequence",
         ],
     },
     ExpectedTable {

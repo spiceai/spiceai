@@ -369,3 +369,11 @@ required-features = ["chdb-bench", "duckdb-bench"]
 [[bench]]
 harness = false
 name = "mem_tier_join_shapes"
+
+[[bench]]
+harness = false
+name = "publish_metadata_wall"
+
+[[bench]]
+harness = false
+name = "mem_tier_overlay_append"

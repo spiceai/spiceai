@@ -227,6 +227,7 @@ impl TursoMetastore {
             file_size_bytes BIGINT NOT NULL,
             source_data_file_path TEXT,
             sequence_number BIGINT NOT NULL DEFAULT 0,
+            reinsert_sequence BIGINT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -578,6 +579,16 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
+                (),
+            )
+            .await;
+        // Lever L1 (metadata-only publish): per-commit reinsert sequence on
+        // delete-file rows; NULL on legacy rows falls back to
+        // `cayenne_insert_record`. Forward-upgrade safe; downgrade requires a
+        // catalog rebuild (see the sqlite backfill note).
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
                 (),
             )
             .await;
