@@ -2043,6 +2043,21 @@ pub struct CayenneTableProvider {
     /// the spill-then-fallback path rather than growing the tier unboundedly
     /// (the OOM-safety guard). Shared across writer clones.
     mem_checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the mem-tier *publish* (the `ArcSwap` swap + sequence
+    /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
+    /// so an in-memory append no longer waits on scans (read-fence) or
+    /// compaction (write-fence) for its tier swap (the `inmemory_fence_wait`
+    /// that dominated `cdc_path_inmemory` after the lazy-overlay change). The
+    /// mem-tier is an `ArcSwap`, so scan readers observe swaps atomically with no
+    /// lock; this mutex exists ONLY to serialize writers so the (delete, data)
+    /// sequence reservation in [`Self::append_to_mem_tier`] and the
+    /// `snapshot_sequence` reservation in [`Self::checkpoint_mem_tier`]'s capture
+    /// stay mutually exclusive (the seq-ordering invariant that prevents the
+    /// off-fence checkpoint from being overtaken — a stale durable copy =
+    /// over-count). Lock order, when both are held: `listing_fence` (outer) →
+    /// this publish lock (inner) — taken together ONLY by checkpoint phase 2.
+    /// Shared across writer clones so all writers serialize on one lock.
+    mem_tier_publish_lock: Arc<tokio::sync::Mutex<()>>,
     /// Cross-layer handle the runtime installs in memory mode so
     /// `checkpoint_mem_tier` can advance the source slot AFTER the durable fence
     /// (the slot-deferral correctness seam). `None` in file mode (and for
@@ -5088,6 +5103,7 @@ impl CayenneTableProvider {
                 crate::provider::mem_tier::MemTier::empty(),
             )),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mem_tier_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
             mem_tier_max_bytes,
             mem_tier_max_age_ms,
@@ -5820,6 +5836,9 @@ impl CayenneTableProvider {
             // in-memory CDC tier and observes the same slot-advancer handle.
             mem_tier: Arc::clone(&self.mem_tier),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
+            // Shared across clones so EVERY writer serializes on the one publish
+            // lock (the seq-ordering invariant requires a single lock per table).
+            mem_tier_publish_lock: Arc::clone(&self.mem_tier_publish_lock),
             slot_advancer: Arc::clone(&self.slot_advancer),
             mem_tier_max_bytes: self.mem_tier_max_bytes,
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
@@ -12967,17 +12986,29 @@ impl CayenneTableProvider {
 
         let arc_batches = Arc::new(batches);
         let epoch = {
-            // Publish the RAM swap under the same listing fence the durable
-            // inline publish uses, so readers capture the new tier atomically.
+            // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
+            // DECOUPLED from the listing fence. The mem-tier is an `ArcSwap`, so a
+            // concurrent scan still captures either the pre- or post-swap tier
+            // atomically (and the version-keyed `merged_scan_deletions` memo
+            // rebuilds if the version moved mid-scan) — the listing fence was
+            // never needed for the tier swap's reader-atomicity. Taking the
+            // publish lock instead of `listing_fence.write()` stops the append
+            // from WAITING on scans (read-fence) and compaction (write-fence):
+            // `inmemory_fence_wait` was ~63% of `cdc_path_inmemory` after the
+            // lazy-overlay change. The publish lock serializes only WRITERS, so
+            // the (delete, data) sequence reservation below stays mutually
+            // exclusive with the checkpoint's snapshot-sequence reservation (both
+            // take this lock).
             //
             // Decompose the dominant `cdc_path_inmemory` phase: the time spent
-            // WAITING to acquire the fence (contended by OLAP plan-build
-            // read-fences and checkpoint publishes) is reported separately from
-            // the fence-held swap work itself. Without this split the 168ms-avg
-            // in-memory append was a black box — fence contention and real work
-            // were indistinguishable.
+            // WAITING to acquire the publish lock (contended only by other
+            // writers + the checkpoint capture/clear) is reported separately from
+            // the lock-held swap work itself. The metric labels are kept stable
+            // (`inmemory_fence_wait`/`inmemory_fence_work`) for A/B comparability
+            // across this change; the "wait" is now on the publish lock, not the
+            // listing fence.
             let fence_wait_start = Instant::now();
-            let _fence = self.listing_fence.write().await;
+            let _publish = self.mem_tier_publish_lock.lock().await;
             record_cayenne_write_phase(
                 &self.table_metadata.table_name,
                 "inmemory_fence_wait",
@@ -12985,13 +13016,14 @@ impl CayenneTableProvider {
             );
             let fence_work_start = Instant::now();
 
-            // Reserve the (delete, data) pair INSIDE the fence: append sequence
-            // assignment must be mutually exclusive with a checkpoint's
+            // Reserve the (delete, data) pair INSIDE the publish lock: append
+            // sequence assignment must be mutually exclusive with a checkpoint's
             // snapshot-sequence reservation — see the capture block in
-            // `checkpoint_mem_tier` for the full ordering invariant (an off-fence
-            // reserve permanently over-counts). delete below data so new rows
-            // survive their own tombstones; shared durable allocator for
-            // monotonicity.
+            // `checkpoint_mem_tier` for the full ordering invariant (an
+            // unserialized reserve permanently over-counts). Both the append and
+            // the checkpoint capture now reserve under THIS lock (no longer the
+            // listing fence). delete below data so new rows survive their own
+            // tombstones; shared durable allocator for monotonicity.
             let base_sequence = self.reserve_sequences_local(2).await?;
             let delete_sequence = base_sequence;
             let data_sequence = base_sequence + 1;
@@ -13086,18 +13118,23 @@ impl CayenneTableProvider {
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
         // Capture the corpus to flush AND reserve this checkpoint's
-        // snapshot_sequence ATOMICALLY under a brief listing-fence write, so the
+        // snapshot_sequence ATOMICALLY under the `mem_tier_publish_lock`, so the
         // capture+reservation is mutually exclusive with append sequence
-        // assignment (appends reserve under the same fence). This pins the
+        // assignment (appends reserve under the SAME publish lock). This pins the
         // ordering invariant: `snapshot_sequence` is strictly above every flushed
         // row's sequence and strictly below every sequence an append reserves
         // after this point — so the off-fence encode/commit below cannot be
         // overtaken by a concurrent upsert (which would orphan the stale durable
-        // copy as a permanent over-count). The fence is held only for the cheap
-        // load + reserve, NOT the encode/commit. Checkpoints are serialized by
-        // `mem_checkpoint_lock` (caller-held) so no concurrent checkpoint races.
+        // copy as a permanent over-count). Taking the publish lock here (rather
+        // than `listing_fence.write()`) is what lets a concurrent off-fence
+        // append proceed without stalling on this capture, while still preserving
+        // the mutual exclusion the seq-ordering needs. The lock is held only for
+        // the cheap load + reserve, NOT the encode/commit. Checkpoints are
+        // serialized by `mem_checkpoint_lock` (caller-held) so no concurrent
+        // checkpoint races; the publish lock additionally orders us against the
+        // append's reservation + tier swap.
         let (snapshot, reserved_snapshot_sequence) = {
-            let _fence = self.listing_fence.write().await;
+            let _publish = self.mem_tier_publish_lock.lock().await;
             let snapshot = self.mem_tier.load_full();
             let seq = if snapshot.is_empty() || self.pk_deletion_strategy.is_position_based() {
                 None
@@ -13118,12 +13155,19 @@ impl CayenneTableProvider {
 
         if batches.is_empty() {
             // Tombstones-only tier (every appended row already superseded): clear
-            // and still advance the slot for the flushed epoch.
-            self.clear_flushed_mem_tier_state_under_held_fence(
-                snapshot.segments.len(),
-                !inlined_view.is_empty(),
-            )
-            .await?;
+            // and still advance the slot for the flushed epoch. The clear mutates
+            // the mem-tier (survivor-only `retain_after`), so it must take the
+            // publish lock to stay mutually exclusive with a concurrent off-fence
+            // append's swap — same invariant as phase 2. There is no durable file
+            // to publish here, so (unlike phase 2) no listing fence is needed.
+            {
+                let _publish = self.mem_tier_publish_lock.lock().await;
+                self.clear_flushed_mem_tier_state_under_publish_lock(
+                    snapshot.segments.len(),
+                    !inlined_view.is_empty(),
+                )
+                .await?;
+            }
             self.fire_slot_advancer(flushed_epoch).await;
             return Ok(0);
         }
@@ -13182,11 +13226,20 @@ impl CayenneTableProvider {
                     super::delta_encoding::WriteClass::Delta,
                 )
                 .await?;
-            self.clear_flushed_mem_tier_state_under_held_fence(
-                snapshot.segments.len(),
-                !inlined_view.is_empty(),
-            )
-            .await?;
+            // Clear under the publish lock (inner to the held fence), uniform
+            // with phase 2. Position-based tables never engage `append_to_mem_tier`
+            // (`is_cdc_memory_mode()` is false for them), so there is no concurrent
+            // tier swap to contend here — but holding the lock keeps the invariant
+            // ("every clear arm holds the publish lock") unconditional. Lock
+            // order: fence (outer) → publish (inner), same as phase 2.
+            {
+                let _publish = self.mem_tier_publish_lock.lock().await;
+                self.clear_flushed_mem_tier_state_under_publish_lock(
+                    snapshot.segments.len(),
+                    !inlined_view.is_empty(),
+                )
+                .await?;
+            }
             self.refresh_listing_table_under_held_fence().await?;
             stats
         } else {
@@ -13224,15 +13277,29 @@ impl CayenneTableProvider {
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
             // encode, no metastore round-trip. Indivisible w.r.t. scans, so the
             // file becoming visible and the RAM rows clearing happen atomically.
+            // The listing-table + deletion-cache swap MUST stay atomic w.r.t.
+            // scans' read-fence, so this keeps `listing_fence.write()`. But the
+            // tier clear (`clear_flushed_mem_tier_state_under_publish_lock` →
+            // `clear_mem_tier_flushed_prefix`) mutates the mem-tier, which is now
+            // serialized by the publish lock (appends swap the tier under that
+            // lock, NOT the fence). So acquire the publish lock for JUST the clear
+            // — its survivor-only `retain_after` reads the live tier and stores
+            // the remainder, and must not race a concurrent append's swap. Lock
+            // order: listing_fence (outer) → publish (inner); the only sites that
+            // hold both (this arm and the position-based arm) take them in this
+            // order, so no opposing acquire order exists.
             {
                 let _fence = self.listing_fence.write().await;
                 self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
                     .await;
-                self.clear_flushed_mem_tier_state_under_held_fence(
-                    snapshot.segments.len(),
-                    !inlined_view.is_empty(),
-                )
-                .await?;
+                {
+                    let _publish = self.mem_tier_publish_lock.lock().await;
+                    self.clear_flushed_mem_tier_state_under_publish_lock(
+                        snapshot.segments.len(),
+                        !inlined_view.is_empty(),
+                    )
+                    .await?;
+                }
                 self.refresh_listing_table_under_held_fence().await?;
             }
             // Reclaim the superseded snapshot dirs (graceful, backgrounded —
@@ -13277,8 +13344,11 @@ impl CayenneTableProvider {
     /// the already-durable prefix into a second file on the next checkpoint — a
     /// double-count (the bug the off-fence move exposed). Checkpoints are
     /// serialized by `mem_checkpoint_lock`, so the only interleaving writer is an
-    /// append (push-only); this store runs under the listing fence the caller
-    /// holds (appends also take it to swap), so the prefix is stable.
+    /// append (push-only); this load+store runs under the `mem_tier_publish_lock`
+    /// the caller holds (appends also take it to swap the tier), so the
+    /// load_full→retain_after→store is atomic w.r.t. an append's swap and the
+    /// survivor prefix is stable. (The tier swap is decoupled from the listing
+    /// fence; only the publish lock serializes tier writers.)
     fn clear_mem_tier_flushed_prefix(&self, flushed_segment_count: usize) {
         let cur = self.mem_tier.load_full();
         let survivors = cur.retain_after(flushed_segment_count);
@@ -13293,12 +13363,21 @@ impl CayenneTableProvider {
         self.bump_inlined_structural_epoch();
     }
 
-    /// The shared under-fence tail of every mem-tier checkpoint arm: drop the
-    /// flushed prefix, clear any flushed inline-metastore state, and re-derive
-    /// the live inlined row count from the survivor tier. Must run while the
-    /// caller holds `listing_fence.write()` so the swap-out is indivisible with
-    /// the durable file becoming visible.
-    async fn clear_flushed_mem_tier_state_under_held_fence(
+    /// The shared tail of every mem-tier checkpoint arm: drop the flushed
+    /// prefix, clear any flushed inline-metastore state, and re-derive the live
+    /// inlined row count from the survivor tier.
+    ///
+    /// LOCKING: this MUST run under the `mem_tier_publish_lock` in every arm,
+    /// because it mutates the mem-tier (`clear_mem_tier_flushed_prefix` does a
+    /// `load_full → retain_after → store`) and an off-fence append swaps the tier
+    /// under that same lock — without it the survivor-only clear could race an
+    /// append's swap and lose (or double-flush) a concurrently-appended segment.
+    /// The non-position phase-2 arm and the position-based arm ALSO hold
+    /// `listing_fence.write()` (acquired OUTSIDE this lock — order: fence → publish)
+    /// so the durable file becoming visible and the RAM rows clearing are
+    /// indivisible w.r.t. scans; the tombstones-only arm has no durable file to
+    /// publish and so holds only the publish lock.
+    async fn clear_flushed_mem_tier_state_under_publish_lock(
         &self,
         flushed_segment_count: usize,
         inlined_view_nonempty: bool,
@@ -15446,11 +15525,21 @@ impl TableProvider for CayenneTableProvider {
         let _fence = self.listing_fence.read().await;
         self.record_listing_fence_wait_duration(listing_fence_wait_start.elapsed());
 
-        // Capture the in-memory CDC tier under the SAME held read fence (an O(1)
-        // `Arc` load — no copy), so a memory-mode scan observes the RAM rows
-        // atomically against a concurrent append/checkpoint that swaps the tier
-        // under `listing_fence.write()`. Empty (and skipped below) in file mode,
-        // so the file-mode plan is byte-identical.
+        // Capture the in-memory CDC tier with a single atomic `ArcSwap` load (an
+        // O(1) `Arc` clone — no copy), pinning ONE immutable `MemTier` snapshot
+        // for this scan. The tier swap is decoupled from the listing fence — an
+        // append/checkpoint swaps it under the `mem_tier_publish_lock`, NOT
+        // `listing_fence.write()` — so the read fence held here does NOT freeze
+        // the tier. It does not need to: the rows below come from THIS captured
+        // snapshot's segments and the merged deletion view (`merged_deletion_snapshot`)
+        // is keyed on THIS snapshot's `version`, so the scan is internally
+        // consistent (rows + the deletes that hide their old copies come from the
+        // same version). An off-fence append that swaps a newer tier mid-scan
+        // bumps the version + structural epoch, so it is simply invisible to this
+        // in-flight scan (and the version-keyed `merged_scan_deletions` memo
+        // rebuilds rather than serving a mismatched view) — correct, since a scan
+        // need not observe a write that lands after its snapshot. Empty (and
+        // skipped below) in file mode, so the file-mode plan is byte-identical.
         let mem_tier_snapshot = self.mem_tier.load_full();
 
         // Capture the (deletion view, protected snapshot map, inlined data)
@@ -20077,6 +20166,131 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_ckpt_concurrent").await,
             6,
             "the off-fence durable checkpoint is reload-stable"
+        );
+    }
+
+    /// Off-fence APPEND seq-ordering guard (the `mem_tier_publish_lock`): with the
+    /// tier swap decoupled from the listing fence, an append and a checkpoint no
+    /// longer serialize on `listing_fence.write()` — they serialize ONLY on the
+    /// publish lock, which is what keeps the append's (delete, data) sequence
+    /// reservation mutually exclusive with the checkpoint's `snapshot_sequence`
+    /// reservation. If that mutual exclusion broke, a tombstoning upsert that
+    /// interleaves with a mid-flight checkpoint could reserve a delete-seq the
+    /// checkpoint's stale durable copy outranks → the old row resurrects
+    /// (over-count) or the new value is lost. This stresses exactly that
+    /// interleaving over several iterations: each round upserts an EXISTING key
+    /// (a tombstone + a fresh row) concurrently with a checkpoint, then asserts
+    /// the upsert always wins (merge-on-read) and the row count never grows
+    /// (no over-count / no resurrection), across the RAM→file boundary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_concurrent_upsert_during_checkpoint_no_overcount() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_ckpt_upsert_race",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let provider = Arc::new(provider);
+
+        // Seed three keys into the RAM tier.
+        let _seed = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("seed RAM tier");
+
+        // Each round: concurrently (a) checkpoint the tier off-fence and (b)
+        // upsert an EXISTING key to a new value (a tombstone hiding the prior copy
+        // + a fresh row). The upsert reserves its (delete, data) seq under the
+        // publish lock; the checkpoint reserves its snapshot_sequence under the
+        // SAME lock — so whichever wins the lock, the seq ordering stays sound and
+        // the freshest value for the key is the visible one with no duplicate.
+        let mut expected_value_for_key1 = 10_i64;
+        for round in 0..6_i64 {
+            let new_value = 1000 + round; // monotonically newer values for key 1
+            expected_value_for_key1 = new_value;
+
+            let checkpoint_provider = Arc::clone(&provider);
+            let checkpoint = tokio::spawn(async move {
+                // Mirror the production caller: hold `mem_checkpoint_lock` so
+                // checkpoints serialize among themselves, exactly like
+                // `spill_mem_tier` / the periodic tick.
+                let _guard = checkpoint_provider.mem_checkpoint_lock_for_writer().lock_owned().await;
+                checkpoint_provider.checkpoint_mem_tier().await
+            });
+
+            let upsert_provider = Arc::clone(&provider);
+            let upsert_schema = Arc::clone(&schema);
+            let upsert_ctx = ctx.task_ctx();
+            let upsert = tokio::spawn(async move {
+                upsert_provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(upsert_schema, &[1], &[new_value])),
+                        &upsert_ctx,
+                    )
+                    .await
+            });
+
+            checkpoint
+                .await
+                .expect("join checkpoint task")
+                .expect("off-fence checkpoint succeeds");
+            let _upsert_write = upsert
+                .await
+                .expect("join upsert task")
+                .expect("concurrent upsert of an existing key succeeds");
+
+            // Invariant after EVERY round: exactly three keys, and key 1 carries
+            // the freshest value. No resurrection of the prior copy (over-count),
+            // no lost update (the upsert always wins merge-on-read), regardless of
+            // which side won the publish lock.
+            let pairs = collect_id_value_pairs(&ctx, &provider, "mem_ckpt_upsert_race").await;
+            assert_eq!(
+                pairs,
+                vec![(1, expected_value_for_key1), (2, 20), (3, 30)],
+                "round {round}: upsert must win merge-on-read with no resurrected copy"
+            );
+            assert_eq!(
+                query_count_star(&ctx, &provider, "mem_ckpt_upsert_race").await,
+                3,
+                "round {round}: COUNT(*) must stay exactly 3 (no over-count across the RAM→file boundary)"
+            );
+        }
+
+        // Drain any survivor epoch the last concurrent round left in RAM, then
+        // re-assert durability after reopen.
+        {
+            let _g = provider.mem_checkpoint_lock_for_writer().lock_owned().await;
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("final drain checkpoint");
+        }
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("mem_ckpt_upsert_race")
+            .await
+            .expect("reopen checkpointed memory-mode table");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "mem_ckpt_upsert_race").await,
+            vec![(1, expected_value_for_key1), (2, 20), (3, 30)],
+            "the concurrent upsert/checkpoint result is durable across reopen"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &reopened, "mem_ckpt_upsert_race").await,
+            3,
+            "reopened table preserves exactly three rows (no durable over-count)"
         );
     }
 
