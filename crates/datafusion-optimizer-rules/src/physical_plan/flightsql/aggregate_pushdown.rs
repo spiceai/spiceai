@@ -110,6 +110,16 @@ fn try_rewrite_partial_aggregate(
     // original expressions during SQL generation.
     let (scan_child, column_substitutions) = skip_projection(child);
 
+    // A RoundRobin RepartitionExec can also sit BELOW the CSE projection
+    // (Aggregate → Projection → Repartition → Union → …Flight). This is the
+    // common shape for aggregates over computed arguments — e.g.
+    // `sum(l_extendedprice * (1 - l_discount))` (TPC-H Q1) — where CSE pulls the
+    // computed expression into a projection that lands above the repartition.
+    // Skip it here too so `collect_flight_execs` sees the `UnionExec` directly
+    // instead of bailing on a multi-input node mid-walk. The repartition
+    // preserves the scan schema, so the projection substitutions stay valid.
+    let scan_child = skip_repartition_roundrobin(scan_child);
+
     let flight_execs = collect_flight_execs(scan_child);
     let Some(flight_execs) = flight_execs else {
         return Ok(Transformed::no(plan));

@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod autotune;
+// `pub(crate)` (not private) so the Cayenne *catalog* connector
+// (`crate::catalogconnector::cayenne`) can seed the adaptive-tuning knobs from
+// the same hardware-derived profile this accelerator path uses.
+pub(crate) mod autotune;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
