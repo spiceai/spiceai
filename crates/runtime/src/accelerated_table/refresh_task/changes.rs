@@ -17,13 +17,16 @@ use super::RefreshTask;
 use crate::accelerated_table::metrics;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
+use crate::component::dataset::OnSchemaChange;
 use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
+use crate::schema_evolution::evolution_allowed;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_tools::record_batch::try_cast_to;
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution, WideningPlan};
 use cache::Caching;
 #[cfg(not(windows))]
 use cayenne::{CayenneCdcWrite, CayenneTableProvider};
@@ -313,6 +316,18 @@ struct UpsertOutcome {
     in_memory_epoch: Option<u64>,
 }
 
+/// Outcome of applying one coalesced same-schema group of a run.
+enum CoalescedRunOutcome {
+    /// Written (and committers handed off); continue with the next group.
+    Applied,
+    /// The group was skipped without acking (concat failure) — the rest of
+    /// the run must also be skipped so later commits can't advance the source
+    /// offset past the unapplied envelopes. The stream itself continues.
+    SkipRun,
+    /// Fatal: stop the stream.
+    Stop,
+}
+
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
 /// # Example
@@ -403,14 +418,12 @@ const CDC_COMMIT_TIMEOUT_MS_DEFAULT: usize = 30_000;
 const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
 const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
 
-#[cfg(any(test, not(windows)))]
 #[derive(Debug, Default)]
 struct BoundedWarningKeys {
     seen: std::collections::HashSet<String>,
     insertion_order: std::collections::VecDeque<String>,
 }
 
-#[cfg(any(test, not(windows)))]
 impl BoundedWarningKeys {
     fn insert_new(&mut self, key: String, limit: usize) -> bool {
         if limit == 0 || self.seen.contains(&key) {
@@ -451,6 +464,145 @@ static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
 static CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS: std::sync::LazyLock<
     parking_lot::Mutex<BoundedWarningKeys>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
+
+const SCHEMA_EVOLUTION_WARNING_KEY_LIMIT: usize = 1024;
+
+/// Once-per-(dataset, change) gate for schema-evolution warnings so the apply
+/// loop doesn't repeat the same warning on every batch of a high-rate stream.
+static SCHEMA_EVOLUTION_WARNING_KEYS: std::sync::LazyLock<parking_lot::Mutex<BoundedWarningKeys>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
+
+fn schema_evolution_first_warn(key: String) -> bool {
+    SCHEMA_EVOLUTION_WARNING_KEYS
+        .lock()
+        .insert_new(key, SCHEMA_EVOLUTION_WARNING_KEY_LIMIT)
+}
+
+static SCHEMA_EVOLUTION_METER: std::sync::LazyLock<opentelemetry::metrics::Meter> =
+    std::sync::LazyLock::new(|| opentelemetry::global::meter("schema_evolution"));
+
+pub(crate) static SCHEMA_EVOLUTION_DETECTED: std::sync::LazyLock<
+    opentelemetry::metrics::Counter<u64>,
+> = std::sync::LazyLock::new(|| {
+    SCHEMA_EVOLUTION_METER
+        .u64_counter("schema_evolution_detected")
+        .with_description(
+            "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
+        )
+        .build()
+});
+
+pub(crate) static SCHEMA_EVOLUTION_APPLIED: std::sync::LazyLock<
+    opentelemetry::metrics::Counter<u64>,
+> = std::sync::LazyLock::new(|| {
+    SCHEMA_EVOLUTION_METER
+        .u64_counter("schema_evolution_applied")
+        .with_description("Schema evolutions applied to the accelerator or cached source schema.")
+        .build()
+});
+
+pub(crate) static SCHEMA_EVOLUTION_FAILED: std::sync::LazyLock<
+    opentelemetry::metrics::Counter<u64>,
+> = std::sync::LazyLock::new(|| {
+    SCHEMA_EVOLUTION_METER
+        .u64_counter("schema_evolution_failed")
+        .with_description(
+            "Schema changes that were not applied: incompatible, blocked by policy, or requiring a restart.",
+        )
+        .build()
+});
+
+pub(crate) fn schema_evolution_labels(
+    dataset: &str,
+    kind: &'static str,
+    action: &'static str,
+) -> [KeyValue; 3] {
+    [
+        KeyValue::new("dataset", dataset.to_string()),
+        KeyValue::new("kind", kind),
+        KeyValue::new("action", action),
+    ]
+}
+
+/// Dominant change kind of a widening plan for the `kind` metric label.
+#[must_use]
+pub(crate) fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
+    if !plan.widened_columns.is_empty() {
+        "widened_types"
+    } else if !plan.relaxed_nullability.is_empty() {
+        "nullability"
+    } else {
+        "added_columns"
+    }
+}
+
+/// Per-dataset CDC schema-evolution settings, installed at dataset
+/// registration (the apply loop holds no handle to the dataset component).
+/// An absent entry behaves as `on_schema_change: block` — today's code paths
+/// verbatim.
+#[derive(Debug, Clone)]
+pub struct CdcSchemaEvolution {
+    pub policy: OnSchemaChange,
+    /// Column names referenced by the dataset's primary key / unique / index
+    /// constraints — the classifier's constraint guard.
+    pub constraint_columns: Vec<String>,
+}
+
+static CDC_SCHEMA_EVOLUTION: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<TableReference, Arc<CdcSchemaEvolution>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Install the dataset's `on_schema_change` policy and constraint columns for
+/// the CDC apply loop. Call at dataset registration, before the changes
+/// stream starts; re-installing overwrites (hot reload / richer constraint
+/// sets win by being installed last). Installing [`OnSchemaChange::Block`] is
+/// equivalent to no entry.
+pub fn install_cdc_schema_evolution(dataset_name: &TableReference, settings: CdcSchemaEvolution) {
+    if let Ok(mut registry) = CDC_SCHEMA_EVOLUTION.write() {
+        registry.insert(dataset_name.clone(), Arc::new(settings));
+    }
+}
+
+/// Remove a dataset's CDC schema-evolution settings (dataset removal/reload).
+pub fn remove_cdc_schema_evolution(dataset_name: &TableReference) {
+    if let Ok(mut registry) = CDC_SCHEMA_EVOLUTION.write() {
+        registry.remove(dataset_name);
+    }
+}
+
+fn cdc_schema_evolution_for(dataset_name: &TableReference) -> Option<Arc<CdcSchemaEvolution>> {
+    CDC_SCHEMA_EVOLUTION
+        .read()
+        .ok()
+        .and_then(|registry| registry.get(dataset_name).cloned())
+}
+
+/// Fast path: the CDC data struct matches the accelerator schema by name and
+/// type in order. Nullability is ignored — the CDC `data` struct is built
+/// nullable-everywhere by design (DELETE old-tuples carry nulls).
+fn cdc_data_schema_matches(target: &SchemaRef, incoming: &SchemaRef) -> bool {
+    target.fields().len() == incoming.fields().len()
+        && target
+            .fields()
+            .iter()
+            .zip(incoming.fields())
+            .all(|(t, i)| t.name() == i.name() && t.data_type() == i.data_type())
+}
+
+/// Re-tighten the nullable-everywhere CDC data struct to the accelerator's
+/// nullability for name-matched fields so the classifier doesn't report a
+/// nullability relax on every non-nullable field; added fields stay nullable.
+fn align_nullability_for_classify(target: &SchemaRef, incoming: &SchemaRef) -> Schema {
+    let fields: Vec<Field> = incoming
+        .fields()
+        .iter()
+        .map(|f| match target.field_with_name(f.name()) {
+            Ok(t) => f.as_ref().clone().with_nullable(t.is_nullable()),
+            Err(_) => f.as_ref().clone(),
+        })
+        .collect();
+    Schema::new_with_metadata(fields, incoming.metadata().clone())
+}
 
 /// Install the CDC configuration resolved from spicepod
 /// `runtime.params.cdc_*`. Should be called exactly once during runtime
@@ -1247,6 +1399,48 @@ impl RefreshTask {
             batches.push(batch);
         }
 
+        // Mixed-schema runs (mid-stream schema evolution): `concat_change_batches`
+        // requires equal schemas. When the dataset's policy allows evolution,
+        // split the run into contiguous same-schema groups applied in order —
+        // the common case stays a single group. With `block` (or no installed
+        // settings) the run is one group and a mixed-schema concat keeps
+        // today's error/skip behavior verbatim.
+        let split_on_schema_change = cdc_schema_evolution_for(context.dataset_name)
+            .is_some_and(|evolution| !matches!(evolution.policy, OnSchemaChange::Block));
+        let groups = group_run_by_schema(batches, committers, split_on_schema_change);
+        let last_group = groups.len().saturating_sub(1);
+        for (group_idx, (group_batches, group_committers)) in groups.into_iter().enumerate() {
+            match self
+                .apply_coalesced_run(
+                    context,
+                    group_batches,
+                    group_committers,
+                    any_ready && group_idx == last_group,
+                )
+                .await
+            {
+                CoalescedRunOutcome::Applied => {}
+                // A skipped group's committers were dropped without acking —
+                // later groups must not apply (their commits would advance the
+                // source offset past the skipped, unapplied envelopes).
+                CoalescedRunOutcome::SkipRun => return true,
+                CoalescedRunOutcome::Stop => return false,
+            }
+        }
+        true
+    }
+
+    /// Concatenate one same-schema group of `ChangeBatch`es into a single
+    /// accelerator write, then hand the group's committers to the ordered
+    /// background commit chain. Split out of [`Self::apply_envelope_run`] so
+    /// mixed-schema runs can apply per contiguous same-schema group.
+    async fn apply_coalesced_run(
+        &self,
+        context: &mut ApplyContext<'_>,
+        batches: Vec<ChangeBatch>,
+        committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+        mark_ready: bool,
+    ) -> CoalescedRunOutcome {
         let coalesce_start = Instant::now();
         // Fast path: a single envelope (low-load / serial behavior). Skips
         // concat allocation entirely so the no-coalesce path matches the
@@ -1271,7 +1465,7 @@ impl RefreshTask {
                     // Drop committers without acking — the source will
                     // re-send these envelopes on reconnect, and CDC apply
                     // is idempotent at the upsert/delete level.
-                    return true;
+                    return CoalescedRunOutcome::SkipRun;
                 }
             }
         };
@@ -1301,7 +1495,7 @@ impl RefreshTask {
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
-                    return false;
+                    return CoalescedRunOutcome::Stop;
                 }
                 cayenne.clear_slot_advancer();
             } else {
@@ -1339,7 +1533,7 @@ impl RefreshTask {
                             status::ComponentStatus::error_with_message(error_message),
                         )
                         .await;
-                        return false;
+                        return CoalescedRunOutcome::Stop;
                     }
                     record_cdc_fixed_cost(context.dataset_name, "finalize_wait", finalize_start);
 
@@ -1351,12 +1545,12 @@ impl RefreshTask {
                         )
                         .await
                     {
-                        return false;
+                        return CoalescedRunOutcome::Stop;
                     }
                 }
 
                 let current_finalize_pending = write_outcome.pending_finalize.is_some();
-                if any_ready && !current_finalize_pending {
+                if mark_ready && !current_finalize_pending {
                     context
                         .initial_load_completed
                         .store(true, Ordering::Relaxed);
@@ -1386,7 +1580,7 @@ impl RefreshTask {
                     *context.pending_finalize = Some(PendingFinalizeCommit {
                         finalize,
                         committers: committers.take().unwrap_or_default(),
-                        ready_after_finalize: any_ready,
+                        ready_after_finalize: mark_ready,
                     });
                 }
 
@@ -1406,7 +1600,7 @@ impl RefreshTask {
                                 status::ComponentStatus::error_with_message(error_message),
                             )
                             .await;
-                            return false;
+                            return CoalescedRunOutcome::Stop;
                         }
                         record_cdc_fixed_cost(
                             context.dataset_name,
@@ -1445,7 +1639,7 @@ impl RefreshTask {
                                 status::ComponentStatus::error_with_message(error_message),
                             )
                             .await;
-                            return false;
+                            return CoalescedRunOutcome::Stop;
                         }
 
                         *context.pending_commit = Some(spawn_ordered_commit_task(
@@ -1468,10 +1662,10 @@ impl RefreshTask {
                 }
                 // Drop committers without acking, and stop this stream before
                 // any later envelope can commit past the uncommitted gap.
-                return false;
+                return CoalescedRunOutcome::Stop;
             }
         }
-        true
+        CoalescedRunOutcome::Applied
     }
 
     #[cfg(test)]
@@ -1592,6 +1786,12 @@ impl RefreshTask {
     ) -> crate::accelerated_table::Result<UpsertOutcome> {
         let data_batch = change_batch.data_batch();
 
+        // Mid-stream schema evolution (policy != block): evolve Cayenne live,
+        // or surface the detected change loudly for engines that need a
+        // restart, BEFORE the narrowing cast below silently drops the change.
+        self.maybe_evolve_schema_for_cdc(&data_batch.schema())
+            .await?;
+
         let target_schema = self.accelerator.schema();
 
         let selected_batch = select_rows(&data_batch, row_indices)?;
@@ -1709,6 +1909,129 @@ impl RefreshTask {
             pending_finalize: None,
             in_memory_epoch: None,
         })
+    }
+
+    /// Detect a widening schema change between the incoming CDC data struct
+    /// and the accelerator schema and act per the dataset's installed
+    /// `on_schema_change` policy:
+    ///
+    /// - Cayenne + allowed widening ⇒ evolve LIVE via the provider's
+    ///   `evolve_schema_live` (fence + flush + metastore update + in-memory
+    ///   schema swap, idempotent) and continue — the cast below becomes a
+    ///   pass-through to the evolved schema. A failed evolve stops the stream;
+    ///   the source redelivers and the idempotent evolve self-heals.
+    /// - Other engines ⇒ NO mid-life engine DDL: keep today's narrowing cast,
+    ///   warn once, count the failure — restart-time evolution applies it.
+    /// - `fail` policy ⇒ terminal actionable error.
+    /// - `block` policy / no installed settings ⇒ return immediately (today's
+    ///   code path verbatim).
+    async fn maybe_evolve_schema_for_cdc(
+        &self,
+        incoming_data_schema: &SchemaRef,
+    ) -> crate::accelerated_table::Result<()> {
+        let Some(evolution) = cdc_schema_evolution_for(&self.dataset_name) else {
+            return Ok(());
+        };
+        if matches!(evolution.policy, OnSchemaChange::Block) {
+            return Ok(());
+        }
+        let target_schema = self.accelerator.schema();
+        if cdc_data_schema_matches(&target_schema, incoming_data_schema) {
+            return Ok(());
+        }
+        let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
+        let ctx = EvolutionContext {
+            constraint_columns: &evolution.constraint_columns,
+        };
+        let dataset = self.dataset_name.to_string();
+        match schema_evolution::classify(&target_schema, &aligned, &ctx) {
+            SchemaEvolution::Identical => Ok(()),
+            SchemaEvolution::Widening(plan) => {
+                let kind = widening_plan_kind(&plan);
+                let change = plan.describe();
+                SCHEMA_EVOLUTION_DETECTED
+                    .add(1, &schema_evolution_labels(&dataset, kind, "cdc_stream"));
+                if matches!(evolution.policy, OnSchemaChange::Fail) {
+                    SCHEMA_EVOLUTION_FAILED
+                        .add(1, &schema_evolution_labels(&dataset, kind, "fail_policy"));
+                    return Err(crate::accelerated_table::Error::FailedToWriteData {
+                        source: DataFusionError::Execution(format!(
+                            "schema change detected on the CDC stream for {dataset} ({change}) and `on_schema_change: fail` is set. \
+                             Revert the source schema change, or set `on_schema_change: append_new_columns`/`sync_all_columns` to evolve"
+                        )),
+                    });
+                }
+                if !evolution_allowed(&evolution.policy, &plan) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset, kind, "blocked_by_policy"),
+                    );
+                    if schema_evolution_first_warn(format!("{dataset}|policy|{change}")) {
+                        tracing::warn!(
+                            dataset = %dataset,
+                            "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema. Set `on_schema_change: sync_all_columns` to evolve types",
+                            evolution.policy
+                        );
+                    }
+                    return Ok(());
+                }
+                #[cfg(not(windows))]
+                if let Some(cayenne) = self.cayenne_accelerator() {
+                    cayenne
+                        .evolve_schema_live(&plan)
+                        .await
+                        .map_err(DataFusionError::from)
+                        .map_err(find_datafusion_root)
+                        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+                    SCHEMA_EVOLUTION_APPLIED
+                        .add(1, &schema_evolution_labels(&dataset, kind, "cdc_live"));
+                    tracing::info!(
+                        dataset = %dataset,
+                        "applied live schema evolution from the CDC stream: {change}"
+                    );
+                    return Ok(());
+                }
+                SCHEMA_EVOLUTION_FAILED.add(
+                    1,
+                    &schema_evolution_labels(&dataset, kind, "restart_required"),
+                );
+                if schema_evolution_first_warn(format!("{dataset}|restart|{change}")) {
+                    tracing::warn!(
+                        dataset = %dataset,
+                        "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart. Restart Spice to apply the evolution"
+                    );
+                }
+                Ok(())
+            }
+            SchemaEvolution::Incompatible { reason } => {
+                SCHEMA_EVOLUTION_DETECTED.add(
+                    1,
+                    &schema_evolution_labels(&dataset, "incompatible", "cdc_stream"),
+                );
+                if matches!(evolution.policy, OnSchemaChange::Fail) {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset, "incompatible", "fail_policy"),
+                    );
+                    return Err(crate::accelerated_table::Error::FailedToWriteData {
+                        source: DataFusionError::Execution(format!(
+                            "incompatible schema change detected on the CDC stream for {dataset}: {reason}. `on_schema_change: fail` is set"
+                        )),
+                    });
+                }
+                SCHEMA_EVOLUTION_FAILED.add(
+                    1,
+                    &schema_evolution_labels(&dataset, "incompatible", "incompatible"),
+                );
+                if schema_evolution_first_warn(format!("{dataset}|incompatible|{reason}")) {
+                    tracing::warn!(
+                        dataset = %dataset,
+                        "incompatible schema change detected on the CDC stream: {reason}. Values continue to be cast to the current schema"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Resolve the inner [`CayenneTableProvider`] from the accelerator, peeling
@@ -1877,6 +2200,47 @@ impl RefreshTask {
 
         Ok(())
     }
+}
+
+/// One equal-schema group from [`group_run_by_schema`]: the batches and their
+/// matching commit handles, kept in arrival order.
+type SchemaGroupedRun = (
+    Vec<ChangeBatch>,
+    Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+);
+
+/// Split a contiguous envelope run into groups of equal-schema
+/// `ChangeBatch`es (preserving arrival order) so each group can be
+/// concatenated into one accelerator write. A mid-stream schema evolution
+/// produces exactly one boundary: every batch before the source adopted the
+/// wider schema, then every batch after. With `split == false` the whole run
+/// is a single group — zero-cost for the `block` policy.
+fn group_run_by_schema(
+    batches: Vec<ChangeBatch>,
+    committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+    split: bool,
+) -> Vec<SchemaGroupedRun> {
+    if !split || batches.len() <= 1 {
+        return vec![(batches, committers)];
+    }
+    let mut groups: Vec<SchemaGroupedRun> = Vec::new();
+    for (batch, committer) in batches.into_iter().zip(committers) {
+        let same_schema_as_last_group = groups.last().is_some_and(|(group_batches, _)| {
+            group_batches
+                .last()
+                .is_some_and(|last| last.record.schema() == batch.record.schema())
+        });
+        if same_schema_as_last_group {
+            let Some((group_batches, group_committers)) = groups.last_mut() else {
+                unreachable!("same_schema_as_last_group implies a last group");
+            };
+            group_batches.push(batch);
+            group_committers.push(committer);
+        } else {
+            groups.push((vec![batch], vec![committer]));
+        }
+    }
+    groups
 }
 
 /// Concatenate the underlying `RecordBatch`es of multiple `ChangeBatch`es
@@ -3270,6 +3634,14 @@ mod tests {
     }
 
     fn make_refresh_task(accelerator: Arc<dyn TableProvider>) -> RefreshTask {
+        make_refresh_task_named("test", accelerator)
+    }
+
+    /// `make_refresh_task` with an explicit dataset name. Tests that install
+    /// process-global per-dataset state (the CDC schema-evolution registry)
+    /// must use a unique name so they don't change the behavior of other
+    /// tests running concurrently against the shared "test" dataset.
+    fn make_refresh_task_named(name: &str, accelerator: Arc<dyn TableProvider>) -> RefreshTask {
         use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
         use crate::federated_table::FederatedTable;
         use tokio::runtime::Handle;
@@ -3278,7 +3650,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             crate::status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test"),
+            datafusion::sql::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -4508,6 +4880,303 @@ mod tests {
         assert!(
             !initial_load_completed.load(Ordering::Relaxed),
             "failed writes must not mark initial load complete"
+        );
+    }
+
+    // -- Schema evolution: policy gate, classification alignment, and the
+    // mixed-schema per-group fallback ------------------------------------------
+
+    /// CDC data struct carrying an extra trailing nullable `age` column — the
+    /// shape the postgres_replication source emits after adopting a mid-stream
+    /// ADD COLUMN.
+    fn create_widened_change_batch(id: i32, age: i32) -> ChangeBatch {
+        let data_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]);
+        let schema = changes_schema(&data_schema);
+        let op_array: ArrayRef = Arc::new(StringArray::from(vec!["c"]));
+        let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+        let pk_array: ArrayRef = Arc::new(
+            ListArray::try_new(
+                pk_field,
+                arrow::buffer::OffsetBuffer::new(vec![0i32, 1].into()),
+                Arc::new(StringArray::from(vec!["id"])),
+                None,
+            )
+            .expect("pk list"),
+        );
+        let data_fields = vec![
+            (
+                Arc::new(Field::new("id", DataType::Int32, false)),
+                Arc::new(Int32Array::from(vec![id])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("name", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("row")])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("age", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![age])) as ArrayRef,
+            ),
+        ];
+        let data_array: ArrayRef = Arc::new(StructArray::from(data_fields));
+        let record = RecordBatch::try_new(Arc::new(schema), vec![op_array, pk_array, data_array])
+            .expect("record batch");
+        ChangeBatch::try_new(record).expect("change batch")
+    }
+
+    fn make_widened_tracked_envelope(id: i32, log: Arc<CommitLog>) -> ChangeEnvelope {
+        ChangeEnvelope::new(
+            Box::new(TrackingCommitter {
+                id,
+                log,
+                outcome: Ok(()),
+            }),
+            create_widened_change_batch(id, 30),
+            false,
+        )
+    }
+
+    #[test]
+    fn test_evolution_allowed_per_policy_set() {
+        let ctx = EvolutionContext {
+            constraint_columns: &[],
+        };
+        let current = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let added_only = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let SchemaEvolution::Widening(additive) =
+            schema_evolution::classify(&current, &added_only, &ctx)
+        else {
+            panic!("expected additive widening");
+        };
+        let widened = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+        let SchemaEvolution::Widening(typed) = schema_evolution::classify(&current, &widened, &ctx)
+        else {
+            panic!("expected type widening");
+        };
+
+        assert!(evolution_allowed(
+            &OnSchemaChange::AppendNewColumns,
+            &additive
+        ));
+        assert!(!evolution_allowed(
+            &OnSchemaChange::AppendNewColumns,
+            &typed
+        ));
+        assert!(evolution_allowed(
+            &OnSchemaChange::SyncAllColumns,
+            &additive
+        ));
+        assert!(evolution_allowed(&OnSchemaChange::SyncAllColumns, &typed));
+        assert!(!evolution_allowed(&OnSchemaChange::Block, &additive));
+        assert!(!evolution_allowed(&OnSchemaChange::Fail, &additive));
+        assert_eq!(widening_plan_kind(&additive), "added_columns");
+        assert_eq!(widening_plan_kind(&typed), "widened_types");
+    }
+
+    #[test]
+    fn test_align_nullability_prevents_false_relax_classification() {
+        // The CDC data struct is nullable-everywhere by design; without
+        // alignment the classifier would report a nullability relax on every
+        // non-nullable accelerator field and block append_new_columns.
+        let target: SchemaRef = Arc::new(create_test_data_schema());
+        let incoming: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ctx = EvolutionContext {
+            constraint_columns: &[],
+        };
+        let aligned = align_nullability_for_classify(&target, &incoming);
+        assert!(matches!(
+            schema_evolution::classify(&target, &aligned, &ctx),
+            SchemaEvolution::Identical
+        ));
+
+        // An added trailing column stays nullable and classifies additive-only.
+        let wider: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]));
+        let aligned = align_nullability_for_classify(&target, &wider);
+        let SchemaEvolution::Widening(plan) = schema_evolution::classify(&target, &aligned, &ctx)
+        else {
+            panic!("expected widening");
+        };
+        assert!(plan.is_additive_only());
+        assert_eq!(plan.added_columns[0].name(), "age");
+    }
+
+    #[test]
+    fn test_group_run_by_schema_splits_on_schema_boundary() {
+        let log = CommitLog::new();
+        let make_committers =
+            |ids: std::ops::RangeInclusive<i32>| -> Vec<Box<dyn cdc::CommitChange + Send + Sync>> {
+                ids.map(|id| {
+                    Box::new(TrackingCommitter {
+                        id,
+                        log: Arc::clone(&log),
+                        outcome: Ok(()),
+                    }) as Box<dyn cdc::CommitChange + Send + Sync>
+                })
+                .collect()
+            };
+
+        let batches = vec![
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("a")]),
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![2], vec![Some("b")]),
+            create_widened_change_batch(3, 30),
+        ];
+        let groups = group_run_by_schema(batches, make_committers(1..=3), true);
+        assert_eq!(groups.len(), 2, "one schema boundary -> two groups");
+        assert_eq!(groups[0].0.len(), 2);
+        assert_eq!(
+            groups[0].1.len(),
+            2,
+            "committers must travel with their group"
+        );
+        assert_eq!(groups[1].0.len(), 1);
+        assert_eq!(groups[1].1.len(), 1);
+
+        // split == false (block policy / no settings): single group verbatim.
+        let batches = vec![
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("a")]),
+            create_widened_change_batch(2, 30),
+        ];
+        let groups = group_run_by_schema(batches, make_committers(1..=2), false);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0.len(), 2);
+    }
+
+    /// Mixed-schema coalesced run (mid-stream column add): with an evolution
+    /// policy installed, the run falls back to per-schema-group applies
+    /// instead of failing the whole run on the concat error — both envelopes
+    /// apply and commit in stream order. (The MemTable accelerator can't
+    /// evolve mid-stream, so the wider batch narrow-casts with a warning;
+    /// restart-time evolution applies the change.)
+    #[tokio::test]
+    async fn test_apply_envelope_run_mixed_schemas_applies_per_group_under_policy() {
+        let dataset_name = TableReference::bare("schema_evo_mixed_groups");
+        install_cdc_schema_evolution(
+            &dataset_name,
+            CdcSchemaEvolution {
+                policy: OnSchemaChange::AppendNewColumns,
+                constraint_columns: vec!["id".to_string()],
+            },
+        );
+
+        let task = make_refresh_task_named(
+            "schema_evo_mixed_groups",
+            make_mem_table() as Arc<dyn TableProvider>,
+        );
+        let log = CommitLog::new();
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            dataset_name: &dataset_name,
+            caching: None,
+            ready_sender: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let applied = task
+            .apply_envelope_run(
+                &mut context,
+                vec![
+                    make_tracked_envelope(1, Arc::clone(&log), false),
+                    make_widened_tracked_envelope(2, Arc::clone(&log)),
+                ],
+            )
+            .await;
+
+        // Reset the process-global registry entry.
+        remove_cdc_schema_evolution(&dataset_name);
+
+        assert!(applied, "mixed-schema run must apply per group, not fail");
+        if let Some(handle) = context.pending_commit.take() {
+            handle
+                .await
+                .expect("commit task join")
+                .expect("commit task should succeed");
+        }
+        assert_eq!(
+            log.ids().await,
+            vec![1, 2],
+            "both schema groups must commit in stream order"
+        );
+    }
+
+    /// Without an evolution policy installed, a mixed-schema run keeps
+    /// today's behavior verbatim: the concat fails, the run is skipped with
+    /// no commits (the source redelivers), and the dataset status is error.
+    #[tokio::test]
+    async fn test_apply_envelope_run_mixed_schemas_without_policy_keeps_error_skip() {
+        let dataset_name = TableReference::bare("schema_evo_mixed_block");
+        let task = make_refresh_task_named(
+            "schema_evo_mixed_block",
+            make_mem_table() as Arc<dyn TableProvider>,
+        );
+        let log = CommitLog::new();
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let mut pending_finalize = None;
+        let mut pending_commit = None;
+        let write_ctx = SessionContext::new();
+        let write_session_state = write_ctx.state();
+        let mut context = ApplyContext {
+            refresh_sql: None,
+            dataset_name: &dataset_name,
+            caching: None,
+            ready_sender: None,
+            initial_load_completed: &initial_load_completed,
+            write_ctx: &write_ctx,
+            write_session_state: &write_session_state,
+            commit_timeout: Duration::from_secs(5),
+            pending_finalize: &mut pending_finalize,
+            pending_commit: &mut pending_commit,
+            deferred_commits: None,
+        };
+
+        let applied = task
+            .apply_envelope_run(
+                &mut context,
+                vec![
+                    make_tracked_envelope(1, Arc::clone(&log), false),
+                    make_widened_tracked_envelope(2, Arc::clone(&log)),
+                ],
+            )
+            .await;
+
+        assert!(
+            applied,
+            "concat failure skips the run but does not stop the stream"
+        );
+        assert!(
+            context.pending_commit.is_none(),
+            "skipped runs must not commit any envelope"
+        );
+        assert_eq!(log.ids().await, Vec::<i32>::new());
+        assert!(
+            task.runtime_status
+                .get_component_status("dataset:schema_evo_mixed_block")
+                .expect("concat failure should set dataset status")
+                .is_error(),
+            "mixed-schema concat failure under block must mark the dataset status as error"
         );
     }
 

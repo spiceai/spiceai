@@ -11,13 +11,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::SnapshotCreateTrigger;
+use crate::accelerated_table::caching::is_reserved_caching_column;
 use crate::accelerated_table::refresh::Refresh;
 use crate::dataaccelerator::AccelerationSource;
 use crate::dataaccelerator::DataAccelerator;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::swappable::SwappableTableProvider;
 use crate::status::RuntimeStatus;
-use arrow_schema::Schema;
+use arrow_schema::{FieldRef, Schema, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
@@ -108,6 +109,58 @@ impl SnapshotCreationConfig {
 pub type SnapshotCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
 
+/// Builds the canonical schema persisted by the dataset checkpoint (and recorded in
+/// snapshot metadata): the accelerator's field order — type widenings applied in place,
+/// added columns appended at the end — with the hidden `__spice_cache_namespace`
+/// storage column removed. Federated source columns that the accelerator does not
+/// materialize (e.g. columns projected away by `refresh_sql`) are appended after the
+/// accelerator fields so the persisted field SET stays equal to the full source schema.
+///
+/// Field definitions are taken from the federated source schema by name where
+/// available, so engine-internal type rewrites (e.g. `DuckDB`'s timestamptz microsecond
+/// normalization or dictionary unwrapping) don't leak into the persisted schema and
+/// trigger false schema-change detection on the next restart. The accelerator order is
+/// what must be durable: engines can only `ADD COLUMN` at the end, so persisting source
+/// order after an evolution would positionally transpose columns on restart.
+///
+/// The full field set must be retained because `FederatedTable::new` gates restart-time
+/// registration on a name-based `schema_difference` between this checkpoint and the full
+/// source provider schema — persisting only the projected (accelerator) subset would make
+/// `refresh_sql` + file-accelerated datasets defer forever under the default `block`
+/// policy. `schema_difference` is order-insensitive, so the accelerator-first ordering is
+/// safe for that gate while remaining load-bearing after an evolution.
+#[must_use]
+pub(crate) fn canonical_checkpoint_schema(
+    accelerator_schema: &SchemaRef,
+    federated_schema: &SchemaRef,
+) -> SchemaRef {
+    let mut fields: Vec<FieldRef> = accelerator_schema
+        .fields()
+        .iter()
+        .filter(|field| !is_reserved_caching_column(field.name()))
+        .map(|field| {
+            federated_schema.field_with_name(field.name()).map_or_else(
+                |_| Arc::clone(field),
+                |source_field| Arc::new(source_field.clone()),
+            )
+        })
+        .collect();
+
+    // Append any federated source columns the accelerator doesn't materialize
+    // (refresh_sql projections), preserving the full source field set so the
+    // restart-time block gate's name-based comparison matches.
+    for source_field in federated_schema.fields() {
+        if !fields.iter().any(|f| f.name() == source_field.name()) {
+            fields.push(Arc::new(source_field.as_ref().clone()));
+        }
+    }
+
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        federated_schema.metadata().clone(),
+    ))
+}
+
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
 /// The task uses the checkpointer's `last_checkpoint_time()` to determine when the next
@@ -123,7 +176,7 @@ pub fn spawn_snapshot_interval_task(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
-    federated_schema: Arc<Schema>,
+    checkpoint_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
@@ -175,7 +228,7 @@ pub fn spawn_snapshot_interval_task(
         create_checkpoint_and_snapshot(
             &checkpointer,
             Some(&snapshot_manager),
-            &federated_schema,
+            &checkpoint_schema,
             &accelerator_write_mutex,
             &dataset_name,
             &last_updated_at,
@@ -206,7 +259,7 @@ pub fn spawn_snapshot_interval_task(
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
-                &federated_schema,
+                &checkpoint_schema,
                 &accelerator_write_mutex,
                 &dataset_name,
                 &last_updated_at,
@@ -230,7 +283,7 @@ pub fn create_periodic_snapshot_callback(
     snapshot_manager: Option<Arc<SnapshotManager>>,
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
-    federated_schema: Arc<Schema>,
+    checkpoint_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
@@ -258,7 +311,7 @@ pub fn create_periodic_snapshot_callback(
             let last_updated_at_clone = Arc::clone(&last_updated_at);
             let checkpointer_clone = Arc::clone(&checkpointer);
             let snapshot_manager_clone = Arc::clone(&snapshot_manager);
-            let federated_schema_clone = Arc::clone(&federated_schema);
+            let checkpoint_schema_clone = Arc::clone(&checkpoint_schema);
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
@@ -274,7 +327,7 @@ pub fn create_periodic_snapshot_callback(
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
                         Some(&snapshot_manager_clone),
-                        &federated_schema_clone,
+                        &checkpoint_schema_clone,
                         &accelerator_write_mutex_clone,
                         &dataset_name_clone,
                         &last_updated_at_clone,
@@ -295,7 +348,7 @@ pub fn create_periodic_snapshot_callback(
                 let snapshot_manager = Arc::clone(&snapshot_manager);
                 let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
                 let batches_processed = Arc::clone(&batches_processed);
-                let federated_schema = Arc::<Schema>::clone(&federated_schema);
+                let checkpoint_schema = Arc::<Schema>::clone(&checkpoint_schema);
                 let dataset_name = dataset_name.clone();
                 let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
@@ -323,7 +376,7 @@ pub fn create_periodic_snapshot_callback(
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             Some(&snapshot_manager),
-                            &federated_schema,
+                            &checkpoint_schema,
                             &accelerator_write_mutex,
                             &dataset_name,
                             &last_updated_at,
@@ -347,7 +400,7 @@ pub fn create_periodic_snapshot_callback(
 pub async fn create_checkpoint_and_snapshot(
     checkpointer: &Arc<dyn DatasetCheckpointer>,
     snapshot_manager: Option<&Arc<SnapshotManager>>,
-    federated_schema: &Arc<Schema>,
+    checkpoint_schema: &Arc<Schema>,
     accelerator_write_mutex: &Arc<Mutex<()>>,
     dataset_name: &TableReference,
     last_updated_at: &Arc<AtomicI64>,
@@ -356,7 +409,10 @@ pub async fn create_checkpoint_and_snapshot(
     refresh_sql: Option<&str>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
-    if let Err(e) = checkpointer.checkpoint(federated_schema, refresh_sql).await {
+    if let Err(e) = checkpointer
+        .checkpoint(checkpoint_schema, refresh_sql)
+        .await
+    {
         tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
         return;
     }
@@ -377,7 +433,7 @@ pub async fn create_checkpoint_and_snapshot(
 
         match snapshot_manager
             .create_snapshot(
-                federated_schema,
+                checkpoint_schema,
                 lock_guard,
                 updated_at,
                 row_count,

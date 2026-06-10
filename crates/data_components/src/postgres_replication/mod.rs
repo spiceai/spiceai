@@ -29,6 +29,7 @@ pub mod config;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
+pub mod schema_evolution;
 pub mod slot;
 
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use snafu::Snafu;
 
 use crate::cdc::{ChangesStream, StreamError};
 
-pub use config::ReplicationParams;
+pub use config::{ReplicationParams, SchemaEvolutionPolicy};
 pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
@@ -167,6 +168,24 @@ pub struct ReplicationStreamInput {
 /// naturally paces the replication stream.
 #[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
+    // No policy plumbed: `block` runs the legacy validation paths verbatim.
+    start_replication_stream_with_policy(input, SchemaEvolutionPolicy::Block)
+}
+
+/// [`start_replication_stream`] with the dataset's `on_schema_change` policy.
+///
+/// With a policy other than [`SchemaEvolutionPolicy::Block`], pgoutput
+/// `Relation` messages are reconciled against the working schema: added
+/// columns (and lossless OID type widening) are adopted so subsequent
+/// `ChangeBatch`es carry the wider data struct, nullable dataset columns
+/// absent from the relation are null-filled (pre-evolution WAL replay), and
+/// non-widening changes surface a clear actionable error. See
+/// [`schema_evolution::RelationSchemaTracker`].
+#[must_use]
+pub fn start_replication_stream_with_policy(
+    input: ReplicationStreamInput,
+    policy: SchemaEvolutionPolicy,
+) -> ChangesStream {
     // Initialized to 0 until `start_inner` learns the effective start LSN from
     // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
     // both read from this atomic, and a pinned-at-0 value would report a wildly
@@ -174,17 +193,18 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
     // handing the atomic to the WAL client.
     let confirmed_flush = Arc::new(AtomicU64::new(0));
     Box::pin(
-        stream::once(async move { start_inner(input, confirmed_flush).await }).flat_map(|result| {
-            match result {
+        stream::once(async move { start_inner(input, policy, confirmed_flush).await }).flat_map(
+            |result| match result {
                 Ok(stream) => stream,
                 Err(e) => stream::once(async move { Err(stream_error(&e)) }).boxed(),
-            }
-        }),
+            },
+        ),
     )
 }
 
 async fn start_inner(
     input: ReplicationStreamInput,
+    schema_evolution_policy: SchemaEvolutionPolicy,
     confirmed_flush: Arc<AtomicU64>,
 ) -> Result<ChangesStream> {
     let ReplicationStreamInput {
@@ -250,6 +270,7 @@ async fn start_inner(
         schema: Arc::clone(&schema),
         primary_keys,
         dataset_name,
+        schema_evolution_policy,
         // The dataset is already marked ready by `skip_bootstrap_ready` (if
         // bootstrap was skipped) or by the final bootstrap envelope.
         is_dataset_ready_on_first_event: false,

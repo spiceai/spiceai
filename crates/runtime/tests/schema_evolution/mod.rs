@@ -47,6 +47,9 @@ const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
 const DUCKDB_FILE_UPDATE_PATH: &str = "./schema_evolution_file_update.duckdb";
 
 #[cfg(feature = "postgres")]
+use spicepod::component::dataset::OnSchemaChange;
+
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -533,4 +536,371 @@ async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
         ),
     ]);
     run_file_update_csv_phases("cayenne", params, &csv_file.to_string_lossy()).await
+}
+
+// --- Widening schema evolution (`on_schema_change`) tests ---
+//
+// These exercise the restart-time widening-evolution path (`mode: File`, full refresh)
+// across a real source schema change. They contrast with the default `block` policy
+// (covered above by `test_schema_evolution`, which serves stale data via a Deferred
+// provider): under `sync_all_columns`/`append_new_columns` the accelerator table is
+// evolved in place and the new schema becomes queryable instead of the dataset
+// deferring forever.
+//
+// Assertions are explicit (row counts / column presence / widened arrow type) rather
+// than insta snapshots so the cases pass on first CI run without pre-accepted `.snap`
+// files.
+
+#[cfg(feature = "postgres")]
+async fn init_widen_pg_runtime(
+    port: usize,
+    engine: &str,
+    accel_params: HashMap<String, String>,
+    on_schema_change: OnSchemaChange,
+) -> Result<Runtime, anyhow::Error> {
+    register_test_connectors().await;
+
+    let mut ds = Dataset::new("postgres:chameleon", "cham");
+    ds.params = Some(Params::from_string_map(
+        vec![
+            ("pg_host".to_string(), "localhost".to_string()),
+            ("pg_port".to_string(), port.to_string()),
+            ("pg_user".to_string(), "postgres".to_string()),
+            ("pg_pass".to_string(), common::PG_PASSWORD.to_string()),
+            ("pg_sslmode".to_string(), "disable".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    ds.on_schema_change = on_schema_change;
+    ds.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::File,
+        params: Some(Params::from_string_map(accel_params)),
+        ..Acceleration::default()
+    });
+
+    let ds_clone = ds.clone();
+
+    let app = AppBuilder::new("test_schema_evolution_widening")
+        .with_dataset(ds)
+        .build();
+
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let cloned_rt = Arc::clone(&rt);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+        }
+        () = cloned_rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    let app_ref = rt.app();
+    let app_lock = app_ref.read().await;
+    if let Some(app) = app_lock.as_ref()
+        && let Ok(runtime_dataset) =
+            runtime::component::dataset::builder::DatasetBuilder::try_from(ds_clone)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    b.with_app(Arc::clone(app))
+                        .with_runtime(Arc::clone(&rt))
+                        .build()
+                        .map_err(anyhow::Error::from)
+                })
+    {
+        let _ = wait_for_checkpoint(&runtime_dataset, 30).await;
+    }
+    drop(app_lock);
+
+    Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
+}
+
+#[cfg(feature = "postgres")]
+#[expect(clippy::expect_used)]
+async fn assert_query_row_count(rt: &Arc<Runtime>, sql: &str, expected_rows: usize) {
+    let batches = run_query(rt, sql)
+        .await
+        .expect("query should succeed after evolution");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, expected_rows,
+        "query `{sql}` returned {rows} rows, expected {expected_rows}"
+    );
+}
+
+/// Asserts the accelerated column `column` reports arrow type `arrow_type` (e.g. `Int64`),
+/// proving an in-place type widening was applied to the engine table and the registered
+/// schema.
+#[cfg(feature = "postgres")]
+#[expect(clippy::expect_used)]
+async fn assert_column_arrow_type(rt: &Arc<Runtime>, column: &str, arrow_type: &str) {
+    let sql = format!("SELECT arrow_typeof({column}) AS t FROM cham LIMIT 1");
+    let batches = run_query(rt, &sql)
+        .await
+        .expect("arrow_typeof query should succeed");
+    let rendered = to_pretty_display(&batches)
+        .expect("pretty display")
+        .to_string();
+    assert!(
+        rendered.contains(arrow_type),
+        "expected `{column}` to be `{arrow_type}` after widening, got:\n{rendered}"
+    );
+}
+
+/// Restart-time widening under `sync_all_columns`: an additive column and a lossless
+/// `int4 -> int8` type widening are both adopted in place, and the accelerated dataset
+/// keeps serving (rather than deferring on the old schema as `block` would).
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[tokio::test]
+async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let accel_file = temp_dir.path().join("widen.duckdb");
+            let params = HashMap::from([(
+                "duckdb_file".to_string(),
+                accel_file.to_string_lossy().to_string(),
+            )]);
+
+            let port = common::get_random_port()?;
+            let running_container = common::start_postgres_docker_container(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let db_conn = pool
+                .connect_direct()
+                .await
+                .expect("connection can be established");
+
+            reset_pg_table(&db_conn).await;
+
+            // Phase 1: initial load (id, town, age).
+            let rt = Arc::new(
+                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
+                    .await?,
+            );
+            assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 2: additive widening — new nullable column adopted in place.
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
+            )
+            .await;
+            execute_pg_statement(
+                &db_conn,
+                "INSERT INTO public.chameleon (id, town, age, country) VALUES ('4', 'Toronto', 40, 'Canada');",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
+                    .await?,
+            );
+            // Under `block` this query would error (country is not in the registered schema);
+            // under `sync_all_columns` the column is adopted and queryable.
+            assert_query_row_count(
+                &rt,
+                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
+                4,
+            )
+            .await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 3: type widening — int4 -> int8 applied in place.
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ALTER COLUMN age TYPE int8;",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
+                    .await?,
+            );
+            assert_query_row_count(
+                &rt,
+                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
+                4,
+            )
+            .await;
+            assert_column_arrow_type(&rt, "age", "Int64").await;
+            rt.shutdown().await;
+            drop(rt);
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// Restart-time widening on the Cayenne engine under `sync_all_columns` — same scenario
+/// as the DuckDB case, validating the Cayenne metastore schema update + provider swap.
+#[cfg(all(feature = "postgres", not(windows)))]
+#[tokio::test]
+async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let params = HashMap::from([
+                (
+                    "cayenne_file_path".to_string(),
+                    temp_dir.path().join("data").to_string_lossy().to_string(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    temp_dir
+                        .path()
+                        .join("metadata")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ]);
+
+            let port = common::get_random_port()?;
+            let running_container = common::start_postgres_docker_container(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let db_conn = pool
+                .connect_direct()
+                .await
+                .expect("connection can be established");
+
+            reset_pg_table(&db_conn).await;
+
+            let rt = Arc::new(
+                init_widen_pg_runtime(port, "cayenne", params.clone(), OnSchemaChange::SyncAllColumns)
+                    .await?,
+            );
+            assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
+            )
+            .await;
+            execute_pg_statement(
+                &db_conn,
+                "INSERT INTO public.chameleon (id, town, age, country) VALUES ('4', 'Toronto', 40, 'Canada');",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(port, "cayenne", params.clone(), OnSchemaChange::SyncAllColumns)
+                    .await?,
+            );
+            assert_query_row_count(
+                &rt,
+                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
+                4,
+            )
+            .await;
+            rt.shutdown().await;
+            drop(rt);
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
+}
+
+/// `append_new_columns` adopts a new nullable column but does NOT apply a type widening:
+/// the `int4 -> int8` change falls back to block-equivalent behavior (the dataset keeps
+/// serving the prior schema instead of evolving the type).
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
+#[tokio::test]
+async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let accel_file = temp_dir.path().join("append.duckdb");
+            let params = HashMap::from([(
+                "duckdb_file".to_string(),
+                accel_file.to_string_lossy().to_string(),
+            )]);
+
+            let port = common::get_random_port()?;
+            let running_container = common::start_postgres_docker_container(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let db_conn = pool
+                .connect_direct()
+                .await
+                .expect("connection can be established");
+
+            reset_pg_table(&db_conn).await;
+
+            let rt = Arc::new(
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::AppendNewColumns,
+                )
+                .await?,
+            );
+            assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Additive column — adopted under append_new_columns.
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::AppendNewColumns,
+                )
+                .await?,
+            );
+            assert_query_row_count(&rt, "SELECT id, town, age, country FROM cham ORDER BY id ASC", 3)
+                .await;
+            assert_column_arrow_type(&rt, "age", "Int32").await;
+            rt.shutdown().await;
+            drop(rt);
+
+            // Type widening is NOT in the append_new_columns set: the dataset stays on the
+            // prior schema (block-equivalent) — `age` remains Int32, and the original
+            // projection keeps serving.
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ALTER COLUMN age TYPE int8;",
+            )
+            .await;
+            let rt = Arc::new(
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::AppendNewColumns,
+                )
+                .await?,
+            );
+            assert_query_row_count(&rt, "SELECT id, town, country FROM cham ORDER BY id ASC", 3)
+                .await;
+            assert_column_arrow_type(&rt, "age", "Int32").await;
+            rt.shutdown().await;
+            drop(rt);
+
+            running_container.remove().await?;
+            Ok(())
+        })
+        .await
 }

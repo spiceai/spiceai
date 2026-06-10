@@ -25,8 +25,8 @@ use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::accelerated_table::snapshots::{
-    SnapshotCallback, create_checkpoint_and_snapshot, create_periodic_snapshot_callback,
-    spawn_snapshot_interval_task,
+    SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
+    create_periodic_snapshot_callback, spawn_snapshot_interval_task,
 };
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
@@ -889,7 +889,12 @@ impl Refresher {
         };
 
         let checkpointer = self.checkpointer.clone();
-        let federated_schema = self.federated.schema();
+        // Checkpoints (and snapshot metadata) persist the canonical registration
+        // schema — accelerator field order minus the hidden cache-namespace storage
+        // column — not the source-order federated schema, so that evolved column
+        // order is durable across restarts (engines can only append columns).
+        let checkpoint_schema =
+            canonical_checkpoint_schema(&self.accelerator.schema(), &self.federated.schema());
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
@@ -910,7 +915,7 @@ impl Refresher {
                             snapshot_manager.clone(),
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
-                            Arc::clone(&federated_schema),
+                            Arc::clone(&checkpoint_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
@@ -927,7 +932,7 @@ impl Refresher {
                             snapshot_manager,
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
-                            self.federated.schema(),
+                            Arc::clone(&checkpoint_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
@@ -1012,7 +1017,7 @@ impl Refresher {
                         snapshot_manager.clone(),
                         Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
-                        Arc::clone(&federated_schema),
+                        Arc::clone(&checkpoint_schema),
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
                         Arc::clone(&self.last_updated_at),
@@ -1040,7 +1045,7 @@ impl Refresher {
                 let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
                 let runtime_status_clone = Arc::clone(&self.runtime_status);
                 let snapshot_manager_clone = snapshot_manager.clone();
-                let federated_schema_clone = Arc::clone(&federated_schema);
+                let checkpoint_schema_clone = Arc::clone(&checkpoint_schema);
                 let accelerator_write_mutex_clone = Arc::clone(&self.accelerator_write_mutex);
                 let dataset_name_clone = dataset_name.clone();
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
@@ -1059,7 +1064,7 @@ impl Refresher {
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
-                            &federated_schema_clone,
+                            &checkpoint_schema_clone,
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
                             &last_updated_at_clone,
@@ -1147,7 +1152,7 @@ impl Refresher {
                             create_checkpoint_and_snapshot(
                                 checkpointer,
                                 snapshot_manager.as_ref(),
-                                &federated_schema,
+                                &checkpoint_schema,
                                 &snapshot_mutex,
                                 &dataset_name,
                                 &last_updated_at,

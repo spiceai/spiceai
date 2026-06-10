@@ -31,8 +31,9 @@ use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationE
 use super::{
     ReplicationMetricsCollector, Result, SchemaMismatchSnafu,
     changes::{TransactionBuffer, build_change_batch, envelope_with_lsn},
-    config::{ReplicationParams, SslMode},
+    config::{ReplicationParams, SchemaEvolutionPolicy, SslMode},
     pgoutput::{DecodedMessage, Decoder},
+    schema_evolution::RelationSchemaTracker,
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 
@@ -44,6 +45,10 @@ pub struct WalStreamInput {
     pub schema: SchemaRef,
     pub primary_keys: Vec<String>,
     pub dataset_name: String,
+    /// Dataset `on_schema_change` policy. With anything other than `Block`,
+    /// pgoutput `Relation` messages are reconciled against the working schema
+    /// (widening adopted, breaking changes surfaced as actionable errors).
+    pub schema_evolution_policy: SchemaEvolutionPolicy,
     /// When `true`, the first envelope emitted will signal the dataset as
     /// ready — used when we skip bootstrap (existing slot resume path).
     pub is_dataset_ready_on_first_event: bool,
@@ -128,10 +133,27 @@ fn wal_stream(
     let primary_keys = input.primary_keys;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
     let mark_ready_on_first = input.is_dataset_ready_on_first_event;
+    let policy = input.schema_evolution_policy;
     let metrics = input.metrics;
 
     try_stream! {
         let mut first_emitted = !mark_ready_on_first;
+        // The working schema starts at the dataset schema and (policy
+        // permitting) widens when the source relation gains columns or widens
+        // types. It persists across reconnects — the OID baseline in the
+        // tracker does too — so pre-evolution WAL replayed after a reconnect
+        // still null-fills against the widened shape.
+        let mut working_schema = Arc::clone(&schema);
+        let mut relation_tracker = RelationSchemaTracker::new(
+            Arc::clone(&schema),
+            policy,
+            dataset_name.clone(),
+            primary_keys.clone(),
+        );
+        // Block-path observability: relation column names seen so far, used to
+        // warn (once per change) when the source gains columns that are being
+        // silently dropped because no evolution policy is set.
+        let mut known_relation_columns: Option<std::collections::HashSet<String>> = None;
         // If the caller passed `None`, the upfront connect failed transiently
         // (see `start_wal_stream`) — count it as a prior failure so the next
         // successful connect emits an INFO "resumed" line.
@@ -242,15 +264,56 @@ fn wal_stream(
 
                     match msg {
                         DecodedMessage::Relation(rel) => {
-                            if let Err(e) = validate_relation_against_schema(
-                                &schema,
-                                &rel,
-                                &primary_keys,
-                            ) {
-                                metrics.inc_schema_mismatch_error();
-                                Err(StreamError::External(format!(
-                                    "schema mismatch for {dataset_name}: {e}"
-                                )))?;
+                            if policy == SchemaEvolutionPolicy::Block {
+                                if let Err(e) = validate_relation_against_schema(
+                                    &working_schema,
+                                    &rel,
+                                    &primary_keys,
+                                ) {
+                                    metrics.inc_schema_mismatch_error();
+                                    Err(StreamError::External(format!(
+                                        "schema mismatch for {dataset_name}: {e}"
+                                    )))?;
+                                }
+                                // Observability-only (behavior is unchanged under
+                                // `block`): a mid-stream column add is silently
+                                // dropped — say so loudly once per change.
+                                warn_on_new_relation_columns(
+                                    &rel,
+                                    &mut known_relation_columns,
+                                    &dataset_name,
+                                    &metrics,
+                                );
+                            } else {
+                                if let Err(e) =
+                                    validate_relation_primary_keys(&rel, &primary_keys)
+                                {
+                                    metrics.inc_schema_mismatch_error();
+                                    Err(StreamError::External(format!(
+                                        "schema mismatch for {dataset_name}: {e}"
+                                    )))?;
+                                }
+                                match relation_tracker.observe_relation(&rel) {
+                                    Ok(observation) => {
+                                        if observation.schema_changed {
+                                            working_schema =
+                                                Arc::clone(relation_tracker.working_schema());
+                                            metrics.inc_schema_evolution();
+                                            tracing::info!(
+                                                dataset = %dataset_name,
+                                                "adopted source schema change: {}",
+                                                observation.summary
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        metrics.inc_schema_evolution_rejected();
+                                        metrics.inc_schema_mismatch_error();
+                                        Err(StreamError::External(format!(
+                                            "schema change for {dataset_name} cannot be applied: {e}"
+                                        )))?;
+                                    }
+                                }
                             }
                             decoder.apply_declared_primary_keys(rel.relation_id, &primary_keys);
                         }
@@ -352,7 +415,7 @@ fn wal_stream(
                             unreachable!();
                         }
 
-                        let batch = build_change_batch(&schema, rel, &buffer.changes)
+                        let batch = build_change_batch(&working_schema, rel, &buffer.changes, policy)
                             .map_err(|e| StreamError::External(format!(
                                 "change batch build failed for {dataset_name}: {e}"
                             )))?;
@@ -528,6 +591,16 @@ fn validate_relation_against_schema(
             .fail();
         }
     }
+    validate_relation_primary_keys(rel, declared_pks)
+}
+
+/// Validate that every dataset-declared primary key exists on the relation and
+/// is part of the source replica identity. Runs for every policy — UPDATE and
+/// DELETE events cannot be routed without the key columns.
+fn validate_relation_primary_keys(
+    rel: &super::pgoutput::Relation,
+    declared_pks: &[String],
+) -> Result<()> {
     for pk in declared_pks {
         let Some(col) = rel.columns.iter().find(|c| c.name == *pk) else {
             return SchemaMismatchSnafu {
@@ -549,6 +622,39 @@ fn validate_relation_against_schema(
         }
     }
     Ok(())
+}
+
+/// Under `on_schema_change: block`, a mid-stream column add is silently
+/// ignored (the legacy behavior). Surface that narrowing loudly: warn once per
+/// relation change naming the dropped columns, counted as a rejected schema
+/// evolution. The first relation of a connection only seeds the baseline —
+/// columns intentionally excluded from the dataset schema must not warn.
+fn warn_on_new_relation_columns(
+    rel: &super::pgoutput::Relation,
+    known_relation_columns: &mut Option<std::collections::HashSet<String>>,
+    dataset_name: &str,
+    metrics: &ReplicationMetricsCollector,
+) {
+    let current: std::collections::HashSet<String> =
+        rel.columns.iter().map(|c| c.name.clone()).collect();
+    if let Some(known) = known_relation_columns.as_ref() {
+        let added: Vec<&str> = current
+            .iter()
+            .filter(|name| !known.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if !added.is_empty() {
+            metrics.inc_schema_evolution_rejected();
+            tracing::warn!(
+                dataset = %dataset_name,
+                columns = ?added,
+                "source relation {}.{} gained columns whose values are being silently dropped. Set `on_schema_change: append_new_columns` (or `sync_all_columns`) on the dataset to adopt new columns",
+                rel.namespace,
+                rel.name
+            );
+        }
+    }
+    *known_relation_columns = Some(current);
 }
 
 #[cfg(test)]

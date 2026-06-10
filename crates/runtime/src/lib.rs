@@ -126,6 +126,7 @@ pub use runtime_parameters as parameters;
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
+pub mod schema_evolution;
 pub mod search;
 pub mod secrets {
     pub use runtime_secrets::*;

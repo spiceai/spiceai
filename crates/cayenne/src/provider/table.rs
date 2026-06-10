@@ -51,6 +51,7 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{DataType, Field, SchemaBuilder, SchemaRef, TimeUnit};
+use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_trait::async_trait;
 use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::datasource::file_format::FileFormat;
@@ -124,6 +125,11 @@ use arc_swap::ArcSwap;
 
 const POST_WRITE_MAINTENANCE_DEBOUNCE: Duration = Duration::from_millis(100);
 const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
+/// How long [`CayenneTableProvider::evolve_schema_live`] waits for in-flight
+/// pipelined Stage-B publishes (staged WALs + staged inline tombstones) to
+/// drain before giving up. Stage-B finalizes normally complete within
+/// milliseconds; the timeout only guards against a wedged background task.
+const SCHEMA_EVOLUTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -1691,6 +1697,16 @@ pub(crate) async fn reserve_sequences_in(
 pub struct CayenneTableProvider {
     /// Table metadata from the catalog
     table_metadata: TableMetadata,
+    /// Current logical Arrow schema for this table, seeded from
+    /// `table_metadata.schema` at open.
+    ///
+    /// Held in an [`ArcSwap`] (shared across [`Self::clone_for_write`] clones)
+    /// so [`Self::evolve_schema_live`] can atomically widen it under the
+    /// listing fence while in-flight scans keep the `SchemaRef` they already
+    /// loaded (old files read under the old schema stay valid). All schema
+    /// readers must go through [`Self::table_schema`] rather than
+    /// `table_metadata.schema`, which is frozen at open time.
+    table_schema: Arc<ArcSwap<arrow_schema::Schema>>,
     /// Reference to the metadata catalog for file operations
     catalog: Arc<dyn MetadataCatalog>,
     /// Underlying Vortex `ListingTable` that scans all virtual files in the table directory.
@@ -3342,6 +3358,150 @@ impl CayenneTableProvider {
         &self.table_metadata.table_name
     }
 
+    /// Returns the CURRENT logical Arrow schema for this table.
+    ///
+    /// This is the live, swappable schema (see [`Self::evolve_schema_live`]) —
+    /// always prefer it over `table_metadata.schema`, which is frozen at open.
+    #[must_use]
+    pub fn table_schema(&self) -> SchemaRef {
+        self.table_schema.load_full()
+    }
+
+    /// Live (stream-time) widening schema evolution: atomically widen this
+    /// table's logical schema to `plan.evolved_schema` without dropping data.
+    ///
+    /// Sequence (each step's invariant):
+    /// 1. Take `write_lock` — no new writes can admit inline/mem-tier/staged
+    ///    rows while the flush + swap runs.
+    /// 2. Drain in-flight pipelined Stage-B publishes (staged WALs + staged
+    ///    inline tombstones). A checkpoint inside the staged-tombstone window
+    ///    would flush the old inline row to a file AND clear the tombstone,
+    ///    resurfacing the old version (see `pending_inline_tombstones`).
+    /// 3. Flush the RAM CDC tier, then the durable inline corpus. Both must be
+    ///    EMPTY at swap time: inlined IPC batches decode with the stored
+    ///    schema and are unioned into scans projection-only (no cast), so
+    ///    swapping with pending inline rows yields mistyped scan results.
+    ///    Old Vortex FILES are fine — they are self-describing and the scan
+    ///    adapts them to the evolved schema (missing-column null-fill +
+    ///    widened-type cast in the Vortex opener).
+    /// 4. Under one held `listing_fence.write()`: persist the evolved schema
+    ///    to the metastore (`update_table_schema`), swap the in-memory
+    ///    [`Self::table_schema`], re-derive the cached optimizer statistics at
+    ///    the new width, clear stale per-file statistics, and rebuild the
+    ///    listing table — so a scan observes either the old schema entirely
+    ///    or the new one entirely. In-flight scans keep the `SchemaRef` they
+    ///    already loaded (old files under the old schema stay valid).
+    ///
+    /// Idempotent: re-applying a plan whose evolved schema is already live is
+    /// a no-op; a crash between the metastore UPDATE and the swap is healed by
+    /// either a retry (re-classifies as still-widening) or a reopen (the
+    /// provider reads the evolved schema from the metastore).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan's evolved schema is not a widening of
+    /// the live schema (including any primary-key column change — typed PK
+    /// row-encodings cannot be widened in place), when in-flight staged writes
+    /// fail to drain within [`SCHEMA_EVOLUTION_DRAIN_TIMEOUT`], or when a
+    /// flush/metastore step fails.
+    pub async fn evolve_schema_live(&self, plan: &WideningPlan) -> Result<()> {
+        let current = self.table_schema();
+        if current.as_ref() == plan.evolved_schema.as_ref() {
+            return Ok(());
+        }
+
+        // Re-classify against the LIVE schema (not the plan's original base):
+        // rejects stale/foreign plans and re-applies the PK constraint guard.
+        let ctx = EvolutionContext {
+            constraint_columns: &self.table_metadata.primary_key,
+        };
+        match classify(&current, &plan.evolved_schema, &ctx) {
+            SchemaEvolution::Widening(_) => {}
+            // Reorder-only difference: the live schema stays canonical.
+            SchemaEvolution::Identical => return Ok(()),
+            SchemaEvolution::Incompatible { reason } => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    "Rejected live schema evolution: {reason}"
+                );
+                return Err(Error::DataValidation {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!("Cannot evolve schema in place: {reason}"),
+                });
+            }
+        }
+
+        let started = Instant::now();
+        let _write_guard = self.write_lock.lock().await;
+
+        // Step 2: drain Stage-B publishes. They complete without `write_lock`
+        // (visibility lock + listing fence only), and no new ones can start.
+        let drain_deadline = Instant::now() + SCHEMA_EVOLUTION_DRAIN_TIMEOUT;
+        while self.has_inflight_staging_appends()
+            || self.pending_inline_tombstones.load(Ordering::Acquire) > 0
+        {
+            if Instant::now() >= drain_deadline {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message:
+                        "Timed out draining in-flight staged writes before schema evolution"
+                            .to_string(),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Step 3: flush. `checkpoint_mem_tier` requires `mem_checkpoint_lock`
+        // held by the caller; it also folds the inline corpus it shadows, and
+        // `checkpoint_inlined_data` then flushes whatever remains (no-op when
+        // the corpus is already empty — file mode, or just folded).
+        {
+            let _mem_checkpoint_guard = self.mem_checkpoint_lock.lock().await;
+            self.checkpoint_mem_tier().await?;
+        }
+        self.checkpoint_inlined_data().await?;
+
+        // Step 4: publish.
+        {
+            let _fence = self.listing_fence.write().await;
+            self.catalog
+                .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
+                .await
+                .map_err(|source| Error::Catalog { source })?;
+            self.table_schema
+                .store(Arc::clone(&plan.evolved_schema));
+            {
+                // Cached optimizer statistics are column-indexed against the
+                // old schema width (DataFusion expects column_statistics.len()
+                // == schema width); re-derive from the raw blob at the evolved
+                // width. A blob that no longer deserializes (widened column
+                // stat dtypes) degrades to None — unknown stats, never wrong.
+                let mut stats_cache = self.table_statistics.write();
+                let df_stats = stats_cache
+                    .raw
+                    .as_ref()
+                    .and_then(|raw| Self::table_statistics_to_df(&plan.evolved_schema, raw));
+                stats_cache.optimizer_inexact = df_stats
+                    .as_ref()
+                    .map(|s| Self::statistics_to_inexact(s.clone()));
+                stats_cache.optimizer = df_stats;
+            }
+            // Per-file statistics were inferred against the old logical schema
+            // width; drop them so the next scan re-infers at the evolved width.
+            self.scan_file_statistics.clear();
+            self.refresh_listing_table_under_held_fence()?;
+        }
+
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            duration_ms = started.elapsed().as_millis(),
+            "Applied live schema evolution: {}",
+            plan.describe()
+        );
+
+        Ok(())
+    }
+
     /// Returns the base path for this table's data.
     #[must_use]
     pub(crate) fn table_path(&self) -> &str {
@@ -3445,7 +3605,7 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         task_context: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<CayenneCdcWrite> {
-        let target_schema = Arc::clone(&self.table_metadata.schema);
+        let target_schema = self.table_schema();
         // Tally the in-memory Arrow size of every batch as it streams through, so
         // the auto-tuner sees the real ingest *volume* (bytes/s), not just rows/s.
         // Costs one relaxed add per batch on a path that already touches each batch.
@@ -3541,7 +3701,7 @@ impl CayenneTableProvider {
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             self.context.file_format(),
             &self.pk_deletion_strategy,
         )?;
@@ -4868,6 +5028,9 @@ impl CayenneTableProvider {
 
         let provider = Self {
             current_snapshot_id: Arc::new(RwLock::new(table_metadata.current_snapshot_id.clone())),
+            table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
+                &table_metadata.schema,
+            ))),
             table_metadata,
             catalog,
             listing_table: Arc::new(ArcSwap::new(listing_table)),
@@ -5297,7 +5460,7 @@ impl CayenneTableProvider {
         // Create a new ListingTable pointing to the snapshot directory
         let snapshot_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             &write_format,
             &self.pk_deletion_strategy,
         )?;
@@ -5313,7 +5476,7 @@ impl CayenneTableProvider {
         let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Column stats accumulator — updated per batch during writes
-        let stats_accumulator = Arc::new(ColumnStatsAccumulator::new(&self.table_metadata.schema));
+        let stats_accumulator = Arc::new(ColumnStatsAccumulator::new(&self.table_schema()));
 
         // Log when starting S3 upload process
         if is_s3_storage {
@@ -5325,7 +5488,7 @@ impl CayenneTableProvider {
             );
         }
 
-        let tracked_schema = Arc::clone(&self.table_metadata.schema);
+        let tracked_schema = self.table_schema();
         let tracked_stream = {
             let total_bytes_written = Arc::clone(&total_bytes_written);
             let total_rows_written = Arc::clone(&total_rows_written);
@@ -5553,16 +5716,11 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
+        let table_schema = self.table_schema();
         let shard_key_columns = self
             .pk_column_indices
             .iter()
-            .filter_map(|&i| {
-                self.table_metadata
-                    .schema
-                    .fields()
-                    .get(i)
-                    .map(|f| f.name().clone())
-            })
+            .filter_map(|&i| table_schema.fields().get(i).map(|f| f.name().clone()))
             .collect::<Vec<_>>();
         Some(WriteShardConfig {
             write_concurrency: shard_count,
@@ -5613,6 +5771,8 @@ impl CayenneTableProvider {
     pub(crate) fn clone_for_write(&self) -> Self {
         Self {
             table_metadata: self.table_metadata.clone(),
+            // Shared so a live schema swap is observed by every writer clone.
+            table_schema: Arc::clone(&self.table_schema),
             catalog: Arc::clone(&self.catalog),
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
@@ -6144,7 +6304,7 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
             state.config(),
         );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_metadata.schema, &options);
+        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
         let listed = self
             .list_files_for_snapshot_scan(&state, &table_url, &options, &[], None, scan_schema)
             .await
@@ -6175,7 +6335,7 @@ impl CayenneTableProvider {
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             &[],
             self.pk_deletion_strategy.clone(),
             Arc::clone(&self.table_memory),
@@ -6248,16 +6408,15 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
+        let table_schema = self.table_schema();
         let mut indices = Vec::with_capacity(self.table_metadata.primary_key.len());
         for pk_col in &self.table_metadata.primary_key {
-            let idx =
-                self.table_metadata
-                    .schema
-                    .index_of(pk_col)
-                    .map_err(|_| Error::DataValidation {
-                        table: self.table_metadata.table_name.clone(),
-                        message: format!("Primary key column '{pk_col}' not found in schema"),
-                    })?;
+            let idx = table_schema
+                .index_of(pk_col)
+                .map_err(|_| Error::DataValidation {
+                    table: self.table_metadata.table_name.clone(),
+                    message: format!("Primary key column '{pk_col}' not found in schema"),
+                })?;
             indices.push(idx);
         }
 
@@ -6266,9 +6425,10 @@ impl CayenneTableProvider {
 
     /// Build a `RowConverter` for the primary key columns.
     fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
+        let table_schema = self.table_schema();
         let mut sort_fields = Vec::with_capacity(pk_indices.len());
         for idx in pk_indices {
-            let field = self.table_metadata.schema.field(*idx);
+            let field = table_schema.field(*idx);
             sort_fields.push(SortField::new(field.data_type().clone()));
         }
 
@@ -8454,7 +8614,7 @@ impl CayenneTableProvider {
                 self.table_metadata.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.listing_table),
-                Arc::clone(&self.table_metadata.schema),
+                self.table_schema(),
                 &[],
                 self.pk_deletion_strategy.clone(),
                 Arc::clone(&self.table_memory),
@@ -9150,7 +9310,7 @@ impl CayenneTableProvider {
         );
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             self.context.file_format(),
             &self.pk_deletion_strategy,
         )?;
@@ -9930,7 +10090,7 @@ impl CayenneTableProvider {
         );
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             self.context.file_format(),
             &self.pk_deletion_strategy,
         )?;
@@ -10650,7 +10810,7 @@ impl CayenneTableProvider {
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             &filters,
             self.pk_deletion_strategy.clone(),
             Arc::clone(&self.table_memory),
@@ -11035,7 +11195,7 @@ impl CayenneTableProvider {
 
         let new_listing_table = Self::create_listing_table(
             &snapshot_dir_url,
-            Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema),
+            self.table_schema(),
             self.context.file_format(),
             &self.pk_deletion_strategy,
         )?;
@@ -11384,7 +11544,7 @@ impl CayenneTableProvider {
             return;
         }
 
-        let df_stats = Self::table_statistics_to_df(&self.table_metadata.schema, &stats);
+        let df_stats = Self::table_statistics_to_df(&self.table_schema(), &stats);
         let df_stats_inexact = df_stats
             .as_ref()
             .map(|s| Self::statistics_to_inexact(s.clone()));
@@ -12536,7 +12696,7 @@ impl CayenneTableProvider {
             "Checkpointing in-memory CDC tier to a durable Vortex snapshot"
         );
 
-        let schema = Arc::clone(&self.table_metadata.schema);
+        let schema = self.table_schema();
         let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[batches],
             Arc::clone(&schema),
@@ -12698,15 +12858,16 @@ impl CayenneTableProvider {
         }
 
         // Project to the effective projection (reusing the inlined-plan logic).
+        let table_schema = self.table_schema();
         let proj_schema = if let Some(proj) = effective_projection {
-            let schema_fields = self.table_metadata.schema.fields();
+            let schema_fields = table_schema.fields();
             let fields: Vec<arrow_schema::FieldRef> = proj
                 .iter()
                 .map(|&i| Arc::clone(&schema_fields[i]))
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
         } else {
-            Arc::clone(&self.table_metadata.schema)
+            table_schema
         };
 
         let projected_batches: Vec<RecordBatch> = visible_batches
@@ -12790,7 +12951,7 @@ impl CayenneTableProvider {
         );
 
         // Write inlined data through the normal staging path
-        let schema = Arc::clone(&self.table_metadata.schema);
+        let schema = self.table_schema();
         let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[batches],
             Arc::clone(&schema),
@@ -13151,7 +13312,7 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Vec<Expr>> {
-        let df_schema = DFSchema::try_from(self.table_metadata.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(self.table_schema().as_ref().clone())?;
         let mut coerced_filters = Vec::with_capacity(filters.len());
 
         for filter in filters {
@@ -13166,7 +13327,7 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Vec<Arc<dyn PhysicalExpr>>> {
-        let df_schema = DFSchema::try_from(self.table_metadata.schema.as_ref().clone())?;
+        let df_schema = DFSchema::try_from(self.table_schema().as_ref().clone())?;
         let execution_props = ExecutionProps::new();
 
         filters
@@ -13560,9 +13721,10 @@ impl CayenneTableProvider {
         let Some(mut proj) = projection else {
             return (None, already_extended);
         };
+        let table_schema = self.table_schema();
         let mut added = already_extended;
         for col_ref in filter.column_refs() {
-            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name())
+            if let Some((idx, _)) = table_schema.column_with_name(col_ref.name())
                 && !proj.contains(&idx)
             {
                 proj.push(idx);
@@ -13745,7 +13907,7 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
             scan_config,
         );
-        let scan_schema = Self::snapshot_scan_schema(&self.table_metadata.schema, &options);
+        let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
 
         let partition_column_names = options
             .table_partition_cols
@@ -13815,7 +13977,7 @@ impl CayenneTableProvider {
         }
 
         let file_source = options.format.file_source(Self::snapshot_file_table_schema(
-            &self.table_metadata.schema,
+            &self.table_schema(),
             &options,
         ));
 
@@ -13872,7 +14034,7 @@ impl CayenneTableProvider {
                     )
                     .await?
                 } else {
-                    Arc::new(Statistics::new_unknown(&self.table_metadata.schema))
+                    Arc::new(Statistics::new_unknown(&self.table_schema()))
                 };
                 DataFusionResult::Ok(part_file.with_statistics(statistics))
             })
@@ -13930,7 +14092,7 @@ impl CayenneTableProvider {
                 .infer_stats(
                     state,
                     store,
-                    Arc::clone(&self.table_metadata.schema),
+                    self.table_schema(),
                     &part_file.object_meta,
                 )
                 .await?,
@@ -14306,10 +14468,11 @@ impl CayenneTableProvider {
         if self.pk_column_indices.is_empty() {
             return false;
         }
+        let table_schema = self.table_schema();
         let pk_names: Vec<&str> = self
             .pk_column_indices
             .iter()
-            .map(|&idx| self.table_metadata.schema.field(idx).name().as_str())
+            .map(|&idx| table_schema.field(idx).name().as_str())
             .collect();
 
         pk_names.iter().all(|pk_name| {
@@ -14470,7 +14633,7 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::<arrow_schema::Schema>::clone(&self.table_metadata.schema)
+        self.table_schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -14618,7 +14781,7 @@ impl TableProvider for CayenneTableProvider {
         // 2. Wrapped as a physical FilterExec for row-level filtering
         let retention_keep_filter = if let Some(ref builder) = self.time_retention_filter_builder {
             let filter = builder.keep_filter();
-            let filter = util::expr::simplify_expr(filter, &self.table_metadata.schema)?;
+            let filter = util::expr::simplify_expr(filter, &self.table_schema())?;
             Some(filter)
         } else {
             None
@@ -14713,15 +14876,16 @@ impl TableProvider for CayenneTableProvider {
             None
         } else {
             // Apply projection to inlined batches if needed
+            let table_schema = self.table_schema();
             let proj_schema = if let Some(ref proj) = effective_projection {
-                let schema_fields = self.table_metadata.schema.fields();
+                let schema_fields = table_schema.fields();
                 let fields: Vec<arrow_schema::FieldRef> = proj
                     .iter()
                     .map(|&i| Arc::clone(&schema_fields[i]))
                     .collect();
                 Arc::new(arrow_schema::Schema::new(fields))
             } else {
-                Arc::clone(&self.table_metadata.schema)
+                table_schema
             };
 
             let projected_batches: Vec<RecordBatch> = inlined_batches
@@ -14980,7 +15144,7 @@ impl TableProvider for CayenneTableProvider {
         let sink = Arc::new(CayenneDataSink::new(
             self.clone_for_write(),
             overwrite,
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             Arc::clone(&self.context),
         ));
 
@@ -15162,7 +15326,7 @@ impl CayenneTableProvider {
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             filters,
             self.pk_deletion_strategy.clone(),
             Arc::clone(&self.table_memory),
@@ -15211,7 +15375,7 @@ impl CayenneTableProvider {
             self.table_metadata.clone(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.listing_table),
-            Arc::clone(&self.table_metadata.schema),
+            self.table_schema(),
             &[], // no filters — positions are resolved by key probe
             self.pk_deletion_strategy.clone(),
             Arc::clone(&self.table_memory),
@@ -15258,7 +15422,7 @@ impl CayenneTableProvider {
 
             let listing_table = Self::create_listing_table(
                 &snapshot_url,
-                Arc::clone(&self.table_metadata.schema),
+                self.table_schema(),
                 self.context.file_format(),
                 &self.pk_deletion_strategy,
             )

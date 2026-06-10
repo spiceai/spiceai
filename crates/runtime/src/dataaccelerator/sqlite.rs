@@ -28,6 +28,7 @@ use crate::{
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
 };
+use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -88,6 +89,11 @@ pub enum Error {
 
     #[snafu(display("Invalid SQLite acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display(
+        "The data type '{data_type}' is not supported for in-place SQLite schema evolution"
+    ))]
+    UnsupportedSchemaEvolutionType { data_type: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -555,6 +561,118 @@ impl DataAccelerator for SqliteAccelerator {
         );
         Ok(())
     }
+
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Type widening and nullability relaxing need no DDL on SQLite: column type
+        // affinity already stores the widened values. Only added columns require
+        // `ALTER TABLE ADD COLUMN`.
+        let added_columns: Vec<(String, String)> = plan
+            .added_columns
+            .iter()
+            .map(|field| {
+                arrow_type_to_sqlite_ddl(field.data_type())
+                    .map(|ddl_type| (field.name().clone(), ddl_type))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+        if !added_columns.is_empty() {
+            let pool = self.get_shared_pool(source).await?;
+            let conn_sync = pool.connect_sync();
+            let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+                return Err("Failed to downcast to SqliteConnection".into());
+            };
+            let table = table_name.to_string();
+            conn.conn
+                .call(move |conn| {
+                    let tx = conn.transaction()?;
+                    // The table may not exist yet (e.g. a checkpoint without data); it is
+                    // then created with the evolved schema on the next write.
+                    let table_exists = tx
+                        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")?
+                        .query([table.as_str()])?
+                        .next()?
+                        .is_some();
+                    if table_exists {
+                        let existing_columns: Vec<String> = tx
+                            .prepare("SELECT name FROM pragma_table_info(?)")?
+                            .query_map([table.as_str()], |row| row.get::<_, String>(0))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        let escaped_table = table.replace('"', "\"\"");
+                        for (column, ddl_type) in added_columns {
+                            // Idempotent: skip columns already added by a prior
+                            // (possibly interrupted) evolution.
+                            if existing_columns.contains(&column) {
+                                continue;
+                            }
+                            let escaped_column = column.replace('"', "\"\"");
+                            tx.execute(
+                                &format!(
+                                    "ALTER TABLE \"{escaped_table}\" ADD COLUMN \"{escaped_column}\" {ddl_type}"
+                                ),
+                                [],
+                            )?;
+                        }
+                    }
+                    tx.commit()?;
+                    Ok::<(), rusqlite::Error>(())
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        }
+
+        tracing::info!(
+            dataset = %source.name(),
+            "Applied in-place schema evolution to SQLite table '{table_name}': {summary}",
+            summary = plan.describe()
+        );
+        Ok(())
+    }
+}
+
+/// Maps an Arrow [`DataType`] to the `SQLite` DDL type for `ALTER TABLE ADD COLUMN`.
+///
+/// Must produce the same declared type tokens as `CreateTableBuilder::build_sqlite`
+/// in `datafusion-table-providers` (sea-query's `SQLite` backend): the `SQLite` reader
+/// keys value decoding off these declared types (e.g. `date_text`,
+/// `timestamp_with_timezone_text`), so a divergent token would change read behavior
+/// for the evolved column.
+fn arrow_type_to_sqlite_ddl(data_type: &DataType) -> Result<String, Error> {
+    if data_type.is_nested() {
+        // Matches build_sqlite: nested types (List, Struct, ...) are stored as JSON.
+        return Ok("jsonb_text".to_string());
+    }
+    let ddl = match data_type {
+        DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
+        DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
+        DataType::Int32 | DataType::UInt32 => "integer".to_string(),
+        DataType::Int64 | DataType::UInt64 | DataType::Duration(_) => "bigint".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "text".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => format!("decimal({precision}, {scale})"),
+        DataType::Timestamp(_, Some(_)) => "timestamp_with_timezone_text".to_string(),
+        DataType::Timestamp(_, None) => "timestamp_text".to_string(),
+        DataType::Date32 | DataType::Date64 => "date_text".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time_text".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "blob".to_string(),
+        DataType::FixedSizeBinary(num_bytes) => format!("blob({num_bytes})"),
+        other => {
+            return Err(Error::UnsupportedSchemaEvolutionType {
+                data_type: other.to_string(),
+            });
+        }
+    };
+    Ok(ddl)
 }
 
 register_data_accelerator!(Engine::Sqlite, SqliteAccelerator);

@@ -32,6 +32,7 @@ use arrow::{
 };
 use async_trait::async_trait;
 
+use super::config::SchemaEvolutionPolicy;
 use super::pgoutput::{Relation, TupleData, Value};
 use super::{PgOutputDecodeSnafu, Result};
 use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
@@ -125,10 +126,19 @@ impl TransactionBuffer {
 /// schemas. Downstream consumers cast back to the accelerator's nullability
 /// via `SchemaCastScanExec`, so the accelerator's stricter constraints still
 /// apply on write.
+///
+/// **Missing columns:** when `policy` adopts schema changes
+/// (`append_new_columns` / `sync_all_columns`), a *nullable* dataset column
+/// absent from `relation` is null-filled instead of erroring — required for
+/// replaying pre-evolution WAL after restart-time schema evolution widened the
+/// dataset schema (the old `Relation` lacks the added column). A non-nullable
+/// absent column is always an error. With `block`/`fail` the legacy hard
+/// error is kept verbatim.
 pub fn build_change_batch(
     dataset_schema: &SchemaRef,
     relation: &Relation,
     changes: &[DecodedChange],
+    policy: SchemaEvolutionPolicy,
 ) -> Result<ChangeBatch> {
     let num_rows = changes.len();
     // Use a nullable-everywhere version of the schema for the ChangeBatch
@@ -155,23 +165,40 @@ pub fn build_change_batch(
         .collect::<Result<Vec<_>>>()?;
 
     // Precompute dataset_field_idx → relation_column_idx once per batch so the
-    // hot path is O(rows × fields) rather than O(rows × fields²).
-    let column_map: Vec<usize> = dataset_schema
+    // hot path is O(rows × fields) rather than O(rows × fields²). `None` means
+    // the (nullable, adoption-policy) column is absent from the relation and is
+    // null-filled — pre-evolution WAL replay.
+    let column_map: Vec<Option<usize>> = dataset_schema
         .fields()
         .iter()
         .map(|field| {
-            relation
+            match relation
                 .columns
                 .iter()
                 .position(|c| c.name == *field.name())
-                .ok_or_else(|| super::Error::SchemaMismatch {
+            {
+                Some(idx) => Ok(Some(idx)),
+                None if policy.adopts_changes() && field.is_nullable() => Ok(None),
+                None if policy.adopts_changes() => Err(super::Error::SchemaMismatch {
+                    message: format!(
+                        "non-nullable dataset column `{}` is missing from source relation {}.{}. \
+                         Pre-evolution WAL messages can only be replayed for nullable columns. \
+                         To recover: re-add the column on the source, or remove the dataset's \
+                         acceleration data and restart so the dataset re-registers with the new schema",
+                        field.name(),
+                        relation.namespace,
+                        relation.name
+                    ),
+                }),
+                None => Err(super::Error::SchemaMismatch {
                     message: format!(
                         "dataset column {} not present in source relation {}.{}",
                         field.name(),
                         relation.namespace,
                         relation.name
                     ),
-                })
+                }),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -184,8 +211,10 @@ pub fn build_change_batch(
             }
         })?);
 
-        for (col_idx, &source_idx) in column_map.iter().enumerate() {
-            let value = change.row.columns.get(source_idx).and_then(Option::as_ref);
+        for (col_idx, source_idx) in column_map.iter().enumerate() {
+            let value = source_idx
+                .and_then(|idx| change.row.columns.get(idx))
+                .and_then(Option::as_ref);
             data_builders[col_idx].append(value, change.op)?;
         }
     }
@@ -815,6 +844,21 @@ mod tests {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
+    /// Legacy-signature wrapper shadowing the glob import: tests written
+    /// before the policy parameter run with `Block` (today's behavior).
+    fn build_change_batch(
+        dataset_schema: &SchemaRef,
+        relation: &Relation,
+        changes: &[DecodedChange],
+    ) -> Result<ChangeBatch> {
+        super::build_change_batch(
+            dataset_schema,
+            relation,
+            changes,
+            SchemaEvolutionPolicy::Block,
+        )
+    }
+
     #[test]
     fn lsn_committer_supports_deferral() {
         // The Postgres replication slot retains WAL until `confirmed_flush`
@@ -1383,6 +1427,83 @@ mod tests {
             msg.contains("REPLICA IDENTITY FULL"),
             "unexpected error: {msg}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Schema-evolution: pre-evolution WAL replay (relation missing a dataset
+    // column) must null-fill nullable columns under an adopting policy.
+    // ---------------------------------------------------------------------
+
+    /// Dataset schema widened by restart-time evolution: `age` was added on
+    /// the source after the replayed WAL was written, so the (old) relation
+    /// lacks it.
+    fn evolved_users_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ]))
+    }
+
+    #[test]
+    fn pre_evolution_replay_null_fills_nullable_absent_column() {
+        let schema = evolved_users_schema();
+        let batch = super::build_change_batch(
+            &schema,
+            &make_relation(), // only (id, name)
+            &[insert_change("1", Some("Alice"))],
+            SchemaEvolutionPolicy::AppendNewColumns,
+        )
+        .expect("pre-evolution relation replay must null-fill the added nullable column");
+        let data = batch.record.column_by_name("data").expect("data");
+        let data = data.as_struct();
+        assert_eq!(
+            data.column_by_name("id")
+                .expect("id")
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .value(0),
+            1
+        );
+        let age = data
+            .column_by_name("age")
+            .expect("age column must exist in the wider data struct")
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(age.is_null(0), "absent column must be null-filled");
+    }
+
+    #[test]
+    fn pre_evolution_replay_under_block_keeps_hard_error() {
+        let schema = evolved_users_schema();
+        let err = super::build_change_batch(
+            &schema,
+            &make_relation(),
+            &[insert_change("1", Some("Alice"))],
+            SchemaEvolutionPolicy::Block,
+        )
+        .expect_err("block must keep the legacy hard schema-mismatch error");
+        assert!(
+            err.to_string().contains("not present in source relation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn non_nullable_absent_column_errors_with_actionable_message() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("created_at", DataType::Utf8, false), // NOT NULL
+        ]));
+        let err = super::build_change_batch(
+            &schema,
+            &make_relation(),
+            &[insert_change("1", Some("Alice"))],
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .expect_err("non-nullable absent column must error");
+        let msg = err.to_string();
+        assert!(msg.contains("`created_at`"), "must name the column: {msg}");
+        assert!(msg.contains("To recover"), "must name the recovery: {msg}");
     }
 
     #[test]

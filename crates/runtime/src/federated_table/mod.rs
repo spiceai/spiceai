@@ -35,6 +35,7 @@ use std::sync::{
 use crate::datafusion::table_provider_with_spicepod_metadata;
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
+use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use datafusion::catalog::TableProvider;
 use datafusion::common::DataFusionError;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
@@ -43,9 +44,14 @@ use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::{Dataset, OnSchemaChange, acceleration::RefreshMode},
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
     dataconnector::{DataConnector, DataConnectorError},
+    schema_evolution::{
+        SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED, dataset_constraint_columns,
+        engine_supports_in_place_evolution, evolution_allowed, schema_evolution_labels,
+        widening_plan_kind,
+    },
     tracers::OnceTracer,
     warn_once,
 };
@@ -133,6 +139,10 @@ pub struct DeferredTableProvider {
     resolved_unavailable: AtomicBool,
     schema: SchemaRef,
     dataset_name: String,
+    /// Set when `on_schema_change: fail` deferred this provider because of a
+    /// detected source schema change; holds the actionable message that the
+    /// registration path surfaces as the dataset's error status.
+    schema_change_failure: Option<String>,
 }
 
 /// Indicates why [`FederatedTable::try_wait_table_provider`] could not return a
@@ -189,7 +199,13 @@ impl FederatedTable {
 
         let federated_schema = table_provider.schema();
 
-        if schema_difference(&accelerated_schema, &federated_schema).is_some() {
+        if schema_difference(&accelerated_schema, &federated_schema).is_none() {
+            return Self::new_unchecked(table_provider);
+        }
+
+        if dataset.on_schema_change == OnSchemaChange::Block {
+            // `on_schema_change: block` (default): today's behavior verbatim — defer
+            // with the checkpoint schema, retrying the source until it matches.
             return Self::Deferred(Self::new_deferred_with_schema(
                 Arc::clone(&dataset),
                 data_connector,
@@ -198,7 +214,197 @@ impl FederatedTable {
             ));
         }
 
-        Self::new_unchecked(table_provider)
+        Self::new_with_schema_change_policy(
+            dataset,
+            table_provider,
+            data_connector,
+            shutdown_token,
+            accelerated_schema,
+        )
+    }
+
+    /// Applies the dataset's non-`block` `on_schema_change` policy to a detected
+    /// difference between the acceleration checkpoint schema and the source schema.
+    ///
+    /// A widening change inside the policy's evolution set registers Immediately
+    /// with the new source provider — a Deferred provider would report the OLD
+    /// schema and hide the change from the registration path that applies the
+    /// engine evolution. Everything else is block-equivalent (Deferred + loud
+    /// warn), and `fail` additionally records the actionable message for the
+    /// dataset's error status while keeping the deferred retry so a source
+    /// revert self-heals.
+    fn new_with_schema_change_policy(
+        dataset: Arc<Dataset>,
+        table_provider: Arc<dyn TableProvider>,
+        data_connector: Arc<dyn DataConnector>,
+        shutdown_token: CancellationToken,
+        accelerated_schema: SchemaRef,
+    ) -> Self {
+        let policy = dataset.on_schema_change;
+        let federated_schema = table_provider.schema();
+        let constraint_columns =
+            dataset_constraint_columns(&dataset, table_provider.constraints(), &federated_schema);
+        let ctx = EvolutionContext {
+            constraint_columns: &constraint_columns,
+        };
+        let dataset_name = dataset.name.to_string();
+        let acceleration = dataset.acceleration.as_ref();
+        let refresh_mode =
+            data_connector.resolve_refresh_mode(acceleration.and_then(|a| a.refresh_mode));
+        let engine = acceleration.map(|a| a.engine);
+
+        match schema_evolution::classify(&accelerated_schema, &federated_schema, &ctx) {
+            SchemaEvolution::Identical => Self::new_unchecked(table_provider),
+            SchemaEvolution::Widening(plan) => {
+                let kind = widening_plan_kind(&plan);
+                let change = plan.describe();
+                if !evolution_allowed(&policy, &plan) {
+                    if policy == OnSchemaChange::Fail {
+                        return Self::deferred_schema_change_failure(
+                            dataset,
+                            data_connector,
+                            accelerated_schema,
+                            shutdown_token,
+                            kind,
+                            &change,
+                        );
+                    }
+                    SCHEMA_EVOLUTION_DETECTED
+                        .add(1, &schema_evolution_labels(&dataset_name, kind, "startup"));
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Schema change detected ({change}), but `on_schema_change: {policy}` only evolves added columns. Serving the existing acceleration and retrying the source; revert the change or set `on_schema_change: sync_all_columns` to evolve it",
+                    );
+                    return Self::Deferred(Self::new_deferred_with_schema(
+                        Arc::clone(&dataset),
+                        data_connector,
+                        accelerated_schema,
+                        shutdown_token,
+                    ));
+                }
+                if refresh_mode == RefreshMode::Caching {
+                    SCHEMA_EVOLUTION_DETECTED
+                        .add(1, &schema_evolution_labels(&dataset_name, kind, "startup"));
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "caching_mode"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Schema change detected ({change}), but `refresh_mode: caching` does not support in-place schema evolution. Serving the existing acceleration; delete the acceleration data to adopt the new schema",
+                    );
+                    return Self::Deferred(Self::new_deferred_with_schema(
+                        Arc::clone(&dataset),
+                        data_connector,
+                        accelerated_schema,
+                        shutdown_token,
+                    ));
+                }
+                if !engine.is_some_and(engine_supports_in_place_evolution) {
+                    SCHEMA_EVOLUTION_DETECTED
+                        .add(1, &schema_evolution_labels(&dataset_name, kind, "startup"));
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "engine_unsupported"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Schema change detected ({change}), but the '{engine}' acceleration engine does not support in-place schema evolution. Serving the existing acceleration and retrying the source until its schema matches",
+                        engine = engine.map(|e| e.to_string()).unwrap_or_default(),
+                    );
+                    return Self::Deferred(Self::new_deferred_with_schema(
+                        Arc::clone(&dataset),
+                        data_connector,
+                        accelerated_schema,
+                        shutdown_token,
+                    ));
+                }
+                // Detection + applied metrics for this path are emitted by
+                // `handle_schema_difference`, which re-classifies with the same
+                // classifier and applies the engine evolution at registration.
+                tracing::info!(
+                    dataset = %dataset.name,
+                    "Widening schema change detected ({change}); registering with the new source schema for in-place evolution",
+                );
+                Self::new_unchecked(table_provider)
+            }
+            SchemaEvolution::Incompatible { reason } => {
+                if policy == OnSchemaChange::Fail {
+                    return Self::deferred_schema_change_failure(
+                        dataset,
+                        data_connector,
+                        accelerated_schema,
+                        shutdown_token,
+                        "incompatible",
+                        &reason,
+                    );
+                }
+                SCHEMA_EVOLUTION_DETECTED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, "incompatible", "startup"),
+                );
+                SCHEMA_EVOLUTION_FAILED.add(
+                    1,
+                    &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
+                );
+                tracing::warn!(
+                    dataset = %dataset.name,
+                    "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}. Serving the existing acceleration and retrying the source; revert the source schema change to recover",
+                );
+                Self::Deferred(Self::new_deferred_with_schema(
+                    Arc::clone(&dataset),
+                    data_connector,
+                    accelerated_schema,
+                    shutdown_token,
+                ))
+            }
+        }
+    }
+
+    /// `on_schema_change: fail`: defer with the checkpoint schema (so a source
+    /// revert self-heals through the retry loop) and record the actionable
+    /// message for the registration path to surface as the dataset status.
+    fn deferred_schema_change_failure(
+        dataset: Arc<Dataset>,
+        data_connector: Arc<dyn DataConnector>,
+        accelerated_schema: SchemaRef,
+        shutdown_token: CancellationToken,
+        kind: &'static str,
+        change: &str,
+    ) -> Self {
+        let dataset_name = dataset.name.to_string();
+        SCHEMA_EVOLUTION_DETECTED.add(1, &schema_evolution_labels(&dataset_name, kind, "startup"));
+        SCHEMA_EVOLUTION_FAILED.add(
+            1,
+            &schema_evolution_labels(&dataset_name, kind, "fail_policy"),
+        );
+        let message = format!(
+            "A schema change was detected for {dataset_name} ({change}), and `on_schema_change: fail` is set. The existing acceleration continues to serve the previous schema. Revert the source schema change to recover, or set `on_schema_change` to `append_new_columns` or `sync_all_columns` to evolve the schema."
+        );
+        tracing::error!(dataset = %dataset.name, "{message}");
+        let mut deferred = Self::new_deferred_with_schema(
+            dataset,
+            data_connector,
+            accelerated_schema,
+            shutdown_token,
+        );
+        deferred.schema_change_failure = Some(message);
+        Self::Deferred(deferred)
+    }
+
+    /// When `on_schema_change: fail` deferred the provider because of a detected
+    /// source schema change, returns the actionable message so the registration
+    /// path can surface it as the dataset's error status.
+    #[must_use]
+    pub fn schema_change_failure(&self) -> Option<&str> {
+        match self {
+            Self::Immediate(_) => None,
+            Self::Deferred(deferred) => deferred.schema_change_failure.as_deref(),
+        }
     }
 
     /// If the table provider is not available immediately and this is an accelerated table with a previous acceleration checkpoint,
@@ -408,6 +614,7 @@ impl FederatedTable {
             table: OnceLock::new(),
             resolved_unavailable: AtomicBool::new(false),
             dataset_name: dataset_name_str,
+            schema_change_failure: None,
         }
     }
 

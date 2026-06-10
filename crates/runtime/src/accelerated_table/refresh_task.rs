@@ -22,7 +22,7 @@ use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::caching::CacheRefreshHelper;
 use crate::accelerated_table::retention;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
-use crate::component::dataset::TimeFormat;
+use crate::component::dataset::{OnSchemaChange, TimeFormat};
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{
     SpiceExternalError, find_datafusion_root, format_datafusion_error, get_spice_df_error,
@@ -44,8 +44,10 @@ use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
     array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
+    error::ArrowError,
 };
 use arrow_schema::SchemaRef;
+use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan, classify};
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
 use data_components::{
@@ -89,7 +91,11 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
-use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, LazyLock},
+    time::SystemTime,
+};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
@@ -108,6 +114,18 @@ const NANOS_TO_MILLIS: u128 = 1_000_000;
 // Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
 type StreamBatchProcessCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
+
+// Shared-by-name with the other schema-evolution emit sites; the instrument identity
+// (name + description) must stay in sync with them.
+static SCHEMA_EVOLUTION_FAILED: LazyLock<opentelemetry::metrics::Counter<u64>> =
+    LazyLock::new(|| {
+        opentelemetry::global::meter("dataset_acceleration")
+            .u64_counter("schema_evolution_failed")
+            .with_description(
+                "Number of dataset schema changes that could not be applied to the acceleration.",
+            )
+            .build()
+    });
 
 fn table_provider_with_existing_metadata(
     provider: Arc<dyn TableProvider>,
@@ -276,6 +294,9 @@ pub struct RefreshTaskBuilder {
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// The dataset's `on_schema_change` policy, used to shape schema-mismatch
+    /// refresh errors. Defaults to [`OnSchemaChange::Block`].
+    on_schema_change: OnSchemaChange,
 }
 
 impl RefreshTaskBuilder {
@@ -307,6 +328,7 @@ impl RefreshTaskBuilder {
             initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
+            on_schema_change: OnSchemaChange::default(),
         }
     }
 
@@ -385,6 +407,14 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Sets the dataset's `on_schema_change` policy so schema-mismatch refresh
+    /// errors can name the active policy and the matching remedy.
+    #[must_use]
+    pub fn with_on_schema_change(mut self, on_schema_change: OnSchemaChange) -> RefreshTaskBuilder {
+        self.on_schema_change = on_schema_change;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -441,6 +471,7 @@ impl RefreshTaskBuilder {
             initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
+            on_schema_change: self.on_schema_change,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -471,6 +502,9 @@ pub struct RefreshTask {
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// The dataset's `on_schema_change` policy, used to shape schema-mismatch
+    /// refresh errors.
+    on_schema_change: OnSchemaChange,
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
 }
@@ -1185,11 +1219,30 @@ impl RefreshTask {
         // the snapshot metadata's recorded schema **before** the file is
         // downloaded or renamed. This guarantees a schema-incompatible
         // snapshot can never overwrite the accelerator's primary file.
+        // The gate stays strict even for widening-compatible snapshots: a
+        // narrower (pre-evolution) provider swapped under the wider cached
+        // schema would receive projection indices computed against the wider
+        // schema. On rejection the mismatch is classified so the dataset
+        // status names what changed and the remedy.
         let live_schema = state.swappable_provider.schema();
         let live_schema_for_validate = Arc::clone(&live_schema);
+        let mismatch_detail: Arc<std::sync::Mutex<Option<(&'static str, String)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let mismatch_detail_for_validate = Arc::clone(&mismatch_detail);
         let validator: Box<dyn Fn(&arrow_schema::SchemaRef) -> bool + Send + Sync> =
             Box::new(move |candidate: &arrow_schema::SchemaRef| {
-                schemas_compatible(candidate.as_ref(), live_schema_for_validate.as_ref())
+                let compatible =
+                    schemas_compatible(candidate.as_ref(), live_schema_for_validate.as_ref());
+                if !compatible {
+                    *mismatch_detail_for_validate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(snapshot_schema_mismatch_detail(
+                            candidate.as_ref(),
+                            live_schema_for_validate.as_ref(),
+                        ));
+                }
+                compatible
             });
         let download_result = state
             .manager
@@ -1237,18 +1290,45 @@ impl RefreshTask {
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!(
-                    dataset = %self.dataset_name,
-                    error = %e,
-                    "refresh_mode: snapshot - failed to check/download snapshot"
-                );
-                self.set_refresh_status(
-                    None,
-                    status::ComponentStatus::error_with_message(
-                        "snapshot refresh failure".to_string(),
-                    ),
-                )
-                .await;
+                let schema_mismatch = mismatch_detail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((kind, detail)) = schema_mismatch {
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &[
+                            KeyValue::new("dataset", self.dataset_name.to_string()),
+                            KeyValue::new("kind", kind),
+                            KeyValue::new("action", "snapshot_refresh_rejected"),
+                        ],
+                    );
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        error = %e,
+                        "refresh_mode: snapshot - rejected snapshot before download: {detail}"
+                    );
+                    self.set_refresh_status(
+                        None,
+                        status::ComponentStatus::error_with_message(format!(
+                            "snapshot schema mismatch: {detail}"
+                        )),
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(
+                        dataset = %self.dataset_name,
+                        error = %e,
+                        "refresh_mode: snapshot - failed to check/download snapshot"
+                    );
+                    self.set_refresh_status(
+                        None,
+                        status::ComponentStatus::error_with_message(
+                            "snapshot refresh failure".to_string(),
+                        ),
+                    )
+                    .await;
+                }
                 return Err(RetryError::transient(
                     super::Error::FailedToRefreshDataset {
                         source: datafusion::error::DataFusionError::External(Box::new(e)),
@@ -1265,15 +1345,27 @@ impl RefreshTask {
         // here, but `reload_from_snapshot` is gated below — and a
         // schema-mismatch returned here is treated as permanent.
         if !schemas_compatible(info.schema.as_ref(), live_schema.as_ref()) {
+            let (kind, detail) =
+                snapshot_schema_mismatch_detail(info.schema.as_ref(), live_schema.as_ref());
+            SCHEMA_EVOLUTION_FAILED.add(
+                1,
+                &[
+                    KeyValue::new("dataset", self.dataset_name.to_string()),
+                    KeyValue::new("kind", kind),
+                    KeyValue::new("action", "snapshot_refresh_rejected"),
+                ],
+            );
             tracing::error!(
                 dataset = %self.dataset_name,
                 snapshot_id = info.snapshot_id,
                 "refresh_mode: snapshot - downloaded snapshot schema does not match \
-                 accelerator schema; refusing to swap"
+                 accelerator schema; refusing to swap: {detail}"
             );
             self.set_refresh_status(
                 None,
-                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+                status::ComponentStatus::error_with_message(format!(
+                    "snapshot schema mismatch: {detail}"
+                )),
             )
             .await;
             return Err(RetryError::permanent(
@@ -1321,15 +1413,29 @@ impl RefreshTask {
         };
 
         if !schemas_compatible(new_provider.schema().as_ref(), live_schema.as_ref()) {
+            let (kind, detail) = snapshot_schema_mismatch_detail(
+                new_provider.schema().as_ref(),
+                live_schema.as_ref(),
+            );
+            SCHEMA_EVOLUTION_FAILED.add(
+                1,
+                &[
+                    KeyValue::new("dataset", self.dataset_name.to_string()),
+                    KeyValue::new("kind", kind),
+                    KeyValue::new("action", "snapshot_swap_rejected"),
+                ],
+            );
             tracing::error!(
                 dataset = %self.dataset_name,
                 snapshot_id = info.snapshot_id,
                 "refresh_mode: snapshot - reloaded provider schema does not match accelerator \
-                 schema; refusing to swap"
+                 schema; refusing to swap: {detail}"
             );
             self.set_refresh_status(
                 None,
-                status::ComponentStatus::error_with_message("snapshot refresh failure".to_string()),
+                status::ComponentStatus::error_with_message(format!(
+                    "snapshot schema mismatch: {detail}"
+                )),
             )
             .await;
             return Err(RetryError::permanent(
@@ -2160,7 +2266,16 @@ impl RefreshTask {
             self.component_type(),
             &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
             error,
+            self.on_schema_change,
         ) {
+            SCHEMA_EVOLUTION_FAILED.add(
+                1,
+                &[
+                    KeyValue::new("dataset", self.dataset_name.to_string()),
+                    KeyValue::new("kind", "incompatible"),
+                    KeyValue::new("action", "refresh_write_rejected"),
+                ],
+            );
             tracing::warn!("{message}");
             self.set_refresh_status(
                 refresh_sql,
@@ -2211,6 +2326,71 @@ impl RefreshTask {
 /// the unqualified name.
 fn schemas_compatible(candidate: &arrow_schema::Schema, expected: &arrow_schema::Schema) -> bool {
     crate::dataaccelerator::swappable::schemas_compatible(candidate, expected)
+}
+
+/// The metric `kind` label for a widening plan, per the
+/// `schema_evolution_*{kind=...}` counter convention.
+fn widening_plan_kind(plan: &WideningPlan) -> &'static str {
+    if !plan.widened_columns.is_empty() {
+        "widened_types"
+    } else if !plan.relaxed_nullability.is_empty() {
+        "nullability"
+    } else {
+        "added_columns"
+    }
+}
+
+/// Classifies a rejected snapshot schema against the live accelerator schema and
+/// returns a (`metric kind`, actionable message) pair naming what changed, in which
+/// direction, and the remedy.
+fn snapshot_schema_mismatch_detail(
+    snapshot_schema: &arrow_schema::Schema,
+    live_schema: &arrow_schema::Schema,
+) -> (&'static str, String) {
+    let ctx = EvolutionContext {
+        constraint_columns: &[],
+    };
+    match classify(snapshot_schema, live_schema, &ctx) {
+        SchemaEvolution::Identical => (
+            "incompatible",
+            "the snapshot schema differs from the running dataset schema in field order or \
+             nullability only; recreate the snapshot from the current dataset"
+                .to_string(),
+        ),
+        SchemaEvolution::Widening(plan) => (
+            widening_plan_kind(&plan),
+            format!(
+                "the snapshot predates a widening schema change to this dataset ({}); \
+                 refresh_mode: snapshot cannot load a pre-evolution snapshot into the evolved \
+                 table - recreate the snapshot from the evolved dataset",
+                plan.describe()
+            ),
+        ),
+        SchemaEvolution::Incompatible { .. } => match classify(live_schema, snapshot_schema, &ctx) {
+            SchemaEvolution::Widening(plan) => (
+                widening_plan_kind(&plan),
+                format!(
+                    "the snapshot was created after a widening schema change ({}); delete the \
+                     local acceleration data and restart Spice to re-bootstrap from this snapshot",
+                    plan.describe()
+                ),
+            ),
+            SchemaEvolution::Incompatible { reason } => (
+                "incompatible",
+                format!(
+                    "the snapshot schema is incompatible with the running dataset schema: \
+                     {reason}. Delete the existing snapshots and recreate them from the current \
+                     dataset"
+                ),
+            ),
+            SchemaEvolution::Identical => (
+                "incompatible",
+                "the snapshot schema differs from the running dataset schema in field order or \
+                 nullability only; recreate the snapshot from the current dataset"
+                    .to_string(),
+            ),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -2380,6 +2560,30 @@ fn include_source_to_table_name(name: &TableReference, source: Option<&str>) -> 
     }
 }
 
+/// `StructArray::from` panics when a column's data type does not match the filter
+/// schema field (e.g. a source type widening between the accelerated rows and the
+/// incoming update); surface it as a proper refresh error instead.
+fn ensure_dedup_column_type(
+    name: &str,
+    expected: &DataType,
+    actual: &DataType,
+) -> super::Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(ArrowError::SchemaError(format!(
+        "column `{name}` type mismatch during append de-duplication: the update stream has \
+         `{expected}` but the rows being compared hold `{actual}`; this typically follows a \
+         source schema type change - restart Spice so the acceleration schema is re-evaluated \
+         (see `on_schema_change`)"
+    )))
+    .context(super::FailedToFilterUpdatesSnafu)
+}
+
+/// Post-evolution duplicate window: after a widening schema evolution adds a column,
+/// stored rows are NULL-backfilled while the source re-emits them with real values in
+/// the new column - those rows compare unequal here and are appended once more for
+/// the overlap window. This is a documented one-time effect, not a defect.
 fn filter_records(
     update_data: &RecordBatch,
     existing_records: &Vec<RecordBatch>,
@@ -2397,7 +2601,9 @@ fn filter_records(
                     .schema()
                     .index_of(field.name())
                     .context(super::FailedToFilterUpdatesSnafu)?;
-                Ok((Arc::clone(field), update_data.column(column_idx).to_owned()))
+                let column = update_data.column(column_idx);
+                ensure_dedup_column_type(field.name(), field.data_type(), column.data_type())?;
+                Ok((Arc::clone(field), Arc::clone(column)))
             })
             .collect::<Result<Vec<_>, super::Error>>()?,
     );
@@ -2412,7 +2618,9 @@ fn filter_records(
                         .schema()
                         .index_of(field.name())
                         .context(super::FailedToFilterUpdatesSnafu)?;
-                    Ok((Arc::clone(field), existing.column(column_idx).to_owned()))
+                    let column = existing.column(column_idx);
+                    ensure_dedup_column_type(field.name(), field.data_type(), column.data_type())?;
+                    Ok((Arc::clone(field), Arc::clone(column)))
                 })
                 .collect::<Result<Vec<_>, super::Error>>()?,
         );
@@ -2482,6 +2690,7 @@ fn schema_evolution_mismatch_refresh_message(
     component_type: &str,
     table_name: &str,
     error: &super::Error,
+    on_schema_change: OnSchemaChange,
 ) -> Option<String> {
     let (super::Error::FailedToWriteData { source }
     | super::Error::FailedToRefreshDataset { source }) = error
@@ -2493,9 +2702,20 @@ fn schema_evolution_mismatch_refresh_message(
         return None;
     }
 
-    Some(format!(
-        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; fully featured schema evolution is on the roadmap, and acceleration does not apply this schema evolution automatically today; delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
-    ))
+    Some(match on_schema_change {
+        OnSchemaChange::Block => format!(
+            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; `on_schema_change` is not configured (default `block`), so acceleration does not apply schema changes automatically. Set `on_schema_change: append_new_columns` or `sync_all_columns` to evolve widening changes, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+        ),
+        OnSchemaChange::Fail => format!(
+            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: fail` surfaces schema changes as errors without applying them. Revert the source schema change, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+        ),
+        OnSchemaChange::AppendNewColumns => format!(
+            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: append_new_columns` evolves only added nullable columns at startup, so this change was not evolved. Restart Spice to apply a pending column addition, use `sync_all_columns` for lossless type widening, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+        ),
+        OnSchemaChange::SyncAllColumns => format!(
+            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: sync_all_columns` evolves only lossless widening changes (added nullable columns, type widening, nullability relaxing) at startup, so this change was not evolved. Restart Spice to apply a pending widening change, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -2656,11 +2876,60 @@ mod tests {
             ),
         };
 
-        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
-            .expect("should detect schema mismatch");
+        let message = schema_evolution_mismatch_refresh_message(
+            "dataset",
+            "nation",
+            &error,
+            OnSchemaChange::Block,
+        )
+        .expect("should detect schema mismatch");
         assert!(message.contains("schema mismatch"));
-        assert!(message.contains("on the roadmap"));
+        assert!(message.contains("`on_schema_change` is not configured (default `block`)"));
+        assert!(message.contains("append_new_columns"));
         assert!(message.contains("delete the existing acceleration data"));
+    }
+
+    #[test]
+    fn test_schema_evolution_mismatch_refresh_message_policy_set() {
+        let error = super::super::Error::FailedToWriteData {
+            source: DataFusionError::Execution(
+                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
+            ),
+        };
+
+        let message = schema_evolution_mismatch_refresh_message(
+            "dataset",
+            "nation",
+            &error,
+            OnSchemaChange::SyncAllColumns,
+        )
+        .expect("should detect schema mismatch");
+        assert!(message.contains("`on_schema_change: sync_all_columns`"));
+        assert!(message.contains("this change was not evolved"));
+        assert!(
+            message.contains("Expected table schema length: 4, got: 5"),
+            "the message should name what changed: {message}"
+        );
+        assert!(message.contains("Restart Spice"));
+
+        let message = schema_evolution_mismatch_refresh_message(
+            "dataset",
+            "nation",
+            &error,
+            OnSchemaChange::AppendNewColumns,
+        )
+        .expect("should detect schema mismatch");
+        assert!(message.contains("`on_schema_change: append_new_columns`"));
+        assert!(message.contains("only added nullable columns"));
+
+        let message = schema_evolution_mismatch_refresh_message(
+            "dataset",
+            "nation",
+            &error,
+            OnSchemaChange::Fail,
+        )
+        .expect("should detect schema mismatch");
+        assert!(message.contains("`on_schema_change: fail`"));
     }
 
     #[test]
@@ -2669,7 +2938,72 @@ mod tests {
             source: DataFusionError::Execution("other failure".to_string()),
         };
 
-        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+        assert!(
+            schema_evolution_mismatch_refresh_message(
+                "dataset",
+                "nation",
+                &error,
+                OnSchemaChange::Block
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_schema_mismatch_detail_directions() {
+        let narrow = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let wide = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+
+        // Snapshot older/narrower than the live schema.
+        let (kind, detail) = snapshot_schema_mismatch_detail(&narrow, &wide);
+        assert_eq!(kind, "added_columns");
+        assert!(
+            detail.contains("predates a widening schema change"),
+            "{detail}"
+        );
+        assert!(detail.contains("b"), "{detail}");
+
+        // Snapshot newer/wider than the live schema.
+        let (kind, detail) = snapshot_schema_mismatch_detail(&wide, &narrow);
+        assert_eq!(kind, "added_columns");
+        assert!(
+            detail.contains("created after a widening schema change"),
+            "{detail}"
+        );
+
+        // Unrelated schemas.
+        let other = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
+        let (kind, detail) = snapshot_schema_mismatch_detail(&other, &narrow);
+        assert_eq!(kind, "incompatible");
+        assert!(detail.contains("incompatible"), "{detail}");
+    }
+
+    #[test]
+    fn test_filter_records_type_mismatch_is_error_not_panic() {
+        let update_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&update_schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+        )
+        .expect("update batch should be created");
+
+        // Existing accelerated rows still hold the pre-widening Int32 type.
+        let existing_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let existing_batch = RecordBatch::try_new(
+            existing_schema,
+            vec![Arc::new(Int32Array::from(vec![1_i32]))],
+        )
+        .expect("existing batch should be created");
+        let existing_records = vec![existing_batch];
+
+        let err = filter_records(&update_batch, &existing_records, &update_schema)
+            .expect_err("dtype mismatch must be an error, not a panic");
+        let message = err.to_string();
+        assert!(message.contains("`id`"), "{message}");
+        assert!(message.contains("type mismatch"), "{message}");
     }
 
     #[tokio::test]

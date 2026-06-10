@@ -24,7 +24,7 @@ use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_cont
 use common::{
     get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
     make_mongodb_change_stream_dataset_inferred, make_mongodb_extended_inference_dataset,
-    start_mongodb_replica_set_docker_container,
+    make_mongodb_widen_dataset, start_mongodb_replica_set_docker_container,
 };
 #[cfg(feature = "duckdb")]
 use datafusion::assert_batches_eq;
@@ -53,6 +53,8 @@ const MONGODB_CHANGE_STREAM_PORT: u16 = 27020;
 const MONGODB_CHANGE_STREAM_INFERENCE_PORT: u16 = 27035;
 #[cfg(feature = "duckdb")]
 const MONGODB_INFERENCE_PORT: u16 = 27036;
+#[cfg(feature = "duckdb")]
+const MONGODB_WIDEN_PORT: u16 = 27037;
 
 #[instrument]
 async fn init_mongodb_db(port: u16) -> Result<(), anyhow::Error> {
@@ -549,6 +551,130 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
             rt.shutdown().await;
             running_container.remove().await?;
 
+            Ok(())
+        })
+        .await
+}
+
+/// Seed the `widen` collection with two documents carrying only `{_id, name}`,
+/// then (when `with_country`) add a third document that also has a `country`
+/// field — the additive change the restart re-infers and evolves.
+#[cfg(feature = "duckdb")]
+async fn seed_mongodb_widen_collection(port: u16, with_country: bool) -> Result<(), anyhow::Error> {
+    let client = get_mongodb_client(port).await?;
+    let database = client.database("testdb");
+    if with_country {
+        let collection: Collection<mongodb::bson::Document> = database.collection("widen");
+        collection
+            .insert_one(doc! { "_id": 3, "name": "Carlos", "country": "Canada" })
+            .await?;
+    } else {
+        let _ = database
+            .collection::<mongodb::bson::Document>("widen")
+            .drop()
+            .await;
+        let collection: Collection<mongodb::bson::Document> = database.collection("widen");
+        collection
+            .insert_many(vec![
+                doc! { "_id": 1, "name": "Alice" },
+                doc! { "_id": 2, "name": "Bob" },
+            ])
+            .await?;
+    }
+    Ok(())
+}
+
+/// Builds and loads a runtime for the `MongoDB` widening dataset (file-backed
+/// `DuckDB` so the acceleration survives the restart). Re-registers connectors
+/// each call since a prior `shutdown()` clears them.
+#[cfg(feature = "duckdb")]
+async fn build_mongodb_widen_runtime(duckdb_file: &str) -> Result<Arc<Runtime>, anyhow::Error> {
+    register_test_connectors().await;
+    let app = AppBuilder::new("mongodb_schema_evolution_widening")
+        .with_dataset(make_mongodb_widen_dataset(
+            "widen",
+            "widen",
+            MONGODB_WIDEN_PORT,
+            duckdb_file,
+        ))
+        .build();
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for MongoDB widening dataset to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    crate::utils::runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+/// Restart-time widening for a `MongoDB` source: a `country` field that appears in
+/// newly inserted documents is re-inferred on restart and adopted into the
+/// file-backed `DuckDB` acceleration under `on_schema_change: sync_all_columns`
+/// (additive widening), instead of the dataset deferring on the prior schema
+/// (the `block` default). `MongoDB` schema inference unions fields across the
+/// sampled documents, so the field surfaces as a nullable column.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,connector_mongodb=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = tempfile::tempdir()?;
+            let duckdb_file = temp_dir
+                .path()
+                .join("mongo_widen.duckdb")
+                .to_string_lossy()
+                .to_string();
+
+            let running_container = start_mongodb_docker_container(MONGODB_WIDEN_PORT).await?;
+
+            // Seed two documents with only {_id, name}.
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                seed_mongodb_widen_collection(MONGODB_WIDEN_PORT, false)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await?;
+
+            // Phase 1: initial load infers {_id, name}.
+            let rt = build_mongodb_widen_runtime(&duckdb_file).await?;
+            let batches = run_query(&rt, "SELECT _id, name FROM widen ORDER BY _id").await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 2, "expected 2 rows in the initial MongoDB load");
+            rt.shutdown().await;
+            drop(rt);
+
+            // A document carrying the new `country` field arrives.
+            seed_mongodb_widen_collection(MONGODB_WIDEN_PORT, true).await?;
+
+            // Phase 2: restart re-infers the wider schema; sync_all_columns evolves
+            // `country` into the acceleration. Under `block` this query would error
+            // (the column would not be in the registered schema).
+            let rt = build_mongodb_widen_runtime(&duckdb_file).await?;
+            let batches =
+                run_query(&rt, "SELECT _id, name, country FROM widen ORDER BY _id").await?;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 3, "expected 3 rows after the widening restart");
+            let country = run_query(
+                &rt,
+                "SELECT country FROM widen WHERE country IS NOT NULL ORDER BY _id",
+            )
+            .await?;
+            let country_rows: usize = country.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(
+                country_rows, 1,
+                "the evolved `country` column should expose the new document's value"
+            );
+            rt.shutdown().await;
+            drop(rt);
+
+            running_container.remove().await?;
             Ok(())
         })
         .await

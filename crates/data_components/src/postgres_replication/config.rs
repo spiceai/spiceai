@@ -65,6 +65,48 @@ impl std::fmt::Debug for ReplicationParams {
     }
 }
 
+/// Dataset-level `on_schema_change` policy, plumbed into the replication stream
+/// so the source layer can reconcile pgoutput `Relation` messages against the
+/// working schema. Mirrors the runtime's `OnSchemaChange` enum — this crate
+/// cannot depend on the runtime, so the connector maps between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SchemaEvolutionPolicy {
+    /// `on_schema_change: block` (or omitted): run the legacy validation
+    /// verbatim — extra source columns are silently ignored and a dataset
+    /// column missing from the relation is a hard schema-mismatch error.
+    #[default]
+    Block,
+    /// `on_schema_change: fail`: detect-and-error — any source relation schema
+    /// change stops the stream with a terminal actionable error.
+    Fail,
+    /// `on_schema_change: append_new_columns`.
+    AppendNewColumns,
+    /// `on_schema_change: sync_all_columns`.
+    SyncAllColumns,
+}
+
+impl SchemaEvolutionPolicy {
+    /// `true` for the policies that adopt widening changes at the source layer
+    /// (`append_new_columns` / `sync_all_columns`). The source adopts the full
+    /// widening set for both so wider batches reach the runtime apply loop,
+    /// which enforces the per-policy evolution set (added-only vs full).
+    #[must_use]
+    pub fn adopts_changes(self) -> bool {
+        matches!(self, Self::AppendNewColumns | Self::SyncAllColumns)
+    }
+}
+
+impl std::fmt::Display for SchemaEvolutionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Block => write!(f, "block"),
+            Self::Fail => write!(f, "fail"),
+            Self::AppendNewColumns => write!(f, "append_new_columns"),
+            Self::SyncAllColumns => write!(f, "sync_all_columns"),
+        }
+    }
+}
+
 /// SSL negotiation + certificate-verification mode. Matches the standard
 /// libpq sslmode values so users can set `pg_sslmode` with their normal
 /// Postgres vocabulary.
