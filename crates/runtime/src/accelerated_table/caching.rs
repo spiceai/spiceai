@@ -3771,7 +3771,7 @@ mod tests {
         };
 
         let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
-        let table = create_table_provider(&duckdb_factory, &external_table)
+        let table = create_table_provider(&duckdb_factory, &external_table, None)
             .await
             .expect("table should be created");
 
@@ -3865,7 +3865,7 @@ mod tests {
         };
 
         let duckdb_factory = DuckDBTableProviderFactory::new(AccessMode::ReadWrite);
-        let table = create_table_provider(&duckdb_factory, &external_table)
+        let table = create_table_provider(&duckdb_factory, &external_table, None)
             .await
             .expect("table should be created");
 
