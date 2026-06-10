@@ -708,20 +708,8 @@ impl QueryHandle {
         // explicitly propagate the dispatcher through the test future
         // (see `crates/runtime/tests/cluster/distributed_task_history.rs`).
         let span_for_record = parent_span.clone();
-        // Snapshot the active-job cache entry before spawning. The new ballista pin's
-        // `get_job_execution_graph` is `pub(crate)` and gated on the `rest-api` feature,
-        // so it is no longer reachable from this crate. `get_running_job_cache` is the
-        // public alternative — capture the `JobInfoCache` (which holds an
-        // `Arc<RwLock<ExecutionGraphBox>>`) here so the cloned RwLock stays live even
-        // after the entry is evicted by the time the spawned task runs.
-        let graph_for_record = scheduler
-            .state
-            .task_manager
-            .get_running_job_cache()
-            .get(&job_id)
-            .cloned();
         let scheduler_for_cancel = Arc::clone(&scheduler);
-        let cancel_job_id = job_id;
+        let cancel_job_id = job_id.clone();
         handle.spawn(
             async move {
                 let mut final_error = error;
@@ -773,9 +761,14 @@ impl QueryHandle {
                         }
                     }
                 }
-                let graph = graph_for_record;
-                if let Some(job_cache) = graph.as_ref() {
-                    let graph = job_cache.execution_graph.read().await;
+                let graph = scheduler
+                    .state
+                    .task_manager
+                    .get_job_execution_graph(&job_id)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(graph) = graph.as_ref() {
                     crate::datafusion::query::stage_history::record_stage_history(
                         &span_for_record,
                         &ballista_job_id,
