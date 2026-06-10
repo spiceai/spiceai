@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    pin::Pin,
-    sync::{Arc, LazyLock},
-};
+use std::{pin::Pin, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use arrow_tools::{schema_evolution::is_widening_cast, type_rewrite::normalize_dictionary_types};
@@ -34,18 +31,8 @@ use util::RetryError;
 
 use crate::{
     accelerated_table::refresh_task::retry_from_df_error, datafusion::error::find_datafusion_root,
-    dataupdate::StreamingDataUpdateExecutionPlan,
+    dataupdate::StreamingDataUpdateExecutionPlan, schema_evolution::SCHEMA_EVOLUTION_DETECTED,
 };
-
-// Shared-by-name with the other schema-evolution emit sites; the instrument identity
-// (name + description) must stay in sync with them.
-static SCHEMA_EVOLUTION_DETECTED: LazyLock<opentelemetry::metrics::Counter<u64>> =
-    LazyLock::new(|| {
-        opentelemetry::global::meter("dataset_acceleration")
-            .u64_counter("schema_evolution_detected")
-            .with_description("Number of dataset schema changes detected at acceleration surfaces.")
-            .build()
-    });
 
 /// Returns the (dropped columns, narrowed columns) that casting `input_schema` to
 /// `target_schema` would silently lose: columns present in the input but absent from

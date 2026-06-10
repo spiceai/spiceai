@@ -599,11 +599,17 @@ impl DataAccelerator for SqliteAccelerator {
                         .next()?
                         .is_some();
                     if table_exists {
-                        let existing_columns: Vec<String> = tx
-                            .prepare("SELECT name FROM pragma_table_info(?)")?
-                            .query_map([table.as_str()], |row| row.get::<_, String>(0))?
-                            .collect::<std::result::Result<Vec<_>, _>>()?;
                         let escaped_table = table.replace('"', "\"\"");
+                        // `pragma_table_info` does not reliably accept a bound
+                        // parameter across SQLite/rusqlite versions; interpolate the
+                        // escaped table name and run with no parameters (mirrors the
+                        // Turso implementation).
+                        let existing_columns: Vec<String> = tx
+                            .prepare(&format!(
+                                "SELECT name FROM pragma_table_info(\"{escaped_table}\")"
+                            ))?
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
                         for (column, ddl_type) in added_columns {
                             // Idempotent: skip columns already added by a prior
                             // (possibly interrupted) evolution.

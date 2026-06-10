@@ -91,11 +91,7 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
-use std::{
-    cmp::Ordering,
-    sync::{Arc, LazyLock},
-    time::SystemTime,
-};
+use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
@@ -109,23 +105,15 @@ use util::{RetryError, retry};
 pub(crate) mod changes;
 mod deletion;
 
+// Reuse the single shared schema-evolution instrument (defined in `changes`) rather
+// than registering a same-named counter under a second meter.
+use changes::SCHEMA_EVOLUTION_FAILED;
+
 const NANOS_TO_MILLIS: u128 = 1_000_000;
 
 // Callback which is called after each batch of streaming data is processed by the `RefreshTask`.
 type StreamBatchProcessCallback =
     Arc<Mutex<Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>>;
-
-// Shared-by-name with the other schema-evolution emit sites; the instrument identity
-// (name + description) must stay in sync with them.
-static SCHEMA_EVOLUTION_FAILED: LazyLock<opentelemetry::metrics::Counter<u64>> =
-    LazyLock::new(|| {
-        opentelemetry::global::meter("dataset_acceleration")
-            .u64_counter("schema_evolution_failed")
-            .with_description(
-                "Number of dataset schema changes that could not be applied to the acceleration.",
-            )
-            .build()
-    });
 
 fn table_provider_with_existing_metadata(
     provider: Arc<dyn TableProvider>,

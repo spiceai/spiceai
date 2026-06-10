@@ -199,13 +199,14 @@ impl FederatedTable {
 
         let federated_schema = table_provider.schema();
 
-        if schema_difference(&accelerated_schema, &federated_schema).is_none() {
-            return Self::new_unchecked(table_provider);
-        }
-
         if dataset.on_schema_change == OnSchemaChange::Block {
-            // `on_schema_change: block` (default): today's behavior verbatim — defer
-            // with the checkpoint schema, retrying the source until it matches.
+            // `on_schema_change: block` (default): today's behavior verbatim.
+            // `schema_difference` is nullability-insensitive, so a no-op (or a
+            // nullability-only change) registers immediately and any other
+            // difference defers on the checkpoint schema, retrying the source.
+            if schema_difference(&accelerated_schema, &federated_schema).is_none() {
+                return Self::new_unchecked(table_provider);
+            }
             return Self::Deferred(Self::new_deferred_with_schema(
                 Arc::clone(&dataset),
                 data_connector,
@@ -214,6 +215,10 @@ impl FederatedTable {
             ));
         }
 
+        // Non-`block` policies use the widening-aware classifier so nullability
+        // relaxations (which `schema_difference` ignores) are detected and routed
+        // through the policy consistently. `classify` returns `Identical` for a
+        // true no-op, so this still registers immediately when nothing changed.
         Self::new_with_schema_change_policy(
             dataset,
             table_provider,
