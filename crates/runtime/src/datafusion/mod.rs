@@ -2891,6 +2891,16 @@ impl DataFusion {
                                         ". The new schema is not applied; a restart retries the evolution"
                                     },
                                 );
+                                if !is_file_update {
+                                    // Evolution failed and we will not drop-recreate: pin
+                                    // back to the existing (un-evolved) checkpoint schema so
+                                    // the registered provider matches the engine table.
+                                    // Widened source data is cast down on write
+                                    // (block-equivalent) and a restart retries the
+                                    // idempotent evolve. file_update falls through to the
+                                    // drop-recreate path below.
+                                    return Ok(Some(Arc::clone(&existing_schema)));
+                                }
                             }
                         }
                     }

@@ -4887,7 +4887,7 @@ mod tests {
     // mixed-schema per-group fallback ------------------------------------------
 
     /// CDC data struct carrying an extra trailing nullable `age` column — the
-    /// shape the postgres_replication source emits after adopting a mid-stream
+    /// shape the `postgres_replication` source emits after adopting a mid-stream
     /// ADD COLUMN.
     fn create_widened_change_batch(id: i32, age: i32) -> ChangeBatch {
         let data_schema = Schema::new(vec![
@@ -5057,7 +5057,7 @@ mod tests {
     /// Mixed-schema coalesced run (mid-stream column add): with an evolution
     /// policy installed, the run falls back to per-schema-group applies
     /// instead of failing the whole run on the concat error — both envelopes
-    /// apply and commit in stream order. (The MemTable accelerator can't
+    /// apply and commit in stream order. (The `MemTable` accelerator can't
     /// evolve mid-stream, so the wider batch narrow-casts with a warning;
     /// restart-time evolution applies the change.)
     #[tokio::test]

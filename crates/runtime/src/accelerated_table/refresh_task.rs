@@ -2952,7 +2952,7 @@ mod tests {
             detail.contains("predates a widening schema change"),
             "{detail}"
         );
-        assert!(detail.contains("b"), "{detail}");
+        assert!(detail.contains('b'), "{detail}");
 
         // Snapshot newer/wider than the live schema.
         let (kind, detail) = snapshot_schema_mismatch_detail(&wide, &narrow);

@@ -626,7 +626,10 @@ async fn assert_query_row_count(rt: &Arc<Runtime>, sql: &str, expected_rows: usi
     let batches = run_query(rt, sql)
         .await
         .expect("query should succeed after evolution");
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(
         rows, expected_rows,
         "query `{sql}` returned {rows} rows, expected {expected_rows}"
@@ -636,7 +639,7 @@ async fn assert_query_row_count(rt: &Arc<Runtime>, sql: &str, expected_rows: usi
 /// Asserts the accelerated column `column` reports arrow type `arrow_type` (e.g. `Int64`),
 /// proving an in-place type widening was applied to the engine table and the registered
 /// schema. Reads the type from the result batch's Arrow schema rather than `arrow_typeof`,
-/// which is a DataFusion scalar function the accelerator engine (DuckDB) cannot evaluate
+/// which is a `DataFusion` scalar function the accelerator engine (`DuckDB`) cannot evaluate
 /// when the projection is pushed down.
 #[cfg(feature = "postgres")]
 #[expect(clippy::expect_used)]
@@ -758,7 +761,7 @@ async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), 
 }
 
 /// Restart-time widening on the Cayenne engine under `sync_all_columns` — same scenario
-/// as the DuckDB case, validating the Cayenne metastore schema update + provider swap.
+/// as the `DuckDB` case, validating the `Cayenne` metastore schema update + provider swap.
 #[cfg(all(feature = "postgres", not(windows)))]
 #[tokio::test]
 async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(), anyhow::Error> {

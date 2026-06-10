@@ -645,7 +645,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
             // Phase 1: initial load infers {_id, name}.
             let rt = build_mongodb_widen_runtime(&duckdb_file).await?;
             let batches = run_query(&rt, "SELECT _id, name FROM widen ORDER BY _id").await?;
-            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(rows, 2, "expected 2 rows in the initial MongoDB load");
             rt.shutdown().await;
             drop(rt);
@@ -668,7 +668,7 @@ async fn mongodb_schema_evolution_widening_adds_column() -> Result<(), anyhow::E
                 has_country,
                 "the `country` column should be adopted into the registered schema after the widening restart"
             );
-            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let rows: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
             assert!(
                 rows >= 2,
                 "existing documents should be preserved across the widening restart (got {rows})"

@@ -113,25 +113,31 @@ const METADATA_FILE_NAME: &str = "metadata.json";
 const SNAPSHOT_CHECKSUM_ALGORITHM: &str = "SHA256";
 const NETWORK_RETRY_MAX: usize = 3;
 
-// Shared-by-name with the other schema-evolution emit sites; the instrument identity
-// (name + description) must stay in sync with them.
+// Shared with the other schema-evolution emit sites. `runtime-acceleration` cannot
+// import the `runtime` crate's counters (it is a dependency of `runtime`), so the
+// instruments are defined locally but kept identical — same meter (`schema_evolution`),
+// name, and description — so telemetry backends that deduplicate by metric name see a
+// single consistent instrument.
 static SCHEMA_EVOLUTION_APPLIED: LazyLock<opentelemetry::metrics::Counter<u64>> =
     LazyLock::new(|| {
-        opentelemetry::global::meter("dataset_acceleration_snapshot_metrics")
+        opentelemetry::global::meter("schema_evolution")
             .u64_counter("schema_evolution_applied")
             .with_description(
-                "Number of dataset schema evolutions applied at acceleration surfaces.",
+                "Schema evolutions applied to the accelerator or cached source schema.",
             )
             .build()
     });
 
-static SCHEMA_EVOLUTION_DETECTED: LazyLock<opentelemetry::metrics::Counter<u64>> =
-    LazyLock::new(|| {
-        opentelemetry::global::meter("dataset_acceleration_snapshot_metrics")
+static SCHEMA_EVOLUTION_DETECTED: LazyLock<opentelemetry::metrics::Counter<u64>> = LazyLock::new(
+    || {
+        opentelemetry::global::meter("schema_evolution")
             .u64_counter("schema_evolution_detected")
-            .with_description("Number of dataset schema changes detected at acceleration surfaces.")
+            .with_description(
+                "Schema changes detected between an incoming source schema and the stored/accelerator schema.",
+            )
             .build()
-    });
+    },
+);
 
 /// The metric `kind` label for a widening plan, per the
 /// `schema_evolution_*{kind=...}` counter convention.
