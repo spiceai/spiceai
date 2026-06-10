@@ -29,6 +29,7 @@ pub mod config;
 pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
+pub mod shared;
 pub mod slot;
 
 use std::sync::Arc;
@@ -117,6 +118,36 @@ pub enum Error {
 
     #[snafu(display("Failed to build TLS configuration for Postgres replication: {source}"))]
     TlsConfig { source: config::TlsConfigError },
+
+    #[snafu(display(
+        "Table {schema}.{table} is already subscribed on shared replication slot `{slot}` by \
+         another dataset. Each source table can back at most one dataset per shared slot — \
+         give this dataset a different `pg_replication_slot` (or remove the param to get a \
+         dedicated per-dataset slot)."
+    ))]
+    SharedTableAlreadySubscribed {
+        schema: String,
+        table: String,
+        slot: String,
+    },
+
+    #[snafu(display(
+        "Dataset `{dataset}` joins a shared replication slot whose publication is \
+         `{expected}`, but declares publication `{got}`. All datasets sharing a slot must \
+         use the same publication — remove the per-dataset `pg_publication` override or \
+         make it consistent."
+    ))]
+    SharedPublicationMismatch {
+        dataset: String,
+        expected: String,
+        got: String,
+    },
+
+    #[snafu(display(
+        "Shared replication source for slot `{slot}` kept shutting down while this dataset \
+         was subscribing. Check earlier log lines for the underlying stream failure."
+    ))]
+    SharedSourceUnavailable { slot: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -167,6 +198,11 @@ pub struct ReplicationStreamInput {
 /// naturally paces the replication stream.
 #[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
+    // Datasets that opted into slot sharing are multiplexed onto one
+    // replication connection per (connection, slot) — see [`shared`].
+    if input.params.shared {
+        return shared::subscribe(input);
+    }
     // Initialized to 0 until `start_inner` learns the effective start LSN from
     // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
     // both read from this atomic, and a pinned-at-0 value would report a wildly

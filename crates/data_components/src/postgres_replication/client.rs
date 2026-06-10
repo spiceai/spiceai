@@ -63,7 +63,12 @@ pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
     // by the reconnect loop. If it succeeds we hand the client to the stream;
     // if it fails with a transient error we still proceed into the resilient
     // loop so the dataset comes up once Postgres is reachable.
-    let config = build_replication_config(&input);
+    let config = build_replication_config(
+        &input.params,
+        &input.slot_name,
+        &input.publication_name,
+        input.start_lsn,
+    );
     let initial = ReplicationClient::connect(config.clone()).await;
     match initial {
         Ok(client) => Ok(Box::pin(wal_stream(Some(client), config, input))),
@@ -79,12 +84,17 @@ pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
     }
 }
 
-fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
+pub(crate) fn build_replication_config(
+    params: &ReplicationParams,
+    slot_name: &str,
+    publication_name: &str,
+    start_lsn: u64,
+) -> ReplicationConfig {
     // Map our `SslMode` to pgwire-replication's `TlsConfig`. The crate uses
     // rustls and its own SslMode enum (Disabled / Require / VerifyCa /
     // VerifyFull), so we pick the matching constructor and pass the optional
     // CA path.
-    let tls = match input.params.sslmode {
+    let tls = match params.sslmode {
         // Prefer maps to plaintext for WAL streaming. Rationale:
         // pgwire-replication does not expose a safe "try TLS then fall back
         // to plaintext" path, so the only two honest mappings are Disabled
@@ -98,21 +108,21 @@ fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
         // VerifyCa, or VerifyFull explicitly.
         SslMode::Disable | SslMode::Prefer => TlsConfig::disabled(),
         SslMode::Require => TlsConfig::require(),
-        SslMode::VerifyCa => TlsConfig::verify_ca(input.params.sslrootcert.clone()),
-        SslMode::VerifyFull => TlsConfig::verify_full(input.params.sslrootcert.clone()),
+        SslMode::VerifyCa => TlsConfig::verify_ca(params.sslrootcert.clone()),
+        SslMode::VerifyFull => TlsConfig::verify_full(params.sslrootcert.clone()),
     };
     ReplicationConfig {
-        host: input.params.host.clone(),
-        port: input.params.port,
-        user: input.params.user.clone(),
-        password: input.params.password.expose_secret().to_string(),
-        database: input.params.database.clone(),
+        host: params.host.clone(),
+        port: params.port,
+        user: params.user.clone(),
+        password: params.password.expose_secret().to_string(),
+        database: params.database.clone(),
         tls,
-        slot: input.slot_name.clone(),
-        publication: input.publication_name.clone(),
-        start_lsn: Lsn(input.start_lsn),
+        slot: slot_name.to_string(),
+        publication: publication_name.to_string(),
+        start_lsn: Lsn(start_lsn),
         stop_at_lsn: None,
-        status_interval: input.params.status_interval,
+        status_interval: params.status_interval,
         idle_wakeup_interval: Duration::from_secs(1),
         buffer_events: 1024,
     }
@@ -418,7 +428,7 @@ fn wal_stream(
 
 /// Convert a Postgres-epoch microsecond timestamp (from pgoutput Commit) into a
 /// `SystemTime`. Postgres' epoch is 2000-01-01T00:00:00 UTC, not the Unix epoch.
-fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
+pub(crate) fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     // 30 years = 946_684_800 seconds between 1970-01-01 and 2000-01-01.
     const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let total_micros = pg_micros + PG_EPOCH_UNIX_SECS * 1_000_000;
@@ -464,7 +474,7 @@ fn reconnect_logs_at_warn(attempt: u32) -> bool {
 /// Emit a per-attempt log for a transient connect/recv failure. The first
 /// attempt of an outage cycle is WARN (so an outage is loud and greppable);
 /// subsequent attempts are DEBUG to avoid flooding logs during long outages.
-fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
+pub(crate) fn log_transient_reconnect(attempt: u32, dataset: &str, error: &str, retry_in_ms: u128) {
     if reconnect_logs_at_warn(attempt) {
         tracing::warn!(
             dataset = %dataset,
@@ -510,7 +520,7 @@ fn advance(flush: &AtomicU64, to: u64) {
     }
 }
 
-fn validate_relation_against_schema(
+pub(crate) fn validate_relation_against_schema(
     dataset_schema: &SchemaRef,
     rel: &super::pgoutput::Relation,
     declared_pks: &[String],

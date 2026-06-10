@@ -44,6 +44,14 @@ pub struct ReplicationParams {
     pub status_interval: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
+    /// `true` when the slot name was explicitly configured
+    /// (`pg_replication_slot`). Explicitly-named slots are served by the
+    /// shared multiplexer ([`super::shared`]): every dataset on the same
+    /// connection naming the same slot shares one replication
+    /// connection/decoder, with changes routed per table. Default
+    /// (per-dataset generated) slot names keep the dedicated per-dataset
+    /// stream.
+    pub shared: bool,
 }
 
 impl std::fmt::Debug for ReplicationParams {
@@ -61,6 +69,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("temporary_slot", &self.temporary_slot)
             .field("status_interval", &self.status_interval)
             .field("bootstrap_batch_size", &self.bootstrap_batch_size)
+            .field("shared", &self.shared)
             .finish_non_exhaustive()
     }
 }
@@ -155,14 +164,35 @@ const PUB_DATASET_PORTION_MAX: usize =
 /// within Postgres' 63-byte limit.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
+    let instance_hash = instance_hash();
+    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
+    let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
+    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
+}
+
+/// Default publication name for a dataset with an explicitly-named
+/// (shareable) replication slot: `{sanitized_slot}_pub`.
+///
+/// Derived from the slot rather than the dataset so that every dataset
+/// sharing the slot lands on the *same* publication by default — the shared
+/// stream opens one replication connection with one publication covering all
+/// member tables.
+#[must_use]
+pub fn publication_name_for_slot(slot_name: &str) -> String {
+    let base = sanitize(slot_name);
+    let base = truncate_to_bytes(&base, PG_IDENTIFIER_MAX_BYTES - 4);
+    format!("{base}_pub")
+}
+
+/// 8-hex-char hash identifying this spiced instance, derived from
+/// `SPICE_INSTANCE_ID` (falling back to the machine hostname). Deterministic
+/// across restarts of the same instance.
+fn instance_hash() -> String {
     let instance = std::env::var("SPICE_INSTANCE_ID")
         .ok()
         .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
         .unwrap_or_else(|| "unknown".to_string());
-    let instance_hash = xxh3_short_hash(&instance);
-    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
-    let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
-    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
+    xxh3_short_hash(&instance)
 }
 
 /// Default publication is shared across replicas:
@@ -494,6 +524,19 @@ mod tests {
         );
         assert!(pubname.starts_with(SLOT_PREFIX));
         assert!(pubname.ends_with("_pub"));
+    }
+
+    #[test]
+    fn publication_name_for_slot_is_slot_derived() {
+        assert_eq!(
+            publication_name_for_slot("spice_spicehq_dev"),
+            "spice_spicehq_dev_pub"
+        );
+        // Sanitized so odd slot names still produce a valid identifier.
+        assert_eq!(publication_name_for_slot("my-slot"), "my_slot_pub");
+        // 63-byte cap survives long slot names.
+        let long = "p".repeat(120);
+        assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
     }
 
     #[test]

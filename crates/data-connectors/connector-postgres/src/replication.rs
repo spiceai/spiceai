@@ -450,10 +450,25 @@ fn replication_params_from_connector_params(
         config::SslMode::from_str_or_default(optional_string(params, "sslmode").as_deref());
     let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
 
-    let slot_name = optional_string(params, "replication_slot")
-        .unwrap_or_else(|| config::default_slot_name(dataset_name));
-    let publication_name = optional_string(params, "publication")
-        .unwrap_or_else(|| config::default_publication_name(dataset_name));
+    // An explicitly-named slot is shareable: every dataset on the same
+    // connection naming the same slot is multiplexed onto one replication
+    // connection (see `data_components::postgres_replication::shared`). The
+    // default publication is then derived from the slot — not the dataset —
+    // so all members land on the same publication.
+    let explicit_slot = optional_string(params, "replication_slot");
+    let shared = explicit_slot.is_some();
+    let (slot_name, publication_name) = match explicit_slot {
+        Some(slot) => {
+            let publication = optional_string(params, "publication")
+                .unwrap_or_else(|| config::publication_name_for_slot(&slot));
+            (slot, publication)
+        }
+        None => (
+            config::default_slot_name(dataset_name),
+            optional_string(params, "publication")
+                .unwrap_or_else(|| config::default_publication_name(dataset_name)),
+        ),
+    };
     let initial_snapshot = optional_string(params, "replication_initial_snapshot")
         .is_none_or(|s| parse_bool_default_true(&s));
     let temporary_slot = optional_string(params, "replication_temporary_slot")
@@ -482,6 +497,7 @@ fn replication_params_from_connector_params(
         temporary_slot,
         status_interval,
         bootstrap_batch_size,
+        shared,
     })
 }
 

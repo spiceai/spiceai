@@ -65,6 +65,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         temporary_slot: false,
         status_interval: Duration::from_secs(1),
         bootstrap_batch_size: 8192,
+        shared: false,
     }
 }
 

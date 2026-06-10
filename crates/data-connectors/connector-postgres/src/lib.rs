@@ -148,13 +148,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
-         Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Each Spice replica \
+         Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
+         same connection that name the same slot SHARE it: one replication connection, \
+         one publication, with decoded changes routed per table. Each Spice replica \
          MUST have its own unique slot.",
     ),
     ParameterSpec::component("publication").description(
         "Name of the Postgres publication to create/reuse for this dataset. \
-         Defaults to `spice_<dataset>_<dataset-hash>_pub`. Shared across replicas for the \
-         same dataset.",
+         Defaults to `spice_<dataset>_<dataset-hash>_pub`, or `<slot>_pub` when \
+         `pg_replication_slot` is set. Shared across replicas for the same dataset; \
+         datasets sharing a slot must use the same publication.",
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
