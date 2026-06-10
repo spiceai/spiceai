@@ -1881,6 +1881,16 @@ pub struct CayenneTableProvider {
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
+    /// Incrementally-maintained VISIBLE view of the in-memory CDC tier: the
+    /// merge-on-read-filtered batches, kept current at APPEND time (push the new
+    /// segment O(1); re-filter only the pk-range-overlapping cached entries
+    /// against the append's tombstone delta) instead of re-materializing the
+    /// whole resident tier on every scan. Under sustained CDC the per-scan
+    /// re-materialization was the dominant churn-coupled collapse
+    /// (`mem_tier_join_shapes` live lanes: 247x on a single scan). Invalidated
+    /// (None) by the checkpoint clear; rebuilt from the (small) survivor tier on
+    /// the next append. Keyed by `MemTier::version`.
+    mem_tier_visible_overlay: Arc<arc_swap::ArcSwapOption<MemTierVisibleOverlay>>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -2922,6 +2932,22 @@ enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
+/// One visible-overlay entry: a tier segment's merge-on-read-FILTERED batches,
+/// with the segment's data sequence (for delta re-filtering) and, for the
+/// Int64Pk strategy, the surviving rows' pk range (delta-overlap pruning).
+struct MemTierOverlayEntry {
+    data_sequence: i64,
+    batches: Vec<RecordBatch>,
+    pk_range: Option<(i64, i64)>,
+}
+
+/// The incrementally-maintained visible mem-tier view. See the provider field
+/// docs; valid only while `tier_version` matches the live tier.
+struct MemTierVisibleOverlay {
+    tier_version: u64,
+    entries: Vec<MemTierOverlayEntry>,
+}
+
 /// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
 /// See the `merged_scan_deletions` field docs for the key's torn-state proof.
 struct MergedScanDeletions {
@@ -2950,6 +2976,40 @@ impl PkDeletionSnapshot {
             Self::PositionBased => false,
             Self::Int64Pk { tombstones } => tombstones.has_deletions(),
             Self::RowConverterBased { tombstones } => tombstones.has_deletions(),
+        }
+    }
+
+    /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
+    /// persistent-index extend. Used by the append path to keep the
+    /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
+    /// version-keyed memo can otherwise never hit: every append bumps the tier
+    /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
+    /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
+    fn extended_by_delta(&self, delta: &crate::provider::mem_tier::InMemTombstones) -> Self {
+        match self {
+            Self::PositionBased => Self::PositionBased,
+            Self::Int64Pk { tombstones } => {
+                if delta.int64_pk.is_empty() {
+                    return self.clone();
+                }
+                let updated = tombstones.extend_max_deletes(
+                    delta.int64_pk.iter().map(|(&pk, &seq)| (pk, seq)),
+                );
+                Self::Int64Pk {
+                    tombstones: Arc::new(updated),
+                }
+            }
+            Self::RowConverterBased { tombstones } => {
+                if delta.row_keys.is_empty() {
+                    return self.clone();
+                }
+                let updated = tombstones.extend_max_deletes(
+                    delta.row_keys.iter().map(|(key, &seq)| (key.as_ref(), seq)),
+                );
+                Self::RowConverterBased {
+                    tombstones: Arc::new(updated),
+                }
+            }
         }
     }
 
@@ -4977,6 +5037,7 @@ impl CayenneTableProvider {
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
+            mem_tier_visible_overlay: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5718,6 +5779,7 @@ impl CayenneTableProvider {
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
+            mem_tier_visible_overlay: Arc::clone(&self.mem_tier_visible_overlay),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -8942,6 +9004,12 @@ impl CayenneTableProvider {
     }
 
     fn publish_on_conflict_update(&self, update: OnConflictUpdate) {
+        // A file-side deletion publish (staged-path finalize, checkpoint commit)
+        // can hide rows the visible mem-tier overlay has cached; drop the overlay
+        // so the next append rebuilds it against the new deletion state.
+        if !update.is_empty() {
+            self.mem_tier_visible_overlay.store(None);
+        }
         let OnConflictUpdate {
             deletion_update,
             inlined_tombstone_written,
@@ -12541,6 +12609,152 @@ impl CayenneTableProvider {
         Ok(batches)
     }
 
+    /// Int64-pk range of surviving rows across `batches` (overlay delta-prune
+    /// key); `None` for the row-key strategy or when empty.
+    fn overlay_pk_range(&self, batches: &[RecordBatch]) -> Option<(i64, i64)> {
+        if !self.pk_deletion_strategy.is_int64_pk() {
+            return None;
+        }
+        let pk_name = self.table_metadata.primary_key.first()?;
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for batch in batches {
+            let idx = batch.schema().index_of(pk_name).ok()?;
+            let col = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()?;
+            if let (Some(bl), Some(bh)) =
+                (arrow::compute::min(col), arrow::compute::max(col))
+            {
+                lo = lo.min(bl);
+                hi = hi.max(bh);
+            }
+        }
+        (lo <= hi).then_some((lo, hi))
+    }
+
+    /// Rebuild the visible overlay from scratch for `tier` (the same
+    /// merge-on-read filtering `visible_mem_tier_batches` performs, retained
+    /// per-segment). O(tier) — runs only on cold start / post-checkpoint, when
+    /// the tier is empty-or-small; steady-state appends maintain incrementally.
+    fn build_mem_tier_overlay(
+        &self,
+        tier: &crate::provider::mem_tier::MemTier,
+    ) -> Result<MemTierVisibleOverlay> {
+        let maps = Self::mem_tier_deletion_maps(tier);
+        let mut entries = Vec::with_capacity(tier.segments.len());
+        for segment in tier.segments.iter() {
+            let mut batches = Vec::with_capacity(segment.batches.len());
+            for batch in segment.batches.iter() {
+                if let Some(visible) = self.filter_inlined_batch_for_deletions(
+                    batch.clone(),
+                    segment.data_sequence,
+                    &maps,
+                )? {
+                    batches.push(visible);
+                }
+            }
+            if batches.is_empty() {
+                continue;
+            }
+            let pk_range = self.overlay_pk_range(&batches);
+            entries.push(MemTierOverlayEntry {
+                data_sequence: segment.data_sequence,
+                batches,
+                pk_range,
+            });
+        }
+        Ok(MemTierVisibleOverlay {
+            tier_version: tier.version,
+            entries,
+        })
+    }
+
+    /// Maintain the visible overlay for one append, O(delta): push the new
+    /// segment as-is (file-side tombstones all carry lower sequences, and the
+    /// append's own tombstones carry `delete_sequence = data_sequence - 1`, so
+    /// none can hide the new rows) and re-filter ONLY the cached entries whose
+    /// pk range overlaps the delta (every key the delta hides has
+    /// `delete_sequence` above every cached entry's `data_sequence`). Falls back
+    /// to a full rebuild when the overlay is cold or version-skewed.
+    fn maintain_mem_tier_overlay_on_append(
+        &self,
+        prev_version: u64,
+        next: &crate::provider::mem_tier::MemTier,
+        new_batches: &Arc<Vec<RecordBatch>>,
+        data_sequence: i64,
+        delta: &crate::provider::mem_tier::InMemTombstones,
+    ) -> Result<()> {
+        let rebuilt;
+        let overlay = match self.mem_tier_visible_overlay.load_full() {
+            Some(overlay) if overlay.tier_version == prev_version => overlay,
+            _ => {
+                rebuilt = Arc::new(self.build_mem_tier_overlay(next)?);
+                self.mem_tier_visible_overlay.store(Some(Arc::clone(&rebuilt)));
+                return Ok(());
+            }
+        };
+        let _ = rebuilt;
+
+        let delta_range = delta.int64_deleted_key_range();
+        let delta_has_row_keys = !delta.row_keys.is_empty();
+        let mut entries = Vec::with_capacity(overlay.entries.len() + 1);
+        for entry in &overlay.entries {
+            let affected = if delta_has_row_keys {
+                // Row-key strategy has no cheap range prune: re-filter on any delta.
+                true
+            } else {
+                match (entry.pk_range, delta_range) {
+                    (Some((el, eh)), Some((dl, dh))) => !(eh < dl || el > dh),
+                    (None, Some(_)) => true,
+                    _ => false,
+                }
+            };
+            if !affected {
+                entries.push(MemTierOverlayEntry {
+                    data_sequence: entry.data_sequence,
+                    batches: entry.batches.clone(),
+                    pk_range: entry.pk_range,
+                });
+                continue;
+            }
+            let mut batches = Vec::with_capacity(entry.batches.len());
+            for batch in &entry.batches {
+                if let Some(visible) = self.filter_inlined_batch_for_deletions(
+                    batch.clone(),
+                    entry.data_sequence,
+                    delta,
+                )? {
+                    batches.push(visible);
+                }
+            }
+            if batches.is_empty() {
+                continue;
+            }
+            entries.push(MemTierOverlayEntry {
+                data_sequence: entry.data_sequence,
+                // Old range stays a sound SUPERSET of the survivors (pruning key
+                // only ever skips work, never rows).
+                pk_range: entry.pk_range,
+                batches,
+            });
+        }
+        let new_visible: Vec<RecordBatch> = new_batches.as_ref().clone();
+        let pk_range = self.overlay_pk_range(&new_visible);
+        entries.push(MemTierOverlayEntry {
+            data_sequence,
+            batches: new_visible,
+            pk_range,
+        });
+        self.mem_tier_visible_overlay
+            .store(Some(Arc::new(MemTierVisibleOverlay {
+                tier_version: next.version,
+                entries,
+            })));
+        Ok(())
+    }
+
     fn visible_mem_tier_batches(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
@@ -12685,7 +12899,7 @@ impl CayenneTableProvider {
 
             let cur = self.mem_tier.load();
             let next = cur.append_segment(
-                arc_batches,
+                Arc::clone(&arc_batches),
                 data_sequence,
                 &tombstones,
                 incoming_bytes,
@@ -12693,11 +12907,45 @@ impl CayenneTableProvider {
                 superseded,
             );
             let epoch = next.epoch;
+            let next_version = next.version;
+            // Maintain the incrementally-filtered visible overlay BEFORE the
+            // swap publishes the new tier (same fence => scans see tier+overlay
+            // move together; a version mismatch on read just falls back).
+            self.maintain_mem_tier_overlay_on_append(
+                cur.version,
+                &next,
+                &arc_batches,
+                data_sequence,
+                &tombstones,
+            )?;
             self.mem_tier.store(Arc::new(next));
             // A new tombstone can retroactively hide rows already materialized in
             // a cached inline/mem view, so this is a STRUCTURAL change (full
             // re-read on the next scan), matching the durable tombstone path.
             self.bump_inlined_structural_epoch();
+            // Keep the merged-scan-deletions memo CURRENT in lockstep: extend it
+            // by this append's tombstone delta (O(delta)) and re-key it to the
+            // post-append (version, structural-epoch). Without this the memo can
+            // never hit under sustained CDC (every append re-keys the tier) and
+            // each scan pays an O(tier) merged-index rebuild — the churn-coupled
+            // 175-247x collapse the `mem_tier_join_shapes` live lanes measure.
+            // Only valid while the memo still matches the live file-side index
+            // (`cur.version` pre-append + the current strategy snapshot ptr);
+            // any mismatch leaves the memo stale-keyed and the next scan
+            // rebuilds, exactly as before.
+            if let Some(memo) = self.merged_scan_deletions.load_full()
+                && memo.tier_version == cur.version
+                && Some(memo.file_index_ptr) == self.pk_deletion_snapshot().index_ptr()
+            {
+                let structural_epoch = self.inlined_structural_epoch.load(Ordering::Relaxed);
+                self.merged_scan_deletions
+                    .store(Some(Arc::new(MergedScanDeletions {
+                        file_index_ptr: memo.file_index_ptr,
+                        tier_version: next_version,
+                        structural_epoch,
+                        merged: memo.merged.extended_by_delta(&tombstones),
+                    })));
+            }
             epoch
         };
 
@@ -12923,6 +13171,9 @@ impl CayenneTableProvider {
         // the process-global budget; survivor bytes stay resident.
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.store(Arc::new(survivors));
+        // The overlay keys on tier version; drop it so the next append rebuilds
+        // from the (small) survivor tier.
+        self.mem_tier_visible_overlay.store(None);
         crate::provider::mem_tier_budget::release_bytes(released);
         self.bump_inlined_structural_epoch();
     }
@@ -12980,6 +13231,25 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
+        // Overlay fast path: the incrementally-maintained visible view makes the
+        // per-scan cost O(entries) Arc-clones instead of O(tier rows)
+        // re-filtering (the churn-coupled 247x). Predicate pruning is skipped on
+        // this path (the rows are already minimal; static filters still apply via
+        // the branch FilterExec / post-scan filter).
+        if let Some(overlay) = self.mem_tier_visible_overlay.load_full()
+            && overlay.tier_version == snapshot.version
+        {
+            let visible: Vec<RecordBatch> = overlay
+                .entries
+                .iter()
+                .flat_map(|entry| entry.batches.iter().cloned())
+                .collect();
+            if visible.is_empty() {
+                return Ok(None);
+            }
+            return self.finish_mem_tier_scan_plan(visible, effective_projection);
+        }
+
         let visible_batches = self
             .visible_mem_tier_batches(snapshot, pruning_predicate)
             .map_err(|e| {
@@ -12992,7 +13262,16 @@ impl CayenneTableProvider {
         if visible_batches.is_empty() {
             return Ok(None);
         }
+        self.finish_mem_tier_scan_plan(visible_batches, effective_projection)
+    }
 
+    /// Shared tail of the mem-tier scan plan: apply the effective projection and
+    /// wrap the visible batches in a `MemorySourceConfig` exec.
+    fn finish_mem_tier_scan_plan(
+        &self,
+        visible_batches: Vec<RecordBatch>,
+        effective_projection: Option<&Vec<usize>>,
+    ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
         let proj_schema = if let Some(proj) = effective_projection {
             let schema_fields = self.table_metadata.schema.fields();
