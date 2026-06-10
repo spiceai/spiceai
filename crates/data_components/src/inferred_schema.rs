@@ -63,7 +63,9 @@ pub const INFERRED_METADATA_KEYS: [&str; 5] = [
 /// output schema no longer equals its input schema and the schema-invariant
 /// check fails. Strip them from the scan schema (only) to keep join schemas
 /// stable while leaving the statistics/tuning consumers untouched.
-pub fn strip_inferred_metadata<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>) {
+pub fn strip_inferred_metadata<S: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, S>,
+) {
     for key in INFERRED_METADATA_KEYS {
         metadata.remove(key);
     }
