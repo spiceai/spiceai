@@ -13386,9 +13386,11 @@ impl CayenneTableProvider {
         }
 
         // Read deletion vector files in a blocking task, detecting type from schema
-        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>) where:
+        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>,
+        // HashMap<Box<[u8]>, i64>) where:
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
+        // - derived_reinserted: PK bytes -> max reinsert sequence
         let (per_file_row_ids, deleted_row_keys, derived_reinserted) =
             task::spawn_blocking(move || detect_deletion_type_and_read(delete_files))
                 .await
@@ -13417,9 +13419,9 @@ impl CayenneTableProvider {
             PkDeletionStrategy::Int64Pk => {
                 let mut merged = insert_records_pk_i64;
                 for (bytes, seq) in &derived_reinserted {
-                    if bytes.len() >= 8 {
+                    if bytes.len() == 8 {
                         let mut arr = [0_u8; 8];
-                        arr.copy_from_slice(&bytes[..8]);
+                        arr.copy_from_slice(bytes.as_ref());
                         let pk = i64::from_be_bytes(arr);
                         merged
                             .entry(pk)
@@ -13427,7 +13429,7 @@ impl CayenneTableProvider {
                             .or_insert(*seq);
                     } else {
                         tracing::warn!(
-                            "Skipping invalid Int64 derived reinsert key with length {} (expected at least 8 bytes)",
+                            "Skipping invalid Int64 derived reinsert key with length {} (expected exactly 8 bytes)",
                             bytes.len()
                         );
                     }

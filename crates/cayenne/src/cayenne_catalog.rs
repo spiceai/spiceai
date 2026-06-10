@@ -45,6 +45,7 @@ struct ExistingDeleteFileRecord {
     file_size_bytes: i64,
     source_data_file_path: Option<String>,
     sequence_number: i64,
+    reinsert_sequence: Option<i64>,
 }
 
 fn metastore_value_at(values: &[MetastoreValue], index: usize) -> CatalogResult<&MetastoreValue> {
@@ -64,6 +65,7 @@ fn existing_delete_file_record_from_values(
         file_size_bytes: i64::from_value(metastore_value_at(values, 4)?)?,
         source_data_file_path: Option::<String>::from_value(metastore_value_at(values, 5)?)?,
         sequence_number: Option::<i64>::from_value(metastore_value_at(values, 6)?)?.unwrap_or(0),
+        reinsert_sequence: Option::<i64>::from_value(metastore_value_at(values, 7)?)?,
     })
 }
 
@@ -271,7 +273,7 @@ impl CayenneCatalog {
                 QueryParams {
                     sql: r"
                     SELECT delete_file_id, path_is_relative, format, delete_count,
-                           file_size_bytes, source_data_file_path, sequence_number
+                              file_size_bytes, source_data_file_path, sequence_number, reinsert_sequence
                     FROM cayenne_delete_file
                     WHERE table_id = ?1 AND path = ?2
                     ORDER BY delete_file_id DESC
@@ -291,6 +293,7 @@ impl CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         source_data_file_path: row.get_optional_string(5)?,
                         sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
+                        reinsert_sequence: row.get_optional_i64(7)?,
                     })
                 },
             )
@@ -329,7 +332,7 @@ impl CayenneCatalog {
             .query_row_values(QueryRowParams {
                 sql: r"
                     SELECT delete_file_id, path_is_relative, format, delete_count,
-                           file_size_bytes, source_data_file_path, sequence_number
+                          file_size_bytes, source_data_file_path, sequence_number, reinsert_sequence
                     FROM cayenne_delete_file
                     WHERE table_id = ?1 AND path = ?2
                     ORDER BY delete_file_id DESC
@@ -642,7 +645,7 @@ impl CayenneCatalog {
     }
 
     /// Build a multi-VALUES `INSERT ... ON CONFLICT(table_id, path) DO UPDATE`
-    /// for a chunk of delete-file rows. Each row uses 9 parameters; the
+    /// for a chunk of delete-file rows. Each row uses 10 parameters; the
     /// per-row `ON CONFLICT` clause references `excluded` (the single
     /// conflicting row), so the idempotency check is the same as the
     /// single-row form previously emitted in `commit_on_conflict_deletions`.
@@ -1151,9 +1154,10 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
                     delete_file_id, table_id, path, path_is_relative,
-                    format, delete_count, file_size_bytes, source_data_file_path, sequence_number
+                    format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                    reinsert_sequence
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                 )
             ",
                 params: vec![
@@ -1169,6 +1173,9 @@ impl MetadataCatalog for CayenneCatalog {
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Integer(delete_file.sequence_number),
+                    delete_file
+                        .reinsert_sequence
+                        .map_or(MetastoreValue::Null, MetastoreValue::Integer),
                 ],
             })
             .await;
@@ -3411,6 +3418,9 @@ fn validate_existing_delete_file_record(
     if existing.sequence_number != incoming.sequence_number {
         mismatched_fields.push("sequence_number");
     }
+    if existing.reinsert_sequence != incoming.reinsert_sequence {
+        mismatched_fields.push("reinsert_sequence");
+    }
 
     if mismatched_fields.is_empty() {
         return Ok(());
@@ -4077,7 +4087,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
-            reinsert_sequence: None,
+            reinsert_sequence: Some(7),
         };
 
         let first_id = catalog
@@ -4085,7 +4095,7 @@ mod tests {
             .await
             .expect("initial add_delete_file should succeed");
 
-        let mut conflicting_delete_file = delete_file;
+        let mut conflicting_delete_file = delete_file.clone();
         conflicting_delete_file.file_size_bytes = 1024;
 
         let err = catalog
@@ -4106,6 +4116,27 @@ mod tests {
             other => panic!("expected FailedToAddDeleteFile, got: {other}"),
         }
 
+        let mut conflicting_reinsert_delete_file = delete_file.clone();
+        conflicting_reinsert_delete_file.reinsert_sequence = Some(8);
+
+        let err = catalog
+            .add_delete_file(conflicting_reinsert_delete_file)
+            .await
+            .expect_err("conflicting same-path reinsert_sequence should be rejected");
+
+        match err {
+            CatalogError::FailedToAddDeleteFile { source } => match *source {
+                CatalogError::ConstraintViolation { message } => {
+                    assert!(
+                        message.contains("reinsert_sequence"),
+                        "expected reinsert_sequence mismatch in error, got: {message}"
+                    );
+                }
+                other => panic!("expected nested ConstraintViolation, got: {other}"),
+            },
+            other => panic!("expected FailedToAddDeleteFile, got: {other}"),
+        }
+
         let delete_files = catalog
             .get_table_delete_files(&table_id)
             .await
@@ -4114,6 +4145,7 @@ mod tests {
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].delete_file_id, first_id);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        assert_eq!(delete_files[0].reinsert_sequence, Some(7));
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

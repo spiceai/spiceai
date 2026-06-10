@@ -395,9 +395,10 @@ impl<'a> DeletionVectorWriter<'a> {
 ///
 /// # Returns
 ///
-/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence)`.
+/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence, reinserted_row_keys)`.
 /// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
 /// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
+/// - `reinserted_row_keys`: Map of PK bytes -> max reinsert sequence number derived from delete-file metadata
 ///
 /// # Errors
 ///
