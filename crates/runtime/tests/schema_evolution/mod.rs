@@ -635,20 +635,24 @@ async fn assert_query_row_count(rt: &Arc<Runtime>, sql: &str, expected_rows: usi
 
 /// Asserts the accelerated column `column` reports arrow type `arrow_type` (e.g. `Int64`),
 /// proving an in-place type widening was applied to the engine table and the registered
-/// schema.
+/// schema. Reads the type from the result batch's Arrow schema rather than `arrow_typeof`,
+/// which is a DataFusion scalar function the accelerator engine (DuckDB) cannot evaluate
+/// when the projection is pushed down.
 #[cfg(feature = "postgres")]
 #[expect(clippy::expect_used)]
 async fn assert_column_arrow_type(rt: &Arc<Runtime>, column: &str, arrow_type: &str) {
-    let sql = format!("SELECT arrow_typeof({column}) AS t FROM cham LIMIT 1");
+    let sql = format!("SELECT {column} FROM cham LIMIT 1");
     let batches = run_query(rt, &sql)
         .await
-        .expect("arrow_typeof query should succeed");
-    let rendered = to_pretty_display(&batches)
-        .expect("pretty display")
-        .to_string();
+        .expect("projection query should succeed");
+    let schema = batches.first().expect("at least one record batch").schema();
+    let field = schema
+        .field_with_name(column)
+        .expect("queried column present in result schema");
+    let actual = format!("{:?}", field.data_type());
     assert!(
-        rendered.contains(arrow_type),
-        "expected `{column}` to be `{arrow_type}` after widening, got:\n{rendered}"
+        actual.contains(arrow_type),
+        "expected `{column}` to be `{arrow_type}` after evolution, got `{actual}`"
     );
 }
 
@@ -682,53 +686,65 @@ async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), 
 
             // Phase 1: initial load (id, town, age).
             let rt = Arc::new(
-                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
-                    .await?,
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
             );
             assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
             rt.shutdown().await;
             drop(rt);
 
-            // Phase 2: additive widening — new nullable column adopted in place.
+            // Phase 2: additive widening — a new nullable column is adopted in place on
+            // restart. Existing rows are preserved (with the column backfilled NULL); the
+            // restart evolves the schema rather than re-fetching the source, so the row
+            // count is unchanged. Under `block` this query would error (country is not in
+            // the registered schema); under `sync_all_columns` the column is queryable.
             execute_pg_statement(
                 &db_conn,
                 "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
             )
             .await;
-            execute_pg_statement(
-                &db_conn,
-                "INSERT INTO public.chameleon (id, town, age, country) VALUES ('4', 'Toronto', 40, 'Canada');",
-            )
-            .await;
             let rt = Arc::new(
-                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
-                    .await?,
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
             );
-            // Under `block` this query would error (country is not in the registered schema);
-            // under `sync_all_columns` the column is adopted and queryable.
             assert_query_row_count(
                 &rt,
                 "SELECT id, town, age, country FROM cham ORDER BY id ASC",
-                4,
+                3,
             )
             .await;
             rt.shutdown().await;
             drop(rt);
 
-            // Phase 3: type widening — int4 -> int8 applied in place.
+            // Phase 3: type widening — int4 -> int8 applied in place to the existing rows.
             execute_pg_statement(
                 &db_conn,
                 "ALTER TABLE public.chameleon ALTER COLUMN age TYPE int8;",
             )
             .await;
             let rt = Arc::new(
-                init_widen_pg_runtime(port, "duckdb", params.clone(), OnSchemaChange::SyncAllColumns)
-                    .await?,
+                init_widen_pg_runtime(
+                    port,
+                    "duckdb",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
             );
             assert_query_row_count(
                 &rt,
                 "SELECT id, town, age, country FROM cham ORDER BY id ASC",
-                4,
+                3,
             )
             .await;
             assert_column_arrow_type(&rt, "age", "Int64").await;
@@ -778,31 +794,39 @@ async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(),
             reset_pg_table(&db_conn).await;
 
             let rt = Arc::new(
-                init_widen_pg_runtime(port, "cayenne", params.clone(), OnSchemaChange::SyncAllColumns)
-                    .await?,
+                init_widen_pg_runtime(
+                    port,
+                    "cayenne",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
             );
             assert_query_row_count(&rt, "SELECT id, town, age FROM cham ORDER BY id ASC", 3).await;
             rt.shutdown().await;
             drop(rt);
 
+            // Additive widening on Cayenne: the metastore schema update + provider swap
+            // adopt `country` in place on restart; existing rows are preserved (backfilled
+            // NULL), so the row count is unchanged and the column becomes queryable.
             execute_pg_statement(
                 &db_conn,
                 "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
             )
             .await;
-            execute_pg_statement(
-                &db_conn,
-                "INSERT INTO public.chameleon (id, town, age, country) VALUES ('4', 'Toronto', 40, 'Canada');",
-            )
-            .await;
             let rt = Arc::new(
-                init_widen_pg_runtime(port, "cayenne", params.clone(), OnSchemaChange::SyncAllColumns)
-                    .await?,
+                init_widen_pg_runtime(
+                    port,
+                    "cayenne",
+                    params.clone(),
+                    OnSchemaChange::SyncAllColumns,
+                )
+                .await?,
             );
             assert_query_row_count(
                 &rt,
                 "SELECT id, town, age, country FROM cham ORDER BY id ASC",
-                4,
+                3,
             )
             .await;
             rt.shutdown().await;
@@ -870,8 +894,12 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
                 )
                 .await?,
             );
-            assert_query_row_count(&rt, "SELECT id, town, age, country FROM cham ORDER BY id ASC", 3)
-                .await;
+            assert_query_row_count(
+                &rt,
+                "SELECT id, town, age, country FROM cham ORDER BY id ASC",
+                3,
+            )
+            .await;
             assert_column_arrow_type(&rt, "age", "Int32").await;
             rt.shutdown().await;
             drop(rt);

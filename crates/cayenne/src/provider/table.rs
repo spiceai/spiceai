@@ -3443,9 +3443,8 @@ impl CayenneTableProvider {
             if Instant::now() >= drain_deadline {
                 return Err(Error::Internal {
                     table: self.table_metadata.table_name.clone(),
-                    message:
-                        "Timed out draining in-flight staged writes before schema evolution"
-                            .to_string(),
+                    message: "Timed out draining in-flight staged writes before schema evolution"
+                        .to_string(),
                 });
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3468,8 +3467,7 @@ impl CayenneTableProvider {
                 .update_table_schema(&self.table_metadata.table_id, &plan.evolved_schema)
                 .await
                 .map_err(|source| Error::Catalog { source })?;
-            self.table_schema
-                .store(Arc::clone(&plan.evolved_schema));
+            self.table_schema.store(Arc::clone(&plan.evolved_schema));
             {
                 // Cached optimizer statistics are column-indexed against the
                 // old schema width (DataFusion expects column_statistics.len()
@@ -14089,12 +14087,7 @@ impl CayenneTableProvider {
 
         let statistics = Arc::new(
             format
-                .infer_stats(
-                    state,
-                    store,
-                    self.table_schema(),
-                    &part_file.object_meta,
-                )
+                .infer_stats(state, store, self.table_schema(), &part_file.object_meta)
                 .await?,
         );
         self.scan_file_statistics.put_with_extra(

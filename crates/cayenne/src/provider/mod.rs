@@ -1255,9 +1255,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_restart.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        let catalog = Arc::new(
-            CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"),
-        );
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
         catalog.init().await.expect("to init catalog");
 
         let stored_schema = Arc::new(Schema::new(vec![
@@ -1294,13 +1293,10 @@ mod tests {
         let ctx = SessionContext::new();
         let catalog_trait: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
-        let provider = CayenneTableProvider::new(
-            table_name,
-            Arc::clone(&catalog_trait),
-            ctx.runtime_env(),
-        )
-        .await
-        .expect("to open provider");
+        let provider =
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider");
 
         let ids: Vec<i64> = (0..1000).collect();
         let vs: Vec<i32> = (0..1000).collect();
@@ -1349,11 +1345,7 @@ mod tests {
         // Filter on the WIDENED column over old Int32 files (exercises the
         // stats-pruning + expression-adaptation path with an Int64 predicate).
         assert_eq!(
-            query_count(
-                &ctx,
-                "SELECT COUNT(*) FROM evolution_restart WHERE v > 500"
-            )
-            .await,
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart WHERE v > 500").await,
             499
         );
         // Filter on the ADDED column over pre-evolution files (null-fill).
@@ -1420,9 +1412,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_gate.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        let catalog = Arc::new(
-            CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"),
-        );
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
         catalog.init().await.expect("to init catalog");
 
         let stored_schema = Arc::new(Schema::new(vec![
@@ -1444,32 +1435,38 @@ mod tests {
             Field::new("v", DataType::Int32, true),
         ]));
 
-        let options_for = |table: &str,
-                           schema: &Arc<Schema>,
-                           mode: SchemaEvolutionMode|
-         -> CreateTableOptions {
-            CreateTableOptions {
-                table_name: table.to_string(),
-                schema: Arc::clone(schema),
-                primary_key: vec!["id".to_string()],
-                on_conflict: None,
-                base_path: temp_dir.path().to_string_lossy().to_string(),
-                partition_column: None,
-                vortex_config: crate::metadata::VortexConfig {
-                    schema_evolution: mode,
-                    ..crate::metadata::VortexConfig::default()
-                },
-            }
-        };
+        let options_for =
+            |table: &str, schema: &Arc<Schema>, mode: SchemaEvolutionMode| -> CreateTableOptions {
+                CreateTableOptions {
+                    table_name: table.to_string(),
+                    schema: Arc::clone(schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        schema_evolution: mode,
+                        ..crate::metadata::VortexConfig::default()
+                    },
+                }
+            };
 
         // Disabled (legacy): the stored schema is pinned.
         let table = "t_disabled";
         let id_before = catalog
-            .create_table(options_for(table, &stored_schema, SchemaEvolutionMode::Disabled))
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
             .await
             .expect("create");
         let id_after = catalog
-            .create_table(options_for(table, &widened_schema, SchemaEvolutionMode::Disabled))
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
             .await
             .expect("re-create with changed schema");
         assert_eq!(id_before, id_after);
@@ -1482,11 +1479,19 @@ mod tests {
         // Widen: the full widening set evolves in place, same table_id.
         let table = "t_widen";
         let id_before = catalog
-            .create_table(options_for(table, &stored_schema, SchemaEvolutionMode::Widen))
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
             .await
             .expect("create");
         let id_after = catalog
-            .create_table(options_for(table, &widened_schema, SchemaEvolutionMode::Widen))
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
             .await
             .expect("re-create with widened schema");
         assert_eq!(id_before, id_after);
@@ -1538,11 +1543,19 @@ mod tests {
         // (typed PK row-encodings) — pinned even under Widen.
         let table = "t_pkguard";
         catalog
-            .create_table(options_for(table, &stored_schema, SchemaEvolutionMode::Widen))
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
             .await
             .expect("create");
         catalog
-            .create_table(options_for(table, &pk_widened_schema, SchemaEvolutionMode::Widen))
+            .create_table(options_for(
+                table,
+                &pk_widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
             .await
             .expect("re-create with widened PK schema");
         assert_eq!(
@@ -1555,7 +1568,11 @@ mod tests {
         // the schema also widened (schema must be the ONLY difference).
         let table = "t_mixed_diff";
         catalog
-            .create_table(options_for(table, &stored_schema, SchemaEvolutionMode::Widen))
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
             .await
             .expect("create");
         let mut mixed = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
@@ -1581,9 +1598,8 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_live.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
-        let catalog = Arc::new(
-            CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"),
-        );
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
         catalog.init().await.expect("to init catalog");
 
         let stored_schema = Arc::new(Schema::new(vec![
