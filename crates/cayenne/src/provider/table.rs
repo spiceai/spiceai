@@ -19713,6 +19713,100 @@ mod tests {
         );
     }
 
+    /// Pins that DF53's hash-join DYNAMIC filter installs probe-side pruning
+    /// even when the fact table has a resident in-memory CDC tier (the scan is
+    /// then union(file branch, bare memory branch)). Verified to HOLD today at
+    /// this shape — DataFusion routes the pushdown through the union per-child
+    /// and installs on the file branch — so this guards against a future
+    /// regression in that routing. NOTE: the SF-100 dimension-join slowdown
+    /// under memory mode (q20 322ms -> 65s, supplier-join set 4-200x) is NOT
+    /// explained by this shape (an always-true-FilterExec absorber on the
+    /// memory branch was tested and changed nothing); the live-plan
+    /// investigation (EXPLAIN q20 at SF-100, join-mode/statistics with a
+    /// resident tier) is the open thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mem_tier_join_probe_keeps_dynamic_filter_pushdown() {
+        use arrow::array::Int64Array;
+        use datafusion::datasource::MemTable;
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "fact_dyn",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Durable rows + a checkpoint (a real file branch), then a RAM append so
+        // the scan unions a resident memory branch — the shape under test.
+        let ids: Vec<i64> = (0..512).collect();
+        let values: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &values)).await;
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("flush to the file tier");
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[600], &[6000])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("RAM append");
+        assert!(write.in_memory_epoch().is_some(), "tier must be resident");
+
+        ctx.register_table("fact_dyn", Arc::new(provider.clone_for_write()))
+            .expect("register fact");
+        // Small dimension: 4 rows — unambiguously the hash-join build side.
+        let dim_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("tag", arrow_schema::DataType::Int64, false),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40])),
+            ],
+        )
+        .expect("dim batch");
+        ctx.register_table(
+            "dim_dyn",
+            Arc::new(MemTable::try_new(dim_schema, vec![vec![dim_batch]]).expect("dim table")),
+        )
+        .expect("register dim");
+
+        let frame = ctx
+            .sql("SELECT count(*) FROM fact_dyn JOIN dim_dyn ON fact_dyn.id = dim_dyn.id WHERE dim_dyn.tag = 20")
+            .await
+            .expect("plan join");
+        let physical = frame
+            .create_physical_plan()
+            .await
+            .expect("optimized physical plan");
+        let display =
+            datafusion_physical_plan::displayable(physical.as_ref()).indent(true).to_string();
+        let probe_side_installed = display.lines().any(|line| {
+            let l = line.to_lowercase();
+            (l.contains("datasourceexec") || l.contains("filterexec"))
+                && l.contains("dynamicfilter")
+        });
+        assert!(
+            probe_side_installed,
+            "dimension->fact dynamic filter must install on the PROBE side (a scan or \
+             absorber FilterExec line), not merely display on the join, even with a \
+             resident mem tier (bare memory branch blocks pushdown). Plan:\n{display}"
+        );
+    }
+
     /// Timed local repro for the SF-100 apply-throughput collapse (run3: stock
     /// drained at ~3.5 MB/s with zero query traffic). Sustained fixed-keyspace
     /// upserts against a memory-mode table with the production-shaped background
