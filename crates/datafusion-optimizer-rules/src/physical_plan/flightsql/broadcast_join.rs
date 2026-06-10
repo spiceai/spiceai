@@ -56,7 +56,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError, Result, Statistics};
+use datafusion::common::{DataFusionError, NullEquality, Result, Statistics};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::JoinType;
@@ -65,7 +65,6 @@ use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -266,7 +265,15 @@ fn try_rewrite(
         return Ok(Transformed::no(plan));
     };
     // Only inner equi-joins with no residual filter (the common cayenne shape).
-    if *join.join_type() != JoinType::Inner || join.filter().is_some() || join.on().is_empty() {
+    // SQL `=` never matches NULL keys, so a join planned with
+    // `NullEquality::NullEqualsNull` (`IS NOT DISTINCT FROM`) cannot be
+    // rendered as `f.k = d.k` — rewriting it would silently drop the
+    // NULL-key matches the central join produces.
+    if *join.join_type() != JoinType::Inner
+        || join.filter().is_some()
+        || join.on().is_empty()
+        || join.null_equality() != NullEquality::NullEqualsNothing
+    {
         return Ok(Transformed::no(plan));
     }
 
@@ -419,9 +426,9 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
 fn resolve_federated_side(plan: &Arc<dyn ExecutionPlan>) -> Option<FederatedSide<'_>> {
     // A join input is typically `RepartitionExec(Hash) -> UnionExec ->
     // [pass-through -> FlightSqlExec]`. Descend through single-input wrapper
-    // nodes (repartition / coalesce / filter / cooperative) to reach the
-    // `UnionExec` (or a bare `FlightSqlExec`) before collecting the per-partition
-    // scans — otherwise `collect_flight_execs` hits the multi-input `UnionExec`
+    // nodes (repartition / coalesce / cooperative) to reach the `UnionExec`
+    // (or a bare `FlightSqlExec`) before collecting the per-partition scans —
+    // otherwise `collect_flight_execs` hits the multi-input `UnionExec`
     // mid-walk and bails.
     let mut scan_root = plan;
     while scan_root.as_any().downcast_ref::<UnionExec>().is_none()
@@ -482,16 +489,22 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
 }
 
 /// A single-input node that passes data through unchanged for the purposes of
-/// resolving a federated scan: repartition, coalesce-batches, filter (the
-/// underlying `FlightSqlExec` already carries the predicate in its SQL), and the
+/// resolving a federated scan: repartition, coalesce-batches, and the
 /// name-identified `CooperativeExec` / `BytesProcessedExec` wrappers.
+///
+/// `FilterExec` is deliberately NOT in this set. `FlightSQLTable` classifies
+/// every filter as `Exact` (removed from the plan, embedded in the scan SQL) or
+/// `Unsupported` (kept in a `FilterExec`, absent from the scan SQL) — never
+/// `Inexact`. So a `FilterExec` above these scans always carries a predicate
+/// the rewritten per-executor SQL would NOT apply; walking through it would
+/// silently drop that predicate and return extra rows. Bail instead and keep
+/// the central join, which still executes the `FilterExec`.
 fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
     plan.as_any().downcast_ref::<RepartitionExec>().is_some()
         || plan
             .as_any()
             .downcast_ref::<CoalesceBatchesExec>()
             .is_some()
-        || plan.as_any().downcast_ref::<FilterExec>().is_some()
         || PASS_THROUGH_EXEC_NAMES.contains(&plan.name())
 }
 
@@ -531,11 +544,18 @@ fn build_join_sql(
         .join(" UNION ALL ");
 
     // ON clause: each equi-key pair is (left_col, right_col); assign to f/d by
-    // which physical side is the fact.
+    // which physical side is the fact. Track key pairs where both sides use the
+    // SAME column name — those are the only names that may safely appear in
+    // both scan schemas (see the projection attribution below).
     let mut on_terms = Vec::with_capacity(join.on().len());
+    let mut same_named_key_pairs: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     for (l, r) in join.on() {
         let l_name = l.as_any().downcast_ref::<Column>()?.name();
         let r_name = r.as_any().downcast_ref::<Column>()?.name();
+        if l_name == r_name {
+            same_named_key_pairs.insert(l_name);
+        }
         let (fact_col, dim_col) = if fact_is_left {
             (l_name, r_name)
         } else {
@@ -549,8 +569,13 @@ fn build_join_sql(
     }
     let on_clause = on_terms.join(" AND ");
 
-    // Output projection: map each output field to f.<col> or d.<col> by name
-    // (cayenne/TPCH join columns are uniquely named across the two inputs).
+    // Output projection: map each output field to f.<col> or d.<col> by name.
+    // A name present in BOTH scan schemas is ambiguous — the output field could
+    // be either side's column, and attributing it to the wrong side silently
+    // returns the other table's values. The one safe case is a name joined to
+    // itself (`f.x = d.x`): the inner equi-join guarantees both sides carry
+    // equal values on every output row, so either attribution is correct. Bail
+    // on any other shared name and keep the central join.
     let fact_names: std::collections::HashSet<&str> = fact
         .schema
         .fields()
@@ -566,14 +591,19 @@ fn build_join_sql(
     let mut select_items = Vec::with_capacity(join.schema().fields().len());
     for field in join.schema().fields() {
         let name = field.name();
-        let qualified = if fact_names.contains(name.as_str()) {
-            format!("f.{}", quote_ident(name))
-        } else if dim_names.contains(name.as_str()) {
-            format!("d.{}", quote_ident(name))
-        } else {
-            // Output column we can't attribute to a side — bail rather than
-            // produce a wrong schema.
-            return None;
+        let qualified = match (
+            fact_names.contains(name.as_str()),
+            dim_names.contains(name.as_str()),
+        ) {
+            (true, true) if same_named_key_pairs.contains(name.as_str()) => {
+                format!("f.{}", quote_ident(name))
+            }
+            (true, false) => format!("f.{}", quote_ident(name)),
+            (false, true) => format!("d.{}", quote_ident(name)),
+            // Ambiguous non-key name (both sides) — wrong attribution would
+            // be silent wrong data; unattributable name (neither side) —
+            // wrong schema. Bail on both rather than guess.
+            (true, true) | (false, false) => return None,
         };
         select_items.push(format!("{qualified} AS {}", quote_ident(name)));
     }
@@ -631,4 +661,229 @@ fn coerce_batch(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(target), columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_expr::expressions::IsNotNullExpr;
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::sql::TableReference;
+    use tonic::transport::Channel;
+
+    fn dummy_client() -> FlightSqlClient {
+        let channel = Channel::from_static("http://[::1]:1").connect_lazy();
+        let cookie_svc =
+            flight_client::cookie::CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new(cookie_svc)
+    }
+
+    /// A leaf scan with an exact row-count statistic, so the broadcast cost
+    /// gate (`dim_rows × executors × margin < fact_rows`) can be evaluated.
+    fn flight_exec(schema: &SchemaRef, table: &str, rows: usize) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            FlightSqlExec::new(
+                None,
+                schema,
+                &TableReference::parse_str(table),
+                dummy_client(),
+                &[],
+                None,
+                Arc::new(CookieStore::new()),
+            )
+            .expect("build FlightSqlExec")
+            .with_statistics(Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows))),
+        )
+    }
+
+    fn schema_of(fields: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|(name, dt)| Field::new(*name, dt.clone(), true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn inner_hash_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: Vec<(&str, usize, &str, usize)>,
+        null_equality: NullEquality,
+    ) -> Arc<dyn ExecutionPlan> {
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = on
+            .into_iter()
+            .map(|(l_name, l_idx, r_name, r_idx)| {
+                (
+                    Arc::new(Column::new(l_name, l_idx)) as Arc<dyn PhysicalExpr>,
+                    Arc::new(Column::new(r_name, r_idx)) as Arc<dyn PhysicalExpr>,
+                )
+            })
+            .collect();
+        Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                null_equality,
+            )
+            .expect("valid HashJoinExec"),
+        )
+    }
+
+    /// The rewritten SQL when the rewrite fired with a single fact partition
+    /// (the root is then the `BroadcastJoinFlightSqlExec` itself).
+    fn broadcast_sql(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+        plan.as_any()
+            .downcast_ref::<BroadcastJoinFlightSqlExec>()
+            .map(|b| b.sql.clone())
+    }
+
+    const ADDR: &str = "e0:50052";
+
+    #[tokio::test]
+    async fn rewrites_small_dim_join_and_attributes_columns_by_side() {
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(result.transformed, "small-dim inner join must broadcast");
+        let sql = broadcast_sql(&result.data).expect("root should be the broadcast exec");
+
+        assert!(
+            sql.contains(r#"f."f_val" AS "f_val""#),
+            "fact column must come from the fact side: {sql}"
+        );
+        assert!(
+            sql.contains(r#"d."d_name" AS "d_name""#),
+            "dim column must come from the dim side: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ON f."f_key" = d."d_key""#),
+            "equi-key pair must join fact to dim: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("executor_table('https://{ADDR}', 'cat.sch.dim')")),
+            "dim must be gathered from the executor: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_column_name_shared_by_both_sides() {
+        // Both scans expose a non-key column named `note`. The join output
+        // contains two `note` fields (one per side); attributing them by name
+        // alone would return the fact's values for the dim's column. The
+        // rewrite must leave the plan alone.
+        let fact_schema = schema_of(&[("k", DataType::Int64), ("note", DataType::Utf8)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("note", DataType::Utf8)]);
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("k", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "ambiguous shared column name must not broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_shared_name_when_it_is_the_equi_join_key() {
+        // `id` exists on both sides but is the equi-join key joined to itself,
+        // so both output copies provably carry equal values — attribution to
+        // the fact side is safe and the rewrite may fire.
+        let fact_schema = schema_of(&[("id", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("id", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("id", 0, "id", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            result.transformed,
+            "same-named equi-key pair is unambiguous and must broadcast"
+        );
+        let sql = broadcast_sql(&result.data).expect("root should be the broadcast exec");
+        assert!(
+            sql.contains(r#"f."id" AS "id""#),
+            "key columns attribute to the fact side: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"d."id" AS "id""#),
+            "key columns must not be attributed to the dim side: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_null_equals_null_join() {
+        // `IS NOT DISTINCT FROM` joins match NULL keys; SQL `=` does not, so
+        // rendering the join as `f.k = d.k` would drop NULL-key matches.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            flight_exec(&dim_schema, "cat.sch.dim", 10),
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNull,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "NullEqualsNull join must not be rewritten to SQL `=`"
+        );
+    }
+
+    #[tokio::test]
+    async fn bails_on_residual_filter_exec() {
+        // A FilterExec above the scan carries a predicate the scan's SQL does
+        // NOT apply (FlightSQLTable pushdown is Exact-or-Unsupported). The
+        // rewrite would discard the join input subtree — including this filter
+        // — so it must bail and keep the central join.
+        let fact_schema = schema_of(&[("f_key", DataType::Int64), ("f_val", DataType::Int64)]);
+        let dim_schema = schema_of(&[("d_key", DataType::Int64), ("d_name", DataType::Utf8)]);
+        let dim = flight_exec(&dim_schema, "cat.sch.dim", 10);
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("d_name", 1))));
+        let filtered: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, dim).expect("valid FilterExec"));
+        let join = inner_hash_join(
+            flight_exec(&fact_schema, "cat.sch.fact", 1_000),
+            filtered,
+            vec![("f_key", 0, "d_key", 0)],
+            NullEquality::NullEqualsNothing,
+        );
+
+        let result =
+            try_rewrite(join, &[ADDR.to_string()], 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "a residual FilterExec must block the broadcast rewrite"
+        );
+    }
 }
