@@ -356,3 +356,7 @@ required-features = ["chdb-bench", "duckdb-bench"]
 harness = false
 name = "vs_chdb_scan_under_compaction"
 required-features = ["chdb-bench", "duckdb-bench"]
+
+[[bench]]
+harness = false
+name = "publish_metadata_wall"

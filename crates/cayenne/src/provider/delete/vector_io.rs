@@ -405,9 +405,18 @@ impl<'a> DeletionVectorWriter<'a> {
 #[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
-) -> datafusion_common::Result<(HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>)> {
+) -> datafusion_common::Result<(
+    HashMap<String, RoaringBitmap>,
+    HashMap<Box<[u8]>, i64>,
+    HashMap<Box<[u8]>, i64>,
+)> {
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
     let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    // Metadata-only publish: pk_bytes -> max(reinsert_sequence). Each key-based
+    // delete file stamps its per-commit `reinsert_sequence` onto every key it
+    // carries, reconstructing the per-key insert-record map WITHOUT a durable row
+    // per key.
+    let mut reinserted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
     let file_count = delete_files.len();
 
     tracing::debug!(
@@ -445,6 +454,10 @@ pub fn detect_deletion_type_and_read(
 
         // Get the sequence number for this delete file (for sequence-based ordering)
         let file_sequence = delete_file.sequence_number;
+        // Metadata-only publish: the per-commit reinsert sequence carried on this
+        // file's row (None for legacy rows / pure deletes — those fall back to the
+        // `cayenne_insert_record` table at the load site).
+        let file_reinsert = delete_file.reinsert_sequence;
 
         for batch_result in reader {
             let batch = batch_result.map_err(|e| {
@@ -468,6 +481,15 @@ pub fn detect_deletion_type_and_read(
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
                         let key = row_key_array.value(i).to_vec().into_boxed_slice();
+                        // Metadata-only publish: this key was re-inserted at the
+                        // file's per-commit reinsert sequence (when present). Track
+                        // the max across files BEFORE moving `key` into the delete map.
+                        if let Some(reinsert) = file_reinsert {
+                            reinserted_row_keys
+                                .entry(key.clone())
+                                .and_modify(|seq| *seq = (*seq).max(reinsert))
+                                .or_insert(reinsert);
+                        }
                         // Track max delete sequence for each PK
                         deleted_row_keys
                             .entry(key)
@@ -530,7 +552,7 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    Ok((per_file_row_ids, deleted_row_keys))
+    Ok((per_file_row_ids, deleted_row_keys, reinserted_row_keys))
 }
 
 // ============================================================================
@@ -659,6 +681,10 @@ fn build_delete_file(
         deletion_type,
         // Sequence number is set by the caller after getting the current sequence from catalog
         sequence_number: table.current_sequence_number,
+        // Metadata-only publish: the per-commit reinsert sequence is stamped by the
+        // catalog commit (it owns the upsert's insert_sequence); a freshly built
+        // file is None until then. Pure deletes / position files keep None.
+        reinsert_sequence: None,
     })
 }
 
