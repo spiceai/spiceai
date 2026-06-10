@@ -185,13 +185,10 @@ fn bench_checkpoint_fence_stall(c: &mut Criterion) {
 // throughput reclaimed per table per second.
 const ENCODE: Duration = Duration::from_millis(8);
 
-#[inline(never)]
-fn swap_no_op() {
-    // Stand-in for the under-fence work the new path keeps: ArcSwap publish of
-    // the snapshot pointer + deletion cache, clear the flushed epoch, refresh the
-    // listing table. All in-process; real cost is sub-millisecond.
-    black_box(0u64);
-}
+// The under-fence work the new path keeps (ArcSwap publish + tier clear +
+// listing refresh) is all in-process and sub-millisecond — model it with the
+// same no-op symbol the inline-checkpoint lanes use.
+use refresh_listing_table_no_op as swap_no_op;
 
 async fn encode_commit_under_fence(fence: &RwLock<()>, commit_rtt: Duration) -> Duration {
     let started = Instant::now();

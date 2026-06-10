@@ -94,11 +94,8 @@ impl InMemTombstones {
     /// Closed `[min,max]` of all deleted `Int64Pk` keys, or `None` when no
     /// `Int64Pk` tombstone is present. A sound superset of the keys the filter
     /// could remove (mirrors `DeletionIndex::deleted_key_range`). The scan-side
-    /// compose-trap disjoint gate computes the equivalent range over the
-    /// `InlinedDeletionMaps` the tier tombstones are projected into
-    /// (`CayenneTableProvider::int64_map_key_range`); this method exists for the
-    /// tier-level unit tests and as the documented parity point.
-    #[cfg(test)]
+    /// disjoint gate calls this on the `InlinedDeletionMaps` view (an alias of
+    /// this type) — one implementation, no parity to track by hand.
     pub(crate) fn int64_deleted_key_range(&self) -> Option<(i64, i64)> {
         let mut iter = self.int64_pk.keys().copied();
         let first = iter.next()?;
@@ -186,7 +183,8 @@ pub(crate) struct MemTier {
     /// Monotonic mem-tier epoch. Each append advances the live tier; a checkpoint
     /// flushes every segment up to and including the snapshotted epoch and fires
     /// [`SlotAdvancer::on_checkpoint_durable`] with that epoch only after the
-    /// durable fence.
+    /// durable fence. NOT a content version — a checkpoint clear changes the
+    /// tier's contents while PRESERVING this epoch; cache keys use [`Self::version`].
     pub(crate) epoch: u64,
     /// Wall-clock instant the OLDEST un-checkpointed segment was appended, used
     /// by the age cap to bound the crash-replay window for cold tables. `None`
@@ -305,11 +303,16 @@ impl MemTier {
             return empty;
         }
         let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
-        let mut tombstones = InMemTombstones::default();
-        let mut bytes = 0u64;
-        let mut rows = 0u64;
-        let mut superseded = 0u64;
-        for segment in &survivors {
+        // Seed the aggregates from the FIRST survivor (an O(1) HAMT-root clone)
+        // and fold only the rest — this runs under the phase-2 listing fence and
+        // the common interleaved-append case has exactly one survivor, which now
+        // costs scalar adds instead of re-inserting its whole tombstone delta.
+        let first = &survivors[0];
+        let mut tombstones = first.tombstones.clone();
+        let mut bytes = first.bytes;
+        let mut rows = first.rows;
+        let mut superseded = first.superseded;
+        for segment in &survivors[1..] {
             tombstones.merge_from(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);

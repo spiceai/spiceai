@@ -836,9 +836,7 @@ fn default_inline_flush_max_bytes() -> i64 {
 /// background tick time to drain the tier before this cap is reached at typical
 /// CDC rates, while staying small enough that ~N memory-mode tables sum well
 /// under the process-global budget (`get_total_memory()/8`), which remains the
-/// RAM-scaling aggregate backstop. (Was 64 MiB, sized for the old fence-blocking
-/// checkpoint where frequent tiny spills minimized each per-stall duration; that
-/// trade-off is obsolete now that checkpoints don't hold the fence.)
+/// RAM-scaling aggregate backstop.
 fn default_cdc_mem_tier_max_bytes() -> i64 {
     256 * 1024 * 1024
 }
