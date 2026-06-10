@@ -2950,36 +2950,24 @@ enum PkDeletionSnapshot {
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
 
-/// One visible-overlay entry: a tier segment's merge-on-read-FILTERED batches,
-/// with the segment's data sequence (for delta re-filtering) and, for the
-/// Int64Pk strategy, the surviving rows' pk range (delta-overlap pruning).
+// NOTE (lazy-overlay cleanup): the overlay structs + test counters below are now
+// dead (the apply no longer maintains the overlay; the scan always takes the
+// raw-segment path). Kept temporarily so the tree compiles; removed wholesale in
+// the post-run cargo-check-guided cleanup along with the overlay methods/field/tests.
+#[allow(dead_code)]
 struct MemTierOverlayEntry {
     data_sequence: i64,
     batches: Vec<RecordBatch>,
     pk_range: Option<(i64, i64)>,
-    /// `RowConverterBased` (composite-PK) delta-overlap prune: a bloom over this
-    /// entry's surviving row-key bytes. `Some` only for the row-key strategy
-    /// (Int64Pk uses `pk_range`). An inline-conflict delta whose keys all
-    /// `maybe_contains == false` cannot hide any of this entry's rows, so the
-    /// O(entry) re-filter is skipped. `maybe_contains` only ever errs toward a
-    /// false POSITIVE (an unnecessary re-filter) — never a false negative — so a
-    /// stale bloom (still holding a key later filtered out) is conservatively
-    /// safe and never drops a survivor. `Arc` so cloning an entry stays O(1).
     key_bloom: Option<std::sync::Arc<PkBloom>>,
 }
 
-/// The incrementally-maintained visible mem-tier view. See the provider field
-/// docs; valid only while `tier_version` matches the live tier.
+#[allow(dead_code)]
 struct MemTierVisibleOverlay {
     tier_version: u64,
     entries: Vec<MemTierOverlayEntry>,
 }
 
-/// Test-only instrumentation: how often `maintain_mem_tier_overlay_on_append`
-/// took the O(delta) incremental path vs the O(tier) full rebuild. Used to prove
-/// the incremental path is actually reached under sustained appends (a silent
-/// per-append fall-back to `build_mem_tier_overlay` would make the lever-L2 delta
-/// narrowing a no-op and re-impose the O(tier) cost it removes).
 #[cfg(test)]
 pub(crate) static OVERLAY_INCREMENTAL_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -12592,6 +12580,9 @@ impl CayenneTableProvider {
 
     /// Int64-pk range of surviving rows across `batches` (overlay delta-prune
     /// key); `None` for the row-key strategy or when empty.
+    // Dead: overlay subsystem superseded by the lazy mem-tier scan path (the apply
+    // no longer maintains the overlay). Marked here; removed wholesale in follow-up.
+    #[allow(dead_code)]
     fn overlay_pk_range(&self, batches: &[RecordBatch]) -> Option<(i64, i64)> {
         if !self.pk_deletion_strategy.is_int64_pk() {
             return None;
@@ -12625,6 +12616,7 @@ impl CayenneTableProvider {
     /// hide any of this entry's rows (the O(entry) re-filter is then safely
     /// skipped). On any conversion error the bloom is dropped (`None`), which
     /// conservatively forces a re-filter rather than risking a dropped row.
+    #[allow(dead_code)]
     fn build_overlay_key_bloom(
         &self,
         batches: &[arrow::record_batch::RecordBatch],
@@ -12653,6 +12645,7 @@ impl CayenneTableProvider {
     /// merge-on-read filtering `visible_mem_tier_batches` performs, retained
     /// per-segment). O(tier) — runs only on cold start / post-checkpoint, when
     /// the tier is empty-or-small; steady-state appends maintain incrementally.
+    #[allow(dead_code)]
     fn build_mem_tier_overlay(
         &self,
         tier: &crate::provider::mem_tier::MemTier,
@@ -12695,6 +12688,7 @@ impl CayenneTableProvider {
     /// pk range overlaps the delta (every key the delta hides has
     /// `delete_sequence` above every cached entry's `data_sequence`). Falls back
     /// to a full rebuild when the overlay is cold or version-skewed.
+    #[allow(dead_code)]
     fn maintain_mem_tier_overlay_on_append(
         &self,
         prev_version: u64,
@@ -12918,6 +12912,7 @@ impl CayenneTableProvider {
     /// approximate (bloom) existence path conservatively pushes to BOTH lists
     /// (table.rs key-deletion population), so the overlay re-filter is never
     /// starved of a key it must apply.
+    #[allow(dead_code)]
     fn build_mem_tombstones_inlined_only(
         &self,
         deletions: &OnConflictDeletions,
@@ -13004,12 +12999,6 @@ impl CayenneTableProvider {
             // merged-scan-deletions memo both apply to file AND tier rows, so they
             // need every superseded key.
             let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
-            // RAM-hit ONLY (lever L2): the visible overlay holds in-RAM tier rows,
-            // so only deletions whose prior copy is RAM-resident can hide an overlay
-            // row. Passing this narrower delta makes the dominant file-resident
-            // conflict case an O(1) overlay maintenance instead of an O(tier)
-            // re-filter under the listing fence. See `build_mem_tombstones_inlined_only`.
-            let overlay_delta = self.build_mem_tombstones_inlined_only(deletions, delete_sequence);
 
             let cur = self.mem_tier.load();
             let next = cur.append_segment(
@@ -13022,20 +13011,16 @@ impl CayenneTableProvider {
             );
             let epoch = next.epoch;
             let next_version = next.version;
-            // Maintain the incrementally-filtered visible overlay BEFORE the
-            // swap publishes the new tier (same fence => scans see tier+overlay
-            // move together; a version mismatch on read just falls back). Timed
-            // separately so the per-entry bloom prune's effect on the overlay
-            // re-filter cost is observable apart from the rest of the fence work.
-            let __ov = std::time::Instant::now();
-            self.maintain_mem_tier_overlay_on_append(
-                cur.version,
-                &next,
-                &arc_batches,
-                data_sequence,
-                &overlay_delta,
-            )?;
-            record_cayenne_write_phase(&self.table_metadata.table_name, "inmemory_overlay", __ov);
+            // The visible overlay is no longer eagerly maintained on the apply
+            // path. Its only justification — avoiding an O(tier) per-scan
+            // deletion-map rebuild — is obsolete now that the mem-tier tombstones
+            // are an `im::HashMap` (O(1) structural clone). Eager maintenance
+            // traded an expensive fence-held O(tier) re-filter on every
+            // conflicting append for a cheap per-row tombstone probe at scan time
+            // — backwards, since the apply is the throughput bottleneck (the
+            // re-filter was ~72% of `cdc_path_inmemory`). Scans now always take
+            // the raw-segment path (`visible_mem_tier_batches`), applying
+            // tombstones lazily via the same O(1)-map probe the file side uses.
             self.mem_tier.store(Arc::new(next));
             // A new tombstone can retroactively hide rows already materialized in
             // a cached inline/mem view, so this is a STRUCTURAL change (full
