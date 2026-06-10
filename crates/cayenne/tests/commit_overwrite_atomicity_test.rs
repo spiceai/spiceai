@@ -120,6 +120,7 @@ async fn plant_full_pre_overwrite_state(
         file_size_bytes: 128,
         deletion_type: DeletionType::PositionBased,
         sequence_number: 7,
+        reinsert_sequence: None,
     };
     catalog
         .add_delete_file(delete_file)

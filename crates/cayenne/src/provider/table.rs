@@ -7530,7 +7530,7 @@ impl CayenneTableProvider {
     ///
     /// 1. Building deletion vector specs from raw row keys
     /// 2. Writing deletion vector files via [`DeletionVectorWriter`]
-    /// 3. Committing delete files + optional insert records to the catalog
+    /// 3. Committing delete files + optional reinsert metadata to the catalog
     async fn write_and_commit_deletion_vectors(
         &self,
         delete_sequence: i64,
@@ -7901,14 +7901,14 @@ impl CayenneTableProvider {
             std::mem::take(&mut *self.pending_durable_tombstone_flips.lock());
 
         // Stage-A metastore write #2 (FOLDED): commit the on-conflict deletion
-        // metadata (delete files + insert records + protected-snapshot sequence)
+        // metadata (delete files + reinsert metadata + protected-snapshot sequence)
         // AND the inline tombstone INSERT AND the deferred flips in ONE
         // transaction. Previously these were two transactions
         // (`commit_on_conflict_deletions` then `add_inlined_delete`), each
         // acquiring the process-wide SQLite writer separately. Instrumented as
         // `stage_tombstone_prepare` (the audit's name for "the OTHER per-batch
         // metastore write transactions"). Statement order is preserved: delete
-        // files → insert records → snapshot sequence → tombstone INSERT →
+        // files → reinsert metadata → snapshot sequence → tombstone INSERT →
         // deferred flips.
         let tombstone_prepare_start = Instant::now();
         let commit_result = self
@@ -13425,6 +13425,11 @@ impl CayenneTableProvider {
                             .entry(pk)
                             .and_modify(|s| *s = (*s).max(*seq))
                             .or_insert(*seq);
+                    } else {
+                        tracing::warn!(
+                            "Skipping invalid Int64 derived reinsert key with length {} (expected at least 8 bytes)",
+                            bytes.len()
+                        );
                     }
                 }
                 (merged, insert_records_row_keys)
@@ -18111,8 +18116,16 @@ mod tests {
         // Insert (new keys, no conflict), then upsert the SAME keys at new values:
         // the conflict writes a key-based delete file stamped with the per-commit
         // reinsert_sequence and NO per-key insert_record.
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &vec![100; 8])).await;
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &vec![200; 8])).await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &[100; 8]),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &[200; 8]),
+        )
+        .await;
 
         let expected: Vec<(i64, i64)> = ids.iter().map(|&id| (id, 200)).collect();
         assert_eq!(

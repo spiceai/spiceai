@@ -2546,6 +2546,15 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(());
         }
 
+        if delete_files.is_empty() && !insert_pk_bytes_list.is_empty() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Cannot commit {} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows",
+                    insert_pk_bytes_list.len()
+                ),
+            });
+        }
+
         // Validate every delete_file belongs to this table_id up front so a
         // mismatch can't half-apply via the txn. Duplicate path metadata is
         // checked by the INSERT/ON CONFLICT guard inside the transaction and
@@ -2785,6 +2794,15 @@ impl MetadataCatalog for CayenneCatalog {
             && pending_durable_flips.is_empty()
         {
             return Ok(None);
+        }
+
+        if delete_files.is_empty() && !insert_pk_bytes_list.is_empty() {
+            return Err(CatalogError::InvalidOperationNoSource {
+                message: format!(
+                    "Cannot commit {} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows",
+                    insert_pk_bytes_list.len()
+                ),
+            });
         }
 
         // Generate the tombstone id up front (outside the retry loop) so a retry
@@ -4096,6 +4114,72 @@ mod tests {
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].delete_file_id, first_id);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_rejects_reinsert_keys_without_delete_files() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_reinsert_without_delete_files_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let err = catalog
+            .commit_on_conflict_deletions(Vec::new(), "table_id", vec![vec![1_u8]], 2, None)
+            .await
+            .expect_err("reinsert keys without delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without delete files"),
+                    "expected missing delete files in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_with_tombstone_rejects_reinsert_without_delete_files() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_tombstone_reinsert_without_delete_files_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let err = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                Vec::new(),
+                "table_id",
+                vec![vec![1_u8]],
+                2,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("reinsert keys without delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without delete files"),
+                    "expected missing delete files in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
