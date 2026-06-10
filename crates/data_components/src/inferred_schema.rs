@@ -56,14 +56,14 @@ pub const INFERRED_METADATA_KEYS: [&str; 5] = [
 /// surfaces the inferred row-count / byte-size as table statistics (see
 /// `MetadataEnrichedTableProvider`) and seeds the accelerator's tuning warm-start
 /// from them. They must not, however, ride on a query scan's *output* schema.
-/// Their values vary per table, and DataFusion builds a join's output schema by
+/// Their values vary per table, and `DataFusion` builds a join's output schema by
 /// merging its inputs' schema-level metadata in input order; when the
 /// `join_selection` physical-optimizer rule swaps a hash join's build/probe
 /// sides, that merge order flips and the surviving values change, so the rule's
 /// output schema no longer equals its input schema and the schema-invariant
 /// check fails. Strip them from the scan schema (only) to keep join schemas
 /// stable while leaving the statistics/tuning consumers untouched.
-pub fn strip_inferred_metadata(metadata: &mut HashMap<String, String>) {
+pub fn strip_inferred_metadata<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>) {
     for key in INFERRED_METADATA_KEYS {
         metadata.remove(key);
     }
