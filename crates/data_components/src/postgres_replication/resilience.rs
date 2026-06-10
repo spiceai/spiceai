@@ -164,6 +164,14 @@ fn is_transient_by_display(msg: &str) -> bool {
         "network is unreachable",
         "host unreachable",
         "operation interrupted",
+        // SQLSTATE 55006 (object_in_use): "replication slot ... is active for
+        // PID ...". A reconnect can race the previous walsender's teardown —
+        // the server releases the slot within moments, so retry with backoff
+        // instead of failing the stream. (Two *distinct* consumers fighting
+        // over one slot keep erroring through the retry budget and still
+        // surface, just slower.)
+        "sqlstate 55006",
+        "is active for pid",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
