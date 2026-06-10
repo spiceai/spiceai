@@ -14,7 +14,35 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Turso implementation of the metastore backend.
+//! Turso (libSQL-rewrite) implementation of the metastore backend, behind the
+//! `turso` cargo feature.
+//!
+//! Uses the native-Rust `turso` crate against a local database file
+//! (`libsql://` connection strings are accepted; the prefix is stripped).
+//! Connections run `PRAGMA journal_mode = 'mvcc'`
+//! (`turso_shared::JOURNAL_MODE_SQL_LITERAL`), which enables
+//! `BEGIN CONCURRENT`: MVCC write transactions on different connections can
+//! proceed in parallel instead of serializing on a single engine-level write
+//! lock as in plain `SQLite` WAL. A fixed pool of K = 16 connections is opened
+//! lazily on first use; each connection sets a 5 s busy timeout,
+//! `foreign_keys = ON`, `synchronous = NORMAL` (no per-commit fsync — durable
+//! to process crash, the most recent commits may be lost on power failure),
+//! and a 32 MiB page cache.
+//!
+//! Differences from the `SQLite` backend ([`super::sqlite`]):
+//!
+//! * Transactions use `BEGIN CONCURRENT` rather than `BEGIN IMMEDIATE`.
+//! * `cayenne_insert_record` is a plain rowid table — Turso rejects
+//!   `WITHOUT ROWID` under the `mvcc` journal mode.
+//! * No `checkpoint_wal` override: the default no-op applies, and `shutdown`
+//!   performs no checkpoint/optimize either (Turso manages its own journal).
+//! * Pragmas are fixed at the values above; the `SqliteMetastoreConfig`
+//!   runtime tuning does not apply here.
+//!
+//! The schema DDL, additive `ALTER TABLE` backfills, legacy
+//! `cayenne_insert_record` migration, and expected-schema validation against
+//! [`super::EXPECTED_TABLES`] all mirror the `SQLite` backend so the catalog
+//! sees an identical column layout on either backend.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
@@ -268,8 +296,8 @@ impl TursoMetastore {
     /// dropped (see `init_schema` for the legacy-schema migration).
     ///
     /// `table_id` stores the 16 raw bytes of the UUID (`BLOB`), not the 36-char
-    /// text — a pure re-encoding (via `cayenne_catalog::insert_record_table_id_value`
-    /// / `metastore::table_id_to_key_bytes`) that cuts the WAL/journal volume of
+    /// text — a pure re-encoding (via `cayenne_catalog::util::insert_record_table_id_value`
+    /// over `metastore::table_id_to_key_bytes`) that cuts the WAL/journal volume of
     /// hot upsert bursts; see the `SQLite` `INSERT_RECORD_TABLE_DDL` doc for the
     /// full rationale and correctness contract. The catalog builders bind the
     /// same `MetastoreValue::Blob` regardless of backend, so this column shape

@@ -39,17 +39,18 @@ limitations under the License.
 //!   `DataFusion` `TableProvider` impl.
 //! - [`scan`]: `CayenneAccelerationExec` wrapper and round-robin repartitioning
 //!   used to fan unsorted writes across multiple writer partitions.
-//! - [`vortex_format`]: `DeletionFilteringVortexFormat` wrapping
-//!   `vortex_datafusion::VortexFormat` to attach per-file position-based
-//!   deletion vectors and to gate decimal→float predicate pushdown.
+//! - [`vortex_format`]: `PositionDeletionAccessPlanProvider` — exposes
+//!   per-file position-based deletion vectors to `vortex-datafusion` as scan
+//!   access plans and soundly downgrades footer statistics for deleted rows.
 //! - [`sink`]: `CayenneDataSink` — `DataFusion` `DataSink` adapter that the
 //!   regular (non-CDC) write path uses for both append and overwrite modes.
 //! - [`mutation_writer`]: `AppendMutationWriter` — append-side write logic,
 //!   inline-memtable admission, and `write_cdc_pipelined` for the Stage A /
 //!   Stage B CDC path consumed by `runtime/src/accelerated_table/refresh_task`.
 //! - [`staging_wal`]: Staging WAL for crash-safe staged appends. Three-phase
-//!   commit lifecycle: `prepare` (write WAL) → `apply_under_barrier` (move +
-//!   listing-cache invalidation) → `finish` (drop write guard).
+//!   commit lifecycle: `prepare` (write WAL, register the in-flight append) →
+//!   `apply_under_barrier` (move + listing-cache invalidation) → `finish`
+//!   (unregister the in-flight append, return the row count).
 //! - [`overwrite`]: Catalog-pointer-flip path for overwrite-mode writes.
 //! - [`delete`]: Deletion vector handling and filtering.
 //!   - [`delete::sink`]: position- and key-based deletion sinks for SQL `DELETE`.
@@ -59,12 +60,32 @@ limitations under the License.
 //! - [`deletion_index`]: Bloom-prefiltered `DeletionIndex` (Int64 PKs) and
 //!   `KeyDeletionIndex` (composite byte keys) used by the filter execs.
 //! - [`deletion_strategy`]: `PkDeletionStrategyWithCache` — the per-table
-//!   deletion strategy and its atomically-published `ArcSwap<DeletionSnapshot>`.
-//! - [`compaction`]: Tiered small-files picker and `BackgroundCompactor`.
-//! - [`retention`]: Time-based retention filter builder + SQL retention DDL.
+//!   deletion strategy with its atomically-published `ArcSwap` caches
+//!   (`Int64PkDeletionSnapshot` / `RowConverterDeletionSnapshot` plus the
+//!   per-file position-delete map).
+//! - [`compaction`]: Tiered small-files picker, `BackgroundCompactor`, and the
+//!   background mem-tier checkpointer.
+//! - [`retention`]: Time-based retention keep-filter builder + retention
+//!   filter-expression parsing.
 //! - [`streaming`]: Streaming execution plan for write operations.
 //! - [`context`]: `CayenneContext` — shared Vortex format, upload semaphore,
-//!   `RuntimeEnv`, and config.
+//!   `RuntimeEnv`, config, and the live (dynamically-tunable) knobs.
+//! - [`tuning`]: Closed-loop dynamic auto-tuning for the CDC ingest path
+//!   (`LiveKnobs`, `IngestStats`, the `decide` controller).
+//! - [`mem_tier`]: In-RAM CDC durability tier (`cdc_durability: memory`) and
+//!   the `SlotAdvancer` deferred-ack callback.
+//! - [`mem_tier_budget`]: Process-global byte budget bounding the aggregate
+//!   RAM held by all memory-mode tables.
+//! - [`write_budget`]: Process-global encode-concurrency budget shared across
+//!   all tables' write/encode paths.
+//! - [`memory_account`]: Per-table reservation of off-pool resident state (PK
+//!   keyset + deletion indexes) against the `DataFusion` memory pool.
+//! - [`delta_encoding`]: Per-write encoding levels (`cayenne_delta_encoding`)
+//!   distinguishing short-lived delta writes from maintenance rewrites.
+//! - [`file_pruning`]: Statistics-based pruning of whole files / inline
+//!   segments before scan planning.
+//! - [`fsync_tier`]: Ordering-tier fsync helpers used on the staged-commit hot
+//!   path (plain `fsync(2)` on macOS, `fdatasync`/`fsync` elsewhere).
 //! - [`utils`]: Numeric conversion utilities.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table

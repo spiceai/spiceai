@@ -15,22 +15,48 @@ limitations under the License.
 */
 
 //! Data structures for Cayenne metadata.
+//!
+//! Plain-data rows and configuration types persisted by the metadata catalog:
+//! table/partition/file records ([`TableMetadata`], [`PartitionMetadata`],
+//! [`DataFile`], [`DeleteFile`]), the inline level-0 memtable rows
+//! ([`InlinedData`], [`InlinedDelete`]), per-table statistics
+//! ([`TableStatistics`], [`SnapshotFileStatistics`]), and the per-table
+//! configuration surface ([`VortexConfig`] and its enums).
+//!
+//! # Sequence-number model
+//!
+//! Visibility ordering is Iceberg-style: every insert and delete is stamped
+//! with a monotonically increasing per-table sequence number. A delete with
+//! sequence `S` masks data with sequence `<= S`; a row survives only when its
+//! data sequence is **strictly greater** than every applicable delete sequence
+//! (`data_sequence > delete_sequence`). Upserts therefore reserve the delete
+//! sequence strictly below the replacement data's sequence so the re-inserted
+//! row stays visible.
 
 use arrow_schema::SchemaRef;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use serde::{Deserialize, Serialize};
 
-/// Default maximum number of rows to inline in the metastore instead of writing a Vortex file.
+/// Default for [`VortexConfig::inline_max_rows`]: maximum rows in a single write
+/// that may be inlined into the metastore instead of writing a Vortex file (1024).
 pub const DEFAULT_INLINE_MAX_ROWS: usize = 1024;
-/// Default maximum serialized IPC size in bytes for a single inlined entry.
+/// Default for [`VortexConfig::inline_max_bytes`]: maximum serialized Arrow IPC
+/// size of a single inlined entry (1 MiB).
 pub const DEFAULT_INLINE_MAX_BYTES: usize = 1_048_576;
-/// Default maximum in-memory byte budget while buffering an inline fast-path stream.
+/// Default for [`VortexConfig::inline_max_buffer_bytes`]: maximum in-memory bytes
+/// buffered while deciding whether a streaming write qualifies for inlining (4 MiB).
 pub const DEFAULT_INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576;
-/// Default maximum rows to keep inline before flushing to Vortex.
+/// Default for [`VortexConfig::inline_flush_max_rows`]: total inline rows that may
+/// accumulate before a checkpoint flushes them to Vortex (10,000). The
+/// `INLINE_FLUSH_*` thresholds are *flush* caps (when accumulated inline data is
+/// checkpointed to Vortex), unlike the `INLINE_MAX_*` *admission* caps above
+/// (whether a single write may be inlined at all).
 pub const DEFAULT_INLINE_FLUSH_MAX_ROWS: i64 = 10_000;
-/// Default maximum inline entries before flushing to Vortex.
+/// Default for [`VortexConfig::inline_flush_max_segments`]: total inline entries
+/// that may accumulate before a checkpoint flushes them to Vortex (64).
 pub const DEFAULT_INLINE_FLUSH_MAX_SEGMENTS: i64 = 64;
-/// Default maximum serialized IPC bytes to keep inline before flushing to Vortex.
+/// Default for [`VortexConfig::inline_flush_max_bytes`]: total serialized IPC bytes
+/// that may accumulate inline before a checkpoint flushes them to Vortex (8 MiB).
 pub const DEFAULT_INLINE_FLUSH_MAX_BYTES: i64 = 8 * 1_048_576;
 
 /// Metadata about a table in the catalog.
@@ -59,14 +85,15 @@ pub struct TableMetadata {
     pub vortex_config: VortexConfig,
     /// Current sequence number for ordering operations (Iceberg-style).
     ///
-    /// Monotonically increasing counter used to order deletes and inserts.
-    /// When data is inserted, it gets the current sequence number.
-    /// When a delete is written, it also gets the current sequence number.
-    /// A delete only applies to data with `data_sequence < delete_sequence`.
+    /// Monotonically increasing counter used to order deletes and inserts:
+    /// each insert and delete is stamped with a sequence number at commit time.
+    /// A delete applies to data with `data_sequence <= delete_sequence`; a row
+    /// survives only when `data_sequence > delete_sequence` (equal sequences
+    /// mean the delete wins).
     ///
-    /// This enables upsert semantics: if a PK is deleted and then re-inserted,
-    /// the new insert has a higher sequence than the delete, so the delete
-    /// doesn't apply to the new data.
+    /// This enables upsert semantics: when a PK is deleted and re-inserted, the
+    /// write path reserves the delete's sequence *strictly below* the new
+    /// data's sequence, so the delete doesn't apply to the new row.
     pub current_sequence_number: i64,
 }
 
@@ -100,8 +127,9 @@ pub struct DataFile {
     /// Starting row ID for this file (for row ID assignment)
     pub row_id_start: i64,
     /// Sequence number when this data file was written.
-    /// Used for ordering deletions: a deletion only applies to data files with
-    /// `sequence_number` <= the delete file's `sequence_number`.
+    /// Used for ordering against deletes: a delete masks this file's rows when
+    /// this `sequence_number` is `<=` the delete's `sequence_number`; the rows
+    /// stay visible only when it is strictly greater.
     pub sequence_number: i64,
 }
 
@@ -143,11 +171,14 @@ pub struct DeleteFile {
     pub deletion_type: DeletionType,
     /// Sequence number for ordering deletes (Iceberg-style).
     ///
-    /// A delete only applies to data files whose `data_sequence_number` is
-    /// strictly less than this delete's `sequence_number`. This enables
-    /// upsert semantics without anti-deletion tracking:
-    /// - New inserts get higher sequence numbers
-    /// - Old deletes don't apply to new data with the same PK
+    /// This delete applies to data whose sequence number is less than or
+    /// equal to this `sequence_number`; data survives only when its sequence
+    /// is strictly greater (visibility check: `data_sequence >
+    /// delete_sequence`). This enables upsert semantics without anti-deletion
+    /// tracking:
+    /// - Re-inserts are written at a strictly higher sequence than the
+    ///   conflict delete
+    /// - So old deletes don't apply to new data with the same PK
     pub sequence_number: i64,
 }
 
@@ -720,14 +751,16 @@ pub struct VortexConfig {
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill. Defaults to 64 MiB so the write path self-spills while the
-    /// tier is small (the per-append clone stays cheap).
+    /// the spill. Defaults to 256 MiB: the synchronous write-path spill is a
+    /// rare backstop, with the periodic background checkpointer as the primary
+    /// flush (see `default_cdc_mem_tier_max_bytes` for the sizing rationale).
     #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
-    /// trip). `0` disables the age trigger. Defaults to 2 s.
+    /// trip). `0` disables the age trigger. Defaults to 10 s (the 1 s background
+    /// checkpointer drains actively-written tables well before this fires).
     #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
     /// Periodic background mem-tier checkpoint interval in milliseconds, in

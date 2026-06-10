@@ -55,6 +55,65 @@ limitations under the License.
 //!
 //! - **Tables**: Metadata about table schemas and structure
 //! - **Data Files**: Metadata for virtual files (Vortex `ListingTables` at unique directories)
+//!
+//! # Layering
+//!
+//! From the storage backend up to `DataFusion`:
+//!
+//! ```text
+//! metastore::{sqlite, turso}        raw SQL backends (single-writer queue, WAL tuning)
+//!         ▲
+//! cayenne_catalog::CayenneCatalog   concrete MetadataCatalog impl (transactions, retries)
+//!         ▲
+//! catalog::MetadataCatalog          backend-agnostic trait the rest of the crate codes to
+//!         ▲
+//! provider::CayenneTableProvider    per-table DataFusion TableProvider (scan/insert/delete/
+//!         ▲                         update, compaction, inline memtable, deletion vectors)
+//! catalog_provider::*               DataFusion CatalogProvider/SchemaProvider adapters
+//! ```
+//!
+//! `logical_optimizer` and `optimizer_rules` contribute Cayenne-aware logical and
+//! physical `DataFusion` optimizer rules; `ddl` (feature-gated) handles
+//! CREATE/DROP/ALTER and MERGE planning.
+//!
+//! # Write paths
+//!
+//! - **Append**: serialized per table by an internal write lock. Data is staged
+//!   under a staging directory with a crash-safe WAL (`provider::staging_wal`,
+//!   3 phases: prepare WAL → atomic catalog commit → finish), then moved into the
+//!   current snapshot directory.
+//! - **Inline memtable**: small batches are stored directly in the metastore
+//!   (level-0) instead of writing Vortex files, and checkpointed to Vortex once
+//!   row/segment/byte pressure thresholds are exceeded.
+//! - **CDC upsert**: pipelined Stage A/B writes with sequence numbers reserved in
+//!   blocks; conflicting primary keys are masked via deletion vectors or inline
+//!   tombstones whose visibility flips atomically after durability.
+//!
+//! # Read path & deletion model
+//!
+//! Scans list the current snapshot's files (wait-free via `ArcSwap`d listing
+//! state), union the inline memtable / memory tier, and apply deletion filtering.
+//! Deletions are tracked two ways:
+//!
+//! - **Key-based**: deleted primary keys, applied with sequence-number ordering —
+//!   a delete masks only rows whose data sequence is older than the delete
+//!   sequence, which is what makes upsert (delete + higher-sequence re-insert)
+//!   correct.
+//! - **Position-based**: roaring bitmaps of row positions per file, used when no
+//!   suitable primary key exists.
+//!
+//! Deletion state is published as immutable snapshots behind `ArcSwap` so readers
+//! never block on writers.
+//!
+//! # Concurrency invariants (per table)
+//!
+//! - `write_lock` serializes mutation streams; scans never take it.
+//! - `listing_fence` (`RwLock`) coordinates staged-file moves and listing-cache
+//!   invalidation against in-flight scans.
+//! - `scan_state_lock` atomically publishes deletion snapshots, protected
+//!   snapshots, and inline-data visibility together.
+//! - Catalog commits are single metastore transactions; delete files, insert
+//!   records, and snapshot sequence bumps are never partially visible.
 
 pub mod catalog;
 pub mod catalog_provider;

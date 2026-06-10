@@ -105,7 +105,8 @@ pub enum Error {
 /// A specialized [`Result`](std::result::Result) type for Cayenne catalog operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Default catalog name used when no catalog ID is specified.
+/// Catalog name used to derive the default on-disk layout
+/// (`<spice_data_base_path>/cayenne_<name>/{metadata,data}`).
 const DEFAULT_CATALOG_NAME: &str = "cayenne";
 
 /// `DataFusion` [`CatalogProvider`] backed by a Cayenne metadata catalog.
@@ -248,10 +249,13 @@ impl CayenneCatalogProvider {
         self.schemas.read().get(name).cloned()
     }
 
-    /// Registers or replaces a schema provider for a namespace.
+    /// Registers or replaces a schema provider for a namespace, returning the
+    /// previous provider for that namespace, if any.
     ///
     /// # Errors
     ///
+    /// Never fails; the `Result` exists for parity with
+    /// [`CatalogProvider::register_schema`], which delegates here.
     pub fn register_schema_provider(
         &self,
         name: &str,
@@ -329,6 +333,16 @@ impl CatalogProvider for CayenneCatalogProvider {
 
 #[async_trait]
 impl RefreshableCatalogProvider for CayenneCatalogProvider {
+    /// Re-list tables from the metadata catalog and rebuild the namespace →
+    /// schema-provider map.
+    ///
+    /// Table providers that already exist in a schema are kept as-is (their
+    /// in-memory state is authoritative; see `refresh_from`) — only newly
+    /// discovered tables get freshly opened providers. Namespaces that no
+    /// longer have any tables in the catalog are dropped from the schema map,
+    /// and their old provider's table map is emptied so externally held
+    /// references stop serving stale tables. A failure to list tables is
+    /// logged and treated as an empty catalog rather than an error.
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let table_names = self.catalog.list_table_names().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to list existing Cayenne tables: {e}");
@@ -431,7 +445,10 @@ impl CayenneSchemaProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if any table fails to load from the catalog.
+    /// Currently never fails: a table that cannot be loaded or opened is
+    /// logged at warn level and omitted from the schema rather than failing
+    /// construction (it can still be lazily loaded later via
+    /// [`SchemaProvider::table`]).
     pub async fn try_new(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
@@ -530,7 +547,12 @@ impl CayenneSchemaProvider {
         format!("{}/{short_name}", self.namespace)
     }
 
-    /// Create a [`CayenneTableProvider`] for a table by its full metadata name.
+    /// Create a Cayenne table provider for a table by its full metadata name.
+    ///
+    /// Returns `Ok(None)` both when the table does not exist in the catalog
+    /// and when it exists but fails to open (the open failure is logged at
+    /// warn level). Only non-`TableNotFound` catalog lookup errors propagate
+    /// as `Err`.
     async fn load_table(
         catalog: &Arc<dyn MetadataCatalog>,
         table_name: &str,

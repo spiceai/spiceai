@@ -15,7 +15,23 @@ limitations under the License.
 */
 
 //! [`CayennePartitionCreator`] — implements [`PartitionCreator`] for Cayenne-backed
-//! partitioned tables, creating and opening per-partition [`CayenneTableProvider`]s.
+//! partitioned tables, creating and opening per-partition `CayenneTableProvider`s.
+//!
+//! Each partition is a full Cayenne table of its own, rooted at a Hive-style
+//! subdirectory of the parent table's base path (e.g.
+//! `base/year=2025/month=10/`) and registered in the metadata catalog as both a
+//! `PartitionMetadata` row and a per-partition table named
+//! `<table>_<partition-key>` (slashes in composite keys replaced with `_`).
+//! On local filesystems, creating a partition fsyncs the parent directory
+//! before the catalog `add_partition` commit so the directory entry is durable
+//! first. All partitions share one [`CayenneContext`] (footer/segment caches)
+//! and inherit the parent's schema, primary key, on-conflict, retention, and
+//! Vortex config.
+//!
+//! Filter pushdown to partition selection is `Inexact` and only offered for
+//! filters whose columns are all referenced by partition expressions; other
+//! filters are `Unsupported` at this layer and evaluated inside each
+//! partition's provider.
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};

@@ -13,6 +13,13 @@ limitations under the License.
 */
 
 //! Memory-pool accounting for Cayenne resident state that lives outside query execution.
+//!
+//! Tracks two byte dimensions per table — the PK keyset cache (exact keyset or
+//! bloom) and the deletion/insert-record indexes (including position-delete
+//! vectors) — as one [`MemoryReservation`] against the `DataFusion`
+//! `MemoryPool` that `runtime.query.memory_limit` controls. Used by the table
+//! provider and the deletion sink whenever either dimension is republished;
+//! see [`CayenneMemoryAccount`] for why the accounting is infallible.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

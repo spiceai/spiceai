@@ -19,6 +19,13 @@ limitations under the License.
 //! Defines [`PkDeletionStrategy`] (the strategy kind) and [`PkDeletionStrategyWithCache`]
 //! (the strategy with its associated in-memory caches).
 //!
+//! The strategy is selected from the table's primary-key configuration: no PK
+//! → `PositionBased`; a single Int64 PK column → `Int64Pk`; any other PK shape
+//! → `RowConverterBased`. Orthogonally, `deletion_mode: position` (the `auto`
+//! default for PK tables) adds a per-file position-delete cache alongside the
+//! key index, so deletes with a known `(file, position)` are pushed into the
+//! Vortex scan while only unlocated rows pay the above-scan key probe.
+//!
 //! Caches are held in [`ArcSwap`] cells so that scans probe a wait-free, immutable
 //! snapshot. Writers build a new index off the hot path and publish it via a single
 //! atomic swap; readers never block on a write lock.
@@ -195,14 +202,18 @@ impl RowConverterDeletionSnapshot {
 /// Chosen based on the table's primary key configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PkDeletionStrategy {
-    /// No primary key - use position-based deletion with `RoaringBitmap`.
-    /// Requires `CoalescePartitionsExec` to ensure consistent ordering.
+    /// No primary key - use position-based deletion with per-file
+    /// `RoaringBitmap`s, pushed into the Vortex scan as per-file access plans
+    /// (`Selection::ExcludeRoaring`); no above-scan filter exec is needed.
     PositionBased,
-    /// Single-column Int64 primary key - use direct `HashSet<i64>` lookup.
-    /// Most efficient: no serialization, 8 bytes per key, parallel reads.
+    /// Single-column Int64 primary key - probe a bloom-prefiltered
+    /// [`DeletionIndex`] of fused delete/insert-sequence tombstones.
+    /// Most efficient key-based strategy: no key serialization, wait-free
+    /// parallel reads.
     Int64Pk,
-    /// Composite or non-integer primary key - use `RowConverter` + `HashSet<Box<[u8]>>`.
-    /// Handles all PK types but has serialization overhead.
+    /// Composite or non-integer primary key - `RowConverter` byte keys probed
+    /// against a [`KeyDeletionIndex`] (keyed by the XXH3-128 hash of the key
+    /// bytes). Handles all PK types but pays per-row key encoding.
     RowConverterBased,
 }
 

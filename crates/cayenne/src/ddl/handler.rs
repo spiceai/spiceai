@@ -36,7 +36,13 @@ use crate::ddl::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExec, CayenneDropTableExec,
 };
 
-/// Handle DDL for Cayenne Catalog (via using `datafusion_ddl` machinery).
+/// Single-node [`CatalogDdlHandler`] for Cayenne catalogs, plugged into the
+/// `datafusion_ddl` analyzer/planner machinery.
+///
+/// Targets catalogs whose provider downcasts directly to
+/// [`CayenneCatalogProvider`]. The `PARTITION BY` expression arrives as a
+/// logical `Expr` in the params' extension and is carried as raw SQL text, to
+/// be re-parsed and validated at execution time.
 #[derive(Debug, Default)]
 pub struct CayenneDdlHandler;
 

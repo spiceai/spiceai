@@ -22,9 +22,9 @@ limitations under the License.
 //!
 //! - [`AppendMutationWriter::write`] — the synchronous append path used by
 //!   `DataFusion`'s `INSERT INTO` and by CDC fallback. Runs prepare →
-//!   try-inline-or-stage → optional on-conflict deletion vectors → optional
-//!   retention/sort → schedule post-write maintenance (debounced refresh +
-//!   stats + compaction).
+//!   try-inline-or-stage → optional on-conflict deletion vectors → schedule
+//!   post-write maintenance (debounced refresh + stats + compaction +
+//!   asynchronous retention when configured).
 //! - [`AppendMutationWriter::write_cdc_pipelined`] — the CDC fast path. Stage A
 //!   writes Vortex files into the staging dir and returns a [`super::table::CayenneCdcWrite`]
 //!   that owns the staging-WAL receipt and the still-held per-table write
@@ -34,9 +34,11 @@ limitations under the License.
 //! ## Pipelined vs. synchronous routing
 //!
 //! `write_cdc_pipelined` short-circuits to the synchronous `write_prepared_stream`
-//! path when the table has pending PK deletions or is partitioned — those need
-//! state held until the visibility flip is durable and can't be deferred to
-//! Stage B.
+//! path only for partitioned tables — their visibility flip can't be deferred
+//! to a backgrounded publish. Tables with pending PK deletions DO pipeline:
+//! the batch stages into a `ProtectedSnapshot` whose `snapshot_sequence` is
+//! reserved above the current max delete sequence, so the new rows are immune
+//! to every pre-existing tombstone.
 //!
 //! On-conflict (upsert) tables DO pipeline: the burst stages into a new
 //! protected snapshot and the on-conflict deletions are resolved and published
@@ -58,10 +60,10 @@ limitations under the License.
 //! restreamed into the regular staged-write path.
 //!
 //! The cumulative memtable flush thresholds (`inline_flush_max_*` on
-//! `VortexConfig`) are evaluated by
+//! `VortexConfig`) are checked after every inline insert via
+//! `schedule_inline_checkpoint_if_memtable_pressure_exceeded`, which schedules
 //! [`super::table::CayenneTableProvider::checkpoint_inlined_data_if_memtable_pressure_exceeded`]
-//! after every inline insert, and trigger a checkpoint to a Vortex file when
-//! exceeded.
+//! to flush the inline memtable to a Vortex file when exceeded.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

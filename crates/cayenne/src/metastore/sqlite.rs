@@ -16,8 +16,45 @@ limitations under the License.
 
 //! `SQLite` implementation of the metastore backend.
 //!
-//! Uses `tokio-rusqlite` for a persistent connection managed by a background thread,
-//! avoiding the overhead of opening a new connection for each operation.
+//! Uses `tokio-rusqlite`, which runs each `rusqlite` connection on its own
+//! background thread. The metastore keeps a lazily-initialised pool of
+//! K = `min(available_parallelism, 32)` (minimum 2, fallback 4) persistent
+//! connections plus one **dedicated checkpoint connection**, avoiding both the
+//! cost of opening a connection per operation and a single-mutex serialization
+//! bottleneck across tables.
+//!
+//! # Concurrency model
+//!
+//! `SQLite` WAL mode allows many concurrent readers per database file, but
+//! serializes writers at the engine level — there is exactly one WAL write
+//! lock. The pool therefore lifts the *read*-side concurrency ceiling; writes
+//! still queue single-file regardless of pool size. `begin_transaction` issues
+//! `BEGIN IMMEDIATE`, taking the reserved lock up front so contending writers
+//! wait on the 30 s (default) busy timeout instead of failing a late deferred
+//! lock upgrade. A transaction holds its pool slot (an `OwnedMutexGuard`)
+//! until commit/rollback/drop.
+//!
+//! # Durability
+//!
+//! Connections run `PRAGMA journal_mode = WAL` with
+//! `PRAGMA synchronous = NORMAL`: commits append to the `-wal` file but are
+//! **not individually fsynced**; the fsync happens when a checkpoint copies
+//! frames into the main DB. This is crash-safe for the application process
+//! (committed data survives a process crash) and can never corrupt the DB,
+//! but the most recent commits may be lost on power failure / OS crash. The
+//! Cayenne catalog accepts this tier: metastore state is reconcilable against
+//! the data files it describes.
+//!
+//! # WAL-drain contract (cycle-8 TASK A2)
+//!
+//! The inline auto-checkpoint is **disabled** (`PRAGMA wal_autocheckpoint = 0`
+//! by default) so a checkpoint fsync can never land inside a hot CDC COMMIT.
+//! The WAL is drained exclusively by [`SqliteMetastore::checkpoint_wal`] on
+//! the background maintenance tick (debounced 100 ms in `provider::table`),
+//! running PASSIVE on the dedicated connection and escalating to TRUNCATE
+//! once the `-wal` file exceeds
+//! [`SqliteMetastoreConfig::wal_truncate_threshold_bytes`] (default 160 MiB).
+//! See those items for the full contract and tuning rationale.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
@@ -153,8 +190,10 @@ pub struct SqliteMetastoreConfig {
     /// tick, NEVER on the hot write path. Defaults to
     /// [`DEFAULT_WAL_TRUNCATE_THRESHOLD_BYTES`] (160 MiB — bracketed by
     /// measurement; see that const's rationale): TRUNCATEs are infrequent enough
-    /// not to tax writers, yet the file stays bounded if a tick lags. `0` makes
-    /// EVERY background checkpoint a TRUNCATE (used by tests for determinism).
+    /// not to tax writers, yet the file stays bounded if a tick lags. The
+    /// comparison is strict (`wal_bytes > threshold`), so `0` makes every
+    /// background checkpoint that finds a non-empty `-wal` file a TRUNCATE
+    /// (used by tests for determinism).
     pub wal_truncate_threshold_bytes: u64,
     /// `auto_vacuum` mode. Takes effect only on a fresh DB (an existing DB needs
     /// a full VACUUM to change it). Defaults to [`SqliteAutoVacuum::None`].
@@ -379,14 +418,22 @@ impl SqliteMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Open a configured `SQLite` connection.
+    /// Open a configured `SQLite` connection, creating (and best-effort
+    /// fsyncing the parent of) the database directory if missing.
     ///
-    /// The connection is configured with performance optimizations:
-    /// - WAL mode for non-blocking reads/writes
-    /// - Busy timeout to reduce lock contention errors
-    /// - NORMAL synchronous mode (safe with WAL)
-    /// - Memory cache and temp storage for performance
-    /// - Foreign keys enabled
+    /// Pragmas applied (values from [`SqliteMetastoreConfig`], see
+    /// [`configure_sqlite_connection`]):
+    /// - `journal_mode = WAL` — concurrent readers, single serialized writer
+    /// - `synchronous = NORMAL` — no per-commit fsync; durable to process
+    ///   crash, last commits may be lost on power loss (never corruption)
+    /// - `busy_timeout` (default 30 s) so contending writers queue instead of
+    ///   erroring `SQLITE_BUSY`
+    /// - `cache_size` (default 256 MiB, per connection) and `mmap_size`
+    ///   (default 1 GiB)
+    /// - `temp_store = memory`, `foreign_keys = ON`
+    /// - `wal_autocheckpoint` (default 0 = inline auto-checkpoint disabled;
+    ///   see the module-level WAL-drain contract)
+    /// - `auto_vacuum` only when non-default (fresh DBs only)
     ///
     async fn open_connection(&self) -> CatalogResult<tokio_rusqlite::Connection> {
         let db_path = self.db_path();
@@ -553,7 +600,8 @@ impl SqliteMetastore {
     /// burst, so the 20-byte/row text→raw-bytes shrink removes ~37% of the WAL
     /// frames a hot upsert burst writes (it both narrows each cell and packs
     /// more rows per B-tree leaf). The value is a pure re-encoding of the same
-    /// constant — `cayenne_catalog::table_id_blob` translates the `table_id`
+    /// constant — `cayenne_catalog::util::insert_record_table_id_value` (over
+    /// `metastore::table_id_to_key_bytes`) translates the `table_id`
     /// `&str` once per call at every access path, so the `WHERE table_id = ?`
     /// prefix scan and the `(table_id, pk_bytes)` upsert conflict target are
     /// preserved 1:1; the reader (`get_insert_records`) only ever returns

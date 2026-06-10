@@ -15,6 +15,16 @@ limitations under the License.
 */
 
 //! Shared context for Cayenne table operations.
+//!
+//! [`CayenneContext`] bundles the resources one or more `CayenneTableProvider`s
+//! (e.g. the partitions of a single dataset) share: the base `VortexFormat`
+//! (scan/write options + the session-level FULL encoding strategy), the
+//! `VortexConfig`, the upload-concurrency semaphore, the runtime-owned
+//! `RuntimeEnv` (its file-metadata/list-files caches are shared with the main
+//! query engine; the table provider registers the table's object store into
+//! it on open and into the session's `RuntimeEnv` at scan time, when one is
+//! needed), and the live, dynamically-tunable knob values plus the rolling
+//! CDC ingest accounting that feeds the [`super::tuning`] controller.
 
 use std::sync::Arc;
 

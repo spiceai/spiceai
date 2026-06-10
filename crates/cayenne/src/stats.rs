@@ -16,8 +16,18 @@ limitations under the License.
 
 //! Conversion utilities between `DataFusion` and Vortex statistics.
 //!
-//! Provides serialization/deserialization of Vortex [`FileStatistics`] and
-//! conversion between `DataFusion` [`ColumnStatistics`] and Vortex [`StatsSet`].
+//! Provides serialization/deserialization of Vortex [`FileStatistics`]
+//! (flatbuffer blobs persisted in the metastore) and conversion between
+//! `DataFusion` [`ColumnStatistics`] and Vortex [`StatsSet`].
+//!
+//! Only three per-column statistics round-trip: **min**, **max**, and
+//! **null count** (each carrying exact/inexact precision); `sum_value`,
+//! `distinct_count`, and `byte_size` are always `Precision::Absent` on the
+//! `DataFusion` side. Scalar conversion covers booleans, all integer widths,
+//! `Float32`/`Float64`, UTF-8 strings, dates, and timestamps; other scalar
+//! types (e.g. decimals, binary) are skipped rather than converted lossily.
+//! Cross-write aggregation goes through `merge_serialized_stats`, which
+//! merges per-column stats commutatively (min/max widen, null counts add).
 
 use std::fmt::Debug;
 use std::sync::Arc;

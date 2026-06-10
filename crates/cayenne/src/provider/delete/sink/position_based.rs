@@ -16,9 +16,14 @@ limitations under the License.
 
 //! Position-based deletion methods for `CayenneDeletionSink`.
 //!
-//! This module implements deletion logic for tables WITHOUT a primary key.
-//! It uses file-local row positions tracked via `RoaringBitmap` for efficient
-//! row exclusion during Vortex scans.
+//! Implements deletion by file-local row position, tracked via `RoaringBitmap`
+//! and pushed into Vortex scans for efficient row exclusion. This is the only
+//! deletion path for tables WITHOUT a primary key (the streaming
+//! `delete_filtered_rows_position_based` scan), and it also serves PK tables
+//! under `deletion_mode: position`: `persist_position_based_deletions` writes
+//! into the unified per-file position cache, and `scan_file_for_all_positions`
+//! is the write-time read-back that upgrades keyset entries to
+//! `FilePositioned` so later upserts can tombstone by position.
 
 // `vortex::array::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
 // `execute_arrow(ctx)`; migrating requires threading a Vortex session through the delete path,

@@ -20,6 +20,22 @@ limitations under the License.
 //! and `datafusion_ddl::DdlExtensionPlanner` for DDL, and with
 //! `datafusion_dml::DmlExtensionPlanner` for any emitted generic DML extension
 //! nodes.
+//!
+//! # Supported operations
+//!
+//! The `datafusion_ddl` analyzer intercepts exactly three DDL statement kinds
+//! for Cayenne catalogs, handled here by [`CayenneDdlHandler`]:
+//!
+//! - `CREATE TABLE` (with `IF NOT EXISTS`, `PARTITION BY <expr>`, and
+//!   `CREATE TABLE … (LIKE <table>)`)
+//! - `DROP TABLE` (with `IF EXISTS`)
+//! - `CREATE SCHEMA` (with `IF NOT EXISTS`)
+//!
+//! Other DDL (`ALTER TABLE`, `DROP SCHEMA`, views, …) is not intercepted and
+//! falls through to `DataFusion`'s default handling. On the DML side,
+//! [`CayenneDmlHandler`] overlays only `MERGE` (see [`merge_planner`] for the
+//! supported statement shape); `INSERT`/`UPDATE`/`DELETE` use the standard
+//! `TableProvider` paths.
 
 pub mod handler;
 pub mod merge_planner;

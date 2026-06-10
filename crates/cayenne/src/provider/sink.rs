@@ -57,8 +57,11 @@ use super::table::CayenneTableProvider;
 ///
 /// # Concurrency
 ///
-/// A per-table write lock (acquired in [`DataSink::write_all`]) serializes all write
-/// operations. Multiple concurrent `insert_into()` calls on the same table will block,
+/// A per-table write lock serializes all write operations: the append path
+/// acquires it in [`DataSink::write_all`]; the overwrite path acquires it
+/// inside [`CayenneTableProvider::begin_overwrite`] and holds it via the
+/// returned [`super::overwrite::PreparedOverwrite`] until `finish`/`rollback`.
+/// Multiple concurrent `insert_into()` calls on the same table will block,
 /// ensuring only one write runs at a time.
 pub struct CayenneDataSink {
     /// The Cayenne table provider to write to.

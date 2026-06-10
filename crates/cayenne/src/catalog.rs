@@ -16,9 +16,23 @@ limitations under the License.
 
 //! Trait abstraction for metadata catalog operations.
 //!
-//! This trait defines the interface for managing table metadata
-//! and file references. It can be implemented by different RDBMS backends
-//! (`SQLite`, `PostgreSQL`, etc.).
+//! [`MetadataCatalog`] defines the interface for managing table metadata,
+//! file references (delete files / deletion vectors), sequence numbers,
+//! snapshots, and inlined data. The concrete layering is:
+//!
+//! ```text
+//! MetadataCatalog (this trait)
+//!   └─ CayenneCatalog (crate::cayenne_catalog) — SQL-backed implementation
+//!        └─ MetastoreImpl — enum dispatch over the configured backend
+//!             ├─ SqliteMetastore (crate::metastore::sqlite, "sqlite://", default)
+//!             └─ TursoMetastore  (crate::metastore::turso, "libsql://", `turso` feature)
+//! ```
+//!
+//! Both backends serialize writers (`SQLite` WAL has a single writer;
+//! Turso commits `BEGIN CONCURRENT` transactions optimistically), so the
+//! multi-statement commit methods on the trait retry transient
+//! busy/conflict errors internally — see [`CatalogError`] for which
+//! variants are considered retryable.
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
@@ -30,6 +44,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Error type for catalog operations.
+///
+/// # Retry semantics
+///
+/// Most variants are terminal. Only transient write conflicts are
+/// retryable, as classified by [`crate::is_retryable_write_conflict`]:
+/// [`Database`](Self::Database) whose message matches a busy/locked or
+/// Turso `BEGIN CONCURRENT` commit conflict, [`Sqlite`](Self::Sqlite)
+/// with `SQLITE_BUSY` / `SQLITE_LOCKED`, or
+/// [`InvalidOperation`](Self::InvalidOperation) wrapping one of those.
+/// The multi-statement commit methods on [`MetadataCatalog`]
+/// (`commit_compaction`, `commit_overwrite`, `swap_protected_snapshots`,
+/// `commit_inlined_mutation`, `commit_on_conflict_deletions*`,
+/// `reserve_sequence_numbers`) retry these internally with backoff;
+/// `commit_*_in_txn` building blocks and single-statement operations
+/// surface them so the caller (e.g. the cross-partition coordinator in
+/// the runtime crate) can roll back and retry the whole batch.
 #[expect(missing_docs)]
 #[derive(Debug, Snafu)]
 pub enum CatalogError {
@@ -213,16 +243,28 @@ pub struct SnapshotSequenceCommit {
     pub sequence_number: i64,
 }
 
-// Transaction support is currently not exposed at the catalog level.
-// Each catalog implementation can use backend-specific transactions internally
-// to ensure atomicity of operations.
-//
-// Future work: Expose catalog-level transactions when needed.
+// Transaction support is not exposed on the `MetadataCatalog` trait itself.
+// Each implementation uses backend-specific transactions internally to make
+// the multi-statement commit methods atomic. Callers that need to batch
+// several catalog mutations into one transaction (e.g. the cross-partition
+// coordinator) use the concrete `CayenneCatalog::begin_transaction` plus its
+// `*_in_txn` building blocks instead of this trait.
 
 /// Trait for metadata catalog operations.
 ///
-/// This trait provides the core operations needed to manage a Cayenne catalog,
-/// including table creation and file tracking.
+/// This trait provides the core operations needed to manage a Cayenne catalog:
+/// table lifecycle, sequence-number allocation, delete-file (deletion vector)
+/// and insert-record tracking, snapshot sequences, statistics, and inlined
+/// data. The production implementation is [`crate::CayenneCatalog`], which
+/// dispatches to a `SQLite` or Turso metastore backend.
+///
+/// Sequence-number ordering contract: all visibility decisions compare the
+/// per-table monotonically increasing sequence counter. A row insert with
+/// `insert_sequence > delete_sequence` for the same PK is visible; deletion
+/// vectors only apply to snapshots whose recorded sequence is `<=` the
+/// delete's sequence. Sequence values are unique and strictly increasing per
+/// table; gaps (from failed transactions that had already reserved numbers)
+/// are allowed and harmless.
 #[async_trait]
 pub trait MetadataCatalog: Send + Sync {
     /// Initialize the catalog, creating necessary tables if they don't exist.
@@ -231,7 +273,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// List all table names in the catalog.
     async fn list_table_names(&self) -> CatalogResult<Vec<String>>;
 
-    /// Create a new table.
+    /// Create a new table, returning its `table_id` (a `UUIDv7` string).
+    ///
+    /// Idempotent on re-registration: if a table with the same name already
+    /// exists and its data-affecting configuration (schema, primary key,
+    /// on-conflict, partition column, sort/compression, base path) matches,
+    /// the existing `table_id` is returned. If the stored configuration
+    /// differs, the implementation logs a warning and still returns the
+    /// existing `table_id` — the stored configuration wins; the table is NOT
+    /// recreated.
     async fn create_table(&self, options: CreateTableOptions) -> CatalogResult<String>;
 
     /// Get table metadata by name.
@@ -268,10 +318,18 @@ pub trait MetadataCatalog: Send + Sync {
     /// reservations — gaps are acceptable for the sequence ordering contract).
     async fn reserve_sequence_numbers(&self, table_id: &str, count: u32) -> CatalogResult<i64>;
 
-    /// Add a delete file (deletion vector) for a data file.
+    /// Add a delete file (deletion vector) for a data file, returning the new
+    /// `delete_file_id`.
     ///
     /// Tracks a deletion vector file that marks rows as deleted in a specific
     /// virtual file (`ListingTable`).
+    ///
+    /// Idempotent under concurrent insertion: if another writer already
+    /// registered the same `(table_id, path)` with byte-identical metadata,
+    /// the existing row's id is returned. If the existing row's metadata
+    /// differs, the call fails with [`CatalogError::FailedToAddDeleteFile`]
+    /// wrapping a [`CatalogError::ConstraintViolation`] naming the mismatched
+    /// fields.
     async fn add_delete_file(&self, delete_file: DeleteFile) -> CatalogResult<String>;
 
     /// Get all active delete files for a table (across all virtual files).
@@ -346,7 +404,8 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// Returns an error if the transaction cannot be opened, any insert
     /// fails, or the commit fails. Failures roll back the entire txn —
-    /// the catalog is unchanged.
+    /// the catalog is unchanged. Transient write conflicts are retried
+    /// internally (with a fresh transaction) before failing.
     async fn commit_on_conflict_deletions(
         &self,
         delete_files: Vec<DeleteFile>,
@@ -499,7 +558,16 @@ pub trait MetadataCatalog: Send + Sync {
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str)
     -> CatalogResult<()>;
 
-    /// Atomically update snapshot and clear delete files in a single transaction.
+    /// Atomically commit a compaction in a single transaction: clear the
+    /// table's delete files, insert records, and snapshot sequences, then
+    /// advance `current_snapshot_id` to `new_snapshot_id`.
+    ///
+    /// Inlined data and inlined deletes are PRESERVED (the inline memtable is
+    /// still valid for the new snapshot) — contrast with
+    /// [`commit_overwrite`](Self::commit_overwrite). Transient write conflicts
+    /// (`SQLITE_BUSY`/`SQLITE_LOCKED`, Turso commit conflicts) are retried
+    /// internally with backoff. The caller must have durably written the new
+    /// snapshot's files before invoking this.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     /// Atomically swap a subset of protected snapshots for a single merged
@@ -527,9 +595,11 @@ pub trait MetadataCatalog: Send + Sync {
     ) -> CatalogResult<bool>;
 
     /// Atomically commit an overwrite: update the snapshot pointer, clear all
-    /// per-snapshot delete tracking, AND drop inlined data, inlined deletes,
-    /// and table statistics — everything that belonged to the old snapshot
-    /// and no longer applies once the user has replaced the table's contents.
+    /// per-snapshot delete tracking (delete files, insert records, snapshot
+    /// sequences), AND drop inlined data, inlined deletes, table statistics,
+    /// per-file snapshot statistics, and the persisted PK index — everything
+    /// that belonged to the old snapshot and no longer applies once the user
+    /// has replaced the table's contents.
     ///
     /// Differs from [`commit_compaction`] in that compaction PRESERVES inlined
     /// data (the inlined memtable is still valid for the new snapshot — the
@@ -541,7 +611,8 @@ pub trait MetadataCatalog: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transaction cannot be committed.
+    /// Returns an error if the transaction cannot be committed. Transient
+    /// write conflicts are retried internally with backoff before failing.
     async fn commit_overwrite(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -783,22 +854,30 @@ pub trait MetadataCatalog: Send + Sync {
         Ok(())
     }
 
-    /// Run a NON-BLOCKING WAL checkpoint off the hot commit path (cycle-5 TASK
-    /// 2b). Called from the background maintenance tick so the WAL is drained on
-    /// a timer instead of relying on the inline `wal_autocheckpoint` firing a
-    /// passive checkpoint on a CDC commit/UPDATE — which lands an fsync inside
-    /// the WAL-write-locked Stage-A/Stage-B window. The checkpoint must NOT block
-    /// writers or wait for readers (`SQLite` `PASSIVE`), so a failure or a busy WAL
-    /// is a no-op the next tick retries. Default implementation does nothing.
+    /// Run a WAL checkpoint off the hot commit path (cycle-5 TASK 2b). Called
+    /// from the background maintenance tick so the WAL is drained on a timer
+    /// instead of an inline auto-checkpoint firing on a CDC commit/UPDATE —
+    /// which would land an fsync inside the WAL-write-locked Stage-A/Stage-B
+    /// window. The `SQLite` backend uses a `PASSIVE` checkpoint by default
+    /// (never blocks writers or waits for readers; a busy WAL is a no-op the
+    /// next tick retries), escalating to `TRUNCATE` only when the `-wal` file
+    /// exceeds its configured size threshold — `TRUNCATE` briefly takes the
+    /// WAL write lock, acceptable on this background tick but never on the
+    /// hot path. Default implementation does nothing.
     async fn checkpoint_wal(&self) -> CatalogResult<()> {
         Ok(())
     }
 
-    /// Drop a table and all its associated metadata (delete files, insert records,
-    /// snapshot sequences, partitions).
+    /// Drop a table and all its associated metadata: insert records, snapshot
+    /// sequences, delete files, partitions, table statistics, per-file
+    /// snapshot statistics, inlined data, and inlined deletes, followed by the
+    /// table row itself.
     ///
     /// This is used for `file_create` mode to clean up existing table metadata
-    /// before recreating the table fresh.
+    /// before recreating the table fresh. Note: in the `CayenneCatalog`
+    /// implementation the deletes run as sequential statements, NOT one
+    /// transaction — a failure partway can leave some auxiliary rows removed
+    /// while the table row remains (a retry completes the cleanup).
     ///
     /// # Arguments
     ///
@@ -812,7 +891,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// Export the metastore rows for `dataset_name` as a portable, versioned
     /// slice with path columns rewritten relative to `data_dir_anchor`.
     ///
-    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// Default implementation returns [`CatalogError::InvalidOperationNoSource`].
     /// `CayenneCatalog` overrides this with a real implementation.
     ///
     /// # Errors
@@ -834,7 +913,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// prior rows for the same `dataset_name`. Path columns are re-anchored
     /// at `data_dir_anchor`.
     ///
-    /// Default implementation returns [`CatalogError::InvalidOperation`].
+    /// Default implementation returns [`CatalogError::InvalidOperationNoSource`].
     /// `CayenneCatalog` overrides this with a real implementation.
     ///
     /// # Errors

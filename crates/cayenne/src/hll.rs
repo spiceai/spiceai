@@ -126,6 +126,14 @@ impl HyperLogLog {
     }
 
     /// Estimate the distinct cardinality.
+    ///
+    /// Standard `HyperLogLog` estimator (Flajolet et al.): the bias-corrected
+    /// harmonic mean of the registers (`alpha_m * m^2 / sum(2^-r)`), switching
+    /// to linear counting (`m * ln(m / zeros)`) in the small range (raw
+    /// estimate `<= 2.5m` with empty registers remaining). Standard error is
+    /// `1.04 / sqrt(m)` ≈ 1.6% at the default [`PRECISION`] of 12 (m = 4096).
+    /// No large-range correction is applied — with 64-bit hashes the classic
+    /// `2^32` saturation correction is unnecessary.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,

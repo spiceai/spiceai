@@ -76,11 +76,16 @@ pub struct CreateTableParams {
     /// Primary key column names (empty if no primary key).
     pub primary_key: Vec<String>,
     /// Raw SQL text for the `PARTITION BY` expression.
-    /// Parsed and validated at execution time inside [`CayenneCreateTableExec`].
+    /// Parsed and validated at execution time by [`create_table`] (using
+    /// [`Self::ctx`]), under `CayenneCreateTableExec` or the runtime's
+    /// broadcast exec.
     pub partition_expr_sql: Option<String>,
     /// If `true`, do not error when the table already exists.
     pub if_not_exists: bool,
-    /// Source table for `CREATE TABLE … (LIKE …)`.
+    /// Source table for `CREATE TABLE … (LIKE …)`. Not consumed by the
+    /// single-node [`create_table`] (the LIKE source's schema and partition
+    /// SQL are resolved at plan time into `arrow_schema`/`partition_expr_sql`);
+    /// the runtime's broadcast exec uses it to copy partition assignments.
     pub like_source_table: Option<TableReference>,
     /// `SessionContext` used to parse the partition expression at execution time.
     pub ctx: Option<Arc<SessionContext>>,

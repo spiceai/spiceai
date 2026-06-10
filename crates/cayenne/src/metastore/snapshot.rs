@@ -33,13 +33,22 @@ limitations under the License.
 //!
 //! * **Import**: `import_dataset(metastore, slice, anchor)` atomically
 //!   replaces any local rows for the same `table_name` with the slice's
-//!   contents inside a single `BEGIN IMMEDIATE` transaction. Path columns
-//!   are rewritten back to absolute form anchored at the local `anchor`.
-//!   FK `ON DELETE CASCADE` removes the dataset's prior dependent rows when
-//!   the existing `cayenne_table` row is deleted.
+//!   contents inside a single backend transaction (`BEGIN IMMEDIATE` on
+//!   `SQLite`, `BEGIN CONCURRENT` on Turso). Path columns are rewritten back
+//!   to absolute form anchored at the local `anchor`. FK `ON DELETE CASCADE`
+//!   removes the dataset's prior dependent rows when the existing
+//!   `cayenne_table` row is deleted — except `cayenne_insert_record`, which
+//!   no longer carries that foreign key (its `table_id` is a raw-UUID-bytes
+//!   BLOB) and is cleared by an explicit `DELETE` in the same transaction.
 //!
-//! The slice format is **versioned** (`format_version: 1`) so future
-//! changes can be detected and rejected with a clear error.
+//! The row layout is positional: each slice row's values follow the column
+//! order of the matching [`EXPECTED_TABLES`] entry, so the expected-schema
+//! definitions are the single source of truth for both export and import.
+//!
+//! The slice format is **versioned** (`format_version: 1`) and tagged with an
+//! engine identifier (`"cayenne"`); both are validated at parse time
+//! ([`DatasetMetastoreSlice::from_json_bytes`]) and again at import, and any
+//! mismatch is rejected with a clear error rather than a partial import.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -54,6 +63,11 @@ use super::{
 use crate::catalog::{CatalogError, CatalogResult};
 
 /// Current slice format version. Incremented on incompatible format changes.
+///
+/// Compatibility is an **exact match**: a build only reads slices whose
+/// `format_version` equals this constant — there is no forward- or
+/// backward-compatibility window. Mismatches are rejected at both
+/// [`DatasetMetastoreSlice::from_json_bytes`] and [`import_dataset`].
 pub const SLICE_FORMAT_VERSION: u32 = 1;
 
 /// Engine identifier embedded in slices to detect cross-engine misuse.
@@ -256,9 +270,18 @@ async fn lookup_table_id(
 
 /// Export this dataset's rows from the metastore as a versioned slice.
 ///
-/// Path columns are rewritten relative to `data_dir_anchor` so the resulting
-/// slice is portable to readers with a different data directory, provided
-/// they re-anchor at their own data directory on import.
+/// Every table in [`EXPECTED_TABLES`] gets an entry in the slice (possibly an
+/// empty row list). Child-table rows are selected by the dataset's `table_id`;
+/// for `cayenne_insert_record` the filter binds the raw-UUID-bytes BLOB key
+/// (see [`super::table_id_to_key_bytes`]), since a TEXT bind would never match
+/// the BLOB column.
+///
+/// Path columns are rewritten relative to `data_dir_anchor` (with
+/// `path_is_relative` set to `true`) so the resulting slice is portable to
+/// readers with a different data directory, provided they re-anchor at their
+/// own data directory on import. A path outside the anchor is left absolute
+/// with `path_is_relative = false` and a warning is logged — such a slice
+/// is internally consistent but not portable.
 ///
 /// # Errors
 ///
@@ -357,15 +380,23 @@ pub async fn export_dataset(
 /// Atomically import a dataset slice into the metastore.
 ///
 /// If `slice.dataset_name` already exists in the local `cayenne_table`, that
-/// row is deleted (cascading to all dependent rows) before the slice's rows
-/// are inserted. Path columns are re-anchored at `data_dir_anchor`.
+/// row is deleted before the slice's rows are inserted: FK `ON DELETE CASCADE`
+/// clears the dependent rows of every child table that still references it,
+/// and the dataset's `cayenne_insert_record` rows (which carry no foreign key —
+/// their `table_id` is a raw-UUID-bytes BLOB) are cleared by an explicit
+/// `DELETE` first, inside the same transaction. Path columns are re-anchored
+/// at `data_dir_anchor` (rewritten back to absolute, with `path_is_relative`
+/// reset to `false`); the slice's `table_id` values are inserted verbatim.
 ///
-/// The entire import runs inside a single `BEGIN IMMEDIATE` transaction; on
-/// any error the local metastore is left unchanged.
+/// The entire import runs inside a single backend transaction
+/// (`BEGIN IMMEDIATE` on `SQLite`, `BEGIN CONCURRENT` on Turso); on any error
+/// the transaction rolls back and the local metastore is left unchanged.
 ///
 /// # Errors
 ///
-/// Returns an error if any DML fails or the slice is internally inconsistent.
+/// Returns an error if the slice's `format_version` or `engine` does not
+/// match this build, if any row's column count disagrees with
+/// [`EXPECTED_TABLES`], if a blob fails base64 decoding, or if any DML fails.
 pub async fn import_dataset(
     metastore: &impl MetastoreBackend,
     slice: &DatasetMetastoreSlice,

@@ -105,7 +105,7 @@ impl fmt::Debug for CayenneCreateTableExec {
 }
 
 impl CayenneCreateTableExec {
-    /// Construct a new single-node  execution plan.
+    /// Construct a new single-node `CREATE TABLE` execution plan.
     #[must_use]
     pub fn new(
         params: CreateTableParams,
@@ -228,7 +228,7 @@ impl fmt::Debug for CayenneDropTableExec {
 }
 
 impl CayenneDropTableExec {
-    /// Construct a new single-node  execution plan.
+    /// Construct a new single-node `DROP TABLE` execution plan.
     #[must_use]
     pub fn new(
         table_name: String,
@@ -346,7 +346,7 @@ impl fmt::Debug for CayenneCreateSchemaExec {
 }
 
 impl CayenneCreateSchemaExec {
-    /// Construct a new  execution plan.
+    /// Construct a new `CREATE SCHEMA` execution plan.
     #[must_use]
     pub fn new(
         schema_name: String,
@@ -825,7 +825,8 @@ fn build_delete_filter(
 /// Try the fast key-probe deletion path for `PositionBased` Cayenne tables.
 ///
 /// Returns `Some(delete_count)` if the provider is a `PositionBased` Cayenne table
-/// (direct, adapter-wrapped, or partitioned) and the deletion succeeded.
+/// (a direct `CayenneTableProvider`, or a `PartitionTableProvider` wrapping
+/// per-partition Cayenne providers) and the deletion succeeded.
 /// Returns `None` if the provider doesn't support the fast path, in which case
 /// the caller should fall back to the legacy filter-based deletion.
 async fn try_key_probe_delete(
@@ -844,7 +845,7 @@ async fn try_key_probe_delete(
         return Ok(None);
     }
 
-    // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
+    // Case 2: PartitionTableProvider wrapping per-partition Cayenne providers.
     // All partitions share the same table metadata and deletion strategy, so
     // checking the first partition is sufficient to decide the fast path.
     if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {

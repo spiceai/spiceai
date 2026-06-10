@@ -17,8 +17,23 @@ limitations under the License.
 //! Metastore backend abstraction for Cayenne catalog storage.
 //!
 //! This module provides a trait-based abstraction over different database backends
-//! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
-//! Turso, or other storage implementations.
+//! that can be used to store Cayenne metadata. This allows swapping between `SQLite`
+//! ([`sqlite::SqliteMetastore`], the default) and Turso/libSQL
+//! (`turso::TursoMetastore`, behind the `turso` feature).
+//!
+//! Key pieces:
+//!
+//! * [`MetastoreBackend`] — the backend trait: schema init, ad-hoc execute/query,
+//!   transactions, shutdown, and an optional off-hot-path WAL checkpoint hook
+//!   ([`MetastoreBackend::checkpoint_wal`]).
+//! * [`MetastoreTransaction`] — a transaction guard holding exclusive use of one
+//!   backend connection until commit/rollback (rollback on drop).
+//! * [`MetastoreValue`] / [`MetastoreRow`] — backend-agnostic value and row types
+//!   used by the catalog and by the generic slice export/import in [`snapshot`].
+//! * [`EXPECTED_TABLES`] + [`validate_existing_schema`] — the expected-schema
+//!   definitions every backend validates an existing database against at
+//!   `init_schema` time, failing with `CatalogError::SchemaMismatch` on an
+//!   incompatible metadata DB from a previous version.
 
 pub mod snapshot;
 pub mod sqlite;
@@ -205,14 +220,19 @@ pub fn table_id_to_key_bytes(table_id: &str) -> Vec<u8> {
 /// Validate the existing metadata table schemas against the expected definitions.
 ///
 /// Compares the actual column names of each metadata table against
-/// [`EXPECTED_TABLES`]. If any table has a different set of columns (missing,
-/// extra, or reordered), returns a [`CatalogError::SchemaMismatch`] that tells
-/// the user to clear their acceleration data.
+/// [`EXPECTED_TABLES`]. The comparison is an exact ordered-list equality on
+/// names only: a missing, extra, or reordered column fails, while declared
+/// types and constraints are never inspected (see [`ExpectedTable`]). On a
+/// mismatch, returns a [`CatalogError::SchemaMismatch`] that tells the user to
+/// clear their acceleration data — there is no in-place repair beyond the
+/// additive `ALTER TABLE` backfills each backend's `init_schema` runs *before*
+/// this validation.
 ///
 /// `actual_columns_fn` is an async callback that returns the ordered list of
 /// column names for a given table. It should return an empty `Vec` if the table
-/// does not yet exist (the table will be created by the DDL that runs before
-/// validation).
+/// does not yet exist; empty tables are skipped (a freshly created table always
+/// matches because the DDL that runs before validation created it from the
+/// current schema).
 ///
 /// # Errors
 ///
@@ -585,15 +605,19 @@ pub trait MetastoreBackend: Send + Sync {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static;
 
-    /// Begin a new transaction, acquiring exclusive access to the connection.
+    /// Begin a new transaction, acquiring exclusive access to one connection.
     ///
-    /// The returned transaction holds a lock on the underlying connection,
-    /// preventing other operations from interleaving. This ensures that
-    /// multi-statement transactions (BEGIN...COMMIT) are atomic even when
-    /// multiple tasks share the same metastore.
+    /// The returned transaction holds a lock on the underlying connection
+    /// (one slot of the backend's connection pool), preventing other
+    /// operations from interleaving statements on that connection. This
+    /// ensures that multi-statement transactions (BEGIN...COMMIT) are atomic
+    /// even when multiple tasks share the same metastore.
     ///
-    /// The backend-specific BEGIN statement is sent automatically
-    /// (e.g. `BEGIN TRANSACTION` for `SQLite`, `BEGIN CONCURRENT` for Turso).
+    /// The backend-specific BEGIN statement is sent automatically:
+    /// `BEGIN IMMEDIATE` for `SQLite` (write transactions take the reserved
+    /// lock up front so contending writers queue on the busy timeout instead
+    /// of failing on a late lock upgrade) and `BEGIN CONCURRENT` for Turso
+    /// (MVCC, so writers on different connections can proceed in parallel).
     ///
     /// # Errors
     ///

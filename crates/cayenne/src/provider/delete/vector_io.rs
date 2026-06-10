@@ -23,7 +23,8 @@ limitations under the License.
 //!
 //! Deletion vectors are stored as Arrow IPC files with one of two schemas:
 //!
-//! - **Position-based** (for tables without primary key):
+//! - **Position-based** (tables without a primary key, and located deletes of
+//!   PK tables under `deletion_mode: position`):
 //!   - `row_id: UInt64` - File-local row position (0-indexed)
 //!   - `deleted_at: Int64` - Deletion timestamp (microseconds)
 //!

@@ -15,6 +15,33 @@ limitations under the License.
 */
 
 //! Arrow schema transformations for Vortex compatibility.
+//!
+//! [`transform_schema_for_vortex`] rewrites an Arrow schema so every field can
+//! be stored in Vortex files. Exact type mappings (applied unconditionally, at
+//! any nesting depth):
+//!
+//! ```text
+//! Float16                      → Float32
+//! Timestamp(Second, tz)        → Timestamp(Microsecond, tz)
+//! Timestamp(Millisecond, tz)   → Timestamp(Microsecond, tz)
+//! Timestamp(Nanosecond, tz)    → Timestamp(Microsecond, tz)
+//! ```
+//!
+//! Unsupported types — `Interval(_)`, `Duration(_)`, `FixedSizeBinary(_)` — are
+//! resolved per the caller's `UnsupportedTypeAction` (see
+//! [`transform_schema_for_vortex`] for the top-level vs. nested rules):
+//!
+//! ```text
+//! String → Utf8 (top level only)    Ignore → field dropped (top level only)
+//! Warn   → kept as-is (insert may fail)    Error → transformation fails
+//! ```
+//!
+//! The transform recurses through every nested-type container — `Dictionary`
+//! values, `List`/`LargeList`/`FixedSizeList`/`ListView`/`LargeListView`
+//! items, `Map` entries, `Struct` fields, `Union` variants, and
+//! `RunEndEncoded` values — reporting unsupported nested fields by dotted /
+//! `[]` path (e.g. `payload.events[]`). All other types, plus field and
+//! schema metadata, pass through unchanged.
 
 use std::sync::Arc;
 

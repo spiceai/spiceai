@@ -18,17 +18,26 @@ limitations under the License.
 //!
 //! This module provides deletion filtering strategies:
 //!
-//! - **Position-based**: For tables WITHOUT a primary key.
-//!   Uses per-file deletion vectors with `RoaringBitmap`. Deletions are pushed down
-//!   directly to Vortex scan via `Selection::ExcludeRoaring` for efficient row skipping.
+//! - **Position-based**: Per-file deletion vectors (`RoaringBitmap` of file-local
+//!   row positions) pushed down directly into the Vortex scan via
+//!   `Selection::ExcludeRoaring` for efficient row skipping. The only strategy
+//!   for tables WITHOUT a primary key; PK tables under `deletion_mode: position`
+//!   (the `auto` default) also record per-file position vectors for rows whose
+//!   `(file, position)` is known, falling back to the key filters below for
+//!   unlocated rows.
 //!
 //! - **Int64 PK-based (`Int64PkDeletionFilterExec`)**: For tables with a single-column
-//!   Int64 primary key. Uses direct `HashSet<i64>` lookup - no serialization overhead.
-//!   This is the most efficient deletion strategy for the common case.
+//!   Int64 primary key. Probes a bloom-prefiltered
+//!   [`deletion_index::DeletionIndex`](super::deletion_index::DeletionIndex)
+//!   of fused delete/insert-sequence tombstones — no key serialization overhead.
+//!   This is the most efficient key-based strategy for the common case.
 //!
 //! - **RowConverter-based (`KeyBasedDeletionFilterExec`)**: For tables with composite
 //!   or non-integer primary keys. Uses Arrow's `RowConverter` to create deterministic
-//!   byte keys. More overhead but handles all PK types.
+//!   byte keys and probes a
+//!   [`deletion_index::KeyDeletionIndex`](super::deletion_index::KeyDeletionIndex)
+//!   (keyed by the XXH3-128 hash of the key bytes). More overhead but handles
+//!   all PK types.
 //!
 //! Also provides:
 //! - `CayenneDeletionSink`: Handles writing deletion vectors to storage

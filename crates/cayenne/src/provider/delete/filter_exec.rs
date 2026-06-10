@@ -19,7 +19,8 @@ limitations under the License.
 //! This module provides execution plans that filter out deleted rows during query execution:
 //!
 //! - **`Int64PkDeletionFilterExec`**: Optimized for tables with single-column Int64 primary keys.
-//!   Probes a [`DeletionIndex`] (bloom filter + `HashMap<i64, i64>`) once per row.
+//!   Probes a [`DeletionIndex`] (bloom prefilter + layered map of fused
+//!   delete/insert-sequence [`Tombstone`] entries) once per row.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
 //!   Uses Arrow's `RowConverter` to create deterministic byte keys, then probes a
@@ -30,7 +31,10 @@ limitations under the License.
 //! For tables **without** a primary key, position-based deletion is used. This strategy
 //! does NOT use a filter execution plan. Instead, deletions are pushed down directly to
 //! the Vortex scan layer via `Selection::ExcludeRoaring`, which efficiently skips deleted
-//! row positions at the storage level.
+//! row positions at the storage level. PK tables under `deletion_mode: position`
+//! get the same per-file pushdown for deletes whose `(file, position)` is
+//! known; the filter execs above then only have to cover the remaining
+//! unlocated keys.
 //!
 //! # Sequence-Based Ordering
 //!

@@ -24,16 +24,23 @@ limitations under the License.
 //!
 //! The staging WAL bridges this gap:
 //!
-//! 1. After all data files are written to `_staging/`, a `_wal.json` file is
-//!    created that records which files need to be moved and to which snapshot.
+//! 1. After all data files are written to the append's `_staging/<id>/`
+//!    directory, a `_wal.json` file is created there that records which files
+//!    need to be moved and to which snapshot.
 //! 2. The files are then moved to the snapshot directory.
 //! 3. On success, the WAL file is removed.
 //!
 //! If the process crashes during step 2, the WAL file survives and is detected
-//! on the next table open or write attempt, alerting the operator to a potentially inconsistent
-//! state.
+//! on the next table open or write attempt by
+//! [`CayenneTableProvider::ensure_no_incomplete_write`], which first audits
+//! that every WAL-listed file is reachable (in staging or already in the
+//! target snapshot) and then re-drives the move and removes the WAL.
+//! Automated recovery is refused — surfacing an `IncompleteWrite` error for
+//! the operator — when it would be unsafe: the current snapshot has changed
+//! since the WAL was written, a WAL-listed file is missing from both
+//! locations (genuine data loss), or a WAL is unreadable.
 //!
-//! # Two-phase commit lifecycle
+//! # Three-phase commit lifecycle
 //!
 //! For cross-partition coordination (issue #10125), the staged-append surface is
 //! split into a three-phase lifecycle:
@@ -76,9 +83,9 @@ use tokio::sync::OwnedMutexGuard;
 /// - Granular orchestration via `write_wal`, `move_staged_files`,
 ///   `remove_wal`, and `refresh_listing_table`
 /// - One-shot orchestration via `finalize_staged_write`
-/// - Two-phase commit via [`CayenneStagedAppend::prepare`] →
+/// - Three-phase commit via [`CayenneStagedAppend::prepare`] →
 ///   [`PreparedStagedAppend::apply_under_barrier`] → [`PreparedStagedAppend::finish`].
-///   The two-phase API is what the cross-partition coordinator uses; for single-partition
+///   The phased API is what the cross-partition coordinator uses; for single-partition
 ///   callers it is equivalent to [`CayenneStagedAppend::commit`].
 ///
 /// `begin_staged_append` returns this handle after writing data into `_staging/`
@@ -1068,13 +1075,22 @@ impl CayenneTableProvider {
 
     /// Ensure no incomplete write is pending before starting a new write.
     ///
-    /// Checks for a leftover staging WAL, which indicates a previous staged
-    /// append was interrupted during the file-move phase. Returns an error to
-    /// block further writes until the inconsistency is resolved.
+    /// Checks for leftover staging WALs, which indicate a previous staged
+    /// append was interrupted during the file-move phase. WALs belonging to
+    /// process-local in-flight appends are skipped. For each crash-leftover
+    /// WAL (processed in staging-id / `UUIDv7` order) this method first audits
+    /// that every WAL-listed file is reachable in the staging dir or the
+    /// target snapshot, then attempts automated recovery: re-drive the move
+    /// and remove the WAL. Orphan pre-WAL staging files are cleaned up
+    /// per-entry afterwards.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::IncompleteWrite`] if a staging WAL file is found.
+    /// Returns [`Error::IncompleteWrite`] only when recovery is unsafe or
+    /// fails: the WAL targets the current snapshot but the current snapshot
+    /// has changed; WAL-listed files are missing from both staging and target
+    /// (genuine data loss); a WAL is unreadable or uses the unsupported
+    /// top-level layout; or the move/WAL-removal itself errors.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)

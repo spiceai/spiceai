@@ -15,6 +15,32 @@ limitations under the License.
 */
 
 //! Local Cayenne DML handler plus MERGE logical-input preparation helpers.
+//!
+//! # MERGE planning flow
+//!
+//! Only one statement shape is supported (enforced upstream by
+//! `datafusion_dml`'s MERGE parser): a single `WHEN MATCHED THEN UPDATE SET …`
+//! clause with an `ON` condition that is a conjunction of
+//! `target_col = source_col` equalities. `WHEN NOT MATCHED … INSERT` and
+//! `WHEN MATCHED … DELETE` are rejected at parse time.
+//!
+//! Planning proceeds in three stages:
+//!
+//! ```text
+//! 1. Logical rewrite      build_local_merge_plan_input: INNER JOIN target ⋈ source
+//!    (plan time)          on the ON keys, then project to the target schema with
+//!                         SET expressions substituted — one row per matched
+//!                         target row, already carrying its updated values.
+//! 2. Extension node       the joined/projected plan + MergeParams are wrapped in
+//!                         the generic datafusion_dml::DmlExtensionNode.
+//! 3. Physical planning    DmlExtensionPlanner calls CayenneDmlHandler::merge_exec,
+//!                         which wraps the planned join input in CayenneMergeExec
+//!                         (validate no duplicate keys → delete matched rows →
+//!                         re-insert updated rows).
+//! ```
+//!
+//! [`CayenneDmlHandler`] is the single-node handler; the runtime crate has a
+//! distributed variant that reuses [`build_local_merge_plan_input`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

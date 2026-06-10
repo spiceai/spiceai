@@ -14,6 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Scan-side execution-plan wrapper for Cayenne tables.
+//!
+//! [`CayenneAccelerationExec`] is a transparent wrapper that identifies
+//! Cayenne table scans inside a physical plan (after the logical-plan table
+//! reference is lost), exposes a stable [`ScanIdentity`] used by the
+//! optimizer's cross-scan dynamic-filter sharing, surfaces read-amplification
+//! (`snapshots_scanned` / `files_scanned`) in `EXPLAIN`, and remaps
+//! "too many open files" scan errors to an actionable error. The module also
+//! provides [`round_robin_repartition_if_needed`], which fans unsorted write
+//! inputs across multiple writer partitions.
+
 use std::{
     any::Any,
     collections::BTreeSet,

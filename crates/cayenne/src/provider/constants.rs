@@ -18,20 +18,29 @@ limitations under the License.
 
 /// Reserved directory name for staged append writes.
 ///
-/// Append writes are first written to `{table_path}/{table_id}/_staging/`,
-/// then moved to the current snapshot directory on success. On error, the
-/// staging directory is cleaned up (best-effort) and the current snapshot
-/// remains unchanged.
+/// Each staged append writes into its own isolated subdirectory
+/// `{table_path}/{table_id}/_staging/<id>/` (the `<id>` is a `UUIDv7`, so
+/// concurrent appends never share a staging dir), then the files are moved to
+/// the target snapshot directory on success. On error, the append's staging
+/// subdirectory is cleaned up (best-effort) and the target snapshot remains
+/// unchanged.
 pub const STAGING_DIR_NAME: &str = "_staging";
 
 /// Filename for the staging write-ahead log (WAL).
 ///
-/// Written inside `_staging/` after all data files are staged but before
-/// the move-to-snapshot operation begins. Records which files need to be
-/// moved and to which snapshot. Removed after a successful move.
+/// Written at `_staging/<id>/_wal.json` after all data files are staged but
+/// before the move-to-snapshot operation begins. Records which files need to
+/// be moved and to which snapshot (current or protected). Removed after a
+/// successful move. A WAL directly at `_staging/_wal.json` is a legacy layout
+/// and is rejected with an error.
 ///
-/// If this file exists on table open, or before new writes, the previous staged append was
-/// interrupted mid-move and the table may be in an inconsistent state.
+/// If this file exists on table open, or before new writes, the previous
+/// staged append was interrupted mid-move.
+/// `CayenneTableProvider::ensure_no_incomplete_write` then attempts automated
+/// recovery (re-driving the move and removing the WAL) and only surfaces an
+/// `IncompleteWrite` error when recovery would be unsafe — e.g. the current
+/// snapshot has moved on, or WAL-listed files are missing from both the
+/// staging and target directories.
 pub const STAGING_WAL_FILENAME: &str = "_wal.json";
 
 /// Temporary filename used during atomic staging WAL writes.
