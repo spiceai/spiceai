@@ -63,6 +63,10 @@ use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); the wrapper check below still recognizes it where it appears in a plan"
+)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter::FilterExec;
@@ -481,6 +485,10 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
 /// resolving a federated scan: repartition, coalesce-batches, filter (the
 /// underlying `FlightSqlExec` already carries the predicate in its SQL), and the
 /// name-identified `CooperativeExec` / `BytesProcessedExec` wrappers.
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); kept for plan-shape recognition"
+)]
 fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
     plan.as_any().downcast_ref::<RepartitionExec>().is_some()
         || plan
