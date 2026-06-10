@@ -696,25 +696,6 @@ impl CayenneAccelerator {
                 }
             }
 
-            // File pruning (enabled | disabled | true | false). Controls whether
-            // scans build DataFusion's `FilePruner` to skip whole Vortex files
-            // using statistics and partition values before opening them. Defaults
-            // to enabled; flows through to the Vortex session context as a bool.
-            if let Some((key, value)) = ["cayenne_file_pruning", "file_pruning"]
-                .iter()
-                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
-            {
-                match value.trim().to_ascii_lowercase().as_str() {
-                    "enabled" | "true" => config.file_pruning = true,
-                    "disabled" | "false" => config.file_pruning = false,
-                    _ => {
-                        tracing::warn!(
-                            "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: enabled, disabled, true, false. Defaulting to enabled."
-                        );
-                    }
-                }
-            }
-
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
             // checkpoint; it is only meaningful for the small-write/CDC profile,
@@ -1332,8 +1313,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    33,
-    { S3_PARAMS_LEN + 33 },
+    32,
+    { S3_PARAMS_LEN + 32 },
 >(
     S3_PARAMETERS,
     [
@@ -1410,19 +1391,15 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["file", "memory"])
             .default("file"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 67108864 (64 MiB) so the write path self-spills while the tier is small. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 268435456 (256 MiB) so the periodic background checkpoint is the primary flush path and the write-path spill remains a rare backstop. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
-            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. Default 2000 (2 s). Set 0 to disable the age trigger."),
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. Default 10000 (10 s). Set 0 to disable the age trigger."),
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
-        ParameterSpec::component("file_pruning")
-            .description("Whether scans build DataFusion's FilePruner to skip whole Vortex files using file-level statistics (min/max) and partition values before opening them. 'enabled' (default) prunes non-matching files without reading them. 'disabled' opens and scans every candidate file. Accepts: enabled, disabled, true, false.")
-            .one_of(&["enabled", "disabled", "true", "false"])
-            .default("enabled"),
     ],
 );
 
@@ -3317,47 +3294,6 @@ mod tests {
         assert_eq!(config.compaction_max_levels, 5);
         assert_eq!(config.compaction_max_files_per_pick, 64);
         assert_eq!(config.compaction_background_interval_ms, 45_000);
-    }
-
-    #[tokio::test]
-    async fn test_file_pruning_param_parses() {
-        async fn file_pruning_for(value: Option<&str>) -> bool {
-            let app = Arc::new(AppBuilder::new("test").build());
-            let rt = Arc::new(crate::Runtime::builder().build().await);
-            let mut dataset = DatasetBuilder::try_new("fp".to_string(), "fp")
-                .expect("dataset builder")
-                .with_app(app)
-                .with_runtime(rt)
-                .build()
-                .expect("dataset");
-            let params: HashMap<String, String> = value
-                .map(|v| {
-                    [("cayenne_file_pruning".to_string(), v.to_string())]
-                        .into_iter()
-                        .collect()
-                })
-                .unwrap_or_default();
-            dataset.acceleration = Some(Acceleration {
-                engine: Engine::Cayenne,
-                mode: Mode::File,
-                params,
-                ..Default::default()
-            });
-            CayenneAccelerator::get_vortex_config("fp", &dataset)
-                .await
-                .file_pruning
-        }
-
-        // Defaults to enabled when unset.
-        assert!(file_pruning_for(None).await);
-        // `enabled` / `true` keep it on.
-        assert!(file_pruning_for(Some("enabled")).await);
-        assert!(file_pruning_for(Some("TRUE")).await);
-        // `disabled` / `false` turn it off.
-        assert!(!file_pruning_for(Some("disabled")).await);
-        assert!(!file_pruning_for(Some("false")).await);
-        // Invalid values fall back to the default (enabled).
-        assert!(file_pruning_for(Some("nonsense")).await);
     }
 
     #[test]

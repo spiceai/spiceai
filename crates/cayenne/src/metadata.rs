@@ -720,14 +720,14 @@ pub struct VortexConfig {
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill. Defaults to 64 MiB so the write path self-spills while the
-    /// tier is small (the per-append clone stays cheap).
+    /// the spill. Defaults to 256 MiB so the periodic background checkpoint is
+    /// the primary flush path and the write-path spill remains a rare backstop.
     #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
-    /// trip). `0` disables the age trigger. Defaults to 2 s.
+    /// trip). `0` disables the age trigger. Defaults to 10 s.
     #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
     /// Periodic background mem-tier checkpoint interval in milliseconds, in
@@ -752,12 +752,6 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
     #[serde(default)]
     pub pinned_tuning_knobs: PinnedTuningKnobs,
-    /// Whether scans may build `DataFusion`'s `FilePruner` to skip whole Vortex
-    /// files using statistics and partition values before opening them. Passed
-    /// through to `vortex-datafusion` as a per-format boolean. Defaults to
-    /// `true` (pruning enabled).
-    #[serde(default = "default_file_pruning")]
-    pub file_pruning: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -854,10 +848,6 @@ fn default_cdc_mem_tier_max_age_ms() -> u64 {
 /// bound hot tables).
 fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
     1_000
-}
-
-fn default_file_pruning() -> bool {
-    true
 }
 
 impl VortexConfig {
@@ -967,7 +957,6 @@ impl Default for VortexConfig {
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_knobs: PinnedTuningKnobs::default(),
-            file_pruning: default_file_pruning(),
         }
     }
 }
