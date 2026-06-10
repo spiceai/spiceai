@@ -2957,6 +2957,15 @@ struct MemTierOverlayEntry {
     data_sequence: i64,
     batches: Vec<RecordBatch>,
     pk_range: Option<(i64, i64)>,
+    /// `RowConverterBased` (composite-PK) delta-overlap prune: a bloom over this
+    /// entry's surviving row-key bytes. `Some` only for the row-key strategy
+    /// (Int64Pk uses `pk_range`). An inline-conflict delta whose keys all
+    /// `maybe_contains == false` cannot hide any of this entry's rows, so the
+    /// O(entry) re-filter is skipped. `maybe_contains` only ever errs toward a
+    /// false POSITIVE (an unnecessary re-filter) — never a false negative — so a
+    /// stale bloom (still holding a key later filtered out) is conservatively
+    /// safe and never drops a survivor. `Arc` so cloning an entry stays O(1).
+    key_bloom: Option<std::sync::Arc<PkBloom>>,
 }
 
 /// The incrementally-maintained visible mem-tier view. See the provider field
@@ -7114,9 +7123,16 @@ impl CayenneTableProvider {
         let mut deleted_inlined_pk_i64: Vec<i64> = Vec::new();
         let mut deleted_inlined_row_keys: Vec<Box<[u8]>> = Vec::new();
 
+        // Hoist the PK-null check out of the per-row loop: an Arrow column with no
+        // null buffer reports `null_count() == 0` in O(1), so when no PK column is
+        // nullable we skip the per-row `is_null` scan across all PK columns
+        // entirely (the common case — PK columns are NOT NULL). Only when a PK
+        // column actually carries nulls do we pay the per-row check to locate and
+        // reject them. On the hot CDC apply path this removes an O(rows x pk_cols)
+        // scan from every coalesced batch (16K+ envelopes).
+        let any_pk_nullable = pk_columns.iter().any(|col| col.null_count() > 0);
         for row_idx in 0..batch.num_rows() {
-            let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
-            if has_null {
+            if any_pk_nullable && pk_columns.iter().any(|col| col.is_null(row_idx)) {
                 return Err(Error::DataValidation {
                     table: self.table_metadata.table_name.clone(),
                     message: "Primary key values must be non-null".to_string(),
@@ -12599,6 +12615,40 @@ impl CayenneTableProvider {
         (lo <= hi).then_some((lo, hi))
     }
 
+    /// Build a bloom over the row-key bytes of all rows in `batches` — the
+    /// `RowConverterBased` (composite-PK) analogue of [`Self::overlay_pk_range`].
+    /// `None` for the `Int64Pk` strategy (no `pk_row_converter`; that path prunes
+    /// by `pk_range`) and for an empty input. Keys are encoded with the table's
+    /// cached `pk_row_converter` over `pk_column_indices`, byte-identical to the
+    /// keys [`Self::filter_inlined_batch_for_deletions`] probes and to the delta's
+    /// `row_keys`, so a bloom miss for every delta key proves the delta cannot
+    /// hide any of this entry's rows (the O(entry) re-filter is then safely
+    /// skipped). On any conversion error the bloom is dropped (`None`), which
+    /// conservatively forces a re-filter rather than risking a dropped row.
+    fn build_overlay_key_bloom(
+        &self,
+        batches: &[arrow::record_batch::RecordBatch],
+    ) -> Option<std::sync::Arc<PkBloom>> {
+        let converter = self.pk_row_converter.as_ref()?; // None => Int64Pk, uses pk_range
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if total == 0 {
+            return None;
+        }
+        let mut bloom = PkBloom::with_expected_keys(total, 4 * 1024 * 1024);
+        for batch in batches {
+            let pk_cols: Vec<_> = self
+                .pk_column_indices
+                .iter()
+                .map(|&i| std::sync::Arc::clone(batch.column(i)))
+                .collect();
+            let rows = converter.convert_columns(&pk_cols).ok()?;
+            for i in 0..batch.num_rows() {
+                bloom.insert(rows.row(i).as_ref());
+            }
+        }
+        Some(std::sync::Arc::new(bloom))
+    }
+
     /// Rebuild the visible overlay from scratch for `tier` (the same
     /// merge-on-read filtering `visible_mem_tier_batches` performs, retained
     /// per-segment). O(tier) — runs only on cold start / post-checkpoint, when
@@ -12624,10 +12674,12 @@ impl CayenneTableProvider {
                 continue;
             }
             let pk_range = self.overlay_pk_range(&batches);
+            let key_bloom = self.build_overlay_key_bloom(&batches);
             entries.push(MemTierOverlayEntry {
                 data_sequence: segment.data_sequence,
                 batches,
                 pk_range,
+                key_bloom,
             });
         }
         Ok(MemTierVisibleOverlay {
@@ -12671,8 +12723,22 @@ impl CayenneTableProvider {
         let mut entries = Vec::with_capacity(overlay.entries.len() + 1);
         for entry in &overlay.entries {
             let affected = if delta_has_row_keys {
-                // Row-key strategy has no cheap range prune: re-filter on any delta.
-                true
+                // Row-key (composite-PK) strategy: re-filter ONLY when some delta
+                // key MIGHT be in this entry. The per-entry bloom over the entry's
+                // surviving row-keys turns the old unconditional O(tier) re-filter
+                // (every entry re-filtered on any inline conflict) into O(delta):
+                // a delta whose keys are all definitely-absent from the entry
+                // (every `maybe_contains == false`) cannot hide any of its rows.
+                // `maybe_contains` returns false ONLY when the key is definitely
+                // absent, so a miss is a SOUND skip; a false positive (incl. a
+                // stale bloom) only costs an unnecessary re-filter. `None` (no
+                // bloom built, e.g. a conversion error) conservatively re-filters.
+                match &entry.key_bloom {
+                    Some(bloom) => {
+                        delta.row_keys.keys().any(|k| bloom.maybe_contains(k.as_ref()))
+                    }
+                    None => true,
+                }
             } else {
                 match (entry.pk_range, delta_range) {
                     (Some((el, eh)), Some((dl, dh))) => !(eh < dl || el > dh),
@@ -12685,6 +12751,7 @@ impl CayenneTableProvider {
                     data_sequence: entry.data_sequence,
                     batches: entry.batches.clone(),
                     pk_range: entry.pk_range,
+                    key_bloom: entry.key_bloom.clone(),
                 });
                 continue;
             }
@@ -12703,18 +12770,23 @@ impl CayenneTableProvider {
             }
             entries.push(MemTierOverlayEntry {
                 data_sequence: entry.data_sequence,
-                // Old range stays a sound SUPERSET of the survivors (pruning key
-                // only ever skips work, never rows).
+                // Old range / bloom both stay a sound SUPERSET of the survivors
+                // (the pruning keys only ever skip work, never rows): retaining
+                // the pre-filter bloom can at worst cause a later unnecessary
+                // re-filter for a key that was just removed — never a dropped row.
                 pk_range: entry.pk_range,
+                key_bloom: entry.key_bloom.clone(),
                 batches,
             });
         }
         let new_visible: Vec<RecordBatch> = new_batches.as_ref().clone();
         let pk_range = self.overlay_pk_range(&new_visible);
+        let key_bloom = self.build_overlay_key_bloom(&new_visible);
         entries.push(MemTierOverlayEntry {
             data_sequence,
             batches: new_visible,
             pk_range,
+            key_bloom,
         });
         self.mem_tier_visible_overlay
             .store(Some(Arc::new(MemTierVisibleOverlay {
@@ -12952,7 +13024,10 @@ impl CayenneTableProvider {
             let next_version = next.version;
             // Maintain the incrementally-filtered visible overlay BEFORE the
             // swap publishes the new tier (same fence => scans see tier+overlay
-            // move together; a version mismatch on read just falls back).
+            // move together; a version mismatch on read just falls back). Timed
+            // separately so the per-entry bloom prune's effect on the overlay
+            // re-filter cost is observable apart from the rest of the fence work.
+            let __ov = std::time::Instant::now();
             self.maintain_mem_tier_overlay_on_append(
                 cur.version,
                 &next,
@@ -12960,6 +13035,7 @@ impl CayenneTableProvider {
                 data_sequence,
                 &overlay_delta,
             )?;
+            record_cayenne_write_phase(&self.table_metadata.table_name, "inmemory_overlay", __ov);
             self.mem_tier.store(Arc::new(next));
             // A new tombstone can retroactively hide rows already materialized in
             // a cached inline/mem view, so this is a STRUCTURAL change (full
@@ -20545,6 +20621,168 @@ mod tests {
             collect_ab_value_triples(&ctx, &reopened, "mem_overlay_composite").await,
             expected,
             "reopened durable state: one row per composite key with the last value"
+        );
+    }
+
+    /// Correctness guard for the per-entry bloom prune in
+    /// `maintain_mem_tier_overlay_on_append` (the `RowConverterBased` / composite-PK
+    /// path): an inline-conflict delta that hits keys present in only SOME tier
+    /// segments must yield EXACTLY the same set of visible rows as a fresh
+    /// full-rebuild `build_mem_tier_overlay` on the post-delta tier. The bloom only
+    /// ever SKIPS a re-filter for an entry whose keys are all definitely-absent
+    /// from the delta, so a passing assertion proves the prune never drops a
+    /// survivor (the load-bearing invariant) AND that re-filtered entries match the
+    /// authoritative rebuild. Run in isolation so the process-global path counters
+    /// are not perturbed:
+    /// `cargo test -p cayenne --lib -- overlay_bloom_prune_matches_full_rebuild --exact`.
+    #[tokio::test]
+    async fn overlay_bloom_prune_matches_full_rebuild() {
+        use crate::provider::mem_tier::{InMemTombstones, MemTier};
+
+        OVERLAY_INCREMENTAL_HITS.store(0, Ordering::Relaxed);
+        OVERLAY_FULL_REBUILDS.store(0, Ordering::Relaxed);
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_memory_composite_pk_table("overlay_bloom_prune", ctx.runtime_env()).await;
+        assert!(
+            matches!(
+                provider.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::RowConverterBased { .. }
+            ),
+            "the bloom prune only applies to the RowConverterBased (composite-PK) path"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Three segments over DISJOINT key blocks, each at a distinct, increasing
+        // data_sequence. The delta below carries a delete_sequence above every
+        // segment's data_sequence, so a tombstone for a key present in a segment
+        // hides that key's row (merge-on-read: hidden iff delete_seq >= data_seq).
+        let block_a: Vec<(i64, i64)> = (0..8).map(|b| (0, b)).collect();
+        let block_b: Vec<(i64, i64)> = (0..8).map(|b| (1, b)).collect();
+        let block_c: Vec<(i64, i64)> = (0..8).map(|b| (2, b)).collect();
+        let seg_a = ab_value_batch(Arc::clone(&schema), &block_a, &vec![0; block_a.len()]);
+        let seg_b = ab_value_batch(Arc::clone(&schema), &block_b, &vec![0; block_b.len()]);
+        let seg_c = ab_value_batch(Arc::clone(&schema), &block_c, &vec![0; block_c.len()]);
+
+        let empty = InMemTombstones::default();
+        let tier_pre = MemTier::empty()
+            .append_segment(Arc::new(vec![seg_a]), 10, &empty, 0, block_a.len() as u64, 0)
+            .append_segment(Arc::new(vec![seg_b]), 20, &empty, 0, block_b.len() as u64, 0)
+            .append_segment(Arc::new(vec![seg_c]), 30, &empty, 0, block_c.len() as u64, 0);
+
+        // Pre-store the overlay for `tier_pre` so the next call takes the O(delta)
+        // INCREMENTAL path (a version mismatch would silently full-rebuild instead).
+        let pre_overlay = provider
+            .build_mem_tier_overlay(&tier_pre)
+            .expect("cold overlay build");
+        provider
+            .mem_tier_visible_overlay
+            .store(Some(Arc::new(pre_overlay)));
+
+        // Helper: row-key bytes for a composite (a, b), encoded byte-identically to
+        // the overlay bloom and the merge-on-read filter (same converter + indices).
+        let row_key = |a: i64, b: i64| -> Box<[u8]> {
+            let batch = ab_value_batch(Arc::clone(&schema), &[(a, b)], &[0]);
+            let converter = provider.pk_row_converter.as_ref().expect("composite converter");
+            let pk_cols: Vec<_> = provider
+                .pk_column_indices
+                .iter()
+                .map(|&i| Arc::clone(batch.column(i)))
+                .collect();
+            let rows = converter.convert_columns(&pk_cols).expect("convert pk");
+            rows.row(0).as_ref().to_vec().into_boxed_slice()
+        };
+
+        // Inline-conflict delta hitting keys in segment A and segment C ONLY — NONE
+        // in segment B. So the bloom for B must report all-miss and SKIP B's
+        // re-filter, while A and C are re-filtered and lose their hit rows. The
+        // delete_sequence (35) sits above every segment's data_sequence.
+        let mut delta = InMemTombstones::default();
+        for &(a, b) in &[(0, 1), (0, 3), (2, 2), (2, 5)] {
+            delta.row_keys.insert(row_key(a, b), 35);
+        }
+
+        // The append that carries the delta also brings fresh rows on a disjoint
+        // key block (a == 9) at a data_sequence above the delete_sequence, so they
+        // always survive. Both paths must include this new segment.
+        let new_keys: Vec<(i64, i64)> = (0..4).map(|b| (9, b)).collect();
+        let new_batch = ab_value_batch(Arc::clone(&schema), &new_keys, &vec![7; new_keys.len()]);
+        let new_arc = Arc::new(vec![new_batch]);
+        let next = tier_pre.append_segment(
+            Arc::clone(&new_arc),
+            36,
+            &delta,
+            0,
+            new_keys.len() as u64,
+            0,
+        );
+
+        // INCREMENTAL (bloom-pruned) maintenance.
+        provider
+            .maintain_mem_tier_overlay_on_append(tier_pre.version, &next, &new_arc, 36, &delta)
+            .expect("incremental overlay maintenance");
+        let incremental_overlay = provider
+            .mem_tier_visible_overlay
+            .load_full()
+            .expect("overlay stored after maintenance");
+
+        // AUTHORITATIVE full rebuild over the post-delta tier (filters every segment
+        // against next.tombstones, which now includes the delta).
+        let rebuilt_overlay = provider
+            .build_mem_tier_overlay(&next)
+            .expect("full rebuild over post-delta tier");
+
+        // Confirm the incremental path was actually exercised (not a silent rebuild).
+        assert!(
+            OVERLAY_INCREMENTAL_HITS.load(Ordering::Relaxed) >= 1,
+            "this test must drive the incremental bloom-pruned path"
+        );
+
+        // Collect the visible (a, b, value) triples from an overlay's entry batches.
+        let triples = |overlay: &MemTierVisibleOverlay| -> Vec<((i64, i64), i64)> {
+            use arrow::array::Int64Array;
+            let mut out = Vec::new();
+            for entry in &overlay.entries {
+                for batch in &entry.batches {
+                    let a = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let b = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let v = batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+                    for i in 0..batch.num_rows() {
+                        out.push(((a.value(i), b.value(i)), v.value(i)));
+                    }
+                }
+            }
+            out.sort_unstable();
+            out
+        };
+
+        let incremental_rows = triples(&incremental_overlay);
+        let rebuilt_rows = triples(&rebuilt_overlay);
+        assert_eq!(
+            incremental_rows, rebuilt_rows,
+            "bloom-pruned incremental overlay must equal the full rebuild — the prune \
+             must never drop a survivor (incremental={incremental_rows:?}, \
+             rebuilt={rebuilt_rows:?})"
+        );
+
+        // Sanity: the deleted keys are gone and a same-block survivor remains, so the
+        // assertion above is not vacuously comparing two empty/identical-by-bug sets.
+        assert!(
+            !incremental_rows.iter().any(|&(k, _)| k == (0, 1) || k == (2, 5)),
+            "delta-hit keys must be absent from the visible overlay"
+        );
+        assert!(
+            incremental_rows.iter().any(|&(k, _)| k == (0, 0)),
+            "an un-deleted key in a re-filtered segment must survive"
+        );
+        assert!(
+            incremental_rows.iter().any(|&(k, _)| k == (1, 0)),
+            "the bloom-SKIPPED segment B (no delta keys) must keep all its rows"
+        );
+        assert!(
+            incremental_rows.iter().any(|&(k, v)| k == (9, 0) && v == 7),
+            "the freshly appended segment must be visible"
         );
     }
 
