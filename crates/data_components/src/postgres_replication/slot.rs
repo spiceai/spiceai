@@ -237,7 +237,33 @@ async fn ensure_slot(
     }
 
     let (consistent_lsn, snapshot_name) =
-        create_logical_slot(client, &params.slot_name, params.temporary_slot).await?;
+        match create_logical_slot(client, &params.slot_name, params.temporary_slot).await {
+            Ok(created) => created,
+            // Lost a creation race: another consumer (a second replica, or a
+            // concurrent stream on an older build) created the slot between
+            // our catalog read and the CREATE. The slot exists now — treat it
+            // exactly like the existing-slot paths above instead of failing
+            // the dataset with "replication slot already exists".
+            Err(e) if is_duplicate_slot_error(&e) => {
+                tracing::info!(
+                    slot = %params.slot_name,
+                    "Lost replication-slot creation race; resuming from the winner's slot"
+                );
+                let confirmed = read_slot_confirmed_flush(client, &params.slot_name)
+                    .await?
+                    .unwrap_or(0);
+                return Ok(SlotInfo {
+                    slot_name: params.slot_name.clone(),
+                    publication_name: params.publication_name.clone(),
+                    consistent_lsn: confirmed,
+                    snapshot_name: None,
+                    // A raced slot with no durable checkpoint yet still needs
+                    // a bootstrap (same reasoning as the Some(0) path above).
+                    created_fresh: confirmed == 0,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
     tracing::info!(
         slot = %params.slot_name,
@@ -254,6 +280,16 @@ async fn ensure_slot(
         snapshot_name: Some(snapshot_name),
         created_fresh: true,
     })
+}
+
+/// SQLSTATE 42710 (`duplicate_object`) from `pg_create_logical_replication_slot`
+/// — someone else created the slot first.
+fn is_duplicate_slot_error(e: &super::Error) -> bool {
+    matches!(
+        e,
+        super::Error::SetupExec { source }
+            if source.as_db_error().is_some_and(|db| db.code().code() == "42710")
+    )
 }
 
 async fn validate_replica_identity(
@@ -354,11 +390,58 @@ async fn ensure_publication(
         table = quote_ident(table_name),
     );
     // In multi-replica deployments two replicas can both observe `exists =
-    // false` and race into `CREATE PUBLICATION` / `ALTER PUBLICATION`. The
-    // loser gets SQLSTATE 42710 (`duplicate_object`); treat that as success
-    // since the desired state is already achieved.
-    ignore_duplicate_object(client.simple_query(&stmt).await)?;
+    // false` and race into `CREATE PUBLICATION`. The loser gets SQLSTATE
+    // 42710 (`duplicate_object`) — but on a *shared* publication the winner
+    // may have created it for a different table, so losing the race does NOT
+    // imply our table is a member. Enforce membership explicitly with a
+    // follow-up ADD TABLE (itself 42710-tolerant for the same-table race).
+    if ignore_duplicate_object(client.simple_query(&stmt).await)?.is_none() {
+        let add = format!(
+            "ALTER PUBLICATION {pub} ADD TABLE {schema}.{table}",
+            pub = quote_ident(publication_name),
+            schema = quote_ident(schema_name),
+            table = quote_ident(table_name),
+        );
+        ignore_duplicate_object(client.simple_query(&add).await)?;
+    }
     Ok(true)
+}
+
+/// Best-effort removal of a table from a (shared) publication. Used when a
+/// member detaches while its initial snapshot is still running: tearing the
+/// table out of the publication forces any future rejoin — in-process or after
+/// a restart — back through the ADD TABLE + fresh-snapshot path, instead of
+/// resuming over an accelerator that is missing base rows.
+///
+/// "Already absent" outcomes (publication or membership gone) are success.
+pub async fn remove_table_from_publication(
+    params: &ReplicationParams,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<()> {
+    let (client, conn_task) = connect_setup(params).await?;
+    let stmt = format!(
+        "ALTER PUBLICATION {pub} DROP TABLE {schema}.{table}",
+        pub = quote_ident(&params.publication_name),
+        schema = quote_ident(schema_name),
+        table = quote_ident(table_name),
+    );
+    let outcome = match client.simple_query(&stmt).await {
+        Ok(_) => Ok(()),
+        // 42704 undefined_object: table is not a member; 42P01 undefined_table:
+        // the publication (or table) no longer exists. Both mean the desired
+        // state — "table not published" — already holds.
+        Err(e)
+            if e.as_db_error()
+                .is_some_and(|db| matches!(db.code().code(), "42704" | "42P01")) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e).context(SetupExecSnafu),
+    };
+    drop(client);
+    let _ = conn_task.await;
+    outcome
 }
 
 /// Treats a `duplicate_object` SQLSTATE (42710) as success — some replica beat

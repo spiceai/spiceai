@@ -148,6 +148,17 @@ pub enum Error {
          was subscribing. Check earlier log lines for the underlying stream failure."
     ))]
     SharedSourceUnavailable { slot: String },
+
+    #[snafu(display(
+        "Dataset `{dataset}` joins a shared replication slot but its `{param}` differs from \
+         the dataset that opened the slot. All datasets sharing a slot are served over one \
+         replication connection and must use identical connection parameters — make `{param}` \
+         consistent, or give this dataset its own `pg_replication_slot`."
+    ))]
+    SharedConnectionParamsMismatch {
+        dataset: String,
+        param: &'static str,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

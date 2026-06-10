@@ -44,6 +44,18 @@ limitations under the License.
 //! commit; the snapshot (taken after the ALTER) covers everything before it
 //! and the overlap replays idempotently.
 //!
+//! While a member snapshots, the pump routes nothing at it (so a long
+//! snapshot never back-pressures the other members through the bounded
+//! channel); its ack floor is held at the join LSN instead. On clean snapshot
+//! completion the pump reconnects from the held floor and *promotes* the
+//! member at connect time — only a connection that provably starts at or
+//! below a member's floor makes it routable and creditable, which closes the
+//! window where changes decoded before the reconnect could be acknowledged
+//! past an unrouted member. A snapshot that fails leaves an accelerator
+//! missing base rows WAL can never provide, so a mid-snapshot detach removes
+//! the table from the publication (best-effort), forcing any rejoin back
+//! through the fresh-snapshot path.
+//!
 //! # Ack / WAL-retention model
 //!
 //! `confirmed_flush_lsn` is per-slot, so the shared slot acknowledges the
@@ -153,6 +165,17 @@ struct AckEntry {
     /// `false` once the member detached; its `committed` then becomes a held
     /// floor the shared ack can never pass.
     live: bool,
+    /// `true` while the member's initial snapshot runs. Cleared by the
+    /// snapshot-completion hook; a member that detaches with this still set
+    /// has an accelerator missing base rows.
+    snapshotting: bool,
+    /// `true` once the pump has (re)connected at or below this member's floor
+    /// — only then is the member routed and creditable. Members are *held*
+    /// (no routing, never credited, floor pinned) from registration until
+    /// that promotion: crediting a member before a connection provably covers
+    /// its gap would acknowledge WAL it never received (changes decoded while
+    /// it had no route), losing them permanently.
+    streaming: bool,
 }
 
 /// Per-member LSN accounting. The slot-level acknowledgment
@@ -165,10 +188,10 @@ struct AckTable {
 }
 
 impl AckTable {
-    /// Register a member (or revive a detached one). A rejoining member keeps
-    /// its held `committed` floor — everything after it is about to be
-    /// replayed.
-    fn register(&self, key: &MemberKey) {
+    /// Register a member (or revive a detached one) in the *held* state. A
+    /// rejoining member keeps its held `committed` floor — everything after
+    /// it is about to be replayed.
+    fn register(&self, key: &MemberKey, snapshotting: bool) {
         let at = self.flush_lsn();
         let mut entries = lock(&self.entries);
         entries
@@ -176,12 +199,53 @@ impl AckTable {
             .and_modify(|e| {
                 e.live = true;
                 e.delivered = e.committed;
+                e.snapshotting = snapshotting;
+                e.streaming = false;
             })
             .or_insert(AckEntry {
                 committed: at,
                 delivered: at,
                 live: true,
+                snapshotting,
+                streaming: false,
             });
+    }
+
+    /// The member's initial snapshot finished cleanly. It stays *held* until
+    /// the pump's next (re)connect promotes it — the caller must also request
+    /// that reconnect.
+    fn snapshot_finished(&self, key: &MemberKey) {
+        let mut entries = lock(&self.entries);
+        if let Some(e) = entries.get_mut(key) {
+            e.snapshotting = false;
+        }
+    }
+
+    /// Called by the pump immediately after a successful connect, whose
+    /// `start_lsn` was the floor (min over all `committed`, held members
+    /// included): every held, snapshot-complete member's gap is covered by
+    /// this connection's replay, so they become routable and creditable.
+    fn promote_ready_members(&self) {
+        let mut entries = lock(&self.entries);
+        for e in entries.values_mut() {
+            if e.live && !e.snapshotting {
+                e.streaming = true;
+            }
+        }
+    }
+
+    fn is_streaming(&self, key: &MemberKey) -> bool {
+        lock(&self.entries).get(key).is_some_and(|e| e.streaming)
+    }
+
+    /// Whether the member has already durably applied this commit — used to
+    /// suppress re-delivery of envelopes during a reconnect replay (the replay
+    /// always starts at the *minimum* floor, so caught-up members would
+    /// otherwise see every commit since the slowest member's position again).
+    fn already_committed(&self, key: &MemberKey, lsn: u64) -> bool {
+        lock(&self.entries)
+            .get(key)
+            .is_some_and(|e| e.committed >= lsn)
     }
 
     fn deliver(&self, key: &MemberKey, lsn: u64) {
@@ -201,14 +265,17 @@ impl AckTable {
         self.recompute();
     }
 
-    /// Credit live members with no in-flight envelopes up to `upto` — they
-    /// have applied (or never needed) everything before it. Held entries are
-    /// never credited: that's the point of the hold.
+    /// Credit streaming members with no in-flight envelopes up to `upto` —
+    /// the connection's in-order replay guarantees their routed changes below
+    /// `upto` were already delivered. Detached entries are never credited
+    /// (that's the point of the hold), and neither are held (not-yet-promoted)
+    /// members — they have no route yet, so "no in-flight envelopes" says
+    /// nothing about what they've missed.
     fn credit_idle(&self, upto: u64) {
         {
             let mut entries = lock(&self.entries);
             for e in entries.values_mut() {
-                if e.live && e.delivered == e.committed {
+                if e.live && e.streaming && e.delivered == e.committed {
                     let lsn = e.committed.max(upto);
                     e.committed = lsn;
                     e.delivered = lsn;
@@ -218,10 +285,17 @@ impl AckTable {
         self.recompute();
     }
 
-    fn detach(&self, key: &MemberKey) {
+    /// Detach a member, returning whether it was still snapshotting (its
+    /// snapshot never completed cleanly).
+    fn detach(&self, key: &MemberKey) -> bool {
         let mut entries = lock(&self.entries);
-        if let Some(e) = entries.get_mut(key) {
-            e.live = false;
+        match entries.get_mut(key) {
+            Some(e) => {
+                e.live = false;
+                e.streaming = false;
+                e.snapshotting
+            }
+            None => false,
         }
     }
 
@@ -350,9 +424,15 @@ impl SharedSource {
     /// Detach a member: stop routing to it but hold its ack floor so the slot
     /// never acknowledges past what it durably applied. See the module docs
     /// for why the hold (and the WAL retention it causes) is intentional.
+    ///
+    /// A member that detaches while its initial snapshot was still running has
+    /// an accelerator missing base rows that WAL replay can never provide, so
+    /// its table is (best-effort) removed from the publication — any rejoin,
+    /// in-process or after a restart, then re-adds the table and takes a fresh
+    /// snapshot.
     fn detach_member(&self, key: &MemberKey, reason: &str) {
         let removed = lock(&self.members).remove(key);
-        self.ack.detach(key);
+        let was_snapshotting = self.ack.detach(key);
         lock(&self.detached).insert(key.clone());
         if let Some(member) = removed {
             tracing::warn!(
@@ -360,10 +440,29 @@ impl SharedSource {
                 table = %format_member(key),
                 slot = %self.key.slot_name,
                 reason,
+                was_snapshotting,
                 "shared replication member detached; its last applied LSN now pins WAL \
                  retention for the shared slot until the dataset rejoins or spiced restarts \
                  (watch dataset_postgres_replication_lag_bytes)"
             );
+        }
+        if was_snapshotting {
+            let params = self.params.clone();
+            let (schema_name, table_name) = key.clone();
+            let slot_name = self.key.slot_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await
+                {
+                    tracing::warn!(
+                        table = %format!("{schema_name}.{table_name}"),
+                        slot = %slot_name,
+                        "failed to remove mid-snapshot table from the shared publication; \
+                         re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
+                         the table from the publication manually before re-adding: {e}"
+                    );
+                }
+            });
         }
     }
 
@@ -419,10 +518,10 @@ async fn subscribe_inner(input: ReplicationStreamInput) -> Result<ChangesStream>
 
 fn get_or_create_source(key: &SourceKey, params: &ReplicationParams) -> Arc<SharedSource> {
     let mut registry = lock(&REGISTRY);
-    if let Some(existing) = registry.get(key) {
-        if !existing.dead.load(Ordering::Acquire) {
-            return Arc::clone(existing);
-        }
+    if let Some(existing) = registry.get(key)
+        && !existing.dead.load(Ordering::Acquire)
+    {
+        return Arc::clone(existing);
     }
     let source = Arc::new(SharedSource::new(key.clone(), params.clone()));
     registry.insert(key.clone(), Arc::clone(&source));
@@ -458,12 +557,33 @@ async fn attach_member(
         });
     }
 
-    if source.member(&member_key).is_some() {
-        return Err(Error::SharedTableAlreadySubscribed {
-            schema: schema_name,
-            table: table_name,
-            slot: source.key.slot_name.clone(),
+    // The pump serves every member over ONE connection built from the first
+    // subscriber's params. Reject members whose connection-level settings
+    // differ rather than silently using someone else's — a mismatched
+    // sslmode, for example, would otherwise quietly downgrade (or break) the
+    // transport this dataset asked for. (host/port/database/user are already
+    // part of the registry key; member-level knobs like the snapshot batch
+    // size stay per-dataset.)
+    if let Some(param) = connection_params_mismatch(&params, &source.params) {
+        return Err(Error::SharedConnectionParamsMismatch {
+            dataset: dataset_name,
+            param,
         });
+    }
+
+    if let Some(existing) = source.member(&member_key) {
+        if existing.sender.is_closed() {
+            // The previous subscription's receiver is gone (dataset reload,
+            // failed sink) but the pump hasn't reaped it yet — detach it now
+            // so this is a rejoin, not a duplicate.
+            source.detach_member(&member_key, "superseded by a new subscription");
+        } else {
+            return Err(Error::SharedTableAlreadySubscribed {
+                schema: schema_name,
+                table: table_name,
+                slot: source.key.slot_name.clone(),
+            });
+        }
     }
 
     // Slot + publication DDL (idempotent, retried on transient errors).
@@ -478,14 +598,17 @@ async fn attach_member(
 
     let rejoining = lock(&source.detached).remove(&member_key);
     // Snapshot when this slot epoch has no usable history for the table:
-    // fresh slot (regardless of leftover publication membership), or table
-    // newly added to the publication. A rejoin skips it — the held ack floor
-    // guarantees the gap is still in WAL and will be replayed.
+    // table newly added to the publication (late-added dataset, or a rejoin
+    // after a failed snapshot — mid-bootstrap detach removes the table from
+    // the publication), or a slot created fresh this process (regardless of
+    // leftover publication membership). A plain rejoin skips it — the held
+    // ack floor guarantees the gap is still in WAL and will be replayed.
     let need_snapshot =
-        !rejoining && (source.slot_created_fresh.load(Ordering::Acquire) || setup.table_added);
+        setup.table_added || (!rejoining && source.slot_created_fresh.load(Ordering::Acquire));
 
+    let snapshotting = need_snapshot && params.initial_snapshot;
     let (sender, receiver) = mpsc::channel(MEMBER_CHANNEL_CAPACITY);
-    source.ack.register(&member_key);
+    source.ack.register(&member_key, snapshotting);
     lock(&source.members).insert(
         member_key.clone(),
         Arc::new(MemberHandle {
@@ -520,8 +643,16 @@ async fn attach_member(
 
     // Head of the member's stream: initial snapshot (its last envelope flips
     // is_dataset_ready), or an immediate ready signal when resuming.
-    let head: ChangesStream = if need_snapshot && params.initial_snapshot {
-        Box::pin(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
+    //
+    // While the snapshot runs, the pump does NOT route WAL to this member
+    // (its `bootstrapping` ack entry both signals that and holds the join-LSN
+    // floor), so one member's long snapshot never back-pressures the others
+    // through its undrained channel. When the snapshot completes, the
+    // `bootstrap_finished` hook flips the member live and asks the pump to
+    // reconnect — Postgres resumes from the held floor and replays the
+    // member's gap (idempotent for everyone).
+    let head: ChangesStream = if snapshotting {
+        let snapshot = bootstrap::snapshot_stream(bootstrap::SnapshotInput {
             params: params.clone(),
             schema_name,
             table_name,
@@ -529,7 +660,33 @@ async fn attach_member(
             primary_keys,
             dataset_name,
             metrics,
-        })?)
+        })?;
+        // Flip the member live only on CLEAN snapshot completion. If the
+        // snapshot errored, the member must stay `bootstrapping`: its
+        // accelerator is missing base rows that WAL replay can never provide,
+        // so the eventual detach tears its table out of the publication and a
+        // rejoin re-snapshots from scratch.
+        let saw_error = Arc::new(AtomicBool::new(false));
+        let error_flag = Arc::clone(&saw_error);
+        let snapshot = snapshot.inspect(move |item| {
+            if item.is_err() {
+                error_flag.store(true, Ordering::Release);
+            }
+        });
+        let hook_source = Arc::clone(source);
+        let hook_key = member_key.clone();
+        let mut hook_fired = false;
+        let bootstrap_finished = stream::poll_fn(move |_| {
+            if !hook_fired {
+                hook_fired = true;
+                if !saw_error.load(Ordering::Acquire) {
+                    hook_source.ack.snapshot_finished(&hook_key);
+                    hook_source.restart_requested.store(true, Ordering::Release);
+                }
+            }
+            std::task::Poll::Ready(None)
+        });
+        Box::pin(snapshot.chain(bootstrap_finished))
     } else {
         metrics.mark_bootstrap_complete();
         let envelope = crate::cdc::build_ready_signal_envelope(&schema).map_err(|e| {
@@ -541,6 +698,29 @@ async fn attach_member(
     };
 
     Ok(Box::pin(head.chain(ReceiverStream::new(receiver))))
+}
+
+/// Compare connection-level params of a joining member against the shared
+/// source's. Returns the name of the first mismatched parameter, never its
+/// value — passwords and certificate paths must not leak into error messages.
+fn connection_params_mismatch(
+    member: &ReplicationParams,
+    source: &ReplicationParams,
+) -> Option<&'static str> {
+    use secrecy::ExposeSecret;
+    if member.password.expose_secret() != source.password.expose_secret() {
+        return Some("pg_pass");
+    }
+    if member.sslmode != source.sslmode {
+        return Some("pg_sslmode");
+    }
+    if member.sslrootcert != source.sslrootcert {
+        return Some("pg_sslrootcert");
+    }
+    if member.temporary_slot != source.temporary_slot {
+        return Some("pg_replication_temporary_slot");
+    }
+    None
 }
 
 /// Send a fatal error to every member and terminate the source.
@@ -574,10 +754,10 @@ async fn member_fatal(source: &Arc<SharedSource>, key: &MemberKey, message: Stri
 fn finish_pump(source: &Arc<SharedSource>) {
     source.dead.store(true, Ordering::Release);
     let mut registry = lock(&REGISTRY);
-    if let Some(current) = registry.get(&source.key) {
-        if Arc::ptr_eq(current, source) {
-            registry.remove(&source.key);
-        }
+    if let Some(current) = registry.get(&source.key)
+        && Arc::ptr_eq(current, source)
+    {
+        registry.remove(&source.key);
     }
 }
 
@@ -641,6 +821,10 @@ async fn run_pump(source: Arc<SharedSource>) {
                     );
                     reconnect_attempts = 0;
                 }
+                // This connection starts at the floor (min over every held
+                // member), so it covers every snapshot-complete member's gap:
+                // promote them to routable + creditable.
+                source.ack.promote_ready_members();
                 c
             }
             Err(e) if resilience::is_transient_pgwire(&e) => {
@@ -821,6 +1005,21 @@ async fn handle_decoded(
                 );
                 return;
             };
+            if !source.ack.is_streaming(&member_key) {
+                // The member is still held — snapshotting, or joined after
+                // this connection started. Don't route WAL at it (a
+                // snapshotting member's channel isn't drained until the
+                // snapshot ends). Its held ack floor keeps this WAL
+                // replayable; the next (re)connect promotes it and re-sends
+                // this Relation.
+                routes.remove(&rel.relation_id);
+                tracing::debug!(
+                    dataset = %member.dataset_name,
+                    table = %format_member(&member_key),
+                    "member is not yet streaming; deferring WAL routing until the next reconnect"
+                );
+                return;
+            }
             if let Err(e) =
                 client::validate_relation_against_schema(&member.schema, &rel, &member.primary_keys)
             {
@@ -838,57 +1037,57 @@ async fn handle_decoded(
             routes.insert(rel.relation_id, member_key);
         }
         DecodedMessage::Insert { relation_id, tuple } => {
-            if let Some(member_key) = routes.get(&relation_id) {
-                if let Some(member) = source.member(member_key) {
-                    member.metrics.inc_insert();
-                    txn.entry(relation_id).or_default().push(DecodedChange {
-                        op: ChangeOp::Create,
-                        row: tuple,
-                    });
-                }
+            if let Some(member_key) = routes.get(&relation_id)
+                && let Some(member) = source.member(member_key)
+            {
+                member.metrics.inc_insert();
+                txn.entry(relation_id).or_default().push(DecodedChange {
+                    op: ChangeOp::Create,
+                    row: tuple,
+                });
             }
         }
         DecodedMessage::Update {
             relation_id, new, ..
         } => {
-            if let Some(member_key) = routes.get(&relation_id) {
-                if let Some(member) = source.member(member_key) {
-                    member.metrics.inc_update();
-                    txn.entry(relation_id).or_default().push(DecodedChange {
-                        op: ChangeOp::Update,
-                        row: new,
-                    });
-                }
+            if let Some(member_key) = routes.get(&relation_id)
+                && let Some(member) = source.member(member_key)
+            {
+                member.metrics.inc_update();
+                txn.entry(relation_id).or_default().push(DecodedChange {
+                    op: ChangeOp::Update,
+                    row: new,
+                });
             }
         }
         DecodedMessage::Delete { relation_id, old } => {
-            if let Some(member_key) = routes.get(&relation_id) {
-                if let Some(member) = source.member(member_key) {
-                    member.metrics.inc_delete();
-                    txn.entry(relation_id).or_default().push(DecodedChange {
-                        op: ChangeOp::Delete,
-                        row: old,
-                    });
-                }
+            if let Some(member_key) = routes.get(&relation_id)
+                && let Some(member) = source.member(member_key)
+            {
+                member.metrics.inc_delete();
+                txn.entry(relation_id).or_default().push(DecodedChange {
+                    op: ChangeOp::Delete,
+                    row: old,
+                });
             }
         }
         DecodedMessage::Truncate { relation_ids } => {
             // Unlike the per-dataset path, multi-relation TRUNCATEs are fine
             // here: each relation routes to its own member.
             for relation_id in relation_ids {
-                if let Some(member_key) = routes.get(&relation_id) {
-                    if let Some(member) = source.member(member_key) {
-                        member.metrics.inc_truncate();
-                        txn.entry(relation_id).or_default().push(DecodedChange {
-                            op: ChangeOp::Truncate,
-                            row: pgoutput::TupleData { columns: vec![] },
-                        });
-                        tracing::info!(
-                            dataset = %member.dataset_name,
-                            relation_id,
-                            "TRUNCATE from shared postgres replication queued for accelerator"
-                        );
-                    }
+                if let Some(member_key) = routes.get(&relation_id)
+                    && let Some(member) = source.member(member_key)
+                {
+                    member.metrics.inc_truncate();
+                    txn.entry(relation_id).or_default().push(DecodedChange {
+                        op: ChangeOp::Truncate,
+                        row: pgoutput::TupleData { columns: vec![] },
+                    });
+                    tracing::info!(
+                        dataset = %member.dataset_name,
+                        relation_id,
+                        "TRUNCATE from shared postgres replication queued for accelerator"
+                    );
                 }
             }
         }
@@ -918,6 +1117,11 @@ async fn deliver_commit(
         let Some(member) = source.member(member_key) else {
             continue; // detached mid-transaction
         };
+        if source.ack.already_committed(member_key, end_lsn) {
+            // Reconnect replay of a commit this member already durably
+            // applied (replays start at the minimum floor across members).
+            continue;
+        }
         let Some(rel) = decoder.relation(relation_id) else {
             member_fatal(
                 source,
@@ -979,8 +1183,8 @@ mod tests {
     fn ack_floor_is_min_across_members() {
         let ack = AckTable::default();
         ack.seed(100);
-        ack.register(&key("a"));
-        ack.register(&key("b"));
+        ack.register(&key("a"), false);
+        ack.register(&key("b"), false);
 
         ack.deliver(&key("a"), 200);
         ack.commit(&key("a"), 200);
@@ -996,8 +1200,9 @@ mod tests {
     fn ack_credit_idle_skips_members_with_inflight_envelopes() {
         let ack = AckTable::default();
         ack.seed(100);
-        ack.register(&key("a"));
-        ack.register(&key("b"));
+        ack.register(&key("a"), false);
+        ack.register(&key("b"), false);
+        ack.promote_ready_members();
 
         // a has an in-flight envelope (delivered past committed).
         ack.deliver(&key("a"), 300);
@@ -1013,11 +1218,60 @@ mod tests {
     }
 
     #[test]
+    fn held_member_is_never_credited_until_promoted() {
+        let ack = AckTable::default();
+        ack.seed(100);
+        ack.register(&key("a"), true);
+        ack.register(&key("b"), false);
+        ack.promote_ready_members();
+        assert!(
+            !ack.is_streaming(&key("a")),
+            "a snapshotting → not promoted"
+        );
+        assert!(ack.is_streaming(&key("b")));
+
+        // Commits flow for b, but a's join-LSN floor holds while it snapshots.
+        ack.deliver(&key("b"), 300);
+        ack.commit(&key("b"), 300);
+        ack.credit_idle(300);
+        assert_eq!(ack.flush_lsn(), 100);
+
+        // Snapshot finished — but a stays held (and uncredited) until the
+        // pump's next connect promotes it. Crediting in this window would ack
+        // past changes decoded while a had no route (the data-loss race).
+        ack.snapshot_finished(&key("a"));
+        ack.credit_idle(400);
+        assert_eq!(ack.flush_lsn(), 100);
+        assert!(!ack.is_streaming(&key("a")));
+
+        // The reconnect (started at the floor, covering a's gap) promotes a.
+        ack.promote_ready_members();
+        assert!(ack.is_streaming(&key("a")));
+        ack.credit_idle(400);
+        assert_eq!(ack.flush_lsn(), 400);
+    }
+
+    #[test]
+    fn detach_reports_snapshotting_state() {
+        let ack = AckTable::default();
+        ack.seed(100);
+        ack.register(&key("a"), true);
+        ack.register(&key("b"), false);
+        assert!(ack.detach(&key("a")), "a detached mid-snapshot");
+        assert!(!ack.detach(&key("b")), "b was not snapshotting");
+        assert!(
+            !ack.detach(&key("zz")),
+            "unknown member is not snapshotting"
+        );
+    }
+
+    #[test]
     fn detached_member_holds_the_floor() {
         let ack = AckTable::default();
         ack.seed(100);
-        ack.register(&key("a"));
-        ack.register(&key("b"));
+        ack.register(&key("a"), false);
+        ack.register(&key("b"), false);
+        ack.promote_ready_members();
         ack.credit_idle(200);
         assert_eq!(ack.flush_lsn(), 200);
 
@@ -1026,9 +1280,10 @@ mod tests {
         ack.credit_idle(900);
         assert_eq!(ack.flush_lsn(), 200);
 
-        // Rejoin keeps the held floor; once it commits the replayed tail, the
-        // floor moves again.
-        ack.register(&key("a"));
+        // Rejoin keeps the held floor; once promoted by the reconnect and the
+        // replayed tail commits, the floor moves again.
+        ack.register(&key("a"), false);
+        ack.promote_ready_members();
         ack.deliver(&key("a"), 900);
         ack.commit(&key("a"), 900);
         ack.credit_idle(900);
@@ -1039,7 +1294,8 @@ mod tests {
     fn replayed_older_commits_never_regress() {
         let ack = AckTable::default();
         ack.seed(100);
-        ack.register(&key("a"));
+        ack.register(&key("a"), false);
+        ack.promote_ready_members();
         ack.deliver(&key("a"), 500);
         ack.commit(&key("a"), 500);
         assert_eq!(ack.flush_lsn(), 500);
@@ -1057,7 +1313,7 @@ mod tests {
     async fn shared_committer_advances_member_floor() {
         let ack = Arc::new(AckTable::default());
         ack.seed(10);
-        ack.register(&key("a"));
+        ack.register(&key("a"), false);
         let committer = SharedLsnCommitter {
             ack: Arc::clone(&ack),
             key: key("a"),
