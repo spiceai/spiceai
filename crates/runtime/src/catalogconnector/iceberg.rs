@@ -175,7 +175,7 @@ impl IcebergCatalog {
     }
 }
 
-pub const ICEBERG_PARAM_LEN: usize = 23;
+pub const ICEBERG_PARAM_LEN: usize = 24;
 pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
@@ -237,6 +237,9 @@ pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
         .secret(),
     ParameterSpec::component("s3_connect_timeout")
         .description("Configure socket connection timeout, in seconds (default: 60)."),
+    ParameterSpec::component("s3_path_style_access")
+        .description("Controls S3 addressing style. Defaults to 'true' (path-style: endpoint/bucket), which is required for object stores such as MinIO. Set to 'false' to use virtual-hosted-style (bucket.endpoint).")
+        .default("true"),
 
     // GCS storage options
     ParameterSpec::component("gcs_project_id")
@@ -274,6 +277,7 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
             "rest.session-token".to_string(),
         ]),
         "s3_region" => Some(vec!["s3.region".to_string()]),
+        "s3_path_style_access" => Some(vec!["s3.path-style-access".to_string()]),
         "s3_role_session_name" => Some(vec![
             "client.assume-role.session-name".to_string(),
             "rest.client.assume-role.session-name".to_string(),
