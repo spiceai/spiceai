@@ -19431,6 +19431,7 @@ mod tests {
         // Arm the RAM tier (the runtime does this on the first replayable committer).
         #[expect(clippy::items_after_statements)]
         struct TestAdvancer;
+        #[expect(clippy::items_after_statements)]
         #[async_trait::async_trait]
         impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
             async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
@@ -19549,6 +19550,7 @@ mod tests {
 
         #[expect(clippy::items_after_statements)]
         struct TestAdvancer;
+        #[expect(clippy::items_after_statements)]
         #[async_trait::async_trait]
         impl crate::provider::mem_tier::SlotAdvancer for TestAdvancer {
             async fn on_checkpoint_durable(&self, _durable_epoch: u64) {}
