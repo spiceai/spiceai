@@ -69,7 +69,6 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 )]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -419,7 +418,7 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
 fn resolve_federated_side(plan: &Arc<dyn ExecutionPlan>) -> Option<FederatedSide<'_>> {
     // A join input is typically `RepartitionExec(Hash) -> UnionExec ->
     // [pass-through -> FlightSqlExec]`. Descend through single-input wrapper
-    // nodes (repartition / coalesce / filter / cooperative) to reach the
+    // nodes (repartition / coalesce / cooperative) to reach the
     // `UnionExec` (or a bare `FlightSqlExec`) before collecting the per-partition
     // scans — otherwise `collect_flight_execs` hits the multi-input `UnionExec`
     // mid-walk and bails.
@@ -482,9 +481,17 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
 }
 
 /// A single-input node that passes data through unchanged for the purposes of
-/// resolving a federated scan: repartition, coalesce-batches, filter (the
-/// underlying `FlightSqlExec` already carries the predicate in its SQL), and the
+/// resolving a federated scan: repartition, coalesce-batches, and the
 /// name-identified `CooperativeExec` / `BytesProcessedExec` wrappers.
+///
+/// `FilterExec` is deliberately NOT pass-through. `FlightSQLTable` reports
+/// filter pushdown as `Exact` (predicate absorbed into the scan SQL, no
+/// `FilterExec` planned) or `Unsupported` (predicate stays in the plan as a
+/// `FilterExec` and is NOT in the scan SQL) — it never reports `Inexact`. So a
+/// `FilterExec` here always carries a predicate the generated join SQL would
+/// lose (e.g. a `CASE` expression or a volatile function), and replacing the
+/// subtree would silently return unfiltered rows. Bail and keep the central
+/// join instead.
 #[expect(
     deprecated,
     reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); kept for plan-shape recognition"
@@ -495,7 +502,6 @@ fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
             .as_any()
             .downcast_ref::<CoalesceBatchesExec>()
             .is_some()
-        || plan.as_any().downcast_ref::<FilterExec>().is_some()
         || PASS_THROUGH_EXEC_NAMES.contains(&plan.name())
 }
 
@@ -570,14 +576,18 @@ fn build_join_sql(
     let mut select_items = Vec::with_capacity(join.schema().fields().len());
     for field in join.schema().fields() {
         let name = field.name();
-        let qualified = if fact_names.contains(name.as_str()) {
-            format!("f.{}", quote_ident(name))
-        } else if dim_names.contains(name.as_str()) {
-            format!("d.{}", quote_ident(name))
-        } else {
-            // Output column we can't attribute to a side — bail rather than
-            // produce a wrong schema.
-            return None;
+        let in_fact = fact_names.contains(name.as_str());
+        let in_dim = dim_names.contains(name.as_str());
+        let qualified = match (in_fact, in_dim) {
+            (true, false) => format!("f.{}", quote_ident(name)),
+            (false, true) => format!("d.{}", quote_ident(name)),
+            // Present on BOTH sides: the join's output schema distinguishes the
+            // two columns only by position, so a by-name mapping cannot tell
+            // which side this output field came from — qualifying both as `f.`
+            // would silently ship fact values in the dim column. Present on
+            // NEITHER side: we can't attribute the column at all. Bail in both
+            // cases rather than render a wrong projection.
+            (true, true) | (false, false) => return None,
         };
         select_items.push(format!("{qualified} AS {}", quote_ident(name)));
     }
@@ -635,4 +645,225 @@ fn coerce_batch(batch: RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(Arc::clone(target), columns)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_flight::sql::client::FlightSqlServiceClient;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::NullEquality;
+    use datafusion::common::stats::Precision;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+    use datafusion::physical_plan::displayable;
+    use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
+    use flight_client::cookie::CookieService;
+    use tonic::transport::Channel;
+
+    fn dummy_client() -> FlightSqlClient {
+        let channel = Channel::from_static("http://[::1]:1").connect_lazy();
+        let cookie_svc = CookieService::new(channel, Arc::new(CookieStore::new()));
+        FlightSqlServiceClient::new(cookie_svc)
+    }
+
+    fn fact_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, true),
+            Field::new("l_extendedprice", DataType::Int64, true),
+        ]))
+    }
+
+    fn dim_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, true),
+            Field::new("o_totalprice", DataType::Int64, true),
+        ]))
+    }
+
+    /// A `FlightSqlExec` leaf with an exact row-count statistic, so the
+    /// broadcast cost gate can classify the side as fact or dimension.
+    fn make_flight_exec(
+        schema: &SchemaRef,
+        table_ref: &str,
+        num_rows: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let mut statistics = Statistics::new_unknown(schema);
+        statistics.num_rows = Precision::Exact(num_rows);
+        Arc::new(
+            FlightSqlExec::new(
+                None,
+                schema,
+                &TableReference::parse_str(table_ref),
+                dummy_client(),
+                &[],
+                None,
+                Arc::new(CookieStore::new()),
+            )
+            .expect("build FlightSqlExec")
+            .with_statistics(statistics),
+        )
+    }
+
+    fn make_join(
+        fact_side: Arc<dyn ExecutionPlan>,
+        dim_side: Arc<dyn ExecutionPlan>,
+        fact_key: &str,
+        dim_key: &str,
+    ) -> Arc<dyn ExecutionPlan> {
+        let fact_idx = fact_side
+            .schema()
+            .index_of(fact_key)
+            .expect("fact key in schema");
+        let dim_idx = dim_side
+            .schema()
+            .index_of(dim_key)
+            .expect("dim key in schema");
+        let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
+            Arc::new(Column::new(fact_key, fact_idx)),
+            Arc::new(Column::new(dim_key, dim_idx)),
+        )];
+        Arc::new(
+            HashJoinExec::try_new(
+                fact_side,
+                dim_side,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("valid HashJoinExec"),
+        )
+    }
+
+    fn addresses() -> Vec<String> {
+        vec!["e0:50052".to_string(), "e1:50052".to_string()]
+    }
+
+    fn plan_display(plan: &Arc<dyn ExecutionPlan>) -> String {
+        displayable(plan.as_ref()).indent(false).to_string()
+    }
+
+    /// Positive control: a clean fact⋈dim join over federated scans is
+    /// rewritten into per-executor broadcast joins.
+    #[tokio::test]
+    async fn broadcast_fires_for_clean_small_dim_join() {
+        let fact = UnionExec::try_new(vec![
+            make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+            make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+        ])
+        .expect("fact union");
+        let dim = make_flight_exec(&dim_schema(), "foo.foo.dim", 10);
+        let join = make_join(fact, dim, "l_orderkey", "o_orderkey");
+
+        let result = try_rewrite(join, &addresses(), 25_000_000).expect("rewrite should not error");
+        assert!(result.transformed, "broadcast rewrite should fire");
+        let display = plan_display(&result.data);
+        assert!(
+            display.contains("BroadcastJoinFlightSqlExec"),
+            "rewritten plan should contain broadcast leaves: {display}"
+        );
+        assert!(
+            display.contains("executor_table('https://e0:50052', 'foo.foo.dim')")
+                && display.contains("executor_table('https://e1:50052', 'foo.foo.dim')"),
+            "dimension should be gathered from every executor: {display}"
+        );
+        assert!(
+            display.contains("f.\"l_orderkey\" = d.\"o_orderkey\""),
+            "join keys should map fact/dim sides: {display}"
+        );
+    }
+
+    /// A `FilterExec` above a federated scan holds a predicate that is NOT in
+    /// the scan's SQL (`FlightSQLTable` pushdown is `Exact` or `Unsupported`,
+    /// never `Inexact`). Rewriting through it would silently drop the
+    /// predicate, so the rule must leave the plan alone.
+    #[tokio::test]
+    async fn filter_exec_above_dim_scan_blocks_broadcast() {
+        let fact = UnionExec::try_new(vec![
+            make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+            make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+        ])
+        .expect("fact union");
+        let dim_scan = make_flight_exec(&dim_schema(), "foo.foo.dim", 10);
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("o_totalprice", 1)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(100)))),
+        ));
+        let dim = Arc::new(FilterExec::try_new(predicate, dim_scan).expect("filter"))
+            as Arc<dyn ExecutionPlan>;
+        let join = make_join(fact, dim, "l_orderkey", "o_orderkey");
+
+        let result = try_rewrite(join, &addresses(), 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "a FilterExec above the dim scan must block the broadcast rewrite"
+        );
+    }
+
+    /// Same as above, but with the un-pushed predicate inside a fact union leg.
+    #[tokio::test]
+    async fn filter_exec_in_fact_union_leg_blocks_broadcast() {
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("l_extendedprice", 1)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(100)))),
+        ));
+        let filtered_leg = Arc::new(
+            FilterExec::try_new(
+                predicate,
+                make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+            )
+            .expect("filter"),
+        ) as Arc<dyn ExecutionPlan>;
+        let fact = UnionExec::try_new(vec![
+            filtered_leg,
+            make_flight_exec(&fact_schema(), "foo.foo.fact", 10_000),
+        ])
+        .expect("fact union");
+        let dim = make_flight_exec(&dim_schema(), "foo.foo.dim", 10);
+        let join = make_join(fact, dim, "l_orderkey", "o_orderkey");
+
+        let result = try_rewrite(join, &addresses(), 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "a FilterExec inside a fact union leg must block the broadcast rewrite"
+        );
+    }
+
+    /// When both join inputs expose a column with the same name, the join's
+    /// output schema distinguishes the two only by position — a by-name
+    /// `f.`/`d.` attribution would ship one side's values in the other side's
+    /// column. The rule must bail.
+    #[tokio::test]
+    async fn shared_column_name_blocks_broadcast() {
+        let fact_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("fk", DataType::Int64, true),
+            Field::new("tag", DataType::Int64, true),
+        ]));
+        let dim_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("dk", DataType::Int64, true),
+            Field::new("tag", DataType::Int64, true),
+        ]));
+        let fact = UnionExec::try_new(vec![
+            make_flight_exec(&fact_schema, "foo.foo.fact", 10_000),
+            make_flight_exec(&fact_schema, "foo.foo.fact", 10_000),
+        ])
+        .expect("fact union");
+        let dim = make_flight_exec(&dim_schema, "foo.foo.dim", 10);
+        let join = make_join(fact, dim, "fk", "dk");
+
+        let result = try_rewrite(join, &addresses(), 25_000_000).expect("rewrite should not error");
+        assert!(
+            !result.transformed,
+            "an output column name present on both join sides must block the broadcast rewrite"
+        );
+    }
 }
