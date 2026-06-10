@@ -21,7 +21,7 @@ use aws_sdk_glue::{Client, types::Table};
 use aws_sdk_s3::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
-    Catalog, CatalogBuilder, NamespaceIdent, TableIdent,
+    CatalogBuilder, NamespaceIdent, TableIdent,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
 };
 use iceberg_catalog_glue::{
