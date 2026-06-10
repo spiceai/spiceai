@@ -81,13 +81,29 @@ impl DocumentParser for PptxParser {
                 .context(InternalParsingSnafu {
                     format: DocumentType::Pptx,
                 })?;
+            // Cap the decompressed size of each slide entry to defend against
+            // decompression ("zip") bombs: a small malicious .pptx whose slide
+            // XML inflates to many gigabytes would otherwise drive an unbounded
+            // `read_to_string` and OOM the process. 64 MiB is far above any
+            // legitimate slide.
+            const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
             let mut xml = String::new();
-            entry
+            let read = entry
+                .take(MAX_SLIDE_BYTES + 1)
                 .read_to_string(&mut xml)
                 .boxed()
                 .context(InternalParsingSnafu {
                     format: DocumentType::Pptx,
                 })?;
+            if read as u64 > MAX_SLIDE_BYTES {
+                return Err(std::io::Error::other(format!(
+                    "PPTX slide '{path}' exceeds the {MAX_SLIDE_BYTES}-byte decompression limit (possible decompression bomb)"
+                )))
+                .boxed()
+                .context(InternalParsingSnafu {
+                    format: DocumentType::Pptx,
+                });
+            }
             slides.push(extract_slide_text(&xml)?);
         }
 
@@ -188,6 +204,30 @@ impl Document for PptxDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_decompression_bomb() {
+        use std::io::Write;
+        // A tiny .pptx whose single slide entry decompresses past the 64 MiB cap
+        // (65 MiB of 'a', which deflates to a few KB) must be rejected rather than
+        // driving an unbounded read that would OOM the process.
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("ppt/slides/slide1.xml", options)
+            .expect("start file");
+        let chunk = vec![b'a'; 1024 * 1024];
+        for _ in 0..65 {
+            zip.write_all(&chunk).expect("write");
+        }
+        let buf = zip.finish().expect("finish").into_inner();
+
+        let result = PptxParser::default().parse(&Bytes::from(buf));
+        assert!(
+            result.is_err(),
+            "a slide exceeding the decompression cap should be rejected"
+        );
+    }
 
     #[test]
     fn slide_index_parses_numeric_suffix() {

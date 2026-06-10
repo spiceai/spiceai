@@ -795,6 +795,28 @@ impl Https {
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                const MAX_REDIRECTS: usize = 5;
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    return attempt.error("too many redirects");
+                }
+                // SSRF defense-in-depth: refuse to follow a redirect to a
+                // private, loopback, or link-local IP-literal target.
+                let to_internal = match attempt.url().host() {
+                    Some(url::Host::Ipv4(ip)) => {
+                        ip.is_loopback()
+                            || ip.is_private()
+                            || ip.is_link_local()
+                            || ip.is_unspecified()
+                    }
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+                    _ => false,
+                };
+                if to_internal {
+                    return attempt.error("redirect to a private address is not allowed");
+                }
+                attempt.follow()
+            }))
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 

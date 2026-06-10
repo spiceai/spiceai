@@ -54,6 +54,8 @@ limitations under the License.
 use datafusion::prelude::SessionContext;
 use http::HeaderMap;
 use moka::sync::Cache;
+use runtime_auth::AuthPrincipal;
+use spicepod::component::runtime::ApiKey;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::metadata::MetadataMap;
@@ -126,7 +128,10 @@ impl SessionStore {
         base_ctx: &SessionContext,
         api_key: Option<&str>,
     ) -> (String, Arc<SessionContext>) {
-        let session_id = Uuid::now_v7().hyphenated().to_string();
+        // Use a CSPRNG-backed UUIDv4 rather than the time-ordered UUIDv7: this id
+        // is returned to the client and accepted as a bearer session token, so it
+        // must be unpredictable and must not leak its creation time.
+        let session_id = Uuid::new_v4().hyphenated().to_string();
 
         // Create a new SessionState with a unique session_id using SessionStateBuilder.
         // This is critical for session isolation - each session needs its own session_id
@@ -174,6 +179,28 @@ impl SessionStore {
     #[must_use]
     pub fn get_session(&self, session_id: &str) -> Option<Arc<SessionContext>> {
         self.sessions.get(session_id)
+    }
+
+    /// Returns the stable principal id of the session's owner if the request
+    /// names an existing, owned session.
+    ///
+    /// The session id is read from the same `x-session-id` / Authorization
+    /// headers used to select the session. The returned id matches the
+    /// `stable_id()` of the `ApiKey` principal that created the session at
+    /// handshake, so callers can compare it against the authenticated principal
+    /// to confirm the session belongs to them. Returns `None` for unknown or
+    /// unowned sessions (the latter preserving behavior for unauthenticated
+    /// setups).
+    #[must_use]
+    pub fn owner_stable_id_from_http(&self, headers: &HeaderMap) -> Option<String> {
+        let session_id = extract_session_id_from_headers(headers)?;
+        let owner_api_key = self.validate_session(&session_id)?;
+        // `ApiKey::stable_id` hashes only the key bytes (group-independent), so
+        // reconstructing the key here yields the same id the owning principal
+        // exposes. Kept consistent with `runtime_auth`'s `AuthPrincipal` impl.
+        ApiKey::parse_str(&owner_api_key)
+            .stable_id()
+            .map(|id| id.into_owned())
     }
 
     /// Gets or creates a session from the request metadata.
@@ -464,5 +491,57 @@ mod tests {
             .expect("Should return existing session");
         assert!(Arc::ptr_eq(&ctx1, &ctx2));
         assert_eq!(store.session_count(), 1);
+    }
+
+    #[test]
+    fn test_session_id_is_csprng_uuid_v4() {
+        // Regression: session ids are returned to clients and accepted as bearer
+        // session tokens, so they must be CSPRNG-random (UUIDv4), never the
+        // time-ordered/partly-predictable UUIDv7.
+        let store = SessionStore::new();
+        let base_ctx = SessionContext::new();
+        let (session_id, _) = store.create_session(&base_ctx, Some("k"));
+
+        let uuid = Uuid::parse_str(&session_id).expect("session id should be a valid UUID");
+        assert_eq!(
+            uuid.get_version(),
+            Some(uuid::Version::Random),
+            "session id must be a UUIDv4 (random), got {session_id}"
+        );
+    }
+
+    #[test]
+    fn test_owner_stable_id_from_http_binds_session_to_owner() {
+        let store = SessionStore::new();
+        let base_ctx = SessionContext::new();
+
+        // An owned session resolves to its owner's stable id.
+        let (session_id, _) = store.create_session(&base_ctx, Some("owner-key"));
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            session_id.parse().expect("valid header value"),
+        );
+        let expected = ApiKey::parse_str("owner-key")
+            .stable_id()
+            .map(|id| id.into_owned());
+        assert!(expected.is_some());
+        assert_eq!(store.owner_stable_id_from_http(&headers), expected);
+
+        // A session created without an api key is unowned (None).
+        let (anon_id, _) = store.create_session(&base_ctx, None);
+        let mut anon_headers = http::HeaderMap::new();
+        anon_headers.insert("x-session-id", anon_id.parse().expect("valid header value"));
+        assert_eq!(store.owner_stable_id_from_http(&anon_headers), None);
+
+        // An unknown session id yields no owner.
+        let mut unknown = http::HeaderMap::new();
+        unknown.insert(
+            "x-session-id",
+            "00000000-0000-4000-8000-000000000000"
+                .parse()
+                .expect("valid header value"),
+        );
+        assert_eq!(store.owner_stable_id_from_http(&unknown), None);
     }
 }

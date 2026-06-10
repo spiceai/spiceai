@@ -58,6 +58,7 @@ limitations under the License.
 //! ```
 
 use std::any::Any;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
@@ -137,6 +138,160 @@ fn validate_azure_url(url_str: &str) -> DFResult<()> {
     )))
 }
 
+/// Environment variable that, when set to a truthy value (`1`/`true`/`yes`/`on`),
+/// disables the SSRF guard on `http`/`https` URL tables, allowing them to target
+/// private, loopback, and link-local addresses. Off by default — intended only
+/// for operators who knowingly query an internal HTTP object store.
+const ALLOW_PRIVATE_HOSTS_ENV: &str = "SPICE_URL_TABLE_ALLOW_PRIVATE_HOSTS";
+
+/// Whether the SSRF guard is disabled via [`ALLOW_PRIVATE_HOSTS_ENV`].
+fn allow_private_hosts() -> bool {
+    std::env::var(ALLOW_PRIVATE_HOSTS_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Returns `true` if `ip` is in a range that must not be reachable through a
+/// user-supplied `http`/`https` URL table: loopback, private/RFC1918,
+/// link-local (incl. the `169.254.169.254` cloud-metadata endpoint), CGNAT,
+/// unspecified, multicast, and other reserved ranges. Used to prevent SSRF.
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_internal_ipv4(v4),
+        // Unwrap IPv4-mapped/-compatible addresses (e.g. `::ffff:169.254.169.254`)
+        // and re-check them as IPv4 so they can't bypass the v4 rules.
+        IpAddr::V6(v6) => match v6.to_ipv4() {
+            Some(v4) => is_internal_ipv4(v4),
+            None => is_internal_ipv6(v6),
+        },
+    }
+}
+
+fn is_internal_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // Only the four oldest, universally-stable classifiers are used as methods;
+    // the rest are explicit prefix checks so behavior is obvious and portable.
+    ip.is_loopback()            // 127.0.0.0/8
+        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()   // 169.254.0.0/16 (incl. 169.254.169.254 metadata)
+        || ip.is_unspecified()  // 0.0.0.0
+        || o[0] == 0                                 // 0.0.0.0/8 "this network"
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)      // 100.64.0.0/10 CGNAT
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)      // 198.18.0.0/15 benchmarking
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)   // 192.0.2.0/24 TEST-NET-1
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100) // 198.51.100.0/24 TEST-NET-2
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113) // 203.0.113.0/24 TEST-NET-3
+        || o[0] >= 224 // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved, 255.255.255.255 broadcast
+}
+
+fn is_internal_ipv6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    ip.is_loopback()                  // ::1
+        || ip.is_unspecified()        // ::
+        || (first & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (first & 0xffc0) == 0xfe80 // fe80::/10 link local
+        || (first & 0xff00) == 0xff00 // ff00::/8 multicast
+}
+
+/// Builds the error returned when a URL table targets a blocked internal host.
+fn ssrf_blocked_error(url_str: &str) -> DataFusionError {
+    DataFusionError::Plan(format!(
+        "URL table '{url_str}' targets a private, loopback, or link-local address, which is not allowed for SSRF protection. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true."
+    ))
+}
+
+/// Guards against SSRF for `http`/`https` URL tables by rejecting URLs whose
+/// host is (or resolves to) an internal address. Object-store schemes (`s3`,
+/// `gs`, `abfs`, ...) are not checked here because they reach a fixed cloud
+/// provider endpoint rather than an arbitrary host.
+///
+/// Note: this resolves DNS and checks the result, then hands the URL to the
+/// object-store HTTP client which resolves again — a determined attacker
+/// controlling DNS could rebind between the two lookups. Blocking literal
+/// internal IPs and resolved-internal hostnames still closes the common cases
+/// (direct metadata-IP access, `localhost`, and names that resolve to RFC1918).
+async fn validate_http_url_not_internal(url_str: &str) -> DFResult<()> {
+    validate_http_url_with_policy(url_str, allow_private_hosts()).await
+}
+
+async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DFResult<()> {
+    if allow_private {
+        return Ok(());
+    }
+
+    let Ok(parsed) = Url::parse(url_str) else {
+        // Not parseable here; the regular `ListingTableUrl::parse` will surface the error.
+        return Ok(());
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Ok(());
+    }
+
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            if is_internal_ip(IpAddr::V4(ip)) {
+                return Err(ssrf_blocked_error(url_str));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if is_internal_ip(IpAddr::V6(ip)) {
+                return Err(ssrf_blocked_error(url_str));
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            let lower = domain.to_ascii_lowercase();
+            // RFC 6761 / cloud-metadata names that never legitimately point at a
+            // remote object store.
+            if lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower == "metadata.google.internal"
+                || lower == "metadata.goog"
+            {
+                return Err(ssrf_blocked_error(url_str));
+            }
+
+            // Resolve the host and reject if ANY resolved address is internal.
+            let lookup_host = lower.clone();
+            let addrs = tokio::task::spawn_blocking(move || {
+                (lookup_host.as_str(), 0u16)
+                    .to_socket_addrs()
+                    .map(|iter| iter.map(|s| s.ip()).collect::<Vec<IpAddr>>())
+            })
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "DNS resolution task failed for URL table '{url_str}': {e}"
+                ))
+            })?
+            .map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Failed to resolve host for URL table '{url_str}': {e}"
+                ))
+            })?;
+
+            if addrs.is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "Could not resolve host for URL table '{url_str}'"
+                )));
+            }
+            if addrs.iter().any(|ip| is_internal_ip(*ip)) {
+                return Err(ssrf_blocked_error(url_str));
+            }
+        }
+        None => {
+            return Err(DataFusionError::Plan(format!(
+                "URL table '{url_str}' is missing a host"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// A factory that creates [`ListingTable`] providers from object store URLs.
 ///
 /// This enables queries like:
@@ -197,6 +352,9 @@ impl UrlTableFactory for SpiceUrlTableFactory {
 
         // Validate Azure URLs have the required account name
         validate_azure_url(url)?;
+
+        // Prevent SSRF: http/https URL tables must not target internal addresses.
+        validate_http_url_not_internal(url).await?;
 
         // Parse the URL
         let table_url = ListingTableUrl::parse(url).map_err(|e| {
@@ -682,5 +840,99 @@ mod tests {
             err.to_string().contains("missing the storage account name"),
             "Error should mention missing account: {err}"
         );
+    }
+
+    #[test]
+    fn test_is_internal_ip_blocks_dangerous_ranges() {
+        use std::str::FromStr;
+
+        // Must be blocked (SSRF targets).
+        for ip in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "169.254.169.254", // AWS/GCP/Azure IMDS
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "100.64.0.1", // CGNAT
+            "0.0.0.0",
+            "198.18.0.1", // benchmarking
+            "240.0.0.1",  // reserved
+            "255.255.255.255",
+        ] {
+            let addr = IpAddr::from_str(ip).expect("valid ip");
+            assert!(is_internal_ip(addr), "{ip} should be treated as internal");
+        }
+
+        // IPv6 internal ranges.
+        for ip in [
+            "::1",                      // loopback
+            "::",                       // unspecified
+            "fe80::1",                  // link local
+            "fc00::1",                  // unique local
+            "fd12:3456::1",            // unique local
+            "::ffff:169.254.169.254",  // v4-mapped metadata
+            "::ffff:127.0.0.1",        // v4-mapped loopback
+            "ff02::1",                  // multicast
+        ] {
+            let addr = IpAddr::from_str(ip).expect("valid ip");
+            assert!(is_internal_ip(addr), "{ip} should be treated as internal");
+        }
+
+        // Must be allowed (legitimate public addresses).
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",          // example.com
+            "2606:4700:4700::1111",   // Cloudflare DNS
+        ] {
+            let addr = IpAddr::from_str(ip).expect("valid ip");
+            assert!(!is_internal_ip(addr), "{ip} should be treated as public");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_guard_blocks_internal_http_urls() {
+        // Direct internal IP literals and localhost are blocked (no DNS needed).
+        for url in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://127.0.0.1:8080/admin",
+            "https://10.0.0.5/data.parquet",
+            "http://[::1]:9000/data",
+            "https://localhost/data.parquet",
+            "https://service.localhost/data.parquet",
+            "http://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let result = validate_http_url_with_policy(url, false).await;
+            assert!(result.is_err(), "{url} should be blocked by the SSRF guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_guard_allows_public_and_non_http() {
+        // Public IP literals (no DNS) pass.
+        validate_http_url_with_policy("https://8.8.8.8/data.parquet", false)
+            .await
+            .expect("public IP should be allowed");
+
+        // Non-http(s) schemes are out of scope for this guard.
+        for url in [
+            "s3://bucket/data.parquet",
+            "gs://bucket/data/",
+            "abfss://container@account.dfs.core.windows.net/path/",
+        ] {
+            validate_http_url_with_policy(url, false)
+                .await
+                .unwrap_or_else(|e| panic!("{url} should be allowed: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ssrf_guard_can_be_disabled_by_policy() {
+        // When the allow-private policy is on, internal hosts are permitted.
+        validate_http_url_with_policy("http://127.0.0.1/data.parquet", true)
+            .await
+            .expect("internal host should be allowed when policy permits");
     }
 }

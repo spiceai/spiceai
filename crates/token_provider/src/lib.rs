@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Debug;
 use std::sync::Arc;
-use std::{
-    fmt::Debug,
-    hash::{DefaultHasher, Hash, Hasher},
-};
 
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use tokio::sync::watch;
 
@@ -57,12 +55,6 @@ pub struct StaticTokenProvider {
     token: Arc<SecretString>,
 }
 
-impl Hash for StaticTokenProvider {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.token.expose_secret().hash(state);
-    }
-}
-
 impl std::fmt::Debug for StaticTokenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StaticTokenProvider")
@@ -86,8 +78,46 @@ impl TokenProvider for StaticTokenProvider {
     }
 
     fn dyn_hash(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish().to_string()
+        // Domain-separated SHA-256 of the secret, so this stable identity is
+        // one-way: it can serve as a registry/dedup key (and is safe to log)
+        // without ever exposing the underlying token. (Previously a reversible
+        // `DefaultHasher` of the raw secret.)
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hasher = Sha256::new();
+        hasher.update(b"spice/static-token-provider/v1\0");
+        hasher.update(self.token.expose_secret().as_bytes());
+        let digest = hasher.finalize();
+
+        let mut out = String::with_capacity(4 + digest.len() * 2);
+        out.push_str("stp-");
+        for byte in digest {
+            out.push(char::from(HEX[(byte >> 4) as usize]));
+            out.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SecretString, StaticTokenProvider, TokenProvider};
+
+    #[test]
+    fn dyn_hash_is_stable_one_way_and_distinct() {
+        let secret = "super-secret-token-value";
+        let a = StaticTokenProvider::new(SecretString::from(secret));
+        let a2 = StaticTokenProvider::new(SecretString::from(secret));
+        let b = StaticTokenProvider::new(SecretString::from("a-different-token"));
+
+        // Stable for the same token, distinct for different tokens.
+        assert_eq!(a.dyn_hash(), a2.dyn_hash());
+        assert_ne!(a.dyn_hash(), b.dyn_hash());
+
+        // One-way: the identity must never embed the raw secret, and is a
+        // fixed-length, prefixed, hex digest.
+        let h = a.dyn_hash();
+        assert!(!h.contains(secret), "dyn_hash must not contain the secret");
+        assert!(h.starts_with("stp-"));
+        assert_eq!(h.len(), 4 + 64); // "stp-" + 32-byte SHA-256 in hex
     }
 }

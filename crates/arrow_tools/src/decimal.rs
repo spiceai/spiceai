@@ -58,17 +58,19 @@ pub fn rescale_i128(unscaled: i128, src_scale: i8, dst_scale: i8) -> Result<i128
     match src_scale.cmp(&dst_scale) {
         Equal => Ok(unscaled),
         Less => {
-            let diff = dst_scale - src_scale;
-            let mul = 10_i128
-                .checked_pow(u32::from(diff.cast_unsigned()))
-                .context(OverflowSnafu)?;
+            // Widen before subtracting so a hostile/truncated `src_scale`
+            // (e.g. -128 from a malformed Debezium `scale`) cannot overflow i8
+            // and panic in debug builds; the magnitude is then bounded by
+            // `checked_pow` below.
+            let diff = i16::from(dst_scale) - i16::from(src_scale);
+            let exp = u32::try_from(diff).map_err(|_| OverflowSnafu.build())?;
+            let mul = 10_i128.checked_pow(exp).context(OverflowSnafu)?;
             unscaled.checked_mul(mul).context(OverflowSnafu)
         }
         Greater => {
-            let diff = src_scale - dst_scale;
-            let div = 10_i128
-                .checked_pow(u32::from(diff.cast_unsigned()))
-                .context(OverflowSnafu)?;
+            let diff = i16::from(src_scale) - i16::from(dst_scale);
+            let exp = u32::try_from(diff).map_err(|_| OverflowSnafu.build())?;
+            let div = 10_i128.checked_pow(exp).context(OverflowSnafu)?;
             Ok(unscaled / div)
         }
     }
@@ -214,6 +216,28 @@ mod tests {
     /// two's-complement, base64 — without zero/sign padding to 16 bytes.
     fn b64(bytes: &[u8]) -> String {
         BASE64_STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn rescale_does_not_panic_on_extreme_scales() {
+        // Regression: a hostile/truncated scale (e.g. `i8::MIN` from a malformed
+        // Debezium `scale`) must yield an Overflow error, never an i8-subtraction
+        // panic (which would crash debug builds on attacker-controlled CDC input).
+        for (src, dst) in [
+            (i8::MIN, 20_i8),
+            (20, i8::MIN),
+            (i8::MIN, i8::MAX),
+            (i8::MAX, i8::MIN),
+        ] {
+            let r = rescale_i128(123, src, dst);
+            assert!(
+                r.is_err(),
+                "expected Overflow for scales ({src},{dst}), got {r:?}"
+            );
+        }
+        // Normal rescales are unaffected.
+        assert_eq!(rescale_i128(5, 0, 2).expect("ok"), 500);
+        assert_eq!(rescale_i128(500, 2, 0).expect("ok"), 5);
     }
 
     #[test]

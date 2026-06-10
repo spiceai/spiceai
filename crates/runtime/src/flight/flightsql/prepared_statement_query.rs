@@ -402,34 +402,7 @@ pub(crate) async fn do_put_query(
 
     tracing::debug!("do_put_query: Parameter schema: {:?}", schema);
 
-    let mut parameters = Vec::new();
-    let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;
-    // Collect all parameter batches
-    let mut batches = Vec::new();
-    let mut total_rows = 0;
-    while let Some(msg) = futures::TryStreamExt::try_next(&mut decoder).await? {
-        match msg.payload {
-            DecodedPayload::None => {}
-            DecodedPayload::Schema(_) => {
-                return Err(Status::invalid_argument(
-                    "parameter flight data must contain a single schema",
-                ));
-            }
-            DecodedPayload::RecordBatch(record_batch) => {
-                total_rows += record_batch.num_rows();
-                batches.push(record_batch.clone());
-                // Write each batch to the encoder for serialization
-                encoder.write(&record_batch).map_err(error_to_status)?;
-            }
-        }
-    }
-    encoder.finish().map_err(error_to_status)?;
-
-    if total_rows > 1 {
-        return Err(Status::invalid_argument(
-            "parameters should contain a single row",
-        ));
-    }
+    let parameters = encode_single_row_parameters(&mut decoder, &schema).await?;
 
     // Serialize the parameter schema for later use in query planning
     let schema_bytes = {
@@ -454,6 +427,43 @@ pub(crate) async fn do_put_query(
         app_metadata: result.encode_to_vec().into(),
     })]);
     Ok(Response::new(Box::pin(output)))
+}
+
+/// Reads parameter record batches from `decoder` (after the schema has been
+/// consumed) and returns the IPC-serialized parameters, enforcing that they
+/// contain at most a single row.
+///
+/// The single-row bound is checked *as each batch arrives*, before buffering
+/// more, so a client cannot stream unbounded parameter batches and OOM the
+/// process — the per-message size cap bounds one batch, not the stream length.
+pub(super) async fn encode_single_row_parameters(
+    decoder: &mut FlightDataDecoder,
+    schema: &SchemaRef,
+) -> Result<Vec<u8>, Status> {
+    let mut parameters = Vec::new();
+    let mut encoder = StreamWriter::try_new(&mut parameters, schema).map_err(error_to_status)?;
+    let mut total_rows = 0;
+    while let Some(msg) = futures::TryStreamExt::try_next(decoder).await? {
+        match msg.payload {
+            DecodedPayload::None => {}
+            DecodedPayload::Schema(_) => {
+                return Err(Status::invalid_argument(
+                    "parameter flight data must contain a single schema",
+                ));
+            }
+            DecodedPayload::RecordBatch(record_batch) => {
+                total_rows += record_batch.num_rows();
+                if total_rows > 1 {
+                    return Err(Status::invalid_argument(
+                        "parameters should contain a single row",
+                    ));
+                }
+                encoder.write(&record_batch).map_err(error_to_status)?;
+            }
+        }
+    }
+    encoder.finish().map_err(error_to_status)?;
+    Ok(parameters)
 }
 
 async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Status> {
@@ -575,6 +585,68 @@ mod tests {
         writer.write(batch)?;
         writer.finish()?;
         writer.into_inner()
+    }
+
+    fn int64_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
+    }
+
+    fn one_col_batch(schema: &Arc<Schema>, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(Int64Array::from(values))])
+            .expect("record batch")
+    }
+
+    /// Encodes `batches` as a Flight stream and returns a decoder positioned
+    /// just past the schema message, along with the decoded schema.
+    async fn decoder_for(batches: Vec<RecordBatch>) -> (FlightDataDecoder, SchemaRef) {
+        use arrow_flight::encode::FlightDataEncoderBuilder;
+        let input = futures::stream::iter(
+            batches
+                .into_iter()
+                .map(Ok::<RecordBatch, FlightError>)
+                .collect::<Vec<_>>(),
+        );
+        let flight_stream = FlightDataEncoderBuilder::new().build(input);
+        let mut decoder = FlightDataDecoder::new(flight_stream);
+        let schema = decode_schema(&mut decoder).await.expect("schema decoded");
+        (decoder, schema)
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_accepts_one_row() {
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1])]).await;
+        let params = encode_single_row_parameters(&mut decoder, &schema_ref)
+            .await
+            .expect("a single row of parameters should be accepted");
+        assert!(!params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_rejects_two_rows_in_one_batch() {
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![one_col_batch(&schema, vec![1, 2])]).await;
+        let err = encode_single_row_parameters(&mut decoder, &schema_ref)
+            .await
+            .expect_err("more than one row must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn encode_single_row_parameters_rejects_multiple_batches() {
+        // Regression for the unbounded-buffering OOM: a stream of many
+        // single-row batches must be rejected as soon as the row count exceeds
+        // one, rather than buffering the whole stream before the check.
+        let schema = int64_schema();
+        let (mut decoder, schema_ref) = decoder_for(vec![
+            one_col_batch(&schema, vec![1]),
+            one_col_batch(&schema, vec![2]),
+        ])
+        .await;
+        let err = encode_single_row_parameters(&mut decoder, &schema_ref)
+            .await
+            .expect_err("multiple parameter batches must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
