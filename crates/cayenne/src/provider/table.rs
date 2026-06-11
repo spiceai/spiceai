@@ -7459,13 +7459,17 @@ impl CayenneTableProvider {
             .map(|pk| pk.to_be_bytes().to_vec())
             .collect();
 
+        // This upgrade commits no delete files, so the metadata-only publish
+        // path (`commit_on_conflict_deletions`, which stamps `reinsert_sequence`
+        // on delete-file rows) cannot carry it. Persist the per-key insert
+        // sequences through the legacy `cayenne_insert_record` table instead —
+        // the merge-on-read load reads both sides (∪ max), so the upgraded
+        // tombstones are rebuilt identically on restart.
         self.catalog
-            .commit_on_conflict_deletions(
-                Vec::new(),
+            .add_insert_records_batch(
                 &self.table_metadata.table_id,
                 insert_pk_bytes,
                 flush_sequence,
-                None,
             )
             .await
             .map_err(|err| Error::Catalog { source: err })?;
