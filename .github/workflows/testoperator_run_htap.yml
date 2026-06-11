@@ -105,16 +105,45 @@ jobs:
 
       - name: Start resource monitor
         run: |
+          HZ=$(getconf CLK_TCK)
           echo -e "timestamp\tpg_cpu_pct\tpg_mem\tpg_block_io\tspiced_cpu_pct\tspiced_rss_kb\ttestop_cpu_pct\ttestop_rss_kb" > /tmp/resource-monitor.tsv
+
+          # Delta-based CPU% over the last sampling interval, comparable to `docker stats`.
+          # Reads /proc/<pid>/stat utime+stime ticks, divides by elapsed wall-clock × CLK_TCK.
+          # Multi-threaded processes can exceed 100% (one core = 100). Returns "cpu_pct rss_kb".
+          sample_proc () {
+            local label=$1 pattern=$2
+            local pid utime stime ticks now rss=0 pct=0
+            pid=$(pgrep -x "$pattern" | head -1)
+            if [ -z "$pid" ]; then
+              rm -f /tmp/.mon."$label".pid /tmp/.mon."$label".ticks /tmp/.mon."$label".wall
+              echo "0 0"; return
+            fi
+            read -r utime stime < <(awk '{print $14, $15}' /proc/"$pid"/stat 2>/dev/null) || { echo "0 0"; return; }
+            ticks=$((utime + stime))
+            now=$(date +%s%N)
+            rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null || echo 0)
+            local prev_pid prev_ticks prev_wall
+            prev_pid=$(cat /tmp/.mon."$label".pid 2>/dev/null || echo)
+            prev_ticks=$(cat /tmp/.mon."$label".ticks 2>/dev/null || echo)
+            prev_wall=$(cat /tmp/.mon."$label".wall 2>/dev/null || echo)
+            if [ "$prev_pid" = "$pid" ] && [ -n "$prev_ticks" ] && [ -n "$prev_wall" ]; then
+              local d_ticks=$((ticks - prev_ticks))
+              local d_ns=$((now - prev_wall))
+              [ "$d_ns" -le 0 ] && d_ns=1
+              pct=$(awk -v d="$d_ticks" -v ns="$d_ns" -v h="$HZ" 'BEGIN{ if (d<0) d=0; printf "%.1f", (d / (ns/1e9 * h)) * 100 }')
+            fi
+            echo "$pid"   > /tmp/.mon."$label".pid
+            echo "$ticks" > /tmp/.mon."$label".ticks
+            echo "$now"   > /tmp/.mon."$label".wall
+            echo "$pct $rss"
+          }
+
           (while true; do
             ts=$(date -u +%H:%M:%S)
-            pg=$(docker stats chbench-pg --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.BlockIO}}" 2>/dev/null || echo "0%\t0\t0")
-            spiced_line=$(ps -eo pcpu,rss,comm | grep '[s]piced' | head -1 || true)
-            testop_line=$(ps -eo pcpu,rss,comm | grep '[t]estoperator' | head -1 || true)
-            spiced_cpu=$(echo "$spiced_line" | awk '{print $1+0}')
-            spiced_rss=$(echo "$spiced_line" | awk '{print $2+0}')
-            testop_cpu=$(echo "$testop_line" | awk '{print $1+0}')
-            testop_rss=$(echo "$testop_line" | awk '{print $2+0}')
+            pg=$(docker stats chbench-pg --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.BlockIO}}" 2>/dev/null || echo -e "0%\t0\t0")
+            read -r spiced_cpu spiced_rss <<< "$(sample_proc spiced spiced)"
+            read -r testop_cpu testop_rss <<< "$(sample_proc testop testoperator)"
             echo -e "${ts}\t${pg}\t${spiced_cpu}\t${spiced_rss}\t${testop_cpu}\t${testop_rss}" >> /tmp/resource-monitor.tsv
             sleep 10
           done) &
