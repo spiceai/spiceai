@@ -4961,17 +4961,11 @@ mod tests {
         };
 
         assert!(evolution_allowed(
-            &OnSchemaChange::AppendNewColumns,
+            OnSchemaChange::AppendNewColumns,
             &additive
         ));
-        assert!(!evolution_allowed(
-            &OnSchemaChange::AppendNewColumns,
-            &typed
-        ));
-        assert!(evolution_allowed(
-            &OnSchemaChange::SyncAllColumns,
-            &additive
-        ));
+        assert!(!evolution_allowed(OnSchemaChange::AppendNewColumns, &typed));
+        assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &additive));
         assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &typed));
         assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
         assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));

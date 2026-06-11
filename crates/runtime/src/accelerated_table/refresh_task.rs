@@ -22,7 +22,7 @@ use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::caching::CacheRefreshHelper;
 use crate::accelerated_table::retention;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
-use crate::component::dataset::{OnSchemaChange, TimeFormat};
+use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
 use crate::datafusion::error::{
     SpiceExternalError, find_datafusion_root, format_datafusion_error, get_spice_df_error,
@@ -282,9 +282,6 @@ pub struct RefreshTaskBuilder {
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
-    /// The dataset's `on_schema_change` policy, used to shape schema-mismatch
-    /// refresh errors. Defaults to [`OnSchemaChange::Block`].
-    on_schema_change: OnSchemaChange,
 }
 
 impl RefreshTaskBuilder {
@@ -316,7 +313,6 @@ impl RefreshTaskBuilder {
             initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
-            on_schema_change: OnSchemaChange::default(),
         }
     }
 
@@ -395,14 +391,6 @@ impl RefreshTaskBuilder {
         self
     }
 
-    /// Sets the dataset's `on_schema_change` policy so schema-mismatch refresh
-    /// errors can name the active policy and the matching remedy.
-    #[must_use]
-    pub fn with_on_schema_change(mut self, on_schema_change: OnSchemaChange) -> RefreshTaskBuilder {
-        self.on_schema_change = on_schema_change;
-        self
-    }
-
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -459,7 +447,6 @@ impl RefreshTaskBuilder {
             initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
-            on_schema_change: self.on_schema_change,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -490,9 +477,6 @@ pub struct RefreshTask {
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
-    /// The dataset's `on_schema_change` policy, used to shape schema-mismatch
-    /// refresh errors.
-    on_schema_change: OnSchemaChange,
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
 }
@@ -2254,7 +2238,6 @@ impl RefreshTask {
             self.component_type(),
             &include_source_to_table_name(&self.dataset_name, self.federated_source.as_deref()),
             error,
-            self.on_schema_change,
         ) {
             SCHEMA_EVOLUTION_FAILED.add(
                 1,
@@ -2678,7 +2661,6 @@ fn schema_evolution_mismatch_refresh_message(
     component_type: &str,
     table_name: &str,
     error: &super::Error,
-    on_schema_change: OnSchemaChange,
 ) -> Option<String> {
     let (super::Error::FailedToWriteData { source }
     | super::Error::FailedToRefreshDataset { source }) = error
@@ -2690,20 +2672,9 @@ fn schema_evolution_mismatch_refresh_message(
         return None;
     }
 
-    Some(match on_schema_change {
-        OnSchemaChange::Block => format!(
-            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema; `on_schema_change` is not configured (default `block`), so acceleration does not apply schema changes automatically. Set `on_schema_change: append_new_columns` or `sync_all_columns` to evolve widening changes, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
-        ),
-        OnSchemaChange::Fail => format!(
-            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: fail` surfaces schema changes as errors without applying them. Revert the source schema change, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
-        ),
-        OnSchemaChange::AppendNewColumns => format!(
-            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: append_new_columns` evolves only added nullable columns at startup, so this change was not evolved. Restart Spice to apply a pending column addition, use `sync_all_columns` for lossless type widening, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
-        ),
-        OnSchemaChange::SyncAllColumns => format!(
-            "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}); `on_schema_change: sync_all_columns` evolves only lossless widening changes (added nullable columns, type widening, nullability relaxing) at startup, so this change was not evolved. Restart Spice to apply a pending widening change, or delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
-        ),
-    })
+    Some(format!(
+        "Failed to load data for {component_type} {table_name}: schema mismatch between the existing accelerated table and current source schema ({source}). If this is a widening change (new nullable columns, lossless type widening, or relaxed nullability), set `on_schema_change: sync_all_columns` (or `append_new_columns` for additive-only changes) and restart Spice to evolve it. Otherwise, delete the existing acceleration data and restart Spice to rebuild it with the updated schema."
+    ))
 }
 
 #[cfg(test)]
@@ -2864,60 +2835,17 @@ mod tests {
             ),
         };
 
-        let message = schema_evolution_mismatch_refresh_message(
-            "dataset",
-            "nation",
-            &error,
-            OnSchemaChange::Block,
-        )
-        .expect("should detect schema mismatch");
+        let message = schema_evolution_mismatch_refresh_message("dataset", "nation", &error)
+            .expect("should detect schema mismatch");
         assert!(message.contains("schema mismatch"));
-        assert!(message.contains("`on_schema_change` is not configured (default `block`)"));
-        assert!(message.contains("append_new_columns"));
-        assert!(message.contains("delete the existing acceleration data"));
-    }
-
-    #[test]
-    fn test_schema_evolution_mismatch_refresh_message_policy_set() {
-        let error = super::super::Error::FailedToWriteData {
-            source: DataFusionError::Execution(
-                "Inserting query must have the same schema length as the table. Expected table schema length: 4, got: 5".to_string(),
-            ),
-        };
-
-        let message = schema_evolution_mismatch_refresh_message(
-            "dataset",
-            "nation",
-            &error,
-            OnSchemaChange::SyncAllColumns,
-        )
-        .expect("should detect schema mismatch");
-        assert!(message.contains("`on_schema_change: sync_all_columns`"));
-        assert!(message.contains("this change was not evolved"));
+        // Names what changed (the underlying error) and the actionable remedies.
         assert!(
             message.contains("Expected table schema length: 4, got: 5"),
             "the message should name what changed: {message}"
         );
-        assert!(message.contains("Restart Spice"));
-
-        let message = schema_evolution_mismatch_refresh_message(
-            "dataset",
-            "nation",
-            &error,
-            OnSchemaChange::AppendNewColumns,
-        )
-        .expect("should detect schema mismatch");
-        assert!(message.contains("`on_schema_change: append_new_columns`"));
-        assert!(message.contains("only added nullable columns"));
-
-        let message = schema_evolution_mismatch_refresh_message(
-            "dataset",
-            "nation",
-            &error,
-            OnSchemaChange::Fail,
-        )
-        .expect("should detect schema mismatch");
-        assert!(message.contains("`on_schema_change: fail`"));
+        assert!(message.contains("`on_schema_change: sync_all_columns`"));
+        assert!(message.contains("append_new_columns"));
+        assert!(message.contains("delete the existing acceleration data"));
     }
 
     #[test]
@@ -2926,15 +2854,7 @@ mod tests {
             source: DataFusionError::Execution("other failure".to_string()),
         };
 
-        assert!(
-            schema_evolution_mismatch_refresh_message(
-                "dataset",
-                "nation",
-                &error,
-                OnSchemaChange::Block
-            )
-            .is_none()
-        );
+        assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
     }
 
     #[test]

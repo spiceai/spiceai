@@ -201,29 +201,20 @@ mod tests {
         let relaxing = widening_plan(vec![], vec![], vec!["a".to_string()]);
 
         assert!(evolution_allowed(
-            &OnSchemaChange::AppendNewColumns,
+            OnSchemaChange::AppendNewColumns,
             &additive
         ));
         assert!(!evolution_allowed(
-            &OnSchemaChange::AppendNewColumns,
+            OnSchemaChange::AppendNewColumns,
             &widening
         ));
         assert!(!evolution_allowed(
-            &OnSchemaChange::AppendNewColumns,
+            OnSchemaChange::AppendNewColumns,
             &relaxing
         ));
-        assert!(evolution_allowed(
-            &OnSchemaChange::SyncAllColumns,
-            &additive
-        ));
-        assert!(evolution_allowed(
-            &OnSchemaChange::SyncAllColumns,
-            &widening
-        ));
-        assert!(evolution_allowed(
-            &OnSchemaChange::SyncAllColumns,
-            &relaxing
-        ));
+        assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &additive));
+        assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &widening));
+        assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &relaxing));
         assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
         assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
     }
