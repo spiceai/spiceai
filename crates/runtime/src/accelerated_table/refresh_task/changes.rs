@@ -2882,7 +2882,7 @@ mod tests {
             max_coalesced_envelopes: 8000,
             max_coalesced_bytes: 64 * 1024 * 1024,
             max_coalesce_age_ms: 250,
-            commit_timeout: Duration::from_millis(30_000),
+            commit_timeout: Duration::from_secs(30),
         };
         let overlaid = cdc_config_overlay(
             base,
