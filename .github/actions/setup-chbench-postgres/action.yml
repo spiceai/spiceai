@@ -8,6 +8,8 @@ runs:
       shell: bash
       run: |
         docker run -d --name chbench-pg \
+          --cpus=30 \
+          --memory=28g --memory-swap=28g \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 \
           --shm-size=4g \
