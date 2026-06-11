@@ -18,6 +18,7 @@ limitations under the License.
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
 mod correctness;
+mod reporting;
 mod spice;
 mod staleness;
 
@@ -268,7 +269,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     if let Some(metrics) = spiced_metrics {
-        emit_replication_metrics(&metrics, "under load", true);
+        reporting::emit_replication_metrics(&metrics, "under load", true);
+        // For Cayenne backend report additional metrics
+        reporting::emit_cayenne_read_amp_percentiles(&metrics);
     }
 
     // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
@@ -307,7 +310,11 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             if report.converged_at.is_none() {
                 match crate::spiced_metrics::MetricsScraper::scrape_once().await {
                     Ok(metrics) => {
-                        emit_replication_metrics(&metrics, "post-drain re-scrape", false);
+                        reporting::emit_replication_metrics(
+                            &metrics,
+                            "post-drain re-scrape",
+                            false,
+                        );
                     }
                     Err(e) => {
                         eprintln!(
@@ -355,7 +362,30 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
+    // For Cayenne backend report additional metrics
+    match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+        Ok(final_metrics) => reporting::emit_cayenne_compaction_metrics(&final_metrics),
+        Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
+    }
+
     telemetry.emit().await?;
+
+    // Optional: hold spiced alive after the benchmark so you can run ad-hoc
+    // queries against it. Set SPICED_KEEP_ALIVE to block here until you press
+    // Enter; spiced is still serving on its usual HTTP (8090) / Flight ports.
+    if std::env::var_os("SPICED_KEEP_ALIVE").is_some() {
+        let workdir = spiced_instance
+            .get_tempdir_path()
+            .map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string());
+        println!(
+            "\nSPICED_KEEP_ALIVE set — spiced is still running for manual queries \
+             spiced working dir: {workdir}\n\
+             Press Enter to stop spiced and finish the run..."
+        );
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+    }
+
     spiced_instance.stop()?;
 
     let health_report = health_report?;
@@ -376,145 +406,4 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Emits replication metrics scraped from spiced's `/metrics` endpoint.
-///
-/// `phase` labels the scrape context (e.g. "under load", "post-drain re-scrape").
-/// `record_telemetry` controls whether the values are recorded to OpenTelemetry —
-/// only the primary under-load scrape should be recorded so diagnostic re-scrapes
-/// don't overwrite the headline lag metric.
-fn emit_replication_metrics(
-    metrics: &crate::spiced_metrics::SpicedMetrics,
-    phase: &str,
-    record_telemetry: bool,
-) {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    // Collect replication metrics per dataset from scraped samples.
-    // Gauges (lag_ms, lag_bytes): use the last observed value — represents the
-    // pipeline state when the scraper stopped (while OLTP was still active).
-    // Counters (inserts, updates, deletes): use the last value (monotonic total).
-    let mut lag_ms: BTreeMap<String, f64> = BTreeMap::new();
-    let mut lag_bytes: BTreeMap<String, f64> = BTreeMap::new();
-    let mut inserts: BTreeMap<String, f64> = BTreeMap::new();
-    let mut updates: BTreeMap<String, f64> = BTreeMap::new();
-    let mut deletes: BTreeMap<String, f64> = BTreeMap::new();
-    let mut recv_errors: BTreeMap<String, f64> = BTreeMap::new();
-    let mut reconnects: BTreeMap<String, f64> = BTreeMap::new();
-
-    let gauge_metrics = [
-        (
-            "dataset_postgres_replication_lag_ms",
-            &mut lag_ms as &mut BTreeMap<String, f64>,
-        ),
-        ("dataset_postgres_replication_lag_bytes", &mut lag_bytes),
-    ];
-    let counter_metrics = [
-        (
-            "dataset_postgres_replication_inserts_total",
-            &mut inserts as &mut BTreeMap<String, f64>,
-        ),
-        ("dataset_postgres_replication_updates_total", &mut updates),
-        ("dataset_postgres_replication_deletes_total", &mut deletes),
-        (
-            "dataset_postgres_replication_recv_errors_total",
-            &mut recv_errors,
-        ),
-        (
-            "dataset_postgres_replication_reconnects_total",
-            &mut reconnects,
-        ),
-    ];
-
-    for (metric_name, map) in gauge_metrics {
-        if let Some(samples) = metrics.samples.get(metric_name) {
-            for sample in samples {
-                let dataset = sample
-                    .labels
-                    .get("name")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                // Gauge: last value wins (overwrites previous).
-                map.insert(dataset, sample.value);
-            }
-        }
-    }
-
-    for (metric_name, map) in counter_metrics {
-        if let Some(samples) = metrics.samples.get(metric_name) {
-            for sample in samples {
-                let dataset = sample
-                    .labels
-                    .get("name")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                // Counter: last observed value is the total.
-                map.insert(dataset, sample.value);
-            }
-        }
-    }
-
-    if lag_ms.is_empty()
-        && lag_bytes.is_empty()
-        && inserts.is_empty()
-        && updates.is_empty()
-        && deletes.is_empty()
-        && recv_errors.is_empty()
-        && reconnects.is_empty()
-    {
-        return;
-    }
-
-    println!("\nReplication Metrics ({phase})");
-    // Header
-    println!(
-        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "dataset",
-        "lag_ms",
-        "lag_bytes",
-        "inserts",
-        "updates",
-        "deletes",
-        "recv_errs",
-        "reconnects"
-    );
-
-    let all_datasets: BTreeSet<&String> = lag_ms
-        .keys()
-        .chain(lag_bytes.keys())
-        .chain(inserts.keys())
-        .chain(updates.keys())
-        .chain(deletes.keys())
-        .chain(recv_errors.keys())
-        .chain(reconnects.keys())
-        .collect();
-
-    let mut worst_lag_ms: f64 = 0.0;
-    for dataset in &all_datasets {
-        let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
-        let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
-        let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
-        let upd = updates.get(*dataset).copied().unwrap_or(0.0);
-        let del = deletes.get(*dataset).copied().unwrap_or(0.0);
-        let recv = recv_errors.get(*dataset).copied().unwrap_or(0.0);
-        let reconn = reconnects.get(*dataset).copied().unwrap_or(0.0);
-        println!(
-            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
-        );
-
-        if record_telemetry {
-            crate::metrics::REPLICATION_LAG_MS
-                .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
-        }
-        if l_ms > worst_lag_ms {
-            worst_lag_ms = l_ms;
-        }
-    }
-    println!();
-
-    // Headline: worst replication lag across all datasets.
-    if record_telemetry {
-        crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
-    }
 }

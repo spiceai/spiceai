@@ -511,6 +511,72 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     }
     live_c.commit().await?;
 
+    // --- 5b. Unchanged-TOAST columns under REPLICA IDENTITY FULL. ---
+    // Dedicated table: Postgres rejects UPDATEs outright when REPLICA
+    // IDENTITY FULL covers an unpublished GENERATED column ("Replica
+    // identity must not contain unpublished generated columns"), so this
+    // stage cannot share shared_repl_c. Write an incompressible ~10KB value
+    // (forced out-of-line TOAST), then update a DIFFERENT column: pgoutput
+    // marks the blob "unchanged" in the new tuple even under RIF, and the
+    // value must be recovered from the old tuple instead of fatally ending
+    // the stream.
+    source
+        .simple_query(
+            "DROP TABLE IF EXISTS public.shared_repl_d; \
+             CREATE TABLE public.shared_repl_d (id int PRIMARY KEY, name text, blob text); \
+             ALTER TABLE public.shared_repl_d REPLICA IDENTITY FULL; \
+             INSERT INTO public.shared_repl_d VALUES (1, 'd1', NULL);",
+        )
+        .await?;
+    let toast_schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("blob", DataType::Utf8, true),
+    ]));
+    let mut stream_d =
+        start_replication_stream(input_with_schema(port, "shared_repl_d", toast_schema));
+    let boot_d = next_envelope(&mut stream_d, "bootstrap d").await?;
+    assert_eq!(boot_d.change_batch.record.num_rows(), 1, "bootstrap d rows");
+    boot_d.commit().await?;
+
+    source
+        .simple_query(
+            "UPDATE public.shared_repl_d \
+             SET blob = (SELECT string_agg(md5(g::text), '' ORDER BY g) \
+                         FROM generate_series(1, 320) g) \
+             WHERE id = 1",
+        )
+        .await?;
+    let blob_write = next_envelope(&mut stream_d, "blob write").await?;
+    assert_eq!(ops_of(&blob_write), vec!["u".to_string()], "blob write op");
+    assert_eq!(
+        string_col_of(&blob_write, "blob", 0).len(),
+        320 * 32,
+        "blob update carries the full value"
+    );
+    blob_write.commit().await?;
+
+    source
+        .simple_query("UPDATE public.shared_repl_d SET name = 'd1x' WHERE id = 1")
+        .await?;
+    let toast_update = next_envelope(&mut stream_d, "unchanged-TOAST update").await?;
+    assert_eq!(
+        ops_of(&toast_update),
+        vec!["u".to_string()],
+        "unchanged-TOAST update op"
+    );
+    assert_eq!(
+        string_col_of(&toast_update, "name", 0),
+        "d1x",
+        "changed column updated"
+    );
+    assert_eq!(
+        string_col_of(&toast_update, "blob", 0).len(),
+        320 * 32,
+        "unchanged TOASTed column must be filled from the old tuple, not NULLed or fatal"
+    );
+    toast_update.commit().await?;
+
     // No cross-routing: the next change for `a` arrives on stream_a with only
     // `a` rows, despite the c-traffic in between.
     source
@@ -614,6 +680,7 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
 
     // --- Cleanup ---
     drop(stream_a3);
+    drop(stream_d);
     drop(dup);
     drop(mismatch);
     drop_replication_slot_when_inactive(&source, SLOT).await?;

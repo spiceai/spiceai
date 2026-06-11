@@ -823,6 +823,21 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
 }
 
 /// Same deny-list as [`deny_spice_specific_functions`], but expressed in the
+/// `datafusion-table-providers` [`TpFunctionSupport`] type that the fork's
+/// factory `with_function_support` seams expect (`SqliteTableProviderFactory`,
+/// `PostgresTableProviderFactory`, `MySQLTableFactory`).
+///
+/// For backends whose unparser dialect has no Spice-function carve-out (unlike
+/// `DuckDB`), this is the full default deny-list: every built-in Spice UDF plus
+/// any user-registered function. See issue #10703.
+#[must_use]
+pub fn deny_spice_specific_functions_table_providers() -> TpFunctionSupport {
+    let mut denied = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice().to_vec();
+    denied.extend(USER_FUNCTION_NAMES.read().iter().cloned());
+    TpFunctionSupport::new(Some(TpFunctionRestriction::Deny(denied)), None, None)
+}
+
+/// Same deny-list as [`deny_spice_specific_functions`], but expressed in the
 /// `datafusion-table-providers` [`TpFunctionSupport`] type that
 /// `MySQLTableFactory::with_function_support` expects.
 ///
@@ -831,9 +846,7 @@ pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
 /// user-registered function. See issue #10703.
 #[must_use]
 pub fn deny_spice_functions_for_mysql_table_providers() -> TpFunctionSupport {
-    let mut denied = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice().to_vec();
-    denied.extend(USER_FUNCTION_NAMES.read().iter().cloned());
-    TpFunctionSupport::new(Some(TpFunctionRestriction::Deny(denied)), None, None)
+    deny_spice_specific_functions_table_providers()
 }
 
 fn json_functions() -> Vec<String> {
@@ -1073,6 +1086,26 @@ mod tests {
             Arc::new(stub_scalar_udf(name)),
             vec![],
         ))
+    }
+
+    #[test]
+    fn table_providers_default_deny_list_denies_spice_functions() {
+        // The default table-providers-typed deny-list (wired into the SQLite
+        // and Postgres accelerator factories and the MySQL connector factory)
+        // has no dialect carve-out: every built-in Spice UDF must be denied
+        // while ordinary functions still federate.
+        let support = deny_spice_specific_functions_table_providers();
+        let json_name = json_get_str_udf().name().to_string();
+        for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} is a Spice-only function and must be denied"
+            );
+        }
+        assert!(
+            support.supports(&make_named_expr("upper")),
+            "non-Spice functions must not be denied"
+        );
     }
 
     #[test]
