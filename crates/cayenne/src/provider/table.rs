@@ -7367,14 +7367,16 @@ impl CayenneTableProvider {
                         message: "Int64 primary key column has unexpected type".to_string(),
                     })?;
 
-                for row_index in 0..batch.num_rows() {
-                    if pk_array.is_null(row_index) {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
-                        });
-                    }
-                    let should_delete = deleted_pk_i64.contains(&pk_array.value(row_index));
+                if pk_array.null_count() > 0 {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary key values must be non-null".to_string(),
+                    });
+                }
+                // Bulk values() iteration: the null gate proves the buffer
+                // valid, so the per-row is_null branch drops out of the loop.
+                for pk in pk_array.values() {
+                    let should_delete = deleted_pk_i64.contains(pk);
                     keep_mask.push(!should_delete);
                     removed_rows += usize::from(should_delete);
                 }
@@ -12410,24 +12412,36 @@ impl CayenneTableProvider {
                     }
                 }
 
-                for row_index in 0..batch.num_rows() {
-                    if pk_array.is_null(row_index) {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
-                        });
+                if pk_array.null_count() > 0 {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary key values must be non-null".to_string(),
+                    });
+                }
+                // Column sweep (see `DeletionIndex::get_batch`): bulk PK slice
+                // instead of per-row `is_null`+`value`, one bloom sweep with
+                // tier walks only for the survivors, and the inline-map pass
+                // skipped when the map is empty. `max(file_seq, inline_seq) >=
+                // data_sequence` iff either side is, so the fused
+                // `.chain(...).max()` fold decomposes into independent passes.
+                let pks: &[i64] = pk_array.values();
+                keep_mask.resize(pks.len(), true);
+                deleted_pk.get_batch(pks, |row_index, tombstone| {
+                    if data_sequence <= tombstone.delete_sequence {
+                        keep_mask[row_index] = false;
                     }
-                    let pk = pk_array.value(row_index);
-                    let max_delete_sequence = deleted_pk
-                        .get(pk)
-                        .map(|tombstone| tombstone.delete_sequence)
-                        .into_iter()
-                        .chain(inlined_deletions.int64_pk.get(&pk).copied())
-                        .max();
-                    keep_mask.push(
-                        max_delete_sequence
-                            .is_none_or(|delete_sequence| data_sequence > delete_sequence),
-                    );
+                });
+                if !inlined_deletions.int64_pk.is_empty() {
+                    for (keep, pk) in keep_mask.iter_mut().zip(pks) {
+                        if *keep
+                            && inlined_deletions
+                                .int64_pk
+                                .get(pk)
+                                .is_some_and(|&seq| data_sequence <= seq)
+                        {
+                            *keep = false;
+                        }
+                    }
                 }
             }
             PkDeletionStrategyWithCache::RowConverterBased {
@@ -12441,24 +12455,33 @@ impl CayenneTableProvider {
                 let rows = converter.convert_columns(&pk_columns)?;
                 let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
 
-                for row_index in 0..batch.num_rows() {
-                    if pk_columns.iter().any(|column| column.is_null(row_index)) {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Primary key values must be non-null".to_string(),
-                        });
+                if pk_columns.iter().any(|column| column.null_count() > 0) {
+                    return Err(Error::DataValidation {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Primary key values must be non-null".to_string(),
+                    });
+                }
+                // Same column-sweep shape as the Int64 arm: one batched bloom
+                // sweep over the encoded row keys, then the inline-map pass
+                // only for rows still kept (drop is monotone, so skipping
+                // already-dropped rows is equivalence-preserving).
+                keep_mask.resize(batch.num_rows(), true);
+                deleted_row_keys.get_batch(rows.iter().map(|row| row.data()), |row_index, tombstone| {
+                    if data_sequence <= tombstone.delete_sequence {
+                        keep_mask[row_index] = false;
                     }
-                    let row_key = rows.row(row_index);
-                    let max_delete_sequence = deleted_row_keys
-                        .get(row_key.as_ref())
-                        .map(|tombstone| tombstone.delete_sequence)
-                        .into_iter()
-                        .chain(inlined_deletions.row_keys.get(row_key.as_ref()).copied())
-                        .max();
-                    keep_mask.push(
-                        max_delete_sequence
-                            .is_none_or(|delete_sequence| data_sequence > delete_sequence),
-                    );
+                });
+                if !inlined_deletions.row_keys.is_empty() {
+                    for (row_index, keep) in keep_mask.iter_mut().enumerate() {
+                        if *keep
+                            && inlined_deletions
+                                .row_keys
+                                .get(rows.row(row_index).as_ref())
+                                .is_some_and(|&seq| data_sequence <= seq)
+                        {
+                            *keep = false;
+                        }
+                    }
                 }
             }
             PkDeletionStrategyWithCache::PositionBased { .. } => unreachable!(
@@ -13694,18 +13717,16 @@ impl CayenneTableProvider {
                             batch.column(pk_index).data_type()
                         ))
                     })?;
-                let mut values = Vec::with_capacity(batch.num_rows());
-                for row_index in 0..batch.num_rows() {
-                    if pk_array.is_null(row_index) {
-                        return Err(datafusion_common::DataFusionError::Execution(format!(
-                            "Primary key values must be non-null for table {}",
-                            self.table_metadata.table_name
-                        )));
-                    }
-                    values.push(pk_array.value(row_index));
+                if pk_array.null_count() > 0 {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "Primary key values must be non-null for table {}",
+                        self.table_metadata.table_name
+                    )));
                 }
+                // Bulk slice copy (~5x over the per-row is_null+value+push
+                // loop): the null gate above proves the values buffer valid.
                 Ok(ExtractedPrimaryKeys {
-                    int64_pk: values,
+                    int64_pk: pk_array.values().to_vec(),
                     row_keys: Vec::new(),
                 })
             }
