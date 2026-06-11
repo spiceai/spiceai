@@ -248,7 +248,7 @@ async fn mongodb_integration_test() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -332,7 +332,7 @@ async fn mongodb_extended_schema_inference_loads_and_queries() -> Result<(), any
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!(
                         "Timed out waiting for MongoDB extended-inference dataset to load"
                     ));
@@ -399,7 +399,7 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -497,7 +497,7 @@ async fn mongodb_change_streams_infer_primary_key() -> Result<(), anyhow::Error>
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for MongoDB Change Streams dataset to load"));
                 }
                 () = cloned_rt.load_components() => {}

@@ -52,7 +52,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
     TableScan, Volatility as DfVolatility,
-    simplify::{ExprSimplifyResult, SimplifyInfo},
+    simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
@@ -435,7 +435,7 @@ impl ScalarUDFImpl for WasmScalarTableArgUdf {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);

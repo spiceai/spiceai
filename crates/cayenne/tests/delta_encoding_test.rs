@@ -113,7 +113,7 @@ fn vortex_bytes_under(dir: &Path) -> u64 {
         if path.is_dir() {
             total += vortex_bytes_under(&path);
         } else if path.extension().is_some_and(|ext| ext == "vortex") {
-            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            total += entry.metadata().map_or(0, |m| m.len());
         }
     }
     total

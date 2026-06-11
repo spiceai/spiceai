@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Snowflake federation now uses the shared deny-list wrapper in
-//! [`crate::federation`]. Re-exported here so existing `snowflake::federation::*`
-//! call sites keep working.
+//! Snowflake federation re-exports.
+//!
+//! The deny-list `SQLExecutor` wrapper started Snowflake-specific and was
+//! generalized for every `SqlTable`-backed connector; the shared
+//! implementation lives in [`crate::federation`].
 
 pub use crate::federation::{DenyFunctionsSqlExecutor, create_spice_federated_table_provider};

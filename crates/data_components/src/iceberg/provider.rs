@@ -141,7 +141,7 @@ impl IcebergCatalogProvider {
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
             .into_iter()
-            .zip(providers.into_iter())
+            .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
                 (name, provider)
@@ -315,27 +315,29 @@ impl IcebergSchemaProvider {
             .await
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
-        // Use IcebergTableProvider - it keeps a reference to the catalog for read/write support
-        match IcebergTableProvider::try_new(
-            Arc::clone(&catalog),
-            table_name.namespace().clone(),
-            table_name.name().to_string(),
-        )
-        .await
-        {
-            Ok(provider) => {
-                // Wrap in IcebergDeletionProvider so that
-                // catalog tables support DELETE FROM via equality delete files.
-                // Access control is handled by the SQL validator, not here.
-                let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
-                    Arc::clone(&catalog),
-                    table_name.namespace().clone(),
-                    table_name.name().to_string(),
-                    Arc::new(provider),
-                );
-                let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
-                Ok(Some(adapted))
-            }
+        match catalog.load_table(&table_name).await {
+            Ok(_) => match IcebergTableProvider::try_new(
+                Arc::clone(&catalog),
+                table_name.namespace().clone(),
+                table_name.name().to_string(),
+            )
+            .await
+            {
+                Ok(provider) => {
+                    // Wrap in IcebergDeletionProvider so that
+                    // catalog tables support DELETE FROM via equality delete files.
+                    // Access control is handled by the SQL validator, not here.
+                    let deletion_provider = crate::iceberg::delete::IcebergDeletionProvider::new(
+                        Arc::clone(&catalog),
+                        table_name.namespace().clone(),
+                        table_name.name().to_string(),
+                        Arc::new(provider),
+                    );
+                    let adapted: Arc<dyn TableProvider> = Arc::new(deletion_provider);
+                    Ok(Some(adapted))
+                }
+                Err(e) => Err(handle_iceberg_error(e)),
+            },
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("NoSuchIcebergTableException") || err_msg.contains("code: 404")
@@ -370,8 +372,7 @@ impl SchemaProvider for IcebergSchemaProvider {
     fn table_exist(&self, name: &str) -> bool {
         self.tables
             .read()
-            .map(|tables| tables.contains_key(name))
-            .unwrap_or(false)
+            .is_ok_and(|tables| tables.contains_key(name))
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {

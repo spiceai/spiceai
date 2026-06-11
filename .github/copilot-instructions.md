@@ -73,8 +73,8 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ### Rust Version Baseline
 
-- **Workspace Rust version is 1.94.1**: Treat Rust 1.94.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
-- **Use stable Rust features through 1.94.1**: Prefer stable language, standard library, and Cargo features available in Rust 1.94.1 when they improve correctness, clarity, ergonomics, or maintainability.
+- **Workspace Rust version is 1.95.0**: Treat Rust 1.95.0 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
+- **Use stable Rust features through 1.95.0**: Prefer stable language, standard library, and Cargo features available in Rust 1.95.0 when they improve correctness, clarity, ergonomics, or maintainability.
 - **Do not code to an older Rust subset by default**: Avoid workarounds for pre-1.94 compilers unless there is a concrete compatibility requirement.
 - **Prefer modern std APIs over manual patterns**: When a newer stable standard-library API expresses the intent more clearly or avoids extra allocation or unsafe code, use it.
 
@@ -519,7 +519,7 @@ This pattern caused real regressions, e.g. [#10460](https://github.com/spiceai/s
 3. Spicepod is YAML config format
 4. Integration tests need credentials (`spice login` or `.env`)
 5. testoperator is the test harness
-6. Workspace uses Rust edition 2024 and rust-version 1.94.1; use stable Rust features available through 1.94.1 by default
+6. Workspace uses Rust edition 2024 and rust-version 1.95.0; use stable Rust features available through 1.95.0 by default
 7. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
 8. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
 

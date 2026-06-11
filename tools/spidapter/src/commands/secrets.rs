@@ -113,9 +113,7 @@ fn scheduler_state_location_uses_s3(spicepod_yaml: &str) -> bool {
             return false;
         }
 
-        Url::parse(state_location)
-            .map(|url| url.scheme().eq_ignore_ascii_case("s3"))
-            .unwrap_or(false)
+        Url::parse(state_location).is_ok_and(|url| url.scheme().eq_ignore_ascii_case("s3"))
     })
 }
 

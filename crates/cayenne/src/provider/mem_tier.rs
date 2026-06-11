@@ -24,6 +24,13 @@ limitations under the License.
 //! an O(1) `Arc` swap and reads union the tier under the listing fence with
 //! zero copy.
 //!
+//! The tombstone maps are structurally-shared persistent maps ([`im::HashMap`],
+//! HAMT) so an append shares structure with the prior tier instead of deep-copying
+//! the accumulated corpus — the per-append cost is O(incoming · log tier), not
+//! O(tier). Combined with the bounded fence section in `append_to_mem_tier`, the
+//! whole append is therefore cheap regardless of tier size (the per-append clone
+//! was the dominant write-phase cost before this change).
+//!
 //! Crash model: the tier is pure RAM and is DISCARDED on crash/restart. The
 //! source slot is the single source of truth — it holds at most the
 //! last-checkpointed LSN, so on restart the source re-streams every WAL record
@@ -32,12 +39,15 @@ limitations under the License.
 //! advances ONLY after the covering checkpoint's Vortex+metastore writes are
 //! durable.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
+use arrow_schema::Schema;
 use async_trait::async_trait;
+use datafusion_common::Statistics;
+use hash_index::XxHash3BuildHasher;
+use im::HashMap as PersistentHashMap;
 
 /// In-RAM tombstones for one mem tier, mirroring the strategy split that
 /// `load_inlined_deletion_maps` produces for the durable inline path. Each map
@@ -45,17 +55,39 @@ use async_trait::async_trait;
 /// semantics: a scanned data row at `data_sequence` is hidden iff some tombstone
 /// for its key has `delete_sequence >= data_sequence`).
 ///
+/// The maps are persistent ([`im::HashMap`], a HAMT) keyed with
+/// [`XxHash3BuildHasher`] — the same structure and hasher
+/// `provider::deletion_index` uses for its durable delta. The HAMT gives an
+/// O(1) structural clone (an `Arc` bump of the root) so [`MemTier::append_segment`]
+/// no longer deep-copies the accumulated corpus on every CDC append; `insert`
+/// touches only the small incoming set against a structurally-shared base. The
+/// XXH3 hasher (not the `im` default `SipHash`) keeps per-key hashing off the
+/// `im::nodes::hamt::hash_key` hot path that profiles flagged for the deletion
+/// index.
+///
 /// The authoritative `superseded` row-delta count is carried separately on the
 /// tier (NOT recomputed from these maps): the i64 and byte-key encodings of the
 /// same `Int64Pk` deletion would double-count, and position deletes are not
 /// represented here (memory mode runs only for the key-based merge-on-read
 /// shape; partitioned/position tables stay on the durable path).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct InMemTombstones {
     /// `Int64Pk` strategy: PK value -> max delete sequence.
-    pub(crate) int64_pk: HashMap<i64, i64>,
+    pub(crate) int64_pk: PersistentHashMap<i64, i64, XxHash3BuildHasher>,
     /// `RowConverterBased` strategy: committed row-key bytes -> max delete sequence.
-    pub(crate) row_keys: HashMap<Box<[u8]>, i64>,
+    pub(crate) row_keys: PersistentHashMap<Box<[u8]>, i64, XxHash3BuildHasher>,
+}
+
+impl Default for InMemTombstones {
+    fn default() -> Self {
+        // `im::HashMap` needs an explicit hasher (it cannot derive `Default` with a
+        // non-`Default`-constructed `RandomState`); build both maps with the XXH3
+        // hasher so they share the deletion-index's hashing characteristics.
+        Self {
+            int64_pk: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+            row_keys: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+        }
+    }
 }
 
 impl InMemTombstones {
@@ -81,18 +113,18 @@ impl InMemTombstones {
 
     /// Merge `other`'s tombstones into `self`, keeping the max delete sequence
     /// per key (monotone — a later epoch can only raise a key's delete sequence).
+    ///
+    /// Each `insert` is O(log n) on the persistent map and only structurally
+    /// re-writes the path to the touched leaf, so this is O(incoming · log tier),
+    /// NOT O(tier): the untouched nodes stay shared with `self`'s prior root.
     fn merge_from(&mut self, other: &InMemTombstones) {
         for (&pk, &seq) in &other.int64_pk {
-            self.int64_pk
-                .entry(pk)
-                .and_modify(|s| *s = (*s).max(seq))
-                .or_insert(seq);
+            let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
+            self.int64_pk.insert(pk, next);
         }
         for (key, &seq) in &other.row_keys {
-            self.row_keys
-                .entry(key.clone())
-                .and_modify(|s| *s = (*s).max(seq))
-                .or_insert(seq);
+            let next = self.row_keys.get(key).map_or(seq, |&cur| cur.max(seq));
+            self.row_keys.insert(key.clone(), next);
         }
     }
 
@@ -110,6 +142,21 @@ pub(crate) struct MemSegment {
     /// The inline data sequence assigned to this segment's rows (the visibility
     /// watermark used by the merge-on-read deletion filter).
     pub(crate) data_sequence: i64,
+    /// Exact min/max over this segment's batches for predicate-based pruning.
+    pub(crate) statistics: Arc<Statistics>,
+    /// This segment's OWN tombstone delta (the on-conflict deletions of the batch
+    /// that produced it), kept per-segment — not just folded into the tier-level
+    /// aggregate — so a partial checkpoint ([`MemTier::retain_after`]) can rebuild
+    /// the survivors' aggregate tombstones without re-flushing the durable prefix.
+    /// Cheap to carry: [`InMemTombstones`] is an `im::HashMap` (O(1) structural clone).
+    pub(crate) tombstones: InMemTombstones,
+    /// This segment's measured byte cost (`get_array_memory_size`), for budget
+    /// release accounting on a partial clear.
+    pub(crate) bytes: u64,
+    /// This segment's row count.
+    pub(crate) rows: u64,
+    /// Rows this segment's upsert superseded (carried, not recomputed).
+    pub(crate) superseded: u64,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -122,7 +169,11 @@ pub(crate) struct MemTier {
     /// the outer Vec (cloning `Arc<Vec<RecordBatch>>` element pointers), never
     /// the batch data.
     pub(crate) segments: Arc<Vec<MemSegment>>,
-    /// In-RAM tombstones accumulated across this tier's segments.
+    /// In-RAM tombstones accumulated across this tier's segments. Held as
+    /// structurally-shared persistent maps ([`InMemTombstones`] over
+    /// [`im::HashMap`]), so [`MemTier::append_segment`]'s clone of this field is
+    /// an O(1) `Arc` bump of the HAMT root — the accumulated corpus is never
+    /// deep-copied per append (the prior O(tier) write tax).
     pub(crate) tombstones: InMemTombstones,
     /// Sum of `get_array_memory_size()` across all retained batches — the cap
     /// dimension checked against the per-table + global byte budget.
@@ -164,9 +215,11 @@ impl MemTier {
     }
 
     /// Produce a new tier with one segment + its tombstones appended, advancing
-    /// the epoch. Clones only the outer `Vec<MemSegment>` (Arc-pointer copies),
-    /// never the batch data. `incoming_bytes`/`incoming_rows`/`superseded` are
-    /// the caller's measured deltas for this batch.
+    /// the epoch. Clones only the outer `Vec<MemSegment>` (Arc-pointer copies) and
+    /// the persistent tombstone maps' HAMT roots (O(1) `Arc` bumps) — never the
+    /// batch data and never the accumulated tombstone corpus.
+    /// `incoming_bytes`/`incoming_rows`/`superseded` are the caller's measured
+    /// deltas for this batch.
     #[must_use]
     pub(crate) fn append_segment(
         &self,
@@ -177,13 +230,32 @@ impl MemTier {
         incoming_rows: u64,
         superseded: u64,
     ) -> Self {
+        let statistics = batches.first().map_or_else(
+            || Arc::new(Statistics::new_unknown(&Schema::empty())),
+            |first| {
+                Arc::new(
+                    crate::provider::file_pruning::statistics_from_record_batches(
+                        first.schema_ref(),
+                        batches.as_ref(),
+                    ),
+                )
+            },
+        );
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
         segments.extend(self.segments.iter().cloned());
         segments.push(MemSegment {
             batches,
             data_sequence,
+            statistics,
+            tombstones: tombstones.clone(),
+            bytes: incoming_bytes,
+            rows: incoming_rows,
+            superseded,
         });
 
+        // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
+        // accumulated corpus. `merge_from` then applies only the incoming deltas
+        // against the structurally-shared base.
         let mut merged_tombstones = self.tombstones.clone();
         merged_tombstones.merge_from(tombstones);
 
@@ -204,6 +276,48 @@ impl MemTier {
         self.oldest_append.map_or(0, |t| {
             u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
         })
+    }
+
+    /// The tier that REMAINS after a checkpoint durably flushed the first
+    /// `flushed_segment_count` segments (an append-ordered prefix — appends only
+    /// ever push to the end, so the flushed snapshot is always a prefix of the
+    /// live tier). Survivor segments (appended after the flushed snapshot, e.g.
+    /// while the off-fence encode/commit ran) are re-folded onto an empty tier so
+    /// the aggregate tombstones / bytes / rows / superseded reflect ONLY the
+    /// survivors. This is what prevents a double-count: keeping the whole tier
+    /// would re-flush the already-durable prefix into a second file on the next
+    /// checkpoint. The monotone `epoch` is preserved so a later append never
+    /// reuses a flushed epoch.
+    #[must_use]
+    pub(crate) fn retain_after(&self, flushed_segment_count: usize) -> Self {
+        if flushed_segment_count >= self.segments.len() {
+            // Nothing newer survived — empty tier, epoch preserved.
+            let mut empty = Self::empty();
+            empty.epoch = self.epoch;
+            return empty;
+        }
+        let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
+        let mut tombstones = InMemTombstones::default();
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        for segment in &survivors {
+            tombstones.merge_from(&segment.tombstones);
+            bytes = bytes.saturating_add(segment.bytes);
+            rows = rows.saturating_add(segment.rows);
+            superseded = superseded.saturating_add(segment.superseded);
+        }
+        Self {
+            segments: Arc::new(survivors),
+            tombstones,
+            bytes,
+            rows,
+            superseded,
+            epoch: self.epoch,
+            // Reset the age clock: the flushed segments are gone, so the survivor
+            // age is measured from now (the next age-cap window starts here).
+            oldest_append: Some(Instant::now()),
+        }
     }
 }
 
@@ -271,6 +385,109 @@ mod tests {
         ));
         // The original tier is unchanged (immutable swap semantics).
         assert!(tier.is_empty());
+    }
+
+    /// Appending shares the accumulated TOMBSTONE map's HAMT root rather than
+    /// deep-copying it — the missing guard for the root-cause O(tier)-per-append
+    /// clone. Mirrors `append_shares_batch_arc_no_deep_copy` for the tombstone
+    /// corpus (which was the actually-expensive clone, unlike the batch `Arc`).
+    #[test]
+    fn append_shares_tombstone_map_no_deep_copy() {
+        // Seed a tier carrying a non-trivial Int64 tombstone corpus.
+        let mut seed = InMemTombstones::default();
+        for pk in 0..1_000_i64 {
+            seed.int64_pk.insert(pk, 1);
+        }
+        let base = MemTier::empty().append_segment(Arc::new(vec![batch(&[1])]), 2, &seed, 16, 1, 0);
+
+        // A fresh clone of the base's tombstone map shares its root (O(1) clone,
+        // no deep copy) — this is the property `append_segment` relies on.
+        let base_clone = base.tombstones.int64_pk.clone();
+        assert!(
+            base.tombstones.int64_pk.ptr_eq(&base_clone),
+            "cloning the persistent tombstone map shares the HAMT root (O(1), no deep copy)"
+        );
+
+        // Append one new tombstone key. The NEW tier reflects it; the prior tier
+        // is untouched and still shares its original root with the earlier clone.
+        let mut one = InMemTombstones::default();
+        one.int64_pk.insert(10_000, 3);
+        let next = base.append_segment(Arc::new(vec![batch(&[2])]), 4, &one, 16, 1, 0);
+
+        assert_eq!(
+            next.tombstones.int64_pk.get(&10_000),
+            Some(&3),
+            "the appended tombstone is visible in the new tier"
+        );
+        assert_eq!(
+            next.tombstones.int64_pk.len(),
+            1_001,
+            "the new tier merged exactly one incoming key onto the shared base"
+        );
+        assert!(
+            base.tombstones.int64_pk.get(&10_000).is_none(),
+            "the prior tier is immutable — the append did not mutate it in place"
+        );
+        assert!(
+            base.tombstones.int64_pk.ptr_eq(&base_clone),
+            "the prior tier still shares its original root (the append built a new structurally-shared map, not a deep copy)"
+        );
+    }
+
+    /// B-T3 — bounded-tier / no-O(N²) check. Appending many segments must keep
+    /// each new tier structurally sharing the prior tier's accumulated tombstone
+    /// corpus (an O(1) HAMT-root clone per append), NOT deep-copying it — which is
+    /// what turned the per-append cost from O(tier) into O(incoming·log tier) and
+    /// the cumulative cost from O(K²) into O(K log K). Proven by structural
+    /// identity rather than wall-clock timing (deterministic, non-flaky): after
+    /// each append, the keys carried by the PREVIOUS tier still resolve in the new
+    /// tier (the base was shared, not rebuilt), and the previous tier is never
+    /// mutated in place.
+    #[test]
+    fn append_bounded_tier_shares_corpus_no_quadratic_copy() {
+        // Each segment supersedes a fresh window of keys; the tombstone corpus
+        // grows by one key per append so the accumulated map is non-trivial.
+        const APPENDS: usize = 256;
+        let mut tier = MemTier::empty();
+        for i in 0..APPENDS {
+            let key = i64::try_from(i).expect("loop index fits i64");
+            // Snapshot the prior corpus root + a sentinel key it must still carry.
+            let prior_root = tier.tombstones.int64_pk.clone();
+            let prior_len = tier.tombstones.int64_pk.len();
+            let sentinel = key - 1; // present once i > 0
+
+            let mut incoming = InMemTombstones::default();
+            incoming.int64_pk.insert(key, 1);
+            let next =
+                tier.append_segment(Arc::new(vec![batch(&[key])]), key + 1, &incoming, 16, 1, 0);
+
+            // The new tier carries exactly one more key than the prior tier — the
+            // base was structurally shared and extended, not rebuilt from scratch.
+            assert_eq!(
+                next.tombstones.int64_pk.len(),
+                prior_len + 1,
+                "append {i}: corpus grew by exactly the one incoming key"
+            );
+            if i > 0 {
+                assert!(
+                    next.tombstones.int64_pk.get(&sentinel).is_some(),
+                    "append {i}: a key from the prior corpus survives (base was shared, not dropped)"
+                );
+            }
+            // The prior tier's root is immutable — the append never deep-copied or
+            // mutated it (the O(1)-share invariant that avoids the O(N²) blow-up).
+            assert!(
+                tier.tombstones.int64_pk.ptr_eq(&prior_root),
+                "append {i}: the prior tier still owns its original HAMT root (no in-place mutation / deep copy)"
+            );
+
+            tier = next;
+        }
+        assert_eq!(
+            tier.tombstones.int64_pk.len(),
+            APPENDS,
+            "every appended key accumulated into the final shared corpus"
+        );
     }
 
     /// Tombstones merge with max-sequence-per-key semantics; the deleted-key

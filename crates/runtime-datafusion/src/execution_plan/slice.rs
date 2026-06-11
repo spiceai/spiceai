@@ -32,7 +32,7 @@ pub struct SliceExec {
     input: Arc<dyn ExecutionPlan>,
     /// The partition of the execution plan to return.
     partition: usize,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SliceExec {
@@ -44,12 +44,12 @@ impl SliceExec {
         Self {
             input,
             partition,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 emission_type,
                 boundedness,
-            ),
+            )),
         }
     }
 }
@@ -80,7 +80,7 @@ impl ExecutionPlan for SliceExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -23,7 +23,6 @@ use chrono::Utc;
 use datafusion::{
     common::DFSchema,
     error::DataFusionError,
-    execution::context::ExecutionProps,
     logical_expr::Expr,
     optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext},
 };
@@ -50,8 +49,9 @@ pub fn simplify_expr(expr: Expr, schema: &SchemaRef) -> Result<Expr, DataFusionE
 
     // Set query_execution_start_time so that NOW() and other time-dependent
     // functions can be evaluated during simplification
-    let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-    let simplify_context = SimplifyContext::new(&execution_props).with_schema(Arc::new(df_schema));
+    let simplify_context = SimplifyContext::default()
+        .with_query_execution_start_time(Some(Utc::now()))
+        .with_schema(Arc::new(df_schema));
     let simplifier = ExprSimplifier::new(simplify_context);
 
     simplifier.simplify(expr)

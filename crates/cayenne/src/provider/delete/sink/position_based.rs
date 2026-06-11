@@ -20,6 +20,11 @@ limitations under the License.
 //! It uses file-local row positions tracked via `RoaringBitmap` for efficient
 //! row exclusion during Vortex scans.
 
+// `vortex::array::arrow::IntoArrowArray::into_arrow_preferred` is deprecated in favour of
+// `execute_arrow(ctx)`; migrating requires threading a Vortex session through the delete path,
+// which is deferred. Use `expect` (not `allow`) so it resurfaces once that migration lands.
+#![expect(deprecated)]
+
 use super::super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use super::CayenneDeletionSink;
 use crate::provider::Error;

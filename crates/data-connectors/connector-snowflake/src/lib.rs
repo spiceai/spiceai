@@ -303,7 +303,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
     use datafusion_table_providers::sql::db_connection_pool::dbconnection::DbConnection;
     use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
     use std::any::Any;
@@ -437,14 +437,17 @@ mod tests {
         }
     }
 
-    fn stub_udf(name: &str) -> Arc<ScalarUDF> {
-        Arc::new(create_udf(
+    fn stub_udf(name: &str) -> datafusion::logical_expr::Expr {
+        let udf = Arc::new(create_udf(
             name,
             vec![DataType::Utf8],
             DataType::Utf8,
             Volatility::Immutable,
             Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
-        ))
+        ));
+        datafusion::logical_expr::Expr::ScalarFunction(
+            datafusion::logical_expr::expr::ScalarFunction::new_udf(udf, vec![]),
+        )
     }
 
     #[test]
@@ -466,15 +469,15 @@ mod tests {
             .expect("connector-snowflake must install the Spice deny-list");
 
         assert!(
-            !function_support.supports_scalar(&stub_udf("json_get_str")),
+            !function_support.supports(&stub_udf("json_get_str")),
             "json_get_str must be denied so federation falls back to local DataFusion"
         );
         assert!(
-            !function_support.supports_scalar(&stub_udf("cosine_distance")),
+            !function_support.supports(&stub_udf("cosine_distance")),
             "cosine_distance must be denied (Snowflake does not have an exact equivalent)"
         );
         assert!(
-            function_support.supports_scalar(&stub_udf("upper")),
+            function_support.supports(&stub_udf("upper")),
             "non-Spice functions like upper() must still federate to Snowflake"
         );
     }

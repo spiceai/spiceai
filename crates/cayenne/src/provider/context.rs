@@ -391,6 +391,21 @@ impl CayenneContext {
         }
     }
 
+    /// Periodic mem-tier checkpoint interval for `cdc_durability: memory`.
+    /// Returns `None` when disabled (interval = 0). Read straight from the static
+    /// config — unlike the compaction interval this is not a dynamically-tuned
+    /// knob, so the periodic mem-tier checkpoint cadence is fixed for the table's
+    /// lifetime (the write-path byte/age caps absorb hot-table variation).
+    #[must_use]
+    pub(crate) fn mem_tier_checkpoint_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_checkpoint_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {

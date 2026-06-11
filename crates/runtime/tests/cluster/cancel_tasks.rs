@@ -226,7 +226,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for scheduler components"));
                 }
                 () = Arc::clone(&scheduler_rt).load_components() => {}
@@ -284,7 +284,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for executor components"));
                 }
                 () = Arc::clone(&executor_rt).load_components() => {}
@@ -328,7 +328,7 @@ async fn test_cancel_tasks_via_control_stream() -> Result<(), anyhow::Error> {
 
             wait_for_active_tasks_eq(executor.as_ref(), 0, Duration::from_secs(20)).await?;
 
-            let completion = timeout(Duration::from_secs(20), query_handle.wait_for_completion())
+            let completion = timeout(Duration::from_secs(20), query_handle.into_stream())
                 .await
                 .map_err(|_| anyhow::Error::msg("Timed out waiting for query cancellation"))?;
             assert!(

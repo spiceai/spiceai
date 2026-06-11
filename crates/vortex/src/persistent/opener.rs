@@ -5,10 +5,13 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
 
+use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
+use datafusion_common::arrow::array::AsArray;
+use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
@@ -34,17 +37,17 @@ use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
+use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::layout::scan::split_by::SplitBy;
 use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
-use vortex::scan::ScanBuilder;
-use vortex::scan::SplitBy;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
@@ -201,8 +204,10 @@ impl FileOpener for VortexOpener {
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
-                && let Some(file_metadata) = file_metadata_cache.get(&file.object_meta)
-                && let Some(vortex_metadata) = file_metadata
+                && let Some(entry) = file_metadata_cache.get(file.path())
+                && entry.is_valid_for(&file.object_meta)
+                && let Some(vortex_metadata) = entry
+                    .file_metadata
                     .as_any()
                     .downcast_ref::<CachedVortexMetadata>()
             {
@@ -219,6 +224,7 @@ impl FileOpener for VortexOpener {
             let this_file_schema = Arc::new(calculate_physical_schema(
                 vxf.dtype(),
                 &unified_file_schema,
+                &session.arrow(),
             )?);
 
             let projected_physical_schema = projection.project_schema(&unified_file_schema)?;
@@ -226,7 +232,7 @@ impl FileOpener for VortexOpener {
             let expr_adapter = expr_adapter_factory.create(
                 Arc::clone(&unified_file_schema),
                 Arc::clone(&this_file_schema),
-            );
+            )?;
 
             let simplifier = PhysicalExprSimplifier::new(&this_file_schema);
 
@@ -276,7 +282,8 @@ impl FileOpener for VortexOpener {
                     .collect();
                 Schema::new_with_metadata(fields, this_file_schema.metadata().clone())
             };
-            let stream_schema = calculate_physical_schema(&scan_dtype, &scan_reference_schema)?;
+            let stream_schema =
+                calculate_physical_schema(&scan_dtype, &scan_reference_schema, &session.arrow())?;
 
             let leftover_projection = leftover_projection
                 .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
@@ -343,6 +350,22 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_row_range(row_range);
             }
 
+            // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
+            // `StatFn`). The conjuncts collected here are translated to a Vortex
+            // `Expression` and handed to `ScanBuilder::with_some_filter` below. Inside
+            // Vortex the zoned layout reader rewrites that expression into a stats
+            // predicate (`Expression::falsify`) and prunes whole zones whose min/max
+            // can't satisfy it (`ZoneMap::prune`). Dynamic hash-join filters (the
+            // InList fragments produced by the native dynamic-filter pass) flow through
+            // the same path: `collect_vortex_pushdown_conjunct` unwraps
+            // `DynamicFilterPhysicalExpr` via `.current()` at file-open time (not plan
+            // build time), and Vortex's `PruningResult::mask()` re-derives the zone mask
+            // whenever the dynamic expression's version advances — so a build side that
+            // populates after the scan starts still prunes zones. `VortexAccessPlan`
+            // (applied above) only adds a row `Selection`; it does not bypass this
+            // filter, so stats pruning still engages under position-delete scans.
+            // Filters Vortex can't translate (`skipped_dynamic`) are dropped here but
+            // still feed the coarser per-file `FilePruner`/`PrunableStream` above.
             let filter = filter
                 .and_then(|f| {
                     // Verify that all filters we've accepted from DataFusion get pushed down.
@@ -389,6 +412,7 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_concurrency(concurrency);
             }
 
+            let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -396,7 +420,13 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .map(move |chunk| {
                     let mut ctx = session.create_execution_ctx();
-                    chunk.execute_record_batch(&stream_schema, &mut ctx)
+                    let arrow_session = ctx.session().clone();
+                    let arrow = arrow_session.arrow().execute_arrow(
+                        chunk,
+                        Some(&stream_target_field),
+                        &mut ctx,
+                    )?;
+                    Ok(RecordBatch::from(arrow.as_struct().clone()))
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
@@ -617,7 +647,7 @@ mod tests {
     use vortex::io::VortexWrite;
     use vortex::io::object_store::ObjectStoreWrite;
     use vortex::metrics::DefaultMetricsRegistry;
-    use vortex::scan::Selection;
+    use vortex::scan::selection::Selection;
     use vortex::session::VortexSession;
 
     use super::*;
@@ -1173,7 +1203,7 @@ mod tests {
     async fn test_selection_include_by_index() -> anyhow::Result<()> {
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
         use vortex::buffer::Buffer;
-        use vortex::scan::Selection;
+        use vortex::scan::selection::Selection;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";
@@ -1258,7 +1288,7 @@ mod tests {
     #[tokio::test]
     // Test that Selection::All returns all rows.
     async fn test_selection_all() -> anyhow::Result<()> {
-        use vortex::scan::Selection;
+        use vortex::scan::selection::Selection;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";

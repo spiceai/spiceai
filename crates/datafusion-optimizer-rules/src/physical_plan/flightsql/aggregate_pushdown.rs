@@ -792,8 +792,8 @@ mod tests {
         AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity)]
           CoalescePartitionsExec
             UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE ("l_shipdate" > 100) GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -928,17 +928,17 @@ mod tests {
     #[derive(Debug)]
     struct MockNonFlightExec {
         schema: SchemaRef,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl MockNonFlightExec {
         fn new(schema: SchemaRef) -> Self {
-            let props = PlanProperties::new(
+            let props = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Self {
                 schema,
                 properties: props,
@@ -962,7 +962,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

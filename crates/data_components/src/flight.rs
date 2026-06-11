@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use crate::{Read, ReadWrite, sql_expr::to_sql_preserving_precedence};
 use arrow::{
     array::RecordBatch,
@@ -37,9 +38,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
-use datafusion_federation::sql::MultiPartTableReference;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
+use datafusion_federation::sql::{MultiPartTableReference, RemoteTableRef};
 use flight_client::{
     Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
 };
@@ -59,7 +58,7 @@ pub enum Error {
     #[snafu(display(
         "Query execution failed. {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL { source: DataFusionError },
 
     #[snafu(display("Failed to query Arrow Flight. {source}"))]
     Flight { source: flight_client::Error },
@@ -136,7 +135,7 @@ impl FlightFactory {
 
     pub async fn table_provider(
         &self,
-        table_reference: impl Into<MultiPartTableReference>,
+        table_reference: impl Into<RemoteTableRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = Arc::new(
             FlightTable::create(
@@ -188,7 +187,7 @@ pub struct FlightTable {
     client: FlightClient,
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
-    table_reference: MultiPartTableReference,
+    table_reference: RemoteTableRef,
     /// Federation function deny-list. Functions on the list (Spice-only UDFs such
     /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
     /// sent to the Flight server. See issue #10703.
@@ -211,7 +210,7 @@ impl FlightTable {
     pub async fn create(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<MultiPartTableReference>,
+        table_reference: impl Into<RemoteTableRef>,
         dialect: Arc<dyn Dialect>,
         extra_compute_context: Option<Arc<str>>,
     ) -> Result<Self> {
@@ -236,7 +235,7 @@ impl FlightTable {
     pub fn create_with_schema(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<MultiPartTableReference>,
+        table_reference: impl Into<RemoteTableRef>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
         extra_compute_context: Option<Arc<str>>,
@@ -268,10 +267,10 @@ impl FlightTable {
 
     async fn get_schema(
         client: FlightClient,
-        table_reference: impl Into<MultiPartTableReference>,
+        table_reference: impl Into<RemoteTableRef>,
     ) -> Result<SchemaRef> {
         let table_reference = table_reference.into();
-        let table_paths = match &table_reference {
+        let table_paths = match table_reference.table_ref() {
             MultiPartTableReference::TableReference(table_reference) => match table_reference {
                 TableReference::Bare { table } => vec![table.to_string()],
                 TableReference::Partial { schema, table } => {
@@ -294,7 +293,8 @@ impl FlightTable {
             schema
         } else {
             tracing::debug!(
-                "Failed to get schema from Arrow Flight for table {table_reference} via the native GetSchema call. Falling back to query schema."
+                "Failed to get schema from Arrow Flight for table {} via the native GetSchema call. Falling back to query schema.",
+                table_reference.to_quoted_string()
             );
             Self::get_query_schema(
                 client.clone(),
@@ -339,7 +339,7 @@ impl FlightTable {
     }
 
     pub fn get_table_reference(&self) -> String {
-        self.table_reference.to_string()
+        self.table_reference.to_quoted_string()
     }
 
     fn get_base_context(client: &FlightClient) -> String {
@@ -406,18 +406,18 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: MultiPartTableReference,
+    table_reference: RemoteTableRef,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &MultiPartTableReference,
+        table_reference: &RemoteTableRef,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
@@ -429,12 +429,12 @@ impl FlightExec {
             client,
             filters: filters.to_vec(),
             limit,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 
@@ -459,7 +459,7 @@ impl FlightExec {
                 .filters
                 .iter()
                 .map(|f| to_sql_preserving_precedence(f).map(|sql| format!("({sql})")))
-                .collect::<expr::Result<Vec<_>>>()
+                .collect::<DataFusionResult<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
@@ -498,7 +498,7 @@ impl ExecutionPlan for FlightExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

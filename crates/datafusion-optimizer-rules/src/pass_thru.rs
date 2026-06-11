@@ -155,7 +155,7 @@ where
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
