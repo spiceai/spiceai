@@ -66,7 +66,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBIntermediateIndexMaterializationOptimizer {})
     }
-
     /// Split a SQL AST expression into conjunctive parts
     /// This mimics `datafusion::logical_expr::utils::split_conjunction` but for SQL AST
     fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
@@ -247,6 +246,7 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
         let table_alias = TableAlias {
             name: Ident::new(CTE_NAME),
             columns: vec![],
+            explicit: false,
         };
 
         let cte_query = Query {

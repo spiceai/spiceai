@@ -1024,7 +1024,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     return None;
                 }
                 // Check it is in projection
-                if projection.is_none() || projection.is_some_and(|proj| proj.contains(&i)) {
+                if projection.is_none_or(|proj| proj.contains(&i)) {
                     Some(ident(f.name()))
                 } else {
                     None
@@ -1115,7 +1115,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
-            && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
+            && projection.is_none_or(|proj| proj.contains(&idx))
         {
             final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }

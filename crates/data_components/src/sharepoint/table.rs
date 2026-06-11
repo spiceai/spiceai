@@ -109,7 +109,7 @@ impl TableProvider for SharepointTableProvider {
 struct SharepointListExec {
     client: Arc<SharepointClient>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     projections: Option<Vec<usize>>,
     limit: Option<usize>,
     formatter: Option<Arc<dyn DocumentParser>>,
@@ -124,12 +124,12 @@ impl SharepointListExec {
         formatter: Option<&Arc<dyn DocumentParser>>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Self {
             client: Arc::new(client),
@@ -215,7 +215,7 @@ impl ExecutionPlan for SharepointListExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

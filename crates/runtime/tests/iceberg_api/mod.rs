@@ -77,7 +77,7 @@ async fn test_iceberg_api_get_table_schema() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

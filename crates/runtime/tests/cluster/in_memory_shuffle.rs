@@ -281,7 +281,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for scheduler to start"));
                 }
                 () = Arc::clone(&scheduler_rt).load_components() => {}
@@ -340,7 +340,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for executor1 to start"));
                 }
                 () = Arc::clone(&executor1_rt).load_components() => {}
@@ -399,7 +399,7 @@ async fn test_in_memory_shuffle_multiple_executors() -> Result<(), anyhow::Error
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for executor2 to start"));
                 }
                 () = Arc::clone(&executor2_rt).load_components() => {}

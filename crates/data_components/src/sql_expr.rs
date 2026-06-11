@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::logical_expr::Expr;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
+use datafusion::{
+    error::Result,
+    logical_expr::Expr,
+    sql::unparser::{Unparser, dialect::DefaultDialect},
+};
 
-pub fn to_sql_preserving_precedence(expr_value: &Expr) -> expr::Result<String> {
+pub fn to_sql_preserving_precedence(expr_value: &Expr) -> Result<String> {
     match expr_value {
         Expr::BinaryExpr(binary_expr) => {
             let left = to_sql_preserving_precedence(binary_expr.left.as_ref())?;
@@ -64,6 +67,9 @@ pub fn to_sql_preserving_precedence(expr_value: &Expr) -> expr::Result<String> {
             "(-{})",
             to_sql_preserving_precedence(inner.as_ref())?
         )),
-        _ => expr::to_sql(expr_value),
+        _ => {
+            let dialect = DefaultDialect {};
+            Ok(Unparser::new(&dialect).expr_to_sql(expr_value)?.to_string())
+        }
     }
 }

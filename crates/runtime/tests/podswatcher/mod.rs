@@ -101,7 +101,7 @@ async fn podswatcher_integration_test() -> Result<(), anyhow::Error> {
             // Set a timeout for the test
             let cloned_rt = Arc::clone(&rt);
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

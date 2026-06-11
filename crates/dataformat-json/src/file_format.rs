@@ -61,7 +61,7 @@ use datafusion::{
 use datafusion_datasource::decoder::Decoder;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::source::DataSource;
-use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
+use object_store::{GetResultPayload, ObjectMeta, ObjectStore, ObjectStoreExt};
 use snafu::prelude::*;
 
 #[derive(Debug)]

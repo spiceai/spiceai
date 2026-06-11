@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(
             CacheControl::MaxStale(
                 CacheKeyType::Default,
-                Some(std::time::Duration::from_secs(60))
+                Some(std::time::Duration::from_mins(1))
             )
             .cache_key_type(),
             Some(CacheKeyType::Default)
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(
             CacheControl::MinFresh(
                 CacheKeyType::ClientSupplied,
-                std::time::Duration::from_secs(120)
+                std::time::Duration::from_mins(2)
             )
             .cache_key_type(),
             Some(CacheKeyType::ClientSupplied)

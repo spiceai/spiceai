@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![expect(clippy::expect_used, reason = "integration-test helpers")]
 
 //! End-to-end integration test for issue #7507: bounded intermediate batch size in
 //! [`ChunkedSearchIndex`]. The test wires up an `IndexedTableProvider` whose only index is a

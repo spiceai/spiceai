@@ -23,9 +23,9 @@ use futures::StreamExt;
 use futures::future::join_all;
 use futures::stream::BoxStream;
 use object_store::{
-    ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RetryConfig, aws::AmazonS3Builder,
-    client::SpawnedReqwestConnector, path::Path,
+    ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RetryConfig, aws::AmazonS3Builder, client::SpawnedReqwestConnector, path::Path,
 };
 use runtime_parameters::ParameterSpec;
 use runtime_secrets::get_params_with_secrets;
@@ -115,7 +115,7 @@ struct ZoneStore {
     store: Arc<dyn ObjectStore>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MultiZoneS3ExpressStore {
     zones: Vec<ZoneStore>,
 }
@@ -236,6 +236,50 @@ impl MultiZoneS3ExpressStore {
         }
 
         rollback_failures
+    }
+
+    async fn delete_one(&self, location: &Path) -> object_store::Result<()> {
+        let mut all_not_found = true;
+        let mut last_not_found: Option<object_store::Error> = None;
+        let mut failed_zone_details = Vec::new();
+        for zone in &self.zones {
+            match zone.store.delete(location).await {
+                Ok(()) => {
+                    all_not_found = false;
+                }
+                Err(err) => {
+                    if let object_store::Error::NotFound { .. } = err {
+                        tracing::debug!(
+                            "Object '{}' not found in zone '{}' during delete: {err}",
+                            location,
+                            zone.zone_id
+                        );
+                        last_not_found = Some(err);
+                    } else {
+                        tracing::warn!(
+                            "Failed to delete object '{}' from zone '{}': {err}",
+                            location,
+                            zone.zone_id
+                        );
+                        failed_zone_details.push(format!("{}: {err}", zone.zone_id));
+                        all_not_found = false;
+                    }
+                }
+            }
+        }
+
+        if !failed_zone_details.is_empty() {
+            Err(self.multi_zone_delete_error(&failed_zone_details))
+        } else if all_not_found {
+            Err(
+                last_not_found.unwrap_or_else(|| object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: "No configured S3 zones".into(),
+                }),
+            )
+        } else {
+            Ok(())
+        }
     }
 
     fn build_list_stream_for_zone(
@@ -447,74 +491,21 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         }))
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let read_order = self.read_order();
-        let mut last_err: Option<object_store::Error> = None;
-
-        for idx in read_order {
-            let zone = &self.zones[idx];
-            match zone.store.head(location).await {
-                Ok(meta) => return Ok(meta),
-                Err(err) => {
-                    tracing::debug!(
-                        "S3 Express head failed for zone '{}' and object '{}': {err}",
-                        zone.zone_id,
-                        location
-                    );
-                    last_err = Some(err);
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let store = self.clone();
+        locations
+            .then(move |location| {
+                let store = store.clone();
+                async move {
+                    let location = location?;
+                    store.delete_one(&location).await?;
+                    Ok(location)
                 }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| object_store::Error::NotFound {
-            path: location.to_string(),
-            source: "No configured S3 zones".into(),
-        }))
-    }
-
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let mut all_not_found = true;
-        let mut last_not_found: Option<object_store::Error> = None;
-        let mut failed_zone_details = Vec::new();
-        for zone in &self.zones {
-            match zone.store.delete(location).await {
-                Ok(()) => {
-                    // At least one zone confirmed the delete.
-                    all_not_found = false;
-                }
-                Err(err) => {
-                    if let object_store::Error::NotFound { .. } = err {
-                        tracing::debug!(
-                            "Object '{}' not found in zone '{}' during delete: {err}",
-                            location,
-                            zone.zone_id
-                        );
-                        last_not_found = Some(err);
-                    } else {
-                        tracing::warn!(
-                            "Failed to delete object '{}' from zone '{}': {err}",
-                            location,
-                            zone.zone_id
-                        );
-                        failed_zone_details.push(format!("{}: {err}", zone.zone_id));
-                        all_not_found = false;
-                    }
-                }
-            }
-        }
-
-        if !failed_zone_details.is_empty() {
-            Err(self.multi_zone_delete_error(&failed_zone_details))
-        } else if all_not_found {
-            Err(
-                last_not_found.unwrap_or_else(|| object_store::Error::NotFound {
-                    path: location.to_string(),
-                    source: "No configured S3 zones".into(),
-                }),
-            )
-        } else {
-            Ok(())
-        }
+            })
+            .boxed()
     }
 
     fn list(
@@ -556,44 +547,21 @@ impl ObjectStore for MultiZoneS3ExpressStore {
         }))
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         let mut successful_zone_ids = Vec::new();
         let mut failed_zone_details = Vec::new();
 
         for zone in &self.zones {
-            match zone.store.copy(from, to).await {
+            match zone.store.copy_opts(from, to, options.clone()).await {
                 Ok(()) => successful_zone_ids.push(zone.zone_id.clone()),
                 Err(err) => {
                     tracing::warn!(
                         "Failed to copy object '{}' -> '{}' in zone '{}': {err}",
-                        from,
-                        to,
-                        zone.zone_id
-                    );
-                    failed_zone_details.push(format!("{}: {err}", zone.zone_id));
-                }
-            }
-        }
-
-        if failed_zone_details.is_empty() {
-            return Ok(());
-        }
-
-        let rollback_failures = self.rollback_copy(to, &successful_zone_ids).await;
-        failed_zone_details.extend(rollback_failures);
-        Err(self.multi_zone_write_error(&failed_zone_details))
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let mut successful_zone_ids = Vec::new();
-        let mut failed_zone_details = Vec::new();
-
-        for zone in &self.zones {
-            match zone.store.copy_if_not_exists(from, to).await {
-                Ok(()) => successful_zone_ids.push(zone.zone_id.clone()),
-                Err(err) => {
-                    tracing::warn!(
-                        "Failed to copy_if_not_exists '{}' -> '{}' in zone '{}': {err}",
                         from,
                         to,
                         zone.zone_id
@@ -1223,7 +1191,7 @@ pub async fn build_s3_object_store_for_validation(
 
     // Use provided settings or defaults
     let effective_unsigned_payload = unsigned_payload.unwrap_or(true);
-    let effective_timeout = timeout.unwrap_or(std::time::Duration::from_secs(120));
+    let effective_timeout = timeout.unwrap_or(std::time::Duration::from_mins(2));
 
     // Configure S3 Express One Zone mode
     tracing::debug!(
@@ -1520,13 +1488,13 @@ async fn build_single_s3_store_for_path(
 
     let retry_config = RetryConfig {
         max_retries: 3,
-        retry_timeout: std::time::Duration::from_secs(600),
+        retry_timeout: std::time::Duration::from_mins(10),
         ..Default::default()
     };
     s3_builder = s3_builder.with_retry(retry_config);
 
     let mut client_options =
-        ClientOptions::default().with_timeout(std::time::Duration::from_secs(120));
+        ClientOptions::default().with_timeout(std::time::Duration::from_mins(2));
 
     s3_builder = s3_builder
         .with_s3_express(true)
@@ -1765,14 +1733,6 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-            self.inner.head(location).await
-        }
-
-        async fn delete(&self, location: &Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
-        }
-
         fn list(
             &self,
             prefix: Option<&Path>,
@@ -1795,12 +1755,20 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
         }
 
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

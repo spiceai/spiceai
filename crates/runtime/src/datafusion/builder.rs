@@ -70,6 +70,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
+
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
 use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
@@ -147,8 +148,6 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
 
     RwLock::new(df_config)
 });
-
-const EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR: u64 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CayenneOptimizerRules {
@@ -619,8 +618,18 @@ impl DataFusionBuilder {
             );
         }
 
-        let exact_join_filter_memory_limit =
-            configure_hash_join_memory_limits(&mut config, effective_memory_limit);
+        // Sizes DataFusion's *native* hash-join InList dynamic-filter budget
+        // (`optimizer.hash_join_inlist_pushdown_max_size`) from the runtime
+        // memory limit. The native inner-join dynamic-filter pushdown
+        // (min/max bounds + InList/hash-table membership) supersedes the former
+        // forked `ExactLeftAccumulator` seam.
+        configure_hash_join_memory_limits(&mut config, effective_memory_limit);
+
+        // Per-query budget for the opt-in `CayenneJoinRewriter` exact in-list
+        // accumulator. Independent of the default-path
+        // `configure_hash_join_memory_limits` cap-raise above; only consumed when
+        // the `exact_join_filter` rule is registered below.
+        let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
 
         #[cfg(not(windows))]
         {
@@ -682,10 +691,15 @@ impl DataFusionBuilder {
 
         #[cfg(not(windows))]
         {
-            // Cayenne is not built on Windows, so its exact join-filter rewrite
-            // and accumulator budget are only configured for supported targets.
+            // Cayenne is not built on Windows, so its physical optimizer rules
+            // are only configured for supported targets. By default the ordinary
+            // inner-join probe filter is handled by DataFusion 53's native
+            // hash-join dynamic-filter pushdown (no Cayenne-specific physical
+            // rule); the InList budget for it is sized in
+            // `configure_hash_join_memory_limits` above. The opt-in
+            // `CayenneJoinRewriter` below (gated on `exact_join_filter`) restores
+            // the forked exact in-list accumulator path on top of that default.
             // Windows keeps DataFusion's standard hash-join dynamic filters.
-            clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
             state = with_cayenne_logical_optimizers(state, self.cayenne_optimizer_rules);
             if self.cayenne_optimizer_rules.dynamic_filter_sharing() {
                 state = state
@@ -696,14 +710,22 @@ impl DataFusionBuilder {
                     CayenneAntiJoinSortMergeRewriter::new(),
                 ));
             }
+            // Opt-in: restores the forked exact in-list join accumulator seam
+            // (`ExactLeftAccumulator`). Off by default — the default path uses
+            // DataFusion 53's native hash-join dynamic-filter pushdown sized by
+            // `configure_hash_join_memory_limits` above. When enabled, clamp the
+            // process-wide shared in-list reservation and register the rewriter
+            // after the sort-merge rewrite so it only touches remaining
+            // `HashJoinExec` nodes.
             if self.cayenne_optimizer_rules.exact_join_filter() {
+                clamp_maximum_shared_inlist_memory_bytes(exact_join_filter_memory_limit);
                 state = state.with_physical_optimizer_rule(Arc::new(CayenneJoinRewriter::new()));
+            } else {
+                let _ = exact_join_filter_memory_limit;
             }
         }
         #[cfg(windows)]
-        {
-            let _ = exact_join_filter_memory_limit;
-        }
+        let _ = exact_join_filter_memory_limit;
 
         state = state
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(Arc::new(
@@ -865,6 +887,7 @@ impl DataFusionBuilder {
         }
 
         // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
+        // Federation runs as the first of these (see `AnalyzerRulesBuilder::include_federation`).
         for rule in AnalyzerRulesBuilder::default().build() {
             ctx.add_analyzer_rule(rule);
         }
@@ -1196,6 +1219,14 @@ fn cayenne_optimizer_config(
     config
 }
 
+/// Fraction (1/N) of the runtime memory limit budgeted for the opt-in
+/// `CayenneJoinRewriter` exact in-list join accumulator.
+const EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR: u64 = 8;
+
+/// Per-query byte budget for the opt-in exact in-list join accumulator, derived
+/// from the runtime memory limit. Only consumed when the `exact_join_filter`
+/// rule is enabled; the default-path native-pushdown cap is sized separately in
+/// `configure_hash_join_memory_limits`.
 fn exact_join_filter_memory_limit(effective_memory_limit: u64) -> usize {
     let limit = effective_memory_limit / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR;
 
@@ -1218,22 +1249,22 @@ fn hash_join_inlist_memory_limit_per_partition(
     }
 }
 
-fn configure_hash_join_memory_limits(
-    config: &mut SessionConfig,
-    effective_memory_limit: u64,
-) -> usize {
+/// Sizes `DataFusion`'s native hash-join `InList` dynamic-filter budget
+/// (`optimizer.hash_join_inlist_pushdown_max_size`) down to the runtime memory
+/// limit divided across `target_partitions`, never raising `DataFusion`'s own
+/// default. This bounds the per-partition memory the native inner-join dynamic
+/// filter can spend materializing build-side keys as an `InList`; larger build
+/// sides automatically fall back to the hash-table membership strategy.
+fn configure_hash_join_memory_limits(config: &mut SessionConfig, effective_memory_limit: u64) {
     let runtime_memory_limit_per_partition = hash_join_inlist_memory_limit_per_partition(
         effective_memory_limit,
         config.options().execution.target_partitions,
     );
-    let exact_join_filter_memory_limit = exact_join_filter_memory_limit(effective_memory_limit);
 
     let optimizer = &mut config.options_mut().optimizer;
     optimizer.hash_join_inlist_pushdown_max_size = optimizer
         .hash_join_inlist_pushdown_max_size
         .min(runtime_memory_limit_per_partition);
-
-    exact_join_filter_memory_limit
 }
 
 fn runtime_env_with_effective_memory_limit_and_object_store_registry(
@@ -1388,7 +1419,7 @@ mod tests {
 
     use super::{
         CayenneOptimizerRules, DataFusionBuilder, build_compaction_runtime_env,
-        configure_hash_join_memory_limits, exact_join_filter_memory_limit,
+        configure_hash_join_memory_limits,
         runtime_env_with_effective_memory_limit_and_object_store_registry,
         validate_compaction_memory_fraction,
     };
@@ -1396,7 +1427,6 @@ mod tests {
     use crate::status;
     #[cfg(not(windows))]
     use data_components::poly::PolyTableProvider;
-    use runtime_datafusion::join_accumulator::DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES;
     use runtime_object_store::registry::SpiceObjectStoreRegistry;
     #[cfg(not(windows))]
     use std::collections::HashMap;
@@ -1414,36 +1444,13 @@ mod tests {
             "Default analyzer rules have changed"
         );
         let expected_rule_names = vec!["resolve_grouping_function", "type_coercion"];
-        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
+        for (rule, expected_name) in default_rules.iter().zip(expected_rule_names) {
             assert_eq!(
                 expected_name,
                 rule.name(),
                 "Default analyzer rule order has changed"
             );
         }
-    }
-
-    #[test]
-    fn test_exact_join_filter_memory_limit_respects_runtime_query_memory_limit() {
-        assert_eq!(
-            128,
-            exact_join_filter_memory_limit(1_024),
-            "Exact dynamic join filters should use a fraction of the shared runtime query memory budget"
-        );
-
-        let high_memory_limit = u64::try_from(DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES)
-            .expect("default in-list memory limit should fit in u64")
-            .saturating_mul(16);
-        assert_eq!(
-            DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES.saturating_mul(2),
-            exact_join_filter_memory_limit(high_memory_limit),
-            "Exact dynamic join filters should scale above the historical default on larger memory pools"
-        );
-        assert_eq!(
-            0,
-            exact_join_filter_memory_limit(1),
-            "Very small memory limits should not exceed the configured memory fraction"
-        );
     }
 
     #[tokio::test]
@@ -1516,9 +1523,8 @@ mod tests {
             .optimizer
             .hash_join_inlist_pushdown_max_size = 1_000;
 
-        let exact_join_filter_memory_limit = configure_hash_join_memory_limits(&mut config, 2_048);
+        configure_hash_join_memory_limits(&mut config, 2_048);
 
-        assert_eq!(256, exact_join_filter_memory_limit);
         assert_eq!(
             512,
             config
@@ -1534,13 +1540,8 @@ mod tests {
             .optimizer
             .hash_join_inlist_pushdown_max_size = 1_000;
 
-        let exact_join_filter_memory_limit =
-            configure_hash_join_memory_limits(&mut config, 1_000_000);
+        configure_hash_join_memory_limits(&mut config, 1_000_000);
 
-        assert_eq!(
-            125_000, exact_join_filter_memory_limit,
-            "A larger runtime query memory limit should scale the shared exact join-filter budget"
-        );
         assert_eq!(
             1_000,
             config
@@ -1580,6 +1581,7 @@ mod tests {
         assert_eq!(config.sort_merge_min_rows, 100_000_000);
         assert!((config.sort_merge_memory_pool_fraction - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.sort_merge_memory_pool_bytes, Some(1_024));
+        // memory_limit 1_024 / EXACT_JOIN_FILTER_MEMORY_POOL_FRACTION_DENOMINATOR (8) = 128.
         assert_eq!(config.exact_join_filter_max_bytes, 128);
     }
 
@@ -1804,11 +1806,11 @@ mod tests {
     #[cfg(not(windows))]
     fn test_built_datafusion_can_enable_one_cayenne_physical_rule() {
         let mut rules = CayenneOptimizerRules::none();
-        rules.set_exact_join_filter(true);
+        rules.set_dynamic_filter_sharing(true);
 
         let (_, physical_rule_names) = built_datafusion_cayenne_rule_names(rules);
 
-        assert_eq!(physical_rule_names, vec!["CayenneJoinRewriter"]);
+        assert_eq!(physical_rule_names, vec!["CayenneDynamicFilterSharing"]);
     }
 
     #[test]
@@ -2322,7 +2324,7 @@ mod tests {
         let cayenne_join_rewriter_position = rule_names
             .iter()
             .position(|name| *name == "CayenneJoinRewriter")
-            .expect("Cayenne join rewriter should be registered");
+            .expect("Cayenne join rewriter should be registered when exact_join_filter is on");
 
         assert!(
             sanity_check_position < cayenne_filter_sharing_position,

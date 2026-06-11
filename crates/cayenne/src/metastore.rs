@@ -117,6 +117,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
     },
     ExpectedTable {
+        name: "cayenne_snapshot_file_statistics",
+        columns: &[
+            "table_id",
+            "snapshot_id",
+            "file_path",
+            "file_size_bytes",
+            "num_rows",
+            "statistics_blob",
+        ],
+    },
+    ExpectedTable {
         name: "cayenne_pk_index",
         columns: &["table_id", "snapshot_id", "index_blob"],
     },

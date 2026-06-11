@@ -97,7 +97,7 @@ async fn build_runtime(app: app::App) -> Result<Arc<Runtime>, String> {
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     let rt_for_load = Arc::clone(&rt);
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err("Timed out waiting for components to load".to_string());
         }
         () = rt_for_load.load_components() => {}
