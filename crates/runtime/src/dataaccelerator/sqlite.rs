@@ -23,6 +23,7 @@ use crate::{
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
+    datafusion::udf::deny_spice_specific_functions_table_providers,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -121,8 +122,17 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
+            // `decimal_between` rewrites federated `BETWEEN` comparisons over
+            // decimal columns (stored as TEXT in `SQLite`) so they compare
+            // numerically instead of lexically — without it those queries
+            // silently return wrong rows. The deny-list keeps plans referencing
+            // Spice-only functions (e.g. `json_get_str`) evaluating locally
+            // instead of failing in `SQLite`. Both were wired before the
+            // `DataFusion` 53 upgrade (#11118) dropped them; see issue #10703.
             sqlite_factory: SqliteTableProviderFactory::new()
-                .with_batch_insert_use_prepared_statements(true),
+                .with_batch_insert_use_prepared_statements(true)
+                .with_decimal_between(true)
+                .with_function_support(deny_spice_specific_functions_table_providers()),
         }
     }
 
