@@ -94,26 +94,31 @@ fn supports_name(restriction: Option<&FunctionRestriction>, name: &str) -> bool 
     }
 }
 
+/// Returns `true` if any expression anywhere in `plan` — including child plan
+/// nodes and subquery plans (`IN`/`EXISTS`/scalar subqueries) — references a
+/// function the `function_support` restriction rejects.
+///
+/// The walk must cover the whole plan tree, not just `plan.expressions()` on
+/// the root node: callers pass the root of an entire federated subtree (e.g.
+/// `Projection → Filter → TableScan`), so a denied function in a `WHERE`
+/// predicate or subquery would otherwise escape the check and be unparsed into
+/// the remote engine's SQL.
 pub fn contains_unsupported_functions(
     plan: &LogicalPlan,
     function_support: &FunctionSupport,
 ) -> Result<bool> {
     let mut unsupported = false;
-    for expr in plan.expressions() {
-        expr.apply(|expr| {
-            if !function_support.supports(expr) {
+    plan.apply_with_subqueries(|plan| {
+        for expr in plan.expressions() {
+            if !function_support.supports(&expr) {
                 unsupported = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        if unsupported {
-            return Ok(true);
         }
-    }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
 
-    Ok(false)
+    Ok(unsupported)
 }
 
 pub fn unfederate_plan_with_unsupported_functions(
@@ -128,4 +133,122 @@ pub fn unfederate_plan_with_unsupported_functions(
     }
 
     Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::logical_expr::{
+        ColumnarValue, LogicalPlanBuilder, ScalarUDF, TableSource, Volatility,
+        builder::LogicalTableSource, create_udf, expr::ScalarFunction, expr_fn::in_subquery,
+    };
+    use datafusion::prelude::{col, lit};
+
+    use super::*;
+
+    fn stub_udf(name: &str) -> Arc<ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ))
+    }
+
+    fn udf_expr(name: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(stub_udf(name), vec![col("val")]))
+    }
+
+    fn scan(table: &str) -> LogicalPlanBuilder {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Utf8, true),
+        ]));
+        let source = Arc::new(LogicalTableSource::new(schema)) as Arc<dyn TableSource>;
+        LogicalPlanBuilder::scan(table, source, None).expect("scan")
+    }
+
+    fn deny(names: &[&str]) -> FunctionSupport {
+        FunctionSupport::new(
+            Some(FunctionRestriction::Deny(
+                names.iter().map(|s| (*s).to_string()).collect(),
+            )),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn detects_denied_function_in_root_node() {
+        let plan = scan("t")
+            .project(vec![udf_expr("json_get_str")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        assert!(
+            contains_unsupported_functions(&plan, &deny(&["json_get_str"])).expect("walk plan"),
+            "denied function in the root projection must be detected"
+        );
+    }
+
+    #[test]
+    fn detects_denied_function_below_root_node() {
+        // The denied function sits in a `Filter` BELOW the root `Projection`,
+        // whose own expressions are clean. A root-only check misses it and the
+        // predicate would be unparsed into the remote engine's SQL.
+        let plan = scan("t")
+            .filter(udf_expr("json_get_str").eq(lit("x")))
+            .expect("filter")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        assert!(
+            contains_unsupported_functions(&plan, &deny(&["json_get_str"])).expect("walk plan"),
+            "denied function in a filter below the root must be detected"
+        );
+    }
+
+    #[test]
+    fn detects_denied_function_inside_subquery() {
+        // The denied function lives only inside the `IN (<subquery>)` plan.
+        // `Expr::apply` does not descend into subquery plans, so the walk must
+        // use `apply_with_subqueries` to see it.
+        let subquery = scan("u")
+            .project(vec![udf_expr("json_get_str")])
+            .expect("project")
+            .build()
+            .expect("build");
+        let plan = scan("t")
+            .filter(in_subquery(col("val"), Arc::new(subquery)))
+            .expect("filter")
+            .build()
+            .expect("build");
+
+        assert!(
+            contains_unsupported_functions(&plan, &deny(&["json_get_str"])).expect("walk plan"),
+            "denied function inside a subquery must be detected"
+        );
+    }
+
+    #[test]
+    fn allows_plan_without_denied_functions() {
+        let plan = scan("t")
+            .filter(udf_expr("upper").eq(lit("x")))
+            .expect("filter")
+            .project(vec![col("id")])
+            .expect("project")
+            .build()
+            .expect("build");
+
+        assert!(
+            !contains_unsupported_functions(&plan, &deny(&["json_get_str"])).expect("walk plan"),
+            "plan with no denied functions must stay federated"
+        );
+    }
 }
