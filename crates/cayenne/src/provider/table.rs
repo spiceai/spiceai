@@ -20335,6 +20335,134 @@ mod tests {
         );
     }
 
+    /// Double-checked spill: a writer that breaches the per-table cap and
+    /// queues behind an in-flight checkpoint must NOT run a SECOND whole-tier
+    /// encode once that checkpoint has drained the tier below the cap — the
+    /// checkpoint-lock wait IS the pipelined wait behind the in-flight flush,
+    /// and the re-check under the lock converts "wait + redundant encode" into
+    /// just "wait". Observable: the slot advancer fires once per non-empty
+    /// checkpoint, so a redundant writer-side checkpoint of the (non-empty)
+    /// survivor tier would fire it a second time and flush the survivors out
+    /// of RAM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_spill_double_check_skips_redundant_checkpoint() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        struct CountingAdvancer(Arc<std::sync::atomic::AtomicU64>);
+        #[async_trait::async_trait]
+        impl crate::provider::mem_tier::SlotAdvancer for CountingAdvancer {
+            async fn on_checkpoint_durable(&self, _durable_epoch: u64) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // The per-table cap equals the (large) seed batch exactly: while the
+        // seed is resident ANY incoming bytes breach the cap, and after the
+        // drain a tiny survivor + the incoming batch fit far below it.
+        let seed = id_value_batch_for_range(Arc::clone(&schema), 0, 4096);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "spill_double_check",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                cdc_mem_tier_max_bytes: i64::try_from(seed_bytes).expect("cap fits i64"),
+                // Byte cap only: the age component must not re-trip the
+                // re-checked predicate after the drain.
+                cdc_mem_tier_max_age_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let checkpoints = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(CountingAdvancer(Arc::clone(&checkpoints))));
+        let provider = Arc::new(provider);
+
+        // Fill the tier to the cap.
+        provider
+            .append_to_mem_tier(vec![seed], &OnConflictDeletions::default(), seed_bytes, 0)
+            .await
+            .expect("seed RAM tier to the cap");
+
+        // Model the in-flight BACKGROUND flush: hold the checkpoint lock before
+        // spawning the writer, so the writer breaches the cap and parks behind it.
+        let in_flight_guard = provider.mem_checkpoint_lock_for_writer().lock_owned().await;
+
+        let writer_provider = Arc::clone(&provider);
+        let writer_schema = Arc::clone(&schema);
+        let writer_ctx = ctx.task_ctx();
+        let writer = tokio::spawn(async move {
+            writer_provider
+                .write_cdc_append_stream(
+                    single_batch_stream(id_value_batch_for_range(writer_schema, 10_000, 512)),
+                    &writer_ctx,
+                )
+                .await
+        });
+        // Let the writer reach the cap arm (tier-at-cap + anything breaches)
+        // and park on the checkpoint lock. If it is ever slower than this, it
+        // simply finds the post-drain tier under the cap and skips the arm
+        // entirely — the assertions below hold either way (never false-fails).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // The in-flight flush drains the seed (the ONE expected checkpoint),
+        // then a fresh tiny segment lands, leaving a NON-empty tier far below
+        // the cap — exactly the state a redundant writer-side checkpoint would
+        // needlessly re-encode.
+        let flushed = provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("in-flight checkpoint drains the seed");
+        assert_eq!(flushed, 4096, "the in-flight flush drained the seed rows");
+        let survivor = id_value_batch(Arc::clone(&schema), &[99_999], &[1]);
+        let survivor_bytes = survivor.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(
+                vec![survivor],
+                &OnConflictDeletions::default(),
+                survivor_bytes,
+                0,
+            )
+            .await
+            .expect("survivor segment lands while the lock is still held");
+        drop(in_flight_guard);
+
+        let _writer_result = writer
+            .await
+            .expect("join writer")
+            .expect("cap-breaching writer succeeds after the in-flight flush");
+
+        // The double-check must skip the writer's own checkpoint: only the
+        // in-flight flush fired the advancer, and the survivor + writer rows
+        // are still resident in RAM (a redundant second checkpoint would have
+        // flushed them and fired the advancer again).
+        assert_eq!(
+            checkpoints.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the writer must not run a second checkpoint once the in-flight flush drained the tier"
+        );
+        assert!(
+            !provider.mem_tier.load().is_empty(),
+            "survivor + writer rows stay in RAM — the redundant whole-tier encode was skipped"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "spill_double_check").await,
+            4096 + 1 + 512,
+            "all rows (flushed seed + RAM survivor + writer batch) stay visible"
+        );
+    }
+
     /// Merged-scan-deletions memo: repeated scans in a quiescent window reuse
     /// ONE merged (file ∪ mem-tier) deletion snapshot (the q20 correlated-rescan
     /// fix), and any append invalidates it (new tier version ⇒ rebuild). Also
