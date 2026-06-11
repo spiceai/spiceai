@@ -472,9 +472,7 @@ fn bson_to_u64(value: Option<&Bson>) -> Option<u64> {
             reason = "guarded to non-negative integer values within f64's exact-integer range"
         )]
         Bson::Double(f)
-            if f.is_finite()
-                && f.fract() == 0.0
-                && (0.0..=9_007_199_254_740_992.0).contains(f) =>
+            if f.is_finite() && f.fract() == 0.0 && (0.0..=9_007_199_254_740_992.0).contains(f) =>
         {
             Some(*f as u64)
         }
