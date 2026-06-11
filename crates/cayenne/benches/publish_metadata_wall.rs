@@ -104,7 +104,7 @@ fn synthetic_delete_file(
         format: "arrow_ipc".to_string(),
         delete_count: i64::try_from(delete_count).expect("delete count fits in i64"),
         file_size_bytes: 0,
-        deletion_type: DeletionType::default(),
+        deletion_type: DeletionType::KeyBased,
         sequence_number,
         reinsert_sequence: None,
     }

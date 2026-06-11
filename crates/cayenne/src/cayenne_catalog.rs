@@ -18,7 +18,7 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
@@ -67,6 +67,37 @@ fn existing_delete_file_record_from_values(
         sequence_number: Option::<i64>::from_value(metastore_value_at(values, 6)?)?.unwrap_or(0),
         reinsert_sequence: Option::<i64>::from_value(metastore_value_at(values, 7)?)?,
     })
+}
+
+fn ensure_reinsert_keys_have_key_based_delete_file(
+    table_id: &str,
+    delete_files: &[DeleteFile],
+    reinsert_key_count: usize,
+) -> CatalogResult<()> {
+    if reinsert_key_count == 0 {
+        return Ok(());
+    }
+
+    if delete_files.is_empty() {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Cannot commit {reinsert_key_count} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows"
+            ),
+        });
+    }
+
+    if !delete_files
+        .iter()
+        .any(|delete_file| delete_file.deletion_type == DeletionType::KeyBased)
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Cannot commit {reinsert_key_count} on-conflict reinsert keys for table {table_id} without a key-based delete file; metadata-only publish reconstructs reinserts from key-based delete vectors carrying reinsert_sequence"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Metastore backend enum to support different implementations.
@@ -2553,15 +2584,6 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(());
         }
 
-        if delete_files.is_empty() && !insert_pk_bytes_list.is_empty() {
-            return Err(CatalogError::InvalidOperationNoSource {
-                message: format!(
-                    "Cannot commit {} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows",
-                    insert_pk_bytes_list.len()
-                ),
-            });
-        }
-
         // Validate every delete_file belongs to this table_id up front so a
         // mismatch can't half-apply via the txn. Duplicate path metadata is
         // checked by the INSERT/ON CONFLICT guard inside the transaction and
@@ -2585,17 +2607,27 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &delete_files,
+            insert_pk_bytes_list.len(),
+        )?;
+
         // Metadata-only publish: stamp the per-commit reinsert sequence on the
-        // upsert's delete-file rows. The keys this file deletes are exactly the
-        // keys re-inserted at `insert_sequence` (the on-conflict upsert contract
-        // validated above), so one column per file reconstructs the per-key insert
-        // map on read — the per-key `cayenne_insert_record` chunks below are no
-        // longer written. `None` when nothing is re-inserted (a pure delete) and
-        // harmless on position-based files (their DV carries no keys).
+        // upsert's key-based delete-file rows. The keys each key-based file
+        // deletes are exactly the keys re-inserted at `insert_sequence` (the
+        // on-conflict upsert contract validated above), so one column per file
+        // reconstructs the per-key insert map on read — the per-key
+        // `cayenne_insert_record` chunks below are no longer written. Position
+        // files carry no keys, so they keep None.
         let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
         let mut delete_files = delete_files;
         for delete_file in &mut delete_files {
-            delete_file.reinsert_sequence = reinsert_sequence;
+            delete_file.reinsert_sequence = if delete_file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2803,15 +2835,6 @@ impl MetadataCatalog for CayenneCatalog {
             return Ok(None);
         }
 
-        if delete_files.is_empty() && !insert_pk_bytes_list.is_empty() {
-            return Err(CatalogError::InvalidOperationNoSource {
-                message: format!(
-                    "Cannot commit {} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows",
-                    insert_pk_bytes_list.len()
-                ),
-            });
-        }
-
         // Generate the tombstone id up front (outside the retry loop) so a retry
         // re-INSERTs the SAME id rather than minting a new one each attempt —
         // the whole transaction rolls back on conflict, so only the committed
@@ -2846,13 +2869,26 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &delete_files,
+            insert_pk_bytes_list.len(),
+        )?;
+
         // Metadata-only publish: stamp the per-commit reinsert sequence on the
-        // delete-file rows (see `commit_on_conflict_deletions`). Replaces the
-        // per-key insert-record chunks dropped below.
+        // upsert's key-based delete-file rows. The keys each key-based file
+        // deletes are exactly the keys re-inserted at `insert_sequence`, so one
+        // column per file reconstructs the per-key insert map on read. No
+        // per-key `cayenne_insert_record` rows are written in this folded path
+        // either. Position files carry no keys, so they keep None.
         let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
         let mut delete_files = delete_files;
         for delete_file in &mut delete_files {
-            delete_file.reinsert_sequence = reinsert_sequence;
+            delete_file.reinsert_sequence = if delete_file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -4220,6 +4256,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_commit_on_conflict_deletions_rejects_reinsert_without_key_based_delete_file() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_reinsert_without_key_file_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: "table_id".to_string(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/position_only_delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 1,
+            file_size_bytes: 128,
+            deletion_type: DeletionType::PositionBased,
+            sequence_number: 1,
+            reinsert_sequence: None,
+        };
+
+        let err = catalog
+            .commit_on_conflict_deletions(vec![delete_file], "table_id", vec![vec![1_u8]], 2, None)
+            .await
+            .expect_err("reinsert keys without key-based delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without a key-based delete file"),
+                    "expected missing key-based delete file in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_with_tombstone_rejects_reinsert_without_key_based_delete_file()
+    {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_tombstone_reinsert_without_key_file_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: "table_id".to_string(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/position_only_tombstone_delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 1,
+            file_size_bytes: 128,
+            deletion_type: DeletionType::PositionBased,
+            sequence_number: 1,
+            reinsert_sequence: None,
+        };
+
+        let err = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![delete_file],
+                "table_id",
+                vec![vec![1_u8]],
+                2,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("reinsert keys without key-based delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without a key-based delete file"),
+                    "expected missing key-based delete file in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
     async fn test_commit_on_conflict_deletions_is_idempotent_for_same_delete_file() {
         let test_db = format!(
             "sqlite://./.test_on_conflict_delete_file_idempotent_{}.db",
@@ -4251,13 +4382,13 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_delete_file_same_path.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
             reinsert_sequence: None,
         };
@@ -4336,13 +4467,13 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_delete_file_conflict.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
             reinsert_sequence: None,
         };
@@ -4454,13 +4585,13 @@ mod tests {
         let make_delete_file = |idx: usize| DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some(format!("/tmp/source_{idx}.parquet")),
+            source_data_file_path: None,
             path: format!("/tmp/on_conflict_delete_file_batched_{idx}.parquet"),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
             reinsert_sequence: None,
         };
@@ -4540,13 +4671,13 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source_fold.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_with_tombstone_fold.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 4,
             file_size_bytes: 256,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
             reinsert_sequence: None,
         };
@@ -4808,13 +4939,13 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source_none.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_with_tombstone_none.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 1,
             file_size_bytes: 128,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
             reinsert_sequence: None,
         };

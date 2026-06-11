@@ -330,10 +330,10 @@ pub trait MetadataCatalog: Send + Sync {
     /// may leave a sequence-number gap, but it must not leave a partially
     /// committed delete-file / reinsert-metadata pair. A non-atomic implementation
     /// reintroduces the crash window this method exists to close.
-    /// When reinsert keys are provided, `delete_files` must be non-empty so the
-    /// reinsert sequence has delete-file rows to stamp, and `insert_sequence`
-    /// must be greater than each delete file's sequence number so replacement
-    /// rows remain visible.
+    /// When reinsert keys are provided, `delete_files` must include at least one
+    /// key-based delete file so the reinsert sequence has delete-vector keys to
+    /// stamp, and `insert_sequence` must be greater than each delete file's
+    /// sequence number so replacement rows remain visible.
     ///
     /// This replaces the legacy 3-call sequence on the on-conflict path
     /// (`add_delete_file` per file → `add_insert_records_batch`), which
