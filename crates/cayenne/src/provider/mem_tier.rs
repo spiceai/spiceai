@@ -154,18 +154,6 @@ pub(crate) struct MemSegment {
     pub(crate) rows: u64,
     /// Rows this segment's upsert superseded (carried, not recomputed).
     pub(crate) superseded: u64,
-    /// The tier epoch assigned to this segment when it was appended — the EXACT
-    /// value the runtime tagged this batch's deferred source committers with
-    /// (every [`MemTier::append_segment`] advances the epoch by one and returns it
-    /// as the batch's `in_memory_epoch`). Carried per-segment so a PARTIAL prefix
-    /// checkpoint can advance the source slot to the flushed prefix's last epoch
-    /// ONLY — leaving the retained suffix's higher epochs un-acked (replayable on
-    /// crash). The full-tier checkpoint's flushed epoch equals the tier's `epoch`
-    /// (the last segment's epoch), preserving the prior behavior exactly. Not
-    /// derived from `data_sequence` (a multi-step allocator value) nor from the
-    /// segment index (the post-checkpoint `retain_after` slides the window while
-    /// preserving `epoch`).
-    pub(crate) epoch: u64,
 }
 
 /// The in-memory CDC tier for one table. Immutable once constructed: every
@@ -257,11 +245,6 @@ impl MemTier {
                 )
             },
         );
-        // This append advances the epoch by one; the new segment carries that
-        // post-append epoch (mirrors the `epoch: self.epoch + 1` set below), so a
-        // partial checkpoint can ack the source slot to a flushed prefix's last
-        // segment epoch without consulting the (sliding) segment index.
-        let segment_epoch = self.epoch + 1;
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
         segments.extend(self.segments.iter().cloned());
         segments.push(MemSegment {
@@ -272,7 +255,6 @@ impl MemTier {
             bytes: incoming_bytes,
             rows: incoming_rows,
             superseded,
-            epoch: segment_epoch,
         });
 
         // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
@@ -347,60 +329,6 @@ impl MemTier {
             // age is measured from now (the next age-cap window starts here).
             oldest_append: Some(Instant::now()),
             version: self.version + 1,
-        }
-    }
-
-    /// The append-ordered PREFIX `[0..flush_segment_count)` of this tier, with its
-    /// aggregate tombstones / bytes / rows / superseded re-folded from ONLY those
-    /// segments. This is the corpus a PARTIAL checkpoint encodes durable: feeding
-    /// it (rather than the whole `self`) to the encode + metadata commit makes the
-    /// durable file carry exactly the prefix rows and the published deletion
-    /// snapshot carry exactly the prefix tombstones — the retained suffix
-    /// ([`Self::retain_after`] with the SAME count) keeps its own (higher-sequence)
-    /// tombstones in RAM, where the scan-time merge-on-read re-applies them to the
-    /// new durable file. Crucially the prefix does NOT bake any suffix tombstone
-    /// into the durable file: a suffix DELETE of a prefix row is un-acked (its
-    /// epoch is above the flushed epoch), so persisting it would lose a still-live
-    /// prefix row if that DELETE is rolled back by a crash before its own
-    /// checkpoint. The returned tier's `epoch` is the prefix's LAST segment epoch
-    /// (the value the slot is advanced to), NOT the whole tier's epoch.
-    ///
-    /// `flush_segment_count` is the caller's K, already clamped to
-    /// `1..=segments.len()` (a partial checkpoint always makes progress and never
-    /// over-flushes); when it equals `segments.len()` this returns a clone of the
-    /// whole tier (the full-checkpoint degenerate case).
-    #[must_use]
-    pub(crate) fn take_prefix(&self, flush_segment_count: usize) -> Self {
-        debug_assert!(
-            (1..=self.segments.len()).contains(&flush_segment_count),
-            "take_prefix expects K in 1..=segments.len(); got {flush_segment_count} of {}",
-            self.segments.len()
-        );
-        let k = flush_segment_count.clamp(1, self.segments.len());
-        let prefix: Vec<MemSegment> = self.segments[..k].to_vec();
-        // Seed the aggregates from the FIRST prefix segment (an O(1) HAMT-root
-        // clone) and fold only the rest — symmetric with `retain_after`.
-        let first = &prefix[0];
-        let mut tombstones = first.tombstones.clone();
-        let mut bytes = first.bytes;
-        let mut rows = first.rows;
-        let mut superseded = first.superseded;
-        for segment in &prefix[1..] {
-            tombstones.merge_from(&segment.tombstones);
-            bytes = bytes.saturating_add(segment.bytes);
-            rows = rows.saturating_add(segment.rows);
-            superseded = superseded.saturating_add(segment.superseded);
-        }
-        let prefix_epoch = prefix[k - 1].epoch;
-        Self {
-            segments: Arc::new(prefix),
-            tombstones,
-            bytes,
-            rows,
-            superseded,
-            epoch: prefix_epoch,
-            oldest_append: self.oldest_append,
-            version: self.version,
         }
     }
 }
@@ -599,112 +527,6 @@ mod tests {
         let next = tier.append_segment(Arc::new(vec![batch(&[2])]), 2, &tomb, 16, 1, 1);
         // Authoritative superseded is exactly the passed value (1), not 2.
         assert_eq!(next.superseded, 1);
-    }
-
-    /// Each appended segment carries the post-append tier epoch — the exact value
-    /// the runtime tags the batch's deferred committers with. This is what a
-    /// partial prefix checkpoint reads (segment[K-1].epoch) to ack the slot to the
-    /// flushed prefix only.
-    #[test]
-    fn append_stamps_segment_with_its_tier_epoch() {
-        let mut tier = MemTier::empty();
-        for expected_epoch in 1..=4_u64 {
-            tier = tier.append_segment(
-                Arc::new(vec![batch(&[i64::try_from(expected_epoch).unwrap()])]),
-                i64::try_from(expected_epoch).unwrap(),
-                &InMemTombstones::default(),
-                16,
-                1,
-                0,
-            );
-            assert_eq!(tier.epoch, expected_epoch, "tier epoch advances by one");
-            assert_eq!(
-                tier.segments.last().expect("segment").epoch,
-                expected_epoch,
-                "the new segment is stamped with the post-append epoch"
-            );
-        }
-        // Every segment's epoch equals its 1-based position in a never-cleared tier.
-        for (idx, segment) in tier.segments.iter().enumerate() {
-            assert_eq!(segment.epoch, u64::try_from(idx + 1).unwrap());
-        }
-    }
-
-    /// `take_prefix(K)` and `retain_after(K)` partition a tier at the SAME boundary:
-    /// the prefix carries segments [0..K) (its epoch = segment[K-1].epoch, its
-    /// aggregates folded from only those K), the suffix carries [K..) (epoch
-    /// preserved). Together they reconstruct the whole tier with no segment shared
-    /// or dropped — the prefix is made durable, the suffix stays resident.
-    #[test]
-    fn take_prefix_and_retain_after_partition_at_the_same_boundary() {
-        // Four segments, each one tombstone + distinct byte/row weights.
-        let mut tier = MemTier::empty();
-        for i in 0..4_i64 {
-            let mut tomb = InMemTombstones::default();
-            tomb.int64_pk.insert(100 + i, i + 1);
-            tier = tier.append_segment(
-                Arc::new(vec![batch(&[i])]),
-                i + 1,
-                &tomb,
-                10 * u64::try_from(i + 1).unwrap(),
-                1,
-                0,
-            );
-        }
-        assert_eq!(tier.epoch, 4);
-        assert_eq!(tier.segments.len(), 4);
-        let total_bytes = tier.bytes; // 10+20+30+40 = 100
-        assert_eq!(total_bytes, 100);
-
-        // Flush the first TWO segments.
-        let prefix = tier.take_prefix(2);
-        let suffix = tier.retain_after(2);
-
-        // Prefix: segments [0,1], epoch = segment[1].epoch = 2, bytes 10+20=30.
-        assert_eq!(prefix.segments.len(), 2);
-        assert_eq!(prefix.epoch, 2, "prefix epoch is its LAST segment's epoch");
-        assert_eq!(prefix.bytes, 30, "prefix bytes fold only the prefix segments");
-        assert_eq!(prefix.rows, 2);
-        assert_eq!(prefix.tombstones.int64_pk.len(), 2, "prefix has only its own tombstones");
-        assert!(prefix.tombstones.int64_pk.contains_key(&100));
-        assert!(prefix.tombstones.int64_pk.contains_key(&101));
-
-        // Suffix: segments [2,3], epoch preserved at 4, bytes 30+40=70.
-        assert_eq!(suffix.segments.len(), 2);
-        assert_eq!(suffix.epoch, 4, "suffix preserves the tier epoch");
-        assert_eq!(suffix.bytes, 70, "suffix bytes fold only the suffix segments");
-        assert_eq!(suffix.tombstones.int64_pk.len(), 2, "suffix has only its own tombstones");
-        assert!(suffix.tombstones.int64_pk.contains_key(&102));
-        assert!(suffix.tombstones.int64_pk.contains_key(&103));
-
-        // No segment shared or dropped: prefix.bytes + suffix.bytes == tier.bytes.
-        assert_eq!(prefix.bytes + suffix.bytes, total_bytes);
-        assert!(
-            suffix.segments.first().expect("suffix seg").epoch > prefix.epoch,
-            "the suffix's first epoch is strictly above the flushed prefix epoch (un-acked)"
-        );
-    }
-
-    /// `take_prefix(len)` is the full-checkpoint degenerate case: it returns the
-    /// whole tier with the tier epoch — identical flush target to a full checkpoint.
-    #[test]
-    fn take_prefix_full_len_returns_whole_tier() {
-        let mut tier = MemTier::empty();
-        for i in 0..3_i64 {
-            tier = tier.append_segment(
-                Arc::new(vec![batch(&[i])]),
-                i + 1,
-                &InMemTombstones::default(),
-                16,
-                1,
-                0,
-            );
-        }
-        let prefix = tier.take_prefix(tier.segments.len());
-        assert_eq!(prefix.segments.len(), 3, "the whole tier is the prefix");
-        assert_eq!(prefix.epoch, tier.epoch, "epoch equals the full tier epoch");
-        assert_eq!(prefix.bytes, tier.bytes);
-        assert_eq!(prefix.rows, tier.rows);
     }
 
     /// A trivial `SlotAdvancer` records the highest durable epoch — the shape the
