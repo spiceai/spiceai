@@ -206,6 +206,10 @@ impl DisplayAs for BytesProcessedExec {
 // for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for BytesProcessedExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "BytesProcessedExec"
     }
@@ -225,7 +229,7 @@ impl ExecutionPlan for BytesProcessedExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input_exec.properties()
     }
 
@@ -321,11 +325,6 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input_exec.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input_exec.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

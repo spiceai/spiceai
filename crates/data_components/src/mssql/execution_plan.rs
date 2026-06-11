@@ -49,7 +49,7 @@ pub struct SqlServerExecPlan {
     filters: Vec<Expr>,
     limit: Option<usize>,
     sort_exprs: Vec<PhysicalSortExpr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 pub fn project_schema_safe(
@@ -87,12 +87,12 @@ impl SqlServerExecPlan {
             filters: filters.to_vec(),
             limit,
             sort_exprs: Vec::new(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 
@@ -195,7 +195,7 @@ impl ExecutionPlan for SqlServerExecPlan {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -226,7 +226,7 @@ impl ExecutionPlan for SqlServerExecPlan {
             filters: self.filters.clone(),
             limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
         }))
     }
 
@@ -249,8 +249,7 @@ impl ExecutionPlan for SqlServerExecPlan {
             let is_nullable = self
                 .projected_schema
                 .field_with_name(col.name())
-                .map(arrow::datatypes::Field::is_nullable)
-                .unwrap_or(true);
+                .map_or(true, arrow::datatypes::Field::is_nullable);
             if !is_nullable {
                 continue;
             }
@@ -289,12 +288,12 @@ impl ExecutionPlan for SqlServerExecPlan {
             filters: self.filters.clone(),
             limit: self.limit,
             sort_exprs,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         };
 
         let inner = Arc::new(new_plan) as Arc<dyn ExecutionPlan>;

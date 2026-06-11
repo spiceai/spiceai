@@ -36,7 +36,7 @@ pub struct FullTextSearchExec {
     pub(super) query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl FullTextSearchExec {
@@ -58,12 +58,12 @@ impl FullTextSearchExec {
             query,
             filters,
             limit,
-            plan_properties: PlanProperties::new(
+            plan_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         })
     }
 }
@@ -93,7 +93,7 @@ impl ExecutionPlan for FullTextSearchExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

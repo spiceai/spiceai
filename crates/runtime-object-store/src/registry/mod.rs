@@ -311,7 +311,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(timeout) = params.get("client_timeout") {
             client_options =
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
-                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}"))
                 })?);
         }
         if let Some(allow_http) = params.get("allow_http") {
@@ -442,7 +442,7 @@ impl SpiceObjectStoreRegistry {
         if let Some(timeout) = params.get("client_timeout") {
             client_options =
                 client_options.with_timeout(fundu::parse_duration(timeout).map_err(|_| {
-                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}",))
+                    DataFusionError::Configuration(format!("Unable to parse timeout: {timeout}"))
                 })?);
         }
 

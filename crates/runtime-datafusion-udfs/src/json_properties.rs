@@ -97,7 +97,7 @@ use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -1214,7 +1214,7 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
         // No named args to rewrite; nothing to simplify.
         if args.len() <= 1 {

@@ -24,7 +24,6 @@ use std::{
 use anyhow::Result;
 use arrow::array::RecordBatch;
 use dashmap::DashMap;
-use futures::TryStreamExt;
 use indicatif::ProgressBar;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -586,17 +585,19 @@ impl SpiceTestQueryWorker {
                     self.id, query.name, ref_schema
                 );
 
-                let mut ref_result_stream = spice_client
-                    .sql_with_params(
-                        &reference_query.sql,
-                        reference_query.get_parameters_batch().transpose()?,
-                    )
-                    .await?;
-
-                let mut ref_batches = vec![];
-                while let Some(batch) = ref_result_stream.try_next().await? {
-                    ref_batches.push(batch);
-                }
+                let ref_batches = {
+                    let mut stream = spice_client
+                        .sql_with_params(
+                            &reference_query.sql,
+                            reference_query.get_parameters_batch().transpose()?,
+                        )
+                        .await?;
+                    let mut batches = Vec::new();
+                    while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                        batches.push(batch?);
+                    }
+                    batches
+                };
 
                 // Validate against reference query results
                 let validation_result =
@@ -723,7 +724,7 @@ impl SpiceTestQueryWorker {
                 });
             });
             if result.is_err() {
-                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed",);
+                let error_str = format!("Query `{name}` `{query_name}` snapshot assertion failed");
                 eprintln!("{error_str}");
                 return Err(anyhow::anyhow!(error_str));
             }

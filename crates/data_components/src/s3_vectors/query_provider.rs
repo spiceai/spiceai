@@ -147,7 +147,7 @@ impl std::fmt::Debug for S3VectorsQueryExec {
 pub(super) struct S3VectorsQueryExec {
     idx: S3VectorIdentifier,
     client: Arc<dyn S3Vectors + Send + Sync>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     query: Vec<f32>,
     limit: i32,
     filters: Vec<Expr>,
@@ -178,12 +178,12 @@ impl S3VectorsQueryExec {
         Self {
             idx: Arc::unwrap_or_clone(Arc::clone(&table.idx)),
             client: Arc::clone(&table.client),
-            plan_properties: PlanProperties::new(
+            plan_properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             query,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
             filters,
@@ -200,7 +200,7 @@ impl ExecutionPlan for S3VectorsQueryExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

@@ -125,7 +125,7 @@ pub fn sort_stream(
 /// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
 struct StreamingExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingExec {
@@ -138,7 +138,7 @@ impl StreamingExec {
         );
         Self {
             stream: Mutex::new(Some(stream)),
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -157,6 +157,10 @@ impl DisplayAs for StreamingExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for StreamingExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "StreamingExec"
     }
@@ -176,7 +180,7 @@ impl ExecutionPlan for StreamingExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -253,10 +257,6 @@ impl ExecutionPlan for StreamingExec {
 
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
-    }
-
-    fn statistics(&self) -> Result<datafusion::common::Statistics> {
-        Ok(datafusion::common::Statistics::new_unknown(&self.schema()))
     }
 
     fn partition_statistics(

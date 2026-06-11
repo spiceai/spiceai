@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Larger async fns (start_runtime) overflow the default type-layout query depth
+// under the full feature set; raise the recursion limit for layout computation.
+#![recursion_limit = "256"]
+
 use std::mem::size_of;
 
 // Spice runtime requires at least 64-bit pointer size (8 bytes).

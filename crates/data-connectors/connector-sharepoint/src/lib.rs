@@ -47,12 +47,13 @@ use data_components::sharepoint::table::SharepointTableProvider;
 use data_components::sharepoint::url::DriveRef;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use document_parse::DocumentParser;
 use graph_rs_sdk::GraphClient;
 use runtime::Runtime;
 use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::{LISTING_TABLE_PARAMETERS, ListingTableConnector};
+use runtime::dataconnector::listing::{
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ObjectVersionType,
+};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,

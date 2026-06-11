@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::contains_unsupported_functions;
 use async_trait::async_trait;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
 use std::sync::Arc;
 
 use datafusion::{

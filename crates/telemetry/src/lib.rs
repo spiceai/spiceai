@@ -620,6 +620,41 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
         .add(1, dimensions);
 }
 
+static CAYENNE_SCAN_FILES_LISTED: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_SCAN_FILES_PRUNED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts Vortex data files considered ("listed") and skipped ("pruned") at
+/// scan listing time via the #11234 footer min/max statistics. The pruned/listed
+/// ratio is the read-amplification signal: sorted compaction tightens per-file
+/// ranges so listing-time pruning skips more files for an aligned filter.
+/// `dimensions` should carry `table`.
+pub fn track_cayenne_scan_files(listed: u64, pruned: u64, dimensions: &[KeyValue]) {
+    if listed > 0 {
+        CAYENNE_SCAN_FILES_LISTED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_listed_total")
+                    .with_description(
+                        "Vortex data files considered at scan listing time (before footer-statistics pruning).",
+                    )
+                    .build()
+            })
+            .add(listed, dimensions);
+    }
+    if pruned > 0 {
+        CAYENNE_SCAN_FILES_PRUNED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_pruned_total")
+                    .with_description(
+                        "Vortex data files skipped at scan listing time by footer min/max statistics.",
+                    )
+                    .build()
+            })
+            .add(pruned, dimensions);
+    }
+}
+
 static CAYENNE_INLINE_CACHE_DELTA_POPULATES: OnceLock<Counter<u64>> = OnceLock::new();
 static CAYENNE_INLINE_CACHE_FULL_REBUILDS: OnceLock<Counter<u64>> = OnceLock::new();
 

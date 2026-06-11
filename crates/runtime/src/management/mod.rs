@@ -231,7 +231,7 @@ impl Management {
     // Calculate the timestamp for 3 days ago from now
     fn calculate_export_since_time() -> SystemTime {
         SystemTime::now()
-            .checked_sub(Duration::from_secs(3 * 24 * 60 * 60))
+            .checked_sub(Duration::from_hours(72))
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
 

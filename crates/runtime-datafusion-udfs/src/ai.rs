@@ -1023,9 +1023,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages");
@@ -1059,9 +1057,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1100,9 +1096,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1134,9 +1128,7 @@ mod tests {
                 "error-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1166,9 +1158,7 @@ mod tests {
                 "null-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should invoke async");
@@ -1267,9 +1257,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1417,9 +1405,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await
             .expect("should process messages in parallel");
@@ -1550,9 +1536,7 @@ mod tests {
                 "slow-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             ),
         )
         .await;
@@ -1631,9 +1615,7 @@ mod tests {
                 "large-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1673,9 +1655,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 
@@ -1720,9 +1700,7 @@ mod tests {
                 "test-model",
                 messages,
                 None,
-                std::thread::available_parallelism()
-                    .map(std::num::NonZero::get)
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
             )
             .await;
 

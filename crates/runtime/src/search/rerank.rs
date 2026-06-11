@@ -939,7 +939,7 @@ struct RerankExec {
     /// Whether the input is a nested search UDTF (affects defensive cap).
     input_is_nested: bool,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RerankExec {
@@ -954,12 +954,12 @@ impl RerankExec {
         rerank_limit: Option<usize>,
         input_is_nested: bool,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             output_schema,
@@ -1010,7 +1010,7 @@ impl ExecutionPlan for RerankExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

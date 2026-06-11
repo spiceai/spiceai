@@ -113,7 +113,7 @@ impl ModelSource for SpiceAI {
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(1800))
+            .timeout(Duration::from_mins(30))
             .build()
             .context(super::UnableToFetchModelSnafu)?;
         let data: ModelRoot = client

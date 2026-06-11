@@ -304,7 +304,7 @@ pub async fn load_all(
             let done = w - seed_count;
             if done.is_multiple_of(50) || w == warehouses {
                 let elapsed = clone_start.elapsed();
-                println!("    cloned {done}/{to_clone} warehouses ({elapsed:.1?} elapsed)",);
+                println!("    cloned {done}/{to_clone} warehouses ({elapsed:.1?} elapsed)");
             }
         }
 

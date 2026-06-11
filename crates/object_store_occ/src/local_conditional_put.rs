@@ -43,8 +43,9 @@ use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
-    Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, RenameOptions,
 };
 
 /// Wraps a [`LocalFileSystem`] to add `PutMode::Update` support.
@@ -199,14 +200,6 @@ impl ObjectStore for LocalConditionalPut {
         self.inner.get_opts(location, options).await
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta, ObjectStoreError> {
-        self.inner.head(location).await
-    }
-
-    async fn delete(&self, location: &Path) -> Result<(), ObjectStoreError> {
-        self.inner.delete(location).await
-    }
-
     fn list(
         &self,
         prefix: Option<&Path>,
@@ -229,46 +222,6 @@ impl ObjectStore for LocalConditionalPut {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-
-    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
-        self.inner.rename_if_not_exists(from, to).await
-    }
-
-    async fn put(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-    ) -> Result<PutResult, ObjectStoreError> {
-        self.put_opts(location, payload, PutOptions::default())
-            .await
-    }
-
-    async fn put_multipart(
-        &self,
-        location: &Path,
-    ) -> Result<Box<dyn MultipartUpload>, ObjectStoreError> {
-        self.inner.put_multipart(location).await
-    }
-
-    async fn get(&self, location: &Path) -> Result<GetResult, ObjectStoreError> {
-        self.inner.get(location).await
-    }
-
-    async fn get_range(
-        &self,
-        location: &Path,
-        range: Range<u64>,
-    ) -> Result<Bytes, ObjectStoreError> {
-        self.inner.get_range(location, range).await
-    }
-
     async fn get_ranges(
         &self,
         location: &Path,
@@ -277,15 +230,29 @@ impl ObjectStore for LocalConditionalPut {
         self.inner.get_ranges(location, ranges).await
     }
 
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, Result<Path, ObjectStoreError>>,
-    ) -> BoxStream<'a, Result<Path, ObjectStoreError>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, ObjectStoreError>>,
+    ) -> BoxStream<'static, Result<Path, ObjectStoreError>> {
         self.inner.delete_stream(locations)
     }
 
-    async fn rename(&self, from: &Path, to: &Path) -> Result<(), ObjectStoreError> {
-        self.inner.rename(from, to).await
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> Result<(), ObjectStoreError> {
+        self.inner.rename_opts(from, to, options).await
     }
 }
 

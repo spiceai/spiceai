@@ -509,7 +509,7 @@ const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 const CACHE_MAINTENANCE: &str = "cache_maintenance";
 
 /// How often [`Runtime::run_cache_maintenance`] drives moka housekeeping.
-const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
 
 // Allow 30 seconds for tasks for graceful shutdown
 const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);

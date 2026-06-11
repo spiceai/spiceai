@@ -308,6 +308,7 @@ impl OptimizerRule for CayennePropagateFilterAcrossEquiJoinKeys {
             join.join_type,
             join.join_constraint,
             join.null_equality,
+            join.null_aware,
         )?;
 
         Ok(Transformed::yes(LogicalPlan::Join(new_join)))
@@ -828,6 +829,7 @@ fn build_landed_semi_join(
         JoinType::LeftSemi,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?))
 }
 
@@ -844,6 +846,7 @@ fn rebuild_inner_join(
         inner.join_type,
         inner.join_constraint,
         inner.null_equality,
+        inner.null_aware,
     )?))
 }
 
@@ -953,6 +956,7 @@ fn reassociate_cross_join(
         JoinType::Inner,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?);
 
     let outer_join = Join::try_new(
@@ -963,6 +967,7 @@ fn reassociate_cross_join(
         JoinType::Inner,
         JoinConstraint::On,
         NullEquality::NullEqualsNothing,
+        false,
     )?;
 
     Ok(Transformed::yes(LogicalPlan::Join(outer_join)))
@@ -1508,15 +1513,19 @@ fn collect_selective_filter_columns(expr: &Expr, columns: &mut Vec<Column>) {
             collect_literal_comparison_columns(&binary.left, &binary.right, columns);
             collect_literal_comparison_columns(&binary.right, &binary.left, columns);
         }
-        Expr::Between(between) if !between.negated => {
-            if expr_is_literal_like(&between.low) && expr_is_literal_like(&between.high) {
-                collect_columns_from_expr(&between.expr, columns);
-            }
+        Expr::Between(between)
+            if !between.negated
+                && expr_is_literal_like(&between.low)
+                && expr_is_literal_like(&between.high) =>
+        {
+            collect_columns_from_expr(&between.expr, columns);
         }
-        Expr::InList(in_list) if !in_list.negated && !in_list.list.is_empty() => {
-            if in_list.list.iter().all(expr_is_literal_like) {
-                collect_columns_from_expr(&in_list.expr, columns);
-            }
+        Expr::InList(in_list)
+            if !in_list.negated
+                && !in_list.list.is_empty()
+                && in_list.list.iter().all(expr_is_literal_like) =>
+        {
+            collect_columns_from_expr(&in_list.expr, columns);
         }
         Expr::Like(like) if !like.negated && expr_is_literal_like(&like.pattern) => {
             collect_columns_from_expr(&like.expr, columns);
@@ -2054,6 +2063,7 @@ mod tests {
             cust_orders_join_type,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let three_way = LogicalPlan::Join(Join::try_new(
             Arc::new(cust_orders),
@@ -2063,6 +2073,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         Ok(LogicalPlan::Join(Join::try_new(
             Arc::new(three_way),
@@ -2072,6 +2083,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?))
     }
 
@@ -2138,6 +2150,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = push_down_semi_join_rule().rewrite(
@@ -2217,6 +2230,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let three_way = LogicalPlan::Join(Join::try_new(
             Arc::new(cust_orders),
@@ -2226,6 +2240,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(three_way),
@@ -2239,6 +2254,7 @@ mod tests {
             JoinType::LeftSemi,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let transformed = push_down_semi_join_rule().rewrite(
             plan.clone(),
@@ -2283,6 +2299,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2308,6 +2325,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let original_schema = Arc::clone(plan.schema());
 
@@ -2378,6 +2396,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2396,6 +2415,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = cross_join_rule().rewrite(
@@ -2452,6 +2472,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2464,6 +2485,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let transformed = cross_join_rule().rewrite(
@@ -2495,6 +2517,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2507,6 +2530,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let rule = CayenneReassociateCrossJoin::new_with_table_source_predicate(|_| false);
@@ -2539,6 +2563,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
         let plan = LogicalPlan::Join(Join::try_new(
             Arc::new(cross),
@@ -2551,6 +2576,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let rule = CayenneReassociateCrossJoin::new_with_table_provider_predicate(|provider| {
@@ -2872,6 +2898,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -2951,6 +2978,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3036,6 +3064,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
@@ -3434,6 +3463,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNull,
+            false,
         )?);
 
         let r = rule();
@@ -3487,6 +3517,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
+            false,
         )?);
 
         let r = rule();
