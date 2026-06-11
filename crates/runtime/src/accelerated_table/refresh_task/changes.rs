@@ -1492,6 +1492,15 @@ impl RefreshTask {
         ctx: &SessionContext,
         session_state: &SessionState,
     ) -> crate::accelerated_table::Result<WriteChangeOutcome> {
+        // EXPERIMENT: skip the local write to test if changes-stream write is the
+        // bottleneck for HTAP throughput. Returning DataWritten lets the caller run
+        // committers as usual, so the PG replication slot LSN still advances and
+        // WAL is released — only the DataFusion exec / accelerator write is skipped.
+        const SKIP_CDC_WRITE: bool = true;
+        if SKIP_CDC_WRITE {
+            return Ok(WriteChangeOutcome::new(WriteChangeResult::DataWritten, None));
+        }
+
         let dataset_name = self.dataset_name.clone();
 
         let sub_batches = group_into_sub_batches(&change_batch);
