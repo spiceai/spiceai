@@ -10,6 +10,7 @@ runs:
         docker run -d --name chbench-pg \
           --cpus=44 \
           --memory=112g --memory-swap=112g \
+          --mount type=tmpfs,destination=/var/lib/postgresql/data,tmpfs-size=80g \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 \
           --shm-size=8g \
@@ -20,7 +21,7 @@ runs:
           -c full_page_writes=off \
           -c max_replication_slots=20 \
           -c max_wal_senders=20 \
-          -c shared_buffers=28GB \
+          -c shared_buffers=16GB \
           -c effective_cache_size=80GB \
           -c checkpoint_timeout=30min \
           -c max_wal_size=24GB \

@@ -74,7 +74,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
 
     // EXPERIMENT: skip spiced; run OLTP only to measure raw PG throughput.
-    const SKIP_SPICED: bool = true;
+    const SKIP_SPICED: bool = false;
     if SKIP_SPICED {
         println!(
             "[oltp-only experiment] running TPC-C for {}s against PG; spiced NOT started",
