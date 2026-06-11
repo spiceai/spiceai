@@ -121,18 +121,24 @@ impl TransactionBuffer {
 /// the current value, so the substitution is exact (the same merge Debezium
 /// performs).
 ///
-/// Without an old tuple (`REPLICA IDENTITY DEFAULT`), any remaining
-/// `Value::Unchanged` later fails the change-batch build with the actionable
-/// REPLICA-IDENTITY-FULL hint — silently coercing to NULL would overwrite the
-/// accelerator's value.
+/// The old tuple may be key-only (pgoutput `K` tag under `REPLICA IDENTITY
+/// DEFAULT` when key columns change): it has full column arity but NULLs for
+/// non-key columns. A `u` marker implies the real value is non-NULL, so a
+/// NULL old slot means "value not provided", never "value is NULL" — in that
+/// case the marker is left in place and the change-batch build fails with the
+/// actionable REPLICA-IDENTITY-FULL hint, instead of silently overwriting the
+/// accelerator's value with NULL.
 #[must_use]
 pub fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> TupleData {
     let Some(old) = old else {
         return new;
     };
     for (idx, column) in new.columns.iter_mut().enumerate() {
-        if matches!(column, Some(Value::Unchanged)) {
-            *column = old.columns.get(idx).cloned().flatten();
+        if matches!(column, Some(Value::Unchanged))
+            && let Some(Some(old_value)) = old.columns.get(idx)
+            && !matches!(old_value, Value::Unchanged)
+        {
+            *column = Some(old_value.clone());
         }
     }
     new
