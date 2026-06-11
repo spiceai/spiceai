@@ -149,6 +149,16 @@ pub struct DeleteFile {
     /// - New inserts get higher sequence numbers
     /// - Old deletes don't apply to new data with the same PK
     pub sequence_number: i64,
+    /// Metadata-only publish: the per-commit-constant sequence at which the keys
+    /// deleted by THIS file were RE-INSERTED in the same upsert publish (`None`
+    /// for a pure delete that re-inserts nothing, and for position-based files
+    /// which carry no keys). On load the merge-on-read path assigns this sequence
+    /// to every key in this file's deletion vector, reconstructing the per-key
+    /// `cayenne_insert_record` map WITHOUT a durable row per key — the keys
+    /// deleted by an upsert are exactly the keys it re-inserts, at one shared
+    /// sequence. Legacy rows (pre-feature) and pure deletes leave this `None` and
+    /// fall back to the `cayenne_insert_record` table.
+    pub reinsert_sequence: Option<i64>,
 }
 
 /// Metadata about a partition in a table.
