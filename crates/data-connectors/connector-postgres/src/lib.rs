@@ -140,23 +140,33 @@ const PARAMETERS: &[ParameterSpec] = &[
         )
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
-        .description("The minimum number of idle connections to keep open in the pool.")
+        .description(
+            "The minimum number of idle connections to keep open in the pool. \
+             Default: 1 (0 for `refresh_mode: changes` datasets, which use the pool only \
+             for schema probes — replication runs over dedicated connections).",
+        )
         .default("1")
         .help_link(POSTGRES_DOCS),
     ParameterSpec::runtime("connection_pool_size")
-        .description("The maximum number of connections created in the connection pool.")
+        .description(
+            "The maximum number of connections created in the connection pool. \
+             Default: 5 (2 for `refresh_mode: changes` datasets).",
+        )
         .default("5")
         .help_link(POSTGRES_DOCS),
     // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
-         Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Each Spice replica \
+         Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
+         same connection that name the same slot SHARE it: one replication connection, \
+         one publication, with decoded changes routed per table. Each Spice replica \
          MUST have its own unique slot.",
     ),
     ParameterSpec::component("publication").description(
         "Name of the Postgres publication to create/reuse for this dataset. \
-         Defaults to `spice_<dataset>_<dataset-hash>_pub`. Shared across replicas for the \
-         same dataset.",
+         Defaults to `spice_<dataset>_<dataset-hash>_pub`, or `<slot>_pub` when \
+         `pg_replication_slot` is set. Shared across replicas for the same dataset; \
+         datasets sharing a slot must use the same publication.",
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
@@ -200,6 +210,37 @@ impl DataConnectorFactory for PostgresFactory {
                 "application_name".to_string(),
                 SecretBox::from(format!("Spice.ai {}", env!("CARGO_PKG_VERSION"))),
             );
+
+            // `refresh_mode: changes` datasets use this pool only for schema
+            // probes at initialization — replication runs over its own
+            // dedicated connections. Unless the user sized the pool
+            // explicitly, keep it minimal: no idle connections held for the
+            // lifetime of the dataset (`min_idle: 0`), and a small max. This
+            // matters at N CDC datasets per source database, and keeps a
+            // dataset stuck in an init retry loop from multiplying held
+            // connections.
+            if let ConnectorComponent::Dataset(dataset) = &params.component {
+                let is_changes_mode = dataset.acceleration.as_ref().is_some_and(|acceleration| {
+                    acceleration.refresh_mode
+                        == Some(runtime::component::dataset::acceleration::RefreshMode::Changes)
+                });
+                if is_changes_mode {
+                    // The injected spec defaults are indistinguishable from
+                    // user-set values here, so consult the raw spicepod
+                    // params for whether the user chose a size.
+                    let user_set = |key: &str| {
+                        dataset.params.contains_key(&format!("pg_{key}"))
+                            || dataset.params.contains_key(key)
+                    };
+                    if !user_set("connection_pool_size") {
+                        param_map.insert("connection_pool_size".to_string(), SecretBox::from("2"));
+                    }
+                    if !user_set("connection_pool_min_idle") {
+                        param_map
+                            .insert("connection_pool_min_idle".to_string(), SecretBox::from("0"));
+                    }
+                }
+            }
 
             let params_for_replication = params.parameters.clone();
 

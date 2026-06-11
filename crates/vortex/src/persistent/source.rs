@@ -118,16 +118,6 @@ impl VortexSource {
         self
     }
 
-    /// Enable or disable building `DataFusion`'s `FilePruner` for the underlying scan.
-    ///
-    /// When disabled, the opener never prunes files on statistics or partition
-    /// values; every candidate file is opened and scanned.
-    #[must_use]
-    pub fn with_file_pruning(mut self, enabled: bool) -> Self {
-        self.options.file_pruning = enabled;
-        self
-    }
-
     /// Set an [`ExpressionConvertor`] to control how `DataFusion` expressions should be converted and pushed down.
     #[must_use]
     pub fn with_expression_convertor(
@@ -255,7 +245,6 @@ impl FileSource for VortexSource {
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
             projection_pushdown: self.options.projection_pushdown.enabled(),
-            file_pruning: self.options.file_pruning,
             scan_concurrency: Some(scan_concurrency),
         };
 
