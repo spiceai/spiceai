@@ -612,7 +612,7 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
 
 /// Extract the subset of [`CDC_RUNTIME_PARAMS`] keys present in `params`
 #[must_use]
-pub fn extract_cdc_param_overrides(
+pub(crate) fn extract_cdc_param_overrides(
     params: &std::collections::HashMap<String, String>,
 ) -> Option<std::collections::HashMap<String, String>> {
     let extracted: std::collections::HashMap<String, String> = CDC_RUNTIME_PARAMS
@@ -628,7 +628,7 @@ pub fn extract_cdc_param_overrides(
 
 /// Overlay per-dataset `cdc_*` params on top of an already-resolved global [`CdcConfig`].
 #[must_use]
-pub fn cdc_config_overlay(
+pub(crate) fn cdc_config_overlay(
     base: CdcConfig,
     dataset_params: &std::collections::HashMap<String, String>,
 ) -> CdcConfig {
