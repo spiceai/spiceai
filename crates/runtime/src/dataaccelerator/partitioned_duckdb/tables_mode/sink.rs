@@ -135,7 +135,7 @@ fn unique_name_suffix() -> Result<u64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context(UnableToGetSystemTimeSnafu)?;
-    let nanos = u64::try_from(duration.as_nanos()).map_or(u64::MAX, |value| value);
+    let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
     Ok(nanos.saturating_add(TEMP_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)))
 }
 

@@ -623,9 +623,13 @@ impl<'a> AppendMutationWriter<'a> {
 
         // CAP CHECK + spill/fallback decision (OOM-safety, correctness item #2).
         //
-        // 1. Per-table cap breached → spill (checkpoint) FIRST — double-checked
-        //    under the checkpoint lock, see `spill_mem_tier_if_cap_breached` —
-        //    then append into the bounded tier.
+        // 1. Per-table BYTE cap breached → spill (checkpoint) FIRST — double-
+        //    checked under the checkpoint lock, see
+        //    `spill_mem_tier_if_cap_breached` — then append into the bounded
+        //    tier. Byte cap only: the tier's AGE cap is enforced by the 1s
+        //    background tick without blocking this writer (the age-sharing
+        //    variant made the applier ride out checkpoint outages — the
+        //    measured 33-41s apply stalls behind compaction-starved encodes).
         // 2. Global budget can't admit the bytes → wait (bounded) for ANOTHER
         //    table's checkpoint to release budget; on timeout spill self (which
         //    releases the flushed epoch's budget) and retry once; still refused

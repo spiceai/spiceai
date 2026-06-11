@@ -63,12 +63,11 @@ pub(crate) async fn run(args: &TextToSqlArgs) -> anyhow::Result<()> {
     );
 
     // If we are running `spiced`, monitor its memory usage.
-    let memory_handle_opt: Option<SpicedMemoryUsageMonitor> =
-        spiced_instance.process().map(|p| {
-            let memory_token = CancellationToken::new();
-            let handle = p.watch_memory(&memory_token);
-            (memory_token, handle)
-        });
+    let memory_handle_opt: Option<SpicedMemoryUsageMonitor> = spiced_instance.process().map(|p| {
+        let memory_token = CancellationToken::new();
+        let handle = p.watch_memory(&memory_token);
+        (memory_token, handle)
+    });
 
     let test = SpiceTest::new(
         run_name,

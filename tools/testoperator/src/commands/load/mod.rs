@@ -269,11 +269,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = if let Some(readings) = memory_readings {
-        observe_memory(memory_token, readings).await?
+    let memory_usage = if let Some(readings) = memory_readings {
+        Some(observe_memory(memory_token, readings).await?)
     } else {
         println!("Memory monitoring not available for external spiced instances");
-        (0.0, 0.0)
+        None
     };
 
     // Record per-query metrics for load test

@@ -2118,6 +2118,30 @@ pub struct CayenneTableProvider {
     /// can continue while a previous Stage B is pending; after restart the set
     /// is empty, so the same WALs are treated as crash-recovery input.
     inflight_staging_appends: Arc<ParkingMutex<HashSet<String>>>,
+    /// Snapshot dirs the catalog no longer references (merged away by a
+    /// protected-snapshot subset compaction), awaiting physical deletion:
+    /// snapshot id → the instant it was retired. Deletion is deferred
+    /// `RETIRED_SNAPSHOT_DIR_GRACE` past BOTH retirement and the last scan
+    /// listing of the dir (`snapshot_last_listed`), so every plan built
+    /// against the dir gets to open its files. This event-anchored ledger
+    /// replaces the uuid7-timestamp heuristic (`trigger_old_snapshot_cleanup`)
+    /// for these dirs: under CDC memory mode the current snapshot never
+    /// rotates, so every checkpoint/staged dir is "newer than current" and the
+    /// heuristic can neither reap merged-away dirs (the measured 406-dir/89G
+    /// leak) nor be handed a fresher anchor safely (a just-minted anchor
+    /// defeats every keep-guard and deletes the LIVE current dir mid-scan —
+    /// the NotFound query failures + permanent loss of spill rows).
+    retired_snapshot_dirs: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Last time a scan resolved a file listing for each snapshot dir,
+    /// consulted by `sweep_retired_snapshot_dirs` so a long-running query
+    /// (executing past the grace period) keeps its input dirs alive.
+    snapshot_last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    /// Consecutive protected-snapshot compaction attempts skipped because a
+    /// writer held the write lock on a position-delete table. Position-delete
+    /// rewrites serialize with writers via `try_lock`, so a continuously
+    /// writing table can starve its own compaction indefinitely; a sustained
+    /// streak escalates the (otherwise TRACE-level) skip to a WARN.
+    position_compaction_skip_streak: Arc<AtomicUsize>,
     /// Serializes concurrent compaction passes on this table so a write-driven
     /// inline trigger and the background scheduler can't both rewrite the
     /// current snapshot at the same time. Held across the *entire* trigger
@@ -3778,6 +3802,150 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Grace before physically deleting a retired snapshot dir, measured from
+    /// BOTH retirement and the dir's last scan listing. Mirrors
+    /// `OLD_SNAPSHOT_CLEANUP_GRACE`: plan-build resolves file paths under the
+    /// listing fence but executes after releasing it, so deletion must trail
+    /// any plan that could still open the dir's files.
+    const RETIRED_SNAPSHOT_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Record that the catalog no longer references these snapshot dirs (their
+    /// contents were merged into a successor snapshot). Physical deletion
+    /// happens in [`Self::sweep_retired_snapshot_dirs`] once the grace elapses.
+    pub(crate) fn retire_snapshot_dirs<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let now = Instant::now();
+        let mut ledger = self.retired_snapshot_dirs.lock();
+        for id in ids {
+            ledger.entry(id.to_string()).or_insert(now);
+        }
+    }
+
+    /// Note that a scan resolved a file listing for `snapshot_id`; the sweep
+    /// defers that dir's deletion a full grace past this point so the scan can
+    /// open its files however long it runs.
+    fn note_snapshot_listed(&self, snapshot_id: &str) {
+        self.snapshot_last_listed
+            .lock()
+            .insert(snapshot_id.to_string(), Instant::now());
+    }
+
+    /// Whether a retired dir's grace has fully elapsed: `grace` past both
+    /// retirement and the last scan listing (if any). Pure timing logic,
+    /// extracted for unit tests.
+    fn retired_dir_grace_elapsed(
+        retired_at: Instant,
+        last_listed: Option<Instant>,
+        now: Instant,
+        grace: std::time::Duration,
+    ) -> bool {
+        now.duration_since(retired_at) >= grace
+            && last_listed.is_none_or(|t| now.duration_since(t) >= grace)
+    }
+
+    /// Physically delete retired snapshot dirs whose grace has fully elapsed,
+    /// evicting each deleted dir's (infinite-TTL) `list_files_cache` entry so
+    /// a later plan can't resolve files inside it. Spawned detached — never
+    /// blocks the caller. Local filesystem only: S3 memory-mode dirs currently
+    /// stay until a rotation-anchored cleanup covers them (a bounded leak;
+    /// this path's correctness contract is the priority).
+    pub(crate) fn sweep_retired_snapshot_dirs(&self) {
+        if self.table_metadata.path.starts_with("s3://") {
+            return;
+        }
+        // Lock order everywhere in this file: ledger, then last-listed.
+        let due: Vec<String> = {
+            let now = Instant::now();
+            let ledger = self.retired_snapshot_dirs.lock();
+            let last_listed = self.snapshot_last_listed.lock();
+            ledger
+                .iter()
+                .filter(|(id, retired_at)| {
+                    Self::retired_dir_grace_elapsed(
+                        **retired_at,
+                        last_listed.get(*id).copied(),
+                        now,
+                        Self::RETIRED_SNAPSHOT_DIR_GRACE,
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        // Paranoia re-check against the LIVE reference set: a retired id can
+        // never legitimately return to service (uuid7 ids are never reused),
+        // but deleting the current/protected dirs is the data-loss failure
+        // mode, so refuse it structurally.
+        let current = self.get_current_snapshot_id();
+        let protected = self.protected_snapshots.load();
+        // Prune listing timestamps for dirs in no live or retired set (e.g.
+        // ids cleared wholesale by a full-compaction rotation and reaped by
+        // its own cleanup) so the map doesn't grow unboundedly.
+        {
+            let ledger = self.retired_snapshot_dirs.lock();
+            self.snapshot_last_listed.lock().retain(|id, _| {
+                ledger.contains_key(id) || protected.contains_key(id) || *id == current
+            });
+        }
+        let due: Vec<String> = due
+            .into_iter()
+            .filter(|id| *id != current && !protected.contains_key(id))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let table_path = self.table_metadata.path.clone();
+        let table_id = self.table_metadata.table_id.clone();
+        let runtime_env = Arc::clone(self.context.runtime_env());
+        let ledger = Arc::clone(&self.retired_snapshot_dirs);
+        let last_listed = Arc::clone(&self.snapshot_last_listed);
+        tokio::spawn(async move {
+            for id in due {
+                let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
+                let removed = tokio::task::spawn_blocking(move || {
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => Ok(()),
+                        // Already gone (e.g. reaped by a rotation-anchored
+                        // cleanup): success for our purposes.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+                match removed {
+                    Ok(Ok(())) => {
+                        // Evict the cached listing AFTER the unlink so the
+                        // next plan lists fresh and sees the dir gone.
+                        let url = Self::snapshot_dir_url(&table_path, &table_id, &id);
+                        Self::invalidate_list_files_cache(&runtime_env, &url);
+                        ledger.lock().remove(&id);
+                        last_listed.lock().remove(&id);
+                        tracing::info!(
+                            target: "cayenne::compaction",
+                            table_id = %table_id,
+                            snapshot_id = %id,
+                            "Deleted retired snapshot dir"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        // Stays in the ledger; retried on the next sweep.
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table_id = %table_id,
+                            snapshot_id = %id,
+                            "Failed to delete retired snapshot dir (will retry): {e}"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "cayenne::compaction",
+                            table_id = %table_id,
+                            "Retired-dir deletion task failed to join: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// Construct the path to a snapshot directory.
     ///
     /// Directory structure: `[table_path]/[table_id]/[snapshot_id]/`
@@ -5096,6 +5264,8 @@ impl CayenneTableProvider {
             staging_wal_present: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
+            retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
+            snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -5413,7 +5583,12 @@ impl CayenneTableProvider {
         // the budget total, but clamping here keeps the request honest even if the
         // budget is ever sized below the core count, e.g. reserved query threads.)
         let encode_shards = shard_count.min(target_partitions.max(1));
-        let _encode_permits = super::write_budget::acquire_encode_permits(encode_shards).await;
+        // Class-aware: `Delta` (CDC staged appends, mem-tier checkpoints) may
+        // use the whole budget; `Maintenance` (compaction outputs, sorted
+        // rewrites, overwrites) is capped below it so a latency-bound delta
+        // encode never queues behind a whole multi-shard compaction pass.
+        let _encode_permits =
+            super::write_budget::acquire_encode_permits(encode_shards, write_class).await;
 
         // Construct snapshot directory URL
         let snapshot_dir_url = Self::snapshot_dir_url(
@@ -5823,6 +5998,8 @@ impl CayenneTableProvider {
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
+            retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
+            snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             // Shared so a writer clone's move records the published files where the
             // (same-table) publish on any clone can delta-apply them.
@@ -10694,14 +10871,18 @@ impl CayenneTableProvider {
             });
         }
 
-        // Reap the replaced protected-snapshot dirs in the background after the
-        // grace period. The current snapshot is preserved (passed as the
-        // "current" arg); cleanup reads the LIVE protected set after the grace
-        // sleep, which now excludes the merged inputs and includes the new
-        // snapshot, so only the merged-away dirs are removed.
-        let current_snapshot_id = self.get_current_snapshot_id();
-        self.trigger_old_snapshot_cleanup(&current_snapshot_id)
-            .await;
+        // The merged-away inputs are now unreferenced by the catalog: RETIRE
+        // them for event-anchored deferred deletion and sweep whatever earlier
+        // retirements have aged out. The uuid7-timestamp heuristic
+        // (`trigger_old_snapshot_cleanup`) cannot reap these dirs — under CDC
+        // memory mode the current snapshot never rotates, so every
+        // checkpoint/staged dir is "newer than current" and is kept forever
+        // (the measured 406-dir/89G leak); handing it a fresher anchor instead
+        // defeats every keep-guard and deletes the LIVE current dir mid-scan
+        // (NotFound query failures + permanent loss of spill rows). Naming the
+        // exact dead dirs has neither failure mode.
+        self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
+        self.sweep_retired_snapshot_dirs();
 
         tracing::info!(
             target: "cayenne::compaction",
@@ -12763,19 +12944,34 @@ impl CayenneTableProvider {
     }
 
     /// Whether appending `incoming_bytes`/`incoming_rows` to the live mem tier
-    /// would breach this table's per-table byte cap or age cap. (The global byte
-    /// budget is checked separately at reservation time.)
+    /// would breach this table's per-table BYTE cap. (The global byte budget is
+    /// checked separately at reservation time.)
+    ///
+    /// Deliberately byte-only — NOT the age cap. The write path used to share
+    /// the age predicate, which made the CDC applier synchronously execute (or
+    /// wait behind) a whole-tier checkpoint every `max_age` period; whenever
+    /// checkpoint encodes were starved (compaction holding the encode permits
+    /// and the low-priority runtime), the apply stalled for the full outage —
+    /// measured 33-41s blocked-apply events, the entire freshness P99 tail,
+    /// and every observed stall was age-triggered (no table approached the
+    /// byte cap). Age is enforced by the 1s background tick
+    /// (`run_mem_tier_checkpoint_tick`), which runs the same shared predicate
+    /// and checkpoints WITHOUT blocking the writer; blocking ingest never
+    /// shrank the crash-replay window anyway (the source slot advances only
+    /// when the covering checkpoint completes, stalled appliers or not). The
+    /// byte cap stays here as the synchronous OOM backstop.
     pub(crate) fn mem_tier_per_table_cap_breached(&self, incoming_bytes: u64) -> bool {
         let cur = self.mem_tier.load();
         let would_be = cur.bytes.saturating_add(incoming_bytes);
-        let byte_breach = would_be >= self.mem_tier_max_bytes;
-        byte_breach || self.mem_tier_age_cap_reached(&cur)
+        would_be >= self.mem_tier_max_bytes
     }
 
-    /// The ONE definition of "the tier's age cap has been reached" — shared by
-    /// the write-path forced spill and the periodic tick's churn gate, because
-    /// the documented bound on the deferred slot ack / crash-replay window holds
-    /// only while both compute the identical predicate. `0` disables the cap.
+    /// The ONE definition of "the tier's age cap has been reached" — the
+    /// periodic tick's churn-gate predicate (the writer no longer blocks on
+    /// age; see `mem_tier_per_table_cap_breached`). `0` disables the cap. The
+    /// deferred slot ack / crash-replay window is bounded by `max_age` + the
+    /// tick interval + the checkpoint duration — the same bound the
+    /// writer-blocking variant had, minus the apply stall.
     fn mem_tier_age_cap_reached(&self, tier: &crate::provider::mem_tier::MemTier) -> bool {
         self.mem_tier_max_age_ms > 0 && tier.age_ms() >= self.mem_tier_max_age_ms
     }
@@ -13188,12 +13384,22 @@ impl CayenneTableProvider {
                 }
                 self.refresh_listing_table_under_held_fence().await?;
             }
-            // Reclaim the superseded snapshot dirs (graceful, backgrounded —
-            // same as every other publish path). Without this every checkpoint
-            // leaked its predecessor's dir: measured at SF-100, order_line
-            // ended with 408 on-disk snapshot dirs while the catalog referenced
-            // 2 (≈406 orphans; 89G footprint vs ~live bytes).
-            self.trigger_old_snapshot_cleanup(&new_snapshot_id).await;
+            // Sweep previously-retired snapshot dirs (event-anchored, graceful,
+            // backgrounded). This call used to pass the checkpoint's BRAND-NEW
+            // snapshot id to `trigger_old_snapshot_cleanup` as the "current"
+            // anchor — but the checkpoint snapshot is registered as PROTECTED,
+            // not current, so a just-minted uuid7 anchor defeated every keep
+            // guard (the real current is never in the protected map, and
+            // nothing is "newer than now"): the sweeper deleted the LIVE
+            // current dir two minutes after every checkpoint, failing
+            // concurrent scans with NotFound and permanently dropping the
+            // spill rows staged into that dir. The leak that call was added
+            // for (each checkpoint stranding its merged-away predecessors:
+            // ≈406 orphan dirs / 89G at SF-100) is closed event-anchored
+            // instead: the subset compaction that merges checkpoint dirs away
+            // RETIRES them (`retire_snapshot_dirs`), and this sweep deletes
+            // only retired dirs whose grace has elapsed.
+            self.sweep_retired_snapshot_dirs();
             // [read-amp] Feed this checkpoint's file count into the compaction
             // file-count trigger. A memory-mode checkpoint writes ~target_partitions
             // small files into the new (protected) snapshot, but that fan-out never
@@ -14545,6 +14751,10 @@ impl CayenneTableProvider {
         &self,
         request: &SnapshotScanListingRequest<'_>,
     ) -> datafusion_common::Result<SnapshotFilesForScan> {
+        // Keep the retired-dir sweep at bay: deletion is deferred a full grace
+        // past this listing, so the plan being built here (and its execution,
+        // however long it runs) can open the files it resolves.
+        self.note_snapshot_listed(request.snapshot_id);
         let collect_stats = request.options.collect_stat
             && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
         let store = request
