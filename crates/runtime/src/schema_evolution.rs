@@ -144,6 +144,26 @@ pub fn reorder_to_checkpoint_order(checkpoint: &Schema, schema: &SchemaRef) -> O
     )))
 }
 
+/// Restricts `schema` to the fields whose names appear in `allowed`, preserving
+/// `schema`'s field order and metadata.
+///
+/// The canonical checkpoint schema keeps the full source field set (so the
+/// restart-time block gate matches the source by name), but for `refresh_sql`
+/// datasets that set includes columns the accelerator never materializes. Schema
+/// evolution must compare only the materialized (refresh-schema) columns, or those
+/// non-materialized columns would be mis-classified as removed. A no-op when the
+/// column sets already match (the common, non-`refresh_sql` case).
+#[must_use]
+pub fn restrict_schema_to(schema: &Schema, allowed: &Schema) -> SchemaRef {
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .filter(|field| allowed.field_with_name(field.name()).is_ok())
+        .map(Arc::clone)
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

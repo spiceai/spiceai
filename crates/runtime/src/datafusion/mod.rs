@@ -51,7 +51,7 @@ use crate::federated_table::FederatedTable;
 use crate::schema_evolution::{
     SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
     dataset_constraint_columns, engine_supports_in_place_evolution, evolution_allowed,
-    reorder_to_checkpoint_order, schema_evolution_labels, widening_plan_kind,
+    reorder_to_checkpoint_order, restrict_schema_to, schema_evolution_labels, widening_plan_kind,
 };
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
@@ -2735,6 +2735,10 @@ impl DataFusion {
     //
     // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
     // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
+    //
+    // Schema-evolution comparisons restrict the (canonical, possibly fuller) checkpoint
+    // schema to the materialized refresh-schema columns via `restrict_schema_to` so that
+    // non-materialized `refresh_sql` columns are not mis-classified as removed.
     async fn handle_schema_difference(
         &self,
         dataset: &Dataset,
@@ -2774,11 +2778,20 @@ impl DataFusion {
             Arc::clone(refresh_schema)
         };
 
+        // For `refresh_sql` datasets the canonical checkpoint schema carries
+        // non-materialized source columns that are intentionally absent from the
+        // projected refresh schema. Compare only the materialized (refresh-schema)
+        // columns so those columns are not mis-classified as removed (which would
+        // make `on_schema_change != block` warn/fail on every restart, or
+        // `file_update` recreate spuriously, even when the source is unchanged). A
+        // no-op for the common, non-`refresh_sql` case where the column sets match.
+        let comparison_schema = restrict_schema_to(&existing_schema, &normalized_refresh_schema);
+
         if policy != OnSchemaChange::Block {
             let dataset_name = dataset.name.to_string();
             let ctx = EvolutionContext { constraint_columns };
             match arrow_tools::schema_evolution::classify(
-                &existing_schema,
+                &comparison_schema,
                 &normalized_refresh_schema,
                 &ctx,
             ) {
@@ -2941,8 +2954,10 @@ impl DataFusion {
         // file_update mode contract: anything the policy did not evolve falls back to
         // snapshot + drop-recreate (today's behavior verbatim under `block`).
         if is_file_update
-            && let Some(diff) =
-                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
+            && let Some(diff) = arrow_tools::schema::schema_difference(
+                &comparison_schema,
+                &normalized_refresh_schema,
+            )
         {
             tracing::warn!(
                 "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
