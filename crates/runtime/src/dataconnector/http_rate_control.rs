@@ -1296,6 +1296,8 @@ fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
 mod tests {
     use super::*;
     use crate::component::dataset::builder::DatasetBuilder;
+    #[cfg(feature = "rate-control")]
+    use object_store::ObjectStoreExt;
 
     async fn test_dataset() -> Dataset {
         let app = Arc::new(app::AppBuilder::new("rate_control_registry_test".to_string()).build());

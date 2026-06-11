@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_zero_randomization_factor() {
-        let interval = Duration::from_millis(1000);
+        let interval = Duration::from_secs(1);
         let factor = 0.0;
         let random = 0.5;
         let result = get_random_value_from_interval(factor, random, interval);
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_max_duration_clamping() {
-        let max_duration = Duration::from_millis(2000);
+        let max_duration = Duration::from_secs(2);
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_duration(Some(max_duration))
             .build();

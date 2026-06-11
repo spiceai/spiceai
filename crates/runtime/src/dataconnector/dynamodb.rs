@@ -709,7 +709,7 @@ fn resume_from_checkpoint_stream(
                         Duration::from_secs(CHECKPOINT_EXPIRATION_HOURS * 60 * 60);
                     let checkpoint_age = checkpoint_updated_at
                         .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .unwrap_or(Duration::from_secs(24 * 60 * 60)); // Assume old if no timestamp
+                        .unwrap_or(Duration::from_hours(24)); // Assume old if no timestamp
 
                     if checkpoint_age < CHECKPOINT_AGE_THRESHOLD {
                         // Checkpoint is fresh (<18h), ShardNotFound is unexpected - propagate error

@@ -192,7 +192,7 @@ async fn run_sql(rt: &Runtime, ctx: &Arc<RequestContext>, sql: &str) -> Vec<Reco
     // Cache writes flow through an async channel to a background flush
     // task; sleep long enough that the write has landed before the
     // next scan looks for the cached row.
-    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     batches
 }
 
@@ -268,7 +268,7 @@ async fn run_post_filter_scenario(
             let rt = Runtime::builder().with_app(app).build().await;
             let load_rt = Arc::new(rt.clone());
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg(
                         "Timed out waiting for caching dataset to load",
                     ));

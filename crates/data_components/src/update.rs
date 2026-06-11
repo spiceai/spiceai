@@ -51,7 +51,7 @@ pub struct UpdateExec {
     table_provider: Arc<dyn TableProvider>,
     session_state: SessionState,
     filters: Vec<Expr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl UpdateExec {
@@ -64,12 +64,12 @@ impl UpdateExec {
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("count", arrow::datatypes::DataType::UInt64, false),
         ]));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             source_plan,
             table_provider,
@@ -101,7 +101,7 @@ impl ExecutionPlan for UpdateExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

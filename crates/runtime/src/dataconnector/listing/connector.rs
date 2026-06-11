@@ -38,13 +38,12 @@ use datafusion::datasource::listing::{
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::{PartitionedFile, TableSchema, metadata::MetadataColumn};
+use datafusion_datasource::{PartitionedFile, TableSchema};
 use futures::TryStreamExt;
-use object_store::{ObjectMeta, ObjectStore, path::Path};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use url::Url;
 #[cfg(not(windows))]
@@ -60,7 +59,10 @@ use crate::dataconnector::{
     listing::infer::{infer_partitions_with_types_from_files, infer_partitions_with_types_prefix},
 };
 use crate::parameters::{ExposedParamLookup, Parameters};
-use data_components::object::{metadata::ObjectStoreMetadataTable, text::ObjectStoreTextTable};
+use data_components::object::{
+    metadata::{MetadataColumn, ObjectStoreMetadataTable},
+    text::ObjectStoreTextTable,
+};
 
 use super::{
     DelimitedFormat, ParsedFileExtension, detect_file_extension_from_path,
@@ -256,6 +258,7 @@ impl TableProvider for LocationPruningListingTable {
                 statistics: None,
                 extensions: None,
                 metadata_size_hint: None,
+                ordering: None,
             });
         }
 
@@ -290,6 +293,11 @@ impl TableProvider for LocationPruningListingTable {
             .with_file_groups(file_groups)
             .with_limit(limit)
             .with_metadata_cols(self.inner.options().metadata_cols.clone())
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "Failed to apply metadata columns: {e}"
+                ))
+            })?
             .with_projection_indices(projection.cloned())
             .map_err(|e| {
                 datafusion::error::DataFusionError::Internal(format!(
@@ -472,6 +480,10 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
     } else {
         Some(values)
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectVersionType {
+    Version,
 }
 
 #[async_trait]
@@ -1135,8 +1147,14 @@ pub trait ListingTableConnector: DataConnector {
         let session_state = ctx.state();
         let mut options = ListingOptions::new(file_format)
             .with_file_extension(extension)
-            .with_object_versioning_type(self.object_versioning_type())
             .with_session_config_options(session_state.config());
+
+        options =
+            options.with_object_versioning_type(self.object_versioning_type().map(|v| match v {
+                ObjectVersionType::Version => {
+                    datafusion::parquet::arrow::async_reader::ObjectVersionType::Version
+                }
+            }));
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), schema_infer_url.expose_sensitive_url())
@@ -1167,8 +1185,7 @@ pub trait ListingTableConnector: DataConnector {
             match inferred_partitions {
                 Ok(partitions) => {
                     tracing::debug!(
-                        "Inferred partitions for {:?}: {:?}",
-                        table_path,
+                        "Inferred partitions for {table_path:?}: {:?}",
                         partitions
                             .iter()
                             .map(|(k, _)| k.as_str())
@@ -1178,7 +1195,7 @@ pub trait ListingTableConnector: DataConnector {
                 }
                 Err(e) => {
                     // This might not be an error, it could be that the table is not partitioned.
-                    tracing::debug!("Failed to infer partitions for {:?}: {e}", table_path);
+                    tracing::debug!("Failed to infer partitions for {table_path:?}: {e}");
                 }
             }
         }
@@ -1236,11 +1253,12 @@ pub trait ListingTableConnector: DataConnector {
             return Ok(Arc::new(cached_table));
         }
 
-        let has_location_metadata = table_arc
-            .options()
-            .metadata_cols
-            .iter()
-            .any(|c| matches!(c, MetadataColumn::Location(_)));
+        let has_location_metadata = table_arc.options().metadata_cols.iter().any(|c| {
+            matches!(
+                c,
+                datafusion_datasource::metadata::MetadataColumn::Location(_)
+            )
+        });
 
         if has_location_metadata {
             let wrapped = LocationPruningListingTable::new(
@@ -1423,11 +1441,22 @@ fn add_metadata_columns_if_required(
     let url_prefix = get_url_prefix(table_url);
     if let Some(columns) = dataset.listing_table_metadata_columns(url_prefix, schema) {
         tracing::debug!(
-            "Enabling metadata columns for '{}': {:?}",
+            "Enabling metadata columns for '{}': {columns:?}",
             dataset.name,
-            columns
         );
-        return options.with_metadata_cols(columns);
+        let df_columns = columns
+            .into_iter()
+            .map(|c| match c {
+                MetadataColumn::Location(prefix) => {
+                    datafusion_datasource::metadata::MetadataColumn::Location(prefix)
+                }
+                MetadataColumn::LastModified => {
+                    datafusion_datasource::metadata::MetadataColumn::LastModified
+                }
+                MetadataColumn::Size => datafusion_datasource::metadata::MetadataColumn::Size,
+            })
+            .collect();
+        return options.with_metadata_cols(df_columns);
     }
 
     options
@@ -1541,8 +1570,7 @@ async fn get_last_modified(
         #[expect(clippy::cast_precision_loss)]
         if file_count % 1_000_000 == 0 {
             tracing::debug!(
-                "Continuing to process {table_path} metadata... {} objects processed so far, representing a total size of: {:.2} GiB",
-                file_count,
+                "Continuing to process {table_path} metadata... {file_count} objects processed so far, representing a total size of: {:.2} GiB",
                 total_size as f64 / BYTES_PER_GIB
             );
         }
@@ -1762,8 +1790,7 @@ async fn parquet_page_index_options(runtime: &Runtime) -> ParquetPageIndexOption
         },
         _ => {
             tracing::warn!(
-                "Invalid value '{}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
-                parquet_page_index_param
+                "Invalid value '{parquet_page_index_param}' for runtime.params.parquet_page_index, valid options are: 'auto', 'skip', 'required'. Using 'required'.",
             );
             ParquetPageIndexOptions::default()
         }
@@ -2090,25 +2117,12 @@ mod tests {
             stream::iter(self.meta.clone().into_iter().map(Ok)).boxed()
         }
 
-        async fn put(
-            &self,
-            _location: &Path,
-            _payload: object_store::PutPayload,
-        ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
         async fn put_opts(
             &self,
             _location: &Path,
             _payload: object_store::PutPayload,
             _opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }
         async fn put_multipart_opts(
@@ -2118,9 +2132,6 @@ mod tests {
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }
-        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
-        }
         async fn get_opts(
             &self,
             _location: &Path,
@@ -2128,13 +2139,10 @@ mod tests {
         ) -> object_store::Result<object_store::GetResult> {
             unimplemented!()
         }
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-        fn delete_stream<'a>(
-            &'a self,
-            _locations: BoxStream<'a, object_store::Result<Path>>,
-        ) -> BoxStream<'a, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
             unimplemented!()
         }
         async fn list_with_delimiter(
@@ -2143,10 +2151,12 @@ mod tests {
         ) -> object_store::Result<object_store::ListResult> {
             unimplemented!()
         }
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             unimplemented!()
         }
     }
@@ -2269,31 +2279,12 @@ mod tests {
             panic!("list should not be called for location-pruned scans");
         }
 
-        async fn head(&self, _location: &Path) -> object_store::Result<ObjectMeta> {
-            Ok(self.meta.clone())
-        }
-
-        async fn put(
-            &self,
-            _location: &Path,
-            _payload: object_store::PutPayload,
-        ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
             _payload: object_store::PutPayload,
             _opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }
 
@@ -2305,19 +2296,29 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
-        }
-
         async fn get_opts(
             &self,
             _location: &Path,
-            _options: object_store::GetOptions,
+            options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
+            if !options.head {
+                return Err(object_store::Error::NotImplemented {
+                    operation: "get without head option".to_string(),
+                    implementer: "NoListObjectStore".to_string(),
+                });
+            }
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::empty())),
+                attributes: object_store::Attributes::default(),
+                range: 0..0,
+                meta: self.meta.clone(),
+            })
         }
 
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
             unimplemented!()
         }
 
@@ -2330,11 +2331,12 @@ mod tests {
             panic!("list_with_delimiter should not be called for location-pruned scans");
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             unimplemented!()
         }
     }
@@ -2356,16 +2358,14 @@ mod tests {
         let table_path =
             ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
         let file_format = Arc::new(ParquetFormat::default());
-        let mut options = ListingOptions::new(file_format)
+        let options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
-            .with_metadata_cols(vec![MetadataColumn::Location(Some("s3://bucket/".into()))]);
-        options = options.with_table_partition_cols(vec![]);
+            .with_table_partition_cols(vec![]);
 
-        let file_schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            arrow_schema::DataType::Utf8,
-            true,
-        )]));
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("value", arrow_schema::DataType::Utf8, true),
+            MetadataColumn::Location(Some("s3://bucket/".into())).field(),
+        ]));
 
         let listing = ListingTable::try_new(
             ListingTableConfig::new(table_path.clone())
@@ -2482,9 +2482,11 @@ mod tests {
         let options = ListingOptions::new(file_format)
             .with_file_extension(".parquet")
             .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
-            .with_metadata_cols(vec![MetadataColumn::Location(Some(
-                table_url.clone().into(),
-            ))]);
+            .with_metadata_cols(vec![
+                datafusion_datasource::metadata::MetadataColumn::Location(Some(
+                    table_url.clone().into(),
+                )),
+            ]);
 
         // Note: We only provide the file schema here. The ListingTable automatically
         // adds partition columns (day) and metadata columns (location) to form the
@@ -2608,6 +2610,42 @@ mod tests {
             batches[0].schema().field(1).name(),
             "_location",
             "second column should be location"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listing_table_metadata_columns_are_applied() {
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+        let dataset = DatasetBuilder::try_new("s3://bucket/prefix/".to_string(), "test")
+            .expect("to get dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::new(rt))
+            .with_metadata(HashMap::from([(
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            )]))
+            .build()
+            .expect("to build dataset");
+
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let schema = Schema::new(vec![Field::new(
+            "compression",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]);
+
+        let result = add_metadata_columns_if_required(
+            options,
+            &Url::parse("s3://bucket/prefix/").expect("parse table url"),
+            &schema,
+            &dataset,
+        );
+
+        assert!(
+            !result.metadata_cols.is_empty(),
+            "metadata columns should be set on listing options"
         );
     }
 

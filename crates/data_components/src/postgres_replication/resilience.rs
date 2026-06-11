@@ -42,7 +42,7 @@ pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// giving up. The WAL stream uses the same attempts budget per *reconnect*
 /// but reconnects indefinitely once it has been healthy once — the stream is
 /// meant to run forever.
-pub const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_secs(120);
+pub const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_mins(2);
 
 /// Exponential backoff with full jitter (±20%).
 #[derive(Debug)]
@@ -92,8 +92,7 @@ fn jitter(d: Duration) -> Duration {
     let nanos = u64::from(d.subsec_nanos())
         ^ std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|e| u64::from(e.subsec_nanos()))
-            .unwrap_or(0);
+            .map_or(0, |e| u64::from(e.subsec_nanos()));
     // Map to [-20%, +20%] of `d`. The casts below are intentional — we're
     // computing a small bounded signed offset to add to a positive base and
     // clamping back to a u64 millis. Out-of-range inputs would already be
@@ -165,6 +164,14 @@ fn is_transient_by_display(msg: &str) -> bool {
         "network is unreachable",
         "host unreachable",
         "operation interrupted",
+        // SQLSTATE 55006 (object_in_use): "replication slot ... is active for
+        // PID ...". A reconnect can race the previous walsender's teardown —
+        // the server releases the slot within moments, so retry with backoff
+        // instead of failing the stream. (Two *distinct* consumers fighting
+        // over one slot keep erroring through the retry budget and still
+        // surface, just slower.)
+        "sqlstate 55006",
+        "is active for pid",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))

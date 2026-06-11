@@ -110,7 +110,7 @@ impl std::fmt::Debug for S3VectorsListExec {
 pub(super) struct S3VectorsListExec {
     idx: Arc<S3VectorIdentifier>,
     client: Arc<dyn S3Vectors + Send + Sync>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     limit: Option<usize>,
 }
 
@@ -128,12 +128,12 @@ impl S3VectorsListExec {
     ) -> Self {
         let projected_schema =
             project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             idx: Arc::clone(&table.idx),
@@ -153,7 +153,7 @@ impl ExecutionPlan for S3VectorsListExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

@@ -446,7 +446,7 @@ impl DynamoDbStreamsSource {
                     .with_context(|| format!("Failed to delete table {table_name}"))?;
 
                 // Wait for table to be deleted
-                let timeout = Duration::from_secs(120);
+                let timeout = Duration::from_mins(2);
                 let start = std::time::Instant::now();
 
                 loop {
@@ -491,7 +491,7 @@ impl DynamoDbStreamsSource {
 
     /// Wait for a table to become ACTIVE.
     async fn wait_for_table_active(client: &Client, table_name: &str) -> Result<()> {
-        let timeout = Duration::from_secs(120);
+        let timeout = Duration::from_mins(2);
         let start = std::time::Instant::now();
 
         loop {

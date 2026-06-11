@@ -63,6 +63,10 @@ use datafusion::logical_expr::JoinType;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); the wrapper check below still recognizes it where it appears in a plan"
+)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::joins::HashJoinExec;
@@ -104,7 +108,7 @@ pub struct BroadcastJoinFlightSqlExec {
     cookie_store: Arc<CookieStore>,
     output_schema: SchemaRef,
     trace_parent: Option<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     statistics: Statistics,
 }
 
@@ -117,12 +121,12 @@ impl BroadcastJoinFlightSqlExec {
         trace_parent: Option<String>,
         statistics: Statistics,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             sql,
             client,
@@ -156,7 +160,7 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -189,10 +193,6 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         let stream = query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
             .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.statistics.clone())
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
@@ -492,13 +492,18 @@ fn walk_to_flight_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<&FlightSqlExec> 
 /// resolving a federated scan: repartition, coalesce-batches, and the
 /// name-identified `CooperativeExec` / `BytesProcessedExec` wrappers.
 ///
-/// `FilterExec` is deliberately NOT in this set. `FlightSQLTable` classifies
-/// every filter as `Exact` (removed from the plan, embedded in the scan SQL) or
-/// `Unsupported` (kept in a `FilterExec`, absent from the scan SQL) — never
-/// `Inexact`. So a `FilterExec` above these scans always carries a predicate
-/// the rewritten per-executor SQL would NOT apply; walking through it would
-/// silently drop that predicate and return extra rows. Bail instead and keep
-/// the central join, which still executes the `FilterExec`.
+/// `FilterExec` is deliberately NOT pass-through. `FlightSQLTable` reports
+/// filter pushdown as `Exact` (predicate absorbed into the scan SQL, no
+/// `FilterExec` planned) or `Unsupported` (predicate stays in the plan as a
+/// `FilterExec` and is NOT in the scan SQL) — it never reports `Inexact`. So a
+/// `FilterExec` here always carries a predicate the generated join SQL would
+/// lose (e.g. a `CASE` expression or a volatile function), and replacing the
+/// subtree would silently return unfiltered rows. Bail and keep the central
+/// join instead.
+#[expect(
+    deprecated,
+    reason = "DF53 deprecates CoalesceBatchesExec (arrow BatchCoalescer); kept for plan-shape recognition"
+)]
 fn is_single_input_wrapper(plan: &dyn ExecutionPlan) -> bool {
     plan.as_any().downcast_ref::<RepartitionExec>().is_some()
         || plan
@@ -735,6 +740,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 null_equality,
+                false,
             )
             .expect("valid HashJoinExec"),
         )

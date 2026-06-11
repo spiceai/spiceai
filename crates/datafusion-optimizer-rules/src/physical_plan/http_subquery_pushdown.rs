@@ -283,7 +283,7 @@ struct HttpWithDeferredParamsExec {
     /// Column index in the build side output to materialize values from.
     build_col_index: usize,
     /// Cached plan properties derived from the http side.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Metrics populated at execution time for EXPLAIN ANALYZE visibility.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -301,12 +301,12 @@ impl HttpWithDeferredParamsExec {
         // side. We merge all rewritten partitions into one stream at
         // execution time (same pattern as CoalescePartitionsExec).
         let schema = http_side.schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         // Mark the template HttpExec as deferred so EXPLAIN shows
         // "partitions=deferred" instead of the static partition list.
@@ -336,6 +336,10 @@ impl DisplayAs for HttpWithDeferredParamsExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for HttpWithDeferredParamsExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "HttpWithDeferredParamsExec"
     }
@@ -355,7 +359,7 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -396,10 +400,6 @@ impl ExecutionPlan for HttpWithDeferredParamsExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> Result<Statistics, DataFusionError> {
-        Ok(Statistics::new_unknown(&self.schema()))
     }
 
     fn partition_statistics(
@@ -716,6 +716,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         )

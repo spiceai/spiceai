@@ -391,6 +391,21 @@ impl CayenneContext {
         }
     }
 
+    /// Periodic mem-tier checkpoint interval for `cdc_durability: memory`.
+    /// Returns `None` when disabled (interval = 0). Read straight from the static
+    /// config — unlike the compaction interval this is not a dynamically-tuned
+    /// knob, so the periodic mem-tier checkpoint cadence is fixed for the table's
+    /// lifetime (the write-path byte/age caps absorb hot-table variation).
+    #[must_use]
+    pub(crate) fn mem_tier_checkpoint_interval(&self) -> Option<std::time::Duration> {
+        let ms = self.config.cdc_mem_tier_checkpoint_interval_ms;
+        if ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(ms))
+        }
+    }
+
     /// Get the shared semaphore for limiting concurrent file writes / uploads.
     #[must_use]
     pub fn upload_semaphore(&self) -> &Arc<Semaphore> {
@@ -514,7 +529,6 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
-            file_pruning: config.file_pruning,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
@@ -534,25 +548,5 @@ mod tests {
             context.file_format().options().projection_pushdown,
             ProjectionPushdown::On
         );
-    }
-
-    #[test]
-    fn cayenne_enables_file_pruning_by_default() {
-        let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&VortexConfig::default(), runtime_env, "test");
-
-        assert!(context.file_format().options().file_pruning);
-    }
-
-    #[test]
-    fn cayenne_file_pruning_config_flows_to_table_options() {
-        let config = VortexConfig {
-            file_pruning: false,
-            ..VortexConfig::default()
-        };
-        let runtime_env = Arc::new(RuntimeEnv::default());
-        let context = CayenneContext::new(&config, runtime_env, "test");
-
-        assert!(!context.file_format().options().file_pruning);
     }
 }

@@ -10,11 +10,14 @@ version.workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 arrow = { workspace = true }
+arrow_tools = { path = "../arrow_tools" }
+datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
+regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }
-arrow_tools = { path = "../arrow_tools" }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64.workspace = true
@@ -25,46 +28,52 @@ datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-datasource = { workspace = true }
-datafusion-ddl = { path = "../datafusion-ddl" }
-datafusion-dml = { path = "../datafusion-dml" }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-physical-plan = { workspace = true }
+datafusion-pruning = { workspace = true }
 datafusion-table-providers = { workspace = true }
-flatbuffers = { workspace = true }
 futures = { workspace = true }
 hash-index = { path = "../hash-index" }
 im = "15.1"
 object_store = { workspace = true }
 parking_lot = { workspace = true }
-regex = "1.12.3"
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
+telemetry = { path = "../telemetry" }
+tokio-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
-telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
-tokio-rusqlite = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true, optional = true }
 turso-shared = { workspace = true }
 url = { workspace = true }
 util = { path = "../util", features = ["datafusion"] }
 uuid = { workspace = true, features = ["v7"] }
+flatbuffers = { workspace = true }
 # `files` exposes `vortex::file::WriteStrategyBuilder` for the delta-encoding
 # write-strategy overrides (provider/delta_encoding.rs). The feature is already
 # enabled transitively by vortex-datafusion; naming it here keeps cayenne
 # building if that ever changes.
-chdb-rust = { version = "1", optional = true }
-duckdb = { workspace = true, features = ["bundled"], optional = true }
 vortex = { workspace = true, features = ["files"] }
+# `vortex-btrblocks` exposes the BtrBlocks compressor builder and the concrete
+# compression-scheme types (provider/delta_encoding.rs maps encoding levels to
+# scheme subsets). It is pulled transitively by vortex but with no features, so
+# name it directly to make the scheme types addressable. The `zstd` feature is
+# required for `schemes::string::ZstdScheme`, which the `compression_strategy=
+# zstd` full-tier strategy registers (the vortex umbrella's own `zstd` feature
+# does NOT turn on `vortex-btrblocks/zstd`).
+vortex-btrblocks = { workspace = true, features = ["zstd"] }
 vortex-datafusion = { workspace = true }
 vortex-scan = { workspace = true }
 vortex-session = { workspace = true }
+duckdb = { workspace = true, features = ["bundled"], optional = true }
+chdb-rust = { version = "1", optional = true }
 # Force aegis to use pure-rust implementation for ARM64 builds to avoid C compilation issues
 [target.'cfg(all(target_arch = "aarch64", target_os = "linux"))'.dependencies]
 aegis = { version = "0.9.3", default-features = false, features = [
@@ -80,11 +89,11 @@ aegis = { version = "0.9.3", default-features = false, features = [
 libc = "0.2"
 
 [features]
-chdb-bench = ["dep:chdb-rust"]
 default = []
-duckdb-bench = ["dep:duckdb"]
-partition-table-provider = ["dep:runtime-table-partition"]
 turso = ["dep:turso"]
+partition-table-provider = ["dep:runtime-table-partition"]
+duckdb-bench = ["dep:duckdb"]
+chdb-bench = ["dep:chdb-rust"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports", "async_tokio"] }

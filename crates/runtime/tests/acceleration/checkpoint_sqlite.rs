@@ -91,7 +91,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -110,7 +110,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 datafusion_table_providers::sql::db_connection_pool::Mode::File,
                 JoinPushDown::Disallow,
                 vec![],
-                std::time::Duration::from_millis(5000),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("connection pool");

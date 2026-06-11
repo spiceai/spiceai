@@ -122,12 +122,12 @@ impl TableProvider for ElasticsearchKnnTable {
             projection: projection.cloned(),
             query_text: self.query_text.clone(),
             embedder: self.embedder.clone(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -145,7 +145,7 @@ struct ElasticsearchKnnExec {
     projection: Option<Vec<usize>>,
     query_text: Option<String>,
     embedder: Option<Arc<dyn QueryEmbedder>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ElasticsearchKnnExec {
@@ -167,7 +167,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -365,12 +365,12 @@ impl TableProvider for ElasticsearchTextSearchTable {
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
             projection: projection.cloned(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Final,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -386,7 +386,7 @@ struct ElasticsearchTextSearchExec {
     source_schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ElasticsearchTextSearchExec {
@@ -408,7 +408,7 @@ impl ExecutionPlan for ElasticsearchTextSearchExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

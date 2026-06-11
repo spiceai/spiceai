@@ -26,8 +26,8 @@ use futures::stream::BoxStream;
 use libnfs::{EntryType, Nfs};
 use nix::fcntl::OFlag;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 
 use super::common::{
@@ -172,36 +172,6 @@ impl NFSObjectStore {
         .await
         .map_err(|e| generic_error(STORE_NAME, e))?
     }
-
-    /// Get file metadata without reading content.
-    async fn get_file_metadata(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let config = Arc::clone(&self.config);
-        let location = location.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let nfs = config.connect()?;
-            let location_string = format!("/{location}");
-
-            let stat = nfs.stat64(StdPath::new(&location_string)).map_err(|e| {
-                object_store::Error::NotFound {
-                    path: location_string.clone(),
-                    source: e.into(),
-                }
-            })?;
-
-            let last_modified = {
-                #[expect(clippy::cast_possible_wrap)]
-                let mtime = stat.nfs_mtime as i64;
-                #[expect(clippy::cast_possible_truncation)]
-                let mtime_nsec = stat.nfs_mtime_nsec as u32;
-                DateTime::<Utc>::from_timestamp(mtime, mtime_nsec)
-                    .ok_or_else(|| handle_error("Invalid NFS mtime returned"))?
-            };
-            Ok(build_object_meta(location, stat.nfs_size, last_modified))
-        })
-        .await
-        .map_err(|e| generic_error(STORE_NAME, e))?
-    }
 }
 
 #[async_trait]
@@ -260,6 +230,10 @@ impl ObjectStore for NFSObjectStore {
                 };
                 let object_meta = build_object_meta(location.clone(), size, last_modified);
 
+                if options.head {
+                    return Ok((object_meta, 0, 0, Vec::new()));
+                }
+
                 let (start, end, data_to_read) = resolve_range(options.range.as_ref(), size);
 
                 let file = nfs
@@ -283,20 +257,10 @@ impl ObjectStore for NFSObjectStore {
         })
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        self.get_file_metadata(location).await
-    }
-
-    async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "NFS delete not implemented".into(),
-        })
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        _locations: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        _locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
         futures::stream::once(async {
             Err(object_store::Error::NotSupported {
                 source: "NFS delete_stream not implemented".into(),
@@ -336,15 +300,14 @@ impl ObjectStore for NFSObjectStore {
         self.list_directory_shallow(prefix).await
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
         Err(object_store::Error::NotSupported {
-            source: "NFS copy not implemented".into(),
-        })
-    }
-
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "NFS copy_if_not_exists not implemented".into(),
+            source: "NFS copy_opts not implemented".into(),
         })
     }
 }

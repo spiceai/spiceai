@@ -54,7 +54,7 @@ const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
 const PORT7: u16 = 8007;
 const PORT8: u16 = 8008;
-const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -315,7 +315,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -416,7 +416,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -841,7 +841,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -891,7 +891,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1033,7 +1033,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1085,7 +1085,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1154,7 +1154,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1206,7 +1206,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1332,7 +1332,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -1401,7 +1401,7 @@ async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
 
             // Expect successful load even though the table is empty.
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}

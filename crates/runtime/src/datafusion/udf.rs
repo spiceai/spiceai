@@ -34,11 +34,14 @@ use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
+use data_components::function_support::{FunctionRestriction, FunctionSupport};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
+use datafusion_table_providers::util::supported_functions::{
+    FunctionRestriction as TpFunctionRestriction, FunctionSupport as TpFunctionSupport,
+};
 use parking_lot::RwLock;
 use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
@@ -169,23 +172,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
-    #[cfg(feature = "geo")]
-    if geo_enabled(runtime).await {
-        geodatafusion::register(ctx);
-        tracing::info!("Registered geodatafusion spatial UDFs (runtime.params.geo=enabled)");
-    }
-
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
-}
-
-/// `runtime.params.geo=enabled` opts in to registering the spatial UDFs
-/// provided by the `geodatafusion` crate (PostGIS-style `ST_*` functions).
-#[cfg(feature = "geo")]
-async fn geo_enabled(runtime: &crate::Runtime) -> bool {
-    let Some(app) = runtime.read_app().await else {
-        return false;
-    };
-    app.runtime.params.get("geo").map(String::as_str) == Some("enabled")
 }
 
 /// Emits the user-defined functions BETA warning at most once per
@@ -797,6 +784,58 @@ pub fn deny_spice_functions_for_duckdb() -> Arc<FunctionSupport> {
     )
 }
 
+/// The list of Spice function names denied to `DuckDB`: every built-in Spice UDF
+/// the `DuckDB` dialect can't rewrite into native SQL, plus all user-registered
+/// functions. Shared source of truth for both the local
+/// [`deny_spice_functions_for_duckdb`] ([`FunctionSupport`]) and the
+/// table-providers-typed [`deny_spice_functions_for_duckdb_table_providers`].
+fn denied_function_names_for_duckdb() -> Vec<String> {
+    let builtins = deny_list_excluding_native(
+        BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice(),
+        &crate::datafusion::dialect::duckdb_native_function_names(),
+    );
+    let user = USER_FUNCTION_NAMES.read().clone();
+    let mut denied = Vec::with_capacity(builtins.len() + user.len());
+    denied.extend(builtins);
+    denied.extend(user);
+    denied
+}
+
+/// Same deny-list as [`deny_spice_functions_for_duckdb`], but expressed in the
+/// `datafusion-table-providers` [`TpFunctionSupport`] type that the fork's
+/// `DuckDBTableFactory::with_function_support` seam expects.
+///
+/// The runtime maintains its deny-list in the local
+/// [`data_components::function_support::FunctionSupport`] type, which is a
+/// distinct (private-field) reimplementation of the table-providers type. The
+/// `DuckDB` factory lives in the fork and takes the fork's type, so we build it
+/// here from the shared [`denied_function_names_for_duckdb`] name list rather
+/// than trying to convert between the two opaque structs. See issue #10703.
+#[must_use]
+pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
+    TpFunctionSupport::new(
+        Some(TpFunctionRestriction::Deny(
+            denied_function_names_for_duckdb(),
+        )),
+        None,
+        None,
+    )
+}
+
+/// Same deny-list as [`deny_spice_specific_functions`], but expressed in the
+/// `datafusion-table-providers` [`TpFunctionSupport`] type that
+/// `MySQLTableFactory::with_function_support` expects.
+///
+/// `MySQL`'s unparser dialect has no Spice-function carve-out (unlike `DuckDB`),
+/// so this is the full default deny-list: every built-in Spice UDF plus any
+/// user-registered function. See issue #10703.
+#[must_use]
+pub fn deny_spice_functions_for_mysql_table_providers() -> TpFunctionSupport {
+    let mut denied = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice().to_vec();
+    denied.extend(USER_FUNCTION_NAMES.read().iter().cloned());
+    TpFunctionSupport::new(Some(TpFunctionRestriction::Deny(denied)), None, None)
+}
+
 fn json_functions() -> Vec<String> {
     let mut ctx = SessionContext::new();
     let existing: HashSet<_> = ctx.state().scalar_functions().keys().cloned().collect();
@@ -844,37 +883,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "geo")]
-    const SPATIAL_QUERY: &str = "SELECT ST_AsText(ST_Point(0.0, 0.0)) AS geom";
-
-    #[cfg(feature = "geo")]
-    async fn run_spatial_query(
-        runtime: &crate::Runtime,
-    ) -> anyhow::Result<Vec<datafusion::arrow::array::RecordBatch>> {
-        use futures::TryStreamExt as _;
-
-        let query_result = runtime
-            .datafusion()
-            .query_builder(SPATIAL_QUERY)
-            .build()
-            .run()
-            .await?;
-
-        Ok(query_result.data.try_collect().await?)
-    }
-
-    #[cfg(feature = "geo")]
-    async fn assert_spatial_query_unavailable(runtime: &crate::Runtime, case_name: &str) {
-        let Err(error) = run_spatial_query(runtime).await else {
-            panic!("spatial UDF query should fail when {case_name}");
-        };
-        let error_message = error.to_string().to_lowercase();
-        assert!(
-            error_message.contains("st_astext"),
-            "spatial UDF query failed for an unexpected reason when {case_name}: {error_message}"
-        );
-    }
-
     #[test]
     fn registered_scalar_udf_name_detects_case_insensitive_collision() {
         let ctx = SessionContext::new();
@@ -884,55 +892,6 @@ mod tests {
             registered_scalar_udf_name(&ctx, "CUSTOM_FN").as_deref(),
             Some("custom_fn")
         );
-    }
-
-    #[cfg(feature = "geo")]
-    #[tokio::test]
-    async fn register_udfs_registers_geo_udfs_only_when_enabled() -> anyhow::Result<()> {
-        let default_runtime = crate::Runtime::builder()
-            .with_app(app::AppBuilder::new("geo_default").build())
-            .build()
-            .await;
-        assert_spatial_query_unavailable(&default_runtime, "runtime.params.geo is unset").await;
-
-        let disabled_runtime = crate::Runtime::builder()
-            .with_app(
-                app::AppBuilder::new("geo_disabled")
-                    .with_runtime_params(HashMap::from([(
-                        "geo".to_string(),
-                        "disabled".to_string(),
-                    )]))
-                    .build(),
-            )
-            .build()
-            .await;
-        assert_spatial_query_unavailable(&disabled_runtime, "runtime.params.geo is disabled").await;
-
-        let enabled_runtime = crate::Runtime::builder()
-            .with_app(
-                app::AppBuilder::new("geo_enabled")
-                    .with_runtime_params(HashMap::from([(
-                        "geo".to_string(),
-                        "enabled".to_string(),
-                    )]))
-                    .build(),
-            )
-            .build()
-            .await;
-
-        let batches = run_spatial_query(&enabled_runtime).await?;
-        datafusion::assert_batches_eq!(
-            &[
-                "+------------+",
-                "| geom       |",
-                "+------------+",
-                "| POINT(0 0) |",
-                "+------------+",
-            ],
-            &batches
-        );
-
-        Ok(())
     }
 
     #[test]

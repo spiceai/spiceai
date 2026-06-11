@@ -436,7 +436,7 @@ async fn acceleration_connection(
                 .get_or_init_instance(
                     Arc::from(metadata_db_path.as_str()),
                     datafusion_table_providers::sql::db_connection_pool::Mode::File,
-                    std::time::Duration::from_millis(5000),
+                    std::time::Duration::from_secs(5),
                 )
                 .await
                 .map_err(|e| Error::CayennePool {
