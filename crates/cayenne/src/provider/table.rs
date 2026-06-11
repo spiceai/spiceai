@@ -3018,8 +3018,7 @@ impl PkDeletionSnapshot {
                 if delta.is_int64_empty() {
                     return self.clone();
                 }
-                let updated =
-                    tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
+                let updated = tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
                 Self::Int64Pk {
                     tombstones: Arc::new(updated),
                 }
@@ -3028,8 +3027,7 @@ impl PkDeletionSnapshot {
                 if delta.is_row_keys_empty() {
                     return self.clone();
                 }
-                let updated =
-                    tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
+                let updated = tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
                 Self::RowConverterBased {
                     tombstones: Arc::new(updated),
                 }
@@ -12588,11 +12586,14 @@ impl CayenneTableProvider {
                 // only for rows still kept (drop is monotone, so skipping
                 // already-dropped rows is equivalence-preserving).
                 keep_mask.resize(batch.num_rows(), true);
-                deleted_row_keys.get_batch(rows.iter().map(|row| row.data()), |row_index, tombstone| {
-                    if data_sequence <= tombstone.delete_sequence {
-                        keep_mask[row_index] = false;
-                    }
-                });
+                deleted_row_keys.get_batch(
+                    rows.iter().map(|row| row.data()),
+                    |row_index, tombstone| {
+                        if data_sequence <= tombstone.delete_sequence {
+                            keep_mask[row_index] = false;
+                        }
+                    },
+                );
                 if !inlined_deletions.row_keys.is_empty() {
                     for (row_index, keep) in keep_mask.iter_mut().enumerate() {
                         if *keep
@@ -12652,12 +12653,13 @@ impl CayenneTableProvider {
             return memo.merged.clone();
         }
         let merged = deletion_snapshot.with_mem_tier_tombstones(mem_tier_snapshot);
-        self.merged_scan_deletions.store(Some(Arc::new(MergedScanDeletions {
-            file_index_ptr,
-            tier_version,
-            structural_epoch,
-            merged: merged.clone(),
-        })));
+        self.merged_scan_deletions
+            .store(Some(Arc::new(MergedScanDeletions {
+                file_index_ptr,
+                tier_version,
+                structural_epoch,
+                merged: merged.clone(),
+            })));
         merged
     }
 
@@ -18368,7 +18370,8 @@ mod tests {
     async fn mem_tier_periodic_tick_is_noop_when_unarmed() {
         let runtime_env = SessionContext::new().runtime_env();
         let (provider, _tmp) =
-            create_memory_mode_table_with_caps("unarmed_periodic", runtime_env, i64::MAX, 0, 0).await;
+            create_memory_mode_table_with_caps("unarmed_periodic", runtime_env, i64::MAX, 0, 0)
+                .await;
         assert!(provider.is_cdc_memory_mode(), "memory mode active");
         assert!(!provider.has_slot_advancer(), "not armed");
         // Must not panic and must leave the (empty) tier untouched.
@@ -19890,12 +19893,20 @@ mod tests {
         // Append batch A → RAM (epoch 1).
         let write_a = provider
             .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30])),
+                single_batch_stream(id_value_batch(
+                    Arc::clone(&schema),
+                    &[1, 2, 3],
+                    &[10, 20, 30],
+                )),
                 &ctx.task_ctx(),
             )
             .await
             .expect("append A to RAM tier");
-        assert_eq!(write_a.in_memory_epoch(), Some(1), "batch A lands in RAM epoch 1");
+        assert_eq!(
+            write_a.in_memory_epoch(),
+            Some(1),
+            "batch A lands in RAM epoch 1"
+        );
 
         // Concurrently: checkpoint (flushes epoch 1 with encode+commit OFF the
         // fence) AND append batch B with fresh keys (a higher epoch that must
@@ -19906,15 +19917,12 @@ mod tests {
         let append_schema = Arc::clone(&schema);
         let append_task_ctx = ctx.task_ctx();
 
-        let checkpoint = tokio::spawn(async move { checkpoint_provider.checkpoint_mem_tier().await });
+        let checkpoint =
+            tokio::spawn(async move { checkpoint_provider.checkpoint_mem_tier().await });
         let append = tokio::spawn(async move {
             append_provider
                 .write_cdc_append_stream(
-                    single_batch_stream(id_value_batch(
-                        append_schema,
-                        &[4, 5, 6],
-                        &[40, 50, 60],
-                    )),
+                    single_batch_stream(id_value_batch(append_schema, &[4, 5, 6], &[40, 50, 60])),
                     &append_task_ctx,
                 )
                 .await
@@ -19999,7 +20007,11 @@ mod tests {
         // Seed three keys into the RAM tier.
         let _seed = provider
             .write_cdc_append_stream(
-                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2, 3], &[10, 20, 30])),
+                single_batch_stream(id_value_batch(
+                    Arc::clone(&schema),
+                    &[1, 2, 3],
+                    &[10, 20, 30],
+                )),
                 &ctx.task_ctx(),
             )
             .await
@@ -20021,7 +20033,10 @@ mod tests {
                 // Mirror the production caller: hold `mem_checkpoint_lock` so
                 // checkpoints serialize among themselves, exactly like
                 // `spill_mem_tier` / the periodic tick.
-                let _guard = checkpoint_provider.mem_checkpoint_lock_for_writer().lock_owned().await;
+                let _guard = checkpoint_provider
+                    .mem_checkpoint_lock_for_writer()
+                    .lock_owned()
+                    .await;
                 checkpoint_provider.checkpoint_mem_tier().await
             });
 
@@ -20151,7 +20166,8 @@ mod tests {
                     deleted_inlined_pk_i64: vec![1],
                     ..OnConflictDeletions::default()
                 };
-                pa.append_to_mem_tier(vec![batch], &deletions, bytes, 1).await
+                pa.append_to_mem_tier(vec![batch], &deletions, bytes, 1)
+                    .await
             });
             let pb = Arc::clone(&provider);
             let sb = Arc::clone(&schema);
@@ -20162,7 +20178,8 @@ mod tests {
                     deleted_inlined_pk_i64: vec![1],
                     ..OnConflictDeletions::default()
                 };
-                pb.append_to_mem_tier(vec![batch], &deletions, bytes, 1).await
+                pb.append_to_mem_tier(vec![batch], &deletions, bytes, 1)
+                    .await
             });
             a.await.expect("join A").expect("append A");
             b.await.expect("join B").expect("append B");
@@ -20443,7 +20460,11 @@ mod tests {
 
         // Durable rows first (a file-side index exists), then a RAM upsert that
         // tombstones one of them — the scan must merge file ∪ tier deletions.
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])).await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20]),
+        )
+        .await;
         provider
             .checkpoint_inlined_data()
             .await
@@ -20455,7 +20476,10 @@ mod tests {
             )
             .await
             .expect("RAM upsert");
-        assert!(write.in_memory_epoch().is_some(), "upsert engaged the RAM tier");
+        assert!(
+            write.in_memory_epoch().is_some(),
+            "upsert engaged the RAM tier"
+        );
 
         // First scan builds + stores the memo; the result must be merge-correct.
         assert_eq!(
@@ -20491,7 +20515,10 @@ mod tests {
             )
             .await
             .expect("second RAM upsert");
-        assert!(write2.in_memory_epoch().is_some(), "second upsert engaged RAM");
+        assert!(
+            write2.in_memory_epoch().is_some(),
+            "second upsert engaged RAM"
+        );
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, "merge_memo").await,
             vec![(1, 100), (2, 200)],
@@ -20543,7 +20570,11 @@ mod tests {
         // the scan unions a resident memory branch — the shape under test.
         let ids: Vec<i64> = (0..512).collect();
         let values: Vec<i64> = ids.iter().map(|i| i * 10).collect();
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &values)).await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &values),
+        )
+        .await;
         provider
             .checkpoint_inlined_data()
             .await
@@ -20586,8 +20617,9 @@ mod tests {
             .create_physical_plan()
             .await
             .expect("optimized physical plan");
-        let display =
-            datafusion_physical_plan::displayable(physical.as_ref()).indent(true).to_string();
+        let display = datafusion_physical_plan::displayable(physical.as_ref())
+            .indent(true)
+            .to_string();
         let probe_side_installed = display.lines().any(|line| {
             let l = line.to_lowercase();
             (l.contains("datasourceexec") || l.contains("filterexec"))
@@ -20905,8 +20937,16 @@ mod tests {
         // Insert (new keys, no conflict), then upsert the SAME keys at new values:
         // the conflict writes a key-based delete file stamped with the per-commit
         // reinsert_sequence and NO per-key insert_record.
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &vec![100; 8])).await;
-        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &ids, &vec![200; 8])).await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &vec![100; 8]),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &vec![200; 8]),
+        )
+        .await;
 
         let expected: Vec<(i64, i64)> = ids.iter().map(|&id| (id, 200)).collect();
         assert_eq!(

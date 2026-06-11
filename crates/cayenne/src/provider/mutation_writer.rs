@@ -608,7 +608,11 @@ impl<'a> AppendMutationWriter<'a> {
         // deferred PK-conflict validation and decodes the upstream CDC batches,
         // so this is the "produce + validate the batch" slice — separating
         // upstream-bound cost from the fence + append cost that follows.
-        record_cayenne_write_phase(self.table.table_name(), "inmemory_stream_drain", drain_start);
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "inmemory_stream_drain",
+            drain_start,
+        );
 
         let PostValidationState {
             on_conflict_deletions,

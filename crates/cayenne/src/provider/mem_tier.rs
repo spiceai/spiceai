@@ -712,15 +712,27 @@ mod tests {
 
         // Identical aggregate: same keys, same per-key MAX sequence.
         assert_eq!(via_segment.int64_pk.get(&1), Some(&5));
-        assert_eq!(via_segment.int64_pk.get(&3), Some(&9), "key 3 takes the max seq 9");
+        assert_eq!(
+            via_segment.int64_pk.get(&3),
+            Some(&9),
+            "key 3 takes the max seq 9"
+        );
         assert_eq!(via_segment.int64_pk.get(&4), Some(&9));
         assert_eq!(via_segment.int64_pk.len(), via_map.int64_pk.len());
         assert_eq!(via_segment.row_keys.len(), via_map.row_keys.len());
         for (k, v) in &via_map.int64_pk {
-            assert_eq!(via_segment.int64_pk.get(k), Some(v), "int64 key {k} matches map fold");
+            assert_eq!(
+                via_segment.int64_pk.get(k),
+                Some(v),
+                "int64 key {k} matches map fold"
+            );
         }
         for (k, v) in &via_map.row_keys {
-            assert_eq!(via_segment.row_keys.get(k), Some(v), "row key {k:?} matches map fold");
+            assert_eq!(
+                via_segment.row_keys.get(k),
+                Some(v),
+                "row key {k:?} matches map fold"
+            );
         }
     }
 
