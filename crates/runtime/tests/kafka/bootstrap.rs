@@ -390,7 +390,10 @@ async fn wait_for_topic_partitions(
     const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
     for attempt in 1..=MAX_RETRIES {
-        match producer.client().fetch_metadata(Some(topic), METADATA_TIMEOUT) {
+        match producer
+            .client()
+            .fetch_metadata(Some(topic), METADATA_TIMEOUT)
+        {
             Ok(metadata) => {
                 let partition_count = metadata
                     .topics()
