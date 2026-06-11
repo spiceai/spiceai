@@ -619,3 +619,33 @@ pub static CAYENNE_COMPACTION_DURATION_P90_MS: LazyLock<Gauge<f64>> = LazyLock::
         .with_unit("ms")
         .build()
 });
+
+pub static CAYENNE_SCAN_FILES_LISTED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_scan_files_listed")
+        .with_description(
+            "Total Vortex data files considered at scan listing time during the test, per table (before footer-statistics pruning) — the raw file-level read-amplification volume.",
+        )
+        .with_unit("files")
+        .build()
+});
+
+pub static CAYENNE_SCAN_FILES_PRUNED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_scan_files_pruned")
+        .with_description(
+            "Total Vortex data files skipped at scan listing time by footer min/max statistics during the test, per table.",
+        )
+        .with_unit("files")
+        .build()
+});
+
+pub static CAYENNE_SCAN_FILES_READ: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_scan_files_read")
+        .with_description(
+            "Total Vortex data files actually read at scan time during the test, per table (listed minus footer-pruned) — the files-read read-amplification signal.",
+        )
+        .with_unit("files")
+        .build()
+});

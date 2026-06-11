@@ -166,45 +166,106 @@ pub(super) fn emit_replication_metrics(
 /// Emits the p90 and p99 of Cayenne read amplification (`cayenne_ingest_read_amp`)
 /// per table, computed from the gauge time series the background scraper collected
 /// while the OLTP load was running.
+///
+/// Two granularities of read amplification share this section:
+/// - `p90`/`p99`/`max`: the gauge — protected snapshots a scan must merge, sampled
+///   per tick over the under-load window (the snapshot-level signal).
+/// - `files_read`/`files_pruned`: the file-level signal — cumulative Vortex data
+///   files a scan touched (`cayenne_scan_files_listed_total` minus
+///   `cayenne_scan_files_pruned_total`) and how many footer min/max pruning skipped.
+///   These are run-cumulative counters, dominated by under-load scan activity.
 pub(super) fn emit_cayenne_read_amp_percentiles(metrics: &crate::spiced_metrics::SpicedMetrics) {
-    use std::collections::BTreeMap;
-
-    let Some(samples) = metrics.samples.get("cayenne_ingest_read_amp") else {
-        return;
-    };
+    use std::collections::{BTreeMap, BTreeSet};
 
     let mut per_table: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for sample in samples {
-        if sample.value.is_nan() {
-            continue;
+    if let Some(samples) = metrics.samples.get("cayenne_ingest_read_amp") {
+        for sample in samples {
+            if sample.value.is_nan() {
+                continue;
+            }
+            let table = sample
+                .labels
+                .get("table")
+                .or_else(|| sample.labels.get("name"))
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            per_table.entry(table).or_default().push(sample.value);
         }
-        let table = sample
-            .labels
-            .get("table")
-            .or_else(|| sample.labels.get("name"))
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
-        per_table.entry(table).or_default().push(sample.value);
     }
 
-    if per_table.is_empty() {
+    // File-level read amplification: cumulative counters, so the latest (max)
+    // observed value per table is the run total.
+    let files_listed = latest_counter_per_table(metrics, "cayenne_scan_files_listed_total");
+    let files_pruned = latest_counter_per_table(metrics, "cayenne_scan_files_pruned_total");
+
+    if per_table.is_empty() && files_listed.is_empty() && files_pruned.is_empty() {
         return;
     }
 
+    let all_tables: BTreeSet<&String> = per_table
+        .keys()
+        .chain(files_listed.keys())
+        .chain(files_pruned.keys())
+        .collect();
+
     println!("\nCayenne Read Amplification (under load)");
-    println!("  {:<20} {:>8} {:>8} {:>8}", "table", "p90", "p99", "max");
-    for (table, mut values) in per_table {
+    println!(
+        "  {:<20} {:>8} {:>8} {:>8} {:>13} {:>13}",
+        "table", "p90", "p99", "max", "files_read", "files_pruned"
+    );
+    for table in all_tables {
+        let mut values = per_table.get(table).cloned().unwrap_or_default();
         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p90 = percentile(&values, 0.90);
         let p99 = percentile(&values, 0.99);
-        let max = *values.last().unwrap_or(&0.0);
-        println!("  {table:<20} {p90:>8.0} {p99:>8.0} {max:>8.0}");
+        let max = values.last().copied().unwrap_or(0.0);
 
-        let attributes = [KeyValue::new("table", table)];
+        let listed = files_listed.get(table).copied().unwrap_or(0.0);
+        let pruned = files_pruned.get(table).copied().unwrap_or(0.0);
+        // Files actually read after footer min/max pruning. Clamp at 0 in case a
+        // mid-scrape race leaves pruned momentarily ahead of listed.
+        let read = (listed - pruned).max(0.0);
+        println!(
+            "  {table:<20} {p90:>8.0} {p99:>8.0} {max:>8.0} {read:>13.0} {pruned:>13.0}"
+        );
+
+        let attributes = [KeyValue::new("table", table.clone())];
         crate::metrics::CAYENNE_INGEST_READ_AMP_P90.record(p90, &attributes);
         crate::metrics::CAYENNE_INGEST_READ_AMP_P99.record(p99, &attributes);
+        crate::metrics::CAYENNE_SCAN_FILES_LISTED.record(to_u64(listed), &attributes);
+        crate::metrics::CAYENNE_SCAN_FILES_PRUNED.record(to_u64(pruned), &attributes);
+        crate::metrics::CAYENNE_SCAN_FILES_READ.record(to_u64(read), &attributes);
     }
     println!();
+}
+
+/// Latest (max) value of a cumulative `{table}` counter series per table. Counter
+/// series are monotonic, so the largest observed sample is the run total.
+fn latest_counter_per_table(
+    metrics: &crate::spiced_metrics::SpicedMetrics,
+    name: &str,
+) -> std::collections::BTreeMap<String, f64> {
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(samples) = metrics.samples.get(name) {
+        for sample in samples {
+            if sample.value.is_nan() {
+                continue;
+            }
+            let table = sample
+                .labels
+                .get("table")
+                .or_else(|| sample.labels.get("name"))
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let entry = out.entry(table).or_insert(f64::MIN);
+            if sample.value > *entry {
+                *entry = sample.value;
+            }
+        }
+    }
+    out
 }
 
 /// Emits Cayenne compaction metrics scraped from spiced's `/metrics` endpoint,

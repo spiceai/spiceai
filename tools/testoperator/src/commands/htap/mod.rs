@@ -73,6 +73,32 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
         Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
 
+    // EXPERIMENT: skip spiced; run OLTP only to measure raw PG throughput.
+    const SKIP_SPICED: bool = true;
+    if SKIP_SPICED {
+        println!(
+            "[oltp-only experiment] running TPC-C for {}s against PG; spiced NOT started",
+            duration.as_secs()
+        );
+        let oltp_stop = CancellationToken::new();
+        let oltp_handle = {
+            let stop = oltp_stop.clone();
+            let driver = Arc::clone(&driver);
+            tokio::spawn(async move { driver.run(stop).await })
+        };
+        tokio::time::sleep(duration).await;
+        oltp_stop.cancel();
+        match oltp_handle.await {
+            Ok(Ok(report)) => {
+                println!("\n=== TPC-C OLTP (oltp-only) ===");
+                report.print_summary();
+            }
+            Ok(Err(e)) => return Err(anyhow::anyhow!("OLTP workload error: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("OLTP task join error: {e}")),
+        }
+        return Ok(());
+    }
+
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
