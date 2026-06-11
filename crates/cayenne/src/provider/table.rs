@@ -1899,16 +1899,6 @@ pub struct CayenneTableProvider {
     /// O(tier-tombstones) `with_mem_tier_tombstones` extend that correlated
     /// plans (q20: 322ms -> 74s) paid per outer-group rescan.
     merged_scan_deletions: Arc<arc_swap::ArcSwapOption<MergedScanDeletions>>,
-    /// Incrementally-maintained VISIBLE view of the in-memory CDC tier: the
-    /// merge-on-read-filtered batches, kept current at APPEND time (push the new
-    /// segment O(1); re-filter only the pk-range-overlapping cached entries
-    /// against the append's tombstone delta) instead of re-materializing the
-    /// whole resident tier on every scan. Under sustained CDC the per-scan
-    /// re-materialization was the dominant churn-coupled collapse
-    /// (`mem_tier_join_shapes` live lanes: 247x on a single scan). Invalidated
-    /// (None) by the checkpoint clear; rebuilt from the (small) survivor tier on
-    /// the next append. Keyed by `MemTier::version`.
-    mem_tier_visible_overlay: Arc<arc_swap::ArcSwapOption<MemTierVisibleOverlay>>,
     /// Count of staged inline-conflict tombstones written with `published =
     /// false` whose owning snapshot has not yet finalized (flipped the flag).
     ///
@@ -2047,9 +2037,10 @@ pub struct CayenneTableProvider {
     /// reservation) across all writers — DECOUPLED from [`Self::listing_fence`]
     /// so an in-memory append no longer waits on scans (read-fence) or
     /// compaction (write-fence) for its tier swap (the `inmemory_fence_wait`
-    /// that dominated `cdc_path_inmemory` after the lazy-overlay change). The
-    /// mem-tier is an `ArcSwap`, so scan readers observe swaps atomically with no
-    /// lock; this mutex exists ONLY to serialize writers so the (delete, data)
+    /// that dominated `cdc_path_inmemory` once the apply was a pure segment
+    /// push). The mem-tier is an `ArcSwap`, so scan readers observe swaps
+    /// atomically with no lock; this mutex exists ONLY to serialize writers so
+    /// the (delete, data)
     /// sequence reservation in [`Self::append_to_mem_tier`] and the
     /// `snapshot_sequence` reservation in [`Self::checkpoint_mem_tier`]'s capture
     /// stay mutually exclusive (the seq-ordering invariant that prevents the
@@ -2892,13 +2883,27 @@ pub(crate) struct OnConflictDeletions {
 
 impl OnConflictDeletions {
     /// Total number of existing rows superseded (deleted) by this upsert across
-    /// all strategies (position deletes + file-backed + inlined). Used to net the
+    /// all strategies, each superseded row counted exactly ONCE. Used to net the
     /// live row count: an upsert that replaces N existing rows adds
     /// `inserted - N` live rows, not `inserted`.
+    ///
+    /// Counting a row once requires accounting for the deliberate dual encoding
+    /// of `FilePositioned` conflicts under the `Int64Pk`/`RowConverterBased`
+    /// strategies: `apply_on_conflict_to_batch` pushes BOTH a per-file position
+    /// delete (`delete_specs`, masked inside the Vortex scan) AND a key-based
+    /// twin (`deleted_pk_i64`/`deleted_row_keys`) covering the paths position
+    /// vectors never reach (e.g. the in-memory CDC tier's merge-on-read
+    /// tombstones, built from the key lists only — see `build_mem_tombstones`).
+    /// Summing all five collections would count those rows twice. The key-based
+    /// total already counts every dual-encoded row once, so position deletes
+    /// contribute only the EXCESS beyond the key-based total — exactly the
+    /// conflicts with no key twin (the `PositionBased` strategy, whose key
+    /// lists stay empty).
     pub(crate) fn total_superseded(&self) -> usize {
-        self.delete_specs.values().map(Vec::len).sum::<usize>()
-            + self.deleted_pk_i64.len()
-            + self.deleted_row_keys.len()
+        let position_deletes = self.delete_specs.values().map(Vec::len).sum::<usize>();
+        let file_key_deletes = self.deleted_pk_i64.len() + self.deleted_row_keys.len();
+        file_key_deletes
+            + position_deletes.saturating_sub(file_key_deletes)
             + self.deleted_inlined_pk_i64.len()
             + self.deleted_inlined_row_keys.len()
     }
@@ -2964,31 +2969,6 @@ enum PkDeletionSnapshot {
     Int64Pk { tombstones: Arc<DeletionIndex> },
     RowConverterBased { tombstones: Arc<KeyDeletionIndex> },
 }
-
-// NOTE (lazy-overlay cleanup): the overlay structs + test counters below are now
-// dead (the apply no longer maintains the overlay; the scan always takes the
-// raw-segment path). Kept temporarily so the tree compiles; removed wholesale in
-// the post-run cargo-check-guided cleanup along with the overlay methods/field/tests.
-#[allow(dead_code)]
-struct MemTierOverlayEntry {
-    data_sequence: i64,
-    batches: Vec<RecordBatch>,
-    pk_range: Option<(i64, i64)>,
-    key_bloom: Option<std::sync::Arc<PkBloom>>,
-}
-
-#[allow(dead_code)]
-struct MemTierVisibleOverlay {
-    tier_version: u64,
-    entries: Vec<MemTierOverlayEntry>,
-}
-
-#[cfg(test)]
-pub(crate) static OVERLAY_INCREMENTAL_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
-pub(crate) static OVERLAY_FULL_REBUILDS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// One memoized merged (file ∪ mem-tier) deletion snapshot for the scan path.
 /// See the `merged_scan_deletions` field docs for the key's torn-state proof.
@@ -5079,7 +5059,6 @@ impl CayenneTableProvider {
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
-            mem_tier_visible_overlay: Arc::new(arc_swap::ArcSwapOption::const_empty()),
             pending_inline_tombstones: Arc::new(AtomicU64::new(0)),
             published_inlined_seq: Arc::new(AtomicI64::new(initial_inlined_seq)),
             seq_allocator,
@@ -5822,7 +5801,6 @@ impl CayenneTableProvider {
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
-            mem_tier_visible_overlay: Arc::clone(&self.mem_tier_visible_overlay),
             pending_inline_tombstones: Arc::clone(&self.pending_inline_tombstones),
             published_inlined_seq: Arc::clone(&self.published_inlined_seq),
             // Shared so every writer clone of the same table allocates from one
@@ -7191,11 +7169,16 @@ impl CayenneTableProvider {
                                     }
                                 }
 
-                                // A located file row gets a per-file position
-                                // delete (pushed into the Vortex scan). Unlocated /
-                                // inlined rows are covered by the key-based lists
-                                // populated above. Exactly one delete kind per
-                                // conflict, so no double-masking.
+                                // A located file row ADDITIONALLY gets a
+                                // per-file position delete (pushed into the
+                                // Vortex scan, page-skippable) on top of the
+                                // key-based delete pushed above — the key twin
+                                // covers the paths position vectors never reach
+                                // (e.g. the in-memory CDC tier's merge-on-read
+                                // map, built from the key lists only). Masking
+                                // the same row twice is idempotent for
+                                // visibility; `total_superseded` counts
+                                // dual-encoded rows exactly once.
                                 if let RowLocation::FilePositioned {
                                     file_path,
                                     position,
@@ -7956,9 +7939,11 @@ impl CayenneTableProvider {
         target_snapshot_id: String,
     ) -> CatalogResult<PreparedOnConflictDeletionPublish> {
         // Capture the superseded-row count BEFORE destructuring re-encodes the
-        // deletions: at validation time each superseded row is counted exactly
-        // once (position OR file-i64 OR file-row-key OR inlined), so this is the
-        // correct live-row-delta input. See `PreparedOnConflictDeletionPublish::superseded`.
+        // deletions: `total_superseded` counts each superseded row exactly once
+        // on the validation-time collections (including de-duplicating the
+        // position/key dual encoding of `FilePositioned` conflicts), while the
+        // re-encoded fields below carry the same `Int64Pk` deletions twice. See
+        // `PreparedOnConflictDeletionPublish::superseded`.
         let superseded = on_conflict_deletions.total_superseded();
         let OnConflictDeletions {
             delete_specs,
@@ -8990,12 +8975,6 @@ impl CayenneTableProvider {
     }
 
     fn publish_on_conflict_update(&self, update: OnConflictUpdate) {
-        // A file-side deletion publish (staged-path finalize, checkpoint commit)
-        // can hide rows the visible mem-tier overlay has cached; drop the overlay
-        // so the next append rebuilds it against the new deletion state.
-        if !update.is_empty() {
-            self.mem_tier_visible_overlay.store(None);
-        }
         let OnConflictUpdate {
             deletion_update,
             inlined_tombstone_written,
@@ -12597,218 +12576,6 @@ impl CayenneTableProvider {
         Ok(batches)
     }
 
-    /// Int64-pk range of surviving rows across `batches` (overlay delta-prune
-    /// key); `None` for the row-key strategy or when empty.
-    // Dead: overlay subsystem superseded by the lazy mem-tier scan path (the apply
-    // no longer maintains the overlay). Marked here; removed wholesale in follow-up.
-    #[allow(dead_code)]
-    fn overlay_pk_range(&self, batches: &[RecordBatch]) -> Option<(i64, i64)> {
-        if !self.pk_deletion_strategy.is_int64_pk() {
-            return None;
-        }
-        let pk_name = self.table_metadata.primary_key.first()?;
-        let mut lo = i64::MAX;
-        let mut hi = i64::MIN;
-        for batch in batches {
-            let idx = batch.schema().index_of(pk_name).ok()?;
-            let col = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()?;
-            if let (Some(bl), Some(bh)) =
-                (arrow::compute::min(col), arrow::compute::max(col))
-            {
-                lo = lo.min(bl);
-                hi = hi.max(bh);
-            }
-        }
-        (lo <= hi).then_some((lo, hi))
-    }
-
-    /// Build a bloom over the row-key bytes of all rows in `batches` — the
-    /// `RowConverterBased` (composite-PK) analogue of [`Self::overlay_pk_range`].
-    /// `None` for the `Int64Pk` strategy (no `pk_row_converter`; that path prunes
-    /// by `pk_range`) and for an empty input. Keys are encoded with the table's
-    /// cached `pk_row_converter` over `pk_column_indices`, byte-identical to the
-    /// keys [`Self::filter_inlined_batch_for_deletions`] probes and to the delta's
-    /// `row_keys`, so a bloom miss for every delta key proves the delta cannot
-    /// hide any of this entry's rows (the O(entry) re-filter is then safely
-    /// skipped). On any conversion error the bloom is dropped (`None`), which
-    /// conservatively forces a re-filter rather than risking a dropped row.
-    #[allow(dead_code)]
-    fn build_overlay_key_bloom(
-        &self,
-        batches: &[arrow::record_batch::RecordBatch],
-    ) -> Option<std::sync::Arc<PkBloom>> {
-        let converter = self.pk_row_converter.as_ref()?; // None => Int64Pk, uses pk_range
-        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if total == 0 {
-            return None;
-        }
-        let mut bloom = PkBloom::with_expected_keys(total, 4 * 1024 * 1024);
-        for batch in batches {
-            let pk_cols: Vec<_> = self
-                .pk_column_indices
-                .iter()
-                .map(|&i| std::sync::Arc::clone(batch.column(i)))
-                .collect();
-            let rows = converter.convert_columns(&pk_cols).ok()?;
-            for i in 0..batch.num_rows() {
-                bloom.insert(rows.row(i).as_ref());
-            }
-        }
-        Some(std::sync::Arc::new(bloom))
-    }
-
-    /// Rebuild the visible overlay from scratch for `tier` (the same
-    /// merge-on-read filtering `visible_mem_tier_batches` performs, retained
-    /// per-segment). O(tier) — runs only on cold start / post-checkpoint, when
-    /// the tier is empty-or-small; steady-state appends maintain incrementally.
-    #[allow(dead_code)]
-    fn build_mem_tier_overlay(
-        &self,
-        tier: &crate::provider::mem_tier::MemTier,
-    ) -> Result<MemTierVisibleOverlay> {
-        let maps = Self::mem_tier_deletion_maps(tier);
-        let mut entries = Vec::with_capacity(tier.segments.len());
-        for segment in tier.segments.iter() {
-            let mut batches = Vec::with_capacity(segment.batches.len());
-            for batch in segment.batches.iter() {
-                if let Some(visible) = self.filter_inlined_batch_for_deletions(
-                    batch.clone(),
-                    segment.data_sequence,
-                    &maps,
-                )? {
-                    batches.push(visible);
-                }
-            }
-            if batches.is_empty() {
-                continue;
-            }
-            let pk_range = self.overlay_pk_range(&batches);
-            let key_bloom = self.build_overlay_key_bloom(&batches);
-            entries.push(MemTierOverlayEntry {
-                data_sequence: segment.data_sequence,
-                batches,
-                pk_range,
-                key_bloom,
-            });
-        }
-        Ok(MemTierVisibleOverlay {
-            tier_version: tier.version,
-            entries,
-        })
-    }
-
-    /// Maintain the visible overlay for one append, O(delta): push the new
-    /// segment as-is (file-side tombstones all carry lower sequences, and the
-    /// append's own tombstones carry `delete_sequence = data_sequence - 1`, so
-    /// none can hide the new rows) and re-filter ONLY the cached entries whose
-    /// pk range overlaps the delta (every key the delta hides has
-    /// `delete_sequence` above every cached entry's `data_sequence`). Falls back
-    /// to a full rebuild when the overlay is cold or version-skewed.
-    #[allow(dead_code)]
-    fn maintain_mem_tier_overlay_on_append(
-        &self,
-        prev_version: u64,
-        next: &crate::provider::mem_tier::MemTier,
-        new_batches: &Arc<Vec<RecordBatch>>,
-        data_sequence: i64,
-        delta: &crate::provider::mem_tier::InMemTombstones,
-    ) -> Result<()> {
-        let rebuilt;
-        let overlay = match self.mem_tier_visible_overlay.load_full() {
-            Some(overlay) if overlay.tier_version == prev_version => overlay,
-            _ => {
-                #[cfg(test)]
-                OVERLAY_FULL_REBUILDS.fetch_add(1, Ordering::Relaxed);
-                rebuilt = Arc::new(self.build_mem_tier_overlay(next)?);
-                self.mem_tier_visible_overlay.store(Some(Arc::clone(&rebuilt)));
-                return Ok(());
-            }
-        };
-        let _ = rebuilt;
-        #[cfg(test)]
-        OVERLAY_INCREMENTAL_HITS.fetch_add(1, Ordering::Relaxed);
-
-        let delta_range = delta.int64_deleted_key_range();
-        let delta_has_row_keys = !delta.row_keys.is_empty();
-        let mut entries = Vec::with_capacity(overlay.entries.len() + 1);
-        for entry in &overlay.entries {
-            let affected = if delta_has_row_keys {
-                // Row-key (composite-PK) strategy: re-filter ONLY when some delta
-                // key MIGHT be in this entry. The per-entry bloom over the entry's
-                // surviving row-keys turns the old unconditional O(tier) re-filter
-                // (every entry re-filtered on any inline conflict) into O(delta):
-                // a delta whose keys are all definitely-absent from the entry
-                // (every `maybe_contains == false`) cannot hide any of its rows.
-                // `maybe_contains` returns false ONLY when the key is definitely
-                // absent, so a miss is a SOUND skip; a false positive (incl. a
-                // stale bloom) only costs an unnecessary re-filter. `None` (no
-                // bloom built, e.g. a conversion error) conservatively re-filters.
-                match &entry.key_bloom {
-                    Some(bloom) => {
-                        delta.row_keys.keys().any(|k| bloom.maybe_contains(k.as_ref()))
-                    }
-                    None => true,
-                }
-            } else {
-                match (entry.pk_range, delta_range) {
-                    (Some((el, eh)), Some((dl, dh))) => !(eh < dl || el > dh),
-                    (None, Some(_)) => true,
-                    _ => false,
-                }
-            };
-            if !affected {
-                entries.push(MemTierOverlayEntry {
-                    data_sequence: entry.data_sequence,
-                    batches: entry.batches.clone(),
-                    pk_range: entry.pk_range,
-                    key_bloom: entry.key_bloom.clone(),
-                });
-                continue;
-            }
-            let mut batches = Vec::with_capacity(entry.batches.len());
-            for batch in &entry.batches {
-                if let Some(visible) = self.filter_inlined_batch_for_deletions(
-                    batch.clone(),
-                    entry.data_sequence,
-                    delta,
-                )? {
-                    batches.push(visible);
-                }
-            }
-            if batches.is_empty() {
-                continue;
-            }
-            entries.push(MemTierOverlayEntry {
-                data_sequence: entry.data_sequence,
-                // Old range / bloom both stay a sound SUPERSET of the survivors
-                // (the pruning keys only ever skip work, never rows): retaining
-                // the pre-filter bloom can at worst cause a later unnecessary
-                // re-filter for a key that was just removed — never a dropped row.
-                pk_range: entry.pk_range,
-                key_bloom: entry.key_bloom.clone(),
-                batches,
-            });
-        }
-        let new_visible: Vec<RecordBatch> = new_batches.as_ref().clone();
-        let pk_range = self.overlay_pk_range(&new_visible);
-        let key_bloom = self.build_overlay_key_bloom(&new_visible);
-        entries.push(MemTierOverlayEntry {
-            data_sequence,
-            batches: new_visible,
-            pk_range,
-            key_bloom,
-        });
-        self.mem_tier_visible_overlay
-            .store(Some(Arc::new(MemTierVisibleOverlay {
-                tier_version: next.version,
-                entries,
-            })));
-        Ok(())
-    }
-
     fn visible_mem_tier_batches(
         &self,
         snapshot: &crate::provider::mem_tier::MemTier,
@@ -12907,57 +12674,6 @@ impl CayenneTableProvider {
         tombstones
     }
 
-    /// The RAM-hit-only slice of [`Self::build_mem_tombstones`]: tombstones for
-    /// the upsert's `deleted_inlined_*` keys ONLY (the prior copies that live in
-    /// the in-RAM tier, i.e. in the visible overlay), at `delete_sequence`.
-    ///
-    /// Lever L2. The file-hit keys (`deleted_pk_i64`/`deleted_row_keys`) are
-    /// deliberately excluded: their prior copies live in durable files, never in
-    /// the overlay, so they can never hide an overlay row — feeding them to
-    /// [`Self::maintain_mem_tier_overlay_on_append`] is pure wasted work. For the
-    /// `Int64Pk` strategy that waste was already pruned by the overlay's
-    /// `pk_range` check; for `RowConverterBased` (every composite-PK chbench heavy
-    /// table) there is no cheap range prune, so any file-resident conflict forced
-    /// `affected = true` for EVERY overlay entry — an O(tier) re-filter under the
-    /// `listing_fence.write()` on every conflicting append. With the file-hit keys
-    /// dropped, the dominant case (a conflict against bulk-loaded file data) sends
-    /// an EMPTY delta and the overlay maintenance is O(1).
-    ///
-    /// The split is exact, not heuristic: the existence keyset marks a key
-    /// `Inlined` exactly while its prior copy is RAM-resident and flips it to
-    /// `FileUnlocated` in lockstep with the checkpoint that flushes it
-    /// ([`Self::flip_inlined_keyset_entries_to_file_unlocated`]). So a key lands
-    /// in `deleted_inlined_*` iff its prior copy is still in the overlay, and the
-    /// approximate (bloom) existence path conservatively pushes to BOTH lists
-    /// (table.rs key-deletion population), so the overlay re-filter is never
-    /// starved of a key it must apply.
-    #[allow(dead_code)]
-    fn build_mem_tombstones_inlined_only(
-        &self,
-        deletions: &OnConflictDeletions,
-        delete_sequence: i64,
-    ) -> crate::provider::mem_tier::InMemTombstones {
-        let mut tombstones = crate::provider::mem_tier::InMemTombstones::default();
-        if self.pk_deletion_strategy.is_int64_pk() {
-            for &pk in &deletions.deleted_inlined_pk_i64 {
-                tombstones
-                    .int64_pk
-                    .entry(pk)
-                    .and_modify(|s| *s = (*s).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-        } else {
-            for key in &deletions.deleted_inlined_row_keys {
-                tombstones
-                    .row_keys
-                    .entry(key.clone())
-                    .and_modify(|s| *s = (*s).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
-        }
-        tombstones
-    }
-
     /// Append a validated CDC batch to the in-memory tier (`cdc_durability:
     /// memory`) and return the mem-tier epoch it landed in.
     ///
@@ -12994,11 +12710,11 @@ impl CayenneTableProvider {
             // never needed for the tier swap's reader-atomicity. Taking the
             // publish lock instead of `listing_fence.write()` stops the append
             // from WAITING on scans (read-fence) and compaction (write-fence):
-            // `inmemory_fence_wait` was ~63% of `cdc_path_inmemory` after the
-            // lazy-overlay change. The publish lock serializes only WRITERS, so
-            // the (delete, data) sequence reservation below stays mutually
-            // exclusive with the checkpoint's snapshot-sequence reservation (both
-            // take this lock).
+            // `inmemory_fence_wait` was ~63% of `cdc_path_inmemory` once the
+            // apply was a pure segment push. The publish lock serializes only
+            // WRITERS, so the (delete, data) sequence reservation below stays
+            // mutually exclusive with the checkpoint's snapshot-sequence
+            // reservation (both take this lock).
             //
             // Decompose the dominant `cdc_path_inmemory` phase: the time spent
             // WAITING to acquire the publish lock (contended only by other
@@ -13043,16 +12759,15 @@ impl CayenneTableProvider {
             );
             let epoch = next.epoch;
             let next_version = next.version;
-            // The visible overlay is no longer eagerly maintained on the apply
-            // path. Its only justification — avoiding an O(tier) per-scan
-            // deletion-map rebuild — is obsolete now that the mem-tier tombstones
-            // are an `im::HashMap` (O(1) structural clone). Eager maintenance
-            // traded an expensive fence-held O(tier) re-filter on every
-            // conflicting append for a cheap per-row tombstone probe at scan time
-            // — backwards, since the apply is the throughput bottleneck (the
-            // re-filter was ~72% of `cdc_path_inmemory`). Scans now always take
-            // the raw-segment path (`visible_mem_tier_batches`), applying
-            // tombstones lazily via the same O(1)-map probe the file side uses.
+            // The apply is a pure segment push: no eagerly-materialized visible
+            // view is maintained here. Scans always take the raw-segment path
+            // (`visible_mem_tier_batches`), applying tombstones lazily via the
+            // same O(1)-map probe the file side uses — the mem-tier tombstones
+            // are an `im::HashMap`, so the per-scan deletion view is an O(1)
+            // structural clone, not an O(tier) rebuild. Keeping eager re-filter
+            // work out of this lock-held section matters: the apply is the CDC
+            // throughput bottleneck (an eager lock-held O(tier) re-filter
+            // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.store(Arc::new(next));
             // A new tombstone can retroactively hide rows already materialized in
             // a cached inline/mem view, so this is a STRUCTURAL change (full
@@ -13356,9 +13071,6 @@ impl CayenneTableProvider {
         // the process-global budget; survivor bytes stay resident.
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.store(Arc::new(survivors));
-        // The overlay keys on tier version; drop it so the next append rebuilds
-        // from the (small) survivor tier.
-        self.mem_tier_visible_overlay.store(None);
         crate::provider::mem_tier_budget::release_bytes(released);
         self.bump_inlined_structural_epoch();
     }
@@ -13423,25 +13135,6 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if snapshot.is_empty() || snapshot.segments.is_empty() {
             return Ok(None);
-        }
-
-        // Overlay fast path: the incrementally-maintained visible view makes the
-        // per-scan cost O(entries) Arc-clones instead of O(tier rows)
-        // re-filtering (the churn-coupled 247x). Predicate pruning is skipped on
-        // this path (the rows are already minimal; static filters still apply via
-        // the branch FilterExec / post-scan filter).
-        if let Some(overlay) = self.mem_tier_visible_overlay.load_full()
-            && overlay.tier_version == snapshot.version
-        {
-            let visible: Vec<RecordBatch> = overlay
-                .entries
-                .iter()
-                .flat_map(|entry| entry.batches.iter().cloned())
-                .collect();
-            if visible.is_empty() {
-                return Ok(None);
-            }
-            return self.finish_mem_tier_scan_plan(visible, effective_projection);
         }
 
         let visible_batches = self
@@ -19466,111 +19159,6 @@ mod tests {
         pairs
     }
 
-    /// Create a `cdc_durability: memory` upsert table with a TWO-column primary
-    /// key `(a, b)`, which forces the `RowConverterBased` deletion strategy — the
-    /// path lever L2's overlay narrowing actually changes (the `Int64Pk` path was
-    /// already `pk_range`-pruned). Schema `a: i64, b: i64, value: i64`, PK `[a, b]`.
-    async fn create_cdc_memory_composite_pk_table(
-        table_name: &str,
-        runtime_env: Arc<RuntimeEnv>,
-    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
-        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
-        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
-
-        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
-            as Arc<dyn MetadataCatalog>;
-        catalog.init().await.expect("catalog initialized");
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-            Field::new("b", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-
-        let options = CreateTableOptions {
-            table_name: table_name.to_string(),
-            schema,
-            primary_key: vec!["a".to_string(), "b".to_string()],
-            on_conflict: Some(OnConflict::Upsert(
-                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
-                    "a".to_string(),
-                    "b".to_string(),
-                ]),
-            )),
-            base_path: data_dir,
-            partition_column: None,
-            vortex_config: VortexConfig {
-                cdc_durability: crate::metadata::CdcDurability::Memory,
-                deletion_mode: crate::metadata::DeletionMode::Key,
-                inline_max_rows: 1024,
-                ..VortexConfig::default()
-            },
-        };
-
-        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
-            .create(options)
-            .await
-            .expect("composite-pk table created");
-        (provider, catalog, temp_dir)
-    }
-
-    /// `(a, b, value)` batch for the composite-PK memory table.
-    fn ab_value_batch(schema: SchemaRef, keys: &[(i64, i64)], values: &[i64]) -> RecordBatch {
-        use arrow::array::Int64Array;
-        let a: Vec<i64> = keys.iter().map(|(a, _)| *a).collect();
-        let b: Vec<i64> = keys.iter().map(|(_, b)| *b).collect();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(a)),
-                Arc::new(Int64Array::from(b)),
-                Arc::new(Int64Array::from(values.to_vec())),
-            ],
-        )
-        .expect("a/b/value batch is valid")
-    }
-
-    /// Read back `((a, b), value)` triples sorted by key, for assertion.
-    async fn collect_ab_value_triples(
-        ctx: &SessionContext,
-        provider: &CayenneTableProvider,
-        table_name: &str,
-    ) -> Vec<((i64, i64), i64)> {
-        use arrow::array::Int64Array;
-        let batches = read_all(ctx, provider, table_name).await;
-        let mut out = Vec::new();
-        for batch in &batches {
-            let ai = batch.schema().index_of("a").expect("a column");
-            let bi = batch.schema().index_of("b").expect("b column");
-            let vi = batch.schema().index_of("value").expect("value column");
-            let a = batch
-                .column(ai)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("a is Int64");
-            let b = batch
-                .column(bi)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("b is Int64");
-            let v = batch
-                .column(vi)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value is Int64");
-            for row in 0..batch.num_rows() {
-                out.push(((a.value(row), b.value(row)), v.value(row)));
-            }
-        }
-        out.sort_unstable();
-        out
-    }
-
     // ----------------------------------------------------------------------
     // Lever B2 — in-memory sequence allocator + reserve-ahead persistence.
     // ----------------------------------------------------------------------
@@ -20854,349 +20442,6 @@ mod tests {
         );
     }
 
-    /// Lever L2 correctness guard — the `RowConverterBased` (composite-PK) overlay
-    /// path. Mirrors `mem_tier_checkpoint_no_overcount_under_interleaved_upserts`
-    /// (Int64) but with a 2-column PK, the path L2's
-    /// `build_mem_tombstones_inlined_only` actually changes (the Int64 path was
-    /// already `pk_range`-pruned). The concurrent checkpoint loop guarantees BOTH
-    /// conflict classes occur: a re-upsert of a key still in the RAM tier (an
-    /// `Inlined` conflict — the overlay MUST re-filter the prior copy) AND a
-    /// re-upsert of a key already flushed to a file (a `FileUnlocated` conflict —
-    /// the overlay must NOT re-filter, the prior copy is no longer overlay-resident).
-    /// If the inlined-only delta dropped a key it should have applied, a stale
-    /// duplicate or a wrong value would survive here.
-    #[tokio::test]
-    async fn mem_tier_overlay_composite_pk_no_dup_under_interleaved_upserts() {
-        const KEYS: i64 = 64;
-        const ROUNDS: i64 = 40; // heavy supersession per key
-
-        let ctx = SessionContext::new();
-        let runtime_env = ctx.runtime_env();
-        let (provider, catalog, _tmp) = create_cdc_memory_composite_pk_table(
-            "mem_overlay_composite",
-            Arc::clone(&runtime_env),
-        )
-        .await;
-        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
-        assert!(
-            matches!(
-                provider.pk_deletion_strategy,
-                PkDeletionStrategyWithCache::RowConverterBased { .. }
-            ),
-            "a 2-column PK must select RowConverterBased — the path lever L2 changes"
-        );
-        let schema = Arc::clone(&provider.table_metadata.schema);
-
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-        let provider = Arc::new(provider);
-
-        // Composite keys (a, b) = (k/8, k%8) so they spread across the keyspace.
-        let keys: Vec<(i64, i64)> = (0..KEYS).map(|k| (k / 8, k % 8)).collect();
-
-        let writer_provider = Arc::clone(&provider);
-        let writer_schema = Arc::clone(&schema);
-        let writer_ctx = ctx.task_ctx();
-        let writer_keys = keys.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let writer_done = Arc::clone(&done);
-        let writer = tokio::spawn(async move {
-            for round in 0..ROUNDS {
-                let values: Vec<i64> = (0..KEYS).map(|_| round).collect();
-                let write = writer_provider
-                    .write_cdc_append_stream(
-                        single_batch_stream(ab_value_batch(
-                            Arc::clone(&writer_schema),
-                            &writer_keys,
-                            &values,
-                        )),
-                        &writer_ctx,
-                    )
-                    .await
-                    .expect("interleaved composite upsert round succeeds");
-                drop(write);
-                tokio::task::yield_now().await;
-            }
-            writer_done.store(true, Ordering::Relaxed);
-        });
-
-        let ckpt_provider = Arc::clone(&provider);
-        let checkpointer = tokio::spawn(async move {
-            let mut ticks = 0u32;
-            while !done.load(Ordering::Relaxed) && ticks < 10_000 {
-                ckpt_provider
-                    .checkpoint_mem_tier()
-                    .await
-                    .expect("interleaved checkpoint succeeds");
-                ticks += 1;
-                tokio::task::yield_now().await;
-            }
-        });
-
-        writer.await.expect("join writer");
-        checkpointer.await.expect("join checkpointer");
-        provider
-            .checkpoint_mem_tier()
-            .await
-            .expect("final quiescent checkpoint");
-
-        // Exactly one row per composite key, each showing the LAST round's value:
-        // no overlay over-count (stale duplicate) and no vanish.
-        let mut expected: Vec<((i64, i64), i64)> =
-            keys.iter().map(|&k| (k, ROUNDS - 1)).collect();
-        expected.sort_unstable();
-        assert_eq!(
-            collect_ab_value_triples(&ctx, &provider, "mem_overlay_composite").await,
-            expected,
-            "every composite key must show the LAST upserted value, exactly once"
-        );
-
-        // Reload-stable.
-        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
-            .open("mem_overlay_composite")
-            .await
-            .expect("reopen");
-        assert_eq!(
-            collect_ab_value_triples(&ctx, &reopened, "mem_overlay_composite").await,
-            expected,
-            "reopened durable state: one row per composite key with the last value"
-        );
-    }
-
-    /// Correctness guard for the per-entry bloom prune in
-    /// `maintain_mem_tier_overlay_on_append` (the `RowConverterBased` / composite-PK
-    /// path): an inline-conflict delta that hits keys present in only SOME tier
-    /// segments must yield EXACTLY the same set of visible rows as a fresh
-    /// full-rebuild `build_mem_tier_overlay` on the post-delta tier. The bloom only
-    /// ever SKIPS a re-filter for an entry whose keys are all definitely-absent
-    /// from the delta, so a passing assertion proves the prune never drops a
-    /// survivor (the load-bearing invariant) AND that re-filtered entries match the
-    /// authoritative rebuild. Run in isolation so the process-global path counters
-    /// are not perturbed:
-    /// `cargo test -p cayenne --lib -- overlay_bloom_prune_matches_full_rebuild --exact`.
-    #[tokio::test]
-    async fn overlay_bloom_prune_matches_full_rebuild() {
-        use crate::provider::mem_tier::{InMemTombstones, MemTier};
-
-        OVERLAY_INCREMENTAL_HITS.store(0, Ordering::Relaxed);
-        OVERLAY_FULL_REBUILDS.store(0, Ordering::Relaxed);
-
-        let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) =
-            create_cdc_memory_composite_pk_table("overlay_bloom_prune", ctx.runtime_env()).await;
-        assert!(
-            matches!(
-                provider.pk_deletion_strategy,
-                PkDeletionStrategyWithCache::RowConverterBased { .. }
-            ),
-            "the bloom prune only applies to the RowConverterBased (composite-PK) path"
-        );
-        let schema = Arc::clone(&provider.table_metadata.schema);
-
-        // Three segments over DISJOINT key blocks, each at a distinct, increasing
-        // data_sequence. The delta below carries a delete_sequence above every
-        // segment's data_sequence, so a tombstone for a key present in a segment
-        // hides that key's row (merge-on-read: hidden iff delete_seq >= data_seq).
-        let block_a: Vec<(i64, i64)> = (0..8).map(|b| (0, b)).collect();
-        let block_b: Vec<(i64, i64)> = (0..8).map(|b| (1, b)).collect();
-        let block_c: Vec<(i64, i64)> = (0..8).map(|b| (2, b)).collect();
-        let seg_a = ab_value_batch(Arc::clone(&schema), &block_a, &vec![0; block_a.len()]);
-        let seg_b = ab_value_batch(Arc::clone(&schema), &block_b, &vec![0; block_b.len()]);
-        let seg_c = ab_value_batch(Arc::clone(&schema), &block_c, &vec![0; block_c.len()]);
-
-        let empty = InMemTombstones::default();
-        let tier_pre = MemTier::empty()
-            .append_segment(Arc::new(vec![seg_a]), 10, &empty, 0, block_a.len() as u64, 0)
-            .append_segment(Arc::new(vec![seg_b]), 20, &empty, 0, block_b.len() as u64, 0)
-            .append_segment(Arc::new(vec![seg_c]), 30, &empty, 0, block_c.len() as u64, 0);
-
-        // Pre-store the overlay for `tier_pre` so the next call takes the O(delta)
-        // INCREMENTAL path (a version mismatch would silently full-rebuild instead).
-        let pre_overlay = provider
-            .build_mem_tier_overlay(&tier_pre)
-            .expect("cold overlay build");
-        provider
-            .mem_tier_visible_overlay
-            .store(Some(Arc::new(pre_overlay)));
-
-        // Helper: row-key bytes for a composite (a, b), encoded byte-identically to
-        // the overlay bloom and the merge-on-read filter (same converter + indices).
-        let row_key = |a: i64, b: i64| -> Box<[u8]> {
-            let batch = ab_value_batch(Arc::clone(&schema), &[(a, b)], &[0]);
-            let converter = provider.pk_row_converter.as_ref().expect("composite converter");
-            let pk_cols: Vec<_> = provider
-                .pk_column_indices
-                .iter()
-                .map(|&i| Arc::clone(batch.column(i)))
-                .collect();
-            let rows = converter.convert_columns(&pk_cols).expect("convert pk");
-            rows.row(0).as_ref().to_vec().into_boxed_slice()
-        };
-
-        // Inline-conflict delta hitting keys in segment A and segment C ONLY — NONE
-        // in segment B. So the bloom for B must report all-miss and SKIP B's
-        // re-filter, while A and C are re-filtered and lose their hit rows. The
-        // delete_sequence (35) sits above every segment's data_sequence.
-        let mut delta = InMemTombstones::default();
-        for &(a, b) in &[(0, 1), (0, 3), (2, 2), (2, 5)] {
-            delta.row_keys.insert(row_key(a, b), 35);
-        }
-
-        // The append that carries the delta also brings fresh rows on a disjoint
-        // key block (a == 9) at a data_sequence above the delete_sequence, so they
-        // always survive. Both paths must include this new segment.
-        let new_keys: Vec<(i64, i64)> = (0..4).map(|b| (9, b)).collect();
-        let new_batch = ab_value_batch(Arc::clone(&schema), &new_keys, &vec![7; new_keys.len()]);
-        let new_arc = Arc::new(vec![new_batch]);
-        let next = tier_pre.append_segment(
-            Arc::clone(&new_arc),
-            36,
-            &delta,
-            0,
-            new_keys.len() as u64,
-            0,
-        );
-
-        // INCREMENTAL (bloom-pruned) maintenance.
-        provider
-            .maintain_mem_tier_overlay_on_append(tier_pre.version, &next, &new_arc, 36, &delta)
-            .expect("incremental overlay maintenance");
-        let incremental_overlay = provider
-            .mem_tier_visible_overlay
-            .load_full()
-            .expect("overlay stored after maintenance");
-
-        // AUTHORITATIVE full rebuild over the post-delta tier (filters every segment
-        // against next.tombstones, which now includes the delta).
-        let rebuilt_overlay = provider
-            .build_mem_tier_overlay(&next)
-            .expect("full rebuild over post-delta tier");
-
-        // Confirm the incremental path was actually exercised (not a silent rebuild).
-        assert!(
-            OVERLAY_INCREMENTAL_HITS.load(Ordering::Relaxed) >= 1,
-            "this test must drive the incremental bloom-pruned path"
-        );
-
-        // Collect the visible (a, b, value) triples from an overlay's entry batches.
-        let triples = |overlay: &MemTierVisibleOverlay| -> Vec<((i64, i64), i64)> {
-            use arrow::array::Int64Array;
-            let mut out = Vec::new();
-            for entry in &overlay.entries {
-                for batch in &entry.batches {
-                    let a = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-                    let b = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-                    let v = batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-                    for i in 0..batch.num_rows() {
-                        out.push(((a.value(i), b.value(i)), v.value(i)));
-                    }
-                }
-            }
-            out.sort_unstable();
-            out
-        };
-
-        let incremental_rows = triples(&incremental_overlay);
-        let rebuilt_rows = triples(&rebuilt_overlay);
-        assert_eq!(
-            incremental_rows, rebuilt_rows,
-            "bloom-pruned incremental overlay must equal the full rebuild — the prune \
-             must never drop a survivor (incremental={incremental_rows:?}, \
-             rebuilt={rebuilt_rows:?})"
-        );
-
-        // Sanity: the deleted keys are gone and a same-block survivor remains, so the
-        // assertion above is not vacuously comparing two empty/identical-by-bug sets.
-        assert!(
-            !incremental_rows.iter().any(|&(k, _)| k == (0, 1) || k == (2, 5)),
-            "delta-hit keys must be absent from the visible overlay"
-        );
-        assert!(
-            incremental_rows.iter().any(|&(k, _)| k == (0, 0)),
-            "an un-deleted key in a re-filtered segment must survive"
-        );
-        assert!(
-            incremental_rows.iter().any(|&(k, _)| k == (1, 0)),
-            "the bloom-SKIPPED segment B (no delta keys) must keep all its rows"
-        );
-        assert!(
-            incremental_rows.iter().any(|&(k, v)| k == (9, 0) && v == 7),
-            "the freshly appended segment must be visible"
-        );
-    }
-
-    /// Diagnostic: proves the overlay maintenance takes the O(delta) INCREMENTAL
-    /// path under sustained file-conflicting appends (not a per-append fall-back to
-    /// the O(tier) full rebuild, which would make lever L2 a no-op and re-impose the
-    /// cost it removes). Run in isolation so the process-global path counters are
-    /// not perturbed by other tests:
-    /// `cargo test -p cayenne --lib -- overlay_maintenance_takes_incremental_path --exact`.
-    #[tokio::test]
-    async fn overlay_maintenance_takes_incremental_path() {
-        const BLOCKS: i64 = 12;
-        const SLICE: i64 = 1000;
-
-        OVERLAY_INCREMENTAL_HITS.store(0, Ordering::Relaxed);
-        OVERLAY_FULL_REBUILDS.store(0, Ordering::Relaxed);
-
-        let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_cdc_memory_composite_pk_table(
-            "overlay_incr_path",
-            ctx.runtime_env(),
-        )
-        .await;
-        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
-        let schema = Arc::clone(&provider.table_metadata.schema);
-        let provider = Arc::new(provider);
-
-        // Bulk-load every block (gen 0) then flush to a durable file: the keyset
-        // flips to FileUnlocated so the subsequent upserts are FILE conflicts.
-        for block in 0..BLOCKS {
-            let keys: Vec<(i64, i64)> = (0..SLICE).map(|b| (block, b)).collect();
-            let values: Vec<i64> = (0..SLICE).map(|_| 0).collect();
-            let w = provider
-                .write_cdc_append_stream(
-                    single_batch_stream(ab_value_batch(Arc::clone(&schema), &keys, &values)),
-                    &ctx.task_ctx(),
-                )
-                .await
-                .expect("bulk block append");
-            drop(w);
-        }
-        provider.checkpoint_mem_tier().await.expect("flush bulk to file");
-
-        // Sustained file-conflicting upserts, ONE disjoint block each, NO checkpoint
-        // between them (so the tier/overlay grows and the incremental path is the
-        // one under test).
-        OVERLAY_INCREMENTAL_HITS.store(0, Ordering::Relaxed);
-        OVERLAY_FULL_REBUILDS.store(0, Ordering::Relaxed);
-        for block in 0..BLOCKS {
-            let keys: Vec<(i64, i64)> = (0..SLICE).map(|b| (block, b)).collect();
-            let values: Vec<i64> = (0..SLICE).map(|_| 1).collect();
-            let w = provider
-                .write_cdc_append_stream(
-                    single_batch_stream(ab_value_batch(Arc::clone(&schema), &keys, &values)),
-                    &ctx.task_ctx(),
-                )
-                .await
-                .expect("conflicting block upsert");
-            drop(w);
-        }
-
-        let incremental = OVERLAY_INCREMENTAL_HITS.load(Ordering::Relaxed);
-        let rebuilds = OVERLAY_FULL_REBUILDS.load(Ordering::Relaxed);
-        eprintln!(
-            "overlay maintenance over {BLOCKS} sustained appends: incremental={incremental} \
-             full_rebuilds={rebuilds}"
-        );
-        // The incremental path must dominate; at most the first append may cold-rebuild.
-        assert!(
-            incremental >= BLOCKS as u64 - 1,
-            "overlay must take the incremental path on sustained appends \
-             (incremental={incremental}, rebuilds={rebuilds}) — a per-append rebuild \
-             would make lever L2's delta narrowing a no-op"
-        );
-    }
-
     #[tokio::test]
     async fn test_overlapping_cdc_upserts_see_staged_keys_before_finalize() {
         let ctx = SessionContext::new();
@@ -21407,6 +20652,151 @@ mod tests {
         assert_eq!(
             after_num_rows, 3,
             "upsert replacing two rows must leave the live count at 3, not drift to 5"
+        );
+    }
+
+    /// Regression: a `FilePositioned` conflict is dual-encoded at validation
+    /// time — a per-file position delete (`delete_specs`) AND a key-based twin
+    /// (`deleted_pk_i64`) for the paths position vectors never reach — but it
+    /// supersedes exactly ONE prior row. `total_superseded` must de-duplicate
+    /// the dual encoding: upserting N keys whose priors are file-resident and
+    /// position-captured reports N superseded rows, not 2N (which would skew
+    /// `live_rows_delta = inserted - superseded` downward on every positioned
+    /// upsert).
+    #[tokio::test]
+    async fn total_superseded_counts_file_positioned_conflict_once() {
+        const KEYS: i64 = 8;
+        let expected_keys = usize::try_from(KEYS).expect("KEYS fits usize");
+
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "pos_superseded_once",
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Position,
+                // Disable inlining so the seed insert materializes a Vortex
+                // file — position deletes apply to files, not the inline
+                // memtable (mirrors the position_mode_upsert integration setup).
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                provider.pk_deletion_strategy,
+                PkDeletionStrategyWithCache::Int64Pk { .. }
+            ),
+            "a single Int64 PK under deletion_mode: position keeps the Int64Pk \
+             strategy (positions are captured into the keyset, not a strategy flip)"
+        );
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed N keys. The upsert-table write path publishes the file as a
+        // PROTECTED snapshot, which the position read-back never lists (it
+        // scans only the CURRENT snapshot), so compact first: the full rewrite
+        // folds all live rows into a fresh current snapshot — the steady-state
+        // shape in which priors actually become `FilePositioned`.
+        let ids: Vec<i64> = (0..KEYS).collect();
+        let seed_values = vec![100_i64; expected_keys];
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &ids, &seed_values),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance after seed insert");
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await
+            .expect("compaction full rewrite into a fresh current snapshot");
+
+        // Compaction reset the cached keyset; rebuild it cold (entries start
+        // `FileUnlocated`) and run the capture pass, which upgrades every entry
+        // of the now-current data file to `FilePositioned`.
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("resolve pk indices")
+            .expect("table has a primary key");
+        let pk_converter = provider
+            .build_pk_converter(&pk_indices)
+            .expect("build pk converter");
+        let keyset = provider
+            .load_existing_keyset(&pk_indices, &pk_converter)
+            .await
+            .expect("cold keyset rebuild");
+        provider.store_cached_pk_index(CachedPkIndex::Exact(keyset));
+        assert!(
+            provider.should_capture_positions(),
+            "deletion_mode: position on a PK table must enable the position read-back"
+        );
+        provider
+            .run_position_capture()
+            .await
+            .expect("position capture succeeds");
+
+        // Scenario premise: the capture pass must have upgraded every seeded
+        // key's location to `FilePositioned` in the cached keyset.
+        {
+            let guard = provider.pk_keyset_cache.lock();
+            let Some(CachedPkIndex::Exact(keyset)) = guard.as_ref() else {
+                panic!("seed insert must leave an Exact cached keyset (None/Bloom found)");
+            };
+            let positioned = keyset
+                .keys
+                .values()
+                .filter(|loc| matches!(loc, RowLocation::FilePositioned { .. }))
+                .count();
+            assert_eq!(
+                positioned, expected_keys,
+                "capture must flip all {KEYS} seeded keys to FilePositioned"
+            );
+        }
+
+        // Validate an upsert of the SAME N keys and inspect the on-conflict
+        // deletions it computed (draining the stream finalizes them).
+        let upsert_values = vec![200_i64; expected_keys];
+        let prepared = provider
+            .prepare_stream_for_insert(single_batch_stream(id_value_batch(
+                Arc::clone(&schema),
+                &ids,
+                &upsert_values,
+            )))
+            .await
+            .expect("prepare upsert stream");
+        let post_validation = prepared.post_validation();
+        let mut stream = prepared.stream;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            batch.expect("validated batch");
+        }
+        drop(stream);
+        let deletions = post_validation
+            .lock()
+            .take()
+            .expect("validation finalized on stream end")
+            .on_conflict_deletions;
+
+        let position_deletes: usize = deletions.delete_specs.values().map(Vec::len).sum();
+        assert_eq!(
+            position_deletes, expected_keys,
+            "every prior must be FilePositioned after the capture pass \
+             (the scenario premise — otherwise this test exercises the key fallback)"
+        );
+        assert_eq!(
+            deletions.deleted_pk_i64.len(),
+            expected_keys,
+            "positioned conflicts keep their key-based twins (the in-memory CDC \
+             tier's merge-on-read tombstones are built from the key lists only)"
+        );
+        assert_eq!(
+            deletions.total_superseded(),
+            expected_keys,
+            "a FilePositioned conflict supersedes ONE row — the position/key dual \
+             encoding must not double-count it"
         );
     }
 
