@@ -10167,33 +10167,27 @@ impl CayenneTableProvider {
     /// or the CAS lost a race).
     #[doc(hidden)]
     pub async fn compact_protected_snapshots_subset(&self, max_inputs: usize) -> Result<bool> {
-        // Position deletes are file-path scoped. If a protected-snapshot rewrite
-        // races a writer that adds a position tombstone for one of the input
-        // files, the old file can be swapped away before that tombstone is
-        // physically applied to the merged output. Serialize those rewrites with
-        // writers and staged visibility flips. Key-delete tables remain safe to
-        // compact without the writer gate because post-fence deletes are carried
-        // by sequence number and still apply to the merged snapshot.
+        // Position-delete tables (PK tables whose resolved deletion mode is
+        // `position`) record every upsert delete in BOTH the key deletion index
+        // (by PK + sequence) AND a per-file position vector, tagged with the
+        // SAME sequence — see `apply_on_conflict_to_batch`. The key-index entry
+        // is the correctness backstop; the position vector is a page-skip
+        // optimization layered on top of it.
+        //
+        // That mirror lets the rewrite below run lock-free, exactly like the
+        // key-delete path: a writer that adds a position tombstone for one of
+        // the input files DURING the rewrite records it at
+        // `seq > fence_max_delete_seq`, and because the merged snapshot is tagged
+        // with the Phase-1 fence, the read path's partial-deletion filter
+        // (`apply_partial_deletion_filter`, `seq > fence`) re-applies that delete
+        // to the merged output via its key-index entry — the swapped-away input
+        // file cannot resurrect the row. So we serialize ONLY the final swap
+        // (catalog CAS + in-memory protected-set flip) with writers and staged
+        // visibility flips (see Phase 3), instead of holding `write_lock` across
+        // the whole multi-second rewrite — which previously grabbed it via
+        // `try_lock` and either skipped the pass or starved writers for the
+        // rewrite's duration.
         let serialize_position_deletes = self.should_capture_positions();
-        let _position_write_guard = if serialize_position_deletes {
-            if let Ok(guard) = self.write_lock_arc().try_lock_owned() {
-                Some(guard)
-            } else {
-                tracing::trace!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Skipping protected-snapshot subset compaction: writer active on position-delete table",
-                );
-                return Ok(false);
-            }
-        } else {
-            None
-        };
-        let _position_visibility_guard = if serialize_position_deletes {
-            Some(self.visibility_lock_arc().lock_owned().await)
-        } else {
-            None
-        };
 
         let Ok(_guard) = self.compaction_lock.try_lock() else {
             tracing::trace!(
@@ -10450,20 +10444,72 @@ impl CayenneTableProvider {
             }
         }
 
-        // --- Phase 3: CAS commit. ---
+        // --- Phase 3: CAS commit + in-memory swap (the only serialized step). ---
+        // For position-delete tables, take the writer + visibility locks ONLY
+        // around the commit, in the canonical lock order
+        // (write_lock -> visibility_lock -> listing_fence, matching
+        // `PreparedStagedAppend::apply_under_barrier`) so the protected-set flip
+        // cannot interleave with a staged visibility flip and the order can never
+        // deadlock against a writer. The guards are dropped at the end of this
+        // block — before any cleanup or telemetry — so a lost CAS race or a
+        // catalog error never holds a writer behind compaction. Correctness
+        // across the unlocked rewrite window is carried by the key-index mirror +
+        // the Phase-1 fence tag (see the function header). Key-delete tables
+        // (`serialize_position_deletes == false`) keep the fully lock-free commit.
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
         let phase3_start = std::time::Instant::now();
         let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
-        let swapped = match self
-            .catalog
-            .swap_protected_snapshots(
-                &self.table_metadata.table_id,
-                &old_ids,
-                &new_snapshot_id,
-                fence_max_delete_seq,
-            )
-            .await
-        {
+        let swap_result = {
+            let _swap_write_guard = if serialize_position_deletes {
+                Some(self.write_lock_arc().lock_owned().await)
+            } else {
+                None
+            };
+            let _swap_visibility_guard = if serialize_position_deletes {
+                Some(self.visibility_lock_arc().lock_owned().await)
+            } else {
+                None
+            };
+
+            // Surface the outcome rather than `?`-propagating: an error must be
+            // handled (snapshot cleanup) AFTER the guards drop at the block end,
+            // not by returning straight out of the locked block.
+            match self
+                .catalog
+                .swap_protected_snapshots(
+                    &self.table_metadata.table_id,
+                    &old_ids,
+                    &new_snapshot_id,
+                    fence_max_delete_seq,
+                )
+                .await
+            {
+                Ok(swapped) => {
+                    if swapped {
+                        // Catalog committed — bring the in-memory protected set
+                        // into agreement under the scan fence. Scans capture the
+                        // deletion snapshot and protected-snapshot map while
+                        // holding `listing_fence.read()`, so this map swap must
+                        // hold `listing_fence.write()` or readers can combine a
+                        // pre-compaction deletion snapshot with the
+                        // post-compaction protected set.
+                        let _fence = self.listing_fence.write().await;
+                        self.protected_snapshots.rcu(|current| {
+                            let mut new_map = (**current).clone();
+                            for (id, _) in &inputs {
+                                new_map.remove(id);
+                            }
+                            new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
+                            Arc::new(new_map)
+                        });
+                    }
+                    Ok(swapped)
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        let swapped = match swap_result {
             Ok(swapped) => swapped,
             Err(e) => {
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
@@ -10484,24 +10530,6 @@ impl CayenneTableProvider {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Ok(false);
-        }
-
-        // Catalog committed — bring the in-memory protected set into agreement
-        // under the scan fence. Scans capture the deletion snapshot and
-        // protected-snapshot map while holding `listing_fence.read()`, so the
-        // compaction-side map swap must hold `listing_fence.write()` or readers
-        // can combine a pre-compaction deletion snapshot with the post-compaction
-        // protected set.
-        {
-            let _fence = self.listing_fence.write().await;
-            self.protected_snapshots.rcu(|current| {
-                let mut new_map = (**current).clone();
-                for (id, _) in &inputs {
-                    new_map.remove(id);
-                }
-                new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
-                Arc::new(new_map)
-            });
         }
 
         // Reap the replaced protected-snapshot dirs in the background after the
@@ -15852,12 +15880,14 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
         // Routes to the fast protected-snapshot subset compaction, which only
         // rewrites immutable protected snapshots and CAS-swaps them in the
-        // catalog. Key-delete tables can run concurrently with appends because
-        // post-fence deletes still apply to the merged snapshot by sequence.
-        // Position-delete tables serialize the rewrite inside
-        // `compact_protected_snapshots_subset`, because their tombstones are
-        // file-path scoped and would otherwise be lost if they target a file
-        // that is swapped away by the merge.
+        // catalog. Both key-delete and position-delete tables run the rewrite
+        // concurrently with appends: post-fence deletes still apply to the merged
+        // snapshot by sequence number, and on position-delete tables every
+        // position tombstone is mirrored in the key deletion index at the same
+        // sequence, so a tombstone that targets a swapped-away input file is
+        // re-applied to the merged output via its key-index entry. Only the final
+        // catalog/in-memory swap is serialized with writers (see
+        // `compact_protected_snapshots_subset`).
 
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
         // `listing_fence` and building a session context unless the protected
