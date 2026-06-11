@@ -98,7 +98,9 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         }
     };
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .map(|process| process.watch_memory(&memory_token));
 
     if let Err(e) = spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
@@ -117,13 +119,19 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Append)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
-    let test_metrics = test_metrics
+    let mut test_metrics = test_metrics
         .with_spiced_version(metrics.spiced_version.clone())
         .with_testoperator_commit_sha(metrics.commit_sha.clone())
-        .with_branch_name(metrics.branch_name.clone())
-        .with_memory(max_memory, median_memory);
+        .with_branch_name(metrics.branch_name.clone());
+
+    if let Some((max_memory, median_memory)) = memory_usage {
+        test_metrics = test_metrics.with_memory(max_memory, median_memory);
+    }
 
     let table_count_result = check_table_counts(
         &spiced_instance,
@@ -132,7 +140,11 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     )
     .await;
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;

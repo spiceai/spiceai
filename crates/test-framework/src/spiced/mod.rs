@@ -465,8 +465,7 @@ impl SpicedInstance {
         Ok(())
     }
 
-    /// Returns an instance of a `Process` for the spiced instance
-    /// This allows tracking the spiced process, without owning the spiced instance
+    /// Returns a `Process` handle when this instance owns a local spiced subprocess.
     pub fn process(&self) -> Option<Process> {
         let Self::Owned { child, .. } = self else {
             return None;

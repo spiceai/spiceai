@@ -254,7 +254,32 @@ fn derive_http_base_url(flight_url: &str) -> Option<String> {
     if flight_url.contains("flight.spiceai.io") {
         return Some("https://data.spiceai.io".to_string());
     }
-    flight_url
-        .rfind(':')
-        .map(|last_colon| format!("{base}:8090", base = &flight_url[..last_colon]))
+
+    let mut url = url::Url::parse(flight_url).ok()?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.set_port(Some(8090)).ok()?;
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_http_base_url;
+
+    #[test]
+    fn derive_http_base_url_handles_missing_flight_port() {
+        assert_eq!(
+            derive_http_base_url("https://example.com"),
+            Some("https://example.com:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_replaces_flight_port() {
+        assert_eq!(
+            derive_http_base_url("http://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
 }

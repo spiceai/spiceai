@@ -39,7 +39,8 @@ use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dataaccelerator::UpsertOptions;
 use std::{any::Any, fmt, sync::Arc};
@@ -127,6 +128,16 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+static TEMP_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn unique_name_suffix() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context(UnableToGetSystemTimeSnafu)?;
+    let nanos = u64::try_from(duration.as_nanos()).map_or(u64::MAX, |value| value);
+    Ok(nanos.saturating_add(TEMP_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)))
+}
 
 #[derive(Clone)]
 /// A `DataFusion` sink that writes partitioned data to separate `DuckDB` tables.
@@ -370,12 +381,9 @@ impl PartitionTableManager {
     }
 
     fn generate_internal_name(&self) -> Result<String> {
-        let unix_ms = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context(UnableToGetSystemTimeSnafu)?
-            .as_millis();
+        let suffix = unique_name_suffix()?;
         Ok(format!(
-            "__data_{table_name}_{unix_ms}",
+            "__data_{table_name}_{suffix}",
             table_name = self.definition_name
         ))
     }
@@ -416,12 +424,9 @@ impl PartitionTableManager {
         );
         let stream = FFI_ArrowArrayStream::new(Box::new(record_batch_reader));
 
-        let current_ts = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context(UnableToGetSystemTimeSnafu)?
-            .as_millis();
+        let suffix = unique_name_suffix()?;
         let view_name = format!(
-            "__scan_{}_{current_ts}",
+            "__scan_{}_{suffix}",
             sanitize_identifier_fragment(self.table_name())
         );
         tx.register_arrow_scan_view(&view_name, &stream)
@@ -521,7 +526,7 @@ impl PartitionTableManager {
 
     fn current_indexes(&self, tx: &Transaction<'_>) -> Result<HashSet<String>> {
         let mut stmt = tx
-            .prepare("SELECT index_name FROM duckdb_indexes WHERE table_name = ?")
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE table_name = ?")
             .context(UnableToQueryDataSnafu)?;
         let mut rows = stmt
             .query([self.table_name()])
@@ -953,14 +958,10 @@ fn write_data_chunk_to_table(
         arrow::array::RecordBatchIterator::new(batches.into_iter().map(Ok), Arc::clone(&schema));
     let stream = FFI_ArrowArrayStream::new(Box::new(batch_reader));
 
-    let current_ts = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context(UnableToGetSystemTimeSnafu)
-        .map_err(to_datafusion_error)?
-        .as_millis();
+    let suffix = unique_name_suffix().map_err(to_datafusion_error)?;
 
     let view_name = format!(
-        "__scan_{}_{current_ts}",
+        "__scan_{}_{suffix}",
         sanitize_identifier_fragment(table.table_name())
     );
 
@@ -1331,6 +1332,48 @@ mod test {
             sanitize_identifier_fragment("region=us-east-1/test_table"),
             "region_us_east_1_test_table"
         );
+    }
+
+    #[test]
+    fn unique_name_suffix_does_not_collide_for_fast_calls() {
+        let suffixes = (0..256)
+            .map(|_| unique_name_suffix().expect("suffix generation should succeed"))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(suffixes.len(), 256);
+    }
+
+    #[test]
+    fn current_indexes_queries_duckdb_indexes_table_function() {
+        let pool = get_mem_duckdb();
+        let schema = get_test_schema();
+        let table_name = "region=us-east-1/test_table";
+        let mut conn = pool.connect_sync().expect("to connect");
+        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
+        let tx = duckdb.conn.transaction().expect("to begin transaction");
+
+        tx.execute(
+            &format!(
+                "CREATE TABLE {} (id BIGINT, region VARCHAR)",
+                quote_identifier(table_name)
+            ),
+            [],
+        )
+        .expect("to create table");
+        tx.execute(
+            &format!(
+                "CREATE INDEX {} ON {} (id)",
+                quote_identifier("idx_current_indexes_test"),
+                quote_identifier(table_name)
+            ),
+            [],
+        )
+        .expect("to create index");
+
+        let table = PartitionTableManager::new(table_name.to_string(), schema, None, Vec::new());
+        let indexes = table.current_indexes(&tx).expect("to query indexes");
+
+        assert!(indexes.contains("idx_current_indexes_test"));
     }
 
     #[tokio::test]
