@@ -263,7 +263,7 @@ impl FederatedTable {
             SchemaEvolution::Widening(plan) => {
                 let kind = widening_plan_kind(&plan);
                 let change = plan.describe();
-                if !evolution_allowed(&policy, &plan) {
+                if !evolution_allowed(policy, &plan) {
                     if policy == OnSchemaChange::Fail {
                         return Self::deferred_schema_change_failure(
                             dataset,

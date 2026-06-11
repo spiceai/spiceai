@@ -2780,12 +2780,22 @@ impl DataFusion {
 
         // For `refresh_sql` datasets the canonical checkpoint schema carries
         // non-materialized source columns that are intentionally absent from the
-        // projected refresh schema. Compare only the materialized (refresh-schema)
+        // projected refresh schema; compare only the materialized (refresh-schema)
         // columns so those columns are not mis-classified as removed (which would
         // make `on_schema_change != block` warn/fail on every restart, or
-        // `file_update` recreate spuriously, even when the source is unchanged). A
-        // no-op for the common, non-`refresh_sql` case where the column sets match.
-        let comparison_schema = restrict_schema_to(&existing_schema, &normalized_refresh_schema);
+        // `file_update` recreate spuriously, even when the source is unchanged).
+        //
+        // Restrict ONLY for `refresh_sql` datasets. For a plain dataset the
+        // checkpoint and refresh schemas have the same column set, so restricting
+        // would be a no-op for an unchanged source — but it would also hide a
+        // genuine column DROP (the dropped column is in the checkpoint, absent from
+        // the refresh schema), defeating `file_update`'s drop-recreate. Compare the
+        // full checkpoint there so real removals are still detected.
+        let comparison_schema = if dataset.refresh_sql().is_some() {
+            restrict_schema_to(&existing_schema, &normalized_refresh_schema)
+        } else {
+            Arc::clone(&existing_schema)
+        };
 
         if policy != OnSchemaChange::Block {
             let dataset_name = dataset.name.to_string();
@@ -2823,7 +2833,7 @@ impl DataFusion {
                         }
                         .fail();
                     }
-                    if !evolution_allowed(&policy, &plan) {
+                    if !evolution_allowed(policy, &plan) {
                         SCHEMA_EVOLUTION_FAILED.add(
                             1,
                             &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),

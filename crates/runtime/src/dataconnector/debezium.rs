@@ -942,7 +942,7 @@ async fn refresh_schema_if_evolved(
                         connector_component: ConnectorComponent::from(dataset),
                     });
                 }
-                if !evolution_allowed(&on_schema_change, &plan) {
+                if !evolution_allowed(on_schema_change, &plan) {
                     SCHEMA_EVOLUTION_FAILED.add(
                         1,
                         &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),

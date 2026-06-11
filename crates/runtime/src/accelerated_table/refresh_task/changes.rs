@@ -1961,7 +1961,7 @@ impl RefreshTask {
                         )),
                     });
                 }
-                if !evolution_allowed(&evolution.policy, &plan) {
+                if !evolution_allowed(evolution.policy, &plan) {
                     SCHEMA_EVOLUTION_FAILED.add(
                         1,
                         &schema_evolution_labels(&dataset, kind, "blocked_by_policy"),
@@ -4972,9 +4972,9 @@ mod tests {
             &OnSchemaChange::SyncAllColumns,
             &additive
         ));
-        assert!(evolution_allowed(&OnSchemaChange::SyncAllColumns, &typed));
-        assert!(!evolution_allowed(&OnSchemaChange::Block, &additive));
-        assert!(!evolution_allowed(&OnSchemaChange::Fail, &additive));
+        assert!(evolution_allowed(OnSchemaChange::SyncAllColumns, &typed));
+        assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
+        assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
         assert_eq!(widening_plan_kind(&additive), "added_columns");
         assert_eq!(widening_plan_kind(&typed), "widened_types");
     }

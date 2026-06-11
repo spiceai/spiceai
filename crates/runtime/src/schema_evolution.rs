@@ -44,7 +44,7 @@ pub(crate) use crate::accelerated_table::refresh_task::changes::{
 /// widening set (added columns + lossless type widening + nullability relax);
 /// `block`/`fail` never evolve.
 #[must_use]
-pub fn evolution_allowed(policy: &OnSchemaChange, plan: &WideningPlan) -> bool {
+pub fn evolution_allowed(policy: OnSchemaChange, plan: &WideningPlan) -> bool {
     match policy {
         OnSchemaChange::AppendNewColumns => plan.is_additive_only(),
         OnSchemaChange::SyncAllColumns => true,
@@ -224,8 +224,8 @@ mod tests {
             &OnSchemaChange::SyncAllColumns,
             &relaxing
         ));
-        assert!(!evolution_allowed(&OnSchemaChange::Block, &additive));
-        assert!(!evolution_allowed(&OnSchemaChange::Fail, &additive));
+        assert!(!evolution_allowed(OnSchemaChange::Block, &additive));
+        assert!(!evolution_allowed(OnSchemaChange::Fail, &additive));
     }
 
     #[test]
