@@ -316,7 +316,7 @@ fn trigger_build(
                         );
                         return Ok(());
                     } else if status != "completed" {
-                        println!("Found active build for this SHA (Run ID: {id}). Reusing it.",);
+                        println!("Found active build for this SHA (Run ID: {id}). Reusing it.");
                         existing_run_id = Some(id);
                         break;
                     }
@@ -397,7 +397,7 @@ fn trigger_build(
 
         if !wait {
             println!("You can check the status with:");
-            println!("  gh run list --workflow build_and_release.yml --branch \"{branch}\"",);
+            println!("  gh run list --workflow build_and_release.yml --branch \"{branch}\"");
             return Ok(());
         }
 
@@ -514,7 +514,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
         .join(".spice/bin")
         .join(&branch);
 
-    println!("Looking for latest successful build for branch: {branch}...",);
+    println!("Looking for latest successful build for branch: {branch}...");
 
     let output = Command::new("gh")
         .args([
@@ -554,7 +554,7 @@ fn install_build(branch: Option<&str>, pr: Option<u64>) -> Result<()> {
     let output = Command::new("gh")
         .args([
             "api",
-            &format!("repos/{repo_owner_name}/actions/runs/{run_id}/artifacts",),
+            &format!("repos/{repo_owner_name}/actions/runs/{run_id}/artifacts"),
         ])
         .output()
         .context("Failed to fetch artifacts list")?;

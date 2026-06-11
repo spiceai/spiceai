@@ -141,7 +141,7 @@ struct FlightStreamExec {
     table_reference: TableReference,
     client: FlightClient,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlightStreamExec {
@@ -150,14 +150,14 @@ impl FlightStreamExec {
             table_reference: table_reference.clone(),
             client,
             schema: Arc::clone(schema),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Unbounded {
                     requires_infinite_memory: false,
                 },
-            ),
+            )),
         }
     }
 }
@@ -187,7 +187,7 @@ impl ExecutionPlan for FlightStreamExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

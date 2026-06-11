@@ -217,7 +217,7 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_secs(300);
+const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -338,8 +338,7 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+            .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
@@ -730,6 +729,15 @@ impl CayenneAccelerator {
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
                 config.cdc_mem_tier_max_age_ms,
+                " (milliseconds)",
+            );
+            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_checkpoint_interval_ms",
+                    "cdc_mem_tier_checkpoint_interval_ms",
+                ],
+                config.cdc_mem_tier_checkpoint_interval_ms,
                 " (milliseconds)",
             );
 
@@ -1232,6 +1240,14 @@ impl CayenneAccelerator {
         if spawned {
             tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
         }
+        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+        // file-mode tables. This is what advances the deferred source slot ack on
+        // an idle/pure-upsert stream so replication lag stays bounded.
+        if provider.spawn_background_mem_tier_checkpoint() {
+            tracing::debug!(
+                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+            );
+        }
         Ok(provider)
     }
 }
@@ -1391,9 +1407,11 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["file", "memory"])
             .default("file"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) disables the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 268435456 (256 MiB) so the periodic background checkpoint is the primary flush path and the write-path spill remains a rare backstop. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
-            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. Default 10000 (10 s). Set 0 to disable the age trigger."),
+        ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
+            .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])

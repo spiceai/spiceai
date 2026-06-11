@@ -148,7 +148,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
 
             // Wait for executors to load and accelerate their assigned partitions.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- Test 1: SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -267,7 +267,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
             // Give the executor time to finish loading + acking its assigned partitions.
             sleep(Duration::from_secs(8)).await;
 
@@ -357,7 +357,7 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
             sleep(Duration::from_secs(5)).await;
 
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -438,7 +438,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 
             sleep(Duration::from_secs(2)).await; // Ensure we get an initial partition assignment.
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- SELECT all rows ---
             let select_all_sql = "SELECT id, name, age, city, score FROM test_data ORDER BY id";
@@ -535,7 +535,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // The user predicate `score > 85` must be visible inside the FlightSqlExec
             // sql string — confirming it was pushed to the executor, not applied above.
@@ -608,7 +608,7 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
 
             sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // --- ORDER BY score DESC LIMIT 3 ---
             // Expected top-3 scores from TEST_DATA_CSV: Sarah Wilson=94, Jane Smith=92, Anna Garcia=90
@@ -707,7 +707,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Baseline: both executors up, all 10 rows visible.
             let select_all = "SELECT id FROM test_data ORDER BY id";
@@ -729,7 +729,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .await?;
 
             // Wait for the partition manager to reassign and executor[1] to refresh.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // After rebalance executor[1] should hold all 4 buckets and return all rows.
             let rows = harness.query(select_all).await?;
@@ -826,8 +826,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             // Wait for both tables to be fully accelerated.
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
-            wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
+            wait_for_row_count(&harness, "categories", 10, Duration::from_mins(1)).await?;
 
             // Wait for partition metadata to be fully assigned across both
             // executors before querying. Without this, the scheduler may
@@ -936,7 +936,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Trigger refresh from the scheduler. Previously this would fail with
             // "the refresh worker is no longer running. channel closed" because the
@@ -1027,7 +1027,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                 .await?;
 
             harness.wait_for_executors(Duration::from_secs(15)).await?;
-            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_mins(1)).await?;
 
             // Wait for partition management cycle to discover and assign all partitions.
             // The cycle runs every 1s (configured in make_named_scheduler_config).
@@ -1108,7 +1108,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
             // Wait for the executor to pick up the new partition and load the data.
             // The executor needs to receive the UpdatePartitions message, update its
             // partition filter, and then the next refresh will include Seattle.
-            wait_for_row_count(&harness, "test_data", 11, Duration::from_secs(60)).await?;
+            wait_for_row_count(&harness, "test_data", 11, Duration::from_mins(1)).await?;
 
             harness.shutdown().await;
             Ok(())

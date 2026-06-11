@@ -321,6 +321,19 @@ impl TursoMetastore {
         )
     ";
 
+    const SNAPSHOT_FILE_STATISTICS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_snapshot_file_statistics (
+            table_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size_bytes BIGINT NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
+            statistics_blob BLOB NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, snapshot_id, file_path)
+        )
+    ";
+
     /// Schema for the `cayenne_pk_index` table. Mirrors the `SQLite` definition;
     /// captured in metastore snapshots via `EXPECTED_TABLES`.
     const PK_INDEX_TABLE_DDL: &'static str = r"
@@ -518,7 +531,7 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
@@ -526,6 +539,7 @@ impl MetastoreBackend for TursoMetastore {
             Self::INSERT_RECORD_TABLE_DDL,
             Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
             Self::TABLE_STATISTICS_DDL,
+            Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
             Self::INLINED_DATA_TABLE_DDL,
             Self::INLINED_DELETE_TABLE_DDL,
             Self::PK_INDEX_TABLE_DDL

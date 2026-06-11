@@ -2990,7 +2990,7 @@ mod tests {
             let result = datetime_to_system_time(dt);
 
             // Negative timestamps should be before UNIX_EPOCH
-            let expected = UNIX_EPOCH - Duration::from_secs(315_619_200);
+            let expected = UNIX_EPOCH - Duration::from_hours(87672);
             assert_eq!(
                 result, expected,
                 "Pre-1970 timestamps should be correctly represented"

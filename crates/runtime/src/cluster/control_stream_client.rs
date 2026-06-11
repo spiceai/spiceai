@@ -220,8 +220,7 @@ fn spawn_control_stream(
                         _ = interval.tick() => {
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                                .unwrap_or(0);
+                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
 
                             let msg = ExecutorControlMessage {
                                 executor_id: heartbeat_executor_id.clone(),
@@ -244,8 +243,7 @@ fn spawn_control_stream(
                 message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
                     timestamp_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                        .unwrap_or(0),
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
                 })),
             };
             if outbound_tx.send(init_msg).await.is_err() {

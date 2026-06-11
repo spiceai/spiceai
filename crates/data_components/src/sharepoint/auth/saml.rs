@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Default grace period before expiry when we consider the token stale and
 /// eagerly re-exchange.
-const EXPIRY_GRACE: Duration = Duration::from_secs(60);
+const EXPIRY_GRACE: Duration = Duration::from_mins(1);
 
 /// RFC 7522 grant type URI.
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:saml2-bearer";

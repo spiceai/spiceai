@@ -162,7 +162,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let baseline_duration = Duration::from_secs(baseline_duration_secs);
 
     // baseline run
-    println!("Running baseline throughput test for {baseline_duration_secs}s",);
+    println!("Running baseline throughput test for {baseline_duration_secs}s");
 
     let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,

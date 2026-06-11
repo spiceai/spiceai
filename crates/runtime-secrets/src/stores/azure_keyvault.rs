@@ -258,7 +258,7 @@ const SPICE_KEY_PREFIX_HYPHEN: &str = "spice-";
 /// Chosen to match the AWS Secrets Manager store — Key Vault secret rotation
 /// is typically manual and on the order of hours/days, so a minute of
 /// staleness is acceptable.
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(1);
 
 /// Negative-cache TTL for confirmed-missing secrets (404 responses).
 ///
@@ -1357,7 +1357,7 @@ mod tests {
         let entry = Arc::new(CachedEntry {
             value: Some(SecretString::from("hello".to_string())),
             fetched_at: Instant::now(),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
         });
         store.store_cached("api_key", entry).await;
 
@@ -1394,9 +1394,9 @@ mod tests {
         let stale = Arc::new(CachedEntry {
             value: Some(SecretString::from("old".to_string())),
             fetched_at: Instant::now()
-                .checked_sub(Duration::from_secs(3600))
+                .checked_sub(Duration::from_hours(1))
                 .expect("enough headroom"),
-            ttl: Duration::from_secs(60),
+            ttl: Duration::from_mins(1),
         });
         store.store_cached("k", stale).await;
 

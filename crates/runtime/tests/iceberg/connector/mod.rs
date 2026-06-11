@@ -155,7 +155,7 @@ async fn run_iceberg_test(
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
             panic!("Timeout waiting for components to load");
         }
         () = cloned_rt.load_components() => {}

@@ -16,10 +16,11 @@ limitations under the License.
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::error::Error as StdError;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::array::{RecordBatch, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use datafusion::catalog::{ScanArgs, ScanResult, Session};
@@ -29,12 +30,16 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown, dml::InsertOp};
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::MetricsSet};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    execution_plan::{Boundedness, EmissionType},
+    metrics::MetricsSet,
+    stream::RecordBatchStreamAdapter,
+};
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::{Unparser, dialect::Dialect};
-use datafusion_table_providers::util::count_exec::make_count_exec;
-use datafusion_table_providers::util::dml::{DeletionExec, DeletionSink, UpdateExec, UpdateSink};
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 use snafu::prelude::*;
 use snowflake_api::{QueryResult, SnowflakeApi};
 use tokio::sync::Mutex;
@@ -42,6 +47,8 @@ use tokio::sync::Mutex;
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederationAnalyzerForLogicalPlan, FederationProvider,
 };
+
+use crate::delete::{DeletionExec, DeletionSink};
 
 use super::SnowflakeConnectionPool;
 
@@ -283,7 +290,7 @@ impl TableProvider for SnowflakeTableProvider {
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if assignments.is_empty() {
-            return make_count_exec(0);
+            return Ok(Arc::new(DmlCountExec::new(0)));
         }
 
         let set_clause = assignments_to_sql(&assignments, self.dialect.as_ref())?;
@@ -297,6 +304,180 @@ impl TableProvider for SnowflakeTableProvider {
             write_lock: Arc::clone(&self.write_lock),
         }))))
     }
+}
+
+struct DmlCountExec {
+    count: u64,
+    properties: Arc<PlanProperties>,
+}
+
+impl DmlCountExec {
+    fn new(count: u64) -> Self {
+        let schema = count_schema();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self { count, properties }
+    }
+}
+
+impl std::fmt::Debug for DmlCountExec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DmlCountExec")
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for DmlCountExec {
+    fn fmt_as(
+        &self,
+        _display_type: DisplayFormatType,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(formatter, "DmlCountExec(count={})", self.count)
+    }
+}
+
+impl ExecutionPlan for DmlCountExec {
+    fn name(&self) -> &'static str {
+        "DmlCountExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let count = self.count;
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema(),
+            stream::once(async move { count_batch(count) }),
+        )))
+    }
+}
+
+#[async_trait]
+trait UpdateSink: Send + Sync {
+    async fn execute_update(&self) -> std::result::Result<u64, Box<dyn StdError + Send + Sync>>;
+}
+
+struct UpdateExec {
+    update_sink: Arc<dyn UpdateSink>,
+    properties: Arc<PlanProperties>,
+}
+
+impl UpdateExec {
+    fn new(update_sink: Arc<dyn UpdateSink>) -> Self {
+        let schema = count_schema();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            update_sink,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for UpdateExec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("UpdateExec").finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for UpdateExec {
+    fn fmt_as(
+        &self,
+        _display_type: DisplayFormatType,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(formatter, "UpdateExec")
+    }
+}
+
+impl ExecutionPlan for UpdateExec {
+    fn name(&self) -> &'static str {
+        "UpdateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let update_sink = Arc::clone(&self.update_sink);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema(),
+            stream::once(async move {
+                let count = update_sink
+                    .execute_update()
+                    .await
+                    .map_err(DataFusionError::External)?;
+                count_batch(count)
+            }),
+        )))
+    }
+}
+
+fn count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+fn count_batch(count: u64) -> DataFusionResult<RecordBatch> {
+    Ok(RecordBatch::try_new(
+        count_schema(),
+        vec![Arc::new(UInt64Array::from(vec![count]))],
+    )?)
 }
 
 #[derive(Clone)]
@@ -577,15 +758,16 @@ fn extract_dml_count(table_name: &str, result: QueryResult) -> Result<u64> {
                 if batch.num_rows() == 0 || batch.num_columns() == 0 {
                     continue;
                 }
-                let scalar = ScalarValue::try_from_array(batch.column(0), 0).map_err(|error| {
-                    UnexpectedDmlResponseSnafu {
-                        table: table_name.to_string(),
-                        reason: format!(
-                            "failed to read affected-row count from Arrow response: {error}"
-                        ),
-                    }
-                    .build()
-                })?;
+                let scalar =
+                    ScalarValue::try_from_array(batch.column(0).as_ref(), 0).map_err(|error| {
+                        UnexpectedDmlResponseSnafu {
+                            table: table_name.to_string(),
+                            reason: format!(
+                                "failed to read affected-row count from Arrow response: {error}"
+                            ),
+                        }
+                        .build()
+                    })?;
                 if let Some(count) = scalar_to_u64(&scalar) {
                     return Ok(count);
                 }

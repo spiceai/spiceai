@@ -113,7 +113,8 @@ pub async fn record_explain_plan(
 /// The approach: when we find `PartitionedUnionExec`, we identify child subtrees
 /// by their indentation level. Lines at the first child's indent level start new
 /// subtrees. We sort all subtrees alphabetically.
-fn sort_partitioned_union_children(explain_plan: &str) -> String {
+#[must_use]
+pub fn sort_partitioned_union_children(explain_plan: &str) -> String {
     // if no PartitionedUnionExec, return unchanged
     if !explain_plan.contains("PartitionedUnionExec") {
         return explain_plan.to_string();

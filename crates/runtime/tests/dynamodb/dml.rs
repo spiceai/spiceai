@@ -211,7 +211,7 @@ async fn setup_runtime(table_name: &str, port: u16) -> Result<Runtime, anyhow::E
 
     let cloned_rt = Arc::new(rt.clone());
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(60)) => {
+        () = tokio::time::sleep(Duration::from_mins(1)) => {
             return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
         }
         () = cloned_rt.load_components() => {}

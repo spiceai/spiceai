@@ -149,7 +149,7 @@ async fn start_runtime(dataset: Dataset) -> Result<Arc<runtime::Runtime>, anyhow
     let rt = Arc::new(runtime::Runtime::builder().with_app(app).build().await);
 
     tokio::select! {
-        () = tokio::time::sleep(Duration::from_secs(120)) => {
+        () = tokio::time::sleep(Duration::from_mins(2)) => {
             return Err(anyhow::anyhow!("Timed out waiting for dataset to load"));
         }
         () = Arc::clone(&rt).load_components() => {}

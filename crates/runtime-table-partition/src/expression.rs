@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use arrow_schema::DataType;
 use datafusion::{
@@ -23,7 +24,8 @@ use datafusion::{
         tree_node::{TreeNode, TreeNodeRecursion},
     },
     error::DataFusionError,
-    logical_expr::ExprSchemable,
+    logical_expr::{ExprSchemable, simplify::SimplifyContext},
+    optimizer::simplify_expressions::ExprSimplifier,
     prelude::{Expr, SessionContext},
     scalar::ScalarValue,
 };
@@ -41,6 +43,8 @@ pub enum Error {
     InvalidExpression { message: String },
     #[snafu(display("Parsing SQL expression failed: {}", format_datafusion_error(source)))]
     ParsingExpression { source: DataFusionError },
+    #[snafu(display("Simplifying expression failed: {}", format_datafusion_error(source)))]
+    SimplifyingExpression { source: DataFusionError },
     #[snafu(display(
         "Scalar value type {scalar_type} is incompatible with expression type {expr_type}"
     ))]
@@ -69,12 +73,23 @@ pub fn partition_by_expressions(
     ctx: &SessionContext,
     df_schema: &DFSchema,
 ) -> Result<Vec<PartitionedBy>, Error> {
+    // DataFusion registers Spark-compatible scalar functions (e.g. `date_part`)
+    // as stubs that must be rewritten to their standard DataFusion equivalents by
+    // the `SimplifyExpressions` optimizer pass. The partition path builds a physical
+    // expression directly from this parsed expression and never runs that pass, so
+    // simplify here is reuiqred.
+    let simplifier =
+        ExprSimplifier::new(SimplifyContext::default().with_schema(Arc::new(df_schema.clone())));
+
     let partitioned_by = partitioned_by
         .iter()
         .map(|p| {
             let expression = ctx
                 .parse_sql_expr(&p.expression, df_schema)
                 .context(ParsingExpressionSnafu)?;
+            let expression = simplifier
+                .simplify(expression)
+                .context(SimplifyingExpressionSnafu)?;
             PartitionCriteria.validate(&expression, df_schema)?;
             Ok(PartitionedBy {
                 name: p.name.clone(),

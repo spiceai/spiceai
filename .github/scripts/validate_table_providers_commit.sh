@@ -60,7 +60,7 @@ if git merge-base --is-ancestor "$COMMIT" "$BRANCH_SHA" 2>/dev/null; then
 else
     echo "✗ Error: Commit $COMMIT is NOT on the '$BRANCH' branch"
     echo ""
-    echo "The datafusion-table-providers commit in Cargo.toml must be on the 'spiceai' branch."
-    echo "Please ensure your changes are merged to the spiceai branch before updating the commit."
+    echo "The datafusion-table-providers commit in Cargo.toml must be on the '$BRANCH' branch of $REPO_URL."
+    echo "Please ensure your changes are merged to the '$BRANCH' branch before updating the commit."
     exit 1
 fi
