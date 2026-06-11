@@ -1321,8 +1321,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    33,
-    { S3_PARAMS_LEN + 33 },
+    38,
+    { S3_PARAMS_LEN + 38 },
 >(
     S3_PARAMETERS,
     [
@@ -1410,6 +1410,16 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
+        ParameterSpec::runtime("cdc_prefetch_buffer")
+            .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
+        ParameterSpec::runtime("cdc_max_coalesced_envelopes")
+            .description("Per-dataset override for the maximum number of CDC envelopes coalesced into a single accelerator write."),
+        ParameterSpec::runtime("cdc_max_coalesced_bytes")
+            .description("Per-dataset override for the byte budget (in bytes) of a coalesced CDC burst."),
+        ParameterSpec::runtime("cdc_max_coalesce_age_ms")
+            .description("Per-dataset override for the linger window (ms) the CDC apply loop waits for additional envelopes before flushing."),
+        ParameterSpec::runtime("cdc_commit_timeout_ms")
+            .description("Per-dataset override for the CDC source-side commit timeout (ms)."),
     ],
 );
 
