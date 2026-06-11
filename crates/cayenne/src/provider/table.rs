@@ -5266,6 +5266,7 @@ impl CayenneTableProvider {
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashSet::new())),
             retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
             snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
+            position_compaction_skip_streak: Arc::new(AtomicUsize::new(0)),
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
