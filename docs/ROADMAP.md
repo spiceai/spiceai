@@ -21,12 +21,12 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 **DataFusion:** v53
 
-- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
 - **Schema Evolution**: Safe, non-breaking schema changes for accelerated datasets (add/drop/rename columns, type widening) with automatic migration.
 - **Cayenne Improvements**: Non-distributed Cayenne catalog, multi-version metadata schema support, and orphaned deletion-vector cleanup during retention.
 - **Distributed Acceleration Hardening**: Continued planner and runtime improvements for distributed acceleration, including partitioning, readiness signaling, and filter/TopK pushdown.
 - **Ballista / Distributed Query**: Shared job state across schedulers and faster partition reassignment on executor failure.
+- **Write-Back Acceleration**: Eventually-consistent write-back, with full DML (UPDATE/DELETE) and `spice refresh`/`refresh_check_interval` on write-through accelerated tables.
 
 ### [v2.2](https://github.com/spiceai/spiceai/milestone/99) (September 2026)
 
@@ -34,10 +34,9 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 **DataFusion:** v54
 
+- **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes, with FTS indexes available in distributed query mode.
 - **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
 - **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
-- **Streaming Cayenne Ingest**: `refresh_mode: changes` (Kafka) support for Cayenne-accelerated tables.
-- **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
 
 ### [v2.3](https://github.com/spiceai/spiceai/milestone/100) (October 2026)
 
@@ -48,7 +47,7 @@ To propose features or report issues, please [file an issue](https://github.com/
 - **Audit Logging**: Persistent, immutable query and access logs for compliance.
 - **Resource Quotas**: Per-user/tenant query limits and throttling.
 - **Distributed Cayenne Catalog**: Cayenne catalog with full distributed query and acceleration support.
-- **Write-Back Acceleration**: Eventually-consistent write-back, with full DML (UPDATE/DELETE) and `spice refresh`/`refresh_check_interval` on write-through accelerated tables.
+- **Distributed Search Scale-Out**: Search query partitioning and relative score fusion across distributed nodes.
 
 ### [v2.4](https://github.com/spiceai/spiceai/milestone/101) (December 2026)
 
@@ -95,7 +94,7 @@ These are prioritized based on community demand and strategic alignment. Share y
 
 ### Search & Retrieval
 
-- **Faceted Search**: Aggregations, filters, and counts for enterprise search UX.
+- **Faceted Search**: Native facet buckets and counts returned directly in the search API response — beyond today's `GROUP BY` over the `vector_search`/`text_search` SQL functions — for filter-sidebar enterprise search UX.
 
 ### Data Platform
 
