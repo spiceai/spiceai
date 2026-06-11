@@ -147,16 +147,7 @@ impl SpicedInstance {
     pub fn external(flight_url: impl Into<String>) -> Self {
         let flight_url = flight_url.into();
 
-        // Spice Cloud has a dedicated HTTP endpoint
-        let http_base_url = if flight_url.contains("flight.spiceai.io") {
-            "https://data.spiceai.io".to_string()
-        } else if let Some(last_colon) = flight_url.rfind(':') {
-            // Derive HTTP URL from Flight URL by replacing port
-            // e.g., "http://localhost:50051" -> "http://localhost:8090"
-            format!("{}:8090", &flight_url[..last_colon])
-        } else {
-            format!("{flight_url}:8090")
-        };
+        let http_base_url = derive_http_base_url(&flight_url);
 
         Self::External {
             flight_url,
@@ -476,18 +467,31 @@ impl SpicedInstance {
 
     /// Returns an instance of a `Process` for the spiced instance
     /// This allows tracking the spiced process, without owning the spiced instance
-    pub fn process(&self) -> Result<Process> {
+    pub fn process(&self) -> Option<Process> {
         let Self::Owned { child, .. } = self else {
-            // External / Existing instances have no local child process (e.g. an
-            // already-running remote spiced reached via a URL `--spiced-path`).
-            // Callers use this only for best-effort memory monitoring, so return a
-            // benign Process for the test driver's own PID — the monitoring becomes
-            // a harmless no-op instead of failing the run.
-            return Ok(Process::new(Pid::from_u32(std::process::id())));
+            return None;
         };
 
-        Ok(Process::new(Pid::from_u32(child.id())))
+        Some(Process::new(Pid::from_u32(child.id())))
     }
+}
+
+fn derive_http_base_url(flight_url: &str) -> String {
+    if flight_url.contains("flight.spiceai.io") {
+        return "https://data.spiceai.io".to_string();
+    }
+
+    let Ok(mut url) = reqwest::Url::parse(flight_url) else {
+        return format!("{flight_url}:8090");
+    };
+
+    if url.set_port(Some(8090)).is_err() {
+        return format!("{flight_url}:8090");
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.as_str().trim_end_matches('/').to_string()
 }
 
 impl Drop for SpicedInstance {
@@ -500,5 +504,31 @@ impl Drop for SpicedInstance {
             Ok(()) => (),
             Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_derives_http_base_url_without_flight_port() {
+        let instance = SpicedInstance::external("https://example.com");
+
+        assert_eq!(instance.http_base_url(), "https://example.com:8090");
+    }
+
+    #[test]
+    fn external_derives_http_base_url_from_flight_port() {
+        let instance = SpicedInstance::external("http://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "http://localhost:8090");
+    }
+
+    #[test]
+    fn external_derives_http_base_url_for_ipv6() {
+        let instance = SpicedInstance::external("http://[::1]:50051");
+
+        assert_eq!(instance.http_base_url(), "http://[::1]:8090");
     }
 }
