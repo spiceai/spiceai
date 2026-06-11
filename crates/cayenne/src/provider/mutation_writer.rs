@@ -719,6 +719,17 @@ impl<'a> AppendMutationWriter<'a> {
     /// The cap stays a hard bound either way: a skip means the in-flight flush
     /// already made `incoming_bytes` fit (appends are serialized by the held
     /// `write_lock`, so nothing regrows the tier before our append).
+    ///
+    /// PARTIAL spill: this latency-critical path flushes only the oldest-segment
+    /// prefix needed to bring the tier back under the cap and admit the incoming
+    /// batch (`checkpoint_mem_tier_prefix`), NOT the whole tier — a whole-tier
+    /// Vortex encode here was ~46% of the heaviest table's apply path. The
+    /// per-table cap stays a HARD bound: `mem_tier_spill_min_bytes_to_free`
+    /// targets freeing enough that the post-spill tier + `incoming_bytes` is
+    /// strictly under the cap, and the prefix selector flushes at least that many
+    /// bytes (capping at the full tier). The GLOBAL-budget spill
+    /// (`spill_mem_tier_unless_reserved`) and the periodic background tick keep
+    /// the full-tier drain — only this inline cap spill goes partial.
     async fn spill_mem_tier_if_cap_breached(&self, incoming_bytes: u64) -> Result<()> {
         let _guard = self
             .table
@@ -728,7 +739,13 @@ impl<'a> AppendMutationWriter<'a> {
         if !self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
             return Ok(());
         }
-        self.table.checkpoint_mem_tier().await?;
+        // Free only enough oldest-prefix bytes to re-admit this batch under the
+        // cap. Computed under the held checkpoint lock from the live tier, so it
+        // reflects any in-flight flush that already drained part of the tier.
+        let min_bytes_to_free = self.table.mem_tier_spill_min_bytes_to_free(incoming_bytes);
+        self.table
+            .checkpoint_mem_tier_prefix(min_bytes_to_free)
+            .await?;
         Ok(())
     }
 

@@ -12697,6 +12697,61 @@ impl CayenneTableProvider {
         tombstones
     }
 
+    /// The smallest oldest-segment prefix length `K` (in `1..=segments.len()`)
+    /// whose cumulative `bytes` reach `min_bytes_to_free`. Walks segments
+    /// front-to-back accumulating their measured byte cost and stops at the first
+    /// `K` whose running sum is `>= min_bytes_to_free`; if the whole tier is still
+    /// short of the target (or the target is `0`), returns the bound it can —
+    /// `segments.len()` for an unmet target, `1` for a zero target — so a partial
+    /// checkpoint ALWAYS flushes at least one segment (progress) and never asks to
+    /// flush more than the tier holds. Assumes a non-empty tier (the caller
+    /// returns early on an empty capture).
+    fn mem_tier_prefix_len_for_bytes(
+        snapshot: &crate::provider::mem_tier::MemTier,
+        min_bytes_to_free: u64,
+    ) -> usize {
+        debug_assert!(
+            !snapshot.segments.is_empty(),
+            "prefix length is only selected for a non-empty captured tier"
+        );
+        let mut cumulative: u64 = 0;
+        for (idx, segment) in snapshot.segments.iter().enumerate() {
+            cumulative = cumulative.saturating_add(segment.bytes);
+            if cumulative >= min_bytes_to_free {
+                // K = idx + 1 (flush through this segment). For a zero target this
+                // returns after the first segment (K = 1) — minimal progress.
+                return idx + 1;
+            }
+        }
+        // The whole tier's bytes are below the target: flush all of it (cap at
+        // full; degenerates to a full checkpoint).
+        snapshot.segments.len().max(1)
+    }
+
+    /// The minimum bytes a per-table-cap spill must free so that, AFTER flushing
+    /// that prefix, the live tier plus `incoming_bytes` is STRICTLY under the
+    /// per-table byte cap (`would_be < mem_tier_max_bytes`, the same bound
+    /// [`Self::mem_tier_per_table_cap_breached`] enforces with `>=`). Returns
+    /// `current_tier_bytes + incoming_bytes - cap + 1` when the bytes breach the
+    /// cap, and `0` otherwise (e.g. an AGE-only breach, where the prefix selector
+    /// still flushes the minimal one-segment prefix — `retain_after` resets the
+    /// age clock, clearing the age breach). Keeping the cap arithmetic here (where
+    /// `mem_tier_max_bytes` lives) keeps the spill caller cap-agnostic.
+    pub(crate) fn mem_tier_spill_min_bytes_to_free(&self, incoming_bytes: u64) -> u64 {
+        let cur = self.mem_tier.load();
+        let would_be = cur.bytes.saturating_add(incoming_bytes);
+        // `+ 1`: the cap check is `>=`, so freeing exactly `would_be - cap` would
+        // land at the cap and STILL read as breached. Free one byte more so the
+        // post-spill tier+incoming is strictly under the cap (a hard bound).
+        would_be
+            .saturating_sub(self.mem_tier_max_bytes)
+            .saturating_add(if would_be > self.mem_tier_max_bytes {
+                1
+            } else {
+                0
+            })
+    }
+
     /// Append a validated CDC batch to the in-memory tier (`cdc_durability:
     /// memory`) and return the mem-tier epoch it landed in.
     ///
@@ -12855,6 +12910,50 @@ impl CayenneTableProvider {
     /// (correctness item #4 — a failed checkpoint never advances).
     #[doc(hidden)]
     pub async fn checkpoint_mem_tier(&self) -> Result<u64> {
+        // The full-tier checkpoint: drain every segment. `None` target = no
+        // partial prefix, so K degenerates to `segments.len()` and the flushed
+        // epoch is the whole tier's epoch (the prior behavior, byte-for-byte).
+        self.checkpoint_mem_tier_inner(None).await
+    }
+
+    /// Latency-critical PARTIAL spill: flush only the SMALLEST oldest-segment
+    /// prefix `[0..K)` whose cumulative bytes reach `min_bytes_to_free`, so the
+    /// inline cap spill is O(prefix) rather than a whole-tier encode. `K` is
+    /// clamped to `1..=segments.len()` (always make progress; cap at full, which
+    /// degenerates to [`Self::checkpoint_mem_tier`]). The retained suffix `[K..)`
+    /// stays resident — un-acked and replayable on crash — see
+    /// [`Self::checkpoint_mem_tier_inner`] for the slot-ack-per-prefix proof. Used
+    /// ONLY by the per-table cap spill; the global-budget spill and the periodic
+    /// background tick keep the full-tier drain.
+    #[doc(hidden)]
+    pub async fn checkpoint_mem_tier_prefix(&self, min_bytes_to_free: u64) -> Result<u64> {
+        self.checkpoint_mem_tier_inner(Some(min_bytes_to_free)).await
+    }
+
+    /// Shared body of the full ([`Self::checkpoint_mem_tier`]) and partial
+    /// ([`Self::checkpoint_mem_tier_prefix`]) mem-tier checkpoints.
+    ///
+    /// `min_bytes_to_free`:
+    /// - `None` — flush the WHOLE captured tier (every segment). The flushed epoch
+    ///   is the tier's `epoch`; identical to the historical single path.
+    /// - `Some(n)` — flush the smallest append-ordered prefix `[0..K)` whose
+    ///   cumulative bytes are `>= n`, with `K` clamped to `1..=segments.len()`.
+    ///   The durable file + published deletion snapshot are built from a
+    ///   `take_prefix(K)` view (prefix rows + prefix-only tombstones); the retained
+    ///   suffix `[K..)` (via `retain_after(K)`) keeps its own higher-sequence
+    ///   tombstones in RAM.
+    ///
+    /// SLOT-ACK CORRECTNESS (the data-loss seam): the slot is advanced via
+    /// `fire_slot_advancer(flushed_epoch)`, and the runtime acks every deferred
+    /// source committer with `epoch <= flushed_epoch`. For a partial flush
+    /// `flushed_epoch` is the prefix's LAST segment epoch (`prefix.epoch`, i.e.
+    /// `snapshot.segments[K-1].epoch`), NOT the whole tier's epoch — so the
+    /// retained suffix's strictly-higher epochs stay UN-acked and the source
+    /// re-streams them after a crash (idempotent via PK upsert). When
+    /// `min_bytes_to_free` is `None`, `K == segments.len()` and
+    /// `prefix.epoch == snapshot.epoch`, so the full path advances to the same
+    /// epoch it always did.
+    async fn checkpoint_mem_tier_inner(&self, min_bytes_to_free: Option<u64>) -> Result<u64> {
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under the `mem_tier_publish_lock`, so the
         // capture+reservation is mutually exclusive with append sequence
@@ -12884,10 +12983,28 @@ impl CayenneTableProvider {
         if snapshot.is_empty() {
             return Ok(0);
         }
-        let flushed_epoch = snapshot.epoch;
+        // Select the prefix length K to flush. `None` → the whole tier (K = len),
+        // preserving the full-checkpoint path exactly. `Some(n)` → the smallest
+        // prefix whose cumulative bytes reach `n`, clamped to `1..=len` so a
+        // partial spill always makes progress (K >= 1) and never over-flushes
+        // (K <= len; landing on len degenerates to a full checkpoint). The suffix
+        // [K..) is what the post-flush `retain_after(K)` keeps resident.
+        let flushed_segment_count = match min_bytes_to_free {
+            None => snapshot.segments.len(),
+            Some(min_bytes) => Self::mem_tier_prefix_len_for_bytes(&snapshot, min_bytes),
+        };
+        // The corpus + tombstones to make durable: for a partial flush this is the
+        // prefix [0..K) ONLY (prefix rows, prefix-only tombstones); for a full
+        // flush `take_prefix(len)` is the whole tier. Everything below operates on
+        // `flush_view` exactly as the original single path operated on `snapshot`.
+        let flush_view = snapshot.take_prefix(flushed_segment_count);
+        // SLOT-ACK: advance ONLY to the flushed prefix's last segment epoch (==
+        // `snapshot.epoch` when K == len). The retained suffix's higher epochs
+        // stay un-acked → replayable on crash. This is the data-loss seam.
+        let flushed_epoch = flush_view.epoch;
         let inlined_view = self.cached_inlined_view().await?;
-        let mut batches = self.pruned_inlined_batches(&inlined_view, &snapshot, None)?;
-        let mem_batches = self.visible_mem_tier_batches(&snapshot, None)?;
+        let mut batches = self.pruned_inlined_batches(&inlined_view, &flush_view, None)?;
+        let mem_batches = self.visible_mem_tier_batches(&flush_view, None)?;
         let flushed_mem_rows: usize = mem_batches.iter().map(RecordBatch::num_rows).sum();
         batches.extend(mem_batches);
 
@@ -12901,7 +13018,7 @@ impl CayenneTableProvider {
             {
                 let _publish = self.mem_tier_publish_lock.lock().await;
                 self.clear_flushed_mem_tier_state_under_publish_lock(
-                    snapshot.segments.len(),
+                    flushed_segment_count,
                     !inlined_view.is_empty(),
                 )
                 .await?;
@@ -12973,7 +13090,7 @@ impl CayenneTableProvider {
             {
                 let _publish = self.mem_tier_publish_lock.lock().await;
                 self.clear_flushed_mem_tier_state_under_publish_lock(
-                    snapshot.segments.len(),
+                    flushed_segment_count,
                     !inlined_view.is_empty(),
                 )
                 .await?;
@@ -13007,8 +13124,16 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
 
+            // Commit ONLY the flushed prefix's tombstones to the published
+            // deletion snapshot + durable delete files (`flush_view`, not the whole
+            // captured `snapshot`). The retained suffix's tombstones stay in the
+            // RAM tier; the scan-time merge-on-read (`merged_deletion_snapshot`)
+            // re-applies them to this new durable file. Persisting a suffix
+            // tombstone here would bake an UN-acked DELETE into the durable prefix,
+            // losing a still-live prefix row if that DELETE is rolled back by a
+            // crash before its own checkpoint.
             let update = self
-                .commit_mem_tier_checkpoint_metadata(&snapshot, &new_snapshot_id, sequence_number)
+                .commit_mem_tier_checkpoint_metadata(&flush_view, &new_snapshot_id, sequence_number)
                 .await?;
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
@@ -13033,7 +13158,7 @@ impl CayenneTableProvider {
                 {
                     let _publish = self.mem_tier_publish_lock.lock().await;
                     self.clear_flushed_mem_tier_state_under_publish_lock(
-                        snapshot.segments.len(),
+                        flushed_segment_count,
                         !inlined_view.is_empty(),
                     )
                     .await?;
@@ -13072,12 +13197,16 @@ impl CayenneTableProvider {
         Ok(u64::try_from(flushed_mem_rows).unwrap_or(u64::MAX))
     }
 
-    /// Swap the mem tier to its remainder after a checkpoint flushed every
-    /// segments — an append-ordered prefix of the flushed snapshot. A concurrent
-    /// append that grew the tier ABOVE the snapshot (which the two-phase
+    /// Swap the mem tier to its remainder after a checkpoint flushed the first
+    /// `flushed_segment_count` segments — an append-ordered prefix of the flushed
+    /// snapshot. This is `K == captured-len` for a full checkpoint and `K < len`
+    /// for a PARTIAL prefix spill (`checkpoint_mem_tier_prefix`); either way the
+    /// retained suffix `[K..)` stays resident (un-acked, replayable). A concurrent
+    /// append that grew the tier ABOVE the captured snapshot (which the two-phase
     /// checkpoint allows, since its encode/commit run OUTSIDE the listing fence)
-    /// is preserved: we drop the flushed prefix and KEEP ONLY the survivor
-    /// segments, re-folding their tombstones/bytes/rows via
+    /// is preserved: we drop the flushed prefix and KEEP the survivor segments
+    /// (the un-flushed partial suffix AND any concurrently-appended segments),
+    /// re-folding their tombstones/bytes/rows via
     /// [`MemTier::retain_after`]. Keeping the whole tier instead would re-flush
     /// the already-durable prefix into a second file on the next checkpoint — a
     /// double-count (the bug the off-fence move exposed). Checkpoints are
@@ -19775,6 +19904,387 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_ckpt_concurrent").await,
             6,
             "the off-fence durable checkpoint is reload-stable"
+        );
+    }
+
+    /// Records the LAST `durable_epoch` the slot advancer was fired with (the
+    /// value the runtime acks the source slot to). A partial prefix checkpoint
+    /// must fire it with the FLUSHED PREFIX's epoch only — strictly below the
+    /// retained suffix's epoch — so the un-acked suffix replays on crash.
+    #[derive(Clone)]
+    struct EpochRecorder(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    #[async_trait::async_trait]
+    impl crate::provider::mem_tier::SlotAdvancer for EpochRecorder {
+        async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+            self.0
+                .store(durable_epoch, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// PARTIAL-PREFIX checkpoint (lever T1): seed N disjoint-key segments, flush a
+    /// prefix spanning ~half via `checkpoint_mem_tier_prefix`, and assert the
+    /// O(prefix) split is exact: (i) the retained suffix stays resident in RAM
+    /// (`retain_after` kept exactly the un-flushed segments), (ii) the union scan
+    /// still sees every row (durable prefix file ∪ RAM suffix), (iii) COUNT(*) is
+    /// exact, and (iv) the slot advanced ONLY to the flushed prefix's last epoch —
+    /// the suffix's epoch is strictly greater than the acked epoch (the un-acked,
+    /// replayable tail). A subsequent FULL checkpoint then drains the suffix and
+    /// advances the slot to the tier epoch.
+    #[tokio::test]
+    async fn mem_tier_partial_prefix_flushes_only_the_prefix() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_partial_prefix",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(std::sync::Arc::clone(&durable))));
+
+        // Seed four disjoint-key segments (epochs 1..=4). Disjoint keys → no
+        // tombstones, so the prefix/suffix boundary is a clean row partition.
+        let no_deletions = OnConflictDeletions::default();
+        let mut per_segment_bytes = 0u64;
+        for seg in 0..4_i64 {
+            let start = seg * 10 + 1; // 1.., 11.., 21.., 31..
+            let batch = id_value_batch(Arc::clone(&schema), &[start, start + 1], &[start, start + 1]);
+            per_segment_bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, per_segment_bytes, 0)
+                .await
+                .expect("seed segment");
+        }
+        let tier = provider.mem_tier.load();
+        assert_eq!(tier.segments.len(), 4, "four segments seeded");
+        assert_eq!(tier.epoch, 4, "tier epoch advanced once per append");
+        assert_eq!(tier.rows, 8, "eight rows across four segments");
+
+        // Target ~half the tier: enough bytes to flush exactly the first TWO
+        // segments (cumulative of 2 segments, just under the 3rd's cumulative).
+        let target = per_segment_bytes * 2;
+        let flushed = provider
+            .checkpoint_mem_tier_prefix(target)
+            .await
+            .expect("partial prefix checkpoint");
+        assert_eq!(flushed, 4, "the flushed prefix held four rows (two segments)");
+
+        // (i) retain_after kept exactly the un-flushed suffix in RAM.
+        let after = provider.mem_tier.load();
+        assert_eq!(
+            after.segments.len(),
+            2,
+            "the two un-flushed suffix segments remain resident"
+        );
+        assert_eq!(after.rows, 4, "the suffix's four rows remain in RAM");
+        assert_eq!(
+            after.epoch, 4,
+            "the monotone tier epoch is preserved across the partial clear"
+        );
+
+        // (iv) the slot advanced ONLY to the flushed prefix's last epoch (segment
+        // index 1 → epoch 2), strictly below the retained suffix's epoch (4).
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the slot advanced only to the flushed prefix's last segment epoch"
+        );
+        let suffix_min_epoch = after.segments.first().expect("suffix segment").epoch;
+        assert!(
+            suffix_min_epoch > durable.load(std::sync::atomic::Ordering::SeqCst),
+            "the retained suffix's epoch ({suffix_min_epoch}) is un-acked (> the acked prefix epoch)"
+        );
+
+        // (ii)+(iii) the union scan (durable prefix file ∪ RAM suffix) is exact.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "mem_partial_prefix").await,
+            vec![
+                (1, 1),
+                (2, 2),
+                (11, 11),
+                (12, 12),
+                (21, 21),
+                (22, 22),
+                (31, 31),
+                (32, 32)
+            ],
+            "every row is visible exactly once across the prefix/suffix boundary"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_partial_prefix").await,
+            8,
+            "COUNT(*) over the union is exact after the partial flush"
+        );
+
+        // A FULL checkpoint then drains the suffix and advances the slot to the
+        // tier epoch (4) — the partial flush left durability strictly progressing.
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("full checkpoint drains the suffix");
+        assert!(provider.mem_tier.load().is_empty(), "tier fully drained");
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "the follow-up full checkpoint advanced the slot to the tier epoch"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_partial_prefix").await,
+            8,
+            "COUNT(*) is exact after draining the suffix"
+        );
+    }
+
+    /// PARTIAL-PREFIX crash/replay safety (the data-loss seam): after a partial
+    /// checkpoint flushes the prefix, a crash (drop + reopen from the durable
+    /// metastore) loses the un-acked RAM suffix — the reopened table sees ONLY the
+    /// durably-flushed prefix. The source then re-streams the suffix (slot was
+    /// acked only to the prefix epoch); re-applying it converges to the EXACT
+    /// full set with NO loss and NO double-count (the over-count failure mode the
+    /// off-fence checkpoint first surfaced).
+    #[tokio::test]
+    async fn mem_tier_partial_prefix_crash_replays_unacked_suffix_exactly_once() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_partial_replay",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(std::sync::Arc::clone(&durable))));
+
+        // Three disjoint-key segments (epochs 1..=3).
+        let no_deletions = OnConflictDeletions::default();
+        let seg_batches: Vec<RecordBatch> = (0..3_i64)
+            .map(|seg| {
+                let start = seg * 10 + 1;
+                id_value_batch(Arc::clone(&schema), &[start, start + 1], &[start, start + 1])
+            })
+            .collect();
+        let mut per_segment_bytes = 0u64;
+        for batch in &seg_batches {
+            per_segment_bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch.clone()], &no_deletions, per_segment_bytes, 0)
+                .await
+                .expect("seed segment");
+        }
+
+        // Flush only the FIRST segment (prefix epoch 1); segments 2+3 stay un-acked.
+        provider
+            .checkpoint_mem_tier_prefix(per_segment_bytes)
+            .await
+            .expect("partial prefix checkpoint of segment 1");
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the slot acked only the flushed prefix (epoch 1)"
+        );
+        assert_eq!(
+            provider.mem_tier.load().segments.len(),
+            2,
+            "segments 2 and 3 remain un-acked in RAM"
+        );
+
+        // CRASH: drop the provider (RAM suffix lost) and reopen from the durable
+        // metastore. Only the durably-flushed prefix survives.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+            .open("mem_partial_replay")
+            .await
+            .expect("reopen after partial checkpoint");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "mem_partial_replay").await,
+            vec![(1, 1), (2, 2)],
+            "a crash loses the un-acked suffix; only the durable prefix survives"
+        );
+
+        // Re-arm and re-stream the un-acked suffix (segments 2+3), exactly as the
+        // source would from the slot's confirmed position.
+        reopened.install_slot_advancer(Arc::new(EpochRecorder(std::sync::Arc::clone(&durable))));
+        for batch in seg_batches.iter().skip(1) {
+            let bytes = batch.get_array_memory_size() as u64;
+            reopened
+                .append_to_mem_tier(vec![batch.clone()], &no_deletions, bytes, 0)
+                .await
+                .expect("replay un-acked suffix segment");
+        }
+        reopened
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint the replayed suffix durable");
+
+        // Converges EXACTLY — no loss, no double-count across the crash boundary.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, "mem_partial_replay").await,
+            vec![(1, 1), (2, 2), (11, 11), (12, 12), (21, 21), (22, 22)],
+            "re-applying the un-acked suffix converges exactly-once (no loss, no double-count)"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &reopened, "mem_partial_replay").await,
+            6,
+            "COUNT(*) is exact after the partial-checkpoint crash + suffix replay"
+        );
+
+        // Durable across a SECOND reopen.
+        let reopened2 = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("mem_partial_replay")
+            .await
+            .expect("second reopen");
+        assert_eq!(
+            query_count_star(&ctx, &reopened2, "mem_partial_replay").await,
+            6,
+            "the converged set is durable across restart"
+        );
+    }
+
+    /// PARTIAL-PREFIX cap relief (the production trigger): with a small per-table
+    /// byte cap, a cap-breaching incoming batch on the real CDC write path fires
+    /// the inline spill (`spill_mem_tier_if_cap_breached` →
+    /// `checkpoint_mem_tier_prefix`), which flushes only the oldest prefix needed
+    /// to re-admit the batch. Assert the tier ends STRICTLY under the cap, the
+    /// append succeeds, and COUNT(*) is exact — the cap stays a hard bound while
+    /// the spill is O(prefix), not a whole-tier encode.
+    #[tokio::test]
+    async fn mem_tier_partial_prefix_cap_relief_admits_batch_under_cap() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        // Size the cap to a few segments so an incoming batch breaches it and the
+        // inline spill must free an oldest prefix to re-admit it.
+        let probe = id_value_batch(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            ])),
+            &[1, 2],
+            &[1, 2],
+        );
+        let one_batch_bytes = probe.get_array_memory_size() as u64;
+        let cap = one_batch_bytes * 3; // ~3 batches fit before a breach
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_partial_cap",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                cdc_mem_tier_max_bytes: i64::try_from(cap).expect("cap fits i64"),
+                cdc_mem_tier_min_flush_bytes: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        // Arm the RAM tier so the CDC write path engages memory mode (and the spill
+        // can fire its slot advancer).
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Append disjoint-key batches through the real write path until the tier
+        // approaches the cap, then one more batch breaches it and triggers the
+        // inline partial spill.
+        let mut total_rows = 0_i64;
+        for seg in 0..6_i64 {
+            let start = seg * 10 + 1;
+            let batch = id_value_batch(Arc::clone(&schema), &[start, start + 1], &[start, start + 1]);
+            let _write = provider
+                .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                .await
+                .expect("CDC append through the real write path");
+            total_rows += 2;
+
+            // INVARIANT (hard cap): after each append the resident tier is strictly
+            // under the cap — the inline spill freed an oldest prefix whenever the
+            // incoming batch would have breached it.
+            let tier_bytes = provider.mem_tier.load().bytes;
+            assert!(
+                tier_bytes < cap,
+                "seg {seg}: resident tier bytes ({tier_bytes}) must stay strictly under the cap ({cap})"
+            );
+        }
+
+        // No rows lost across the spills (union scan = every appended row once).
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_partial_cap").await,
+            total_rows,
+            "COUNT(*) over the union is exact after cap-driven partial spills"
+        );
+    }
+
+    /// DEGENERATE target: `checkpoint_mem_tier_prefix` with a target exceeding the
+    /// whole tier behaves IDENTICALLY to `checkpoint_mem_tier` — it flushes every
+    /// segment, retains none, and advances the slot to the tier epoch.
+    #[tokio::test]
+    async fn mem_tier_partial_prefix_target_over_tier_flushes_all() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_partial_degenerate",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        let durable = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        provider.install_slot_advancer(Arc::new(EpochRecorder(std::sync::Arc::clone(&durable))));
+
+        let no_deletions = OnConflictDeletions::default();
+        for seg in 0..3_i64 {
+            let start = seg * 10 + 1;
+            let batch = id_value_batch(Arc::clone(&schema), &[start, start + 1], &[start, start + 1]);
+            let bytes = batch.get_array_memory_size() as u64;
+            provider
+                .append_to_mem_tier(vec![batch], &no_deletions, bytes, 0)
+                .await
+                .expect("seed segment");
+        }
+        assert_eq!(provider.mem_tier.load().epoch, 3, "three segments seeded");
+
+        // A target larger than the whole tier caps at K = segments.len(): full flush.
+        let flushed = provider
+            .checkpoint_mem_tier_prefix(u64::MAX)
+            .await
+            .expect("over-target prefix checkpoint");
+        assert_eq!(flushed, 6, "all six rows flushed (the whole tier)");
+        assert!(
+            provider.mem_tier.load().is_empty(),
+            "the degenerate over-target flush retains nothing (identical to a full checkpoint)"
+        );
+        assert_eq!(
+            durable.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the slot advanced to the full tier epoch, as a full checkpoint would"
+        );
+        assert_eq!(
+            query_count_star(&ctx, &provider, "mem_partial_degenerate").await,
+            6,
+            "COUNT(*) is exact after the full (degenerate-target) flush"
         );
     }
 
