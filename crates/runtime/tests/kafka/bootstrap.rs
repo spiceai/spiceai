@@ -390,15 +390,7 @@ async fn wait_for_topic_partitions(
     const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 
     for attempt in 1..=MAX_RETRIES {
-        let client = producer.client();
-        let topic_name = topic.to_string();
-        let metadata_result = tokio::task::spawn_blocking(move || {
-            client.fetch_metadata(Some(topic_name.as_str()), METADATA_TIMEOUT)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Kafka metadata fetch task failed: {e}"))?;
-
-        match metadata_result {
+        match producer.client().fetch_metadata(Some(topic), METADATA_TIMEOUT) {
             Ok(metadata) => {
                 let partition_count = metadata
                     .topics()
