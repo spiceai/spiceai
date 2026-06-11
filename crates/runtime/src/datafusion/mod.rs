@@ -2396,6 +2396,12 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        accelerated_table_builder.cdc_param_overrides(
+            crate::accelerated_table::refresh_task::changes::extract_cdc_param_overrides(
+                &acceleration_settings.params,
+            )
+            .map(Arc::new),
+        );
         if matches!(refresh_mode, RefreshMode::Caching) {
             // Hide the storage-only namespace column from query planning. Users
             // see the same columns they would have seen pre-isolation.
