@@ -104,7 +104,7 @@ pub struct BroadcastJoinFlightSqlExec {
     cookie_store: Arc<CookieStore>,
     output_schema: SchemaRef,
     trace_parent: Option<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     statistics: Statistics,
 }
 
@@ -117,12 +117,12 @@ impl BroadcastJoinFlightSqlExec {
         trace_parent: Option<String>,
         statistics: Statistics,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             sql,
             client,
@@ -156,7 +156,7 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -189,10 +189,6 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
         let stream = query_to_stream(client, self.sql.clone(), Arc::clone(&self.cookie_store))
             .map(move |res| res.and_then(|batch| coerce_batch(batch, &target_for_map)));
         Ok(Box::pin(RecordBatchStreamAdapter::new(target, stream)))
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.statistics.clone())
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
