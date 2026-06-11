@@ -172,6 +172,16 @@ fn is_transient_by_display(msg: &str) -> bool {
         // surface, just slower.)
         "sqlstate 55006",
         "is active for pid",
+        // SQLSTATE 53300 (too_many_connections) for walsenders: "number of
+        // requested standby connections exceeds max_wal_senders". During a
+        // rolling deploy the outgoing instance still holds its walsender, so
+        // a capped server can momentarily have no free slots. Retry with
+        // backoff; if the server is genuinely over-subscribed the stream
+        // keeps retrying visibly (reconnect logs + metrics) instead of
+        // fatally ending every dataset on the shared slot.
+        "sqlstate 53300",
+        "max_wal_senders",
+        "too many connections",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
@@ -223,6 +233,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slot_contention_errors_are_transient() {
+        // Both raced-walsender shapes observed during rolling deploys: the
+        // outgoing instance still holds the slot / a walsender seat for a
+        // moment. These MUST retry — on a shared slot a fatal classification
+        // terminates every member dataset.
+        for msg in [
+            "server error: replication slot \"s\" is active for PID 123 (SQLSTATE 55006)",
+            "server error: number of requested standby connections exceeds max_wal_senders (currently 5) (SQLSTATE 53300)",
+        ] {
+            assert!(
+                is_transient_pgwire(&pgwire_replication::PgWireError::Server(msg.to_string())),
+                "must be transient: {msg}"
+            );
+        }
+        // A structured server error (permission denied) stays fatal.
+        assert!(!is_transient_pgwire(
+            &pgwire_replication::PgWireError::Server(
+                "server error: permission denied for database app (SQLSTATE 42501)".to_string()
+            )
+        ));
+    }
+
     use super::*;
 
     #[test]

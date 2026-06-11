@@ -115,6 +115,35 @@ impl TransactionBuffer {
     }
 }
 
+/// Resolve `Value::Unchanged` (`TOAST`ed columns omitted from an UPDATE's new
+/// tuple) by substituting the value from the old tuple, when `REPLICA
+/// IDENTITY FULL` provides one — for an *unchanged* column, the old value IS
+/// the current value, so the substitution is exact (the same merge Debezium
+/// performs).
+///
+/// The old tuple may be key-only (pgoutput `K` tag under `REPLICA IDENTITY
+/// DEFAULT` when key columns change): it has full column arity but NULLs for
+/// non-key columns. A `u` marker implies the real value is non-NULL, so a
+/// NULL old slot means "value not provided", never "value is NULL" — in that
+/// case the marker is left in place and the change-batch build fails with the
+/// actionable REPLICA-IDENTITY-FULL hint, instead of silently overwriting the
+/// accelerator's value with NULL.
+#[must_use]
+pub fn merge_unchanged_toast(mut new: TupleData, old: Option<&TupleData>) -> TupleData {
+    let Some(old) = old else {
+        return new;
+    };
+    for (idx, column) in new.columns.iter_mut().enumerate() {
+        if matches!(column, Some(Value::Unchanged))
+            && let Some(Some(old_value)) = old.columns.get(idx)
+            && !matches!(old_value, Value::Unchanged)
+        {
+            *column = Some(old_value.clone());
+        }
+    }
+    new
+}
+
 /// Build a `ChangeBatch` from a list of decoded changes, typing the `data`
 /// struct to the accelerator's Arrow schema.
 ///
@@ -1743,6 +1772,47 @@ mod tests {
             panic!("expected Interval rejection");
         };
         assert!(err.to_string().contains("INTERVAL"));
+    }
+
+    #[test]
+    fn unchanged_toast_merges_from_old_tuple_under_replica_identity_full() {
+        // REPLICA IDENTITY FULL: the UPDATE's old tuple carries the real
+        // value of the unchanged TOASTed column; the merge substitutes it.
+        let new = TupleData {
+            columns: vec![Some(PgValue::Text("1".into())), Some(PgValue::Unchanged)],
+        };
+        let old = TupleData {
+            columns: vec![
+                Some(PgValue::Text("1".into())),
+                Some(PgValue::Text("big toasted value".into())),
+            ],
+        };
+        let merged = merge_unchanged_toast(new, Some(&old));
+        assert!(
+            matches!(&merged.columns[1], Some(PgValue::Text(s)) if s == "big toasted value"),
+            "unchanged TOAST column must take the old tuple's value"
+        );
+
+        // And the merged tuple builds a valid change batch.
+        let schema = non_nullable_users_schema();
+        let batch = build_change_batch(
+            &schema,
+            &make_relation(),
+            &[DecodedChange {
+                op: ChangeOp::Update,
+                row: merged,
+            }],
+        )
+        .expect("merged update must build");
+        assert_op_column(&batch, &["u"]);
+
+        // Old tuple with a NULL in that slot (or no old tuple at all) leaves
+        // the marker untouched/NULL appropriately.
+        let new = TupleData {
+            columns: vec![Some(PgValue::Text("1".into())), Some(PgValue::Unchanged)],
+        };
+        let untouched = merge_unchanged_toast(new, None);
+        assert!(matches!(&untouched.columns[1], Some(PgValue::Unchanged)));
     }
 
     #[test]
