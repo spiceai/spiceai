@@ -43,7 +43,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
-    common::{Constraints, Statistics},
+    common::{Constraints, Statistics, utils::quote_identifier},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, context::SessionContext},
     logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
@@ -944,7 +944,7 @@ fn make_on_refresh_write_handler(
                         Some(false) => " NULLS LAST",
                         None => "",
                     };
-                    format!("\"{}\" {}{nulls}", sc.column, sc.direction)
+                    format!("{} {}{nulls}", quote_identifier(&sc.column), sc.direction)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

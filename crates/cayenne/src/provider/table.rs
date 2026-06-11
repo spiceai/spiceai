@@ -5624,7 +5624,7 @@ impl CayenneTableProvider {
             tracing::warn!(
                 table = self.table_metadata.table_name.as_str(),
                 missing = ?missing,
-                "Configured cayenne_shard_key_columns reference columns absent from the table schema; falling back to the primary key shard key"
+                "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
             );
         }
         self.pk_column_indices

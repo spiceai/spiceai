@@ -265,10 +265,11 @@ fn apply_inferred_shard_key(
     }
     // Equal to the effective primary key (user-set or just-inferred) — the
     // engine already hash-clusters by the PK, so the param would be redundant.
+    // Compare in order: hash clustering is order-sensitive, so a shard key with
+    // the same columns as the PK but a different column order is NOT redundant.
     if let Some(pk) = &acceleration.primary_key {
-        let pk_set: BTreeSet<String> = pk.iter().map(ToString::to_string).collect();
-        let key_set: BTreeSet<String> = inferred.shard_key.iter().cloned().collect();
-        if pk_set == key_set {
+        let pk_cols: Vec<String> = pk.iter().map(ToString::to_string).collect();
+        if pk_cols == inferred.shard_key {
             return false;
         }
     }
@@ -644,6 +645,25 @@ mod tests {
         };
         apply_inferred_schema(&mut acc, &inferred, &schema(&["id"]), "ds");
         assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
+    }
+
+    #[test]
+    fn applies_shard_key_that_reorders_primary_key_columns() {
+        // Hash clustering is order-sensitive, so a shard key with the same
+        // columns as the PK but a different column order is NOT redundant.
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            primary_key: vec!["a".to_string(), "b".to_string()],
+            shard_key: vec!["b".to_string(), "a".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["a", "b"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("cayenne_shard_key_columns")
+                .map(String::as_str),
+            Some("b, a")
+        );
     }
 
     #[test]
