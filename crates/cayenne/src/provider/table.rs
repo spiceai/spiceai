@@ -2086,6 +2086,12 @@ pub struct CayenneTableProvider {
     /// per-table write lock continues to serialize ordinary inserts
     /// independently.
     compaction_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Instant before which the next position-delete protected-snapshot merge is
+    /// deferred (adaptive rate limit; see [`PROTECTED_MERGE_COOLDOWN_FACTOR`]).
+    /// `None` until the first merge arms it. Shared across `clone_for_write`
+    /// clones so the cap is per-table, not per-clone, and gates both the
+    /// write-driven and background compaction drivers.
+    protected_merge_cooldown_until: Arc<ParkingMutex<Option<Instant>>>,
     /// Coalesces write-driven compaction notifications so a high-ingest table
     /// does not spawn one background compaction task per append while a prior
     /// notification is still pending.
@@ -3029,6 +3035,18 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 
+/// Adaptive cooldown multiplier for the position-delete protected-snapshot merge
+/// path: after a merge that took `D`, the next one on that table is deferred by
+/// `D * PROTECTED_MERGE_COOLDOWN_FACTOR`. This bounds compaction's duty cycle to
+/// roughly `1 / (1 + factor)` regardless of merge size, so under continuous CDC
+/// the merge keeps read amplification in check on a steady cadence WITHOUT the
+/// expensive single-output serial encode monopolizing the shared object store,
+/// list-files cache, and memory pool (which regressed SF100 queries ~5x when the
+/// path drained flat-out). Key-delete merges (cheap sharded encode) are not
+/// rate-limited. Function-scoped for now — promote to a `CayenneContext` knob if
+/// the policy needs per-table tuning.
+const PROTECTED_MERGE_COOLDOWN_FACTOR: u32 = 4;
+
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
 /// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
 /// up to `growth`× the previous tier's ceiling.
@@ -3106,6 +3124,79 @@ fn select_protected_snapshot_merge_tier(
     }
 
     Vec::new()
+}
+
+/// Which trigger selected a protected-snapshot subset merge. Kept distinct so the
+/// two paths are legible in compaction logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubsetMergeTrigger {
+    /// A size tier accumulated at least `compaction_trigger_protected_snapshots`
+    /// same-size runs.
+    ProtectedSnapshotCount,
+    /// The protected set holds at least `compaction_trigger_files` small files,
+    /// so the run floor was lowered to 2 to relieve the file-count pressure.
+    SmallFileCount,
+}
+
+impl SubsetMergeTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtectedSnapshotCount => "protected_snapshot_count",
+            Self::SmallFileCount => "small_file_count",
+        }
+    }
+}
+
+/// Decide which protected snapshots to consolidate this pass, and which trigger
+/// fired. Two triggers, checked in order so the write-amplification-cheaper
+/// snapshot-count trigger wins when both apply:
+///
+/// 1. **Snapshot count** — the lowest size tier that has accumulated at least
+///    `count_trigger_runs` same-size runs (see
+///    [`select_protected_snapshot_merge_tier`]).
+/// 2. **Small-file count** — even below that floor, a protected set holding many
+///    small files inflates scan fan-out and object-store LIST cost exactly like
+///    small files in the current snapshot. So when the candidates collectively
+///    hold at least `small_file_trigger` small files (`total_small_files`), merge
+///    the lowest size tier with the run floor lowered to 2. Restricting selection
+///    to a single size tier (rather than folding in every small file regardless
+///    of run size) preserves the O(log N)-per-byte write-amplification bound; if
+///    no tier has two same-size runs the pass is deferred and a later trigger
+///    retries as more same-tier runs accrue.
+///
+/// `inputs` is `(snapshot_id, deletion_threshold, bytes)` oldest-first. Returns
+/// the selected `(snapshot_id, deletion_threshold)` pairs (always `>= 2` when a
+/// trigger fired) together with that trigger, or `(empty, None)` when neither
+/// qualifies.
+fn select_protected_snapshot_subset_merge(
+    inputs: &[(String, i64, u64)],
+    count_trigger_runs: usize,
+    small_file_trigger: usize,
+    total_small_files: usize,
+    max_width: usize,
+    base_bytes: u64,
+    growth: u64,
+) -> (Vec<(String, i64)>, Option<SubsetMergeTrigger>) {
+    let by_count = select_protected_snapshot_merge_tier(
+        inputs,
+        count_trigger_runs,
+        max_width,
+        base_bytes,
+        growth,
+    );
+    if by_count.len() >= 2 {
+        return (by_count, Some(SubsetMergeTrigger::ProtectedSnapshotCount));
+    }
+
+    if small_file_trigger > 0 && total_small_files >= small_file_trigger {
+        let by_files =
+            select_protected_snapshot_merge_tier(inputs, 2, max_width, base_bytes, growth);
+        if by_files.len() >= 2 {
+            return (by_files, Some(SubsetMergeTrigger::SmallFileCount));
+        }
+    }
+
+    (Vec::new(), None)
 }
 
 /// Write shape — encoder fan-out cap and size estimate — for the
@@ -4984,6 +5075,7 @@ impl CayenneTableProvider {
             new_files_since_last_compaction: Arc::new(AtomicUsize::new(0)),
             last_moved_snapshot_files: Arc::new(ParkingMutex::new(None)),
             compaction_lock: Arc::new(tokio::sync::Mutex::new(())),
+            protected_merge_cooldown_until: Arc::new(ParkingMutex::new(None)),
             post_write_compaction_scheduled: Arc::new(AtomicBool::new(false)),
             post_write_maintenance: Arc::new(PostWriteMaintenance::default()),
             background_compactor: Arc::new(std::sync::OnceLock::new()),
@@ -5711,6 +5803,7 @@ impl CayenneTableProvider {
             // Shared so inline (write-driven) and background compaction
             // attempts on the same table coordinate, even across clones.
             compaction_lock: Arc::clone(&self.compaction_lock),
+            protected_merge_cooldown_until: Arc::clone(&self.protected_merge_cooldown_until),
             post_write_compaction_scheduled: Arc::clone(&self.post_write_compaction_scheduled),
             post_write_maintenance: Arc::clone(&self.post_write_maintenance),
             background_compactor: Arc::clone(&self.background_compactor),
@@ -10185,8 +10278,7 @@ impl CayenneTableProvider {
         // (catalog CAS + in-memory protected-set flip) with writers and staged
         // visibility flips (see Phase 3), instead of holding `write_lock` across
         // the whole multi-second rewrite — which previously grabbed it via
-        // `try_lock` and either skipped the pass or starved writers for the
-        // rewrite's duration.
+        // `try_lock` and starved writers for the rewrite's duration.
         let serialize_position_deletes = self.should_capture_positions();
 
         let Ok(_guard) = self.compaction_lock.try_lock() else {
@@ -10196,6 +10288,40 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         };
+
+        // Rate-limit the position-delete merge path. Unlike a writer-activity
+        // gate (which would starve the merge entirely under continuous CDC and let
+        // read amplification run away), this adaptive cooldown fires regardless of
+        // in-flight writes, so the protected set still gets merged on a steady
+        // cadence while writing — just not so often that the expensive
+        // single-output serial encode monopolizes the shared object store,
+        // list-files cache, and memory pool and starves queries (a ~5x SF100
+        // regression when the path drained flat-out). Compaction-produced merged
+        // snapshots also never get position re-capture (`capture_new_file_positions`
+        // only scans the current snapshot), so over-eager merging strands rows on
+        // key-based deletion probes that page-skipping position vectors would
+        // otherwise serve — another reason to pace this path.
+        //
+        // The cooldown is armed at the end of each successful merge to
+        // `now + merge_duration * PROTECTED_MERGE_COOLDOWN_FACTOR`, bounding the
+        // duty cycle independent of merge size. Key-delete merges skip this and
+        // keep draining freely. The rewrite below still runs lock-free, so a writer
+        // is never blocked by compaction.
+        let cooldown_until = if serialize_position_deletes {
+            *self.protected_merge_cooldown_until.lock()
+        } else {
+            None
+        };
+        if let Some(until) = cooldown_until
+            && Instant::now() < until
+        {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping protected-snapshot subset compaction: position-merge cooldown active",
+            );
+            return Ok(false);
+        }
 
         let compaction_start = std::time::Instant::now();
 
@@ -10243,11 +10369,30 @@ impl CayenneTableProvider {
         // + file count. Sizes drive the size-tier selection and reveal the size
         // distribution (e.g. one carried-forward merged snapshot dwarfing the
         // small new deltas). This is diagnostic I/O outside the fence.
+        // The picker config drives BOTH the small-file classification used by the
+        // small-file-count trigger and the trigger threshold itself
+        // (`compaction_trigger_files`, the same knob the current-snapshot picker
+        // reads — see `compaction_picker_config`). Read it once so the live,
+        // dynamically-tuned value stays consistent across sizing and selection.
+        let picker_cfg = self.context.compaction_picker_config();
+        let small_max_bytes = picker_cfg.tiers.small_max_bytes;
+
         let sizing_start = std::time::Instant::now();
         let mut sized_candidates: Vec<(String, i64, u64)> = Vec::with_capacity(candidates.len());
+        // Count of "small" files (below `small_max_bytes`) held across ALL
+        // candidates — the protected-snapshot analogue of the current snapshot's
+        // small-file count. Drives the small-file-count trigger, and is computed
+        // for free from the same listing the size-tiering already needs.
+        let mut total_small_files: usize = 0;
         for (snapshot_id, threshold) in &candidates {
             let bytes = match self.list_snapshot_files_with_sizes(snapshot_id).await {
-                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                Ok(files) => {
+                    total_small_files += files
+                        .iter()
+                        .filter(|(_, size)| *size < small_max_bytes)
+                        .count();
+                    files.iter().map(|(_, sz)| *sz).sum()
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "cayenne::compaction",
@@ -10271,26 +10416,30 @@ impl CayenneTableProvider {
         // only when its tier fills up and it levels up) and read amplification
         // to at most `min_runs - 1` un-merged runs per tier — instead of folding
         // the large carried-forward blob back in on every pass.
-        let min_runs = self.context.compaction_trigger_protected_snapshots().max(2);
-        let inputs = select_protected_snapshot_merge_tier(
+        let count_trigger_runs = self.context.compaction_trigger_protected_snapshots().max(2);
+        let (inputs, trigger) = select_protected_snapshot_subset_merge(
             &sized_candidates,
-            min_runs,
+            count_trigger_runs,
+            picker_cfg.trigger_files,
+            total_small_files,
             PROTECTED_MERGE_MAX_WIDTH,
             PROTECTED_TIER_BASE_BYTES,
             PROTECTED_TIER_GROWTH,
         );
 
-        if inputs.len() < 2 {
+        let Some(trigger) = trigger else {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 candidates = sized_candidates.len(),
-                min_runs,
+                count_trigger_runs,
+                total_small_files,
+                small_file_trigger = picker_cfg.trigger_files,
                 tier_base_bytes = PROTECTED_TIER_BASE_BYTES,
-                "Skipping fast protected-snapshot compaction: no size tier has enough runs to merge"
+                "Skipping fast protected-snapshot compaction: no size tier has enough runs and protected small-file count below trigger"
             );
             return Ok(false);
-        }
+        };
 
         // Diagnostics over the SELECTED (single-tier) input set.
         let selected_ids: std::collections::HashSet<&str> =
@@ -10320,10 +10469,13 @@ impl CayenneTableProvider {
         tracing::info!(
             target: "cayenne::compaction",
             table = self.table_metadata.table_name.as_str(),
+            trigger = trigger.as_str(),
             input_count = inputs.len(),
             candidate_count = sized_candidates.len(),
             selected_tier,
-            min_runs,
+            count_trigger_runs,
+            total_small_files,
+            small_file_trigger = picker_cfg.trigger_files,
             fence_max_delete_seq,
             total_input_bytes,
             largest_input_bytes,
@@ -10589,6 +10741,15 @@ impl CayenneTableProvider {
                 self.table_metadata.table_name.clone(),
             )],
         );
+
+        // Arm the adaptive cooldown so the next position-merge on this table is
+        // deferred proportional to how long this one took, bounding the path's
+        // duty cycle (see [`PROTECTED_MERGE_COOLDOWN_FACTOR`]). Key-delete tables
+        // are never gated, so leave their cooldown unset.
+        if serialize_position_deletes {
+            let cooldown = compaction_start.elapsed() * PROTECTED_MERGE_COOLDOWN_FACTOR;
+            *self.protected_merge_cooldown_until.lock() = Some(Instant::now() + cooldown);
+        }
 
         Ok(true)
     }
@@ -15889,22 +16050,41 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // catalog/in-memory swap is serialized with writers (see
         // `compact_protected_snapshots_subset`).
 
-        // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
-        // `listing_fence` and building a session context unless the protected
-        // set already has enough runs to be worth merging. `protected_snapshots`
-        // is an `ArcSwap`, so `load()` is a cheap atomic read. The authoritative
-        // re-check (and size-tiering) still happens under the fence inside
-        // `compact_protected_snapshots_subset`; this guard only avoids wasted
-        // work on the common path where nothing has accumulated yet.
-        let min_inputs = self.context.compaction_trigger_protected_snapshots().max(2);
+        // Cheap lock-free early-outs before acquiring `compaction_lock` /
+        // `listing_fence` or building a session context.
+        //
+        // 1. Defer while a staged append's publish is mid-flight. A subset merge
+        //    reaps the merged-away snapshot dirs after its swap; a staged append
+        //    that has moved its files but not yet published its protected-snapshot
+        //    metadata is not yet in the live protected set, so starting a merge in
+        //    that window races its cleanup against the pending publish. The
+        //    registration is held across the whole prepare→publish window (see
+        //    `InflightStagingAppendGuard`), matching the guard in
+        //    `run_one_compaction_pass`.
+        if self.has_inflight_staging_appends() {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping fast protected-snapshot compaction: staged append finalization is in flight",
+            );
+            return Ok(false);
+        }
+
+        // 2. A subset merge needs at least two protected snapshots. Above that
+        //    floor BOTH merge triggers — the size-tier snapshot-count trigger AND
+        //    the small-file-count trigger (`compaction_trigger_files` applied to
+        //    the files held across protected snapshots) — are decided inside
+        //    `compact_protected_snapshots_subset`, which already lists each
+        //    candidate's files for size-tiering and so evaluates the file trigger
+        //    without an extra listing. `protected_snapshots` is an `ArcSwap`, so
+        //    `load()` is a cheap atomic read.
         let protected_len = self.protected_snapshots.load().len();
-        if protected_len < min_inputs {
+        if protected_len < 2 {
             tracing::trace!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 protected_len,
-                min_inputs,
-                "Skipping fast protected-snapshot compaction: protected set below trigger floor",
+                "Skipping fast protected-snapshot compaction: fewer than two protected snapshots",
             );
             return Ok(false);
         }
@@ -16365,6 +16545,80 @@ mod tests {
     }
 
     #[test]
+    fn subset_merge_prefers_snapshot_count_trigger() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Four tier-0 runs reach the count floor of 3, so the count trigger fires
+        // and wins even though the small-file trigger would also apply.
+        let inputs = vec![
+            sized("a", 100),
+            sized("b", 200),
+            sized("c", 300),
+            sized("d", 400),
+        ];
+        let (selected, trigger) =
+            select_protected_snapshot_subset_merge(&inputs, 3, 2, 100, 32, base, growth);
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        assert_eq!(trigger, Some(SubsetMergeTrigger::ProtectedSnapshotCount));
+    }
+
+    #[test]
+    fn subset_merge_falls_back_to_small_file_count_trigger() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Two tier-0 runs — below the count floor of 8 — so the count trigger does
+        // not fire. With 8 small files across them (>= the small-file trigger) the
+        // floor is lowered to 2 and they merge.
+        let inputs = vec![sized("a", 100), sized("b", 200)];
+        let (selected, trigger) =
+            select_protected_snapshot_subset_merge(&inputs, 8, 8, 8, 32, base, growth);
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(trigger, Some(SubsetMergeTrigger::SmallFileCount));
+    }
+
+    #[test]
+    fn subset_merge_skips_when_below_both_triggers() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // Two tier-0 runs but only 7 small files — below both the count floor (8)
+        // and the small-file trigger (8) — so nothing merges.
+        let inputs = vec![sized("a", 100), sized("b", 200)];
+        let (selected, trigger) =
+            select_protected_snapshot_subset_merge(&inputs, 8, 8, 7, 32, base, growth);
+        assert!(selected.is_empty());
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn subset_merge_small_file_trigger_needs_two_same_tier_runs() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // High small-file count but the two runs sit in different size tiers, so
+        // the write-amplification-bounded selection finds nothing to merge and
+        // defers — a later trigger retries as more same-tier runs accrue.
+        let inputs = vec![sized("a", 1024), sized("b", base * 4)];
+        let (selected, trigger) =
+            select_protected_snapshot_subset_merge(&inputs, 8, 8, 100, 32, base, growth);
+        assert!(selected.is_empty());
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn subset_merge_small_file_trigger_disabled_when_threshold_zero() {
+        let base = 8 * 1024 * 1024;
+        let growth = 8;
+        // A zero threshold disables the small-file trigger entirely (it must not
+        // make every input merge via `total_small_files >= 0`).
+        let inputs = vec![sized("a", 100), sized("b", 200)];
+        let (selected, trigger) =
+            select_protected_snapshot_subset_merge(&inputs, 8, 0, 100, 32, base, growth);
+        assert!(selected.is_empty());
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
     fn protected_snapshot_maintenance_trigger_uses_compaction_count_threshold() {
         let now = UNIX_EPOCH + Duration::from_secs(1_000);
         let warning_keys = ParkingMutex::new(BoundedWarningKeys::default());
@@ -16570,6 +16824,116 @@ mod tests {
                 persisted.get(id),
             );
         }
+    }
+
+    /// The small-file-count trigger: a protected set BELOW the snapshot-count
+    /// floor still merges once it collectively holds at least
+    /// `compaction_trigger_files` small files. Builds a handful of small (tier-0)
+    /// protected snapshots with the count floor pinned far above that handful, so
+    /// only the small-file trigger can fire, then asserts the merge happens and
+    /// preserves every visible row.
+    #[tokio::test]
+    async fn protected_snapshot_subset_compaction_small_file_count_trigger() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // Count floor far above the snapshots we create, so the snapshot-count
+        // trigger cannot fire — the merge must come from the small-file trigger.
+        const COUNT_TRIGGER: usize = 64;
+        const FILE_TRIGGER: usize = 3;
+        let ctx = SessionContext::new();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "compact_subset_small_files".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // File-backed protected snapshots (the compaction's domain).
+                inline_max_rows: 0,
+                compaction_trigger_protected_snapshots: COUNT_TRIGGER,
+                compaction_trigger_files: FILE_TRIGGER,
+                // Pin the background compactor far out so only our explicit call runs.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        let compaction_setup_guard = provider.compaction_lock.lock().await;
+
+        // A handful of small (tier-0) protected snapshots — well under COUNT_TRIGGER
+        // but at least FILE_TRIGGER small files (each insert lands one small file).
+        let n: i64 = 6;
+        for i in 0..n {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+            )
+            .await;
+        }
+
+        let before = provider.protected_snapshots.load_full().len();
+        assert!(
+            (2..COUNT_TRIGGER).contains(&before),
+            "expected between 2 and {COUNT_TRIGGER} protected snapshots (below the count floor), got {before}"
+        );
+        assert!(
+            before >= FILE_TRIGGER,
+            "the protected set must hold at least {FILE_TRIGGER} small files for the small-file trigger"
+        );
+
+        let expected: Vec<(i64, i64)> = (0..n).map(|i| (i, i * 10)).collect();
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "compact_subset_small_files").await,
+            expected,
+            "sanity: all inserted rows visible before compaction"
+        );
+
+        drop(compaction_setup_guard);
+
+        let merged = provider
+            .compact_protected_snapshots_subset(usize::MAX)
+            .await
+            .expect("compaction should not error");
+        assert!(
+            merged,
+            "a protected set holding >= compaction_trigger_files small files must merge \
+             even below the snapshot-count floor"
+        );
+
+        let after = provider.protected_snapshots.load_full().len();
+        assert!(
+            after < before,
+            "the small-file trigger must reduce the protected-snapshot count: {before} -> {after}"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "compact_subset_small_files").await,
+            expected,
+            "compaction must preserve all visible rows"
+        );
     }
 
     /// Engagement test for the size-aware PARALLEL merge encode: a subset

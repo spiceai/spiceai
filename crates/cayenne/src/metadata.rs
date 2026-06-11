@@ -606,12 +606,18 @@ pub struct VortexConfig {
     /// When unset, writes use the current `DataFusion` session target partition count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_concurrency: Option<usize>,
-    /// Minimum number of "small" Vortex files that must accumulate in the current
-    /// snapshot before tiered compaction is eligible to run. Files are classified
-    /// as "small" when their size is below `target_vortex_file_size_mb / 4`. The
-    /// compactor also requires that the eligible tier's total size meets the
-    /// per-tier target before rewriting the current snapshot (see
-    /// [`crate::provider::compaction`]).
+    /// Minimum number of "small" Vortex files that must accumulate before tiered
+    /// compaction is eligible to run. Files are classified as "small" when their
+    /// size is below `target_vortex_file_size_mb / 4`.
+    ///
+    /// This applies in two places. In the current snapshot, the small-file picker
+    /// rewrites the snapshot once the eligible tier's total size also meets the
+    /// per-tier target (see [`crate::provider::compaction`]). Across protected
+    /// snapshots, the fast subset compaction merges them when they collectively
+    /// hold at least this many small files — even if the protected-snapshot count
+    /// is below `compaction_trigger_protected_snapshots` — because too many small
+    /// files inflate scan fan-out and object-store LIST cost regardless of which
+    /// snapshot holds them.
     ///
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
