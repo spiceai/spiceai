@@ -304,6 +304,11 @@ fn install_vss_once(conn: &DuckDbConnection) -> DataFusionResult<()> {
         DataFusionError::Execution(format!("Failed to lock DuckDB VSS install guard: {error}"))
     })?;
     if VSS_INSTALLED.get().is_none() {
+        if conn.conn.execute("LOAD vss", []).is_ok() {
+            let _ = VSS_INSTALLED.set(());
+            return Ok(());
+        }
+
         conn.conn
             .execute("INSTALL vss", [])
             .map_err(to_execution_error)?;

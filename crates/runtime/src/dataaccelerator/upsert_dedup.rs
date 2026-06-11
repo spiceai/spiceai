@@ -78,7 +78,7 @@ impl UpsertDedupTableProvider {
 
     /// Returns true if deduplication is needed based on the upsert options.
     fn needs_dedup(&self) -> bool {
-        self.upsert_options.remove_duplicates || self.upsert_options.last_write_wins
+        !self.upsert_options.is_default()
     }
 
     /// Returns a reference to the inner table provider.
@@ -359,7 +359,7 @@ pub(crate) fn deduplicate_batch(
     constraints: &Constraints,
     upsert_options: &UpsertOptions,
 ) -> datafusion::error::Result<arrow::array::RecordBatch> {
-    if batch.num_rows() == 0 {
+    if batch.num_rows() == 0 || upsert_options.is_default() {
         return Ok(batch.clone());
     }
 
@@ -445,7 +445,7 @@ pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash
 ) -> Arc<dyn TableProvider> {
     let upsert_options = extract_upsert_options(options);
 
-    if upsert_options.remove_duplicates || upsert_options.last_write_wins {
+    if !upsert_options.is_default() {
         Arc::new(UpsertDedupTableProvider::new(
             provider,
             upsert_options,
@@ -453,5 +453,36 @@ pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash
         ))
     } else {
         provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{
+        array::{ArrayRef, Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    #[test]
+    fn deduplicate_batch_is_noop_for_default_upsert_options() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["first", "second", "third"])) as ArrayRef,
+            ],
+        )
+        .expect("should create test batch");
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+
+        let deduped = deduplicate_batch(&batch, &constraints, &UpsertOptions::default())
+            .expect("default upsert options should not deduplicate");
+
+        assert_eq!(deduped.num_rows(), batch.num_rows());
     }
 }

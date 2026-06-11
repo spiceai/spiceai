@@ -56,6 +56,15 @@ const USE_FLIGHT_TRANSFER: bool = false;
 /// Delay between scheduler status polls while waiting for a distributed job.
 const COMPLETED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Number of consecutive polls to tolerate while a submitted job is not visible in scheduler status.
+const MISSING_JOB_STATUS_MAX_POLLS: usize = 600;
+
+enum JobCompletionPoll {
+    Complete(Vec<PartitionLocation>),
+    Pending,
+    Missing,
+}
+
 /// Status of a distributed query job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DistributedJobStatus {
@@ -283,11 +292,24 @@ impl QueryHandle {
         scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
         cancel: &CancellationToken,
     ) -> Result<Vec<PartitionLocation>> {
+        let mut missing_status_polls = 0;
+
         loop {
             tokio::select! {
                 result = self.check_job_completed(scheduler) => {
-                    if let Some(locations) = result? {
-                        return Ok(locations);
+                    match result? {
+                        JobCompletionPoll::Complete(locations) => return Ok(locations),
+                        JobCompletionPoll::Pending => missing_status_polls = 0,
+                        JobCompletionPoll::Missing => {
+                            missing_status_polls += 1;
+                            if missing_status_polls >= MISSING_JOB_STATUS_MAX_POLLS {
+                                let err = QueryHandleError::JobNotFound {
+                                    ballista_job_id: self.ballista_job_id.clone(),
+                                };
+                                self.finish_tracker_with_error(&err);
+                                return Err(err);
+                            }
+                        }
                     }
                     sleep(COMPLETED_STATUS_POLL_INTERVAL).await;
                 }
@@ -303,12 +325,13 @@ impl QueryHandle {
 
     /// Checks if the job is already completed and returns partition locations if so.
     ///
-    /// Returns `Ok(Some(locations))` if the job is complete, `Ok(None)` if still in progress,
+    /// Returns `Complete` if the job is complete, `Pending` if still in progress, `Missing` if
+    /// scheduler status is not currently visible,
     /// or an error if the job failed or status could not be retrieved.
     async fn check_job_completed(
         &self,
         scheduler: &SchedulerServer<LogicalPlanNode, PhysicalPlanNode>,
-    ) -> Result<Option<Vec<PartitionLocation>>> {
+    ) -> Result<JobCompletionPoll> {
         let status = scheduler
             .state
             .task_manager
@@ -324,14 +347,14 @@ impl QueryHandle {
 
         let Some(job_status) = status else {
             // Job not found yet (still being registered)
-            return Ok(None);
+            return Ok(JobCompletionPoll::Missing);
         };
 
         match job_status.status {
             Some(job_status::Status::Successful(success)) => {
                 let locations = self.convert_partition_locations(success.partition_location)?;
                 self.finish_tracker_success();
-                Ok(Some(locations))
+                Ok(JobCompletionPoll::Complete(locations))
             }
             Some(job_status::Status::Failed(failed)) => {
                 let err = QueryHandleError::JobFailed {
@@ -342,7 +365,7 @@ impl QueryHandle {
             }
             Some(job_status::Status::Queued(_) | job_status::Status::Running(_)) | None => {
                 // Job still in progress
-                Ok(None)
+                Ok(JobCompletionPoll::Pending)
             }
         }
     }

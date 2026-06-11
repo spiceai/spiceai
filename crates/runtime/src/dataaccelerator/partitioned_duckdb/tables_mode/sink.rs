@@ -420,7 +420,10 @@ impl PartitionTableManager {
             .duration_since(std::time::UNIX_EPOCH)
             .context(UnableToGetSystemTimeSnafu)?
             .as_millis();
-        let view_name = format!("__scan_{}_{current_ts}", self.table_name());
+        let view_name = format!(
+            "__scan_{}_{current_ts}",
+            sanitize_identifier_fragment(self.table_name())
+        );
         tx.register_arrow_scan_view(&view_name, &stream)
             .context(UnableToRegisterArrowScanViewForTableCreationSnafu)?;
 
@@ -956,7 +959,10 @@ fn write_data_chunk_to_table(
         .map_err(to_datafusion_error)?
         .as_millis();
 
-    let view_name = format!("__scan_{}_{current_ts}", table.table_name());
+    let view_name = format!(
+        "__scan_{}_{current_ts}",
+        sanitize_identifier_fragment(table.table_name())
+    );
 
     tx.register_arrow_scan_view(&view_name, &stream)
         .context(UnableToRegisterArrowScanViewSnafu)
@@ -1317,6 +1323,14 @@ mod test {
                 "Failed to check if main table or view exists for partition {partition_name}: {e}"
             ),
         }
+    }
+
+    #[test]
+    fn sanitize_identifier_fragment_replaces_partition_separators() {
+        assert_eq!(
+            sanitize_identifier_fragment("region=us-east-1/test_table"),
+            "region_us_east_1_test_table"
+        );
     }
 
     #[tokio::test]

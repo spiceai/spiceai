@@ -1,4 +1,6 @@
+use crate::common::search_visitor::SearchVisitor;
 use crate::concrete;
+use crate::physical_plan::duckdb::ConcreteDuckSqlExec;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, Statistics, exec_err, plan_err};
@@ -17,6 +19,8 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
 };
+use datafusion::sql::unparser::Unparser;
+use datafusion::sql::unparser::dialect::DuckDBDialect;
 use datafusion_expr::LogicalPlan;
 use std::any::Any;
 use std::fmt::Formatter;
@@ -226,13 +230,33 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dialect = DuckDBDialect::new();
+        let unparser = Unparser::new(&dialect);
+
         let maybe_new_plan = plan.transform_down(|p| {
             let Some(marker) = concrete!(p, DuckDBAggregatePushdownMarkerExec) else {
                 return Ok(Transformed::no(p));
             };
 
+            let Some(maybe_duck_exec) =
+                SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&p)?
+            else {
+                return exec_err!("DuckDBAggregatePushdownMarkerExec was found with no DuckSqlExec child. This is a bug.");
+            };
+
+            let Some(duck_exec) = concrete!(maybe_duck_exec, ConcreteDuckSqlExec) else {
+                return exec_err!("Cannot cast DuckSqlExec for rewriting. This is a bug.");
+            };
+
+            let optimized_sql = unparser.plan_to_sql(&marker.logical_plan)?;
+            let logical_plan_schema = Arc::clone(marker.logical_plan.schema().inner());
+
+            let rewritten = duck_exec
+                .clone()
+                .with_optimized_sql(optimized_sql.to_string(), Some(logical_plan_schema));
+
             Ok(Transformed::new(
-                Arc::clone(&marker.input),
+                Arc::new(rewritten),
                 true,
                 TreeNodeRecursion::Jump,
             ))
