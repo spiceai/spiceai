@@ -31,6 +31,7 @@ use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
 };
+use runtime::datafusion::udf::deny_spice_functions_for_mysql_table_providers;
 use runtime::parameters::ParameterSpec;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -263,13 +264,13 @@ impl DataConnectorFactory for MySQLFactory {
                     }
                 },
             };
-            // TODO(#10703): table-providers v0.11 removed the upstream
-            // `function_support` deny-list seam, so the Spice-only-UDF
-            // deny-list (json_get_str, embedding/distance UDFs) cannot be
-            // installed on the MySQL factory yet. Restore once the fork
-            // carries a v0.11 deny-list seam or the connector routes through
-            // the shared DenyFunctionsSqlExecutor wrapper.
-            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool));
+            // Install the Spice function deny-list so federation evaluates
+            // Spice-only UDFs (`json_get_str`, the embedding/distance UDFs, etc.)
+            // locally instead of pushing them into the SQL sent to MySQL, where
+            // those functions don't exist and the query would fail with an
+            // "unknown function" error. See issue #10703.
+            let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
+                .with_function_support(deny_spice_functions_for_mysql_table_providers());
 
             Ok(Arc::new(MySQL {
                 mysql_factory,

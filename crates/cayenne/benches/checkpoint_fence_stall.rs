@@ -231,9 +231,7 @@ fn bench_mem_tier_checkpoint_fence_stall(c: &mut Criterion) {
                         // commit it serializes — guards against the model silently
                         // measuring nothing.
                         assert!(
-                            held >= ENCODE.saturating_mul(
-                                u32::try_from(iters).unwrap_or(u32::MAX)
-                            ),
+                            held >= ENCODE.saturating_mul(u32::try_from(iters).unwrap_or(u32::MAX)),
                             "under-fence lane must hold the fence across the encode"
                         );
                         held

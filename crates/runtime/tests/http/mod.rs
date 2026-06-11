@@ -771,8 +771,26 @@ async fn test_http_dynamic_request_headers_from_subquery() -> Result<(), String>
 ///       enabled: true
 ///       refresh_mode: full
 /// ```
-#[tokio::test]
-async fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), String> {
+#[test]
+fn test_http_dynamic_request_headers_accelerated_view() -> Result<(), String> {
+    // The accelerated-view refresh unparses this deeply nested view plan to SQL
+    // for the `task_history` label; on Linux that recursion exceeds the default
+    // ~2 MiB test-thread stack
+    std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to build tokio runtime: {e}"))?
+                .block_on(run_test_http_dynamic_request_headers_accelerated_view())
+        })
+        .map_err(|e| format!("failed to spawn test thread: {e}"))?
+        .join()
+        .map_err(|_| "test thread panicked".to_string())?
+}
+
+async fn run_test_http_dynamic_request_headers_accelerated_view() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 

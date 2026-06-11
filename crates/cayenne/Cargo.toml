@@ -376,8 +376,4 @@ name = "publish_metadata_wall"
 
 [[bench]]
 harness = false
-name = "mem_tier_overlay_append"
-
-[[bench]]
-harness = false
 name = "cdc_apply_simd"

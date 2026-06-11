@@ -25,7 +25,9 @@ use arrow_array::RecordBatch;
 use ctor::{ctor, dtor};
 use data_components::iceberg::catalog::hadoop::{HadoopCatalog, HadoopCatalogBuilder};
 use futures::TryStreamExt;
-use iceberg::io::{S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY};
+use iceberg::io::{
+    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+};
 use iceberg::{Catalog, NamespaceIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 #[cfg(feature = "test_hadoop_catalog_docker")]
@@ -97,6 +99,7 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
         .set_property(S3_SECRET_ACCESS_KEY, secret_key)
+        .set_property(S3_PATH_STYLE_ACCESS, "true")
 }
 
 /// Regression test helper for scheme inference: configures the warehouse root
@@ -148,6 +151,7 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
         .set_property(S3_ENDPOINT, minio_endpoint)
         .set_property(S3_ACCESS_KEY_ID, access_key)
         .set_property(S3_SECRET_ACCESS_KEY, secret_key)
+        .set_property(S3_PATH_STYLE_ACCESS, "true")
 }
 
 #[cfg(feature = "test_hadoop_catalog_docker")]

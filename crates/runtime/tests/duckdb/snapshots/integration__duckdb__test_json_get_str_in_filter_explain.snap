@@ -14,6 +14,6 @@ expression: pretty
 |               |     ProjectionExec: expr=[json_get_str(data@1, name) as __datafusion_extracted_1, id@0 as id]        |
 |               |       SchemaCastScanExec                                                                             |
 |               |         BytesProcessedExec                                                                           |
-|               |           DuckSqlExec sql= SELECT "json_test"."id", "json_test"."data" FROM "json_test"              |
+|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test"                                      |
 |               |                                                                                                      |
 +---------------+------------------------------------------------------------------------------------------------------+

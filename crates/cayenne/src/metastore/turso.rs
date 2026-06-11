@@ -582,10 +582,9 @@ impl MetastoreBackend for TursoMetastore {
                 (),
             )
             .await;
-        // Lever L1 (metadata-only publish): per-commit reinsert sequence on
-        // delete-file rows; NULL on legacy rows falls back to
-        // `cayenne_insert_record`. Forward-upgrade safe; downgrade requires a
-        // catalog rebuild (see the sqlite backfill note).
+        // Metadata-only publish: per-commit reinsert sequence on delete-file rows;
+        // NULL on legacy rows falls back to cayenne_insert_record. Forward-upgrade
+        // safe; downgrade requires a catalog rebuild (see the sqlite backfill note).
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",

@@ -149,15 +149,15 @@ pub struct DeleteFile {
     /// - New inserts get higher sequence numbers
     /// - Old deletes don't apply to new data with the same PK
     pub sequence_number: i64,
-    /// Lever L1 — metadata-only publish. The per-commit-constant sequence at
-    /// which the keys deleted by THIS file were RE-INSERTED in the same upsert
-    /// publish (`None` for a pure delete that re-inserts nothing, and for
-    /// position-based files which carry no keys). On restart the merge-on-read
-    /// load assigns this sequence to every key in this file's deletion vector,
-    /// reconstructing the per-key `cayenne_insert_record` map WITHOUT a durable
-    /// row per key — the keys deleted by an upsert are exactly the keys it
-    /// re-inserts, at one shared sequence. Legacy rows (pre-L1) and pure deletes
-    /// leave this `None` and fall back to the `cayenne_insert_record` table.
+    /// Metadata-only publish: the per-commit-constant sequence at which the keys
+    /// deleted by THIS file were RE-INSERTED in the same upsert publish (`None`
+    /// for a pure delete that re-inserts nothing, and for position-based files
+    /// which carry no keys). On load the merge-on-read path assigns this sequence
+    /// to every key in this file's deletion vector, reconstructing the per-key
+    /// `cayenne_insert_record` map WITHOUT a durable row per key — the keys
+    /// deleted by an upsert are exactly the keys it re-inserts, at one shared
+    /// sequence. Legacy rows (pre-feature) and pure deletes leave this `None` and
+    /// fall back to the `cayenne_insert_record` table.
     pub reinsert_sequence: Option<i64>,
 }
 
@@ -730,8 +730,8 @@ pub struct VortexConfig {
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill. Defaults to 256 MiB as a rare backstop now that the periodic
-    /// background checkpoint is the primary flush path.
+    /// the spill. Defaults to 256 MiB so the periodic background checkpoint is
+    /// the primary flush path and the write-path spill remains a rare backstop.
     #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
@@ -851,7 +851,7 @@ fn default_cdc_mem_tier_max_bytes() -> i64 {
 /// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
 /// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
 /// accumulated churn degrades scans and the apply path. Gating the tick on
-/// min-flush-bytes OR the age cap caps churn at ~max_bytes/min_flush files per
+/// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
 /// flush window while leaving freshness untouched (RAM rows are visible to
 /// queries immediately; only the deferred source-slot ack waits, bounded by
 /// `cdc_mem_tier_max_age_ms`). The write-path cap spill and explicit

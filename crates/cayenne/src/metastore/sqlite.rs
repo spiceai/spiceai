@@ -838,15 +838,14 @@ impl MetastoreBackend for SqliteMetastore {
                     [],
                 );
 
-                // Lever L1 (metadata-only publish): per-commit reinsert sequence on
-                // delete-file rows replaces the per-key `cayenne_insert_record`
-                // chunks. NULL on legacy rows → the merge-on-read load falls back to
-                // `cayenne_insert_record` for those, so adding the column is
-                // back-compatible for a forward upgrade. (DOWNGRADE is NOT safe: an
-                // older binary on a post-L1 catalog reads an empty insert-record
-                // table for new commits and would drop the re-inserts — rebuild the
-                // catalog before downgrading. A `user_version` gate is the
-                // productionization follow-up.)
+                // Metadata-only publish: per-commit reinsert sequence on delete-file
+                // rows replaces the per-key cayenne_insert_record chunks. NULL on
+                // legacy rows → the merge-on-read load falls back to
+                // cayenne_insert_record, so adding the column is forward-upgrade safe.
+                // (DOWNGRADE is NOT safe: an older binary on a catalog with this
+                // column reads an empty insert-record table for new commits and would
+                // drop the re-inserts — rebuild the catalog before downgrading. A
+                // user_version gate is the productionization follow-up.)
                 let _ = conn.execute(
                     "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
                     [],

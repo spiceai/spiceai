@@ -7546,6 +7546,77 @@ impl CayenneTableProvider {
         }
     }
 
+    /// After `checkpoint_inlined_data` flushes inline rows to a Vortex file at
+    /// `flush_sequence`, walk the supplied PKs and upgrade any pre-existing
+    /// delete-only tombstone (`insert_seq=None`) to record `insert_seq=flush_sequence`.
+    ///
+    /// Without this upgrade, listing-time pruning via
+    /// `vortex_key_delete_pushdown_filter` and the runtime
+    /// `Int64PkDeletionFilterExec` keep treating those PKs as fully hidden and
+    /// drop the brand-new checkpoint file's rows. The upgrade is also persisted
+    /// to the catalog as paired insert records so the same state is rebuilt on
+    /// restart.
+    async fn upgrade_tombstones_for_flushed_pks(
+        &self,
+        flushed_pks: &[i64],
+        flush_sequence: i64,
+    ) -> Result<()> {
+        if flushed_pks.is_empty() {
+            return Ok(());
+        }
+        let PkDeletionStrategyWithCache::Int64Pk {
+            deletion_snapshot, ..
+        } = &self.pk_deletion_strategy
+        else {
+            return Ok(());
+        };
+
+        let current = deletion_snapshot.load_full();
+        // Group PKs needing an upgrade by their existing delete_sequence so we
+        // can do one `extend_max_conflicts` call per group.
+        let mut by_delete_seq: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for &pk in flushed_pks {
+            if let Some(t) = current.tombstones.get(pk)
+                && t.insert_sequence.is_none()
+            {
+                by_delete_seq.entry(t.delete_sequence).or_default().push(pk);
+            }
+        }
+        if by_delete_seq.is_empty() {
+            return Ok(());
+        }
+
+        let insert_pk_bytes: Vec<Vec<u8>> = by_delete_seq
+            .values()
+            .flatten()
+            .map(|pk| pk.to_be_bytes().to_vec())
+            .collect();
+
+        // This upgrade commits no delete files, so the metadata-only publish
+        // path (`commit_on_conflict_deletions`, which stamps `reinsert_sequence`
+        // on delete-file rows) cannot carry it. Persist the per-key insert
+        // sequences through the legacy `cayenne_insert_record` table instead —
+        // the merge-on-read load reads both sides (∪ max), so the upgraded
+        // tombstones are rebuilt identically on restart.
+        self.catalog
+            .add_insert_records_batch(
+                &self.table_metadata.table_id,
+                insert_pk_bytes,
+                flush_sequence,
+            )
+            .await
+            .map_err(|err| Error::Catalog { source: err })?;
+
+        let mut updated = current.tombstones.as_ref().clone();
+        for (delete_seq, pks) in &by_delete_seq {
+            updated =
+                updated.extend_max_conflicts(pks.iter().copied(), *delete_seq, flush_sequence);
+        }
+        deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(updated)));
+        self.refresh_deletion_memory_accounting();
+        Ok(())
+    }
+
     async fn commit_inlined_data_mutation(
         &self,
         rewrite: InlinedDataRewrite,
@@ -7717,7 +7788,7 @@ impl CayenneTableProvider {
     ///
     /// 1. Building deletion vector specs from raw row keys
     /// 2. Writing deletion vector files via [`DeletionVectorWriter`]
-    /// 3. Committing delete files + optional insert records to the catalog
+    /// 3. Committing delete files + optional reinsert metadata to the catalog
     async fn write_and_commit_deletion_vectors(
         &self,
         delete_sequence: i64,
@@ -8090,14 +8161,14 @@ impl CayenneTableProvider {
             std::mem::take(&mut *self.pending_durable_tombstone_flips.lock());
 
         // Stage-A metastore write #2 (FOLDED): commit the on-conflict deletion
-        // metadata (delete files + insert records + protected-snapshot sequence)
+        // metadata (delete files + reinsert metadata + protected-snapshot sequence)
         // AND the inline tombstone INSERT AND the deferred flips in ONE
         // transaction. Previously these were two transactions
         // (`commit_on_conflict_deletions` then `add_inlined_delete`), each
         // acquiring the process-wide SQLite writer separately. Instrumented as
         // `stage_tombstone_prepare` (the audit's name for "the OTHER per-batch
         // metastore write transactions"). Statement order is preserved: delete
-        // files → insert records → snapshot sequence → tombstone INSERT →
+        // files → reinsert metadata → snapshot sequence → tombstone INSERT →
         // deferred flips.
         let tombstone_prepare_start = Instant::now();
         let commit_result = self
@@ -9099,8 +9170,6 @@ impl CayenneTableProvider {
 
         // Commit delete files only — no insert records (inline data bypasses
         // the deletion filter, so no protected insert sequence is needed).
-        // The in-memory deletion cache is published separately by the caller
-        // under `scan_state_lock.write()`.
         self.write_and_commit_deletion_vectors(delete_sequence, row_keys, vec![], 0)
             .await?;
 
@@ -10021,6 +10090,7 @@ impl CayenneTableProvider {
             pass_start.elapsed(),
             &[
                 telemetry::KeyValue::new("table", table.clone()),
+                telemetry::KeyValue::new("kind", "full"),
                 telemetry::KeyValue::new("result", result_label),
             ],
         );
@@ -10031,9 +10101,10 @@ impl CayenneTableProvider {
                     if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
             )
         {
-            telemetry::track_cayenne_compaction_memory_exhausted(&[telemetry::KeyValue::new(
-                "table", table,
-            )]);
+            telemetry::track_cayenne_compaction_memory_exhausted(&[
+                telemetry::KeyValue::new("table", table),
+                telemetry::KeyValue::new("kind", "full"),
+            ]);
         }
         result
     }
@@ -10235,8 +10306,57 @@ impl CayenneTableProvider {
     /// Returns `Ok(true)` if a merge was committed, `Ok(false)` if there was
     /// nothing to do (fewer than two protected snapshots, no qualifying tier,
     /// or the CAS lost a race).
+    ///
+    /// Records compaction telemetry under `kind="subset"`: a pass that actually
+    /// merged (`Ok(true)`) or attempted and failed (`Err`) emits
+    /// `cayenne_compaction_duration_ms` (whose count is the subset-pass counter),
+    /// mirroring the full-path [`rewrite_current_snapshot_for_compaction_tracked`].
+    /// The no-op early-outs (`Ok(false)`: < 2 snapshots, no qualifying tier, lost
+    /// CAS, writer/lock busy) are intentionally not counted, so the subset
+    /// pass count aligns with the `cayenne_compaction_merged_bytes` count.
     #[doc(hidden)]
     pub async fn compact_protected_snapshots_subset(&self, max_inputs: usize) -> Result<bool> {
+        let pass_start = std::time::Instant::now();
+        let result = self
+            .compact_protected_snapshots_subset_inner(max_inputs)
+            .await;
+
+        // Count only passes that did real work (committed a merge) or attempted
+        // one and failed; skip the trivial no-op early-outs so the subset pass
+        // count matches the merged-bytes count emitted on a committed merge.
+        if matches!(result, Ok(true) | Err(_)) {
+            let table = self.table_metadata.table_name.clone();
+            let result_label = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            telemetry::track_cayenne_compaction_duration(
+                pass_start.elapsed(),
+                &[
+                    telemetry::KeyValue::new("table", table.clone()),
+                    telemetry::KeyValue::new("kind", "subset"),
+                    telemetry::KeyValue::new("result", result_label),
+                ],
+            );
+            if let Err(e) = &result
+                && matches!(
+                    e,
+                    Error::DataFusion { source }
+                        if matches!(source, datafusion_common::DataFusionError::ResourcesExhausted(_))
+                )
+            {
+                telemetry::track_cayenne_compaction_memory_exhausted(&[
+                    telemetry::KeyValue::new("table", table),
+                    telemetry::KeyValue::new("kind", "subset"),
+                ]);
+            }
+        }
+
+        result
+    }
+
+    async fn compact_protected_snapshots_subset_inner(&self, max_inputs: usize) -> Result<bool> {
         // Position deletes are file-path scoped. If a protected-snapshot rewrite
         // races a writer that adds a position tombstone for one of the input
         // files, the old file can be swapped away before that tombstone is
@@ -10626,10 +10746,10 @@ impl CayenneTableProvider {
         };
         telemetry::track_cayenne_compaction_merged_bytes(
             merged_output_bytes,
-            &[telemetry::KeyValue::new(
-                "table",
-                self.table_metadata.table_name.clone(),
-            )],
+            &[
+                telemetry::KeyValue::new("table", self.table_metadata.table_name.clone()),
+                telemetry::KeyValue::new("kind", "subset"),
+            ],
         );
 
         Ok(true)
@@ -12986,8 +13106,13 @@ impl CayenneTableProvider {
             // concurrent scan sees the RAM rows (correct) and never the file yet.
             // snapshot_sequence was reserved under the fence at capture time —
             // see the capture block for the ordering invariant.
-            let sequence_number = reserved_snapshot_sequence
-                .expect("non-position checkpoint reserved its snapshot_sequence at capture");
+            let Some(sequence_number) = reserved_snapshot_sequence else {
+                return Err(Error::DataValidation {
+                    table: self.table_name().to_string(),
+                    message: "non-position checkpoint reserved its snapshot_sequence at capture"
+                        .to_string(),
+                });
+            };
             let new_snapshot_id = uuid::Uuid::now_v7().to_string();
             let target_size_bytes = self.context.target_file_size_bytes();
             let (_rows, checkpoint_file_count, stats) = self
@@ -13267,6 +13392,33 @@ impl CayenneTableProvider {
                 .map(|b| b.get_array_memory_size() as u64)
                 .fold(0u64, u64::saturating_add),
         );
+
+        // Extract Int64 PKs from the batches before they're moved into the
+        // `MemorySource` below. After the flush, these PKs live in the new
+        // Vortex file at `sequence_number` (assigned later inside the fence).
+        // Any pending tombstone with `insert_seq=None` for one of these PKs
+        // would otherwise cause `vortex_key_delete_pushdown_filter` to add the
+        // PK to its `pk NOT IN (...)` filter and prune the brand-new file.
+        let flushed_int64_pks: Vec<i64> = if matches!(
+            self.pk_deletion_strategy,
+            PkDeletionStrategyWithCache::Int64Pk { .. }
+        ) && self.pk_column_indices.len() == 1
+        {
+            let pk_idx = self.pk_column_indices[0];
+            let mut pks: Vec<i64> = Vec::new();
+            for batch in &batches {
+                if let Some(arr) = batch.column(pk_idx).as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        if !arr.is_null(i) {
+                            pks.push(arr.value(i));
+                        }
+                    }
+                }
+            }
+            pks
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             "Checkpointing {} inlined rows ({} batches) for table {}",
             total_rows,
@@ -13318,6 +13470,12 @@ impl CayenneTableProvider {
                         ctx.state().config().target_partitions(),
                         estimated_bytes,
                     )
+                    .await?;
+                // Pair every PK now in the new file with `sequence_number` on
+                // any pre-existing delete-only tombstone, so listing-time
+                // pruning and the runtime deletion filter stop hiding rows
+                // from the just-written checkpoint file.
+                self.upgrade_tombstones_for_flushed_pks(&flushed_int64_pks, sequence_number)
                     .await?;
                 stats
             };
@@ -13869,7 +14027,8 @@ impl CayenneTableProvider {
         }
 
         // Read deletion vector files in a blocking task, detecting type from schema
-        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>) where:
+        // Returns (HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>,
+        // HashMap<Box<[u8]>, i64>) where:
         // - per_file_row_ids: file path -> bitmap of deleted row positions
         // - deleted_row_keys: PK bytes -> max delete sequence
         let (per_file_row_ids, deleted_row_keys, derived_reinserted) =
@@ -13899,14 +14058,19 @@ impl CayenneTableProvider {
             PkDeletionStrategy::Int64Pk => {
                 let mut merged = insert_records_pk_i64;
                 for (bytes, seq) in &derived_reinserted {
-                    if bytes.len() >= 8 {
+                    if bytes.len() == 8 {
                         let mut arr = [0_u8; 8];
-                        arr.copy_from_slice(&bytes[..8]);
+                        arr.copy_from_slice(bytes.as_ref());
                         let pk = i64::from_be_bytes(arr);
                         merged
                             .entry(pk)
                             .and_modify(|s| *s = (*s).max(*seq))
                             .or_insert(*seq);
+                    } else {
+                        tracing::warn!(
+                            "Skipping invalid Int64 derived reinsert key with length {} (expected exactly 8 bytes)",
+                            bytes.len()
+                        );
                     }
                 }
                 (merged, insert_records_row_keys)

@@ -32,9 +32,9 @@ use crate::utils::{runtime_ready_check, test_request_context};
 
 // Test data CSV content - use include_str! to embed the test data file
 
-/// Sanitize file paths in physical plans for deterministic snapshots.
-/// Replaces absolute file paths with placeholders.
-fn sanitize_file_paths(plan: &str) -> String {
+/// Normalize a rendered physical plan for deterministic snapshots: replaces absolute file
+/// paths with placeholders and sorts `PartitionedUnionExec` children into a stable order.
+fn sanitize_plan(plan: &str) -> String {
     // Replace absolute paths in file_groups with placeholder
     let mut result = String::new();
     for line in plan.lines() {
@@ -59,7 +59,10 @@ fn sanitize_file_paths(plan: &str) -> String {
         }
         result.push('\n');
     }
-    result
+    // The children of a `PartitionedUnionExec` are produced from a `HashMap` of partitions,
+    // so their order in the rendered plan is non-deterministic across runs. Reuse the shared
+    // helper to sort them into a stable order so the snapshot is reliable.
+    test_framework::snapshot::sort_partitioned_union_children(&result)
 }
 
 /// Execute a SQL query on the Spice runtime and return the results
@@ -181,7 +184,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("bucket_partition_full_scan", sanitized_plan);
 
             // Test 2: Query with id = 1 filter - should only scan partition containing id=1
@@ -191,7 +194,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id = 1").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("bucket_partition_id_equals_filter", sanitized_plan);
 
             // Test 3: Query with id IN (1, 5) - may scan 1 or 2 partitions depending on hash
@@ -206,7 +209,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
             let plan =
                 get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id IN (1, 5)").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("bucket_partition_id_in_filter", sanitized_plan);
 
             // Test 4: Query with range filter - should push down filter to each partition
@@ -218,7 +221,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE id >= 5").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("bucket_partition_id_range_filter", sanitized_plan);
 
             // Test 5: Query with filter on non-partition column - should scan all partitions
@@ -232,7 +235,7 @@ async fn test_cayenne_partition_by_bucket() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM bucket_test WHERE score > 85").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("bucket_partition_non_partition_filter", sanitized_plan);
 
             Ok(())
@@ -329,7 +332,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
 
             let plan = get_physical_plan(&rt, "SELECT * FROM multi_partition_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("multi_partition_full_scan", sanitized_plan);
 
             // Test 2: Filter on first partition column (id)
@@ -341,7 +344,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             let plan =
                 get_physical_plan(&rt, "SELECT * FROM multi_partition_test WHERE id = 1").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("multi_partition_id_filter", sanitized_plan);
 
             // Test 3: Filter on second partition column (score range)
@@ -359,7 +362,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("multi_partition_score_range_filter", sanitized_plan);
 
             // Test 4: Filter on both partition columns
@@ -377,7 +380,7 @@ async fn test_cayenne_partition_by_multiple_expressions() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("multi_partition_both_filters", sanitized_plan);
 
             Ok(())
@@ -465,7 +468,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
 
             let plan = get_physical_plan(&rt, "SELECT * FROM null_partition_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("null_partition_full_scan", sanitized_plan);
 
             // Test 2: Query rows with NULL names specifically
@@ -481,7 +484,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
                 get_physical_plan(&rt, "SELECT * FROM null_partition_test WHERE name IS NULL")
                     .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("null_partition_name_is_null_filter", sanitized_plan);
 
             // Test 3: Query rows with non-NULL names
@@ -499,7 +502,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("null_partition_name_is_not_null_filter", sanitized_plan);
 
             // Test 4: Query with specific bucket filter - should prune to single partition
@@ -518,7 +521,7 @@ async fn test_cayenne_partition_by_bucket_with_nulls() -> Result<(), anyhow::Err
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("null_partition_bucket_equals_filter", sanitized_plan);
 
             // Test 5: Verify partition directory structure exists (Cayenne uses catalog-based partitioning)
@@ -626,7 +629,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             let plan =
                 get_physical_plan(&rt, "SELECT * FROM numeric_null_partition_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("numeric_null_partition_full_scan", sanitized_plan);
 
             // Test 2: Query rows with NULL scores
@@ -644,7 +647,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("numeric_null_partition_score_is_null_filter", sanitized_plan);
 
             // Test 3: Query rows with specific score range (non-NULL)
@@ -665,7 +668,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("numeric_null_partition_score_range_filter", sanitized_plan);
 
             // Test 4: Query with specific bucket filter - should prune to single partition
@@ -683,7 +686,7 @@ async fn test_cayenne_partition_by_bucket_numeric_nulls() -> Result<(), anyhow::
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("numeric_null_partition_bucket_equals_filter", sanitized_plan);
 
             // Test 5: Verify data integrity and NULL partition handling
@@ -779,7 +782,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
 
             let plan = get_physical_plan(&rt, "SELECT * FROM date_partition_test").await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("date_partition_full_scan", sanitized_plan);
 
             // Test 2: Query with filter on underlying date column
@@ -798,7 +801,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("date_partition_date_range_filter", sanitized_plan);
 
             // Test 3: Query with filter on partition expression (date_part)
@@ -819,7 +822,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("date_partition_month_equals_filter", sanitized_plan);
 
             // Test 4: Query with IN filter on partition expression
@@ -838,7 +841,7 @@ async fn test_cayenne_partition_by_date_part() -> Result<(), anyhow::Error> {
             )
             .await?;
             let plan_str = displayable(plan.as_ref()).indent(true).to_string();
-            let sanitized_plan = sanitize_file_paths(&plan_str);
+            let sanitized_plan = sanitize_plan(&plan_str);
             insta::assert_snapshot!("date_partition_month_in_filter", sanitized_plan);
 
             Ok(())
