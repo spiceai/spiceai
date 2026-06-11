@@ -3007,27 +3007,29 @@ impl PkDeletionSnapshot {
     /// version-keyed memo can otherwise never hit: every append bumps the tier
     /// version, and the O(tier) rebuild per scan was the churn-coupled collapse
     /// the `mem_tier_join_shapes` live lanes measure at 175-247x).
-    fn extended_by_delta(&self, delta: &crate::provider::mem_tier::InMemTombstones) -> Self {
+    fn extended_by_delta(&self, delta: &crate::provider::mem_tier::SegmentTombstones) -> Self {
+        // Every key in `delta` shares one reserved delete sequence (one CDC
+        // apply), so the memo extend applies that single scalar to all of them —
+        // identical to extending by a per-key map whose values are all that seq.
+        let seq = delta.delete_sequence();
         match self {
             Self::PositionBased => Self::PositionBased,
             Self::Int64Pk { tombstones } => {
-                if delta.int64_pk.is_empty() {
+                if delta.is_int64_empty() {
                     return self.clone();
                 }
-                let updated = tombstones.extend_max_deletes(
-                    delta.int64_pk.iter().map(|(&pk, &seq)| (pk, seq)),
-                );
+                let updated =
+                    tombstones.extend_max_deletes(delta.int64_keys().map(|pk| (pk, seq)));
                 Self::Int64Pk {
                     tombstones: Arc::new(updated),
                 }
             }
             Self::RowConverterBased { tombstones } => {
-                if delta.row_keys.is_empty() {
+                if delta.is_row_keys_empty() {
                     return self.clone();
                 }
-                let updated = tombstones.extend_max_deletes(
-                    delta.row_keys.iter().map(|(key, &seq)| (key.as_ref(), seq)),
-                );
+                let updated =
+                    tombstones.extend_max_deletes(delta.row_keys().map(|key| (key, seq)));
                 Self::RowConverterBased {
                     tombstones: Arc::new(updated),
                 }
@@ -12776,45 +12778,48 @@ impl CayenneTableProvider {
         self.mem_tier_max_age_ms > 0 && tier.age_ms() >= self.mem_tier_max_age_ms
     }
 
-    /// Build the in-RAM tombstone map for a mem-tier append from the upsert's
-    /// computed on-conflict deletions, at `delete_sequence`. In memory mode the
-    /// prior copy of a superseded PK lives either in the RAM tier or in an
-    /// earlier durable checkpoint; the merge-on-read filter applies the same
-    /// tombstone to both, so the file-backed AND inlined deleted-key encodings
-    /// are unioned into one RAM map keyed by the strategy. `superseded` is the
-    /// authoritative live-row delta (carried separately, NOT recomputed).
-    fn build_mem_tombstones(
+    /// Build the in-RAM deleted-key SET for a mem-tier append from the upsert's
+    /// computed on-conflict deletions — the BATCH-INTRINSIC, sequence-independent
+    /// work, run OFF the `mem_tier_publish_lock`. In memory mode the prior copy of
+    /// a superseded PK lives either in the RAM tier or in an earlier durable
+    /// checkpoint; the merge-on-read filter applies the same tombstone to both, so
+    /// the file-backed AND inlined deleted-key encodings are unioned into one set
+    /// keyed by the strategy. `superseded` is the authoritative live-row delta
+    /// (carried separately, NOT recomputed).
+    ///
+    /// Depends only on the IMMUTABLE strategy flag and the INCOMING batch's
+    /// `OnConflictDeletions` (no live tier / deletion-snapshot read), so it is
+    /// safe to run before acquiring the publish lock. The single reserved
+    /// `delete_sequence` is late-bound under the lock via
+    /// [`crate::provider::mem_tier::SegmentTombstones::stamp`] — every key in one
+    /// apply shares that one sequence, so only the scalar (not the keys) needs the
+    /// lock. This moves the expensive O(batch) key materialization + HAMT build
+    /// off the lock; the under-lock work is the O(1) stamp plus the aggregate fold
+    /// that must read live tier state anyway.
+    fn prepare_segment_tombstones(
         &self,
         deletions: &OnConflictDeletions,
-        delete_sequence: i64,
-    ) -> crate::provider::mem_tier::InMemTombstones {
-        let mut tombstones = crate::provider::mem_tier::InMemTombstones::default();
+    ) -> crate::provider::mem_tier::SegmentTombstones {
+        use crate::provider::mem_tier::SegmentTombstones;
         if self.pk_deletion_strategy.is_int64_pk() {
-            for &pk in deletions
-                .deleted_pk_i64
-                .iter()
-                .chain(deletions.deleted_inlined_pk_i64.iter())
-            {
-                tombstones
-                    .int64_pk
-                    .entry(pk)
-                    .and_modify(|s| *s = (*s).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
+            SegmentTombstones::from_int64_keys(
+                deletions
+                    .deleted_pk_i64
+                    .iter()
+                    .copied()
+                    .chain(deletions.deleted_inlined_pk_i64.iter().copied()),
+            )
         } else {
-            for key in deletions
-                .deleted_row_keys
-                .iter()
-                .chain(deletions.deleted_inlined_row_keys.iter())
-            {
-                tombstones
-                    .row_keys
-                    .entry(key.clone())
-                    .and_modify(|s| *s = (*s).max(delete_sequence))
-                    .or_insert(delete_sequence);
-            }
+            // Clone the row-key bytes OFF the lock (the per-key allocation moves
+            // off-lock); duplicates across the two encodings collapse in the set.
+            SegmentTombstones::from_row_keys(
+                deletions
+                    .deleted_row_keys
+                    .iter()
+                    .chain(deletions.deleted_inlined_row_keys.iter())
+                    .cloned(),
+            )
         }
-        tombstones
     }
 
     /// Append a validated CDC batch to the in-memory tier (`cdc_durability:
@@ -12844,6 +12849,18 @@ impl CayenneTableProvider {
             .fold(0, u64::saturating_add);
 
         let arc_batches = Arc::new(batches);
+
+        // Build the deleted-key SET OFF the publish lock — the BATCH-INTRINSIC,
+        // sequence-independent part (PK extraction / row-key byte cloning / HAMT
+        // build). It reads only the immutable strategy flag + the incoming
+        // `deletions`, never live tier/deletion state, so the pre-lock view can
+        // never go stale (the over-count failure mode of moving state-dependent
+        // work off-lock does not apply here). Only the single reserved
+        // `delete_sequence` is late-bound, under the lock, via `stamp`. This is
+        // where the bulk of `inmemory_fence_work` (the per-batch HAMT build) used
+        // to sit while the lock was held.
+        let mut tombstones = self.prepare_segment_tombstones(deletions);
+
         let epoch = {
             // Publish the RAM swap under the dedicated `mem_tier_publish_lock`,
             // DECOUPLED from the listing fence. The mem-tier is an `ArcSwap`, so a
@@ -12886,16 +12903,20 @@ impl CayenneTableProvider {
             let base_sequence = self.reserve_sequences_local(2).await?;
             let delete_sequence = base_sequence;
             let data_sequence = base_sequence + 1;
-            // FULL union (file-hit ∪ RAM-hit): the segment's tombstone map and the
-            // merged-scan-deletions memo both apply to file AND tier rows, so they
-            // need every superseded key.
-            let tombstones = self.build_mem_tombstones(deletions, delete_sequence);
+            // STAMP the off-lock-built key set with the reserved delete sequence
+            // (O(1) — only the scalar is set; the keys were built off-lock). This
+            // is the single sequence applied to EVERY superseded key in this apply
+            // (delete below data so the fresh rows survive their own tombstones).
+            // The FULL union (file-hit ∪ RAM-hit) was already gathered off-lock:
+            // the segment's tombstones and the merged-scan-deletions memo both
+            // apply to file AND tier rows, so they need every superseded key.
+            tombstones.stamp(delete_sequence);
 
             let cur = self.mem_tier.load();
             let next = cur.append_segment(
                 Arc::clone(&arc_batches),
                 data_sequence,
-                &tombstones,
+                tombstones.clone(),
                 incoming_bytes,
                 incoming_rows,
                 superseded,
@@ -20064,6 +20085,168 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_ckpt_upsert_race").await,
             3,
             "reopened table preserves exactly three rows (no durable over-count)"
+        );
+    }
+
+    /// Concurrent SAME-PK append seq-ordering guard (the `mem_tier_publish_lock`).
+    /// With the tombstone BUILD moved off the publish lock, only the (delete,
+    /// data) sequence reservation + the O(1) stamp + the segment push stay under
+    /// the lock. This stresses the load-bearing invariant that the reservation is
+    /// still mutually exclusive: two appends upserting the SAME key concurrently
+    /// (each a tombstone hiding the prior copy + a fresh row) must resolve to
+    /// EXACTLY ONE row by reserved-sequence order — never an over-count
+    /// (resurrected prior copy) and never a lost-then-duplicated row. The build
+    /// running off-lock is fine because it reads only the immutable batch; the
+    /// SEQUENCE that orders the two appends is reserved under the lock as a
+    /// contiguous (delete, data) pair, so whichever append wins the lock reserves
+    /// the strictly-higher pair and its row is the sole survivor.
+    ///
+    /// Drives `append_to_mem_tier` directly from two tasks (the production caller
+    /// serializes appends on the per-table write lock; this unit targets the
+    /// publish-lock seam specifically). Runs many rounds so the tokio scheduler
+    /// exercises both lock-acquisition orders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mem_tier_concurrent_same_pk_append_no_overcount() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_concurrent_same_pk",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let provider = Arc::new(provider);
+
+        // Seed key 1 = 10 (one resident copy in the RAM tier).
+        let seed = id_value_batch(Arc::clone(&schema), &[1], &[10]);
+        let seed_bytes = seed.get_array_memory_size() as u64;
+        provider
+            .append_to_mem_tier(vec![seed], &OnConflictDeletions::default(), seed_bytes, 0)
+            .await
+            .expect("seed key 1");
+
+        for round in 0..16_i64 {
+            let va = 100 + round * 2;
+            let vb = va + 1;
+
+            // Two concurrent upserts of the SAME key 1. Each tombstones the prior
+            // inlined copy of key 1 (the PK tombstone hides EVERY key-1 row whose
+            // data sequence is below the reserved delete sequence) and appends a
+            // fresh row — modeling exactly what two racing CDC upserts of one key
+            // produce. `superseded = 1`: each replaces the one prior live copy.
+            let pa = Arc::clone(&provider);
+            let sa = Arc::clone(&schema);
+            let a = tokio::spawn(async move {
+                let batch = id_value_batch(sa, &[1], &[va]);
+                let bytes = batch.get_array_memory_size() as u64;
+                let deletions = OnConflictDeletions {
+                    deleted_inlined_pk_i64: vec![1],
+                    ..OnConflictDeletions::default()
+                };
+                pa.append_to_mem_tier(vec![batch], &deletions, bytes, 1).await
+            });
+            let pb = Arc::clone(&provider);
+            let sb = Arc::clone(&schema);
+            let b = tokio::spawn(async move {
+                let batch = id_value_batch(sb, &[1], &[vb]);
+                let bytes = batch.get_array_memory_size() as u64;
+                let deletions = OnConflictDeletions {
+                    deleted_inlined_pk_i64: vec![1],
+                    ..OnConflictDeletions::default()
+                };
+                pb.append_to_mem_tier(vec![batch], &deletions, bytes, 1).await
+            });
+            a.await.expect("join A").expect("append A");
+            b.await.expect("join B").expect("append B");
+
+            // EXACTLY one row for key 1 after the race, regardless of which append
+            // won the publish lock. The visible value is whichever append reserved
+            // the higher (delete, data) pair — both candidates are acceptable; the
+            // invariant under test is "no over-count, no lost-and-duplicated row".
+            let pairs = collect_id_value_pairs(&ctx, &provider, "mem_concurrent_same_pk").await;
+            assert_eq!(
+                pairs.len(),
+                1,
+                "round {round}: exactly one row for key 1 (no over-count / resurrection); got {pairs:?}"
+            );
+            let (id, value) = pairs[0];
+            assert_eq!(id, 1, "round {round}: the surviving row is key 1");
+            assert!(
+                value == va || value == vb,
+                "round {round}: surviving value {value} is one of the two concurrent upserts ({va} or {vb})"
+            );
+            assert_eq!(
+                query_count_star(&ctx, &provider, "mem_concurrent_same_pk").await,
+                1,
+                "round {round}: COUNT(*) stays exactly 1 across the concurrent same-PK race"
+            );
+        }
+    }
+
+    /// Proves the seq-under-lock placement is LOAD-BEARING: the merge-on-read
+    /// keep predicate (`keep iff data_sequence > delete_sequence`) over two
+    /// same-key upserts yields exactly ONE survivor when each upsert reserves a
+    /// CONTIGUOUS (delete, data) pair under the publish lock (mutually exclusive),
+    /// but OVER-COUNTS to two survivors if the delete sequence were reserved
+    /// off-lock so the two reservations could interleave. This is a deterministic
+    /// model of the invariant the concurrent test above stresses — it shows
+    /// directly WHY the reservation must stay under the lock even though the
+    /// tombstone BUILD moved off it.
+    #[test]
+    fn seq_under_lock_pair_prevents_same_pk_overcount() {
+        // Merge-on-read survival for ONE key given its row data sequences and the
+        // max tombstone delete sequence hiding it. A row survives iff its data
+        // sequence is strictly greater than every delete sequence for the key.
+        fn survivors(row_data_seqs: &[i64], max_delete_seq: i64) -> usize {
+            row_data_seqs
+                .iter()
+                .filter(|&&d| d > max_delete_seq)
+                .count()
+        }
+
+        // Two upserts (A, B) of the SAME key, each = one tombstone (delete_seq)
+        // hiding all prior copies + one fresh row (data_seq = delete_seq + 1).
+        //
+        // CORRECT — reserved under the lock as CONTIGUOUS pairs, so the two
+        // reservations are disjoint and ordered. Say A reserves base 0 (delete 0,
+        // data 1) and B reserves base 2 (delete 2, data 3). Both rows present;
+        // the max delete sequence for the key is B's (2). Only B's row (data 3)
+        // clears it — A's row (data 1) is hidden. One survivor.
+        let a_delete = 0;
+        let a_data = a_delete + 1; // 1
+        let b_delete = 2;
+        let b_data = b_delete + 1; // 3
+        let max_delete = a_delete.max(b_delete); // 2
+        assert_eq!(
+            survivors(&[a_data, b_data], max_delete),
+            1,
+            "contiguous (delete,data) pairs reserved under the lock leave exactly one survivor (B)"
+        );
+
+        // BROKEN — delete sequences reserved OFF-lock, so the two appends'
+        // reservations interleave: A.delete=0, B.delete=1, then A.data=2,
+        // B.data=3. Now BOTH rows clear the key's max delete sequence (1):
+        // A.data=2 > 1 AND B.data=3 > 1 — the prior copy is RESURRECTED alongside
+        // the new one. Two survivors = the over-count that the under-lock,
+        // contiguous-pair reservation prevents.
+        let a_delete_bad = 0;
+        let b_delete_bad = 1;
+        let a_data_bad = 2;
+        let b_data_bad = 3;
+        let max_delete_bad = a_delete_bad.max(b_delete_bad); // 1
+        assert_eq!(
+            survivors(&[a_data_bad, b_data_bad], max_delete_bad),
+            2,
+            "interleaved off-lock delete-seq reservation over-counts (two survivors) — \
+             this is the failure the seq-under-lock invariant prevents"
         );
     }
 
