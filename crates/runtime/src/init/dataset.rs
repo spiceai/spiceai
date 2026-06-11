@@ -599,13 +599,15 @@ impl Runtime {
 
         let source_schema = provider.schema();
         let inferred = InferredSchema::from_metadata(source_schema.metadata());
-        // Only acceleration settings (primary key / indexes / sort) are applied here;
-        // inferred sizing rides on the provider schema metadata and is surfaced as
-        // table statistics elsewhere. Skip the refresh_sql parse and dataset rebuild
-        // when nothing acceleration-relevant was inferred (e.g. sizing only).
+        // Only acceleration settings (primary key / indexes / sort / shard key) are
+        // applied here; inferred sizing and column statistics ride on the provider
+        // schema metadata and are surfaced as table statistics / tuning inputs
+        // elsewhere. Skip the refresh_sql parse and dataset rebuild when nothing
+        // acceleration-relevant was inferred (e.g. sizing only).
         if inferred.primary_key.is_empty()
             && inferred.indexes.is_empty()
             && inferred.sort_columns.is_empty()
+            && inferred.shard_key.is_empty()
         {
             return ds;
         }

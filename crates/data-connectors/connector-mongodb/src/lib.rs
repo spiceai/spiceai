@@ -359,10 +359,12 @@ fn index_column_direction(value: &Bson) -> Option<bool> {
     }
 }
 
-/// If the collection is a clustered collection (`MongoDB` 5.3+), return its cluster
-/// key columns with direction — the physical-order analog of a Postgres clustered
-/// index. Returns `None` (best-effort) when not clustered or on any parse miss.
-async fn mongodb_clustered_sort(
+/// Inspect the collection's `listCollections` options for a physical/logical sort
+/// order: the cluster key of a clustered collection (`MongoDB` 5.3+, the analog of
+/// a Postgres clustered index), or the `timeField` of a time-series collection
+/// (bucketed and queried by time, so time is the natural clustering dimension).
+/// Returns `None` (best-effort) when neither applies or on any parse miss.
+async fn mongodb_collection_sort(
     db: &mongodb::Database,
     collection_name: &str,
 ) -> Option<Vec<InferredSortColumn>> {
@@ -370,14 +372,15 @@ async fn mongodb_clustered_sort(
         .run_command(doc! { "listCollections": 1, "filter": { "name": collection_name } })
         .await
         .ok()?;
-    clustered_sort_from_response(&response)
+    collection_sort_from_response(&response)
 }
 
-/// Parse the clustered-collection sort order out of a `listCollections` response.
-/// Pure (no I/O) so it is unit-tested against synthetic responses. Returns `None`
-/// when the collection is not clustered or the response cannot be parsed.
-fn clustered_sort_from_response(response: &Document) -> Option<Vec<InferredSortColumn>> {
-    let key_doc = response
+/// Parse a sort order out of a `listCollections` response: the clustered-collection
+/// cluster key (with direction), else the time-series `timeField` ascending. Pure
+/// (no I/O) so it is unit-tested against synthetic responses. Returns `None` when
+/// neither applies or the response cannot be parsed.
+fn collection_sort_from_response(response: &Document) -> Option<Vec<InferredSortColumn>> {
+    let options = response
         .get_document("cursor")
         .ok()?
         .get_array("firstBatch")
@@ -385,34 +388,63 @@ fn clustered_sort_from_response(response: &Document) -> Option<Vec<InferredSortC
         .first()?
         .as_document()?
         .get_document("options")
-        .ok()?
-        .get_document("clusteredIndex")
-        .ok()?
-        .get_document("key")
         .ok()?;
 
-    let mut sort_columns = Vec::new();
-    for (field, value) in key_doc {
-        let desc = index_column_direction(value)?;
-        sort_columns.push(InferredSortColumn {
-            column: field.clone(),
-            desc,
-        });
+    if let Ok(key_doc) = options
+        .get_document("clusteredIndex")
+        .and_then(|clustered| clustered.get_document("key"))
+    {
+        let mut sort_columns = Vec::new();
+        for (field, value) in key_doc {
+            let desc = index_column_direction(value)?;
+            sort_columns.push(InferredSortColumn {
+                column: field.clone(),
+                desc,
+                nulls_first: None,
+            });
+        }
+        if !sort_columns.is_empty() {
+            return Some(sort_columns);
+        }
     }
-    (!sort_columns.is_empty()).then_some(sort_columns)
+
+    // Time-series collections (MongoDB 5.0+) bucket by `timeField`; it is the
+    // natural sort/clustering dimension. (`metaField` is intentionally not used:
+    // it is commonly a sub-document, which has no flattened scalar column.)
+    let time_field = options
+        .get_document("timeseries")
+        .ok()?
+        .get_str("timeField")
+        .ok()?;
+    Some(vec![InferredSortColumn {
+        column: time_field.to_string(),
+        desc: false,
+        nulls_first: None,
+    }])
 }
 
 /// Parse one `listIndexes` entry into an [`InferredIndex`], or `None` if it should
-/// be skipped: a partial index (not a table-wide guarantee), an index with no key
-/// columns, or any non-b-tree key type (`text`, `2dsphere`, `hashed`, ...). Pure so
-/// it is unit-tested against synthetic index documents.
+/// be skipped: a partial or sparse index (neither is a table-wide guarantee — a
+/// sparse unique index permits any number of documents missing the field), a
+/// wildcard index (`$**` key patterns have no fixed column), an index with no key
+/// columns, or any non-b-tree key type (`text`, `2dsphere`, `hashed`, ...). Hidden
+/// and TTL indexes are kept: both are still maintained (and enforce uniqueness)
+/// even when hidden from the query planner. Pure so it is unit-tested against
+/// synthetic index documents.
 fn parse_mongo_index(index_doc: &Document) -> Option<InferredIndex> {
     if index_doc.contains_key("partialFilterExpression") {
+        return None;
+    }
+    if index_doc.get_bool("sparse").unwrap_or(false) {
         return None;
     }
     let key_doc = index_doc.get_document("key").ok()?;
     let mut columns: Vec<String> = Vec::new();
     for (field, value) in key_doc {
+        // Wildcard patterns (`$**` / `path.$**`) index dynamic paths, not a column.
+        if field.contains("$**") {
+            return None;
+        }
         // A non-ascending/descending key type makes the whole index unusable.
         index_column_direction(value)?;
         columns.push(field.clone());
@@ -425,12 +457,23 @@ fn parse_mongo_index(index_doc: &Document) -> Option<InferredIndex> {
 }
 
 /// Convert a `collStats` numeric field to a `u64` (counts and sizes are
-/// non-negative integers). Returns `None` for missing, non-integer, or negative
-/// values. Pure, so it is unit-tested.
+/// non-negative). Accepts the integer types and the doubles that `mongos` reports
+/// for aggregated stats on sharded clusters. Returns `None` for missing,
+/// non-numeric, negative, or non-finite values. Pure, so it is unit-tested.
 fn bson_to_u64(value: Option<&Bson>) -> Option<u64> {
     match value? {
         Bson::Int32(i) => u64::try_from(*i).ok(),
         Bson::Int64(i) => u64::try_from(*i).ok(),
+        // Sharded-cluster collStats sums arrive as doubles. Bound to the exact-
+        // integer f64 range (2^53) so the cast cannot truncate a real count/size.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "guarded to non-negative values within f64's exact-integer range"
+        )]
+        Bson::Double(f) if f.is_finite() && (0.0..=9_007_199_254_740_992.0).contains(f) => {
+            Some(*f as u64)
+        }
         _ => None,
     }
 }
@@ -450,6 +493,56 @@ async fn mongo_collection_size(
     )
 }
 
+/// Best-effort shard key for a sharded collection, read from the cluster's
+/// `config.collections` catalog (only populated when connected via `mongos`).
+/// Requires read access to the `config` database — any privilege or topology
+/// miss degrades to `None`.
+async fn mongodb_shard_key(
+    client: &mongodb::Client,
+    db_name: &str,
+    collection_name: &str,
+) -> Option<Vec<String>> {
+    let namespace = format!("{db_name}.{collection_name}");
+    let entry = client
+        .database("config")
+        .collection::<Document>("collections")
+        .find_one(doc! { "_id": &namespace })
+        .await
+        .ok()??;
+    shard_key_from_config_doc(&entry)
+}
+
+/// Parse the shard-key fields out of a `config.collections` document. Both
+/// ranged (`1`) and `hashed` key fields name a real field, so both qualify —
+/// hashing scatters rather than orders, but the field is still the dimension
+/// the cluster distributes by. Returns `None` for dropped collections, dynamic
+/// (`$**`) patterns, or unrecognized key forms. Pure so it is unit-tested.
+fn shard_key_from_config_doc(entry: &Document) -> Option<Vec<String>> {
+    // Pre-5.0 clusters leave dropped collections in config.collections with a
+    // `dropped: true` marker.
+    if entry.get_bool("dropped").unwrap_or(false) {
+        return None;
+    }
+    let key_doc = entry.get_document("key").ok()?;
+    let mut columns: Vec<String> = Vec::new();
+    for (field, value) in key_doc {
+        if field.contains('$') {
+            return None;
+        }
+        let usable = match value {
+            Bson::Int32(1) | Bson::Int64(1) => true,
+            Bson::Double(f) => (*f - 1.0).abs() < f64::EPSILON,
+            Bson::String(kind) => kind == "hashed",
+            _ => false,
+        };
+        if !usable {
+            return None;
+        }
+        columns.push(field.clone());
+    }
+    (!columns.is_empty()).then_some(columns)
+}
+
 /// Primary-key-ascending sort, used when the collection has no clustered key or
 /// when catalog enrichment is skipped.
 fn default_sort_from_primary_key(primary_key: &[String]) -> Vec<InferredSortColumn> {
@@ -458,6 +551,7 @@ fn default_sort_from_primary_key(primary_key: &[String]) -> Vec<InferredSortColu
         .map(|column| InferredSortColumn {
             column: column.clone(),
             desc: false,
+            nulls_first: None,
         })
         .collect()
 }
@@ -470,17 +564,21 @@ struct MongoCatalogDetails {
     sort_columns: Vec<InferredSortColumn>,
     row_count: Option<u64>,
     table_bytes: Option<u64>,
+    /// Shard-key fields for a sharded collection (empty when unsharded or the
+    /// `config` database is unreadable).
+    shard_key: Vec<String>,
 }
 
 impl MongoCatalogDetails {
     /// Details when only the primary key is known (catalog unavailable or skipped):
-    /// no secondary indexes, primary-key-ascending sort, no sizing.
+    /// no secondary indexes, primary-key-ascending sort, no sizing, no shard key.
     fn primary_key_only(primary_key: &[String]) -> Self {
         Self {
             indexes: Vec::new(),
             sort_columns: default_sort_from_primary_key(primary_key),
             row_count: None,
             table_bytes: None,
+            shard_key: Vec::new(),
         }
     }
 }
@@ -520,20 +618,27 @@ async fn mongodb_catalog_details(
         }
     }
 
-    // Sort heuristic: clustered collection key (with direction), else the primary
-    // key ascending — mirrors the Postgres "clustered, else primary key" rule.
-    let sort_columns = match mongodb_clustered_sort(&db, collection_name).await {
+    // Sort heuristic: clustered collection key (with direction) or time-series
+    // timeField, else the primary key ascending — mirrors the Postgres
+    // "clustered, else partition key, else primary key" rule.
+    let sort_columns = match mongodb_collection_sort(&db, collection_name).await {
         Some(sort) => sort,
         None => default_sort_from_primary_key(primary_key),
     };
 
     let (row_count, table_bytes) = mongo_collection_size(&db, collection_name).await;
 
+    // Sharded-collection shard key (best-effort; requires `config` db access).
+    let shard_key = mongodb_shard_key(&connection.client, &connection.db_name, collection_name)
+        .await
+        .unwrap_or_default();
+
     Ok(MongoCatalogDetails {
         indexes,
         sort_columns,
         row_count,
         table_bytes,
+        shard_key,
     })
 }
 
@@ -588,6 +693,9 @@ async fn mongodb_inferred_schema_metadata(
         sort_columns: details.sort_columns,
         row_count: details.row_count,
         table_bytes: details.table_bytes,
+        shard_key: details.shard_key,
+        // MongoDB has no pg_stats analog; cardinality/order stats are not inferred.
+        column_stats: Vec::new(),
     }
 }
 
@@ -709,7 +817,7 @@ mod tests {
 mod inferred_schema_tests {
     use super::{
         InferredIndex, InferredSortColumn, MongoCatalogDetails, bson_to_u64,
-        clustered_sort_from_response, default_sort_from_primary_key, index_column_direction,
+        collection_sort_from_response, default_sort_from_primary_key, index_column_direction,
         parse_mongo_index,
     };
     use mongodb::bson::{Bson, doc};
@@ -724,6 +832,21 @@ mod inferred_schema_tests {
         assert_eq!(bson_to_u64(Some(&Bson::Int32(-1))), None);
         assert_eq!(bson_to_u64(Some(&Bson::String("x".to_string()))), None);
         assert_eq!(bson_to_u64(None), None);
+    }
+
+    #[test]
+    fn coll_stats_doubles_convert_to_u64() {
+        // mongos reports aggregated counts/sizes as doubles on sharded clusters.
+        assert_eq!(bson_to_u64(Some(&Bson::Double(42.0))), Some(42));
+        assert_eq!(
+            bson_to_u64(Some(&Bson::Double(9_000_000_000.0))),
+            Some(9_000_000_000)
+        );
+        assert_eq!(bson_to_u64(Some(&Bson::Double(-1.0))), None);
+        assert_eq!(bson_to_u64(Some(&Bson::Double(f64::NAN))), None);
+        assert_eq!(bson_to_u64(Some(&Bson::Double(f64::INFINITY))), None);
+        // Beyond f64's exact-integer range: refuse rather than truncate.
+        assert_eq!(bson_to_u64(Some(&Bson::Double(1.0e19))), None);
     }
 
     #[test]
@@ -780,6 +903,52 @@ mod inferred_schema_tests {
     }
 
     #[test]
+    fn skips_sparse_index() {
+        // A sparse unique index is not a table-wide guarantee: documents missing
+        // the field are excluded from the index entirely.
+        assert!(
+            parse_mongo_index(&doc! {
+                "key": { "email": 1 },
+                "unique": true,
+                "sparse": true
+            })
+            .is_none()
+        );
+        // `sparse: false` stays usable.
+        assert!(
+            parse_mongo_index(&doc! {
+                "key": { "email": 1 },
+                "unique": true,
+                "sparse": false
+            })
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn skips_wildcard_indexes() {
+        assert!(parse_mongo_index(&doc! { "key": { "$**": 1 }, "name": "wild" }).is_none());
+        assert!(
+            parse_mongo_index(&doc! { "key": { "attributes.$**": 1 }, "name": "wild_path" })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keeps_hidden_and_ttl_indexes() {
+        // Hidden indexes are still maintained (and still enforce uniqueness); TTL
+        // indexes are ordinary single-field b-tree indexes.
+        assert!(
+            parse_mongo_index(&doc! { "key": { "email": 1 }, "unique": true, "hidden": true })
+                .is_some()
+        );
+        assert!(
+            parse_mongo_index(&doc! { "key": { "created_at": 1 }, "expireAfterSeconds": 3600 })
+                .is_some()
+        );
+    }
+
+    #[test]
     fn skips_non_btree_indexes() {
         assert!(parse_mongo_index(&doc! { "key": { "body": "text" }, "name": "txt" }).is_none());
         assert!(parse_mongo_index(&doc! { "key": { "loc": "2dsphere" }, "name": "geo" }).is_none());
@@ -803,10 +972,41 @@ mod inferred_schema_tests {
             }
         };
         assert_eq!(
-            clustered_sort_from_response(&response),
+            collection_sort_from_response(&response),
             Some(vec![InferredSortColumn {
                 column: "_id".to_string(),
-                desc: false
+                desc: false,
+                nulls_first: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn parses_time_series_time_field_sort() {
+        // Time-series collections bucket by timeField — the natural sort dimension.
+        let response = doc! {
+            "cursor": {
+                "firstBatch": [
+                    {
+                        "name": "metrics",
+                        "type": "timeseries",
+                        "options": {
+                            "timeseries": {
+                                "timeField": "ts",
+                                "metaField": "sensor",
+                                "granularity": "seconds"
+                            }
+                        }
+                    }
+                ]
+            }
+        };
+        assert_eq!(
+            collection_sort_from_response(&response),
+            Some(vec![InferredSortColumn {
+                column: "ts".to_string(),
+                desc: false,
+                nulls_first: None,
             }])
         );
     }
@@ -814,7 +1014,7 @@ mod inferred_schema_tests {
     #[test]
     fn non_clustered_collection_has_no_sort() {
         let response = doc! { "cursor": { "firstBatch": [ { "name": "events", "options": {} } ] } };
-        assert_eq!(clustered_sort_from_response(&response), None);
+        assert_eq!(collection_sort_from_response(&response), None);
     }
 
     #[test]
@@ -824,14 +1024,66 @@ mod inferred_schema_tests {
             vec![
                 InferredSortColumn {
                     column: "a".to_string(),
-                    desc: false
+                    desc: false,
+                    nulls_first: None,
                 },
                 InferredSortColumn {
                     column: "b".to_string(),
-                    desc: false
+                    desc: false,
+                    nulls_first: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn shard_key_parses_ranged_and_hashed_fields() {
+        use super::shard_key_from_config_doc;
+
+        assert_eq!(
+            shard_key_from_config_doc(
+                &doc! { "_id": "app.events", "key": { "tenant_id": 1, "ts": 1 } }
+            ),
+            Some(vec!["tenant_id".to_string(), "ts".to_string()])
+        );
+        // Hashed shard keys still name the distribution field.
+        assert_eq!(
+            shard_key_from_config_doc(&doc! { "_id": "app.users", "key": { "user_id": "hashed" } }),
+            Some(vec!["user_id".to_string()])
+        );
+        // Doubles arrive from some drivers/versions.
+        assert_eq!(
+            shard_key_from_config_doc(&doc! { "_id": "app.users", "key": { "user_id": 1.0 } }),
+            Some(vec!["user_id".to_string()])
+        );
+    }
+
+    #[test]
+    fn shard_key_rejects_dropped_dynamic_and_unknown_forms() {
+        use super::shard_key_from_config_doc;
+
+        // Dropped-collection leftovers (pre-5.0 clusters).
+        assert_eq!(
+            shard_key_from_config_doc(
+                &doc! { "_id": "app.gone", "dropped": true, "key": { "a": 1 } }
+            ),
+            None
+        );
+        // Dynamic patterns have no fixed column.
+        assert_eq!(
+            shard_key_from_config_doc(&doc! { "_id": "app.x", "key": { "a.$**": 1 } }),
+            None
+        );
+        // Unknown key forms.
+        assert_eq!(
+            shard_key_from_config_doc(&doc! { "_id": "app.x", "key": { "a": -1 } }),
+            None
+        );
+        assert_eq!(
+            shard_key_from_config_doc(&doc! { "_id": "app.x", "key": {} }),
+            None
+        );
+        assert_eq!(shard_key_from_config_doc(&doc! { "_id": "app.x" }), None);
     }
 
     #[test]
@@ -845,7 +1097,8 @@ mod inferred_schema_tests {
             details.sort_columns,
             vec![InferredSortColumn {
                 column: "_id".to_string(),
-                desc: false
+                desc: false,
+                nulls_first: None,
             }]
         );
         assert_eq!(details.row_count, None);
