@@ -8,22 +8,25 @@ runs:
       shell: bash
       run: |
         docker run -d --name chbench-pg \
-          --cpus=30 \
-          --memory=28g --memory-swap=28g \
+          --cpus=44 \
+          --memory=112g --memory-swap=112g \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 \
-          --shm-size=4g \
-          postgres:16 \
+          --shm-size=8g \
+          postgres:17 \
           -c max_connections=200 \
           -c wal_level=logical \
           -c synchronous_commit=off \
+          -c full_page_writes=off \
           -c max_replication_slots=20 \
           -c max_wal_senders=20 \
-          -c shared_buffers=8GB \
-          -c wal_buffers=64MB \
-          -c full_page_writes=off \
+          -c shared_buffers=28GB \
+          -c effective_cache_size=80GB \
           -c checkpoint_timeout=30min \
-          -c max_wal_size=8GB
+          -c max_wal_size=24GB \
+          -c random_page_cost=1.1 \
+          -c effective_io_concurrency=200 \
+          -c bgwriter_lru_maxpages=1000
 
     - name: Wait for CH-benCH PostgreSQL
       shell: bash
