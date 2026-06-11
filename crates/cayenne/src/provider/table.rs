@@ -6001,6 +6001,7 @@ impl CayenneTableProvider {
             inflight_staging_appends: Arc::clone(&self.inflight_staging_appends),
             retired_snapshot_dirs: Arc::clone(&self.retired_snapshot_dirs),
             snapshot_last_listed: Arc::clone(&self.snapshot_last_listed),
+            position_compaction_skip_streak: Arc::clone(&self.position_compaction_skip_streak),
             new_files_since_last_compaction: Arc::clone(&self.new_files_since_last_compaction),
             // Shared so a writer clone's move records the published files where the
             // (same-table) publish on any clone can delta-apply them.
