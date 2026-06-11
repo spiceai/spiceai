@@ -138,6 +138,10 @@ pub(crate) const DEFAULT_WRITE_CONCURRENCY: usize = 4;
 const PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 const PROTECTED_SNAPSHOT_AGE_WARNING_KEY_LIMIT: usize = 1024;
+/// Consecutive writer-active compaction skips on a position-delete table that
+/// escalate the TRACE-level skip to a one-shot WARN (≈30s of starvation at the
+/// 1s background interval). See `compact_protected_snapshots_subset_inner`.
+const POSITION_COMPACTION_SKIP_WARN_STREAK: usize = 30;
 const MIN_CONSECUTIVE_INLIST_REWRITE_VALUES: usize = 4;
 /// Upper bound on PK `IN` list cardinality that qualifies for `target_partitions = 1`.
 const MAX_PK_SELECTIVE_INLIST_VALUES: usize = 32;
@@ -10546,13 +10550,38 @@ impl CayenneTableProvider {
         let serialize_position_deletes = self.should_capture_positions();
         let _position_write_guard = if serialize_position_deletes {
             if let Ok(guard) = self.write_lock_arc().try_lock_owned() {
+                self.position_compaction_skip_streak
+                    .store(0, Ordering::Relaxed);
                 Some(guard)
             } else {
-                tracing::trace!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Skipping protected-snapshot subset compaction: writer active on position-delete table",
-                );
+                // A continuously writing position-delete table loses this
+                // try_lock on every attempt and starves its own compaction
+                // (measured: a delete-heavy table at ~4 writes/s accumulated
+                // 6,294 files in 11 minutes with ZERO merges, invisibly —
+                // this skip was TRACE-only). Escalate a sustained streak to
+                // WARN, once per starvation episode.
+                let streak = self
+                    .position_compaction_skip_streak
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if streak == POSITION_COMPACTION_SKIP_WARN_STREAK {
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        consecutive_skips = streak,
+                        "Protected-snapshot compaction is being starved: a writer has held the \
+                         write lock across every recent attempt on this position-delete table. \
+                         File count will grow unboundedly until writes pause; consider \
+                         `cayenne_deletion_mode: key` for delete-heavy tables (key-delete \
+                         compaction runs concurrently with writers).",
+                    );
+                } else {
+                    tracing::trace!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Skipping protected-snapshot subset compaction: writer active on position-delete table",
+                    );
+                }
                 return Ok(false);
             }
         } else {
@@ -16739,6 +16768,45 @@ mod tests {
 
     use super::*;
 
+    /// The retired-dir sweep timing contract: a dir is due only once the grace
+    /// has elapsed past BOTH its retirement and its last scan listing — a
+    /// long-running query that listed the dir keeps it alive a full grace past
+    /// that listing.
+    #[test]
+    fn retired_dir_grace_elapses_past_retirement_and_listing() {
+        let grace = std::time::Duration::from_secs(120);
+        let t0 = std::time::Instant::now();
+        // Within grace of retirement: not due.
+        assert!(!CayenneTableProvider::retired_dir_grace_elapsed(
+            t0,
+            None,
+            t0 + std::time::Duration::from_secs(60),
+            grace
+        ));
+        // Grace fully past retirement, never listed: due.
+        assert!(CayenneTableProvider::retired_dir_grace_elapsed(
+            t0,
+            None,
+            t0 + grace,
+            grace
+        ));
+        // Grace past retirement but a scan listed the dir recently: NOT due.
+        let listed = t0 + std::time::Duration::from_secs(100);
+        assert!(!CayenneTableProvider::retired_dir_grace_elapsed(
+            t0,
+            Some(listed),
+            t0 + grace,
+            grace
+        ));
+        // Grace past BOTH retirement and the listing: due.
+        assert!(CayenneTableProvider::retired_dir_grace_elapsed(
+            t0,
+            Some(listed),
+            listed + grace,
+            grace
+        ));
+    }
+
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::catalog::TableProviderFactory;
@@ -18658,16 +18726,19 @@ mod tests {
         assert!(provider.mem_tier.load().is_empty(), "tier spilled empty");
     }
 
-    /// A2-T2 — write-path AGE cap fires. With a small `cdc_mem_tier_max_age_ms`,
-    /// after one append the tier's age crosses the cap and the predicate trips on
-    /// the next write (even though the byte cap is generous), forcing a spill on a
-    /// slow-trickle table.
+    /// A2-T2 — the AGE cap never blocks the writer; it belongs to the tick.
+    /// With a small `cdc_mem_tier_max_age_ms`, an aged tier must NOT trip the
+    /// writer's spill predicate (`mem_tier_per_table_cap_breached` is BYTE-only
+    /// — the age-sharing variant made the applier synchronously ride out
+    /// checkpoint outages, the measured 33-41s apply stalls). The aged tier IS
+    /// flushed by the periodic tick, which runs the shared age predicate
+    /// without blocking the writer.
     #[tokio::test]
     #[expect(
         clippy::items_after_statements,
         reason = "the no-op SlotAdvancer is defined inline next to its single use"
     )]
-    async fn mem_tier_write_path_age_cap_fires() {
+    async fn mem_tier_write_path_age_cap_does_not_block_writer() {
         let runtime_env = SessionContext::new().runtime_env();
         // Generous byte cap, tiny age cap.
         let (provider, _tmp) = create_memory_mode_table_with_caps(
@@ -18692,16 +18763,24 @@ mod tests {
             .append_to_mem_tier(vec![b], &no_deletions, bytes, 0)
             .await
             .expect("append epoch 1");
-        // Before the age elapses, a small incoming size is NOT cap-breached.
+        // Fresh tier: under the byte cap.
         assert!(
             !provider.mem_tier_per_table_cap_breached(bytes),
-            "fresh tier under both byte and age caps"
+            "fresh tier under the byte cap"
         );
-        // Wait past the age cap; now the predicate trips purely on age.
+        // Wait past the age cap: the WRITER predicate still must not trip —
+        // age never makes the apply path execute (or wait behind) a
+        // whole-tier checkpoint.
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         assert!(
-            provider.mem_tier_per_table_cap_breached(bytes),
-            "the age cap fires once the oldest segment is older than the cap"
+            !provider.mem_tier_per_table_cap_breached(bytes),
+            "the writer's spill predicate is byte-only; an aged tier never blocks the apply"
+        );
+        // The tick owns age enforcement: one tick flushes the aged tier.
+        provider.run_mem_tier_checkpoint_tick().await;
+        assert!(
+            provider.mem_tier.load().is_empty(),
+            "the periodic tick checkpoints the aged tier without involving the writer"
         );
     }
 
