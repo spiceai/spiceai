@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod pgoutput;
 pub mod resilience;
 pub mod schema_evolution;
+pub mod shared;
 pub mod slot;
 
 use std::sync::Arc;
@@ -118,6 +119,47 @@ pub enum Error {
 
     #[snafu(display("Failed to build TLS configuration for Postgres replication: {source}"))]
     TlsConfig { source: config::TlsConfigError },
+
+    #[snafu(display(
+        "Table {schema}.{table} is already subscribed on shared replication slot `{slot}` by \
+         another dataset. Each source table can back at most one dataset per shared slot — \
+         give this dataset a different `pg_replication_slot` (or remove the param to get a \
+         dedicated per-dataset slot)."
+    ))]
+    SharedTableAlreadySubscribed {
+        schema: String,
+        table: String,
+        slot: String,
+    },
+
+    #[snafu(display(
+        "Dataset `{dataset}` joins a shared replication slot whose publication is \
+         `{expected}`, but declares publication `{got}`. All datasets sharing a slot must \
+         use the same publication — remove the per-dataset `pg_publication` override or \
+         make it consistent."
+    ))]
+    SharedPublicationMismatch {
+        dataset: String,
+        expected: String,
+        got: String,
+    },
+
+    #[snafu(display(
+        "Shared replication source for slot `{slot}` kept shutting down while this dataset \
+         was subscribing. Check earlier log lines for the underlying stream failure."
+    ))]
+    SharedSourceUnavailable { slot: String },
+
+    #[snafu(display(
+        "Dataset `{dataset}` joins a shared replication slot but its `{param}` differs from \
+         the dataset that opened the slot. All datasets sharing a slot are served over one \
+         replication connection and must use identical connection parameters — make `{param}` \
+         consistent, or give this dataset its own `pg_replication_slot`."
+    ))]
+    SharedConnectionParamsMismatch {
+        dataset: String,
+        param: &'static str,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -181,11 +223,21 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
 /// absent from the relation are null-filled (pre-evolution WAL replay), and
 /// non-widening changes surface a clear actionable error. See
 /// [`schema_evolution::RelationSchemaTracker`].
+///
+/// Slot-sharing datasets (`input.params.shared`) are multiplexed onto a single
+/// replication connection by [`shared::subscribe`], which does not plumb the
+/// policy to the source layer; their schema-change handling is enforced by the
+/// runtime apply loop instead.
 #[must_use]
 pub fn start_replication_stream_with_policy(
     input: ReplicationStreamInput,
     policy: SchemaEvolutionPolicy,
 ) -> ChangesStream {
+    // Datasets that opted into slot sharing are multiplexed onto one
+    // replication connection per (connection, slot) — see [`shared`].
+    if input.params.shared {
+        return shared::subscribe(input);
+    }
     // Initialized to 0 until `start_inner` learns the effective start LSN from
     // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
     // both read from this atomic, and a pinned-at-0 value would report a wildly
@@ -228,23 +280,34 @@ async fn start_inner(
         metrics.set_confirmed_flush_lsn(outcome.consistent_lsn);
     }
 
-    // 2. If the slot was just created and bootstrap is enabled, run snapshot.
-    let bootstrap_stream = if outcome.created_fresh && params.initial_snapshot {
-        Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
-            params: params.clone(),
-            schema_name: schema_name.clone(),
-            table_name: table_name.clone(),
-            dataset_schema: Arc::clone(&schema),
-            primary_keys: primary_keys.clone(),
-            dataset_name: dataset_name.clone(),
-            metrics: Arc::clone(&metrics),
-        })?)
-    } else {
-        // No bootstrap this run — if the slot already existed, consider the
-        // accelerator "already populated" so operators see bootstrap_complete=1.
-        metrics.mark_bootstrap_complete();
-        None
-    };
+    // 2. Run the snapshot if the slot was just created — or on every start
+    //    when the accelerator doesn't persist across restarts
+    //    (`snapshot_on_resume`) — provided bootstrap is enabled at all.
+    if !outcome.created_fresh && params.snapshot_on_resume && params.initial_snapshot {
+        tracing::info!(
+            dataset = %dataset_name,
+            slot = %outcome.slot_name,
+            "accelerator does not persist across restarts; running the initial snapshot \
+             despite resuming from an existing replication slot"
+        );
+    }
+    let bootstrap_stream =
+        if (outcome.created_fresh || params.snapshot_on_resume) && params.initial_snapshot {
+            Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
+                params: params.clone(),
+                schema_name: schema_name.clone(),
+                table_name: table_name.clone(),
+                dataset_schema: Arc::clone(&schema),
+                primary_keys: primary_keys.clone(),
+                dataset_name: dataset_name.clone(),
+                metrics: Arc::clone(&metrics),
+            })?)
+        } else {
+            // No bootstrap this run — if the slot already existed, consider the
+            // accelerator "already populated" so operators see bootstrap_complete=1.
+            metrics.mark_bootstrap_complete();
+            None
+        };
 
     // When we skip bootstrap (slot resume or `initial_snapshot: false`), emit
     // an immediate empty `is_dataset_ready=true` envelope so the runtime marks
@@ -261,6 +324,17 @@ async fn start_inner(
         None
     };
 
+    if !outcome.generated_columns.is_empty() {
+        tracing::warn!(
+            dataset = %dataset_name,
+            columns = ?outcome.generated_columns,
+            "source table has GENERATED column(s): Postgres does not publish generated \
+             columns over logical replication, so they are populated by the initial \
+             snapshot but will be NULL on replicated changes. Exclude them from the \
+             dataset schema if NULLs are unacceptable."
+        );
+    }
+
     // 3. Start the WAL stream.
     let wal_stream = client::start_wal_stream(client::WalStreamInput {
         params,
@@ -269,6 +343,7 @@ async fn start_inner(
         start_lsn: outcome.consistent_lsn,
         schema: Arc::clone(&schema),
         primary_keys,
+        generated_columns: outcome.generated_columns.clone(),
         dataset_name,
         schema_evolution_policy,
         // The dataset is already marked ready by `skip_bootstrap_ready` (if
