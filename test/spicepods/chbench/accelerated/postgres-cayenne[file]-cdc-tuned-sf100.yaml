@@ -71,12 +71,7 @@ datasets:
         <<: &accel_high_volume
           cayenne_metastore: sqlite
           cayenne_file_path: .spice/cayenne/district
-          # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
-          # must sit just UNDER the heavy-update tables' (stock, order_line) PK keysets so
-          # they stay on the cheap bloom path — at SF-100 that is 256 (1024 would fit them
-          # on the expensive exact path; the SF-1000 venue pins 1024). The memory-aware
-          # auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) is BACKWARDS — pin it.
-
+          cayenne_deletion_mode: key
         # CDC overrides applied ONLY to district (sit outside the anchor so customer/
         # new_order/oorder/order_line/stock keep the global 250 ms / 128 MB defaults).
         cdc_max_coalesce_age_ms: '1000'
@@ -157,6 +152,8 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
+        cdc_max_coalesce_age_ms: '3000'
+        cdc_max_coalesced_bytes: '536870912' # 512 MB
 
   - from: postgres:stock
     name: stock
@@ -201,6 +198,7 @@ datasets:
         cayenne_file_path: .spice/cayenne/warehouse
         cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
+        cayenne_deletion_mode: key
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh).
