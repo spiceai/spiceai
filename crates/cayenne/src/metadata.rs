@@ -149,6 +149,16 @@ pub struct DeleteFile {
     /// - New inserts get higher sequence numbers
     /// - Old deletes don't apply to new data with the same PK
     pub sequence_number: i64,
+    /// Metadata-only publish: the per-commit-constant sequence at which the keys
+    /// deleted by THIS file were RE-INSERTED in the same upsert publish (`None`
+    /// for a pure delete that re-inserts nothing, and for position-based files
+    /// which carry no keys). On load the merge-on-read path assigns this sequence
+    /// to every key in this file's deletion vector, reconstructing the per-key
+    /// `cayenne_insert_record` map WITHOUT a durable row per key — the keys
+    /// deleted by an upsert are exactly the keys it re-inserts, at one shared
+    /// sequence. Legacy rows (pre-feature) and pure deletes leave this `None` and
+    /// fall back to the `cayenne_insert_record` table.
+    pub reinsert_sequence: Option<i64>,
 }
 
 /// Metadata about a partition in a table.
@@ -507,11 +517,15 @@ pub enum CdcDurability {
     /// OPT-IN (experimental). Engages only for the changes/small-write refresh
     /// profile AND a replayable source committer (the runtime arms it lazily on the
     /// first batch whose committer reports `supports_deferral()`); every other
-    /// profile/source falls back to `File`. KNOWN LIMITATION: without a periodic
-    /// background checkpoint the deferred slot ack lets replication lag grow
-    /// unbounded under sustained ingest (the RAM tier never checkpoints mid-run) —
-    /// prefer `File` until that follow-up lands. Correctness is unaffected (the
-    /// source re-streams on restart; convergence verified).
+    /// profile/source falls back to `File`. The RAM tier is bounded on three axes
+    /// so the deferred slot ack keeps advancing and the tier never grows unbounded:
+    /// a per-table byte cap (`cdc_mem_tier_max_bytes`, default 256 MiB) and age cap
+    /// (`cdc_mem_tier_max_age_ms`, default 10 s) that the write path checks per
+    /// burst, plus a periodic background checkpoint task
+    /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s) that flushes idle /
+    /// pure-upsert tables which never trip a write-path cap. Correctness is
+    /// unaffected (a crash discards the un-checkpointed tail; the source re-streams
+    /// on restart and the PK-idempotent apply converges exactly-once).
     Memory,
 }
 
@@ -716,15 +730,34 @@ pub struct VortexConfig {
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill.
-    #[serde(default)]
+    /// the spill. Defaults to 256 MiB so the periodic background checkpoint is
+    /// the primary flush path and the write-path spill remains a rare backstop.
+    #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
     /// Max wall-clock milliseconds a RAM-tier epoch may age before a forced
     /// checkpoint, in `cdc_durability: memory` mode only. Bounds the crash-replay
     /// window for cold/low-traffic tables (whose byte cap would otherwise never
-    /// trip). `0` disables the age trigger.
-    #[serde(default)]
+    /// trip). `0` disables the age trigger. Defaults to 10 s.
+    #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
+    /// Minimum resident tier bytes before the PERIODIC background tick durably
+    /// checkpoints, in `cdc_durability: memory` mode only. Bounds snapshot /
+    /// delete-file churn: below this size a tick is a no-op unless the tier's
+    /// age has reached `cdc_mem_tier_max_age_ms` (which still bounds the
+    /// deferred slot ack and crash-replay window). The write-path cap spill and
+    /// explicit checkpoints are NOT gated. `0` disables the gate. Defaults to
+    /// 32 MiB.
+    #[serde(default = "default_cdc_mem_tier_min_flush_bytes")]
+    pub cdc_mem_tier_min_flush_bytes: i64,
+    /// Periodic background mem-tier checkpoint interval in milliseconds, in
+    /// `cdc_durability: memory` mode only. The accelerator spawns a per-table
+    /// background task that checkpoints the RAM tier every interval (mirroring
+    /// the background compactor); this is what advances the deferred source slot
+    /// ack on an idle or pure-upsert stream that never trips a delete/truncate
+    /// event trigger or a write-path cap. `0` disables the periodic task. Defaults
+    /// to 1 s.
+    #[serde(default = "default_cdc_mem_tier_checkpoint_interval_ms")]
+    pub cdc_mem_tier_checkpoint_interval_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
     /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
@@ -738,12 +771,6 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
     #[serde(default)]
     pub pinned_tuning_knobs: PinnedTuningKnobs,
-    /// Whether scans may build `DataFusion`'s `FilePruner` to skip whole Vortex
-    /// files using statistics and partition values before opening them. Passed
-    /// through to `vortex-datafusion` as a per-format boolean. Defaults to
-    /// `true` (pruning enabled).
-    #[serde(default = "default_file_pruning")]
-    pub file_pruning: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -802,8 +829,57 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
-fn default_file_pruning() -> bool {
-    true
+/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB).
+///
+/// This is the SYNCHRONOUS write-path spill threshold (`mem_tier_per_table_cap_breached`),
+/// which blocks the refresh-task's next batch while it flushes — so it should be
+/// a rare backstop, not the primary flush. The primary flush is the periodic
+/// background checkpointer, which (since the two-phase `checkpoint_mem_tier`
+/// moved the encode + `BEGIN IMMEDIATE` commit OUTSIDE the listing fence) no
+/// longer stalls appends — so a larger tier is cheap. 256 MiB gives the 1 s
+/// background tick time to drain the tier before this cap is reached at typical
+/// CDC rates, while staying small enough that ~N memory-mode tables sum well
+/// under the process-global budget (`get_total_memory()/8`), which remains the
+/// RAM-scaling aggregate backstop.
+fn default_cdc_mem_tier_max_bytes() -> i64 {
+    256 * 1024 * 1024
+}
+
+/// Default minimum tier size before the PERIODIC tick durably checkpoints
+/// (32 MiB). Every durable checkpoint costs a new snapshot + delete-vector
+/// files + a listing refresh under the fence; at a 1 s tick a high-rate table
+/// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
+/// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
+/// accumulated churn degrades scans and the apply path. Gating the tick on
+/// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
+/// flush window while leaving freshness untouched (RAM rows are visible to
+/// queries immediately; only the deferred source-slot ack waits, bounded by
+/// `cdc_mem_tier_max_age_ms`). The write-path cap spill and explicit
+/// checkpoints bypass the gate. `0` disables the gate (every tick flushes).
+fn default_cdc_mem_tier_min_flush_bytes() -> i64 {
+    32 * 1024 * 1024
+}
+
+/// Default RAM-tier age cap for `cdc_durability: memory` (10 s).
+///
+/// Bounds the crash-replay window and forces a synchronous checkpoint on a
+/// slow-trickle table that never reaches the byte cap. Raised from 2 s now that
+/// the background checkpointer (1 s tick) is the primary, non-fence-blocking
+/// flush path: an actively-written table is drained by the background tick long
+/// before 10 s, so this age cap only catches genuinely slow tables and no longer
+/// needs to fire aggressively on the hot write path.
+fn default_cdc_mem_tier_max_age_ms() -> u64 {
+    10_000
+}
+
+/// Default periodic mem-tier checkpoint interval for `cdc_durability: memory`
+/// (1 s). The accelerator spawns a per-memory-mode-table background task that
+/// checkpoints the RAM tier every interval (mirroring the background compactor),
+/// which is what advances the deferred source slot ack on an idle/pure-upsert
+/// stream. Set to 0 to disable the periodic task (the write-path caps still
+/// bound hot tables).
+fn default_cdc_mem_tier_checkpoint_interval_ms() -> u64 {
+    1_000
 }
 
 impl VortexConfig {
@@ -908,11 +984,12 @@ impl Default for VortexConfig {
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
             cdc_durability: CdcDurability::default(),
-            cdc_mem_tier_max_bytes: 0,
-            cdc_mem_tier_max_age_ms: 0,
+            cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
+            cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
+            cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
+            cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_knobs: PinnedTuningKnobs::default(),
-            file_pruning: default_file_pruning(),
         }
     }
 }
@@ -937,6 +1014,43 @@ mod tests {
         let config: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
 
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    /// The mem-tier caps + periodic interval must default to NON-ZERO so the
+    /// write-path spill and the periodic checkpoint self-fire (bounding the tier
+    /// and advancing the deferred slot ack). A regression to `0`/`u64::MAX`
+    /// disables both and reopens the unbounded-tier lag gap. Guards both the
+    /// struct default and the serde default (an empty config must inherit them).
+    #[test]
+    fn test_cdc_mem_tier_caps_default_non_zero() {
+        let config = VortexConfig::default();
+        assert!(
+            config.cdc_mem_tier_max_bytes > 0,
+            "cdc_mem_tier_max_bytes must default non-zero so the write-path spill self-fires"
+        );
+        assert!(
+            config.cdc_mem_tier_max_age_ms > 0,
+            "cdc_mem_tier_max_age_ms must default non-zero so cold tables checkpoint"
+        );
+        assert!(
+            config.cdc_mem_tier_checkpoint_interval_ms > 0,
+            "cdc_mem_tier_checkpoint_interval_ms must default non-zero so the periodic task runs"
+        );
+
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_bytes, config.cdc_mem_tier_max_bytes,
+            "an empty config must inherit the non-zero byte cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_max_age_ms, config.cdc_mem_tier_max_age_ms,
+            "an empty config must inherit the non-zero age cap via serde default"
+        );
+        assert_eq!(
+            from_empty.cdc_mem_tier_checkpoint_interval_ms,
+            config.cdc_mem_tier_checkpoint_interval_ms,
+            "an empty config must inherit the non-zero checkpoint interval via serde default"
+        );
     }
 
     #[test]
@@ -1057,6 +1171,31 @@ pub struct CreateTableOptions {
     pub partition_column: Option<String>,
     /// Vortex encoding configuration
     pub vortex_config: VortexConfig,
+}
+
+/// Per-file statistics for one Vortex object in a snapshot directory.
+///
+/// Persisted in `cayenne_snapshot_file_statistics` so listing-time pruning can
+/// reuse footer min/max without re-reading every object on each scan. Rows are
+/// keyed by `(table_id, snapshot_id, file_path)` and invalidated when
+/// `file_size_bytes` no longer matches the object store metadata.
+///
+/// Consumers must treat these values as optimization hints only.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileStatistics {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Snapshot directory the file was listed from (`UUIDv7`)
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` file (as returned by listing)
+    pub file_path: String,
+    /// Cached `ObjectMeta::size` at the time stats were captured
+    pub file_size_bytes: i64,
+    /// Row count from the file footer when stats were captured
+    pub num_rows: i64,
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes (per-column min, max,
+    /// and null count)
+    pub statistics_blob: Vec<u8>,
 }
 
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.

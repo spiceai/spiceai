@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, TableMetadata, TableStatistics,
+    CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats, InlinedDelete,
+    PartitionMetadata, PkConflictDetection, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -45,6 +45,7 @@ struct ExistingDeleteFileRecord {
     file_size_bytes: i64,
     source_data_file_path: Option<String>,
     sequence_number: i64,
+    reinsert_sequence: Option<i64>,
 }
 
 fn metastore_value_at(values: &[MetastoreValue], index: usize) -> CatalogResult<&MetastoreValue> {
@@ -64,7 +65,39 @@ fn existing_delete_file_record_from_values(
         file_size_bytes: i64::from_value(metastore_value_at(values, 4)?)?,
         source_data_file_path: Option::<String>::from_value(metastore_value_at(values, 5)?)?,
         sequence_number: Option::<i64>::from_value(metastore_value_at(values, 6)?)?.unwrap_or(0),
+        reinsert_sequence: Option::<i64>::from_value(metastore_value_at(values, 7)?)?,
     })
+}
+
+fn ensure_reinsert_keys_have_key_based_delete_file(
+    table_id: &str,
+    delete_files: &[DeleteFile],
+    reinsert_key_count: usize,
+) -> CatalogResult<()> {
+    if reinsert_key_count == 0 {
+        return Ok(());
+    }
+
+    if delete_files.is_empty() {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Cannot commit {reinsert_key_count} on-conflict reinsert keys for table {table_id} without delete files; metadata-only publish stores reinsert_sequence on delete-file rows"
+            ),
+        });
+    }
+
+    if !delete_files
+        .iter()
+        .any(|delete_file| delete_file.deletion_type == DeletionType::KeyBased)
+    {
+        return Err(CatalogError::InvalidOperationNoSource {
+            message: format!(
+                "Cannot commit {reinsert_key_count} on-conflict reinsert keys for table {table_id} without a key-based delete file; metadata-only publish reconstructs reinserts from key-based delete vectors carrying reinsert_sequence"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Metastore backend enum to support different implementations.
@@ -271,7 +304,7 @@ impl CayenneCatalog {
                 QueryParams {
                     sql: r"
                     SELECT delete_file_id, path_is_relative, format, delete_count,
-                           file_size_bytes, source_data_file_path, sequence_number
+                              file_size_bytes, source_data_file_path, sequence_number, reinsert_sequence
                     FROM cayenne_delete_file
                     WHERE table_id = ?1 AND path = ?2
                     ORDER BY delete_file_id DESC
@@ -291,6 +324,7 @@ impl CayenneCatalog {
                         file_size_bytes: row.get_i64(4)?,
                         source_data_file_path: row.get_optional_string(5)?,
                         sequence_number: row.get_optional_i64(6)?.unwrap_or(0),
+                        reinsert_sequence: row.get_optional_i64(7)?,
                     })
                 },
             )
@@ -329,7 +363,7 @@ impl CayenneCatalog {
             .query_row_values(QueryRowParams {
                 sql: r"
                     SELECT delete_file_id, path_is_relative, format, delete_count,
-                           file_size_bytes, source_data_file_path, sequence_number
+                          file_size_bytes, source_data_file_path, sequence_number, reinsert_sequence
                     FROM cayenne_delete_file
                     WHERE table_id = ?1 AND path = ?2
                     ORDER BY delete_file_id DESC
@@ -553,6 +587,7 @@ impl CayenneCatalog {
              DELETE FROM cayenne_inlined_data WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_inlined_delete WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_table_statistics WHERE table_id = {table_id_literal}; \
+             DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_pk_index WHERE table_id = {table_id_literal}; \
              UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
@@ -642,7 +677,7 @@ impl CayenneCatalog {
     }
 
     /// Build a multi-VALUES `INSERT ... ON CONFLICT(table_id, path) DO UPDATE`
-    /// for a chunk of delete-file rows. Each row uses 9 parameters; the
+    /// for a chunk of delete-file rows. Each row uses 10 parameters; the
     /// per-row `ON CONFLICT` clause references `excluded` (the single
     /// conflicting row), so the idempotency check is the same as the
     /// single-row form previously emitted in `commit_on_conflict_deletions`.
@@ -651,11 +686,15 @@ impl CayenneCatalog {
     ) -> (String, Vec<MetastoreValue>) {
         use std::fmt::Write as _;
 
-        const PARAMS_PER_ROW: usize = 9;
+        const PARAMS_PER_ROW: usize = 10;
         const PREFIX: &str = "INSERT INTO cayenne_delete_file (\
                  delete_file_id, table_id, path, path_is_relative, \
-                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number\
+                 format, delete_count, file_size_bytes, source_data_file_path, sequence_number, \
+                 reinsert_sequence\
              ) VALUES ";
+        // The idempotent re-commit equality list includes `reinsert_sequence` so a
+        // replayed publish with the SAME per-commit reinsert sequence is a no-op,
+        // while a genuinely conflicting metadata change still trips the NULL guard.
         const SUFFIX: &str = " \
              ON CONFLICT(table_id, path) DO UPDATE SET \
                  path = CASE \
@@ -665,11 +704,12 @@ impl CayenneCatalog {
                          AND cayenne_delete_file.file_size_bytes = excluded.file_size_bytes \
                          AND cayenne_delete_file.source_data_file_path IS excluded.source_data_file_path \
                          AND cayenne_delete_file.sequence_number = excluded.sequence_number \
+                         AND cayenne_delete_file.reinsert_sequence IS excluded.reinsert_sequence \
                      THEN cayenne_delete_file.path \
                      ELSE NULL \
                  END";
-        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~64 bytes.
-        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 64);
+        // Each "(?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N, ?N)" row averages ~70 bytes.
+        let mut sql = String::with_capacity(PREFIX.len() + SUFFIX.len() + delete_files.len() * 70);
         sql.push_str(PREFIX);
         let mut params = Vec::with_capacity(delete_files.len() * PARAMS_PER_ROW);
 
@@ -680,7 +720,7 @@ impl CayenneCatalog {
             }
             let _ = write!(
                 sql,
-                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
                 base,
                 base + 1,
                 base + 2,
@@ -690,6 +730,7 @@ impl CayenneCatalog {
                 base + 6,
                 base + 7,
                 base + 8,
+                base + 9,
             );
             params.push(MetastoreValue::Text(uuid::Uuid::now_v7().to_string()));
             params.push(MetastoreValue::Text(delete_file.table_id.clone()));
@@ -705,6 +746,11 @@ impl CayenneCatalog {
                     .map_or(MetastoreValue::Null, MetastoreValue::Text),
             );
             params.push(MetastoreValue::Integer(delete_file.sequence_number));
+            params.push(
+                delete_file
+                    .reinsert_sequence
+                    .map_or(MetastoreValue::Null, MetastoreValue::Integer),
+            );
         }
 
         sql.push_str(SUFFIX);
@@ -1140,9 +1186,10 @@ impl MetadataCatalog for CayenneCatalog {
                 sql: r"
                 INSERT INTO cayenne_delete_file (
                     delete_file_id, table_id, path, path_is_relative,
-                    format, delete_count, file_size_bytes, source_data_file_path, sequence_number
+                    format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                    reinsert_sequence
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                 )
             ",
                 params: vec![
@@ -1158,6 +1205,9 @@ impl MetadataCatalog for CayenneCatalog {
                         .clone()
                         .map_or(MetastoreValue::Null, MetastoreValue::Text),
                     MetastoreValue::Integer(delete_file.sequence_number),
+                    delete_file
+                        .reinsert_sequence
+                        .map_or(MetastoreValue::Null, MetastoreValue::Integer),
                 ],
             })
             .await;
@@ -1200,9 +1250,10 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .query_helper(
                 QueryParams {
-                    sql: "SELECT delete_file_id, table_id, path, path_is_relative, 
-                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number 
-                 FROM cayenne_delete_file 
+                    sql: "SELECT delete_file_id, table_id, path, path_is_relative,
+                        format, delete_count, file_size_bytes, source_data_file_path, sequence_number,
+                        reinsert_sequence
+                 FROM cayenne_delete_file
                  WHERE table_id = ?1",
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
@@ -1220,6 +1271,9 @@ impl MetadataCatalog for CayenneCatalog {
                         // based on the schema (row_id = position-based, row_key = key-based)
                         deletion_type: crate::metadata::DeletionType::default(),
                         sequence_number: row.get_optional_i64(8)?.unwrap_or(0),
+                        // Metadata-only publish: NULL on legacy rows / pure deletes →
+                        // the merge-on-read load falls back to cayenne_insert_record.
+                        reinsert_sequence: row.get_optional_i64(9)?,
                     })
                 },
             )
@@ -2024,6 +2078,89 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn upsert_snapshot_file_statistics(
+        &self,
+        stats: &SnapshotFileStatistics,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file_statistics \
+                      (table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params: vec![
+                    MetastoreValue::Text(stats.table_id.clone()),
+                    MetastoreValue::Text(stats.snapshot_id.clone()),
+                    MetastoreValue::Text(stats.file_path.clone()),
+                    MetastoreValue::Integer(stats.file_size_bytes),
+                    MetastoreValue::Integer(stats.num_rows),
+                    MetastoreValue::Blob(stats.statistics_blob.clone()),
+                ],
+            })
+            .await
+    }
+
+    async fn get_snapshot_file_statistics(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_path: &str,
+    ) -> CatalogResult<Option<SnapshotFileStatistics>> {
+        let results = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT table_id, snapshot_id, file_path, file_size_bytes, num_rows, statistics_blob
+                    FROM cayenne_snapshot_file_statistics
+                    WHERE table_id = ?1 AND snapshot_id = ?2 AND file_path = ?3
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(snapshot_id.to_string()),
+                        MetastoreValue::Text(file_path.to_string()),
+                    ],
+                },
+                |row| {
+                    Ok(SnapshotFileStatistics {
+                        table_id: row.get_string(0)?,
+                        snapshot_id: row.get_string(1)?,
+                        file_path: row.get_string(2)?,
+                        file_size_bytes: row.get_i64(3)?,
+                        num_rows: row.get_i64(4)?,
+                        statistics_blob: row.get_blob(5)?,
+                    })
+                },
+            )
+            .await?;
+        Ok(results.into_iter().next())
+    }
+
+    async fn clear_snapshot_file_statistics_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file_statistics \
+                      WHERE table_id = ?1 AND snapshot_id != ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                ],
+            })
+            .await
+    }
+
+    async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
     async fn upsert_pk_index(
         &self,
         table_id: &str,
@@ -2512,13 +2649,10 @@ impl MetadataCatalog for CayenneCatalog {
         insert_sequence: i64,
         snapshot_sequence: Option<SnapshotSequenceCommit>,
     ) -> CatalogResult<()> {
-        // SQLite param limit chunking (mirrors add_insert_records_batch).
-        const PARAMS_PER_ROW: usize = 4;
+        // SQLite param limit chunking. Delete-file rows use 10 params each
+        // (metadata-only publish added `reinsert_sequence`); keep the same budget.
         const MAX_PARAMS: usize = 32_000;
-        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
-
-        // Delete-file rows use 9 params each; keep the same budget.
-        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
         const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
         // Atomic replacement for the legacy `add_delete_file × N` +
@@ -2555,6 +2689,29 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+        }
+
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &delete_files,
+            insert_pk_bytes_list.len(),
+        )?;
+
+        // Metadata-only publish: stamp the per-commit reinsert sequence on the
+        // upsert's key-based delete-file rows. The keys each key-based file
+        // deletes are exactly the keys re-inserted at `insert_sequence` (the
+        // on-conflict upsert contract validated above), so one column per file
+        // reconstructs the per-key insert map on read — the per-key
+        // `cayenne_insert_record` chunks below are no longer written. Position
+        // files carry no keys, so they keep None.
+        let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
+        let mut delete_files = delete_files;
+        for delete_file in &mut delete_files {
+            delete_file.reinsert_sequence = if delete_file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2646,30 +2803,13 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             }
 
-            // Chunked INSERTs for the insert_record rows.
-            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-                let (sql, params) =
-                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
-                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "insert insert-record chunk inside on-conflict transaction",
-                        )
-                        .await;
-                        continue 'attempts;
-                    }
-                    drop(tx);
-                    return Err(CatalogError::InvalidOperation {
-                        message:
-                            "Failed to insert insert-record chunk inside on-conflict transaction"
-                                .to_string(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+            // Metadata-only publish: the per-key `cayenne_insert_record` chunks
+            // that used to be written here are GONE — the re-insert side is now
+            // carried by the per-commit `reinsert_sequence` column stamped on the
+            // delete-file rows above, and reconstructed per-key on read from each
+            // delete vector's keys. This eliminates the O(N-keys) WAL payload that
+            // was the dominant publish-commit cost. `insert_pk_bytes_list` now only
+            // gates the reinsert stamp.
 
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
@@ -2754,11 +2894,10 @@ impl MetadataCatalog for CayenneCatalog {
         // losing the re-`begin_transaction` semantics.
 
         // SQLite param limit chunking (mirrors commit_on_conflict_deletions).
-        const PARAMS_PER_ROW: usize = 4;
+        // Delete-file rows use 10 params each (metadata-only publish added
+        // `reinsert_sequence`).
         const MAX_PARAMS: usize = 32_000;
-        const MAX_ROWS_PER_CHUNK: usize = MAX_PARAMS / PARAMS_PER_ROW;
-
-        const DELETE_FILE_PARAMS_PER_ROW: usize = 9;
+        const DELETE_FILE_PARAMS_PER_ROW: usize = 10;
         const MAX_DELETE_FILE_ROWS_PER_CHUNK: usize = MAX_PARAMS / DELETE_FILE_PARAMS_PER_ROW;
 
         // cycle-8 TASK D4: deferred-flip UPDATE chunking. The batched UPDATE binds
@@ -2812,6 +2951,28 @@ impl MetadataCatalog for CayenneCatalog {
                     ),
                 });
             }
+        }
+
+        ensure_reinsert_keys_have_key_based_delete_file(
+            table_id,
+            &delete_files,
+            insert_pk_bytes_list.len(),
+        )?;
+
+        // Metadata-only publish: stamp the per-commit reinsert sequence on the
+        // upsert's key-based delete-file rows. The keys each key-based file
+        // deletes are exactly the keys re-inserted at `insert_sequence`, so one
+        // column per file reconstructs the per-key insert map on read. No
+        // per-key `cayenne_insert_record` rows are written in this folded path
+        // either. Position files carry no keys, so they keep None.
+        let reinsert_sequence = (!insert_pk_bytes_list.is_empty()).then_some(insert_sequence);
+        let mut delete_files = delete_files;
+        for delete_file in &mut delete_files {
+            delete_file.reinsert_sequence = if delete_file.deletion_type == DeletionType::KeyBased {
+                reinsert_sequence
+            } else {
+                None
+            };
         }
 
         let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
@@ -2896,29 +3057,8 @@ impl MetadataCatalog for CayenneCatalog {
                 }
             }
 
-            for chunk in insert_pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-                let (sql, params) =
-                    Self::build_insert_records_chunk_sql(table_id, chunk, insert_sequence);
-                if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
-                    if should_retry_metastore_write_conflict(&e, attempt, max_attempts) {
-                        drop(tx);
-                        sleep_before_metastore_write_retry(
-                            attempt,
-                            max_attempts,
-                            "insert insert-record chunk inside on-conflict (with tombstone) transaction",
-                        )
-                        .await;
-                        continue 'attempts;
-                    }
-                    drop(tx);
-                    return Err(CatalogError::InvalidOperation {
-                        message:
-                            "Failed to insert insert-record chunk inside on-conflict (with tombstone) transaction"
-                                .to_string(),
-                        source: Box::new(e),
-                    });
-                }
-            }
+            // Metadata-only publish: per-key insert-record chunks GONE here too —
+            // carried by the delete-file `reinsert_sequence` column.
 
             if let Some(snapshot_sequence) = &snapshot_sequence
                 && let Err(e) = tx
@@ -3215,6 +3355,18 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
+        // 5b. Delete per-file snapshot statistics
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot file statistics.".to_string(),
+                source: Box::new(e),
+            })?;
+
         // 6. Delete inlined data
         self.metastore
             .execute_helper(ExecuteParams {
@@ -3397,6 +3549,9 @@ fn validate_existing_delete_file_record(
     }
     if existing.sequence_number != incoming.sequence_number {
         mismatched_fields.push("sequence_number");
+    }
+    if existing.reinsert_sequence != incoming.reinsert_sequence {
+        mismatched_fields.push("reinsert_sequence");
     }
 
     if mismatched_fields.is_empty() {
@@ -3894,6 +4049,7 @@ mod tests {
                     file_size_bytes: 512,
                     deletion_type: DeletionType::default(),
                     sequence_number: 1, // Test sequence number
+                    reinsert_sequence: None,
                 };
 
                 catalog_clone.add_delete_file(delete_file).await
@@ -3983,6 +4139,7 @@ mod tests {
                     file_size_bytes: 512,
                     deletion_type: DeletionType::default(),
                     sequence_number: 1,
+                    reinsert_sequence: None,
                 };
 
                 catalog_clone.add_delete_file(delete_file).await
@@ -4062,6 +4219,7 @@ mod tests {
             file_size_bytes: 512,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: Some(7),
         };
 
         let first_id = catalog
@@ -4069,7 +4227,7 @@ mod tests {
             .await
             .expect("initial add_delete_file should succeed");
 
-        let mut conflicting_delete_file = delete_file;
+        let mut conflicting_delete_file = delete_file.clone();
         conflicting_delete_file.file_size_bytes = 1024;
 
         let err = catalog
@@ -4090,6 +4248,27 @@ mod tests {
             other => panic!("expected FailedToAddDeleteFile, got: {other}"),
         }
 
+        let mut conflicting_reinsert_delete_file = delete_file.clone();
+        conflicting_reinsert_delete_file.reinsert_sequence = Some(8);
+
+        let err = catalog
+            .add_delete_file(conflicting_reinsert_delete_file)
+            .await
+            .expect_err("conflicting same-path reinsert_sequence should be rejected");
+
+        match err {
+            CatalogError::FailedToAddDeleteFile { source } => match *source {
+                CatalogError::ConstraintViolation { message } => {
+                    assert!(
+                        message.contains("reinsert_sequence"),
+                        "expected reinsert_sequence mismatch in error, got: {message}"
+                    );
+                }
+                other => panic!("expected nested ConstraintViolation, got: {other}"),
+            },
+            other => panic!("expected FailedToAddDeleteFile, got: {other}"),
+        }
+
         let delete_files = catalog
             .get_table_delete_files(&table_id)
             .await
@@ -4098,6 +4277,168 @@ mod tests {
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].delete_file_id, first_id);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        assert_eq!(delete_files[0].reinsert_sequence, Some(7));
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_rejects_reinsert_keys_without_delete_files() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_reinsert_without_delete_files_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let err = catalog
+            .commit_on_conflict_deletions(Vec::new(), "table_id", vec![vec![1_u8]], 2, None)
+            .await
+            .expect_err("reinsert keys without delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without delete files"),
+                    "expected missing delete files in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_with_tombstone_rejects_reinsert_without_delete_files() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_tombstone_reinsert_without_delete_files_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let err = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                Vec::new(),
+                "table_id",
+                vec![vec![1_u8]],
+                2,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("reinsert keys without delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without delete files"),
+                    "expected missing delete files in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_deletions_rejects_reinsert_without_key_based_delete_file() {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_reinsert_without_key_file_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: "table_id".to_string(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/position_only_delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 1,
+            file_size_bytes: 128,
+            deletion_type: DeletionType::PositionBased,
+            sequence_number: 1,
+            reinsert_sequence: None,
+        };
+
+        let err = catalog
+            .commit_on_conflict_deletions(vec![delete_file], "table_id", vec![vec![1_u8]], 2, None)
+            .await
+            .expect_err("reinsert keys without key-based delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without a key-based delete file"),
+                    "expected missing key-based delete file in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
+
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_on_conflict_with_tombstone_rejects_reinsert_without_key_based_delete_file()
+    {
+        let test_db = format!(
+            "sqlite://./.test_on_conflict_tombstone_reinsert_without_key_file_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+
+        let delete_file = DeleteFile {
+            delete_file_id: String::new(),
+            table_id: "table_id".to_string(),
+            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            path: "/tmp/position_only_tombstone_delete.parquet".to_string(),
+            path_is_relative: false,
+            format: "parquet".to_string(),
+            delete_count: 1,
+            file_size_bytes: 128,
+            deletion_type: DeletionType::PositionBased,
+            sequence_number: 1,
+            reinsert_sequence: None,
+        };
+
+        let err = catalog
+            .commit_on_conflict_deletions_with_tombstone(
+                vec![delete_file],
+                "table_id",
+                vec![vec![1_u8]],
+                2,
+                None,
+                None,
+                &[],
+            )
+            .await
+            .expect_err("reinsert keys without key-based delete files should be rejected");
+
+        match err {
+            CatalogError::InvalidOperationNoSource { message } => {
+                assert!(
+                    message.contains("without a key-based delete file"),
+                    "expected missing key-based delete file in error, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidOperationNoSource, got: {other}"),
+        }
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -4137,14 +4478,15 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_delete_file_same_path.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         catalog
@@ -4168,12 +4510,20 @@ mod tests {
             .expect("Failed to get delete files");
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        // Metadata-only publish: the re-insert (insert_sequence = 2) is carried by
+        // the delete file's `reinsert_sequence` column, NOT a per-key insert_record.
+        // The replayed commit re-stamps the SAME value, so the ON CONFLICT equality
+        // (which now includes `reinsert_sequence`) keeps the row idempotent.
+        assert_eq!(delete_files[0].reinsert_sequence, Some(2));
 
         let insert_records = catalog
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
+        assert!(
+            insert_records.is_empty(),
+            "metadata-only publish writes the re-insert via reinsert_sequence, no per-key insert_record"
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -4213,14 +4563,15 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_delete_file_conflict.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         catalog
@@ -4274,13 +4625,20 @@ mod tests {
             .expect("Failed to get delete files");
         assert_eq!(delete_files.len(), 1);
         assert_eq!(delete_files[0].file_size_bytes, 512);
+        // Metadata-only publish: the surviving (first) commit's re-insert rides on
+        // `reinsert_sequence`; the rejected conflicting commit rolled its whole
+        // transaction back, so the original value (insert_sequence = 2) stands and
+        // no per-key insert_record exists for either key.
+        assert_eq!(delete_files[0].reinsert_sequence, Some(2));
 
         let insert_records = catalog
             .get_insert_records(&table_id)
             .await
             .expect("Failed to get insert records");
-        assert_eq!(insert_records.get([1_u8].as_slice()), Some(&2));
-        assert!(!insert_records.contains_key([2_u8].as_slice()));
+        assert!(
+            insert_records.is_empty(),
+            "metadata-only publish writes no per-key insert_record; the re-insert is on reinsert_sequence"
+        );
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
@@ -4323,14 +4681,15 @@ mod tests {
         let make_delete_file = |idx: usize| DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some(format!("/tmp/source_{idx}.parquet")),
+            source_data_file_path: None,
             path: format!("/tmp/on_conflict_delete_file_batched_{idx}.parquet"),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 10,
             file_size_bytes: 512,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         let delete_files: Vec<DeleteFile> = (0..5).map(make_delete_file).collect();
@@ -4408,14 +4767,15 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source_fold.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_with_tombstone_fold.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 4,
             file_size_bytes: 256,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         let snapshot_id = uuid::Uuid::now_v7().to_string();
         let tombstone = InlinedDelete {
@@ -4675,14 +5035,15 @@ mod tests {
         let delete_file = DeleteFile {
             delete_file_id: String::new(),
             table_id: table_id.clone(),
-            source_data_file_path: Some("/tmp/source_none.parquet".to_string()),
+            source_data_file_path: None,
             path: "/tmp/on_conflict_with_tombstone_none.parquet".to_string(),
             path_is_relative: false,
             format: "parquet".to_string(),
             delete_count: 1,
             file_size_bytes: 128,
-            deletion_type: DeletionType::default(),
+            deletion_type: DeletionType::KeyBased,
             sequence_number: 1,
+            reinsert_sequence: None,
         };
 
         let returned = catalog
@@ -4896,6 +5257,7 @@ mod tests {
                 file_size_bytes: 256,
                 deletion_type: DeletionType::default(),
                 sequence_number: 1,
+                reinsert_sequence: None,
             };
             catalog
                 .add_delete_file(delete_file)
@@ -5028,6 +5390,7 @@ mod tests {
                     file_size_bytes: 100,
                     deletion_type: DeletionType::default(),
                     sequence_number: i + 1,
+                    reinsert_sequence: None,
                 };
                 catalog
                     .add_delete_file(delete_file)
@@ -5710,6 +6073,7 @@ mod tests {
             file_size_bytes: 256,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         catalog
             .add_delete_file(delete_file)
@@ -5823,6 +6187,7 @@ mod tests {
             file_size_bytes: 256,
             deletion_type: DeletionType::default(),
             sequence_number: 1,
+            reinsert_sequence: None,
         };
         catalog
             .add_delete_file(delete_file)

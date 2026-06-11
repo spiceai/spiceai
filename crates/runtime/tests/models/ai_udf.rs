@@ -32,7 +32,7 @@ use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
 const DEFAULT_AI_QUERY_TIMEOUT: Duration = Duration::from_secs(20);
-const LOCAL_MODEL_AI_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_MODEL_AI_QUERY_TIMEOUT: Duration = Duration::from_mins(1);
 const LOCAL_MODEL_MULTI_QUERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[tokio::test]
@@ -74,7 +74,7 @@ async fn test_ai_udf_basic() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -194,7 +194,7 @@ async fn test_ai_udf_with_dataset() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -270,7 +270,7 @@ async fn test_ai_udf_left_truncate() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -330,7 +330,7 @@ async fn test_ai_udf_with_local_model() -> Result<(), anyhow::Error> {
 
             // Local models take longer to load, especially on uncached machines.
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(360)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(6)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for local model to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

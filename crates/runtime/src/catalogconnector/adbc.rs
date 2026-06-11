@@ -21,7 +21,7 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec};
 use crate::dataconnector::adbc::{
-    build_db_options, build_join_context, dialect_for_driver, enrich_with_bigquery_metadata,
+    build_db_options, dialect_for_driver, enrich_with_bigquery_metadata,
 };
 use crate::{Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams};
 use adbc_core::options::AdbcVersion;
@@ -34,7 +34,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
 use datafusion_table_providers::adbc::AdbcTableFactory;
-use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
@@ -220,8 +219,6 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
     let driver_options = params.parameters.get("driver_options").expose().ok();
     let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-    let join_context = build_join_context(&uri_str, username, None, None);
-
     let parse_pool_param = |name: &str| -> Result<Option<u32>> {
         match params.parameters.get(name).expose().ok() {
             Some(v) => {
@@ -274,7 +271,6 @@ async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<M
         let pool = AdbcConnectionPoolBuilder::new(db)
             .with_max_size(pool_size)
             .with_min_idle(pool_min_idle)
-            .with_join_push_down(JoinPushDown::AllowedFor(join_context))
             .build()
             .context(UnableToCreateConnectionPoolSnafu {
                 driver_location,

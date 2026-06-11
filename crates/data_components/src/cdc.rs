@@ -26,6 +26,35 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
+pub fn begin_shutdown() {
+    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
+#[must_use]
+pub fn shutdown_epoch() -> u64 {
+    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
 ///
 /// # Readiness contract

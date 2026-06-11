@@ -24,8 +24,6 @@ use cayenne::provider::CayenneAccelerationExec;
 use datafusion::common::{DataFusionError, Result, exec_err};
 use datafusion::execution::{FunctionRegistry, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
-#[cfg(not(windows))]
-use datafusion::physical_plan::joins::{HashJoinExec, MinMaxLeftAccumulator};
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::generated::datafusion_common;
 #[cfg(not(windows))]
@@ -36,8 +34,6 @@ use datafusion_proto::protobuf::PhysicalPlanNode;
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
-#[cfg(not(windows))]
-use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
 use runtime_proto::{
     BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode,
     SpicePhysicalPlanNode, UdtfExecNode, spice_physical_plan_node,
@@ -188,21 +184,6 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             }
         } else {
             #[cfg(not(windows))]
-            if let Some(hash_join) = node
-                .as_any()
-                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
-            {
-                let serializable_join: Arc<dyn ExecutionPlan> =
-                    Arc::new(hash_join.recreate_with_accumulator::<MinMaxLeftAccumulator>());
-                let physical_node =
-                    PhysicalPlanNode::try_from_physical_plan(serializable_join, self)?;
-                physical_node
-                    .encode(buf)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                return Ok(());
-            }
-
-            #[cfg(not(windows))]
             if node
                 .as_any()
                 .downcast_ref::<CayenneAccelerationExec>()
@@ -261,7 +242,7 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_expr::expressions::col;
     use datafusion::physical_plan::displayable;
-    use datafusion::physical_plan::joins::PartitionMode;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 
     fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -274,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cayenne_hash_join_round_trips_as_serializable_hash_join() {
+    fn cayenne_hash_join_round_trips_through_nested_physical_plan() {
         let left = memory_exec("left_id");
         let right: Arc<dyn ExecutionPlan> =
             Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
@@ -290,27 +271,27 @@ mod tests {
             None,
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
+            false,
         )
         .expect("hash join should be valid");
-        let exact_join: Arc<dyn ExecutionPlan> =
-            Arc::new(default_join.recreate_with_accumulator::<ExactLeftAccumulator>());
+        let join: Arc<dyn ExecutionPlan> = Arc::new(default_join);
         let codec = SpicePhysicalCodec {
             inner: Arc::new(BallistaPhysicalExtensionCodec::default()),
             runtime: None,
         };
 
-        let proto = PhysicalPlanNode::try_from_physical_plan(exact_join, &codec)
-            .expect("exact join should serialize through Spice codec");
+        let proto = PhysicalPlanNode::try_from_physical_plan(join, &codec)
+            .expect("hash join should serialize through Spice codec");
         let ctx = SessionContext::new();
         let task_ctx = ctx.state().task_ctx();
         let round_tripped = proto
             .try_into_physical_plan(task_ctx.as_ref(), &codec)
-            .expect("serialized exact join fallback should decode");
+            .expect("serialized hash join should decode");
         let plan = displayable(round_tripped.as_ref()).indent(true).to_string();
 
         assert!(
-            plan.contains("accumulator=MinMaxLeftAccumulator"),
-            "Distributed fallback should preserve the join with DataFusion's serializable accumulator: {plan}"
+            plan.contains("HashJoinExec"),
+            "Distributed fallback should preserve the hash join: {plan}"
         );
         assert!(
             plan.contains("CayenneAccelerationExec"),

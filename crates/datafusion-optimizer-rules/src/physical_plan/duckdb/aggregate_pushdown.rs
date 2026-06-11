@@ -49,6 +49,10 @@ impl DuckDBAggregatePushdownMarkerExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         Self::name()
     }
@@ -68,7 +72,7 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -139,12 +143,6 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input.metrics()
-    }
-
-    // Deprecated, but need to allow because `missing_trait_methods` complains otherwise
-    #[expect(deprecated)]
-    fn statistics(&self) -> Result<Statistics> {
-        self.input.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {

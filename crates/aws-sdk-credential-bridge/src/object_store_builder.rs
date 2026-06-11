@@ -523,7 +523,7 @@ mod tests {
             .with_endpoint("http://localhost:9000")
             .with_credentials("AKID", "SECRET")
             .with_session_token("TOKEN")
-            .with_client_timeout(Duration::from_secs(60))
+            .with_client_timeout(Duration::from_mins(1))
             .with_allow_http(true);
 
         assert_eq!(builder.region, Some("us-east-1".to_string()));
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(builder.access_key_id, Some("AKID".to_string()));
         assert_eq!(builder.secret_access_key, Some("SECRET".to_string()));
         assert_eq!(builder.session_token, Some("TOKEN".to_string()));
-        assert_eq!(builder.client_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(builder.client_timeout, Some(Duration::from_mins(1)));
         assert_eq!(builder.allow_http, Some(true));
     }
 }

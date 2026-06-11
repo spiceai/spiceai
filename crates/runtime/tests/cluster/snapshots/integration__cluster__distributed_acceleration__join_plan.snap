@@ -3,40 +3,36 @@ source: crates/runtime/tests/cluster/distributed_acceleration.rs
 expression: __plan
 snapshot_kind: text
 ---
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                       |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                  |
-|               |   Projection: t.id, t.name, c.category, c.rating                                                                                                           |
-|               |     Inner Join: t.id = c.id                                                                                                                                |
-|               |       SubqueryAlias: t                                                                                                                                     |
-|               |         SubqueryAlias: test_data                                                                                                                           |
-|               |           Union                                                                                                                                            |
-|               |             TableScan: test_data projection=[id, name]                                                                                                     |
-|               |             TableScan: test_data projection=[id, name]                                                                                                     |
-|               |       SubqueryAlias: c                                                                                                                                     |
-|               |         SubqueryAlias: categories                                                                                                                          |
-|               |           Union                                                                                                                                            |
-|               |             TableScan: categories projection=[id, category, rating]                                                                                        |
-|               |             TableScan: categories projection=[id, category, rating]                                                                                        |
-| physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                             |
-|               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                       |
-|               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4] |
-|               |       CoalescePartitionsExec                                                                                                                               |
-|               |         UnionExec                                                                                                                                          |
-|               |           CooperativeExec                                                                                                                                  |
-|               |             BytesProcessedExec                                                                                                                             |
-|               |               FlightSqlExec sql=SELECT id, name FROM test_data                                                                                             |
-|               |           CooperativeExec                                                                                                                                  |
-|               |             BytesProcessedExec                                                                                                                             |
-|               |               FlightSqlExec sql=SELECT id, name FROM test_data                                                                                             |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2                                                                                 |
-|               |         UnionExec                                                                                                                                          |
-|               |           CooperativeExec                                                                                                                                  |
-|               |             BytesProcessedExec                                                                                                                             |
-|               |               FlightSqlExec sql=SELECT id, category, rating FROM categories                                                                                |
-|               |           CooperativeExec                                                                                                                                  |
-|               |             BytesProcessedExec                                                                                                                             |
-|               |               FlightSqlExec sql=SELECT id, category, rating FROM categories                                                                                |
-|               |                                                                                                                                                            |
-+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                    |
++---------------+-------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: t.id ASC NULLS LAST                                                                                               |
+|               |   Projection: t.id, t.name, c.category, c.rating                                                                        |
+|               |     Inner Join: t.id = c.id                                                                                             |
+|               |       SubqueryAlias: t                                                                                                  |
+|               |         SubqueryAlias: test_data                                                                                        |
+|               |           Union                                                                                                         |
+|               |             TableScan: test_data projection=[id, name]                                                                  |
+|               |             TableScan: test_data projection=[id, name]                                                                  |
+|               |       SubqueryAlias: c                                                                                                  |
+|               |         SubqueryAlias: categories                                                                                       |
+|               |           Union                                                                                                         |
+|               |             TableScan: categories projection=[id, category, rating]                                                     |
+|               |             TableScan: categories projection=[id, category, rating]                                                     |
+| physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                          |
+|               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                    |
+|               |     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4] |
+|               |       CoalescePartitionsExec                                                                                            |
+|               |         UnionExec                                                                                                       |
+|               |           BytesProcessedExec                                                                                            |
+|               |             FlightSqlExec sql=SELECT id, name FROM test_data                                                            |
+|               |           BytesProcessedExec                                                                                            |
+|               |             FlightSqlExec sql=SELECT id, name FROM test_data                                                            |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2                                              |
+|               |         UnionExec                                                                                                       |
+|               |           BytesProcessedExec                                                                                            |
+|               |             FlightSqlExec sql=SELECT id, category, rating FROM categories                                               |
+|               |           BytesProcessedExec                                                                                            |
+|               |             FlightSqlExec sql=SELECT id, category, rating FROM categories                                               |
+|               |                                                                                                                         |
++---------------+-------------------------------------------------------------------------------------------------------------------------+

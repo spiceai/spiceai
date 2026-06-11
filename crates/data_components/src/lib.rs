@@ -123,6 +123,7 @@ pub mod federation;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod function_support;
 pub mod iceberg;
 pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
@@ -442,7 +443,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::error::DataFusionError;
-    use datafusion::logical_expr::TableSource;
+    use datafusion::logical_expr::{LogicalPlan, TableSource};
     use datafusion_federation::{
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,

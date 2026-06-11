@@ -324,6 +324,10 @@ pub struct ExactColumnBounds {
 }
 
 impl ColumnBounds for ExactColumnBounds {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     /// Converts the collected arrays into an `InListExpr` for use in dynamic filtering.
     /// This builds an IN expression with all collected values.
     ///

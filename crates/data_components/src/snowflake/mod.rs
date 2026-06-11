@@ -18,6 +18,7 @@ pub mod federation;
 pub mod provider;
 mod write;
 
+use crate::function_support::FunctionSupport;
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
@@ -35,7 +36,6 @@ use datafusion::{
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snowflake_api::SnowflakeApi;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;

@@ -42,7 +42,7 @@ impl AppendConfig {
             end_duration,
             query_set,
             load_steps: 10,
-            load_interval: Duration::from_secs(60 * 4),
+            load_interval: Duration::from_mins(4),
             temp_directory,
             with_conflict_data: false,
             with_retention_data: false,

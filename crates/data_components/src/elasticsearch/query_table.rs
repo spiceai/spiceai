@@ -116,12 +116,12 @@ impl TableProvider for ElasticsearchQueryTable {
             projected_schema,
             projection: projection.cloned(),
             limit,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }))
     }
 }
@@ -134,7 +134,7 @@ struct ElasticsearchQueryExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ElasticsearchQueryExec {
@@ -156,7 +156,7 @@ impl ExecutionPlan for ElasticsearchQueryExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

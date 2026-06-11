@@ -10,11 +10,20 @@ name: postgres-cayenne[file]-cdc-memory
 # apply is PK-idempotent, so the result is exactly-once. The RAM tier is bounded by a per-table
 # byte cap plus a process-global byte budget, so it spills (checkpoints) rather than OOMing.
 #
+# Checkpoint-churn tuning (measured at SF-100, 10K txn/s): every durable checkpoint costs a new
+# snapshot dir + delete-vector files + a protected-snapshot entry that scans must union until
+# compaction folds it. At small/frequent checkpoints the heavy tables hit "high protected snapshot
+# amplification" (stock reached the warn threshold of 24) because folding can't keep pace with
+# inflow on a saturated box, degrading both OLAP and the CDC apply. Fewer, BIGGER checkpoints cut
+# the inflow ~4x and a 1s compaction tick folds ~3x faster. Query freshness is unaffected — RAM
+# rows are visible to queries immediately on append; only the source-slot ack (the crash-replay
+# window) moves out to <=30s, which is exactly what the slot is for.
+#
 # Everything else matches the baseline: storage stays `mode: file` (memory durability is the CDC
-# write-path tier, not in-memory acceleration), every other knob is auto-derived, and the per-table
-# cap / max-age are left at their auto defaults. The static reference tables use refresh_mode: full,
-# which is not the small-write/CDC profile, so `cayenne_cdc_durability` does not apply to them — it
-# is set only on the changes tables (the runtime would otherwise warn and fall back to file).
+# write-path tier, not in-memory acceleration) and every other knob is auto-derived. The static
+# reference tables use refresh_mode: full, which is not the small-write/CDC profile, so
+# `cayenne_cdc_durability` does not apply to them — it is set only on the changes tables (the
+# runtime would otherwise warn and fall back to file).
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of in-memory CDC durability, not caching/history overhead.
@@ -53,6 +62,11 @@ datasets:
         w_id: upsert
       params:
         cayenne_cdc_durability: memory
+        # Fewer, bigger checkpoints: flush at >=128MiB or 30s age (see header).
+        cayenne_cdc_mem_tier_min_flush_bytes: '134217728'
+        cayenne_cdc_mem_tier_max_age_ms: '30000'
+        # Fold protected snapshots faster so folding keeps pace with checkpoint inflow.
+        cayenne_compaction_background_interval_ms: '1000'
 
   - from: postgres:district
     name: district

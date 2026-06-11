@@ -5,10 +5,13 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
 
+use arrow_schema::Field;
 use arrow_schema::Schema;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::ScalarValue;
+use datafusion_common::arrow::array::AsArray;
+use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::exec_datafusion_err;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::TableSchema;
@@ -34,17 +37,17 @@ use itertools::Itertools;
 use object_store::path::Path;
 use tracing::Instrument;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::dtype::FieldMask;
 use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
+use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::layout::scan::split_by::SplitBy;
 use vortex::metrics::Label;
 use vortex::metrics::MetricsRegistry;
-use vortex::scan::ScanBuilder;
-use vortex::scan::SplitBy;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
@@ -102,10 +105,6 @@ pub(crate) struct VortexOpener {
     pub segment_cache: Option<Arc<SharedSegmentCache>>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
-    /// Whether `DataFusion`'s [`FilePruner`] may be built to skip whole files
-    /// using statistics and partition values before opening them. When `false`,
-    /// pruning is disabled and every candidate file is opened and scanned.
-    pub file_pruning: bool,
     pub scan_concurrency: Option<usize>,
 }
 
@@ -129,7 +128,6 @@ impl FileOpener for VortexOpener {
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
         let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
-        let file_pruning = self.file_pruning;
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
@@ -171,10 +169,6 @@ impl FileOpener for VortexOpener {
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
-                // File pruning is gated by the session/table option: when disabled
-                // we never build the pruner, so no file is skipped on statistics or
-                // partition values and every candidate file is opened and scanned.
-                .filter(|_| file_pruning)
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -210,8 +204,10 @@ impl FileOpener for VortexOpener {
             }
 
             if let Some(file_metadata_cache) = file_metadata_cache
-                && let Some(file_metadata) = file_metadata_cache.get(&file.object_meta)
-                && let Some(vortex_metadata) = file_metadata
+                && let Some(entry) = file_metadata_cache.get(file.path())
+                && entry.is_valid_for(&file.object_meta)
+                && let Some(vortex_metadata) = entry
+                    .file_metadata
                     .as_any()
                     .downcast_ref::<CachedVortexMetadata>()
             {
@@ -228,6 +224,7 @@ impl FileOpener for VortexOpener {
             let this_file_schema = Arc::new(calculate_physical_schema(
                 vxf.dtype(),
                 &unified_file_schema,
+                &session.arrow(),
             )?);
 
             let projected_physical_schema = projection.project_schema(&unified_file_schema)?;
@@ -235,7 +232,7 @@ impl FileOpener for VortexOpener {
             let expr_adapter = expr_adapter_factory.create(
                 Arc::clone(&unified_file_schema),
                 Arc::clone(&this_file_schema),
-            );
+            )?;
 
             let simplifier = PhysicalExprSimplifier::new(&this_file_schema);
 
@@ -285,7 +282,8 @@ impl FileOpener for VortexOpener {
                     .collect();
                 Schema::new_with_metadata(fields, this_file_schema.metadata().clone())
             };
-            let stream_schema = calculate_physical_schema(&scan_dtype, &scan_reference_schema)?;
+            let stream_schema =
+                calculate_physical_schema(&scan_dtype, &scan_reference_schema, &session.arrow())?;
 
             let leftover_projection = leftover_projection
                 .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
@@ -352,6 +350,22 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_row_range(row_range);
             }
 
+            // Stats-layout pruning chain (Vortex 0.74 `FileStatsLayoutReader` / zoned
+            // `StatFn`). The conjuncts collected here are translated to a Vortex
+            // `Expression` and handed to `ScanBuilder::with_some_filter` below. Inside
+            // Vortex the zoned layout reader rewrites that expression into a stats
+            // predicate (`Expression::falsify`) and prunes whole zones whose min/max
+            // can't satisfy it (`ZoneMap::prune`). Dynamic hash-join filters (the
+            // InList fragments produced by the native dynamic-filter pass) flow through
+            // the same path: `collect_vortex_pushdown_conjunct` unwraps
+            // `DynamicFilterPhysicalExpr` via `.current()` at file-open time (not plan
+            // build time), and Vortex's `PruningResult::mask()` re-derives the zone mask
+            // whenever the dynamic expression's version advances — so a build side that
+            // populates after the scan starts still prunes zones. `VortexAccessPlan`
+            // (applied above) only adds a row `Selection`; it does not bypass this
+            // filter, so stats pruning still engages under position-delete scans.
+            // Filters Vortex can't translate (`skipped_dynamic`) are dropped here but
+            // still feed the coarser per-file `FilePruner`/`PrunableStream` above.
             let filter = filter
                 .and_then(|f| {
                     // Verify that all filters we've accepted from DataFusion get pushed down.
@@ -398,6 +412,7 @@ impl FileOpener for VortexOpener {
                 scan_builder = scan_builder.with_concurrency(concurrency);
             }
 
+            let stream_target_field = Field::new_struct("", stream_schema.fields().clone(), false);
             let stream = scan_builder
                 .with_metrics_registry(metrics_registry)
                 .with_projection(scan_projection)
@@ -405,7 +420,13 @@ impl FileOpener for VortexOpener {
                 .with_ordered(has_output_ordering)
                 .map(move |chunk| {
                     let mut ctx = session.create_execution_ctx();
-                    chunk.execute_record_batch(&stream_schema, &mut ctx)
+                    let arrow_session = ctx.session().clone();
+                    let arrow = arrow_session.arrow().execute_arrow(
+                        chunk,
+                        Some(&stream_target_field),
+                        &mut ctx,
+                    )?;
+                    Ok(RecordBatch::from(arrow.as_struct().clone()))
                 })
                 .into_stream()
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex stream: {e}"))?
@@ -626,7 +647,7 @@ mod tests {
     use vortex::io::VortexWrite;
     use vortex::io::object_store::ObjectStoreWrite;
     use vortex::metrics::DefaultMetricsRegistry;
-    use vortex::scan::Selection;
+    use vortex::scan::selection::Selection;
     use vortex::session::VortexSession;
 
     use super::*;
@@ -733,7 +754,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         }
     }
@@ -788,63 +808,6 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
-
-        Ok(())
-    }
-
-    #[rstest]
-    // Pruning enabled: a file whose statistics can't satisfy the predicate is
-    // skipped without scanning, yielding no rows.
-    #[case(true, 0)]
-    // Pruning disabled: the FilePruner is never built, so the file is opened and
-    // scanned, returning all of its rows.
-    #[case(false, 3)]
-    #[tokio::test]
-    async fn test_file_pruning_flag_gates_file_pruner(
-        #[case] file_pruning: bool,
-        #[case] expected_rows: usize,
-    ) -> anyhow::Result<()> {
-        use datafusion::common::ColumnStatistics;
-        use datafusion::common::Statistics;
-        use datafusion::common::stats::Precision;
-
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let file_path = "/path/prunable.vortex";
-        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
-            .expect("test record batch should build");
-        let data_size =
-            write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
-
-        let table_schema = TableSchema::from_file_schema(batch.schema());
-
-        // File statistics: column `a` ranges over [1, 3]. The pruning predicate
-        // `a > 1000` can never be satisfied, so a built FilePruner skips the file.
-        let statistics = Statistics {
-            num_rows: Precision::Exact(3),
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics {
-                null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::Int32(Some(3))),
-                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
-                sum_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-                byte_size: Precision::Absent,
-            }],
-        };
-        let file = PartitionedFile::new(file_path.to_string(), data_size)
-            .with_statistics(Arc::new(statistics));
-
-        let predicate = logical2physical(&col("a").gt(lit(1000_i32)), table_schema.table_schema());
-
-        let mut opener = make_opener(object_store, table_schema, None);
-        opener.file_pruning_predicate = Some(predicate);
-        opener.file_pruning = file_pruning;
-
-        let stream = opener.open(file)?.await?;
-        let data = stream.try_collect::<Vec<_>>().await?;
-        let rows: usize = data.iter().map(|rb| rb.num_rows()).sum();
-
-        assert_eq!(rows, expected_rows);
 
         Ok(())
     }
@@ -926,7 +889,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1015,7 +977,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1172,7 +1133,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1234,7 +1194,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         }
     }
@@ -1244,7 +1203,7 @@ mod tests {
     async fn test_selection_include_by_index() -> anyhow::Result<()> {
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
         use vortex::buffer::Buffer;
-        use vortex::scan::Selection;
+        use vortex::scan::selection::Selection;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";
@@ -1329,7 +1288,7 @@ mod tests {
     #[tokio::test]
     // Test that Selection::All returns all rows.
     async fn test_selection_all() -> anyhow::Result<()> {
-        use vortex::scan::Selection;
+        use vortex::scan::selection::Selection;
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";
@@ -1438,7 +1397,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 

@@ -38,7 +38,7 @@ use runtime::dataconnector::{
     DataConnectorFactory, DataConnectorResult,
 };
 use runtime::datafusion::dialect::new_duckdb_dialect;
-use runtime::datafusion::udf::deny_spice_functions_for_duckdb;
+use runtime::datafusion::udf::deny_spice_functions_for_duckdb_table_providers;
 use runtime::parameters::ParameterSpec;
 use snafu::prelude::*;
 use std::any::Any;
@@ -80,7 +80,14 @@ impl DuckDB {
     /// natively — e.g. `cosine_distance`, which `DuckDB` unparses to
     /// `array_cosine_distance` — still federate. See issue #10703.
     fn with_spice_deny_list(factory: DuckDBTableFactory) -> DuckDBTableFactory {
-        factory.with_function_support(deny_spice_functions_for_duckdb().as_ref().clone())
+        // The spiceai table-providers fork restores the `with_function_support`
+        // deny-list seam on DuckDBTableFactory (see issue #10703). Install the
+        // DuckDB-aware deny-list so Spice-only UDFs that DuckDB can't run are
+        // evaluated locally, while functions DuckDB's dialect can rewrite (e.g.
+        // cosine_distance -> array_cosine_distance) still federate. The factory's
+        // seam takes the table-providers FunctionSupport type, so we build the
+        // deny-list directly in that type from the runtime's shared name list.
+        factory.with_function_support(deny_spice_functions_for_duckdb_table_providers())
     }
 
     /// Creates an in-memory `DuckDB` table factory.

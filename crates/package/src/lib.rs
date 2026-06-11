@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::{collections::HashSet, io::Write};
 
 use bytes::Bytes;
-use object_store::{ObjectStore, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
 use spicepod::component::ComponentOrReference;
 use spicepod::component::catalog::Catalog;

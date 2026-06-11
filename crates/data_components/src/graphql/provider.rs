@@ -314,7 +314,7 @@ pub struct GraphQLTableProviderExec {
     limit: Option<usize>,
     error_checker: Option<ErrorChecker>,
     transform_fn: Option<TransformFn>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     query_cost: Option<u32>,
 }
 
@@ -334,12 +334,12 @@ impl GraphQLTableProviderExec {
             limit: None,
             error_checker: None,
             transform_fn: None,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             query_cost: None,
         }
     }
@@ -404,7 +404,7 @@ impl ExecutionPlan for GraphQLTableProviderExec {
         Arc::clone(&self.table_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

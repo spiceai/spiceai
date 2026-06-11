@@ -162,6 +162,7 @@ mod tests {
                 None,
                 PartitionMode::Partitioned,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         );
@@ -217,6 +218,7 @@ mod tests {
                 None,
                 PartitionMode::CollectLeft,
                 NullEquality::NullEqualsNothing,
+                false,
             )
             .expect("valid HashJoinExec"),
         );
