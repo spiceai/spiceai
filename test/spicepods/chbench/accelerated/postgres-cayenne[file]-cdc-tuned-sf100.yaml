@@ -28,9 +28,13 @@ runtime:
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
-    cdc_max_coalesced_bytes: '536870912' # 128 MB
-    cdc_max_coalesce_age_ms: '2000'
+    cdc_max_coalesced_bytes: '134217728' # 128 MB
+    cdc_max_coalesce_age_ms: '250'
     cdc_commit_timeout_ms: '60000'
+    cayenne_sort_merge_min_rows: '50000000'
+    cayenne_footer_cache_mb: '1024'
+    cayenne_metastore_cache_mb: '1024'
+    cayenne_metastore_mmap_mb: '4096'
   query:
     target_partitions: 64
   caching:
@@ -72,9 +76,7 @@ datasets:
           cayenne_metastore: sqlite
           cayenne_file_path: .spice/cayenne/district
           cayenne_deletion_mode: key
-        # CDC overrides applied ONLY to district (sit outside the anchor so customer/
-        # new_order/oorder/order_line/stock keep the global 250 ms / 128 MB defaults).
-        cdc_max_coalesce_age_ms: '1000'
+        cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
 
   - from: postgres:customer
