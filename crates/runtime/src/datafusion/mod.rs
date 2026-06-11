@@ -651,6 +651,23 @@ pub(crate) fn table_provider_with_spicepod_metadata(
         ));
     }
 
+    // If the provider is a FederatedTableProviderAdaptor, push the metadata enrichment
+    // inside it so that the federation analyzer can still discover it via
+    // downcast_ref::<FederatedTableProviderAdaptor>().
+    if let Some(adaptor) = provider.as_any().downcast_ref::<FederatedTableProviderAdaptor>() {
+        if let Some(inner) = &adaptor.table_provider {
+            let enriched_inner = metadata_enriched_table_provider(
+                Arc::clone(inner),
+                table_metadata.clone(),
+                field_metadata,
+            );
+            return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+                Arc::clone(&adaptor.source),
+                enriched_inner,
+            ));
+        }
+    }
+
     metadata_enriched_table_provider(provider, table_metadata.clone(), field_metadata)
 }
 
