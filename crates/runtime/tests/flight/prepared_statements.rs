@@ -439,7 +439,7 @@ mod flight_prepared_statements {
 
                 // Check that the error specifically uses the InvalidArgument code vs generic "Internal"
                 let result_err_message = result.expect_err("Must be error").to_string();
-                assert!(result_err_message.contains("code: InvalidArgument"));
+                assert!(result_err_message.contains("Client specified an invalid argument"));
                 assert!(result_err_message.contains("No value found for placeholder with id $2"));
 
                 Ok(())

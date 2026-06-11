@@ -24,8 +24,8 @@ use iceberg::io::{FileIO, FileIOBuilder, InputFile, StorageFactory};
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
-    Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit, TableCreation,
-    TableIdent,
+    Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime, TableCommit,
+    TableCreation, TableIdent,
 };
 use opendal::{Entry, Operator};
 
@@ -475,6 +475,7 @@ impl Catalog for HadoopCatalog {
             .metadata(table_metadata)
             .identifier(table_identifier.clone())
             .file_io(self.file_io.clone())
+            .runtime(Runtime::current())
             .readonly(true)
             .build()
     }

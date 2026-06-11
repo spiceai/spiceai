@@ -26,7 +26,7 @@ use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
 use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use iceberg_datafusion::IcebergStaticTableProvider;
+use iceberg_datafusion::IcebergTableProvider;
 use tokio::sync::Semaphore;
 
 use crate::RefreshableCatalogProvider;
@@ -316,7 +316,13 @@ impl IcebergSchemaProvider {
             .map_err(|e| Error::SemaphoreError { source: e })?;
 
         match catalog.load_table(&table_name).await {
-            Ok(table) => match IcebergStaticTableProvider::try_new_from_table(table).await {
+            Ok(_) => match IcebergTableProvider::try_new(
+                Arc::clone(&catalog),
+                table_name.namespace().clone(),
+                table_name.name().to_string(),
+            )
+            .await
+            {
                 Ok(provider) => {
                     // Wrap in IcebergDeletionProvider so that
                     // catalog tables support DELETE FROM via equality delete files.

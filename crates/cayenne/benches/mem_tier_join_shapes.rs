@@ -67,8 +67,7 @@ const OVERLAY_FRESH_ROWS: i64 = 20_000; // item_id >= ITEMS: outside every query
 const OVERLAY_UPSERT_ROWS: i64 = 20_000; // value-identical rewrites of existing pks
 const INSERT_CHUNK: i64 = 50_000;
 
-const SINGLE_SCAN_SQL: &str =
-    "SELECT count(*), sum(ol_qty) FROM oline_b WHERE ol_item_id < 5000";
+const SINGLE_SCAN_SQL: &str = "SELECT count(*), sum(ol_qty) FROM oline_b WHERE ol_item_id < 5000";
 // q20-shaped: IN-subquery (semi join) whose inner is a stock x order_line join
 // with GROUP BY + HAVING over an aggregate of the second CDC table.
 const SEMI_JOIN_SQL: &str = "SELECT count(*) FROM supp_b WHERE su_key IN \
@@ -246,7 +245,6 @@ async fn append_overlay(
     );
 }
 
-
 /// Background value-identical upsert stream: rewrites existing pks with their
 /// SAME values at a steady cadence, so every query result stays byte-identical
 /// while the tier version / structural epoch churn at live-CDC rates. Returns
@@ -324,21 +322,41 @@ async fn setup_lane(state: TierState, expected: Option<&Lane>) -> (Lane, tempfil
 
     let oline_schema = fact_schema("ol_item_id", "ol_qty");
     let stock_schema = fact_schema("s_item_id", "s_qty");
-    let oline =
-        create_fact_table(&catalog, base, "oline_b", Arc::clone(&oline_schema), OLINE_ROWS).await;
-    let stock =
-        create_fact_table(&catalog, base, "stock_b", Arc::clone(&stock_schema), STOCK_ROWS).await;
+    let oline = create_fact_table(
+        &catalog,
+        base,
+        "oline_b",
+        Arc::clone(&oline_schema),
+        OLINE_ROWS,
+    )
+    .await;
+    let stock = create_fact_table(
+        &catalog,
+        base,
+        "stock_b",
+        Arc::clone(&stock_schema),
+        STOCK_ROWS,
+    )
+    .await;
     append_overlay(&oline, &oline_schema, state, 3 * ITEMS).await;
     append_overlay(&stock, &stock_schema, state, ITEMS).await;
 
     let ctx = SessionContext::new();
     let oline_handle = Arc::clone(&oline);
-    ctx.register_table("oline_b", oline).expect("register oline");
-    ctx.register_table("stock_b", stock).expect("register stock");
-    let supp_schema = Arc::new(Schema::new(vec![Field::new("su_key", DataType::Int64, false)]));
+    ctx.register_table("oline_b", oline)
+        .expect("register oline");
+    ctx.register_table("stock_b", stock)
+        .expect("register stock");
+    let supp_schema = Arc::new(Schema::new(vec![Field::new(
+        "su_key",
+        DataType::Int64,
+        false,
+    )]));
     let supp_batch = RecordBatch::try_new(
         Arc::clone(&supp_schema),
-        vec![Arc::new(Int64Array::from((0..SUPP_ROWS).collect::<Vec<_>>()))],
+        vec![Arc::new(Int64Array::from(
+            (0..SUPP_ROWS).collect::<Vec<_>>(),
+        ))],
     )
     .expect("supplier batch");
     ctx.register_table(
@@ -451,7 +469,10 @@ fn bench_mem_tier_join_shapes(c: &mut Criterion) {
     );
     let mut live = c.benchmark_group("mem_tier_join_shapes_under_appends");
     live.sample_size(10);
-    for (shape, sql) in [("single_scan", SINGLE_SCAN_SQL), ("semi_join", SEMI_JOIN_SQL)] {
+    for (shape, sql) in [
+        ("single_scan", SINGLE_SCAN_SQL),
+        ("semi_join", SEMI_JOIN_SQL),
+    ] {
         let expected = match shape {
             "single_scan" => &upsert_lane.expected_single,
             _ => &upsert_lane.expected_semi,

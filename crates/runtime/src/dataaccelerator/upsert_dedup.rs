@@ -20,14 +20,13 @@ limitations under the License.
 //! This handles the `UpsertDedup` `on_conflict` behavior by removing duplicate rows
 //! within incoming batches before they are inserted into the accelerator.
 
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
-use arrow::{array::BooleanArray, compute::filter_record_batch, datatypes::SchemaRef};
-use arrow_row::{RowConverter, SortField};
+use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{Constraint, Constraints},
+    common::Constraints,
     datasource::TableProvider,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
@@ -312,34 +311,35 @@ impl ExecutionPlan for UpsertDedupExec {
         let constraints = self.constraints.clone();
         let upsert_options = self.upsert_options.clone();
 
-        // Create a stream that deduplicates each batch before validating constraints.
+        // Create a stream that validates constraints and applies deduplication to each batch.
+        let stream_schema = Arc::clone(&schema);
         let validated_stream = input_stream.then(move |batch_result| {
             let constraints = constraints.clone();
             let upsert_options = upsert_options.clone();
+            let schema = Arc::clone(&stream_schema);
             async move {
                 let batch = batch_result?;
 
-                let deduped_batch = deduplicate_batch(&batch, &constraints, &upsert_options)?;
-
-                // `validate_batch_with_constraints` now takes an owned `Vec<RecordBatch>` plus an
-                // `&datafusion_table_providers::util::constraints::UpsertOptions`
-                // (datafusion-table-providers `sgrebnov/spiceai-53`). Map our local `UpsertOptions`
-                // (field-identical) to that type. We use the call as a constraint check here — dedup
-                // is already applied above — so the returned (potentially modified) batches are
-                // discarded and the locally deduped batch is returned, preserving the prior behavior.
                 let tp_upsert_options =
                     datafusion_table_providers::util::constraints::UpsertOptions::default()
                         .with_remove_duplicates(upsert_options.remove_duplicates)
                         .with_last_write_wins(upsert_options.last_write_wins);
-                datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                    vec![deduped_batch.clone()],
-                    &constraints,
-                    &tp_upsert_options,
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let validated_batches =
+                    datafusion_table_providers::util::constraints::validate_batch_with_constraints(
+                        vec![batch],
+                        &constraints,
+                        &tp_upsert_options,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                Ok(deduped_batch)
+                if validated_batches.is_empty() {
+                    return Err(DataFusionError::Internal(
+                        "Expected validated batch".to_string(),
+                    ));
+                }
+                concat_batches(&schema, &validated_batches)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
             }
         });
 
@@ -352,68 +352,6 @@ impl ExecutionPlan for UpsertDedupExec {
     fn metrics(&self) -> Option<MetricsSet> {
         self.input.metrics()
     }
-}
-
-pub(crate) fn deduplicate_batch(
-    batch: &arrow::array::RecordBatch,
-    constraints: &Constraints,
-    upsert_options: &UpsertOptions,
-) -> datafusion::error::Result<arrow::array::RecordBatch> {
-    if batch.num_rows() == 0 {
-        return Ok(batch.clone());
-    }
-
-    let Some(key_columns) = first_unique_constraint_columns(constraints) else {
-        return Ok(batch.clone());
-    };
-
-    let sort_fields = key_columns
-        .iter()
-        .map(|column_index| SortField::new(batch.schema().field(*column_index).data_type().clone()))
-        .collect::<Vec<_>>();
-    let row_converter = RowConverter::new(sort_fields)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-    let columns = key_columns
-        .iter()
-        .map(|column_index| Arc::clone(batch.column(*column_index)))
-        .collect::<Vec<_>>();
-    let rows = row_converter
-        .convert_columns(&columns)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-
-    let mut selected_rows_by_key = HashMap::with_capacity(batch.num_rows());
-    for row_index in 0..batch.num_rows() {
-        let key = rows.row(row_index).data().to_vec();
-        if upsert_options.last_write_wins {
-            selected_rows_by_key.insert(key, row_index);
-        } else {
-            selected_rows_by_key.entry(key).or_insert(row_index);
-        }
-    }
-
-    if selected_rows_by_key.len() == batch.num_rows() {
-        return Ok(batch.clone());
-    }
-
-    let mut keep_rows = vec![false; batch.num_rows()];
-    for row_index in selected_rows_by_key.values() {
-        keep_rows[*row_index] = true;
-    }
-
-    let filter = BooleanArray::from(keep_rows);
-    filter_record_batch(batch, &filter).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-fn first_unique_constraint_columns(constraints: &Constraints) -> Option<Vec<usize>> {
-    if let Some(constraint) = (**constraints).iter().next() {
-        match constraint {
-            Constraint::PrimaryKey(columns) | Constraint::Unique(columns) => {
-                return Some(columns.clone());
-            }
-        }
-    }
-    None
 }
 
 /// Extracts `UpsertOptions` from the command options.

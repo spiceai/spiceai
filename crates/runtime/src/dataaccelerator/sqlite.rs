@@ -36,7 +36,8 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
-        dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
+        self as db_connection_pool, dbconnection::sqliteconn::SqliteConnection,
+        sqlitepool::SqliteConnectionPool,
     },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
@@ -508,20 +509,36 @@ impl DataAccelerator for SqliteAccelerator {
     }
 
     fn supports_snapshot_reload(&self) -> bool {
-        false
+        true
     }
 
-    /// `SQLite` snapshot reload is disabled until the upstream factory exposes
-    /// safe connection-pool invalidation again.
     async fn reload_from_snapshot(
         &self,
-        _source: &dyn AccelerationSource,
+        source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
-        _provider_factory: super::ReloadProviderFactory,
+        provider_factory: super::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         drop(previous_provider);
 
-        Err("SQLite snapshot reload is unavailable because datafusion-table-providers 0.11 no longer exposes safe connection-pool invalidation".into())
+        let acceleration =
+            source
+                .acceleration()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    "acceleration not configured for snapshot reload".into()
+                })?;
+        match acceleration.mode {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
+                let path = self.sqlite_file_path(source).boxed()?;
+                self.sqlite_factory.invalidate_file_instance(path).await;
+            }
+            Mode::Memory => {
+                self.sqlite_factory
+                    .invalidate_instance(&db_connection_pool::DbInstanceKey::memory())
+                    .await;
+            }
+        }
+
+        provider_factory().await
     }
 
     async fn drop_table(

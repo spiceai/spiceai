@@ -105,10 +105,6 @@ pub(crate) struct VortexOpener {
     pub segment_cache: Option<Arc<SharedSegmentCache>>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
     pub projection_pushdown: bool,
-    /// Whether `DataFusion`'s [`FilePruner`] may be built to skip whole files
-    /// using statistics and partition values before opening them. When `false`,
-    /// pruning is disabled and every candidate file is opened and scanned.
-    pub file_pruning: bool,
     pub scan_concurrency: Option<usize>,
 }
 
@@ -132,7 +128,6 @@ impl FileOpener for VortexOpener {
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
         let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
-        let file_pruning = self.file_pruning;
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
@@ -174,10 +169,6 @@ impl FileOpener for VortexOpener {
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
             let mut file_pruner = file_pruning_predicate
-                // File pruning is gated by the session/table option: when disabled
-                // we never build the pruner, so no file is skipped on statistics or
-                // partition values and every candidate file is opened and scanned.
-                .filter(|_| file_pruning)
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -763,7 +754,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         }
     }
@@ -818,63 +808,6 @@ mod tests {
         let num_batches = data.len();
         let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
         assert_eq!((num_batches, num_rows), (0, 0));
-
-        Ok(())
-    }
-
-    #[rstest]
-    // Pruning enabled: a file whose statistics can't satisfy the predicate is
-    // skipped without scanning, yielding no rows.
-    #[case(true, 0)]
-    // Pruning disabled: the FilePruner is never built, so the file is opened and
-    // scanned, returning all of its rows.
-    #[case(false, 3)]
-    #[tokio::test]
-    async fn test_file_pruning_flag_gates_file_pruner(
-        #[case] file_pruning: bool,
-        #[case] expected_rows: usize,
-    ) -> anyhow::Result<()> {
-        use datafusion::common::ColumnStatistics;
-        use datafusion::common::Statistics;
-        use datafusion::common::stats::Precision;
-
-        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let file_path = "/path/prunable.vortex";
-        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
-            .expect("test record batch should build");
-        let data_size =
-            write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
-
-        let table_schema = TableSchema::from_file_schema(batch.schema());
-
-        // File statistics: column `a` ranges over [1, 3]. The pruning predicate
-        // `a > 1000` can never be satisfied, so a built FilePruner skips the file.
-        let statistics = Statistics {
-            num_rows: Precision::Exact(3),
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![ColumnStatistics {
-                null_count: Precision::Exact(0),
-                max_value: Precision::Exact(ScalarValue::Int32(Some(3))),
-                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
-                sum_value: Precision::Absent,
-                distinct_count: Precision::Absent,
-                byte_size: Precision::Absent,
-            }],
-        };
-        let file = PartitionedFile::new(file_path.to_string(), data_size)
-            .with_statistics(Arc::new(statistics));
-
-        let predicate = logical2physical(&col("a").gt(lit(1000_i32)), table_schema.table_schema());
-
-        let mut opener = make_opener(object_store, table_schema, None);
-        opener.file_pruning_predicate = Some(predicate);
-        opener.file_pruning = file_pruning;
-
-        let stream = opener.open(file)?.await?;
-        let data = stream.try_collect::<Vec<_>>().await?;
-        let rows: usize = data.iter().map(|rb| rb.num_rows()).sum();
-
-        assert_eq!(rows, expected_rows);
 
         Ok(())
     }
@@ -956,7 +889,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1045,7 +977,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1202,7 +1133,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
@@ -1264,7 +1194,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         }
     }
@@ -1468,7 +1397,6 @@ mod tests {
             file_metadata_cache: None,
             segment_cache: None,
             projection_pushdown: false,
-            file_pruning: true,
             scan_concurrency: None,
         };
 
