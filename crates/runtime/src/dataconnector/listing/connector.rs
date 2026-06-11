@@ -585,6 +585,7 @@ pub trait ListingTableConnector: DataConnector {
     /// to infer the format from the dataset's file extension. It supports both tabular and
     /// unstructured formats. It supports the following tabular formats:
     ///  - parquet
+    ///  - vortex (not available on Windows)
     ///  - csv
     ///
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
@@ -796,6 +797,16 @@ pub trait ListingTableConnector: DataConnector {
                             configured_extension.as_ref(),
                             path_extension.as_ref(),
                             ".parquet",
+                            FileCompressionType::UNCOMPRESSED,
+                        ),
+                    )),
+                    #[cfg(not(windows))]
+                    Some("vortex") => Ok((
+                        Some(VortexFormatFactory::new().default()),
+                        listing_extension(
+                            configured_extension.as_ref(),
+                            path_extension.as_ref(),
+                            ".vortex",
                             FileCompressionType::UNCOMPRESSED,
                         ),
                     )),
@@ -1945,6 +1956,37 @@ mod tests {
             connector.get_file_format_and_extension(&dataset).await
         {
             assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_detect_vortex_extension() {
+        let (connector, dataset) =
+            setup_connector("test:test.vortex".to_string(), HashMap::new()).await;
+
+        if let Ok((Some(_file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".vortex");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_get_file_format_and_extension_auto_detects_vortex() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "auto".to_string());
+        let (connector, dataset) = setup_connector("test:test.vortex".to_string(), params).await;
+
+        if let Ok((Some(_file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset).await
+        {
+            assert_eq!(extension, ".vortex");
         } else {
             panic!("Unexpected error");
         }
