@@ -200,7 +200,7 @@ impl SessionStore {
         // exposes. Kept consistent with `runtime_auth`'s `AuthPrincipal` impl.
         ApiKey::parse_str(&owner_api_key)
             .stable_id()
-            .map(|id| id.into_owned())
+            .map(std::borrow::Cow::into_owned)
     }
 
     /// Gets or creates a session from the request metadata.
@@ -524,7 +524,7 @@ mod tests {
         );
         let expected = ApiKey::parse_str("owner-key")
             .stable_id()
-            .map(|id| id.into_owned());
+            .map(std::borrow::Cow::into_owned);
         assert!(expected.is_some());
         assert_eq!(store.owner_stable_id_from_http(&headers), expected);
 

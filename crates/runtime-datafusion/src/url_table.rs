@@ -155,10 +155,13 @@ fn allow_private_hosts() -> bool {
 }
 
 /// Returns `true` if `ip` is in a range that must not be reachable through a
-/// user-supplied `http`/`https` URL table: loopback, private/RFC1918,
-/// link-local (incl. the `169.254.169.254` cloud-metadata endpoint), CGNAT,
-/// unspecified, multicast, and other reserved ranges. Used to prevent SSRF.
-fn is_internal_ip(ip: IpAddr) -> bool {
+/// user-supplied `http`/`https` URL: loopback, private/RFC1918, link-local
+/// (incl. the `169.254.169.254` cloud-metadata endpoint), unique-local,
+/// CGNAT, unspecified, multicast, and other reserved ranges. Used to prevent
+/// SSRF — both by the URL-table guard below and by the HTTPS connector's
+/// redirect guard, so the two share one classifier and never diverge.
+#[must_use]
+pub fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_internal_ipv4(v4),
         // Unwrap IPv4-mapped/-compatible addresses (e.g. `::ffff:169.254.169.254`)
@@ -194,6 +197,21 @@ fn is_internal_ipv6(ip: Ipv6Addr) -> bool {
         || (first & 0xfe00) == 0xfc00 // fc00::/7 unique local
         || (first & 0xffc0) == 0xfe80 // fe80::/10 link local
         || (first & 0xff00) == 0xff00 // ff00::/8 multicast
+}
+
+/// Returns `true` for hostnames that never legitimately point at a remote
+/// endpoint and must be blocked without needing DNS resolution: `localhost`
+/// (and `*.localhost`, RFC 6761) and the well-known cloud-metadata names.
+/// Shared by the URL-table SSRF guard and the HTTPS connector's redirect guard
+/// (the latter runs in a synchronous closure where DNS resolution isn't
+/// available, so this literal-name check is its first line of defense).
+#[must_use]
+pub fn is_blocked_internal_hostname(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "metadata.google.internal"
+        || lower == "metadata.goog"
 }
 
 /// Builds the error returned when a URL table targets a blocked internal host.
@@ -243,19 +261,14 @@ async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DF
             }
         }
         Some(url::Host::Domain(domain)) => {
-            let lower = domain.to_ascii_lowercase();
             // RFC 6761 / cloud-metadata names that never legitimately point at a
             // remote object store.
-            if lower == "localhost"
-                || lower.ends_with(".localhost")
-                || lower == "metadata.google.internal"
-                || lower == "metadata.goog"
-            {
+            if is_blocked_internal_hostname(domain) {
                 return Err(ssrf_blocked_error(url_str));
             }
 
             // Resolve the host and reject if ANY resolved address is internal.
-            let lookup_host = lower.clone();
+            let lookup_host = domain.to_ascii_lowercase();
             let addrs = tokio::task::spawn_blocking(move || {
                 (lookup_host.as_str(), 0u16)
                     .to_socket_addrs()
@@ -867,14 +880,14 @@ mod tests {
 
         // IPv6 internal ranges.
         for ip in [
-            "::1",                      // loopback
-            "::",                       // unspecified
-            "fe80::1",                  // link local
-            "fc00::1",                  // unique local
-            "fd12:3456::1",            // unique local
-            "::ffff:169.254.169.254",  // v4-mapped metadata
-            "::ffff:127.0.0.1",        // v4-mapped loopback
-            "ff02::1",                  // multicast
+            "::1",                    // loopback
+            "::",                     // unspecified
+            "fe80::1",                // link local
+            "fc00::1",                // unique local
+            "fd12:3456::1",           // unique local
+            "::ffff:169.254.169.254", // v4-mapped metadata
+            "::ffff:127.0.0.1",       // v4-mapped loopback
+            "ff02::1",                // multicast
         ] {
             let addr = IpAddr::from_str(ip).expect("valid ip");
             assert!(is_internal_ip(addr), "{ip} should be treated as internal");
@@ -884,11 +897,40 @@ mod tests {
         for ip in [
             "8.8.8.8",
             "1.1.1.1",
-            "93.184.216.34",          // example.com
-            "2606:4700:4700::1111",   // Cloudflare DNS
+            "93.184.216.34",        // example.com
+            "2606:4700:4700::1111", // Cloudflare DNS
         ] {
             let addr = IpAddr::from_str(ip).expect("valid ip");
             assert!(!is_internal_ip(addr), "{ip} should be treated as public");
+        }
+    }
+
+    #[test]
+    fn test_is_blocked_internal_hostname() {
+        // Well-known internal names blocked without DNS (case-insensitive).
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "service.localhost",
+            "metadata.google.internal",
+            "metadata.goog",
+        ] {
+            assert!(
+                is_blocked_internal_hostname(host),
+                "{host} should be blocked"
+            );
+        }
+
+        // Legitimate public hostnames must pass (DNS resolution handles these).
+        for host in [
+            "example.com",
+            "localhost.example.com", // not the `.localhost` TLD
+            "metadata.google.com",   // not the metadata sentinel
+        ] {
+            assert!(
+                !is_blocked_internal_hostname(host),
+                "{host} should not be blocked by literal match"
+            );
         }
     }
 

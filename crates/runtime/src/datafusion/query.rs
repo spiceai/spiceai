@@ -89,9 +89,9 @@ use crate::datafusion::{
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+use runtime_auth::AuthRequestContext;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
-use runtime_auth::AuthRequestContext;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -434,8 +434,11 @@ impl Query {
                 // never served across principals (mirrors the text-query path).
                 let cache_namespace = request_context.cache_namespace();
                 let (ns_tag, ns_id) = cache_namespace.hash_inputs();
-                let plan_cache_key = CacheKey::LogicalPlan(logical_plan)
-                    .as_raw_key_in_namespace(Self::plan_hasher(&self.df), ns_tag, ns_id);
+                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                    Self::plan_hasher(&self.df),
+                    ns_tag,
+                    ns_id,
+                );
 
                 // Check for cached results using the standard cache lookup
                 if let Some(cache_provider) = self.df.results_cache_provider()

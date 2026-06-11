@@ -47,7 +47,7 @@ pub fn make_interceptor(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_interceptor, AuthVerdict, GrpcAuth};
+    use super::{AuthVerdict, GrpcAuth, make_interceptor};
     use crate::AuthPrincipalRef;
     use app::spicepod::component::runtime::ApiKey;
     use std::sync::Arc;
