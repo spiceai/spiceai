@@ -28,13 +28,9 @@ runtime:
   params:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
-    cdc_max_coalesced_bytes: '134217728' # 128 MB
-    cdc_max_coalesce_age_ms: '250'
+    cdc_max_coalesced_bytes: '536870912' # 128 MB
+    cdc_max_coalesce_age_ms: '2000'
     cdc_commit_timeout_ms: '60000'
-    cayenne_sort_merge_min_rows: '50000000'
-    cayenne_footer_cache_mb: '1024'
-    cayenne_metastore_cache_mb: '1024'
-    cayenne_metastore_mmap_mb: '4096'
   query:
     target_partitions: 64
   caching:
@@ -71,22 +67,19 @@ datasets:
       primary_key: (d_w_id, d_id)
       on_conflict:
         (d_w_id, d_id): upsert
-      params: &accel_high_volume
-        cayenne_metastore: sqlite
-        cayenne_file_path: .spice/cayenne/district
-        cayenne_write_concurrency: '4'
-        cayenne_segment_cache_mb: '1024'
-        cayenne_compaction_trigger_protected_snapshots: '3'
-        # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
-        # must sit just UNDER the heavy-update tables' (stock, order_line) PK keysets so
-        # they stay on the cheap bloom path — at SF-100 that is 256 (1024 would fit them
-        # on the expensive exact path; the SF-1000 venue pins 1024). The memory-aware
-        # auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) is BACKWARDS — pin it.
-        cayenne_pk_keyset_cache_mb: '256'
-        cayenne_compaction_trigger_snapshot_age_ms: '15000'
-        cayenne_compaction_max_files_per_pick: '64'
-        cayenne_compaction_background_interval_ms: '3000'
-        cdc_max_coalesce_age_ms: '3000'
+      params:
+        <<: &accel_high_volume
+          cayenne_metastore: sqlite
+          cayenne_file_path: .spice/cayenne/district
+          # Pinned to 256 MiB (SF-100 sweep optimum). The keyset pin is scale-dependent: it
+          # must sit just UNDER the heavy-update tables' (stock, order_line) PK keysets so
+          # they stay on the cheap bloom path — at SF-100 that is 256 (1024 would fit them
+          # on the expensive exact path; the SF-1000 venue pins 1024). The memory-aware
+          # auto-default (total_mem/32 -> ~8 GiB on a 256 GiB host) is BACKWARDS — pin it.
+
+        # CDC overrides applied ONLY to district (sit outside the anchor so customer/
+        # new_order/oorder/order_line/stock keep the global 250 ms / 128 MB defaults).
+        cdc_max_coalesce_age_ms: '1000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
 
   - from: postgres:customer
@@ -107,7 +100,6 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/customer
-        cayenne_target_file_size_mb: '256'
 
   - from: postgres:new_order
     name: new_order
@@ -165,12 +157,6 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/order_line
-        cayenne_write_concurrency: '4'
-        cayenne_target_file_size_mb: '256'
-        cayenne_compaction_trigger_files: '8'
-        cayenne_compaction_trigger_snapshot_age_ms: '30000'
-        cayenne_compaction_max_files_per_pick: '128'
-        cayenne_segment_cache_mb: '2048'
 
   - from: postgres:stock
     name: stock
@@ -190,7 +176,6 @@ datasets:
       params:
         <<: *accel_high_volume
         cayenne_file_path: .spice/cayenne/stock
-        cayenne_target_file_size_mb: '256'
 
   # ------------------------------------------------------------------
   # Low-volume reference tables.
@@ -214,10 +199,6 @@ datasets:
       params: &accel_medium
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/warehouse
-        cayenne_write_concurrency: '4'
-        cayenne_segment_cache_mb: '64'
-        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
-        cayenne_pk_keyset_cache_mb: '256'
         cdc_max_coalesce_age_ms: '3000'
         cdc_max_coalesced_bytes: '536870912' # 512 MB
 
@@ -256,10 +237,6 @@ datasets:
       params: &accel_small
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/region
-        cayenne_write_concurrency: '2'
-        cayenne_segment_cache_mb: '16'
-        # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
-        cayenne_pk_keyset_cache_mb: '256'
 
   - from: postgres:nation
     name: nation
