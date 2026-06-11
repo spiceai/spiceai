@@ -731,6 +731,14 @@ impl CayenneAccelerator {
                 config.cdc_mem_tier_max_age_ms,
                 " (milliseconds)",
             );
+            config.cdc_mem_tier_min_flush_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_min_flush_bytes",
+                    "cdc_mem_tier_min_flush_bytes",
+                ],
+                config.cdc_mem_tier_min_flush_bytes,
+            );
             config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
                 acceleration,
                 &[
@@ -1407,9 +1415,11 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["file", "memory"])
             .default("file"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 268435456 (256 MiB) so the periodic background checkpoint is the primary flush path and the write-path spill remains a rare backstop. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Default 268435456 (256 MiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
-            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. Default 10000 (10 s). Set 0 to disable the age trigger."),
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window and the deferred source-slot ack for tables that never reach a byte threshold. Default 10000 (10 s). Set 0 to disable the age trigger."),
+        ParameterSpec::component("cdc_mem_tier_min_flush_bytes")
+            .description("Minimum resident RAM-tier bytes before the periodic background tick durably checkpoints, in cdc_durability: memory mode only. Bounds snapshot/delete-file churn: below this size a tick is skipped unless the tier age reached cdc_mem_tier_max_age_ms. Query freshness is unaffected (RAM rows are visible immediately); only the deferred slot ack waits. The write-path byte-cap spill is not gated. Default 33554432 (32 MiB). Set 0 to flush on every tick."),
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
