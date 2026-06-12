@@ -794,6 +794,13 @@ pub struct CayenneAutotuneState {
     pub target_file_size_mb: u64,
     /// Live write/encode concurrency (0 = session default).
     pub write_concurrency: u64,
+    /// Live in-memory CDC durability tier byte cap (`cdc_durability: memory`);
+    /// `0` ⇒ no per-table cap (the process-global mem-tier budget still bounds RAM).
+    pub mem_tier_max_bytes: u64,
+    /// Measured fraction of ingested rows that are deletes (EWMA, `[0, 1]`).
+    pub delete_fraction: f64,
+    /// Arrival-interval coefficient of variation (burstiness); ~0 steady, `> 1` spiky.
+    pub arrival_cv: f64,
 }
 
 static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -807,6 +814,9 @@ static CAYENNE_AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new()
 static CAYENNE_AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_DELETE_FRACTION: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_ARRIVAL_CV: OnceLock<Gauge<f64>> = OnceLock::new();
 
 /// Emit the auto-tuner state gauges for one table. `dimensions` should carry
 /// `table`. Called on each background tick.
@@ -916,19 +926,48 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.write_concurrency, dimensions);
+    CAYENNE_AT_MEM_TIER_MAX_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_mem_tier_max_bytes")
+                .with_description(
+                    "Current (live) in-memory CDC durability tier byte cap (0 = no per-table cap).",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(state.mem_tier_max_bytes, dimensions);
+    CAYENNE_AT_DELETE_FRACTION
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_delete_fraction")
+                .with_description("Measured fraction of ingested rows that are deletes (EWMA).")
+                .build()
+        })
+        .record(state.delete_fraction, dimensions);
+    CAYENNE_AT_ARRIVAL_CV
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_arrival_cv")
+                .with_description(
+                    "Arrival-interval coefficient of variation (burstiness); ~0 steady, > 1 spiky.",
+                )
+                .build()
+        })
+        .record(state.arrival_cv, dimensions);
 }
 
 static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();
 
 /// Counts dynamic auto-tune adjustments applied. `dimensions` should carry
-/// `table` and `knob`. A non-zero rate means the closed loop is actively
+/// `table` and `actuator`. A non-zero rate means the closed loop is actively
 /// adapting the table to its observed workload.
 pub fn track_cayenne_autotune_adjustment(dimensions: &[KeyValue]) {
     CAYENNE_AT_ADJUSTMENTS
         .get_or_init(|| {
             cayenne_operational_meter()
                 .u64_counter("cayenne_autotune_adjustments_total")
-                .with_description("Dynamic auto-tune adjustments applied, by knob.")
+                .with_description("Dynamic auto-tune adjustments applied, by actuator.")
                 .build()
         })
         .add(1, dimensions);
