@@ -46,8 +46,11 @@ pub enum Error {
     #[snafu(display("An invalid GitHub token was provided."))]
     InvalidToken,
 
+    // `{value:?}` debug-formats the untrusted input so control characters
+    // (e.g. a newline) are escaped rather than echoed verbatim, keeping the
+    // message single-line and preventing log injection.
     #[snafu(display(
-        "Invalid GitHub {component} '{value}': only letters, digits, '.', '_', '-' (and '/' for a revision) are allowed, and '..' is not permitted."
+        "Invalid GitHub {component} {value:?}: only letters, digits, '.', '_', '-' (and '/' for a revision) are allowed, and '..' is not permitted."
     ))]
     InvalidComponent {
         component: &'static str,

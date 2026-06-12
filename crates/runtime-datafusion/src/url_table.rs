@@ -214,10 +214,20 @@ pub fn is_blocked_internal_hostname(host: &str) -> bool {
         || lower == "metadata.goog"
 }
 
+/// Upper bound on how long the SSRF guard waits for a host's DNS resolution.
+/// Caps the query-visible wait so a slow or hanging resolver can't stall the
+/// query indefinitely. `spawn_blocking` work can't be cancelled, so the
+/// underlying `getaddrinfo` thread keeps running until the OS resolver's own
+/// timeout — but the caller stops waiting after this bound and returns a clear
+/// error instead of pinning the request on a slow lookup.
+const DNS_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Builds the error returned when a URL table targets a blocked internal host.
+/// `url_str` is debug-formatted (`{:?}`) so user-controlled control characters
+/// are escaped rather than echoed into the log/error line.
 fn ssrf_blocked_error(url_str: &str) -> DataFusionError {
     DataFusionError::Plan(format!(
-        "URL table '{url_str}' targets a private, loopback, or link-local address, which is not allowed for SSRF protection. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true."
+        "URL table {url_str:?} targets a private, loopback, or link-local address, which is not allowed for SSRF protection. If this runtime intentionally queries an internal HTTP endpoint, set {ALLOW_PRIVATE_HOSTS_ENV}=true."
     ))
 }
 
@@ -268,27 +278,38 @@ async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DF
             }
 
             // Resolve the host and reject if ANY resolved address is internal.
+            // Bound the blocking lookup with a timeout so a malicious query that
+            // supplies slow/hanging hosts can't make the caller wait unboundedly
+            // on the blocking pool.
             let lookup_host = domain.to_ascii_lowercase();
-            let addrs = tokio::task::spawn_blocking(move || {
+            let resolve = tokio::task::spawn_blocking(move || {
                 (lookup_host.as_str(), 0u16)
                     .to_socket_addrs()
                     .map(|iter| iter.map(|s| s.ip()).collect::<Vec<IpAddr>>())
-            })
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "DNS resolution task failed for URL table '{url_str}': {e}"
-                ))
-            })?
-            .map_err(|e| {
-                DataFusionError::Plan(format!(
-                    "Failed to resolve host for URL table '{url_str}': {e}"
-                ))
-            })?;
+            });
+            let addrs = match tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, resolve).await {
+                Err(_) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Timed out resolving host for URL table {url_str:?} after {}s",
+                        DNS_RESOLUTION_TIMEOUT.as_secs()
+                    )));
+                }
+                Ok(join_result) => join_result
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "DNS resolution task failed for URL table {url_str:?}: {e}"
+                        ))
+                    })?
+                    .map_err(|e| {
+                        DataFusionError::Plan(format!(
+                            "Failed to resolve host for URL table {url_str:?}: {e}"
+                        ))
+                    })?,
+            };
 
             if addrs.is_empty() {
                 return Err(DataFusionError::Plan(format!(
-                    "Could not resolve host for URL table '{url_str}'"
+                    "Could not resolve host for URL table {url_str:?}"
                 )));
             }
             if addrs.iter().any(|ip| is_internal_ip(*ip)) {
@@ -297,7 +318,7 @@ async fn validate_http_url_with_policy(url_str: &str, allow_private: bool) -> DF
         }
         None => {
             return Err(DataFusionError::Plan(format!(
-                "URL table '{url_str}' is missing a host"
+                "URL table {url_str:?} is missing a host"
             )));
         }
     }
