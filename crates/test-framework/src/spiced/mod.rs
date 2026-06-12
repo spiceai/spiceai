@@ -333,28 +333,41 @@ impl SpicedInstance {
         // 3. Launch spiced detached, capturing its PID. Drop any inherited
         //    `--metrics` pair — we bind it on the reachable interface ourselves.
         let extra = strip_metrics_args(&start_request.additional_args).join(" ");
-        // Bind HTTP/Flight/metrics on 0.0.0.0 so the box running testoperator can
-        // reach them (spiced defaults all three to 127.0.0.1). Launch under `setsid`
-        // (new session) so spiced is fully detached from the SSH session — otherwise
-        // ssh keeps the channel open waiting on the long-lived daemon and the launch
-        // call never returns. `$!` is the setsid PID, which becomes spiced's after
-        // exec, so it is the right PID to track/kill.
+        // Launch spiced FULLY detached and return immediately. The launching
+        // command's own stdin/stdout/stderr go to /dev/null and the inner shell is
+        // `setsid`-detached into a new session — otherwise ssh keeps the channel
+        // open waiting on the long-lived daemon and the launch call never returns
+        // (the daemon starts fine, but `start_remote` hangs). The PID is written to
+        // a pidfile and read back separately, rather than over the launch channel.
+        // Bind HTTP/Flight/metrics on 0.0.0.0 (spiced defaults all three to
+        // 127.0.0.1) so the box running testoperator can reach them.
+        let pidfile = format!("{workdir}/spiced.pid");
         let launch = format!(
-            "cd {workdir} && setsid {spiced_path} --telemetry-enabled=false \
+            "setsid bash -c 'cd {workdir}; {spiced_path} --telemetry-enabled=false \
              --http 0.0.0.0:{REMOTE_HTTP_PORT} --flight 0.0.0.0:{REMOTE_FLIGHT_PORT} \
              --metrics 0.0.0.0:{REMOTE_METRICS_PORT} {extra} \
-             </dev/null >{workdir}/spiced.log 2>&1 & echo $!"
+             </dev/null >{workdir}/spiced.log 2>&1 & echo $! > {pidfile}' \
+             </dev/null >/dev/null 2>&1"
         );
-        let launch_out = ssh_run(&ssh_target, &launch)?;
-        let Some(remote_pid) = String::from_utf8_lossy(&launch_out.stdout)
+        ssh_run(&ssh_target, &launch)?;
+
+        // Read the PID back (the pidfile appears within a moment of launch).
+        let pid_out = ssh_run(
+            &ssh_target,
+            &format!(
+                "for _ in $(seq 1 20); do [ -s {pidfile} ] && break; sleep 0.5; done; \
+                 cat {pidfile} 2>/dev/null"
+            ),
+        )?;
+        let Some(remote_pid) = String::from_utf8_lossy(&pid_out.stdout)
             .trim()
             .parse::<u32>()
             .ok()
         else {
             anyhow::bail!(
-                "Remote spiced launch returned no PID (stdout={:?} stderr={:?})",
-                String::from_utf8_lossy(&launch_out.stdout),
-                String::from_utf8_lossy(&launch_out.stderr),
+                "Remote spiced launch did not produce a PID in {pidfile} (stdout={:?} stderr={:?})",
+                String::from_utf8_lossy(&pid_out.stdout),
+                String::from_utf8_lossy(&pid_out.stderr),
             );
         };
 
