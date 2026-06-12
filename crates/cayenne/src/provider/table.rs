@@ -16746,7 +16746,13 @@ impl TableProvider for CayenneTableProvider {
         }
 
         let mem_tier_pruning_predicate = super::file_pruning::build_listing_pruning_predicate(
-            &self.table_metadata.schema,
+            // Live (possibly widened) schema, NOT the construction-time
+            // `table_metadata.schema`: a query filter on a column added by live
+            // `evolve_schema_live` must resolve against the evolved schema here,
+            // or the pruning-predicate build fails with `FieldNotFound`. (On a
+            // restart `table_metadata.schema` already equals the evolved schema,
+            // so this only bit the live-swap path.)
+            &self.table_schema(),
             &mem_tier_pruning_filters,
         )?;
         let inlined_batches = self
