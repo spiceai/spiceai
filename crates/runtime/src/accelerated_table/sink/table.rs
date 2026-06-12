@@ -43,6 +43,14 @@ fn narrowing_schema_cast_changes(
     input_schema: &SchemaRef,
     target_schema: &SchemaRef,
 ) -> (Vec<String>, Vec<String>) {
+    // Hot path: this runs once per insert. Identical schemas (the common
+    // no-schema-change case) cannot narrow, so skip the two
+    // `normalize_dictionary_types` allocations entirely. A dictionary-only
+    // difference is neither pointer- nor structurally equal and still falls
+    // through to the normalized comparison below (correctly reported as no-op).
+    if Arc::ptr_eq(input_schema, target_schema) || input_schema == target_schema {
+        return (Vec::new(), Vec::new());
+    }
     let input = normalize_dictionary_types(input_schema);
     let target = normalize_dictionary_types(target_schema);
 
