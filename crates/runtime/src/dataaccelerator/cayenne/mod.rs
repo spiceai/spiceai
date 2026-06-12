@@ -3330,7 +3330,7 @@ mod tests {
         assert_eq!(config.cdc_mem_tier_min_flush_bytes, 32 * MIB);
     }
 
-    /// `deletion_mode: auto` resolves to `key` ONLY for refresh_mode: changes
+    /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
     /// datasets whose workload has a primary key; explicit configs and every
     /// other profile keep their value (and Auto's downstream position
     /// resolution) untouched.
