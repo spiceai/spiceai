@@ -50,8 +50,9 @@ limitations under the License.
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
 //! `auto` (the default) size-gates: a delta smaller than a quarter of the
-//! target file size encodes at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size
-//! writes use the full default. Level `7` is the explicit opt-out
+//! target file size — or of unknown size (a transient staged stream that
+//! compaction rewrites) — encodes at [`AUTO_LIGHT_LEVEL`]; only a known-large
+//! write uses the full default. Level `7` is the explicit opt-out
 //! (byte-for-byte the pre-feature behavior). Maintenance writes
 //! ([`WriteClass::Maintenance`]) always use the full default regardless of
 //! the configured level.
@@ -120,8 +121,8 @@ pub(crate) enum WriteClass {
     Maintenance,
 }
 
-/// Level used for every [`WriteClass::Maintenance`] write and for large /
-/// unknown-size deltas under `auto`: the full default `BtrBlocks` cascade.
+/// Level used for every [`WriteClass::Maintenance`] write and for large
+/// known-size deltas under `auto`: the full default `BtrBlocks` cascade.
 /// Aliases the metadata constant so the config default and the mapping
 /// boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
@@ -141,8 +142,10 @@ pub(crate) const AUTO_LIGHT_DENOMINATOR: u64 = 4;
 /// Resolve the effective encoding level for one snapshot write.
 ///
 /// `estimated_bytes` is the caller's pre-encode size estimate (`None` when
-/// the stream size is unknown, e.g. opaque staged streams). Unknown sizes
-/// resolve to [`FULL_LEVEL`] under `auto` — conservatively assuming large.
+/// the stream size is unknown, e.g. opaque staged streams). Under `auto`, an
+/// unknown size resolves to [`AUTO_LIGHT_LEVEL`]: it is a transient staged
+/// stream (e.g. the off-fence mem-tier checkpoint) that compaction rewrites,
+/// so only a known-large delta takes [`FULL_LEVEL`].
 pub(crate) fn effective_level(
     encoding: DeltaEncoding,
     write_class: WriteClass,
