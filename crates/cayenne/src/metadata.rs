@@ -887,11 +887,10 @@ fn default_cdc_mem_tier_max_bytes() -> i64 {
 /// (32 MiB — the serde/engine floor; the accelerator's auto-tune derives 1/8 of
 /// the derived byte cap, clamped 32–128 MiB, when the param is unset, keeping
 /// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot +
-/// delete-vector
-/// files + a listing refresh under the fence; at a 1 s tick a high-rate table
-/// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
-/// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
-/// accumulated churn degrades scans and the apply path. Gating the tick on
+/// delete-vector files + a listing refresh under the fence; at a 1 s tick a
+/// high-rate table would otherwise produce ~600 tiny snapshots per 10 minutes
+/// (measured at SF-100: 408–676 accumulated snapshot dirs per heavy table), and
+/// the accumulated churn degrades scans and the apply path. Gating the tick on
 /// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
 /// flush window while leaving freshness untouched (RAM rows are visible to
 /// queries immediately; only the deferred source-slot ack waits, bounded by
