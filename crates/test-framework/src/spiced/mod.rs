@@ -333,9 +333,12 @@ impl SpicedInstance {
         // 3. Launch spiced detached, capturing its PID. Drop any inherited
         //    `--metrics` pair — we bind it on the reachable interface ourselves.
         let extra = strip_metrics_args(&start_request.additional_args).join(" ");
+        // Bind HTTP/Flight/metrics on 0.0.0.0 so the box running testoperator can
+        // reach them (spiced defaults all three to 127.0.0.1).
         let launch = format!(
             "cd {workdir} && nohup {spiced_path} --telemetry-enabled=false \
-             --flight 0.0.0.0:{REMOTE_FLIGHT_PORT} --metrics 0.0.0.0:{REMOTE_METRICS_PORT} {extra} \
+             --http 0.0.0.0:{REMOTE_HTTP_PORT} --flight 0.0.0.0:{REMOTE_FLIGHT_PORT} \
+             --metrics 0.0.0.0:{REMOTE_METRICS_PORT} {extra} \
              </dev/null >{workdir}/spiced.log 2>&1 & echo $!"
         );
         let launch_out = ssh_run(&ssh_target, &launch)?;
