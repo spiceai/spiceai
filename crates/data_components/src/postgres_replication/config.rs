@@ -124,6 +124,27 @@ impl SslMode {
         }
     }
 
+    /// Strict variant of [`Self::from_str_or_default`]: an absent value uses
+    /// the `prefer` default, but an unrecognized value is rejected rather than
+    /// silently downgraded to `prefer`. A typo'd `verify-full` quietly turning
+    /// into `prefer` would disable certificate/hostname verification (a silent
+    /// TLS/MITM downgrade), so the CDC parameter path validates loudly.
+    pub fn from_str_strict(s: Option<&str>) -> std::result::Result<Self, String> {
+        match s.map(str::trim) {
+            None | Some("") => Ok(Self::Prefer),
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "disable" => Ok(Self::Disable),
+                "prefer" => Ok(Self::Prefer),
+                "require" => Ok(Self::Require),
+                "verify-ca" => Ok(Self::VerifyCa),
+                "verify-full" => Ok(Self::VerifyFull),
+                _ => Err(format!(
+                    "must be one of disable, prefer, require, verify-ca, verify-full, got {raw:?}"
+                )),
+            },
+        }
+    }
+
     /// Whether this mode requires any TLS negotiation at all.
     #[must_use]
     pub fn requires_tls(self) -> bool {
