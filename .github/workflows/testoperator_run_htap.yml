@@ -84,12 +84,13 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      # - name: Install MinIO
-      #   uses: ./.github/actions/setup-minio
-      #   with:
-      #     minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-      #     minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-      #     minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+      - name: Install MinIO
+        if: github.event.inputs.runner_type != 'htap-benchmark'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -110,7 +111,12 @@ jobs:
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
-          testoperator run htap \
+          TASKSET=""
+          if [ "${{ github.event.inputs.runner_type }}" = "htap-benchmark" ] && command -v taskset >/dev/null 2>&1; then
+            TASKSET="taskset -c 0-63"
+            echo "Pinning benchmark to CPUs 0-63 via: ${TASKSET}"
+          fi
+          ${TASKSET} testoperator run htap \
             -s /usr/local/bin/spiced \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --query-set chbench \
@@ -127,10 +133,14 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           CHBENCH_PG_HOST: 127.0.0.1
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+          CHBENCH_PG_DB: chbench
 
       # Ensure a crashed/cancelled run leaves no orphaned logical replication slots and publications
-      - name: Clean up orphaned replication slots and publications
-        if: always()
+      - name: Clean up PG
+        if: always() && github.event.inputs.runner_type == 'htap-benchmark'
         env:
           CHBENCH_PG_HOST: 127.0.0.1
           CHBENCH_PG_PORT: '5432'
