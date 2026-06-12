@@ -55,13 +55,15 @@ fn is_advisory(name: &str) -> bool {
 }
 
 /// Whether a result should fail the gate: any non-`Pass` outcome, except a
-/// value/row *divergence* on an advisory query (reported but non-gating —
-/// execution errors on advisory queries still gate). Shared by `emit` and
-/// `failure_message` so the two stay consistent.
+/// value/row [`Outcome::Divergence`] on an advisory query (reported but
+/// non-gating). A harness error ([`Outcome::Fail`]) or an execution error
+/// ([`Outcome::SourceError`] / [`Outcome::SpiceError`]) gates even on an
+/// advisory query, so a real regression on q15 is never silently hidden.
+/// `emit` mirrors this same classification.
 fn is_gating_failure(result: &AnalyticalQueryResult) -> bool {
     match &result.outcome {
         Outcome::Pass => false,
-        Outcome::Fail(_) if is_advisory(&result.name) => false,
+        Outcome::Divergence(_) if is_advisory(&result.name) => false,
         _ => true,
     }
 }
@@ -70,6 +72,13 @@ fn is_gating_failure(result: &AnalyticalQueryResult) -> bool {
 #[derive(Debug)]
 pub enum Outcome {
     Pass,
+    /// Value/row mismatch vs the source: numeric drift over tolerance, or a
+    /// row-set / `NoAnswer` divergence from the validator. Advisory-eligible
+    /// (see [`ADVISORY_QUERIES`]) because an FP-summation-order artifact on an
+    /// advisory query is a property of the query, not an engine bug.
+    Divergence(String),
+    /// Harness / internal error (schema-align, sort, validator). Always gates,
+    /// even on an advisory query — it is never an FP artifact.
     Fail(String),
     SourceError(String),
     SpiceError(String),
@@ -79,6 +88,7 @@ impl Outcome {
     fn label(&self) -> &'static str {
         match self {
             Outcome::Pass => "PASS",
+            Outcome::Divergence(_) => "DIVERGE",
             Outcome::Fail(_) => "FAIL",
             Outcome::SourceError(_) => "PG_ERROR",
             Outcome::SpiceError(_) => "SPICE_ERROR",
@@ -88,7 +98,10 @@ impl Outcome {
     fn detail(&self) -> Option<&str> {
         match self {
             Outcome::Pass => None,
-            Outcome::Fail(m) | Outcome::SourceError(m) | Outcome::SpiceError(m) => Some(m),
+            Outcome::Divergence(m)
+            | Outcome::Fail(m)
+            | Outcome::SourceError(m)
+            | Outcome::SpiceError(m) => Some(m),
         }
     }
 }
@@ -127,9 +140,9 @@ impl AnalyticalReport {
             match &r.outcome {
                 Outcome::Pass => passed += 1,
                 // Only a value/row *divergence* on an advisory query is
-                // non-gating; an execution error (PG or Spice) still gates so a
-                // real regression on q15 is not silently hidden.
-                Outcome::Fail(_) if is_advisory(&r.name) => {
+                // non-gating; harness/execution errors still gate so a real
+                // regression on q15 is not silently hidden.
+                Outcome::Divergence(_) if is_advisory(&r.name) => {
                     advisory += 1;
                     println!(
                         "       (advisory — floating-point summation-order artifact, not gated; see https://github.com/spiceai/spiceai/issues/11212)"
@@ -161,7 +174,8 @@ impl AnalyticalReport {
             .filter(|r| is_gating_failure(r))
             .map(|r| match &r.outcome {
                 Outcome::Pass => unreachable!(),
-                Outcome::Fail(m) => format!("{} mismatch: {m}", r.name),
+                Outcome::Divergence(m) => format!("{} divergence: {m}", r.name),
+                Outcome::Fail(m) => format!("{} error: {m}", r.name),
                 Outcome::SourceError(m) => format!("{} source error: {m}", r.name),
                 Outcome::SpiceError(m) => format!("{} spice error: {m}", r.name),
             })
@@ -288,7 +302,7 @@ pub async fn verify_analytical_results(
                                 let delta = compare::numeric_delta(e0, a0, &actual_source_floats);
                                 if delta.exceeded {
                                     (
-                                        Outcome::Fail(format!(
+                                        Outcome::Divergence(format!(
                                             "numeric drift exceeds tolerance — {}",
                                             delta.worst.as_deref().unwrap_or("(unknown cell)")
                                         )),
@@ -302,7 +316,7 @@ pub async fn verify_analytical_results(
                         }
                     }
                     Ok(QueryValidationResult::Fail(reason)) => (
-                        Outcome::Fail(format!(
+                        Outcome::Divergence(format!(
                             "{reason:?} (source rows={}, spice rows={})",
                             total_rows(&expected_sorted),
                             total_rows(&actual_sorted),
@@ -437,7 +451,10 @@ mod tests {
     fn advisory_divergence_does_not_gate() {
         // q15's row/value divergence is reported but must not fail the gate.
         let report = AnalyticalReport {
-            results: vec![result("chbench_q15", Outcome::Fail("NoAnswer".to_string()))],
+            results: vec![result(
+                "chbench_q15",
+                Outcome::Divergence("NoAnswer (source rows=1, spice rows=0)".to_string()),
+            )],
         };
         assert!(report.failure_message().is_none());
     }
@@ -445,7 +462,10 @@ mod tests {
     #[test]
     fn non_advisory_divergence_gates() {
         let report = AnalyticalReport {
-            results: vec![result("chbench_q1", Outcome::Fail("drift".to_string()))],
+            results: vec![result(
+                "chbench_q1",
+                Outcome::Divergence("drift".to_string()),
+            )],
         };
         let msg = report
             .failure_message()
@@ -466,6 +486,23 @@ mod tests {
         let msg = report
             .failure_message()
             .expect("an execution error on an advisory query must still gate");
+        assert!(msg.contains("chbench_q15"));
+    }
+
+    #[test]
+    fn advisory_harness_error_still_gates() {
+        // A harness/internal error (schema-align, sort, validator) is encoded as
+        // Outcome::Fail, not Divergence, and must gate even for q15 — it is never
+        // an FP-summation-order artifact.
+        let report = AnalyticalReport {
+            results: vec![result(
+                "chbench_q15",
+                Outcome::Fail("schema align error: column count mismatch".to_string()),
+            )],
+        };
+        let msg = report
+            .failure_message()
+            .expect("a harness error on an advisory query must still gate");
         assert!(msg.contains("chbench_q15"));
     }
 }
