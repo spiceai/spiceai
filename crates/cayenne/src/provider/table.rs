@@ -626,17 +626,22 @@ impl CayenneCdcWrite {
         self.rows
     }
 
-    /// Number of rows this write deleted — the on-conflict deletion publish for
-    /// this batch (file/inline tombstones resolved against existing rows; one of
-    /// the two key vectors is populated per PK strategy). Feeds the adaptive
-    /// controller's delete-fraction signal, which withholds the write-concurrency
-    /// lever on delete-heavy streams. A directional heuristic, not an exact count
-    /// (pure insert/append batches return 0).
+    /// Number of existing rows superseded (deleted/replaced) by this write's
+    /// on-conflict deletion publish — the authoritative live-row-delta captured
+    /// from `OnConflictDeletions::total_superseded` at validation time. Feeds the
+    /// adaptive controller's delete-fraction signal, which withholds the
+    /// write-concurrency lever on delete-heavy streams. Pure insert/append
+    /// batches (no on-conflict publish) return 0.
+    ///
+    /// Uses the authoritative `superseded` count rather than
+    /// `deleted_pk_i64.len() + deleted_row_keys.len()`: for an `Int64Pk` table
+    /// those hold the SAME deletions in two encodings (summing double-counts) and
+    /// neither sees `position_deletions`.
     #[must_use]
     pub fn delete_rows(&self) -> u64 {
-        self.prepared_on_conflict.as_ref().map_or(0, |p| {
-            u64::try_from(p.deleted_pk_i64.len() + p.deleted_row_keys.len()).unwrap_or(u64::MAX)
-        })
+        self.prepared_on_conflict
+            .as_ref()
+            .map_or(0, |p| u64::try_from(p.superseded).unwrap_or(u64::MAX))
     }
 
     /// The in-memory CDC tier epoch this write landed in, when the table is in
