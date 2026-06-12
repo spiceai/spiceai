@@ -157,14 +157,28 @@ const PARAMETERS: &[ParameterSpec] = &[
         "Name of the Postgres replication slot to create/reuse for this dataset. \
          Defaults to `spice_<dataset>_<dataset-hash>_<instance-hash>`. Datasets on the \
          same connection that name the same slot SHARE it: one replication connection, \
-         one publication, with decoded changes routed per table. Each Spice replica \
-         MUST have its own unique slot.",
+         one publication, with decoded changes routed per table. An explicit name is used \
+         verbatim, so each Spice replica MUST set a unique slot — or omit this and set \
+         `pg_replication_slot_scope: instance` to share one auto-named slot per replica.",
     ),
+    ParameterSpec::component("replication_slot_scope")
+        .description(
+            "Scope of the auto-generated replication slot when `pg_replication_slot` is not \
+             set. `dataset` (default): one slot per dataset \
+             (`spice_<dataset>_<dataset-hash>_<instance-hash>`). `instance`: one slot per \
+             Spice replica per source connection (`spice_inst_<instance-hash>_<source-hash>`), \
+             shared by every `refresh_mode: changes` dataset on that source via the \
+             replication multiplexer — cutting slot/walsender usage from datasets×replicas to \
+             replicas. Ignored when `pg_replication_slot` is set.",
+        )
+        .one_of(&["dataset", "instance"])
+        .default("dataset")
+        .help_link(POSTGRES_DOCS),
     ParameterSpec::component("publication").description(
         "Name of the Postgres publication to create/reuse for this dataset. \
          Defaults to `spice_<dataset>_<dataset-hash>_pub`, or `<slot>_pub` when \
-         `pg_replication_slot` is set. Shared across replicas for the same dataset; \
-         datasets sharing a slot must use the same publication.",
+         `pg_replication_slot` is set or an instance-scoped slot is used. Shared across \
+         replicas for the same dataset; datasets sharing a slot must use the same publication.",
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(

@@ -272,11 +272,11 @@ async fn expect_single_change(
     Ok(())
 }
 
-async fn slot_count(client: &tokio_postgres::Client) -> Result<i64, anyhow::Error> {
+async fn slot_count(client: &tokio_postgres::Client, slot: &str) -> Result<i64, anyhow::Error> {
     Ok(client
         .query_one(
             "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-            &[&SLOT],
+            &[&slot],
         )
         .await?
         .get(0))
@@ -284,20 +284,22 @@ async fn slot_count(client: &tokio_postgres::Client) -> Result<i64, anyhow::Erro
 
 async fn publication_tables(
     client: &tokio_postgres::Client,
+    publication: &str,
 ) -> Result<HashSet<String>, anyhow::Error> {
     let rows = client
         .query(
             "SELECT tablename FROM pg_publication_tables WHERE pubname = $1",
-            &[&PUBLICATION],
+            &[&publication],
         )
         .await?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
 }
 
-/// Poll until exactly `expected` walsenders serve our slot (reconnects make
+/// Poll until exactly `expected` walsenders serve the slot (reconnects make
 /// the instantaneous count racy).
 async fn wait_for_walsender_count(
     client: &tokio_postgres::Client,
+    slot: &str,
     expected: i64,
 ) -> Result<(), anyhow::Error> {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -308,7 +310,7 @@ async fn wait_for_walsender_count(
                 "SELECT count(*) FROM pg_stat_replication r \
                  JOIN pg_replication_slots s ON s.active_pid = r.pid \
                  WHERE s.slot_name = $1",
-                &[&SLOT],
+                &[&slot],
             )
             .await?
             .get(0);
@@ -318,7 +320,7 @@ async fn wait_for_walsender_count(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Err(anyhow::anyhow!(
-        "expected {expected} walsender(s) for slot {SLOT}, last saw {last}"
+        "expected {expected} walsender(s) for slot {slot}, last saw {last}"
     ))
 }
 
@@ -375,13 +377,13 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     boot_b.commit().await?;
 
     // --- 2. One slot, one publication covering both tables, one walsender. ---
-    assert_eq!(slot_count(&source).await?, 1, "exactly one slot");
+    assert_eq!(slot_count(&source, SLOT).await?, 1, "exactly one slot");
     assert_eq!(
-        publication_tables(&source).await?,
+        publication_tables(&source, PUBLICATION).await?,
         HashSet::from(["shared_repl_a".to_string(), "shared_repl_b".to_string()]),
         "publication covers both member tables"
     );
-    wait_for_walsender_count(&source, 1).await?;
+    wait_for_walsender_count(&source, SLOT, 1).await?;
 
     // --- 3. Interleaved changes route to the right dataset. ---
     source
@@ -461,9 +463,13 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     );
     boot_c.commit().await?;
 
-    assert_eq!(slot_count(&source).await?, 1, "still exactly one slot");
     assert_eq!(
-        publication_tables(&source).await?.len(),
+        slot_count(&source, SLOT).await?,
+        1,
+        "still exactly one slot"
+    );
+    assert_eq!(
+        publication_tables(&source, PUBLICATION).await?.len(),
         3,
         "publication gained the late-added table"
     );
@@ -686,6 +692,98 @@ async fn shared_slot_multiplexes_multiple_datasets() -> Result<(), anyhow::Error
     drop_replication_slot_when_inactive(&source, SLOT).await?;
     source
         .simple_query(&format!("DROP PUBLICATION IF EXISTS {PUBLICATION}"))
+        .await?;
+    Ok(())
+}
+
+/// `pg_replication_slot_scope: instance` shares one *generated* slot across
+/// every changes-mode dataset on a source — distinct per replica via the
+/// instance hash. This proves the shared multiplexer treats the generated
+/// instance-scoped name (`config::instance_slot_name`) exactly like an explicit
+/// one: two datasets collapse onto one slot / one publication / one walsender.
+#[tokio::test(flavor = "multi_thread")]
+async fn instance_scoped_slot_multiplexes_generated_name() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let port = common::get_random_port()?;
+    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let port = u16::try_from(port).expect("port fits in u16");
+    let source = pg_client(port).await?;
+
+    create_table(&source, "inst_a", &[(1, "a1"), (2, "a2")]).await?;
+    create_table(&source, "inst_b", &[(1, "b1")]).await?;
+
+    // The exact name the connector generates for `pg_replication_slot_scope:
+    // instance` on this (host, port, db, user). Both datasets compute the same
+    // name and must multiplex onto it.
+    let slot = config::instance_slot_name("localhost", port, "postgres", "postgres");
+    assert!(slot.starts_with("spice_inst_"), "got slot `{slot}`");
+    let publication = config::publication_name_for_slot(&slot);
+
+    let input = |table: &str| ReplicationStreamInput {
+        dataset_name: table.to_string(),
+        params: ReplicationParams {
+            host: "localhost".into(),
+            port,
+            user: "postgres".into(),
+            password: SecretString::from(common::PG_PASSWORD.to_string()),
+            database: "postgres".into(),
+            sslmode: config::SslMode::Disable,
+            sslrootcert: None,
+            slot_name: slot.clone(),
+            publication_name: publication.clone(),
+            initial_snapshot: true,
+            snapshot_on_resume: false,
+            temporary_slot: false,
+            status_interval: Duration::from_secs(1),
+            bootstrap_batch_size: 8192,
+            shared: true,
+        },
+        schema: dataset_schema(),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.to_string(),
+        metrics: ReplicationMetricsCollector::new(),
+    };
+
+    let mut stream_a = start_replication_stream(input("inst_a"));
+    let boot_a = next_envelope(&mut stream_a, "bootstrap inst_a").await?;
+    assert_eq!(boot_a.change_batch.record.num_rows(), 2, "bootstrap inst_a");
+    boot_a.commit().await?;
+
+    let mut stream_b = start_replication_stream(input("inst_b"));
+    let boot_b = next_envelope(&mut stream_b, "bootstrap inst_b").await?;
+    assert_eq!(boot_b.change_batch.record.num_rows(), 1, "bootstrap inst_b");
+    boot_b.commit().await?;
+
+    // One slot, one publication covering both tables, one walsender.
+    assert_eq!(
+        slot_count(&source, &slot).await?,
+        1,
+        "two instance-scoped datasets share exactly one slot"
+    );
+    assert_eq!(
+        publication_tables(&source, &publication).await?,
+        HashSet::from(["inst_a".to_string(), "inst_b".to_string()]),
+        "instance-scoped publication covers both member tables"
+    );
+    wait_for_walsender_count(&source, &slot, 1).await?;
+
+    // Per-table routing over the shared generated slot.
+    source
+        .simple_query("INSERT INTO public.inst_a VALUES (10, 'a10')")
+        .await?;
+    expect_single_change(&mut stream_a, "insert inst_a", "c", 10).await?;
+    source
+        .simple_query("INSERT INTO public.inst_b VALUES (20, 'b20')")
+        .await?;
+    expect_single_change(&mut stream_b, "insert inst_b", "c", 20).await?;
+
+    drop(stream_a);
+    drop(stream_b);
+    drop_replication_slot_when_inactive(&source, &slot).await?;
+    source
+        .simple_query(&format!("DROP PUBLICATION IF EXISTS {publication}"))
         .await?;
     Ok(())
 }

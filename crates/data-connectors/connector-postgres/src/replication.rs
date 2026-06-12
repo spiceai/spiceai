@@ -495,18 +495,43 @@ fn replication_params_from_connector_params(
     // connection (see `data_components::postgres_replication::shared`). The
     // default publication is then derived from the slot — not the dataset —
     // so all members land on the same publication.
+    //
+    // `pg_replication_slot_scope: instance` opts into the same multiplexer with
+    // a *generated* instance-scoped slot name (`spice_inst_<instance>_<source>`)
+    // shared across every changes-mode dataset on this source — collapsing
+    // `datasets × replicas` slots down to `replicas` (one per replica per
+    // source), while staying distinct per replica via the instance hash. An
+    // explicit `pg_replication_slot` takes precedence and is used verbatim.
     let explicit_slot = optional_string(params, "replication_slot");
-    let shared = explicit_slot.is_some();
-    let (slot_name, publication_name) = match explicit_slot {
+    let instance_scoped = matches!(
+        optional_string(params, "replication_slot_scope").as_deref(),
+        Some("instance")
+    );
+    let explicit_publication = optional_string(params, "publication");
+    let (slot_name, publication_name, shared) = match explicit_slot {
         Some(slot) => {
-            let publication = optional_string(params, "publication")
-                .unwrap_or_else(|| config::publication_name_for_slot(&slot));
-            (slot, publication)
+            if instance_scoped {
+                tracing::warn!(
+                    dataset = %dataset_name,
+                    "both `pg_replication_slot` and `pg_replication_slot_scope: instance` are \
+                     set; using the explicit slot name verbatim and ignoring the scope. Remove \
+                     `pg_replication_slot` to get an instance-scoped (per-replica) slot."
+                );
+            }
+            let publication =
+                explicit_publication.unwrap_or_else(|| config::publication_name_for_slot(&slot));
+            (slot, publication, true)
+        }
+        None if instance_scoped => {
+            let slot = config::instance_slot_name(&host, port, &database, &user);
+            let publication =
+                explicit_publication.unwrap_or_else(|| config::publication_name_for_slot(&slot));
+            (slot, publication, true)
         }
         None => (
             config::default_slot_name(dataset_name),
-            optional_string(params, "publication")
-                .unwrap_or_else(|| config::default_publication_name(dataset_name)),
+            explicit_publication.unwrap_or_else(|| config::default_publication_name(dataset_name)),
+            false,
         ),
     };
     let initial_snapshot = optional_string(params, "replication_initial_snapshot")
@@ -678,5 +703,110 @@ mod tests {
                     "parameter `pg_replication_bootstrap_batch_size` must be a positive integer, got \"many\""
                 )
         );
+    }
+
+    /// Build a full connector param set (the connection params are required by
+    /// `replication_params_from_connector_params`) plus any extra entries.
+    fn conn_params(db: &str, extra: &[(&str, &str)]) -> Parameters {
+        let mut kv: Vec<(String, SecretString)> = vec![
+            ("host".to_string(), SecretString::from("db.example.com")),
+            ("port".to_string(), SecretString::from("5432")),
+            ("user".to_string(), SecretString::from("spice")),
+            ("pass".to_string(), SecretString::from("secret")),
+            ("db".to_string(), SecretString::from(db.to_string())),
+        ];
+        for (k, v) in extra {
+            kv.push(((*k).to_string(), SecretString::from((*v).to_string())));
+        }
+        Parameters::new(kv, "pg", crate::PARAMETERS)
+    }
+
+    #[test]
+    fn default_scope_is_per_dataset_and_unshared() {
+        let p = replication_params_from_connector_params(&conn_params("appdb", &[]), "public.apps")
+            .expect("params build");
+        assert!(
+            !p.shared,
+            "default scope must keep a dedicated per-dataset stream"
+        );
+        assert_eq!(p.slot_name, config::default_slot_name("public.apps"));
+        assert_eq!(
+            p.publication_name,
+            config::default_publication_name("public.apps")
+        );
+    }
+
+    #[test]
+    fn scope_instance_produces_a_shared_instance_slot() {
+        let p = replication_params_from_connector_params(
+            &conn_params("appdb", &[("replication_slot_scope", "instance")]),
+            "public.apps",
+        )
+        .expect("params build");
+        assert!(p.shared, "instance scope must use the shared multiplexer");
+        assert!(
+            p.slot_name.starts_with("spice_inst_"),
+            "got slot `{}`",
+            p.slot_name
+        );
+        // Publication is derived from the (shared) slot, not the dataset, so
+        // every member lands on the same publication.
+        assert_eq!(
+            p.publication_name,
+            config::publication_name_for_slot(&p.slot_name)
+        );
+    }
+
+    #[test]
+    fn scope_instance_shares_one_slot_across_datasets_on_the_same_source() {
+        let apps = replication_params_from_connector_params(
+            &conn_params("appdb", &[("replication_slot_scope", "instance")]),
+            "public.apps",
+        )
+        .expect("params build");
+        let orgs = replication_params_from_connector_params(
+            &conn_params("appdb", &[("replication_slot_scope", "instance")]),
+            "public.orgs",
+        )
+        .expect("params build");
+        // Identical slot + publication → the multiplexer collapses them onto one
+        // replication connection (datasets × replicas → replicas).
+        assert_eq!(apps.slot_name, orgs.slot_name);
+        assert_eq!(apps.publication_name, orgs.publication_name);
+    }
+
+    #[test]
+    fn scope_instance_distinguishes_different_sources() {
+        let appdb = replication_params_from_connector_params(
+            &conn_params("appdb", &[("replication_slot_scope", "instance")]),
+            "public.apps",
+        )
+        .expect("params build");
+        let otherdb = replication_params_from_connector_params(
+            &conn_params("otherdb", &[("replication_slot_scope", "instance")]),
+            "public.apps",
+        )
+        .expect("params build");
+        // Logical slot names are unique cluster-wide; two databases on the same
+        // server must not collide on one physical slot.
+        assert_ne!(appdb.slot_name, otherdb.slot_name);
+    }
+
+    #[test]
+    fn explicit_slot_overrides_instance_scope() {
+        let p = replication_params_from_connector_params(
+            &conn_params(
+                "appdb",
+                &[
+                    ("replication_slot", "my_slot"),
+                    ("replication_slot_scope", "instance"),
+                ],
+            ),
+            "public.apps",
+        )
+        .expect("params build");
+        assert!(p.shared);
+        assert_eq!(p.slot_name, "my_slot", "explicit slot is used verbatim");
+        assert_eq!(p.publication_name, "my_slot_pub");
     }
 }

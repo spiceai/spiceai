@@ -116,7 +116,8 @@ All replication-specific parameters live under `params:` on the dataset and star
 | Parameter                             | Default                                          | Description                                                                                                                                                                                                                            |
 | ------------------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pg_replication_slot`                 | `spice_<dataset>_<dataset-hash>_<instance-hash>` | Name of the replication slot. Must be unique per replica. The dataset-hash protects against truncation collisions between long dataset names. Datasets on the same connection that name the **same** slot share it — see [Sharing one slot across multiple datasets](#sharing-one-slot-across-multiple-datasets). |
-| `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. When `pg_replication_slot` is set explicitly, the default becomes `<slot>_pub` so datasets sharing a slot land on the same publication.                       |
+| `pg_replication_slot_scope`           | `dataset`                                        | Scope of the **auto-generated** slot name when `pg_replication_slot` is unset. `dataset`: one slot per dataset (default). `instance`: one slot per replica per source connection (`spice_inst_<instance-hash>_<source-hash>`), shared by every `refresh_mode: changes` dataset on that source — see [Instance-scoped slots](#instance-scoped-slots-one-slot-per-replica). Ignored when `pg_replication_slot` is set. |
+| `pg_publication`                      | `spice_<dataset>_<dataset-hash>_pub`             | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. When `pg_replication_slot` is set explicitly (or an instance-scoped slot is used), the default becomes `<slot>_pub` so datasets sharing a slot land on the same publication.                       |
 | `pg_replication_initial_snapshot`     | `true`                                           | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. Non-persistent accelerators (`arrow`, or `duckdb`/`sqlite` with `mode: memory`/`file_create`) snapshot on **every** start — including slot resume — since they boot empty.            |
 | `pg_replication_temporary_slot`       | `false`                                          | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps.                                                                                                                                                    |
 | `pg_replication_status_interval`      | `10s`                                            | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |
@@ -223,7 +224,29 @@ Sharing semantics worth knowing:
 - **One dataset per source table per slot.** Two datasets replicating the same table must use different slots.
 - **All members must use the same publication.** Leave `pg_publication` unset (the `<slot>_pub` default agrees automatically) or set it identically on every member.
 - **Removing a dataset** stops routing its changes but does not remove its table from the publication, and its last-applied LSN keeps pinning WAL until spiced restarts. After a restart the remaining members resume and the slot acknowledges freely again. If you later **re-add a previously removed dataset**, drop its table from the publication first (`ALTER PUBLICATION spice_app_cdc_pub DROP TABLE public.users;`) so Spice re-adds it and takes a fresh snapshot — changes that committed while the dataset was absent across a restart are not replayable from the slot.
-- **Replicas still need distinct slots.** Slots are single-consumer: sharing happens *within* a spiced instance, never across replicas. With explicit slot names, include the replica identity in the name (see [Multi-replica deployments](#multi-replica-deployments)); a second consumer of the same slot fails loudly with "replication slot is active".
+- **Replicas still need distinct slots.** Slots are single-consumer: sharing happens *within* a spiced instance, never across replicas. The simplest way to share one slot across many datasets in a multi-replica deployment is [`pg_replication_slot_scope: instance`](#instance-scoped-slots-one-slot-per-replica), which generates a per-replica shared slot for you. With explicit slot names, include the replica identity in the name (see [Multi-replica deployments](#multi-replica-deployments)); a second consumer of the same slot fails loudly with "replication slot is active".
+
+### Instance-scoped slots (one slot per replica)
+
+The sharing above requires every dataset to name the **same** explicit `pg_replication_slot`, and an explicit name is used verbatim — so in a multi-replica deployment every replica computes the *same* slot name and all but one fail with "replication slot is active" (slots are single-consumer). You then have to invent a per-replica naming scheme by hand.
+
+`pg_replication_slot_scope: instance` removes that friction. Set it on each `refresh_mode: changes` dataset (leaving `pg_replication_slot` unset) and Spice generates one shared slot name automatically:
+
+```yaml
+params: &repl
+  pg_host: db.internal
+  pg_db: app
+  pg_user: spice
+  pg_pass: ${secrets:pg_pass}
+  pg_replication_slot_scope: instance
+```
+
+The generated name is `spice_inst_<instance-hash>_<source-hash>`:
+
+- `<instance-hash>` is the replica identity (`SPICE_INSTANCE_ID`, falling back to `HOSTNAME`), so **each replica gets its own slot with no contention** — exactly like the default per-dataset slots (see [Multi-replica deployments](#multi-replica-deployments)).
+- `<source-hash>` folds in `(host, port, db, user)`, so datasets on the same source share one slot while datasets pointing at a different database or server get their own. (Logical slot names are unique cluster-wide, so this prevents two databases on one server from colliding on a single slot.)
+
+The net effect is **one slot per replica per source** instead of `datasets × replicas` — e.g. six tables mirrored across three replicas drop from 18 slots to 3. All the sharing semantics above still apply (collective acknowledgement, one publication, one walsender). The trade-off versus per-dataset slots is that members share a single replication connection/walsender, so they share throughput and back-pressure; correctness stays isolated — a stalled member only pins WAL, as described above. An explicit `pg_replication_slot` still overrides the scope and is used verbatim.
 
 ## Multi-replica deployments
 

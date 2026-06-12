@@ -60,13 +60,13 @@ pub struct ReplicationParams {
     pub status_interval: Duration,
     /// Rows per emitted snapshot batch during initial bootstrap.
     pub bootstrap_batch_size: usize,
-    /// `true` when the slot name was explicitly configured
-    /// (`pg_replication_slot`). Explicitly-named slots are served by the
-    /// shared multiplexer ([`super::shared`]): every dataset on the same
-    /// connection naming the same slot shares one replication
-    /// connection/decoder, with changes routed per table. Default
-    /// (per-dataset generated) slot names keep the dedicated per-dataset
-    /// stream.
+    /// `true` when the slot is shared across datasets — either an explicit
+    /// `pg_replication_slot` name, or `pg_replication_slot_scope: instance`
+    /// (an instance-scoped *generated* name). Shared slots are served by the
+    /// multiplexer ([`super::shared`]): every dataset on the same connection
+    /// naming the same slot shares one replication connection/decoder, with
+    /// changes routed per table. The default (per-dataset generated) slot name
+    /// keeps the dedicated per-dataset stream.
     pub shared: bool,
 }
 
@@ -185,6 +185,36 @@ pub fn default_slot_name(dataset_name: &str) -> String {
     let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
     let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
     format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
+}
+
+/// Build an instance-scoped slot name shared by every changes-mode dataset on
+/// the same source connection within this spiced instance:
+/// `spice_inst_{instance_hash}_{source_hash}`.
+///
+/// Selected by `pg_replication_slot_scope: instance`. Unlike [`default_slot_name`]
+/// (one slot per dataset) this collapses every dataset on the same source onto a
+/// single replication slot/connection/publication via the shared multiplexer
+/// ([`super::shared`]), cutting the slot count from `datasets × replicas` down to
+/// `replicas` (one slot per replica per source connection).
+///
+/// - `instance_hash` (from `SPICE_INSTANCE_ID`, falling back to the hostname)
+///   keeps the name distinct per replica, so HA replicas never contend over a
+///   single physical slot (which would leave all but one serving stale data).
+/// - `source_hash` disambiguates by `(host, port, database, user)`. Logical slot
+///   names are unique cluster-wide, so two instance-scoped datasets pointing at
+///   different databases on the *same* server would otherwise collide on one
+///   name; folding the source in makes it precisely one slot per source. It is
+///   the same tuple the multiplexer keys on ([`super::shared::SourceKey`]), so
+///   datasets that share a source share the name and multiplex, and datasets on
+///   different sources get distinct slots.
+///
+/// Length: `spice_`(6) + `inst_`(5) + 8 + `_`(1) + 8 = 28 bytes, well under the
+/// 63-byte identifier limit (no truncation needed).
+#[must_use]
+pub fn instance_slot_name(host: &str, port: u16, database: &str, user: &str) -> String {
+    let instance = instance_hash();
+    let source = xxh3_short_hash(&format!("{host}:{port}/{database}#{user}"));
+    format!("{SLOT_PREFIX}inst_{instance}_{source}")
 }
 
 /// Default publication name for a dataset with an explicitly-named
@@ -554,6 +584,46 @@ mod tests {
         // 63-byte cap survives long slot names.
         let long = "p".repeat(120);
         assert!(publication_name_for_slot(&long).len() <= PG_IDENTIFIER_MAX_BYTES);
+    }
+
+    #[test]
+    fn instance_slot_name_is_deterministic_and_prefixed() {
+        // Same inputs within a process → same name (so two datasets on the same
+        // source produce the identical slot and therefore multiplex).
+        let a1 = instance_slot_name("db.example.com", 5432, "appdb", "spice");
+        let a2 = instance_slot_name("db.example.com", 5432, "appdb", "spice");
+        assert_eq!(a1, a2);
+        assert!(a1.starts_with("spice_inst_"), "got {a1}");
+        assert!(
+            a1.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "got {} bytes",
+            a1.len()
+        );
+    }
+
+    #[test]
+    fn instance_slot_name_distinguishes_sources() {
+        // Different database, host, port, or user on the same instance must
+        // yield distinct slot names — logical slot names are unique
+        // cluster-wide, so colliding here would make two sources fight over one
+        // physical slot.
+        let base = instance_slot_name("db.example.com", 5432, "appdb", "spice");
+        assert_ne!(
+            base,
+            instance_slot_name("db.example.com", 5432, "otherdb", "spice")
+        );
+        assert_ne!(
+            base,
+            instance_slot_name("other.example.com", 5432, "appdb", "spice")
+        );
+        assert_ne!(
+            base,
+            instance_slot_name("db.example.com", 5433, "appdb", "spice")
+        );
+        assert_ne!(
+            base,
+            instance_slot_name("db.example.com", 5432, "appdb", "other")
+        );
     }
 
     #[test]
