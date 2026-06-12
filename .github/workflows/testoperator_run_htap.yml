@@ -16,15 +16,17 @@ on:
         description: 'Scale factor (warehouses). Terminals = scale_factor * 10.'
         required: false
         type: string
-        default: '1'
+        default: '100'
       terminals:
         description: 'Override OLTP terminal count (default: scale_factor * 10)'
         required: false
         type: string
+        default: '100'
       rate:
         description: 'Target OLTP transaction rate (txns/sec); empty = unlimited'
         required: false
         type: string
+        default: '10000'
       duration:
         description: 'Duration of the HTAP workload in seconds'
         required: false
@@ -82,12 +84,12 @@ jobs:
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
-      - name: Install MinIO
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+      # - name: Install MinIO
+      #   uses: ./.github/actions/setup-minio
+      #   with:
+      #     minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+      #     minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+      #     minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
@@ -126,12 +128,7 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           CHBENCH_PG_HOST: 127.0.0.1
 
-      # Insurance against a crashed/cancelled run leaving an orphaned logical
-      # replication slot behind: an inactive slot keeps pinning WAL until the
-      # next run's prepare() drops it, which can bloat disk on a static PG that
-      # is not torn down between runs. Drop inactive spice_* slots (and their
-      # publications) here so WAL retention is bounded even when no next run
-      # comes. Never fails the job — best-effort cleanup only.
+      # Ensure a crashed/cancelled run leaves no orphaned logical replication slots and publications
       - name: Clean up orphaned replication slots and publications
         if: always()
         env:
