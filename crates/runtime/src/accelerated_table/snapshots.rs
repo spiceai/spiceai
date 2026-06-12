@@ -177,6 +177,7 @@ pub fn spawn_snapshot_interval_task(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: TableReference,
     checkpoint_schema: Arc<Schema>,
+    federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
@@ -238,6 +239,7 @@ pub fn spawn_snapshot_interval_task(
             // Consider use case: periodic
             ForceCreate(initial_delay.is_zero()),
             accelerator.as_ref(),
+            Some(&federated_schema),
             refresh_sql.as_deref(),
         )
         .await;
@@ -265,6 +267,7 @@ pub fn spawn_snapshot_interval_task(
                 &last_updated_at,
                 ForceCreate(false),
                 accelerator.as_ref(),
+                Some(&federated_schema),
                 refresh_sql.as_deref(),
             )
             .await;
@@ -284,6 +287,7 @@ pub fn create_periodic_snapshot_callback(
     accelerator_write_mutex: Arc<Mutex<()>>,
     dataset_name: &TableReference,
     checkpoint_schema: Arc<Schema>,
+    federated_schema: Arc<Schema>,
     runtime_status: Arc<RuntimeStatus>,
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
@@ -312,6 +316,7 @@ pub fn create_periodic_snapshot_callback(
             let checkpointer_clone = Arc::clone(&checkpointer);
             let snapshot_manager_clone = Arc::clone(&snapshot_manager);
             let checkpoint_schema_clone = Arc::clone(&checkpoint_schema);
+            let federated_schema_clone = Arc::clone(&federated_schema);
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
@@ -333,6 +338,7 @@ pub fn create_periodic_snapshot_callback(
                         &last_updated_at_clone,
                         ForceCreate(true),
                         accelerator_clone.as_ref(),
+                        Some(&federated_schema_clone),
                         refresh_sql.as_deref(),
                     )
                     .await;
@@ -349,6 +355,7 @@ pub fn create_periodic_snapshot_callback(
                 let accelerator_write_mutex = Arc::clone(&accelerator_write_mutex);
                 let batches_processed = Arc::clone(&batches_processed);
                 let checkpoint_schema = Arc::<Schema>::clone(&checkpoint_schema);
+                let federated_schema = Arc::<Schema>::clone(&federated_schema);
                 let dataset_name = dataset_name.clone();
                 let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
@@ -382,6 +389,7 @@ pub fn create_periodic_snapshot_callback(
                             &last_updated_at,
                             ForceCreate(false),
                             accelerator.as_ref(),
+                            Some(&federated_schema),
                             refresh_sql.as_deref(),
                         )
                         .await;
@@ -406,9 +414,24 @@ pub async fn create_checkpoint_and_snapshot(
     last_updated_at: &Arc<AtomicI64>,
     force_create: ForceCreate,
     accelerator: Option<&Arc<dyn TableProvider>>,
+    federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
+    // Re-derive the checkpoint schema from the LIVE accelerator schema when both
+    // the accelerator and the federated (source) schema are available, so an
+    // in-place / live schema evolution (e.g. Cayenne CDC) that widened the
+    // accelerator while the runtime is up is persisted to the checkpoint and
+    // snapshot metadata — rather than overwriting it with the schema captured at
+    // refresher start. Falls back to the precomputed `checkpoint_schema`, and is
+    // byte-identical when the accelerator schema has not changed since start.
+    let live_checkpoint_schema;
+    let checkpoint_schema = if let (Some(acc), Some(fed)) = (accelerator, federated_schema) {
+        live_checkpoint_schema = canonical_checkpoint_schema(&acc.schema(), fed);
+        &live_checkpoint_schema
+    } else {
+        checkpoint_schema
+    };
     if let Err(e) = checkpointer
         .checkpoint(checkpoint_schema, refresh_sql)
         .await

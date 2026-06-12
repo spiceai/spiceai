@@ -907,8 +907,12 @@ impl Refresher {
         // schema — accelerator field order minus the hidden cache-namespace storage
         // column — not the source-order federated schema, so that evolved column
         // order is durable across restarts (engines can only append columns).
+        // Captured once for the start-time checkpoint schema AND threaded into the
+        // snapshot tasks so they can re-derive the canonical schema from the LIVE
+        // accelerator at each checkpoint (live schema evolution under CDC).
+        let federated_schema = self.federated.schema();
         let checkpoint_schema =
-            canonical_checkpoint_schema(&self.accelerator.schema(), &self.federated.schema());
+            canonical_checkpoint_schema(&self.accelerator.schema(), &federated_schema);
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
@@ -930,6 +934,7 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
                             Arc::clone(&checkpoint_schema),
+                            Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
@@ -947,6 +952,7 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
                             Arc::clone(&checkpoint_schema),
+                            Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
@@ -1032,6 +1038,7 @@ impl Refresher {
                         Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
                         Arc::clone(&checkpoint_schema),
+                        Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
                         Arc::clone(&self.last_updated_at),
@@ -1084,6 +1091,9 @@ impl Refresher {
                             &last_updated_at_clone,
                             ForceCreate(true),
                             Some(&accelerator_clone),
+                            // Non-changes path: no live evolution, so the
+                            // start-time checkpoint schema is current.
+                            None,
                             refresh_sql.as_deref(),
                         )
                         .await;
@@ -1172,6 +1182,7 @@ impl Refresher {
                                 &last_updated_at,
                                 ForceCreate(false),
                                 Some(&accelerator),
+                                None,
                                 refresh_sql.as_deref(),
                             ).await;
                         }
