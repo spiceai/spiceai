@@ -254,6 +254,13 @@ impl CayenneContext {
         !self.config.sort_columns.is_empty()
     }
 
+    /// Get the configured intra-write shard-key columns. Empty = derive the
+    /// shard key from the primary key (the historical behavior).
+    #[must_use]
+    pub fn shard_key_columns(&self) -> &[String] {
+        &self.config.shard_key_columns
+    }
+
     /// Get the shared `RuntimeEnv`.
     #[must_use]
     pub fn runtime_env(&self) -> &Arc<RuntimeEnv> {
