@@ -21553,7 +21553,7 @@ mod tests {
         };
 
         let scan_result = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(10),
             provider.scan(&ctx.state(), None, &[], None),
         )
         .await;
@@ -21581,10 +21581,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_delete_only_publish_decrements_durable_inline_counter() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_inline_enabled_upsert_table("durable_delete_only_counter", ctx.runtime_env())
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            1,
+            "precondition: one row is resident in the durable inline corpus"
+        );
+
+        provider.publish_inlined_mutation(0, 1, None);
+
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            0,
+            "a durable delete-only publish must decrement the durable inline corpus"
+        );
+    }
+
     /// Zero-corpus rebuild fast path: when the durable inline corpus is
     /// provably empty, an inline-cache rebuild must not touch the metastore.
     /// Proven by renaming `cayenne_inlined_data` out from under the catalog
-    /// via a direct SQLite connection: the rebuild succeeds (installing an
+    /// via a direct `SQLite` connection: the rebuild succeeds (installing an
     /// empty generation-current view) iff it skipped the read, and flipping
     /// the durable-count signal to non-zero makes the SAME rebuild fail —
     /// proving the gate is exactly the durable-corpus counter.
