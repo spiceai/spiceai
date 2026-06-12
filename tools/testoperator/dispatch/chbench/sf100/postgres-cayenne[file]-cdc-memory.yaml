@@ -1,7 +1,7 @@
 tests:
   htap:
     spicepod_path: accelerated/postgres-cayenne[file]-cdc-memory.yaml
-    runner_type: spiceai-dev-xlarge-runners
+    runner_type: htap-benchmark
     scale_factor: 100
     terminals: 100
     duration: 600

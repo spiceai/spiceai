@@ -306,6 +306,8 @@ pub enum RunnerType {
     DevLarge,
     #[serde(rename = "spiceai-dev-xlarge-runners")]
     DevXLarge,
+    #[serde(rename = "htap-benchmark")]
+    HtapBenchmark,
 }
 
 /// Payload sent to the GitHub Actions workflow request. Should match inputs in `.github/workflows/testoperator_run_texttosql.yml`.
@@ -719,5 +721,30 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
         assert_eq!(serialized["runner_type"], "spiceai-dev-xlarge-runners");
+    }
+
+    #[test]
+    fn test_htap_benchmark_runner_type_round_trip() {
+        let yaml = "
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: htap-benchmark
+    scale_factor: 100
+    duration: 600
+    ready_wait: 300
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+
+        assert!(matches!(
+            test_file.tests.htap[0].runner_type,
+            RunnerType::HtapBenchmark
+        ));
+
+        // Verify it serializes back to the expected workflow input value
+        let serialized =
+            serde_json::to_value(&test_file.tests.htap[0]).expect("Failed to serialize");
+        assert_eq!(serialized["runner_type"], "htap-benchmark");
     }
 }
