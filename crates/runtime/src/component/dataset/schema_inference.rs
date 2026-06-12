@@ -43,6 +43,9 @@ use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, R
 ///   duplicate the primary key).
 /// - **sort columns**: applied when no engine sort param is configured, routed to
 ///   the engine-appropriate `acceleration.params` key.
+/// - **shard key** (Cayenne only): the source's declared partition/shard key is
+///   applied as `cayenne_shard_key_columns` when the user set none and it differs
+///   from the primary key.
 ///
 /// Columns absent from `effective_schema` (e.g. projected away by `refresh_sql`)
 /// are skipped so we never produce a constraint the accelerator would reject.
@@ -118,18 +121,28 @@ pub fn apply_inferred_schema(
         }
     }
 
-    // 3) Sort columns — only when no engine sort param is configured, and not for
-    // `refresh_mode: changes`. For CDC the accelerator is driven by the upsert key,
-    // not a refresh-time sort; applying `on_refresh_sort_columns` to a change-stream
-    // dataset is at best a no-op and risks perturbing its initial snapshot/refresh,
-    // so inferred-CDC acceleration stays equivalent to a hand-configured one.
+    // 3) Sort columns — only when no engine sort param is configured. Whether a
+    // change-stream dataset gets one is engine-dependent (decided inside
+    // `apply_inferred_sort`): for DuckDB/Arrow the inferred sort drives the
+    // refresh itself, which is a no-op for a change stream and risks perturbing
+    // its initial snapshot, so it stays disabled. Cayenne is the exception — its
+    // `cayenne_sort_columns` sorts the background COMPACTION rewrite, not the
+    // change stream, so it applies even in changes mode and is what keeps
+    // per-file zone maps tight for listing-time pruning on heavy CDC tables.
     let is_changes = acceleration.refresh_mode == Some(RefreshMode::Changes);
-    let applied_sort = !is_changes && apply_inferred_sort(acceleration, inferred, effective_schema);
+    let applied_sort = apply_inferred_sort(acceleration, inferred, effective_schema, is_changes);
+
+    // 4) Shard key — Cayenne only: route the source's declared distribution key
+    // (Postgres partition key / MongoDB shard key) to `cayenne_shard_key_columns`
+    // so intra-write sharding and parallel compaction merges hash-cluster files
+    // along the source's dominant dimension instead of the primary key.
+    let applied_shard_key = apply_inferred_shard_key(acceleration, inferred, effective_schema);
 
     tracing::debug!(
         dataset = %dataset_name,
         indexes = applied_indexes,
         sort_applied = applied_sort,
+        shard_key_applied = applied_shard_key,
         "Applied extended schema inference to acceleration settings"
     );
 }
@@ -140,6 +153,7 @@ fn apply_inferred_sort(
     acceleration: &mut Acceleration,
     inferred: &InferredSchema,
     effective_schema: &SchemaRef,
+    is_changes: bool,
 ) -> bool {
     if inferred.sort_columns.is_empty() {
         return false;
@@ -164,6 +178,17 @@ fn apply_inferred_sort(
         _ => return false,
     };
 
+    // For `refresh_mode: changes`, skip engines whose sort param drives the
+    // refresh itself (DuckDB `on_refresh_sort_columns`, Arrow `sort_columns`): a
+    // refresh-time sort is a no-op for a change stream and risks perturbing the
+    // initial snapshot. Cayenne is the exception — `cayenne_sort_columns` sorts
+    // the background compaction rewrite, not the change stream (which stays
+    // unsorted by design), so it applies and keeps per-file zone maps tight for
+    // listing-time pruning on the heavy update tables.
+    if is_changes && engine != Engine::Cayenne {
+        return false;
+    }
+
     // Respect any user-configured sort param (Cayenne also accepts `sort_columns`).
     let user_configured = acceleration.params.contains_key(key)
         || (engine == Engine::Cayenne && acceleration.params.contains_key("sort_columns"));
@@ -181,12 +206,90 @@ fn apply_inferred_sort(
     } else {
         present
             .iter()
-            .map(|sc| format!("{} {}", sc.column, if sc.desc { "DESC" } else { "ASC" }))
+            .map(|sc| {
+                let mut spec = format!("{} {}", sc.column, if sc.desc { "DESC" } else { "ASC" });
+                // Carry the source's declared NULLS placement; when unknown the
+                // engine default applies.
+                match sc.nulls_first {
+                    Some(true) => spec.push_str(" NULLS FIRST"),
+                    Some(false) => spec.push_str(" NULLS LAST"),
+                    None => {}
+                }
+                spec
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
 
     acceleration.params.insert(key.to_string(), value);
+    true
+}
+
+/// Inject the inferred distribution/shard key into `cayenne_shard_key_columns`,
+/// unless the user already configured one. Returns whether a value was set.
+///
+/// Cayenne-only: the param drives intra-write hash sharding, which other engines
+/// don't have. Skipped when the key equals the effective primary key (already the
+/// engine default), when any key column is absent from the accelerated schema (a
+/// partial key would cluster by a different dimension than the source declared),
+/// or when the source statistics prove the key is constant (hashing a constant
+/// routes every row to one shard, serializing the encode fan-out for nothing).
+/// A sorted table renders the key inert — the engine forces a single serial
+/// writer — but it is still recorded so the layout follows the source if the
+/// sort is later removed.
+fn apply_inferred_shard_key(
+    acceleration: &mut Acceleration,
+    inferred: &InferredSchema,
+    effective_schema: &SchemaRef,
+) -> bool {
+    if inferred.shard_key.is_empty() {
+        return false;
+    }
+    if acceleration.engine.to_unpartitioned() != Engine::Cayenne {
+        return false;
+    }
+    // Respect a user-configured shard key (Cayenne also accepts `shard_key_columns`).
+    if acceleration
+        .params
+        .contains_key("cayenne_shard_key_columns")
+        || acceleration.params.contains_key("shard_key_columns")
+    {
+        return false;
+    }
+    if !inferred
+        .shard_key
+        .iter()
+        .all(|column| effective_schema.field_with_name(column).is_ok())
+    {
+        return false;
+    }
+    // Equal to the effective primary key (user-set or just-inferred) — the
+    // engine already hash-clusters by the PK, so the param would be redundant.
+    // Compare in order: hash clustering is order-sensitive, so a shard key with
+    // the same columns as the PK but a different column order is NOT redundant.
+    if let Some(pk) = &acceleration.primary_key {
+        let pk_cols: Vec<String> = pk.iter().map(ToString::to_string).collect();
+        if pk_cols == inferred.shard_key {
+            return false;
+        }
+    }
+    // Known-constant key: every column's inferred distinct count is below 2.
+    let known_constant = inferred.shard_key.iter().all(|column| {
+        inferred
+            .column_stats
+            .iter()
+            .find(|stats| &stats.column == column)
+            .and_then(|stats| stats.distinct_count)
+            .is_some_and(|distinct| distinct < 2)
+    });
+    if known_constant {
+        return false;
+    }
+
+    acceleration.params.insert(
+        "cayenne_shard_key_columns".to_string(),
+        inferred.shard_key.join(", "),
+    );
     true
 }
 
@@ -220,6 +323,7 @@ mod tests {
         InferredSortColumn {
             column: column.to_string(),
             desc,
+            nulls_first: None,
         }
     }
 
@@ -442,7 +546,11 @@ mod tests {
     }
 
     #[test]
-    fn does_not_apply_sort_for_changes_refresh_mode() {
+    fn does_not_apply_sort_for_changes_refresh_mode_on_refresh_time_engines() {
+        // DuckDB/Arrow apply the inferred sort as a *refresh-time* sort, which is
+        // a no-op for a change stream and risks perturbing its initial snapshot —
+        // so it stays disabled in changes mode. (Cayenne is the exception; see
+        // `applies_sort_for_changes_refresh_mode_on_cayenne`.)
         let mut acc = accel(Engine::DuckDB);
         acc.refresh_mode = Some(RefreshMode::Changes);
         let inferred = InferredSchema {
@@ -454,11 +562,199 @@ mod tests {
     }
 
     #[test]
+    fn applies_sort_for_changes_refresh_mode_on_cayenne() {
+        // Cayenne's `cayenne_sort_columns` sorts the background COMPACTION rewrite,
+        // not the change stream, so an inferred sort SHOULD be applied even in
+        // changes mode — this is what keeps per-file zone maps tight for
+        // listing-time pruning on heavy CDC tables.
+        let mut acc = accel(Engine::Cayenne);
+        acc.refresh_mode = Some(RefreshMode::Changes);
+        let inferred = InferredSchema {
+            sort_columns: vec![sort("created_at", true), sort("id", false)],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at", "id"]), "ds");
+        assert_eq!(
+            acc.params.get("cayenne_sort_columns").map(String::as_str),
+            Some("created_at, id")
+        );
+    }
+
+    #[test]
     fn empty_inferred_is_noop() {
         let mut acc = accel(Engine::DuckDB);
         apply_inferred_schema(&mut acc, &InferredSchema::default(), &schema(&["id"]), "ds");
         assert!(acc.primary_key.is_none());
         assert!(acc.indexes.is_empty());
         assert!(acc.params.is_empty());
+    }
+
+    #[test]
+    fn duckdb_sort_param_carries_nulls_placement() {
+        let mut acc = accel(Engine::DuckDB);
+        let inferred = InferredSchema {
+            sort_columns: vec![
+                InferredSortColumn {
+                    column: "created_at".to_string(),
+                    desc: true,
+                    nulls_first: Some(true),
+                },
+                InferredSortColumn {
+                    column: "id".to_string(),
+                    desc: false,
+                    nulls_first: Some(false),
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["created_at", "id"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("on_refresh_sort_columns")
+                .map(String::as_str),
+            Some("created_at DESC NULLS FIRST, id ASC NULLS LAST")
+        );
+    }
+
+    #[test]
+    fn applies_shard_key_for_cayenne_when_distinct_from_primary_key() {
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            shard_key: vec!["tenant_id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["id", "tenant_id"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("cayenne_shard_key_columns")
+                .map(String::as_str),
+            Some("tenant_id")
+        );
+    }
+
+    #[test]
+    fn skips_shard_key_equal_to_primary_key() {
+        // The engine already hash-clusters by the PK; an equal shard key is
+        // redundant config.
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            shard_key: vec!["id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["id"]), "ds");
+        assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
+    }
+
+    #[test]
+    fn applies_shard_key_that_reorders_primary_key_columns() {
+        // Hash clustering is order-sensitive, so a shard key with the same
+        // columns as the PK but a different column order is NOT redundant.
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            primary_key: vec!["a".to_string(), "b".to_string()],
+            shard_key: vec!["b".to_string(), "a".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["a", "b"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("cayenne_shard_key_columns")
+                .map(String::as_str),
+            Some("b, a")
+        );
+    }
+
+    #[test]
+    fn respects_user_shard_key_param() {
+        let mut acc = accel(Engine::Cayenne);
+        acc.params
+            .insert("shard_key_columns".to_string(), "custom".to_string());
+        let inferred = InferredSchema {
+            shard_key: vec!["tenant_id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["tenant_id"]), "ds");
+        assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
+    }
+
+    #[test]
+    fn skips_shard_key_on_non_cayenne_engines() {
+        let mut acc = accel(Engine::DuckDB);
+        let inferred = InferredSchema {
+            shard_key: vec!["tenant_id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["tenant_id"]), "ds");
+        assert!(acc.params.is_empty());
+    }
+
+    #[test]
+    fn skips_shard_key_with_missing_column() {
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            shard_key: vec!["tenant_id".to_string(), "absent".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["tenant_id"]), "ds");
+        assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
+    }
+
+    #[test]
+    fn skips_shard_key_known_to_be_constant() {
+        use data_components::inferred_schema::InferredColumnStats;
+
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            shard_key: vec!["region".to_string()],
+            column_stats: vec![InferredColumnStats {
+                column: "region".to_string(),
+                distinct_count: Some(1),
+                correlation: None,
+            }],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["region"]), "ds");
+        assert!(!acc.params.contains_key("cayenne_shard_key_columns"));
+
+        // With a real cardinality (or none known) the key applies.
+        let mut acc = accel(Engine::Cayenne);
+        let inferred = InferredSchema {
+            shard_key: vec!["region".to_string()],
+            column_stats: vec![InferredColumnStats {
+                column: "region".to_string(),
+                distinct_count: Some(12),
+                correlation: None,
+            }],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["region"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("cayenne_shard_key_columns")
+                .map(String::as_str),
+            Some("region")
+        );
+    }
+
+    #[test]
+    fn applies_shard_key_for_changes_refresh_mode() {
+        // CDC tables compact too — the shard key clusters their parallel merge
+        // outputs, so changes mode must not gate it.
+        let mut acc = accel(Engine::Cayenne);
+        acc.refresh_mode = Some(RefreshMode::Changes);
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            shard_key: vec!["tenant_id".to_string()],
+            ..InferredSchema::default()
+        };
+        apply_inferred_schema(&mut acc, &inferred, &schema(&["id", "tenant_id"]), "ds");
+        assert_eq!(
+            acc.params
+                .get("cayenne_shard_key_columns")
+                .map(String::as_str),
+            Some("tenant_id")
+        );
     }
 }

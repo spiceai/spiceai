@@ -43,7 +43,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
-    common::{Constraints, Statistics},
+    common::{Constraints, Statistics, utils::quote_identifier},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, context::SessionContext},
     logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
@@ -938,7 +938,14 @@ fn make_on_refresh_write_handler(
             let order_by_clause: String = config
                 .sort_columns
                 .iter()
-                .map(|sc| format!("\"{}\" {}", sc.column, sc.direction))
+                .map(|sc| {
+                    let nulls = match sc.nulls_first {
+                        Some(true) => " NULLS FIRST",
+                        Some(false) => " NULLS LAST",
+                        None => "",
+                    };
+                    format!("{} {}{nulls}", quote_identifier(&sc.column), sc.direction)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
 

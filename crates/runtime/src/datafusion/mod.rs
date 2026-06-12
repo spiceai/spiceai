@@ -1397,13 +1397,19 @@ impl DataFusion {
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
         // isolation; without this global cap a fleet of memory-mode tables would
         // sum their per-table caps and blow the box (the no-global-cap lesson,
-        // applied to memory). Sized to one eighth of total system/container
+        // applied to memory). Sized to one quarter of total system/container
         // memory, independent of DataFusion's query memory pool; an
         // over-budget append spills to durable Vortex (and, under sustained
         // overload, falls back to the durable path) rather than
         // growing the tier, so memory mode can never OOM. File-mode tables never
-        // touch this budget.
-        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 8;
+        // touch this budget. A quarter (was an eighth): under sustained
+        // high-rate CDC the budget gate fires while resident tiers are far
+        // below it (reservations are held until the flushed epoch's checkpoint
+        // releases them, so encode lag inflates the in-flight aggregate), and a
+        // budget-gated append stalls the apply path — pay RAM for freshness.
+        // The per-table caps and the spill/durable fallbacks stay the
+        // OOM backstops.
+        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 4;
         cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
         tracing::info!(
             mem_tier_budget_bytes,
@@ -2396,6 +2402,12 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        accelerated_table_builder.cdc_param_overrides(
+            crate::accelerated_table::refresh_task::changes::extract_cdc_param_overrides(
+                &acceleration_settings.params,
+            )
+            .map(Arc::new),
+        );
         if matches!(refresh_mode, RefreshMode::Caching) {
             // Hide the storage-only namespace column from query planning. Users
             // see the same columns they would have seen pre-isolation.

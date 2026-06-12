@@ -94,6 +94,39 @@ impl DigestMany {
             scalar_arguments: &[Some(&ScalarValue::Utf8(Some(String::new())))],
         })
     }
+
+    /// Append one column value to a row's pre-hash buffer using a length-prefixed,
+    /// NULL-distinct encoding so that the concatenation is injective: distinct tuples
+    /// always map to distinct strings, regardless of where the column boundaries fall.
+    ///
+    /// The previous implementation wrote each value's `ScalarValue` Display into one
+    /// buffer with no separator and no NULL marker. That made the per-row digest input
+    /// ambiguous: `('ab', 'c')` and `('a', 'bc')` produced the same string, integer
+    /// composite keys `(1, 23)` and `(12, 3)` collided, and a SQL NULL (Display `"NULL"`)
+    /// was indistinguishable from the literal string `'NULL'`. Because `digest_many`
+    /// backs the RRF fusion row identity (`crates/runtime/src/search/rrf.rs`), a single
+    /// such collision silently fuses two distinct documents into one — merging their
+    /// ranks and dropping/misattributing one of them.
+    ///
+    /// Encoding: a NULL value is written as a bare `N`; a non-NULL value `v` is written
+    /// as `<byte_len>:<v>`. A length prefix always begins with a digit, so it can never
+    /// be confused with the `N` NULL marker, and the explicit byte length makes the
+    /// boundary between adjacent values unambiguous even when a value contains digits,
+    /// colons, or the literal text `N`.
+    fn append_value(
+        buffer: &mut String,
+        scratch: &mut String,
+        scalar: &ScalarValue,
+    ) -> DataFusionResult<()> {
+        if scalar.is_null() {
+            buffer.push('N');
+            return Ok(());
+        }
+        scratch.clear();
+        write!(scratch, "{scalar}")?;
+        write!(buffer, "{}:{scratch}", scratch.len())?;
+        Ok(())
+    }
 }
 
 impl ScalarUDFImpl for DigestMany {
@@ -137,9 +170,10 @@ impl ScalarUDFImpl for DigestMany {
             .all(|arg| matches!(arg, ColumnarValue::Scalar(_)))
         {
             let mut hash_me = String::with_capacity(32 * args.len());
+            let mut scratch = String::new();
             for arg in args {
                 if let ColumnarValue::Scalar(scalar) = arg {
-                    write!(&mut hash_me, "{scalar}")?;
+                    Self::append_value(&mut hash_me, &mut scratch, &scalar)?;
                 }
             }
 
@@ -165,8 +199,9 @@ impl ScalarUDFImpl for DigestMany {
         let mut concatenated_builder =
             StringBuilder::with_capacity(num_rows, num_rows * estimated_row_size);
 
-        // Reusable buffer for row concatenation (avoids per-row allocation)
+        // Reusable buffers for row concatenation (avoids per-row allocation)
         let mut row_buffer = String::with_capacity(estimated_row_size);
+        let mut scratch = String::with_capacity(16);
 
         // Build concatenated strings for all rows
         // This batches the string building, then delegates to hash function for vectorized hashing
@@ -177,10 +212,10 @@ impl ScalarUDFImpl for DigestMany {
                 match arg {
                     ColumnarValue::Array(array) => {
                         let scalar = ScalarValue::try_from_array(array, row_idx)?;
-                        write!(&mut row_buffer, "{scalar}")?;
+                        Self::append_value(&mut row_buffer, &mut scratch, &scalar)?;
                     }
                     ColumnarValue::Scalar(scalar) => {
-                        write!(&mut row_buffer, "{scalar}")?;
+                        Self::append_value(&mut row_buffer, &mut scratch, scalar)?;
                     }
                 }
             }
@@ -219,12 +254,36 @@ pub fn digest_many(args: Vec<Expr>, digest: &str) -> Expr {
 mod tests {
     use crate::digest_many::{DigestMany, digest_many};
 
-    use arrow::array::record_batch;
+    use arrow::array::{Array, RecordBatch, StringArray, record_batch};
     use arrow::util::pretty::pretty_format_batches;
+    use arrow_schema::DataType;
     use datafusion::common::Result as DataFusionResult;
     use datafusion::logical_expr::{col, lit};
     use datafusion::prelude::{SessionContext, make_array, named_struct};
     use std::process::ExitCode;
+
+    /// Extract a digest column's values as `Option<String>`, casting from whatever
+    /// string type the hash function returned (md5 returns `Utf8View` in `DataFusion`
+    /// v51+) so the assertion does not depend on the concrete Arrow string variant.
+    fn digest_values(batch: &RecordBatch, column: &str) -> Vec<Option<String>> {
+        let array = batch
+            .column_by_name(column)
+            .expect("digest column is present");
+        let utf8 = arrow::compute::cast(array, &DataType::Utf8).expect("cast digest to Utf8");
+        let strings = utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("digest column casts to StringArray");
+        (0..strings.len())
+            .map(|i| {
+                if strings.is_null(i) {
+                    None
+                } else {
+                    Some(strings.value(i).to_string())
+                }
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_digest_many_record_batch() -> DataFusionResult<ExitCode> {
@@ -261,12 +320,12 @@ mod tests {
         +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
         | a | b   | c     | digest_many(a, b, c)             | digest_many(c)                   | digest_many(c, 'foo')            |
         +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
-        | 1 | 4.0 | alpha | 3409f2c75ffd509c8984bbb074f0e04d | 2c1743a391305fbf367df8e4f069f9f9 | 8784bced698bc929e46475089cb0f674 |
-        | 2 |     | beta  | 546bdc9d2972f2665650d628b4da0bb6 | 987bcab01b929eb2c07877b224215c92 | 16d4e759f170a3cd0928427fe29e41a1 |
-        | 3 | 5.0 | gamma | 82ff28e3c0dd00b848f98ea90fc99a39 | 05b048d7242cb7b8b57cfa3b1d65ecea | 09a0d53b795ebe42be507eb8e36bffc3 |
-        | 4 | 6.0 | alpha | d96dc6ee83c54921044e6f823fb54359 | 2c1743a391305fbf367df8e4f069f9f9 | 8784bced698bc929e46475089cb0f674 |
-        | 5 | 7.0 | beta  | 896b722fd78bf5fe3e33d5baa96cbd88 | 987bcab01b929eb2c07877b224215c92 | 16d4e759f170a3cd0928427fe29e41a1 |
-        | 6 | 8.0 | gamma | 5e53bce9cc7a3eaaca70d58d04947043 | 05b048d7242cb7b8b57cfa3b1d65ecea | 09a0d53b795ebe42be507eb8e36bffc3 |
+        | 1 | 4.0 | alpha | e10f0f3f9cab7d5a48eb5dca9752b239 | f6c1e637db50c80c30606accb7877791 | 1bc36584dfdf327f00541ebcee7b10b8 |
+        | 2 |     | beta  | 13e76fda74b91ce42b64e114ce57cea6 | cfcedac45362b91523dc768e6d975abe | e52b73630a4f01834dc30a85baf0ac29 |
+        | 3 | 5.0 | gamma | f1bec90248c17cdf4b3fb996bed20178 | 9ded07502923355cf0ad19b62b6b1289 | 640dedde6c6eeb86794482fdb2d35398 |
+        | 4 | 6.0 | alpha | 81bb81945f98638c2d65e4c64c6e6a23 | f6c1e637db50c80c30606accb7877791 | 1bc36584dfdf327f00541ebcee7b10b8 |
+        | 5 | 7.0 | beta  | 4d29b6913cd5b11a36206c4ace98abaf | cfcedac45362b91523dc768e6d975abe | e52b73630a4f01834dc30a85baf0ac29 |
+        | 6 | 8.0 | gamma | e1d301c0702a902057d53b55c211015a | 9ded07502923355cf0ad19b62b6b1289 | 640dedde6c6eeb86794482fdb2d35398 |
         +---+-----+-------+----------------------------------+----------------------------------+----------------------------------+
         "
         );
@@ -344,6 +403,93 @@ mod tests {
 
         // Running with same inputs should produce same outputs
         assert_eq!(df_a.to_string().await?, df_b.to_string().await?);
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Regression for #11272: two rows whose string values differ only in where the
+    /// column boundary falls — `('ab', 'c')` vs `('a', 'bc')` — must not collide.
+    /// Without a delimiter both rows concatenated to `"abc"` and hashed identically,
+    /// silently fusing two distinct documents in RRF.
+    #[tokio::test]
+    async fn test_digest_many_string_boundary_no_collision() -> DataFusionResult<ExitCode> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(DigestMany::default().into());
+        ctx.register_batch(
+            "tbl",
+            record_batch!(("a", Utf8, ["ab", "a"]), ("b", Utf8, ["c", "bc"]))
+                .expect("couldn't make record batch"),
+        )?;
+
+        let data = ctx
+            .sql("select digest_many(a, b, 'md5') as d from tbl")
+            .await?
+            .collect()
+            .await?;
+
+        let digests = digest_values(&data[0], "d");
+        assert_eq!(digests.len(), 2);
+        assert_ne!(
+            digests[0], digests[1],
+            "('ab','c') and ('a','bc') must hash differently"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Regression for #11272: integer composite keys `(1, 23)` and `(12, 3)` must not
+    /// collide on the column boundary.
+    #[tokio::test]
+    async fn test_digest_many_integer_boundary_no_collision() -> DataFusionResult<ExitCode> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(DigestMany::default().into());
+        ctx.register_batch(
+            "tbl",
+            record_batch!(("a", Int32, [1, 12]), ("b", Int32, [23, 3]))
+                .expect("couldn't make record batch"),
+        )?;
+
+        let data = ctx
+            .sql("select digest_many(a, b, 'md5') as d from tbl")
+            .await?
+            .collect()
+            .await?;
+
+        let digests = digest_values(&data[0], "d");
+        assert_eq!(digests.len(), 2);
+        assert_ne!(
+            digests[0], digests[1],
+            "(1,23) and (12,3) must hash differently"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Regression for #11272: a SQL NULL must not collide with the literal string
+    /// `'NULL'`. Both previously rendered as the text `NULL` and hashed identically.
+    #[tokio::test]
+    async fn test_digest_many_null_distinct_from_literal_null() -> DataFusionResult<ExitCode> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(DigestMany::default().into());
+        ctx.register_batch(
+            "tbl",
+            record_batch!(("a", Utf8, [None, Some("NULL")])).expect("couldn't make record batch"),
+        )?;
+
+        let data = ctx
+            .sql("select digest_many(a, 'md5') as d from tbl")
+            .await?
+            .collect()
+            .await?;
+
+        let digests = digest_values(&data[0], "d");
+        assert_eq!(digests.len(), 2);
+        // Both rows produce a non-NULL digest of distinct inputs.
+        assert!(digests[0].is_some() && digests[1].is_some());
+        assert_ne!(
+            digests[0], digests[1],
+            "SQL NULL and the literal string 'NULL' must hash differently"
+        );
 
         Ok(ExitCode::SUCCESS)
     }

@@ -166,15 +166,27 @@ fn committers_all_support_deferral(
             .all(|committer| committer.supports_deferral())
 }
 
+/// Op-granular durable-path decision for one coalesced burst:
+/// - `Truncate`/`Unknown` rows always force the durable path (whole burst).
+/// - `Delete` rows force it only when the sink cannot absorb key deletes in
+///   RAM (`sink_absorbs_in_memory_deletes`, the Cayenne
+///   `supports_in_memory_cdc_deletes` capability) or the row carries no
+///   primary key (nothing to tombstone — the keyless durable path deletes by
+///   full-row match).
+/// - `Upsert` rows never force it.
 #[cfg(not(windows))]
-fn change_batch_requires_durable_cdc_path(change_batch: &ChangeBatch) -> bool {
+fn change_batch_requires_durable_cdc_path(
+    change_batch: &ChangeBatch,
+    sink_absorbs_in_memory_deletes: bool,
+) -> bool {
     (0..change_batch.record.num_rows()).any(|row| {
-        matches!(
-            ChangeOperationType::from_operation(&change_batch.op(row)),
-            ChangeOperationType::Delete
-                | ChangeOperationType::Truncate
-                | ChangeOperationType::Unknown
-        )
+        match ChangeOperationType::from_operation(&change_batch.op(row)) {
+            ChangeOperationType::Truncate | ChangeOperationType::Unknown => true,
+            ChangeOperationType::Delete => {
+                !sink_absorbs_in_memory_deletes || change_batch.primary_keys(row).is_empty()
+            }
+            ChangeOperationType::Upsert => false,
+        }
     })
 }
 
@@ -610,6 +622,106 @@ pub fn cdc_config_from_params(params: &std::collections::HashMap<String, String>
     }
 }
 
+/// Extract the subset of [`CDC_RUNTIME_PARAMS`] keys present in `params`
+#[must_use]
+pub(crate) fn extract_cdc_param_overrides(
+    params: &std::collections::HashMap<String, String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    let extracted: std::collections::HashMap<String, String> = CDC_RUNTIME_PARAMS
+        .iter()
+        .filter_map(|&key| params.get(key).map(|v| (key.to_string(), v.clone())))
+        .collect();
+    if extracted.is_empty() {
+        None
+    } else {
+        Some(extracted)
+    }
+}
+
+/// Overlay per-dataset `cdc_*` params on top of an already-resolved global [`CdcConfig`].
+#[must_use]
+pub(crate) fn cdc_config_overlay(
+    base: CdcConfig,
+    dataset_params: &std::collections::HashMap<String, String>,
+) -> CdcConfig {
+    CdcConfig {
+        prefetch_buffer: overlay_usize(
+            dataset_params,
+            "cdc_prefetch_buffer",
+            base.prefetch_buffer,
+            CDC_PREFETCH_BUFFER_MAX,
+        ),
+        max_coalesced_envelopes: overlay_usize(
+            dataset_params,
+            "cdc_max_coalesced_envelopes",
+            base.max_coalesced_envelopes,
+            CDC_MAX_COALESCED_ENVELOPES_MAX,
+        ),
+        max_coalesced_bytes: overlay_usize(
+            dataset_params,
+            "cdc_max_coalesced_bytes",
+            base.max_coalesced_bytes,
+            CDC_MAX_COALESCED_BYTES_MAX,
+        ),
+        max_coalesce_age_ms: overlay_u64(
+            dataset_params,
+            "cdc_max_coalesce_age_ms",
+            base.max_coalesce_age_ms,
+        ),
+        commit_timeout: Duration::from_millis(overlay_usize(
+            dataset_params,
+            "cdc_commit_timeout_ms",
+            usize::try_from(base.commit_timeout.as_millis()).unwrap_or(CDC_COMMIT_TIMEOUT_MS_MAX),
+            CDC_COMMIT_TIMEOUT_MS_MAX,
+        ) as u64),
+    }
+}
+
+fn overlay_usize(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    base: usize,
+    max: usize,
+) -> usize {
+    let Some(raw) = params.get(key) else {
+        return base;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (1..=max).contains(&n) => n,
+        Ok(n) => {
+            tracing::warn!(
+                "dataset acceleration.params.{key}={n} is out of range [1, {max}]; keeping global value {base}"
+            );
+            base
+        }
+        Err(e) => {
+            tracing::warn!(
+                "dataset acceleration.params.{key}={raw:?} is not a valid usize ({e}); keeping global value {base}"
+            );
+            base
+        }
+    }
+}
+
+fn overlay_u64(
+    params: &std::collections::HashMap<String, String>,
+    key: &'static str,
+    base: u64,
+) -> u64 {
+    let Some(raw) = params.get(key) else {
+        return base;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                "dataset acceleration.params.{key}={raw:?} is not a valid u64 ({e}); keeping global value {base}"
+            );
+            base
+        }
+    }
+}
+
 /// Parse a positive `usize` from `var`, falling back to `default` on missing,
 /// unparseable, or out-of-range (`<1` or `> max`) values. Logs a warning
 /// when an explicit value is rejected so misconfiguration is visible.
@@ -656,8 +768,14 @@ impl RefreshTask {
         ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
+        // Effective CDC config = global (already env+default folded) with any
+        // per-dataset `cdc_*` overrides layered on top.
+        let mut effective = cdc_config();
+        if let Some(overrides) = self.cdc_param_overrides.as_ref() {
+            effective = cdc_config_overlay(effective, overrides);
+        }
         self.start_changes_stream_with_config(
-            cdc_config(),
+            effective,
             refresh,
             changes_stream,
             caching,
@@ -1279,9 +1397,22 @@ impl RefreshTask {
 
         #[cfg(not(windows))]
         let can_defer_current_burst = committers_all_support_deferral(&committers);
+        // Capability probe: a key-mode memory-tier Cayenne sink absorbs Delete
+        // events as RAM tombstones (deferring their durability to the covering
+        // checkpoint exactly like upserts), so delete-bearing bursts stay on
+        // the mem path instead of flipping the table durable per burst. Every
+        // other sink reports `false` (here: no Cayenne provider resolves) and
+        // keeps the old behavior.
         #[cfg(not(windows))]
-        let requires_durable_cdc_path =
-            !can_defer_current_burst || change_batch_requires_durable_cdc_path(&coalesced_batch);
+        let sink_absorbs_in_memory_deletes = self
+            .cayenne_accelerator()
+            .is_some_and(CayenneTableProvider::supports_in_memory_cdc_deletes);
+        #[cfg(not(windows))]
+        let requires_durable_cdc_path = !can_defer_current_burst
+            || change_batch_requires_durable_cdc_path(
+                &coalesced_batch,
+                sink_absorbs_in_memory_deletes,
+            );
 
         #[cfg(not(windows))]
         if let Some(queue) = context.deferred_commits
@@ -1527,8 +1658,16 @@ impl RefreshTask {
             match op_type {
                 ChangeOperationType::Delete => {
                     let op_start = Instant::now();
-                    self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
+                    let absorbed_epoch = self
+                        .process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    // An absorbed delete is RAM-only until the covering
+                    // checkpoint, so its epoch must defer this burst's source
+                    // commit exactly like an in-memory upsert sub-batch.
+                    if let Some(epoch) = absorbed_epoch {
+                        max_in_memory_epoch =
+                            Some(max_in_memory_epoch.map_or(epoch, |cur| cur.max(epoch)));
+                    }
                     tracing::trace!(
                         dataset = %dataset_name,
                         op = "delete",
@@ -1819,14 +1958,54 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// Apply one Delete sub-batch. Returns the Cayenne in-memory CDC tier
+    /// epoch when the deletes were ABSORBED as RAM tombstones
+    /// (`cdc_durability: memory`, key-mode) — the caller must defer the
+    /// burst's source commit on that epoch exactly like an in-memory upsert —
+    /// or `None` when the deletes were applied durably (the historical path).
     async fn process_delete_batch(
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<Option<u64>> {
         let dataset_name = &self.dataset_name;
+
+        // In-memory absorption: when the burst-level gate kept this burst on
+        // the mem path, the slot advancer is armed and a capable Cayenne sink
+        // turns the delete rows into mem-tier tombstones, deferring their
+        // durability to the covering checkpoint. `Ok(None)` from the absorb
+        // call (capability lost, inextractable keys, budget refusal after
+        // spill) falls through to the durable path below — safe in either ack
+        // mode, since durable deletes never sit ahead of the source slot.
+        #[cfg(not(windows))]
+        if let Some(cayenne) = self.cayenne_accelerator()
+            && cayenne.supports_in_memory_cdc_deletes()
+            && cayenne.has_slot_advancer()
+            && !row_indices.is_empty()
+            && row_indices
+                .iter()
+                .all(|&row| !change_batch.primary_keys(row).is_empty())
+        {
+            let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
+            let absorbed = cayenne
+                .write_cdc_delete_keys_in_memory(&selected_batch)
+                .await
+                .map_err(DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            if let Some(epoch) = absorbed {
+                tracing::trace!(
+                    dataset = %dataset_name,
+                    rows = row_indices.len(),
+                    epoch,
+                    "Delete sub-batch absorbed into the in-memory CDC tier"
+                );
+                self.update_last_updated_at();
+                return Ok(Some(epoch));
+            }
+        }
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
@@ -1875,7 +2054,7 @@ impl RefreshTask {
             self.update_last_updated_at();
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -2767,6 +2946,111 @@ mod tests {
             config.max_coalesced_envelopes, 4_096,
             "out-of-range fallback must not resurrect the old 4096 cap"
         );
+    }
+
+    #[test]
+    fn cdc_config_overlay_dataset_beats_global_for_known_keys() {
+        let base = CdcConfig {
+            prefetch_buffer: 4096,
+            max_coalesced_envelopes: 8000,
+            max_coalesced_bytes: 64 * 1024 * 1024,
+            max_coalesce_age_ms: 250,
+            commit_timeout: Duration::from_secs(30),
+        };
+        let overlaid = cdc_config_overlay(
+            base,
+            &std::collections::HashMap::from([
+                ("cdc_max_coalesce_age_ms".to_string(), "4000".to_string()),
+                ("cdc_prefetch_buffer".to_string(), "1024".to_string()),
+            ]),
+        );
+
+        // overridden
+        assert_eq!(overlaid.max_coalesce_age_ms, 4000);
+        assert_eq!(overlaid.prefetch_buffer, 1024);
+        // untouched
+        assert_eq!(
+            overlaid.max_coalesced_envelopes,
+            base.max_coalesced_envelopes
+        );
+        assert_eq!(overlaid.max_coalesced_bytes, base.max_coalesced_bytes);
+        assert_eq!(overlaid.commit_timeout, base.commit_timeout);
+    }
+
+    #[test]
+    fn cdc_config_overlay_empty_params_returns_base() {
+        let base = CdcConfig::default();
+        let overlaid = cdc_config_overlay(base, &std::collections::HashMap::new());
+        assert_eq!(overlaid, base);
+    }
+
+    #[test]
+    fn cdc_config_overlay_keeps_base_on_unparseable_value() {
+        let base = CdcConfig {
+            prefetch_buffer: 4096,
+            ..CdcConfig::default()
+        };
+        let overlaid = cdc_config_overlay(
+            base,
+            &std::collections::HashMap::from([(
+                "cdc_prefetch_buffer".to_string(),
+                "not-a-number".to_string(),
+            )]),
+        );
+        assert_eq!(
+            overlaid.prefetch_buffer, base.prefetch_buffer,
+            "unparseable dataset value must fall back to the global value, not the built-in default"
+        );
+    }
+
+    #[test]
+    fn cdc_config_overlay_keeps_base_on_out_of_range_value() {
+        let base = CdcConfig {
+            max_coalesced_envelopes: 8000,
+            ..CdcConfig::default()
+        };
+        let over = CDC_MAX_COALESCED_ENVELOPES_MAX + 1;
+        let overlaid = cdc_config_overlay(
+            base,
+            &std::collections::HashMap::from([(
+                "cdc_max_coalesced_envelopes".to_string(),
+                over.to_string(),
+            )]),
+        );
+        assert_eq!(
+            overlaid.max_coalesced_envelopes, base.max_coalesced_envelopes,
+            "out-of-range dataset value must fall back to the global value, not be clamped"
+        );
+    }
+
+    #[test]
+    fn extract_cdc_param_overrides_filters_to_known_keys_only() {
+        let extracted = extract_cdc_param_overrides(&std::collections::HashMap::from([
+            ("cdc_max_coalesce_age_ms".to_string(), "4000".to_string()),
+            ("unrelated_param".to_string(), "value".to_string()),
+            ("cdc_prefetch_buffer".to_string(), "1024".to_string()),
+        ]))
+        .expect("non-empty cdc_* keys must return Some");
+
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(
+            extracted.get("cdc_max_coalesce_age_ms"),
+            Some(&"4000".to_string())
+        );
+        assert_eq!(
+            extracted.get("cdc_prefetch_buffer"),
+            Some(&"1024".to_string())
+        );
+        assert!(!extracted.contains_key("unrelated_param"));
+    }
+
+    #[test]
+    fn extract_cdc_param_overrides_returns_none_when_no_cdc_keys_present() {
+        let extracted = extract_cdc_param_overrides(&std::collections::HashMap::from([(
+            "unrelated_param".to_string(),
+            "value".to_string(),
+        )]));
+        assert!(extracted.is_none(), "no recognized keys must return None");
     }
 
     #[test]
@@ -3766,18 +4050,65 @@ mod tests {
             vec![Some("create"), Some("update"), Some("read")],
         );
         assert!(
-            !change_batch_requires_durable_cdc_path(&upsert),
+            !change_batch_requires_durable_cdc_path(&upsert, false),
             "upsert-only bursts may use memory CDC durability"
         );
 
+        // Sink cannot absorb deletes in RAM (capability=false): every
+        // non-upsert op forces the durable path — the historical behavior.
         for op in ["d", "t", "x"] {
             let batch =
                 create_test_change_batch(vec![op], &[vec!["id"]], vec![1], vec![Some("row")]);
             assert!(
-                change_batch_requires_durable_cdc_path(&batch),
-                "operation {op} must force the durable CDC path"
+                change_batch_requires_durable_cdc_path(&batch, false),
+                "operation {op} must force the durable CDC path when the sink cannot absorb deletes"
             );
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_memory_cdc_delete_burst_stays_on_mem_path_when_sink_absorbs() {
+        // A keyed delete-bearing burst stays on the mem path when the sink
+        // absorbs deletes in RAM (capability=true) — including mixed
+        // upsert+delete bursts, the high-load coalesced shape.
+        let delete_only =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("row")]);
+        assert!(
+            !change_batch_requires_durable_cdc_path(&delete_only, true),
+            "a keyed delete burst must stay on the mem path when the sink absorbs deletes"
+        );
+
+        let mixed = create_test_change_batch(
+            vec!["c", "d", "u"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("create"), Some("delete"), Some("update")],
+        );
+        assert!(
+            !change_batch_requires_durable_cdc_path(&mixed, true),
+            "a mixed upsert+delete burst must stay on the mem path when the sink absorbs deletes"
+        );
+
+        // Truncate and Unknown are never absorbable — durable regardless of
+        // the delete capability.
+        for op in ["t", "x"] {
+            let batch =
+                create_test_change_batch(vec![op], &[vec!["id"]], vec![1], vec![Some("row")]);
+            assert!(
+                change_batch_requires_durable_cdc_path(&batch, true),
+                "operation {op} must force the durable CDC path even when deletes are absorbable"
+            );
+        }
+
+        // A keyless delete row has nothing to tombstone — durable even with
+        // the capability on.
+        let keyless_delete =
+            create_test_change_batch(vec!["d"], &[vec![]], vec![1], vec![Some("row")]);
+        assert!(
+            change_batch_requires_durable_cdc_path(&keyless_delete, true),
+            "a keyless delete row must force the durable CDC path"
+        );
     }
 
     #[cfg(not(windows))]

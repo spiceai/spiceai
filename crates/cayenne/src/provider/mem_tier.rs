@@ -114,6 +114,11 @@ impl InMemTombstones {
     /// Each `insert` is O(log n) on the persistent map and only structurally
     /// re-writes the path to the touched leaf, so this is O(incoming · log tier),
     /// NOT O(tier): the untouched nodes stay shared with `self`'s prior root.
+    ///
+    /// The live fold path uses [`Self::merge_segment`] (a segment's key set at one
+    /// uniform sequence); this per-key-map variant is retained as the reference
+    /// the equivalence test checks `merge_segment` against.
+    #[cfg(test)]
     fn merge_from(&mut self, other: &InMemTombstones) {
         for (&pk, &seq) in &other.int64_pk {
             let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
@@ -125,8 +130,138 @@ impl InMemTombstones {
         }
     }
 
+    /// Fold one segment's tombstones into `self`, keeping the per-key max delete
+    /// sequence. Every key in `seg` was deleted at the SAME `seg.delete_sequence`
+    /// (a segment is one CDC apply, which reserved one delete sequence), so this
+    /// applies that single scalar to all of `seg`'s keys instead of carrying a
+    /// redundant per-key value map — the equivalence to a per-key map folded by
+    /// [`Self::merge_from`] is exact. O(seg-keys · log self), structurally
+    /// sharing `self`'s untouched nodes (the same persistent-map cost
+    /// `merge_from` has).
+    pub(crate) fn merge_segment(&mut self, seg: &SegmentTombstones) {
+        let seq = seg.delete_sequence;
+        for &pk in seg.int64_pk.keys() {
+            let next = self.int64_pk.get(&pk).map_or(seq, |&cur| cur.max(seq));
+            self.int64_pk.insert(pk, next);
+        }
+        for key in seg.row_keys.keys() {
+            let next = self.row_keys.get(key).map_or(seq, |&cur| cur.max(seq));
+            self.row_keys.insert(key.clone(), next);
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.int64_pk.is_empty() && self.row_keys.is_empty()
+    }
+}
+
+/// ONE CDC apply's tombstones, split into the part that is derivable from the
+/// incoming batch alone (the deduplicated deleted-key SETS) and the part that is
+/// reserved under the publish lock (the single `delete_sequence`).
+///
+/// Every superseded key in one apply is hidden at the SAME reserved
+/// `delete_sequence` (the apply reserves exactly one delete sequence, strictly
+/// below its data sequence so the fresh rows survive their own tombstones), so a
+/// segment's tombstones are a *uniform* `delete_sequence` over a key set — there
+/// is no per-key sequence variation within a segment. Storing the key sets
+/// separately from the scalar is what lets the expensive O(batch) HAMT BUILD of
+/// the key sets run OFF the `mem_tier_publish_lock`
+/// ([`crate::provider::CayenneTableProvider::prepare_segment_tombstones`]), with
+/// only the cheap [`Self::stamp`] of the reserved sequence happening under the
+/// lock. The keys carry `()` values (a set, not a map) so the placeholder/late
+/// sequence can never be misread as a real delete sequence; the authoritative
+/// sequence is always the explicit `delete_sequence` field.
+///
+/// The tier-level aggregate stays an [`InMemTombstones`] (a real per-key
+/// max-sequence map, folded via [`InMemTombstones::merge_segment`]), so every
+/// scan-side consumer is byte-for-byte unchanged — only the per-segment delta
+/// representation differs.
+#[derive(Debug, Clone)]
+pub(crate) struct SegmentTombstones {
+    /// `Int64Pk` strategy: the set of deleted PK values (built off-lock).
+    int64_pk: PersistentHashMap<i64, (), XxHash3BuildHasher>,
+    /// `RowConverterBased` strategy: the set of deleted row-key bytes (off-lock).
+    row_keys: PersistentHashMap<Box<[u8]>, (), XxHash3BuildHasher>,
+    /// The single reserved delete sequence applied to EVERY key above. Set to a
+    /// placeholder by the off-lock builder and overwritten by [`Self::stamp`]
+    /// under the publish lock once the real sequence is reserved.
+    delete_sequence: i64,
+}
+
+impl Default for SegmentTombstones {
+    fn default() -> Self {
+        Self {
+            int64_pk: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+            row_keys: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+            // No keys yet, so the sequence is irrelevant until `stamp`.
+            delete_sequence: 0,
+        }
+    }
+}
+
+impl SegmentTombstones {
+    /// Build the deleted-key SETS from one apply's `Int64Pk` keys (off-lock). The
+    /// `delete_sequence` stays at the placeholder until [`Self::stamp`]; the set
+    /// values are `()`, so the placeholder is structurally unobservable.
+    pub(crate) fn from_int64_keys(keys: impl IntoIterator<Item = i64>) -> Self {
+        let mut int64_pk = PersistentHashMap::with_hasher(XxHash3BuildHasher);
+        for pk in keys {
+            int64_pk.insert(pk, ());
+        }
+        Self {
+            int64_pk,
+            row_keys: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+            delete_sequence: 0,
+        }
+    }
+
+    /// Build the deleted-key SETS from one apply's row keys (off-lock). Takes
+    /// owned `Box<[u8]>` keys so the byte allocation happens off the publish lock.
+    pub(crate) fn from_row_keys(keys: impl IntoIterator<Item = Box<[u8]>>) -> Self {
+        let mut row_keys = PersistentHashMap::with_hasher(XxHash3BuildHasher);
+        for key in keys {
+            row_keys.insert(key, ());
+        }
+        Self {
+            int64_pk: PersistentHashMap::with_hasher(XxHash3BuildHasher),
+            row_keys,
+            delete_sequence: 0,
+        }
+    }
+
+    /// Late-bind the reserved `delete_sequence` under the publish lock. O(1): the
+    /// key sets were already built off-lock; this only records the scalar that
+    /// [`InMemTombstones::merge_segment`] applies to every key.
+    pub(crate) fn stamp(&mut self, delete_sequence: i64) {
+        self.delete_sequence = delete_sequence;
+    }
+
+    /// The reserved delete sequence stamped on this segment (the uniform sequence
+    /// applied to every key).
+    pub(crate) fn delete_sequence(&self) -> i64 {
+        self.delete_sequence
+    }
+
+    /// The deleted `Int64Pk` keys (empty for the row-key strategy). Each yields
+    /// once; the effective delete sequence is the uniform [`Self::delete_sequence`].
+    pub(crate) fn int64_keys(&self) -> impl Iterator<Item = i64> + '_ {
+        self.int64_pk.keys().copied()
+    }
+
+    /// The deleted row keys (empty for the `Int64Pk` strategy). Each yields once;
+    /// the effective delete sequence is the uniform [`Self::delete_sequence`].
+    pub(crate) fn row_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.row_keys.keys().map(Box::as_ref)
+    }
+
+    /// Whether this segment carries no `Int64Pk` tombstone keys.
+    pub(crate) fn is_int64_empty(&self) -> bool {
+        self.int64_pk.is_empty()
+    }
+
+    /// Whether this segment carries no row-key tombstone keys.
+    pub(crate) fn is_row_keys_empty(&self) -> bool {
+        self.row_keys.is_empty()
     }
 }
 
@@ -145,8 +280,12 @@ pub(crate) struct MemSegment {
     /// that produced it), kept per-segment — not just folded into the tier-level
     /// aggregate — so a partial checkpoint ([`MemTier::retain_after`]) can rebuild
     /// the survivors' aggregate tombstones without re-flushing the durable prefix.
-    /// Cheap to carry: [`InMemTombstones`] is an `im::HashMap` (O(1) structural clone).
-    pub(crate) tombstones: InMemTombstones,
+    /// Carried as a [`SegmentTombstones`] (deleted-key SET + the apply's single
+    /// reserved `delete_sequence`) rather than a per-key map: a segment is one
+    /// CDC apply whose keys all share one delete sequence, and keeping the key
+    /// set separate from the scalar lets the key SET be built off the publish
+    /// lock. Cheap to carry: the sets are `im::HashMap` (O(1) structural clone).
+    pub(crate) tombstones: SegmentTombstones,
     /// This segment's measured byte cost (`get_array_memory_size`), for budget
     /// release accounting on a partial clear.
     pub(crate) bytes: u64,
@@ -223,13 +362,15 @@ impl MemTier {
     /// the persistent tombstone maps' HAMT roots (O(1) `Arc` bumps) — never the
     /// batch data and never the accumulated tombstone corpus.
     /// `incoming_bytes`/`incoming_rows`/`superseded` are the caller's measured
-    /// deltas for this batch.
+    /// deltas for this batch. `tombstones` is this apply's [`SegmentTombstones`]
+    /// (key set built off the publish lock, sequence already stamped); it is moved
+    /// into the new segment after its keys are folded into the tier aggregate.
     #[must_use]
     pub(crate) fn append_segment(
         &self,
         batches: Arc<Vec<RecordBatch>>,
         data_sequence: i64,
-        tombstones: &InMemTombstones,
+        tombstones: SegmentTombstones,
         incoming_bytes: u64,
         incoming_rows: u64,
         superseded: u64,
@@ -245,23 +386,26 @@ impl MemTier {
                 )
             },
         );
+
+        // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
+        // accumulated corpus. `merge_segment` then applies only the incoming
+        // segment's keys (at its single stamped sequence) against the
+        // structurally-shared base. Fold BEFORE moving `tombstones` into the
+        // segment below.
+        let mut merged_tombstones = self.tombstones.clone();
+        merged_tombstones.merge_segment(&tombstones);
+
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
         segments.extend(self.segments.iter().cloned());
         segments.push(MemSegment {
             batches,
             data_sequence,
             statistics,
-            tombstones: tombstones.clone(),
+            tombstones,
             bytes: incoming_bytes,
             rows: incoming_rows,
             superseded,
         });
-
-        // O(1): clones the persistent maps' HAMT roots (Arc bumps), NOT the
-        // accumulated corpus. `merge_from` then applies only the incoming deltas
-        // against the structurally-shared base.
-        let mut merged_tombstones = self.tombstones.clone();
-        merged_tombstones.merge_from(tombstones);
 
         Self {
             segments: Arc::new(segments),
@@ -303,17 +447,19 @@ impl MemTier {
             return empty;
         }
         let survivors: Vec<MemSegment> = self.segments[flushed_segment_count..].to_vec();
-        // Seed the aggregates from the FIRST survivor (an O(1) HAMT-root clone)
-        // and fold only the rest — this runs under the phase-2 listing fence and
-        // the common interleaved-append case has exactly one survivor, which now
-        // costs scalar adds instead of re-inserting its whole tombstone delta.
-        let first = &survivors[0];
-        let mut tombstones = first.tombstones.clone();
-        let mut bytes = first.bytes;
-        let mut rows = first.rows;
-        let mut superseded = first.superseded;
-        for segment in &survivors[1..] {
-            tombstones.merge_from(&segment.tombstones);
+        // Rebuild the survivor aggregate by folding each survivor's per-segment
+        // tombstones (key set + its own stamped delete sequence) onto an empty
+        // aggregate map — this runs at checkpoint time under the phase-2 listing
+        // fence (NOT per-append), and the common interleaved-append case has
+        // exactly one survivor, so it is one `merge_segment` of a small key set.
+        // Each survivor folds at its OWN `delete_sequence` (segments do not share
+        // a sequence), preserving per-key max-sequence semantics exactly.
+        let mut tombstones = InMemTombstones::default();
+        let mut bytes = 0u64;
+        let mut rows = 0u64;
+        let mut superseded = 0u64;
+        for segment in &survivors {
+            tombstones.merge_segment(&segment.tombstones);
             bytes = bytes.saturating_add(segment.bytes);
             rows = rows.saturating_add(segment.rows);
             superseded = superseded.saturating_add(segment.superseded);
@@ -382,7 +528,7 @@ mod tests {
         let next = tier.append_segment(
             Arc::clone(&batches),
             1,
-            &InMemTombstones::default(),
+            SegmentTombstones::default(),
             64,
             3,
             0,
@@ -405,12 +551,11 @@ mod tests {
     /// corpus (which was the actually-expensive clone, unlike the batch `Arc`).
     #[test]
     fn append_shares_tombstone_map_no_deep_copy() {
-        // Seed a tier carrying a non-trivial Int64 tombstone corpus.
-        let mut seed = InMemTombstones::default();
-        for pk in 0..1_000_i64 {
-            seed.int64_pk.insert(pk, 1);
-        }
-        let base = MemTier::empty().append_segment(Arc::new(vec![batch(&[1])]), 2, &seed, 16, 1, 0);
+        // Seed a tier carrying a non-trivial Int64 tombstone corpus (one segment,
+        // 1000 keys, all at the segment's single delete sequence 1).
+        let mut seed = SegmentTombstones::from_int64_keys(0..1_000_i64);
+        seed.stamp(1);
+        let base = MemTier::empty().append_segment(Arc::new(vec![batch(&[1])]), 2, seed, 16, 1, 0);
 
         // A fresh clone of the base's tombstone map shares its root (O(1) clone,
         // no deep copy) — this is the property `append_segment` relies on.
@@ -422,9 +567,9 @@ mod tests {
 
         // Append one new tombstone key. The NEW tier reflects it; the prior tier
         // is untouched and still shares its original root with the earlier clone.
-        let mut one = InMemTombstones::default();
-        one.int64_pk.insert(10_000, 3);
-        let next = base.append_segment(Arc::new(vec![batch(&[2])]), 4, &one, 16, 1, 0);
+        let mut one = SegmentTombstones::from_int64_keys([10_000]);
+        one.stamp(3);
+        let next = base.append_segment(Arc::new(vec![batch(&[2])]), 4, one, 16, 1, 0);
 
         assert_eq!(
             next.tombstones.int64_pk.get(&10_000),
@@ -468,10 +613,10 @@ mod tests {
             let prior_len = tier.tombstones.int64_pk.len();
             let sentinel = key - 1; // present once i > 0
 
-            let mut incoming = InMemTombstones::default();
-            incoming.int64_pk.insert(key, 1);
+            let mut incoming = SegmentTombstones::from_int64_keys([key]);
+            incoming.stamp(1);
             let next =
-                tier.append_segment(Arc::new(vec![batch(&[key])]), key + 1, &incoming, 16, 1, 0);
+                tier.append_segment(Arc::new(vec![batch(&[key])]), key + 1, incoming, 16, 1, 0);
 
             // The new tier carries exactly one more key than the prior tier — the
             // base was structurally shared and extended, not rebuilt from scratch.
@@ -517,14 +662,88 @@ mod tests {
         assert_eq!(a.int64_deleted_key_range(), Some((10, 30)));
     }
 
+    /// `merge_segment` (key SET folded at one uniform sequence — the off-lock
+    /// representation) is byte-for-byte equivalent to folding the same keys as a
+    /// per-key map via `merge_from`. This is the invariant the publish-lock split
+    /// rests on: building the key set off-lock and stamping the reserved sequence
+    /// must produce the SAME aggregate as the old `build_mem_tombstones` +
+    /// `merge_from`. Folds two segments at DIFFERENT sequences and asserts the
+    /// per-key max matches the equivalent per-key-map fold.
+    #[test]
+    fn merge_segment_equivalent_to_per_key_map_fold() {
+        // Two CDC applies: seg1 deletes {1,2,3} at seq 5, seg2 deletes {3,4} at
+        // seq 9 (key 3 re-deleted at a higher seq). Row-key side mirrors it.
+        let mut seg1 = SegmentTombstones::from_int64_keys([1, 2, 3]);
+        seg1.stamp(5);
+        let mut seg2 = SegmentTombstones::from_int64_keys([3, 4]);
+        seg2.stamp(9);
+        let key = |b: u8| -> Box<[u8]> { Box::from([b]) };
+        let mut seg1k = SegmentTombstones::from_row_keys([key(1), key(2), key(3)]);
+        seg1k.stamp(5);
+        let mut seg2k = SegmentTombstones::from_row_keys([key(3), key(4)]);
+        seg2k.stamp(9);
+
+        // Fold via the segment representation (the new path).
+        let mut via_segment = InMemTombstones::default();
+        via_segment.merge_segment(&seg1);
+        via_segment.merge_segment(&seg2);
+        via_segment.merge_segment(&seg1k);
+        via_segment.merge_segment(&seg2k);
+
+        // Fold the identical keys/sequences via the per-key map path (the old
+        // build_mem_tombstones + merge_from equivalent).
+        let mut via_map = InMemTombstones::default();
+        let mut m1 = InMemTombstones::default();
+        for pk in [1, 2, 3] {
+            m1.int64_pk.insert(pk, 5);
+        }
+        for b in [1u8, 2, 3] {
+            m1.row_keys.insert(key(b), 5);
+        }
+        let mut m2 = InMemTombstones::default();
+        for pk in [3, 4] {
+            m2.int64_pk.insert(pk, 9);
+        }
+        for b in [3u8, 4] {
+            m2.row_keys.insert(key(b), 9);
+        }
+        via_map.merge_from(&m1);
+        via_map.merge_from(&m2);
+
+        // Identical aggregate: same keys, same per-key MAX sequence.
+        assert_eq!(via_segment.int64_pk.get(&1), Some(&5));
+        assert_eq!(
+            via_segment.int64_pk.get(&3),
+            Some(&9),
+            "key 3 takes the max seq 9"
+        );
+        assert_eq!(via_segment.int64_pk.get(&4), Some(&9));
+        assert_eq!(via_segment.int64_pk.len(), via_map.int64_pk.len());
+        assert_eq!(via_segment.row_keys.len(), via_map.row_keys.len());
+        for (k, v) in &via_map.int64_pk {
+            assert_eq!(
+                via_segment.int64_pk.get(k),
+                Some(v),
+                "int64 key {k} matches map fold"
+            );
+        }
+        for (k, v) in &via_map.row_keys {
+            assert_eq!(
+                via_segment.row_keys.get(k),
+                Some(v),
+                "row key {k:?} matches map fold"
+            );
+        }
+    }
+
     /// The superseded count is carried, not derived from the tombstone maps.
     #[test]
     fn superseded_is_carried_not_recomputed() {
         let tier = MemTier::empty();
-        let mut tomb = InMemTombstones::default();
         // Two encodings of the SAME deletion would double-count if summed.
-        tomb.int64_pk.insert(1, 1);
-        let next = tier.append_segment(Arc::new(vec![batch(&[2])]), 2, &tomb, 16, 1, 1);
+        let mut tomb = SegmentTombstones::from_int64_keys([1]);
+        tomb.stamp(1);
+        let next = tier.append_segment(Arc::new(vec![batch(&[2])]), 2, tomb, 16, 1, 1);
         // Authoritative superseded is exactly the passed value (1), not 2.
         assert_eq!(next.superseded, 1);
     }

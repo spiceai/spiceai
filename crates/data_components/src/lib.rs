@@ -94,6 +94,20 @@ pub const INFERRED_ROW_COUNT_METADATA_KEY: &str = "spice.inferred_row_count";
 /// The value is a base-10 integer string of bytes (e.g. Postgres `pg_relation_size`).
 pub const INFERRED_TABLE_BYTES_METADATA_KEY: &str = "spice.inferred_table_bytes";
 
+/// Schema-level metadata key for the source's declared distribution/shard key
+/// (extended schema inference): Postgres partition-key columns or the `MongoDB`
+/// shard-key fields.
+///
+/// The value is a JSON array of column names in key order: `["region", "id"]`.
+pub const INFERRED_SHARD_KEY_METADATA_KEY: &str = "spice.inferred_shard_key";
+
+/// Schema-level metadata key for rough per-column statistics (extended schema
+/// inference), e.g. from Postgres `pg_stats`.
+///
+/// The value is a JSON array of objects:
+/// `[{ "column": "created_at", "distinct_count": 100000, "correlation": 0.99 }]`.
+pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stats";
+
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 

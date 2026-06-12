@@ -1100,12 +1100,17 @@ async fn handle_decoded(
             }
         }
         DecodedMessage::Update {
-            relation_id, new, ..
+            relation_id,
+            old,
+            new,
         } => {
             if let Some(member_key) = routes.get(&relation_id)
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
+                // Fill unchanged-TOAST markers from the old tuple (REPLICA
+                // IDENTITY FULL) before buffering.
+                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
                 txn.entry(relation_id).or_default().push(DecodedChange {
                     op: ChangeOp::Update,
                     row: new,
