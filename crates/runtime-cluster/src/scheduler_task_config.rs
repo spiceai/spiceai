@@ -100,7 +100,7 @@ impl Default for PartitionAssignmentConfig {
             interval: Duration::from_secs(30),
             max_assignments_per_interval: 100,
             max_partitions_per_executor: 1000,
-            discovery_timeout: Duration::from_secs(60),
+            discovery_timeout: Duration::from_mins(1),
         }
     }
 }

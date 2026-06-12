@@ -42,7 +42,7 @@ pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// giving up. The WAL stream uses the same attempts budget per *reconnect*
 /// but reconnects indefinitely once it has been healthy once — the stream is
 /// meant to run forever.
-pub const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_secs(120);
+pub const DEFAULT_SETUP_MAX_ELAPSED: Duration = Duration::from_mins(2);
 
 /// Exponential backoff with full jitter (±20%).
 #[derive(Debug)]
@@ -92,8 +92,7 @@ fn jitter(d: Duration) -> Duration {
     let nanos = u64::from(d.subsec_nanos())
         ^ std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|e| u64::from(e.subsec_nanos()))
-            .unwrap_or(0);
+            .map_or(0, |e| u64::from(e.subsec_nanos()));
     // Map to [-20%, +20%] of `d`. The casts below are intentional — we're
     // computing a small bounded signed offset to add to a positive base and
     // clamping back to a u64 millis. Out-of-range inputs would already be
@@ -173,6 +172,16 @@ fn is_transient_by_display(msg: &str) -> bool {
         // surface, just slower.)
         "sqlstate 55006",
         "is active for pid",
+        // SQLSTATE 53300 (too_many_connections) for walsenders: "number of
+        // requested standby connections exceeds max_wal_senders". During a
+        // rolling deploy the outgoing instance still holds its walsender, so
+        // a capped server can momentarily have no free slots. Retry with
+        // backoff; if the server is genuinely over-subscribed the stream
+        // keeps retrying visibly (reconnect logs + metrics) instead of
+        // fatally ending every dataset on the shared slot.
+        "sqlstate 53300",
+        "max_wal_senders",
+        "too many connections",
     ];
     let lower = msg.to_ascii_lowercase();
     TRANSIENT_MARKERS.iter().any(|m| lower.contains(m))
@@ -224,6 +233,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slot_contention_errors_are_transient() {
+        // Both raced-walsender shapes observed during rolling deploys: the
+        // outgoing instance still holds the slot / a walsender seat for a
+        // moment. These MUST retry — on a shared slot a fatal classification
+        // terminates every member dataset.
+        for msg in [
+            "server error: replication slot \"s\" is active for PID 123 (SQLSTATE 55006)",
+            "server error: number of requested standby connections exceeds max_wal_senders (currently 5) (SQLSTATE 53300)",
+        ] {
+            assert!(
+                is_transient_pgwire(&pgwire_replication::PgWireError::Server(msg.to_string())),
+                "must be transient: {msg}"
+            );
+        }
+        // A structured server error (permission denied) stays fatal.
+        assert!(!is_transient_pgwire(
+            &pgwire_replication::PgWireError::Server(
+                "server error: permission denied for database app (SQLSTATE 42501)".to_string()
+            )
+        ));
+    }
+
     use super::*;
 
     #[test]

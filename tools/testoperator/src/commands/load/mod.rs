@@ -162,7 +162,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let baseline_duration = Duration::from_secs(baseline_duration_secs);
 
     // baseline run
-    println!("Running baseline throughput test for {baseline_duration_secs}s",);
+    println!("Running baseline throughput test for {baseline_duration_secs}s");
 
     let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
@@ -193,7 +193,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Memory monitoring is only available for owned spiced instances (not external)
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|p| p.watch_memory(&memory_token));
 
     // load test
@@ -270,11 +269,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = if let Some(readings) = memory_readings {
-        observe_memory(memory_token, readings).await?
+    let memory_usage = if let Some(readings) = memory_readings {
+        Some(observe_memory(memory_token, readings).await?)
     } else {
         println!("Memory monitoring not available for external spiced instances");
-        (0.0, 0.0)
+        None
     };
 
     // Record per-query metrics for load test
@@ -311,15 +310,21 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
     print_batches(&baseline_records)?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;

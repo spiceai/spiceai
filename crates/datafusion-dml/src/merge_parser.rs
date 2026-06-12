@@ -83,19 +83,16 @@ pub fn parse_merge_sql(sql: &str) -> DFResult<MergeAstInfo> {
         .next()
         .ok_or_else(|| DataFusionError::Plan("Empty SQL statement".to_string()))?;
 
-    let SQLStatement::Merge {
-        table,
-        source,
-        on,
-        clauses,
-        output,
-        ..
-    } = stmt
-    else {
+    let SQLStatement::Merge(merge) = stmt else {
         return Err(DataFusionError::Plan(
             "parse_merge_sql: expected a MERGE INTO statement".to_string(),
         ));
     };
+    let table = merge.table;
+    let source = merge.source;
+    let on = merge.on;
+    let clauses = merge.clauses;
+    let output = merge.output;
 
     if output.is_some() {
         return Err(DataFusionError::Plan(
@@ -421,12 +418,18 @@ fn extract_assignments(
                 .to_string(),
         ));
     }
-    let MergeAction::Update { assignments } = &clause.action else {
+    let MergeAction::Update(update) = &clause.action else {
         return Err(DataFusionError::Plan(format!(
             "Only UPDATE SET is supported in WHEN MATCHED, found: {}",
             clause.action
         )));
     };
+    if update.update_predicate.is_some() || update.delete_predicate.is_some() {
+        return Err(DataFusionError::Plan(
+            "MERGE UPDATE predicates are not supported".to_string(),
+        ));
+    }
+    let assignments = &update.assignments;
     if assignments.is_empty() {
         return Err(DataFusionError::Plan(
             "MERGE UPDATE SET must have at least one assignment".to_string(),

@@ -281,7 +281,7 @@ async fn http_json_nested_fields_duckdb_hot_reload() -> Result<(), String> {
 
             let load_rt = Arc::clone(&rt);
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(60)) => {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
                     return Err("Timed out waiting for initial load".to_string());
                 }
                 () = load_rt.load_components() => {}

@@ -32,7 +32,7 @@ pub const KAFKA_SASL_PASSWORD: &str = "kafka123";
 pub const KAFKA_SASL_MECHANISM: &str = "SCRAM-SHA-256";
 
 const REDPANDA_IMAGE: &str = "docker.redpanda.com/redpandadata/redpanda:v26.1.6";
-const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
+const KAFKA_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 
 #[instrument]
 pub async fn start_kafka_docker_container(
@@ -368,7 +368,63 @@ pub async fn create_kafka_topic_with_partitions(
         ))
         .await?;
     tracing::debug!("Created topic '{topic}' with {partitions} partitions: {output}");
+
+    let producer = create_kafka_producer(
+        &format!("localhost:{port}"),
+        Some(KAFKA_SASL_USERNAME),
+        Some(KAFKA_SASL_PASSWORD),
+    )?;
+    wait_for_topic_partitions(&producer, topic, partitions).await?;
+
     Ok(())
+}
+
+/// Wait until topic metadata reports the expected partition count.
+async fn wait_for_topic_partitions(
+    producer: &FutureProducer,
+    topic: &str,
+    expected_partitions: i32,
+) -> Result<(), anyhow::Error> {
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_millis(250);
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for attempt in 1..=MAX_RETRIES {
+        match producer
+            .client()
+            .fetch_metadata(Some(topic), METADATA_TIMEOUT)
+        {
+            Ok(metadata) => {
+                let partition_count = metadata
+                    .topics()
+                    .iter()
+                    .find(|t| t.name() == topic)
+                    .map_or(0, |t| t.partitions().len());
+
+                if i32::try_from(partition_count).unwrap_or(0) == expected_partitions {
+                    tracing::debug!("Topic '{topic}' ready with {expected_partitions} partitions");
+                    return Ok(());
+                }
+
+                tracing::debug!(
+                    "Topic '{topic}' has {partition_count} partitions, expected {expected_partitions} (attempt {attempt}/{MAX_RETRIES})"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to fetch metadata for topic '{topic}' (attempt {attempt}/{MAX_RETRIES}): {e}"
+                );
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Topic '{topic}' did not become ready with {expected_partitions} partitions after {MAX_RETRIES} attempts"
+    ))
 }
 
 pub fn make_kafka_dataset(

@@ -599,13 +599,23 @@ impl Runtime {
 
         let source_schema = provider.schema();
         let inferred = InferredSchema::from_metadata(source_schema.metadata());
-        // Only acceleration settings (primary key / indexes / sort) are applied here;
-        // inferred sizing rides on the provider schema metadata and is surfaced as
-        // table statistics elsewhere. Skip the refresh_sql parse and dataset rebuild
-        // when nothing acceleration-relevant was inferred (e.g. sizing only).
+        // Only acceleration settings (primary key / indexes / sort / shard key) are
+        // applied here; inferred sizing and column statistics ride on the provider
+        // schema metadata and are surfaced as table statistics / tuning inputs
+        // elsewhere. Skip the refresh_sql parse and dataset rebuild when nothing
+        // acceleration-relevant was inferred (e.g. sizing only).
+        // `shard_key` is consumed only by Cayenne (see `apply_inferred_shard_key`);
+        // for other engines it is not acceleration-relevant and must not, on its
+        // own, force a refresh_sql parse + dataset rebuild below.
+        let shard_key_relevant = !inferred.shard_key.is_empty()
+            && ds.acceleration.as_ref().is_some_and(|a| {
+                a.engine.to_unpartitioned()
+                    == crate::component::dataset::acceleration::Engine::Cayenne
+            });
         if inferred.primary_key.is_empty()
             && inferred.indexes.is_empty()
             && inferred.sort_columns.is_empty()
+            && !shard_key_relevant
         {
             return ds;
         }

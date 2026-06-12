@@ -31,8 +31,8 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
 const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
-const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());

@@ -343,7 +343,7 @@ struct CosmosDBExec {
     /// Schema presented to `DataFusion` after projection.
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CosmosDBExec {
@@ -355,12 +355,12 @@ impl CosmosDBExec {
         projected_schema: SchemaRef,
         projection: Option<Vec<usize>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             container_client,
             endpoint,
@@ -406,7 +406,7 @@ impl ExecutionPlan for CosmosDBExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

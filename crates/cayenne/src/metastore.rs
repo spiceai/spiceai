@@ -78,6 +78,9 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
             "file_size_bytes",
             "source_data_file_path",
             "sequence_number",
+            // Metadata-only publish: per-commit reinsert sequence (added last,
+            // matching the DDL column order + the ALTER backfill).
+            "reinsert_sequence",
         ],
     },
     ExpectedTable {
@@ -115,6 +118,17 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
     ExpectedTable {
         name: "cayenne_table_statistics",
         columns: &["table_id", "statistics_blob", "num_rows", "ndv_sketches"],
+    },
+    ExpectedTable {
+        name: "cayenne_snapshot_file_statistics",
+        columns: &[
+            "table_id",
+            "snapshot_id",
+            "file_path",
+            "file_size_bytes",
+            "num_rows",
+            "statistics_blob",
+        ],
     },
     ExpectedTable {
         name: "cayenne_pk_index",

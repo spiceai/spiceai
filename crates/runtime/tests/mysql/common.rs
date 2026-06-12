@@ -45,8 +45,8 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
 const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
-const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mysql_docker_container(
@@ -123,7 +123,7 @@ async fn wait_for_mysql_host_port(port: u16) -> Result<(), anyhow::Error> {
 
 #[instrument]
 pub fn get_mysql_conn(port: u16) -> Result<mysql_async::Pool, anyhow::Error> {
-    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb",);
+    let url = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@localhost:{port}/mysqldb");
     let opts_builder =
         mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(url.as_str())?);
     let opts = mysql_async::Opts::from(opts_builder);

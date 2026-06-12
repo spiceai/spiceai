@@ -217,7 +217,7 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_secs(300);
+const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
@@ -338,8 +338,7 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+            .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
@@ -611,6 +610,21 @@ impl CayenneAccelerator {
             };
             apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
 
+            // In-RAM CDC tier caps (`cdc_durability: memory`) scale with host
+            // memory only — see `autotune::HardwareProfile::mem_tier_caps`.
+            // Derived for the small-write/CDC profile (memory mode is forced
+            // back to `file` for every other profile below, where these knobs
+            // are inert); explicit operator params still override in the
+            // param-resolution pass below. The age cap and checkpoint interval
+            // deliberately keep their static defaults: they are time-domain
+            // durability bounds (crash-replay window / slot-ack cadence), not
+            // hardware-capacity quantities.
+            if small_write {
+                let tier_caps = hw.mem_tier_caps();
+                config.cdc_mem_tier_max_bytes = tier_caps.max_bytes;
+                config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
+            }
+
             // Vortex segment cache: memory-aware `auto` default (scales up on
             // memory-rich hosts, never below the historical 256 MiB), overridable.
             config.segment_cache_mb = autotune::auto_or_usize(
@@ -697,28 +711,61 @@ impl CayenneAccelerator {
                 }
             }
 
+            // Auto-resolve the deletion mode for delete-receiving CDC tables:
+            // under `refresh_mode: changes`, position mode is pathological when
+            // DELETE events arrive continuously — position-delete compaction
+            // must serialize with writers (`try_lock`), so a continuously
+            // written table starves its own compaction and file count grows
+            // unboundedly, while key mode compacts concurrently with writers
+            // and rides the in-memory CDC tier. A schema-time auto cannot know
+            // the delete rate, so prefer the mode that degrades gracefully in
+            // both cases. Gated strictly: only an unresolved `auto`, only the
+            // changes/CDC refresh mode, and only when a primary key exists
+            // (key mode requires one) — explicit `position`/`key` configs and
+            // every non-CDC profile keep today's position resolution
+            // (merge-on-read pushdown, zero per-row scan CPU).
+            if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
+                && acceleration.refresh_mode == Some(RefreshMode::Changes)
+                && workload.has_primary_key
+            {
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+                tracing::debug!(
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (CDC refresh mode with a primary key). Key-based deletes compact concurrently with writers; set `cayenne_deletion_mode: position` to opt back into merge-on-read position deletes."
+                );
+            }
+
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
-            // checkpoint; it is only meaningful for the small-write/CDC profile,
-            // so it is forced back to `file` for other profiles below. Default
-            // `file` is byte-identical to the pre-feature behavior.
+            // checkpoint; it is only meaningful for the small-write/CDC
+            // profile, so it is forced back to `file` for other profiles
+            // below. Memory is the DEFAULT (A/B-validated faster than `file`
+            // on the CDC profile end-to-end: analytical QPH, replication lag,
+            // and disk footprint, at identical convergence); `file` remains
+            // the explicit conservative opt-out.
+            let mut cdc_durability_explicit = false;
             if let Some((key, value)) = ["cayenne_cdc_durability", "cdc_durability"]
                 .iter()
                 .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
             {
                 if let Some(mode) = cayenne::metadata::CdcDurability::parse(value) {
                     config.cdc_durability = mode;
+                    cdc_durability_explicit = true;
                 } else {
                     tracing::warn!(
-                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: file, memory. Defaulting to file."
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: file, memory. Using the default (memory, eligibility-gated)."
                     );
                 }
             }
             if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
             {
-                tracing::warn!(
-                    "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; defaulting to `file`."
-                );
+                // Warn only when memory was explicitly requested: memory is
+                // the DEFAULT now, so every full/snapshot-profile dataset
+                // lands here by design and silently keeps the durable path.
+                if cdc_durability_explicit {
+                    tracing::warn!(
+                        "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; using `file`."
+                    );
+                }
                 config.cdc_durability = cayenne::metadata::CdcDurability::File;
             }
             config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
@@ -730,6 +777,23 @@ impl CayenneAccelerator {
                 acceleration,
                 &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
                 config.cdc_mem_tier_max_age_ms,
+                " (milliseconds)",
+            );
+            config.cdc_mem_tier_min_flush_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_min_flush_bytes",
+                    "cdc_mem_tier_min_flush_bytes",
+                ],
+                config.cdc_mem_tier_min_flush_bytes,
+            );
+            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_checkpoint_interval_ms",
+                    "cdc_mem_tier_checkpoint_interval_ms",
+                ],
+                config.cdc_mem_tier_checkpoint_interval_ms,
                 " (milliseconds)",
             );
 
@@ -770,6 +834,20 @@ impl CayenneAccelerator {
                 .or_else(|| acceleration.params.get("sort_columns"))
             {
                 config.sort_columns = sort_cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
+            // Parse shard key columns (the hash-clustering key for intra-write
+            // sharding; the engine derives it from the primary key when unset)
+            if let Some(shard_cols_str) = acceleration
+                .params
+                .get("cayenne_shard_key_columns")
+                .or_else(|| acceleration.params.get("shard_key_columns"))
+            {
+                config.shard_key_columns = shard_cols_str
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -908,17 +986,19 @@ impl CayenneAccelerator {
                 );
             }
             config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
-            // `adaptive` depends on extended schema inference. Any emitted
-            // metadata counts: row_count/table_bytes refine memory sizing, while
-            // inferred primary key/index/sort metadata is applied upstream and
-            // feeds the same warm-start / query-health surface. Without any
-            // inferred metadata the loop starts blind, so fall back to `auto` and
-            // tell the operator how to enable it.
+            // Extended schema inference SHARPENS the warm start (row_count/
+            // table_bytes refine the memory sizing; inferred PK/index/sort metadata
+            // feeds the query-health surface), but it is no longer REQUIRED for
+            // `adaptive`: the controller relearns the observed mean row width from
+            // live ingest and converges its actuators from the hardware-derived
+            // warm start regardless. When the metadata is absent, note that the
+            // warm start is coarser but still let the closed loop run.
             if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
-                tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive`: no inferred schema metadata found (set `schema_inference: extended` for a sharper warm-start); starting from the hardware-derived config and adapting from observed ingest."
                 );
-                config.dynamic_tuning = false;
             }
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
@@ -936,7 +1016,7 @@ impl CayenneAccelerator {
                     "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
                 );
             }
-            config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
+            config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
                 inline_flush: autotune::is_pinned(
                     acceleration,
                     &[
@@ -966,6 +1046,7 @@ impl CayenneAccelerator {
                     acceleration,
                     &["cayenne_write_concurrency", "write_concurrency"],
                 ),
+                mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
             };
 
             // Surface cross-parameter and out-of-range issues that parse cleanly
@@ -999,7 +1080,7 @@ impl CayenneAccelerator {
                 inferred_extended_schema = workload.inferred_metadata.is_present(),
                 has_primary_key = workload.has_primary_key,
                 is_upsert = workload.is_upsert,
-                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                 config.segment_cache_mb,
                 config.pk_keyset_cache_mb,
                 config.target_vortex_file_size_mb,
@@ -1022,6 +1103,9 @@ impl CayenneAccelerator {
                 config.inline_flush_max_rows,
                 config.inline_flush_max_segments,
                 config.inline_flush_max_bytes,
+                config.cdc_durability.as_str(),
+                config.cdc_mem_tier_max_bytes,
+                config.cdc_mem_tier_min_flush_bytes,
             );
         }
 
@@ -1248,6 +1332,14 @@ impl CayenneAccelerator {
         if spawned {
             tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
         }
+        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+        // file-mode tables. This is what advances the deferred source slot ack on
+        // an idle/pure-upsert stream so replication lag stays bounded.
+        if provider.spawn_background_mem_tier_checkpoint() {
+            tracing::debug!(
+                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+            );
+        }
         Ok(provider)
     }
 }
@@ -1327,8 +1419,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    31,
-    { S3_PARAMS_LEN + 31 },
+    39,
+    { S3_PARAMS_LEN + 39 },
 >(
     S3_PARAMETERS,
     [
@@ -1355,6 +1447,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .default("auto"),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("shard_key_columns")
+            .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
@@ -1367,7 +1461,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'position' (merge-on-read): per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' is the explicit opt-out: deletes are applied above the Vortex scan via a per-row RowConverter probe.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -1401,17 +1495,31 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
         ParameterSpec::component("cdc_durability")
-            .description("Durability mode for the inline CDC write path (refresh_mode: changes). 'file' (default) persists each CDC batch durably before advancing the source slot — byte-identical to the prior behavior. 'memory' appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. Only applies to the small-write/CDC profile and non-partitioned tables.")
+            .description("Durability mode for the inline CDC write path. 'memory' (default, eligibility-gated) appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. The memory path applies only to the small-write/CDC profile and non-partitioned tables; other profiles use 'file'. 'file' persists each CDC batch durably before advancing the source slot and remains the explicit conservative opt-out.")
             .one_of(&["file", "memory"])
-            .default("file"),
+            .default("memory"),
         ParameterSpec::component("cdc_mem_tier_max_bytes")
-            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. 0 (default) disables the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
         ParameterSpec::component("cdc_mem_tier_max_age_ms")
-            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window for cold/low-traffic tables whose byte cap would otherwise never trip. 0 (default) disables the age trigger."),
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window and the deferred source-slot ack for tables that never reach a byte threshold. Default 10000 (10 s). Set 0 to disable the age trigger."),
+        ParameterSpec::component("cdc_mem_tier_min_flush_bytes")
+            .description("Minimum resident RAM-tier bytes before the periodic background tick durably checkpoints, in cdc_durability: memory mode only. Bounds snapshot/delete-file churn: below this size a tick is skipped unless the tier age reached cdc_mem_tier_max_age_ms. Query freshness is unaffected (RAM rows are visible immediately); only the deferred slot ack waits. The write-path byte-cap spill is not gated. Auto-derived as 1/8 of the derived cdc_mem_tier_max_bytes (clamped to 32-128 MiB; 32 MiB on hosts at or under 16 GiB). Set 0 to flush on every tick."),
+        ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
+            .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
+            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'schema_inference: extended' sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
+        ParameterSpec::runtime("cdc_prefetch_buffer")
+            .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
+        ParameterSpec::runtime("cdc_max_coalesced_envelopes")
+            .description("Per-dataset override for the maximum number of CDC envelopes coalesced into a single accelerator write."),
+        ParameterSpec::runtime("cdc_max_coalesced_bytes")
+            .description("Per-dataset override for the byte budget (in bytes) of a coalesced CDC burst."),
+        ParameterSpec::runtime("cdc_max_coalesce_age_ms")
+            .description("Per-dataset override for the linger window (ms) the CDC apply loop waits for additional envelopes before flushing."),
+        ParameterSpec::runtime("cdc_commit_timeout_ms")
+            .description("Per-dataset override for the CDC source-side commit timeout (ms)."),
     ],
 );
 
@@ -3279,6 +3387,163 @@ mod tests {
 
         assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
         assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
+    }
+
+    /// Unset mem-tier caps are auto-derived from host memory for the CDC
+    /// profile (range-asserted, since the test host's RAM varies), while a
+    /// non-small-write profile keeps the static serde defaults untouched.
+    #[tokio::test]
+    async fn test_cdc_mem_tier_caps_auto_derived_for_small_write() {
+        const MIB: i64 = 1024 * 1024;
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut cdc = DatasetBuilder::try_new("cdc_auto_tier".to_string(), "cdc_auto_tier")
+            .expect("dataset builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("dataset");
+        cdc.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Default::default()
+        });
+        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc).await;
+        assert!(
+            (256 * MIB..=1024 * MIB).contains(&config.cdc_mem_tier_max_bytes),
+            "derived cap {} outside [256 MiB, 1 GiB]",
+            config.cdc_mem_tier_max_bytes
+        );
+        assert!(
+            (32 * MIB..=128 * MIB).contains(&config.cdc_mem_tier_min_flush_bytes),
+            "derived flush gate {} outside [32 MiB, 128 MiB]",
+            config.cdc_mem_tier_min_flush_bytes
+        );
+        assert!(
+            config.cdc_mem_tier_min_flush_bytes <= config.cdc_mem_tier_max_bytes,
+            "flush gate must not exceed the cap"
+        );
+        // Time-domain knobs are NOT hardware-derived.
+        assert_eq!(config.cdc_mem_tier_max_age_ms, 10_000);
+        assert_eq!(config.cdc_mem_tier_checkpoint_interval_ms, 1_000);
+
+        let mut full = DatasetBuilder::try_new("full_tier".to_string(), "full_tier")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        full.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            ..Default::default()
+        });
+        let config = CayenneAccelerator::get_vortex_config("full_tier", &full).await;
+        assert_eq!(
+            config.cdc_mem_tier_max_bytes,
+            256 * MIB,
+            "non-small-write profiles keep the static default (knob is inert there)"
+        );
+        assert_eq!(config.cdc_mem_tier_min_flush_bytes, 32 * MIB);
+    }
+
+    /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
+    /// datasets whose workload has a primary key; explicit configs and every
+    /// other profile keep their value (and Auto's downstream position
+    /// resolution) untouched.
+    #[tokio::test]
+    async fn test_deletion_mode_auto_resolves_to_key_for_cdc_pk_tables() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let build = |name: &str,
+                     refresh_mode: RefreshMode,
+                     params: Vec<(String, String)>,
+                     app: &Arc<app::App>,
+                     rt: &Arc<crate::Runtime>| {
+            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(app))
+                .with_runtime(Arc::clone(rt))
+                .build()
+                .expect("dataset");
+            ds.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(refresh_mode),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            ds
+        };
+        let pk_workload = autotune::WorkloadProfile {
+            small_write: true,
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity: 1,
+            ..Default::default()
+        };
+
+        // CDC (changes) + PK + unset mode → auto-resolves to Key.
+        let ds = build("cdc_pk", RefreshMode::Changes, vec![], &app, &rt);
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_pk",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Key);
+
+        // Explicit `position` on the same shape is respected.
+        let ds = build(
+            "cdc_pk_pos",
+            RefreshMode::Changes,
+            vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
+            &app,
+            &rt,
+        );
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_pk_pos",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(
+            config.deletion_mode,
+            cayenne::metadata::DeletionMode::Position
+        );
+
+        // CDC without a PK stays Auto (downstream resolution: position — the
+        // only mechanism a PK-less table has).
+        let ds = build("cdc_nopk", RefreshMode::Changes, vec![], &app, &rt);
+        let nopk_workload = autotune::WorkloadProfile {
+            small_write: true,
+            ..Default::default()
+        };
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_nopk",
+            &ds,
+            None,
+            &nopk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+
+        // A non-CDC profile with a PK stays Auto (position downstream).
+        let ds = build("full_pk", RefreshMode::Full, vec![], &app, &rt);
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "full_pk",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
     }
 
     #[tokio::test]

@@ -504,7 +504,9 @@ macro_rules! wait_test_and_memory {
         match $test.wait().await {
             Ok(test) => test,
             Err(e) => {
-                observe_memory($memory_token, $memory_readings).await?;
+                if let Some(memory_readings) = $memory_readings {
+                    observe_memory($memory_token, memory_readings).await?;
+                }
                 return Err(e);
             }
         }

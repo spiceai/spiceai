@@ -28,6 +28,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, PutResult, SchemaResult};
 use arrow_flight::{
@@ -429,6 +430,11 @@ where
         // Create a new Status with the same code and message to avoid cloning the entire Status struct
         return Status::new(status.code(), status.message());
     }
+    if let Some(FlightError::Tonic(status)) =
+        (&e as &dyn std::any::Any).downcast_ref::<FlightError>()
+    {
+        return Status::new(status.code(), status.message());
+    }
     Status::internal(format!("{e}"))
 }
 
@@ -552,6 +558,11 @@ pub enum Error {
         "The cluster scheduler is not initialized, preventing the flight service from starting."
     ))]
     ClusterSchedulerNotInitialized {},
+
+    #[snafu(display(
+        "The cluster executor is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterExecutorNotInitialized {},
 
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },

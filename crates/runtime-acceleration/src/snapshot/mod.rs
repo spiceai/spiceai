@@ -22,7 +22,8 @@ use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::{
-    GetResult, ObjectStore, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath,
+    GetResult, ObjectStore, ObjectStoreExt, PutMode, PutPayload, UpdateVersion,
+    path::Path as ObjectPath,
 };
 use opentelemetry::KeyValue;
 use runtime_parameters::{ParameterSpec, Parameters};
@@ -556,10 +557,11 @@ impl<'a> SnapshotPathLayout<'a> {
         let month_partition = format!("month={}", instant.format("%Y-%m"));
         let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
         let dataset_partition = self.dataset_partition_raw();
-        base.child(month_partition)
-            .child(day_partition)
-            .child(dataset_partition)
-            .child(self.snapshot_filename(instant))
+        base.clone()
+            .join(month_partition)
+            .join(day_partition)
+            .join(dataset_partition)
+            .join(self.snapshot_filename(instant))
     }
 }
 
@@ -669,7 +671,7 @@ impl Not for &ForceCreate {
 
 impl SnapshotManager {
     fn metadata_path(&self) -> ObjectPath {
-        self.snapshots_location.child(METADATA_FILE_NAME)
+        self.snapshots_location.clone().join(METADATA_FILE_NAME)
     }
 
     fn metadata_path_display(&self) -> String {
@@ -1680,7 +1682,7 @@ impl SnapshotManager {
             .filter(|entry| Some(entry.snapshot_id) != dataset_metadata.current_snapshot_id)
             .cloned()
             .collect();
-        remaining.sort_by(|a, b| b.snapshot_id.cmp(&a.snapshot_id));
+        remaining.sort_by_key(|b| std::cmp::Reverse(b.snapshot_id));
         ordered_snapshots.extend(remaining);
 
         let current_engine = self.engine.to_string();
@@ -3343,7 +3345,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3410,7 +3412,7 @@ mod tests {
                 dataset_metadata(&schema, vec![entry], Some(7)),
             )]),
         };
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3545,7 +3547,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -3611,7 +3613,7 @@ mod tests {
             .expect("read stored snapshot");
         assert_eq!(stored_bytes.as_ref(), contents.as_slice());
 
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -3836,7 +3838,7 @@ mod tests {
             .expect("snapshot should be created");
 
         // Read and verify metadata
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -3890,7 +3892,7 @@ mod tests {
             .expect("snapshot should be created");
 
         // Read and verify metadata
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -4420,7 +4422,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4493,7 +4495,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4599,7 +4601,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -4744,7 +4746,7 @@ mod tests {
         );
 
         // Verify metadata was updated correctly
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -4850,7 +4852,7 @@ mod tests {
             .expect("read stored snapshot");
 
         // Verify metadata was created
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await
@@ -4914,7 +4916,7 @@ mod tests {
             )]),
         };
 
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
         write_metadata(&store, &metadata_path, &metadata).await;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -5359,7 +5361,7 @@ mod tests {
         let local_path = temp_path.to_path_buf();
 
         // Create metadata with a different dataset (not our test dataset)
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
         metadata.datasets.insert(
             "other_dataset".to_string(),
@@ -5402,7 +5404,7 @@ mod tests {
 
         // Create metadata that claims snapshots exist, but don't actually create the files
         let schema = sample_schema();
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
         let schema_metadata =
             SchemaMetadata::from_schema(0, &schema).expect("schema serialization");
@@ -5495,7 +5497,7 @@ mod tests {
     async fn get_snapshot_summary_returns_snapshots_from_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 100,
@@ -5563,7 +5565,7 @@ mod tests {
     async fn get_snapshot_summary_returns_missing_snapshot_with_empty_status() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let existing_entry = SnapshotEntry {
             snapshot_id: 1,
@@ -5649,7 +5651,7 @@ mod tests {
     async fn get_snapshot_summary_returns_unverified_when_size_mismatches() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let entry = SnapshotEntry {
             snapshot_id: 1,
@@ -5712,7 +5714,7 @@ mod tests {
     async fn get_snapshot_summary_respects_limit() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let mut snapshots = Vec::new();
         for i in 0..5u64 {
@@ -5776,7 +5778,7 @@ mod tests {
     async fn get_snapshot_returns_snapshot_when_exists() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 200,
@@ -5829,7 +5831,7 @@ mod tests {
     async fn get_snapshot_returns_error_when_snapshot_not_found() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let mut datasets = HashMap::new();
         datasets.insert(
@@ -5878,7 +5880,7 @@ mod tests {
     async fn set_current_snapshot_updates_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry1 = SnapshotEntry {
             snapshot_id: 100,
@@ -5979,7 +5981,7 @@ mod tests {
     async fn set_current_snapshot_returns_error_when_snapshot_not_found() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         let snapshot_entry = SnapshotEntry {
             snapshot_id: 100,
@@ -6042,7 +6044,7 @@ mod tests {
     async fn get_snapshot_summary_returns_error_on_unsupported_version() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata with unsupported version
         let metadata_json = serde_json::json!({
@@ -6069,7 +6071,7 @@ mod tests {
     async fn get_snapshot_summary_returns_empty_when_dataset_not_in_metadata() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata without our dataset
         let metadata = SnapshotMetadata {
@@ -6133,7 +6135,7 @@ mod tests {
     async fn has_existing_snapshots_returns_false_when_metadata_has_no_snapshots() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata with dataset but no snapshots
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
@@ -6160,7 +6162,7 @@ mod tests {
     async fn has_existing_snapshots_returns_false_when_metadata_has_snapshots_but_files_missing() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create metadata claiming snapshots exist
         let mut metadata = SnapshotMetadata::empty(SNAPSHOT_URI_PREFIX.to_string(), 0);
@@ -6200,14 +6202,14 @@ mod tests {
     async fn has_existing_snapshots_returns_true_when_metadata_and_files_exist() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create the actual snapshot file
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foo")
-            .child("foo.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foo")
+            .join("foo.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -6256,14 +6258,14 @@ mod tests {
     async fn has_existing_snapshots_does_not_match_dataset_name_prefix() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create a snapshot file for "foobar" dataset (NOT "foo")
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foobar") // Note: "foobar", not "foo"
-            .child("foobar.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foobar") // Note: "foobar", not "foo"
+            .join("foobar.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -6346,14 +6348,14 @@ mod tests {
     async fn has_existing_snapshots_does_not_match_dataset_name_suffix() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.clone().join(METADATA_FILE_NAME);
 
         // Create a snapshot file for "foobar" dataset
         let snapshot_path = base
-            .child("month=2025-01")
-            .child("day=2025-01-01")
-            .child("dataset=foobar")
-            .child("foobar.db");
+            .join("month=2025-01")
+            .join("day=2025-01-01")
+            .join("dataset=foobar")
+            .join("foobar.db");
         store
             .put(&snapshot_path, Bytes::from_static(b"snapshot data").into())
             .await
@@ -6441,7 +6443,7 @@ mod tests {
     async fn metadata_updates_in_place_with_new_fields() {
         let store = Arc::new(InMemory::new());
         let base = Path::from(SNAPSHOT_BASE_PATH);
-        let metadata_path = base.child(METADATA_FILE_NAME);
+        let metadata_path = base.join(METADATA_FILE_NAME);
 
         // Create old-format metadata without engine fields
         // Note: datasets are flattened at the top level

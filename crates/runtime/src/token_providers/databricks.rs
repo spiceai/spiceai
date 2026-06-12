@@ -106,7 +106,7 @@ impl DatabricksM2MTokenProvider {
             let mut next_wait = next_token_refresh_wait(expires_in);
 
             let mut backoff = FibonacciBackoffBuilder::new()
-                .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+                .max_duration(Some(Duration::from_mins(5))) // Cap at 5 minutes
                 .build();
 
             loop {
@@ -132,7 +132,7 @@ impl DatabricksM2MTokenProvider {
                     }
                     Err(e) => {
                         let backoff_duration =
-                            backoff.next_duration().unwrap_or(Duration::from_secs(300));
+                            backoff.next_duration().unwrap_or(Duration::from_mins(5));
                         tracing::error!(
                             "Databricks M2M token refresh failed: {}. Retrying in {:.2?}",
                             e,
@@ -228,7 +228,7 @@ async fn get_m2m_access_token(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await?;
-        return Err(format!("Failed to get access token: HTTP {status}, {error_text}",).into());
+        return Err(format!("Failed to get access token: HTTP {status}, {error_text}").into());
     }
 
     let token_response = response.json::<TokenResponse>().await?;

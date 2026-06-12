@@ -48,7 +48,7 @@ pub(super) struct DuckDBVectorQueryExec {
     pub(super) dims: i32,
     pub(super) hnsw: DuckDBHnswOptions,
     pub(super) context: DuckDBVectorQueryContext,
-    pub(super) properties: PlanProperties,
+    pub(super) properties: Arc<PlanProperties>,
 }
 
 impl DuckDBVectorQueryExec {
@@ -142,7 +142,7 @@ impl ExecutionPlan for DuckDBVectorQueryExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

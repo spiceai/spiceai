@@ -213,7 +213,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
 pub struct StreamingDataUpdateExecutionPlan {
     record_batch_stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingDataUpdateExecutionPlan {
@@ -235,12 +235,12 @@ impl StreamingDataUpdateExecutionPlan {
         Self {
             record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
             schema: Arc::clone(&schema),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 
@@ -308,7 +308,7 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

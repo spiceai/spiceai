@@ -93,12 +93,12 @@ impl TableProvider for DuckDBVectorQueryTable {
                 .collect(),
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
 
         Ok(Arc::new(DuckDBVectorQueryExec {
             projected_schema,

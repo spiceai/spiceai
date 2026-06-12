@@ -29,12 +29,6 @@ runtime:
     cdc_prefetch_buffer: '16384'
     cdc_max_coalesced_envelopes: '16384'
     cdc_max_coalesced_bytes: '134217728' # 128 MB
-    # 250ms, NOT 4000: this is a real apply-loop linger (trunk #11196). At 4000ms the caught-up
-    # tables over-coalesce past the 1024-row inline admission cap (customer flips 100%
-    # inline->staged and builds a ~16 GB backlog) while apply-bound tables gain nothing (the
-    # deadline anchors at apply-start). Measured fixed cost ~120-250ms/batch, so ~250ms amortizes
-    # it without overflowing the inline cap. The wall is the single-writer metastore txn (per-row
-    # insert_records WAL), not batch size — bigger bursts don't help; 512 MB/4000ms regressed.
     cdc_max_coalesce_age_ms: '250'
     cdc_commit_timeout_ms: '60000'
     cayenne_sort_merge_min_rows: '50000000'
@@ -80,6 +74,17 @@ datasets:
       params: &accel_high_volume
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/district
+        # Explicit: the engine default flipped to `memory`. This pod IS the
+        # file-durability variant (per-batch durable persist before the slot
+        # ack) — its identity must not depend on the build's default. The
+        # memory-durability twin is postgres-cayenne[file]-cdc-memory.yaml.
+        cayenne_cdc_durability: file
+        # KEY deletes even in file mode: deletion_mode auto resolves to
+        # position, which serializes compaction with writers (try_lock
+        # starvation under continuous CDC — measured unbounded file/read-amp
+        # growth on the delete-receiving table). Key-delete compaction runs
+        # concurrently with writers.
+        cayenne_deletion_mode: key
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '1024'
         cayenne_compaction_trigger_protected_snapshots: '3'
@@ -92,6 +97,8 @@ datasets:
         cayenne_compaction_trigger_snapshot_age_ms: '15000'
         cayenne_compaction_max_files_per_pick: '64'
         cayenne_compaction_background_interval_ms: '3000'
+        cdc_max_coalesce_age_ms: '3000'
+        cdc_max_coalesced_bytes: '536870912' # 512 MB
 
   - from: postgres:customer
     name: customer
@@ -218,10 +225,15 @@ datasets:
       params: &accel_medium
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/warehouse
+        # See &accel_high_volume: explicit file durability + key deletes.
+        cayenne_cdc_durability: file
+        cayenne_deletion_mode: key
         cayenne_write_concurrency: '4'
         cayenne_segment_cache_mb: '64'
         # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).
         cayenne_pk_keyset_cache_mb: '256'
+        cdc_max_coalesce_age_ms: '3000'
+        cdc_max_coalesced_bytes: '536870912' # 512 MB
 
   # ------------------------------------------------------------------
   # Static reference tables (no OLTP mutations, full refresh).
@@ -258,6 +270,9 @@ datasets:
       params: &accel_small
         cayenne_metastore: sqlite
         cayenne_file_path: .spice/cayenne/region
+        # See &accel_high_volume: explicit file durability + key deletes.
+        cayenne_cdc_durability: file
+        cayenne_deletion_mode: key
         cayenne_write_concurrency: '2'
         cayenne_segment_cache_mb: '16'
         # Pin 256 MiB explicitly — SF-100 optimum (don't leave to the backwards memory-aware auto-default).

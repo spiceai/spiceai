@@ -954,7 +954,7 @@ async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     println!("Waiting for authentication...");
 
     // Poll for auth status
-    let timeout = std::time::Duration::from_secs(300); // 5 minutes
+    let timeout = std::time::Duration::from_mins(5); // 5 minutes
     let start = std::time::Instant::now();
 
     loop {

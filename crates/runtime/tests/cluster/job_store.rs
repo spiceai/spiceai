@@ -19,6 +19,7 @@ use app::AppBuilder;
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStoreExt;
 use object_store::{ObjectStore, path::Path};
 use runtime::Runtime;
 use runtime::cluster::ResolvedClusterConfig;
@@ -145,7 +146,7 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&scheduler_rt).load_components() => {}
@@ -203,7 +204,7 @@ async fn test_simple_job_store() -> Result<(), anyhow::Error> {
             });
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = Arc::clone(&executor_rt).load_components() => {}

@@ -61,7 +61,7 @@ pub struct SnapshotRefreshState {
 
 impl std::fmt::Debug for SnapshotRefreshState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = self.current_snapshot_id.lock().map(|g| *g).unwrap_or(None);
+        let id = self.current_snapshot_id.lock().map_or(None, |g| *g);
         f.debug_struct("SnapshotRefreshState")
             .field("current_snapshot_id", &id)
             .finish_non_exhaustive()

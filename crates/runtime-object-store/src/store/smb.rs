@@ -29,8 +29,9 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    Attributes, CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, path::Path,
 };
 use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
@@ -460,6 +461,22 @@ impl ObjectStore for SMBObjectStore {
             .await
             .map_err(|e| map_head_error(e, location.to_string()))?;
 
+        let object_meta = build_object_meta(
+            location.clone(),
+            meta.size,
+            epoch_secs_to_datetime(meta.last_modified),
+        );
+
+        if options.head {
+            let stream = futures::stream::empty();
+            return Ok(GetResult {
+                meta: object_meta,
+                payload: GetResultPayload::Stream(Box::pin(stream)),
+                range: 0..0,
+                attributes: Attributes::default(),
+            });
+        }
+
         let (start, end, _to_read) = resolve_range(options.range.as_ref(), meta.size);
         guard_read_size(end.saturating_sub(start))?;
 
@@ -467,15 +484,6 @@ impl ObjectStore for SMBObjectStore {
             .get_object_range(&key, start, end)
             .await
             .map_err(handle_error)?;
-        let size = meta.size;
-        let last_modified = meta.last_modified;
-
-        let object_meta = build_object_meta(
-            location.clone(),
-            size,
-            epoch_secs_to_datetime(last_modified),
-        );
-
         let bytes_data = Bytes::from(data);
         let stream = futures::stream::once(async move { Ok(bytes_data) });
 
@@ -487,38 +495,21 @@ impl ObjectStore for SMBObjectStore {
         })
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let share = self.get_share().await?;
-        let key = self.config().key_for(location);
-
-        let meta = share
-            .head_object(&key)
-            .await
-            .map_err(|e| map_head_error(e, location.to_string()))?;
-
-        Ok(build_object_meta(
-            location.clone(),
-            meta.size,
-            epoch_secs_to_datetime(meta.last_modified),
-        ))
-    }
-
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let share = self.get_share().await?;
-        let key = self.config().key_for(location);
-
-        share.delete_object(&key).await.map_err(handle_error)
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        locations: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let store = self.clone();
         locations
-            .then(move |res| async move {
-                let location = res?;
-                self.delete(&location).await?;
-                Ok(location)
+            .then(move |res| {
+                let store = store.clone();
+                async move {
+                    let location = res?;
+                    let share = store.get_share().await?;
+                    let key = store.config().key_for(&location);
+                    share.delete_object(&key).await.map_err(handle_error)?;
+                    Ok(location)
+                }
             })
             .boxed()
     }
@@ -554,32 +545,28 @@ impl ObjectStore for SMBObjectStore {
         self.list_directory_shallow(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         let share = self.get_share().await?;
         let src_key = self.config().key_for(from);
         let dst_key = self.config().key_for(to);
 
-        share
-            .copy_object(&src_key, &dst_key)
-            .await
-            .map(|_| ())
-            .map_err(handle_error)
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        // Atomic via streaming copy + rename(replace_if_exists=false). The
-        // server enforces the no-overwrite rule when renaming the WAL temp
-        // into place, so there is no TOCTOU window between an existence
-        // check and the rename.
-        let share = self.get_share().await?;
-        let src_key = self.config().key_for(from);
-        let dst_key = self.config().key_for(to);
-
-        share
-            .copy_object_create_only(&src_key, &dst_key)
-            .await
-            .map(|_| ())
-            .map_err(|e| map_put_error(e, to.to_string()))
+        match options.mode {
+            CopyMode::Overwrite => share
+                .copy_object(&src_key, &dst_key)
+                .await
+                .map(|_| ())
+                .map_err(handle_error),
+            CopyMode::Create => share
+                .copy_object_create_only(&src_key, &dst_key)
+                .await
+                .map(|_| ())
+                .map_err(|e| map_put_error(e, to.to_string())),
+        }
     }
 }
 

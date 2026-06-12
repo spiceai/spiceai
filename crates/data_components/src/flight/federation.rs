@@ -1,7 +1,7 @@
+use crate::function_support::contains_unsupported_functions;
 use async_trait::async_trait;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
-use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
 use std::sync::Arc;
 
 use datafusion::{
@@ -18,7 +18,7 @@ impl FlightTable {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = self.table_reference.clone();
         tracing::trace!(
-            %self.table_reference,
+            ?self.table_reference,
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);

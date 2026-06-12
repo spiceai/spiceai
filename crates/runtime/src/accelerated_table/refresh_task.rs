@@ -282,6 +282,9 @@ pub struct RefreshTaskBuilder {
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// Per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl RefreshTaskBuilder {
@@ -313,6 +316,7 @@ impl RefreshTaskBuilder {
             initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
+            cdc_param_overrides: None,
         }
     }
 
@@ -391,6 +395,18 @@ impl RefreshTaskBuilder {
         self
     }
 
+    /// Provide per-dataset `cdc_*` parameter overrides. These layer on top of
+    /// the process-global [`changes::CdcConfig`] only for this dataset's
+    /// changes stream.
+    #[must_use]
+    pub fn with_cdc_param_overrides(
+        mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> RefreshTaskBuilder {
+        self.cdc_param_overrides = overrides;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> RefreshTask {
         let semaphore = self
@@ -448,6 +464,7 @@ impl RefreshTaskBuilder {
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
+            cdc_param_overrides: self.cdc_param_overrides,
         }
     }
 }
@@ -479,6 +496,8 @@ pub struct RefreshTask {
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+    /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
+    pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for RefreshTask {

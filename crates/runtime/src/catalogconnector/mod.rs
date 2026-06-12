@@ -414,7 +414,7 @@ impl RefreshingCatalogProvider {
             return Err(Error::RefreshTaskAlreadyStarted {});
         }
 
-        let interval = interval.unwrap_or(Duration::from_secs(60));
+        let interval = interval.unwrap_or(Duration::from_mins(1));
         let inner = Arc::clone(&self.inner);
         self.refresh_task = Some(tokio::spawn(async move {
             loop {

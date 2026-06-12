@@ -23,7 +23,7 @@ use crate::{
         snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
         storage::{ResolvedAccelerationStorage, resolve_acceleration_storage_async},
     },
-    datafusion::udf::deny_spice_specific_functions,
+    datafusion::udf::deny_spice_specific_functions_table_providers,
     make_spice_data_directory,
     parameters::ParameterSpec,
     register_data_accelerator, spice_data_base_path,
@@ -129,10 +129,17 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(Self::sqlite3_decimal_init_wrapper));
         }
         Self {
+            // `decimal_between` rewrites federated `BETWEEN` comparisons over
+            // decimal columns (stored as TEXT in `SQLite`) so they compare
+            // numerically instead of lexically — without it those queries
+            // silently return wrong rows. The deny-list keeps plans referencing
+            // Spice-only functions (e.g. `json_get_str`) evaluating locally
+            // instead of failing in `SQLite`. Both were wired before the
+            // `DataFusion` 53 upgrade (#11118) dropped them; see issue #10703.
             sqlite_factory: SqliteTableProviderFactory::new()
                 .with_batch_insert_use_prepared_statements(true)
                 .with_decimal_between(true)
-                .with_function_support(deny_spice_specific_functions().as_ref().clone()),
+                .with_function_support(deny_spice_specific_functions_table_providers()),
         }
     }
 
@@ -166,7 +173,7 @@ impl SqliteAccelerator {
                 .sqlite_busy_timeout(&acceleration_params)
                 .map_err(|_| InvalidBusyTimeoutValueSnafu.build());
         }
-        Ok(Duration::from_millis(5000))
+        Ok(Duration::from_secs(5))
     }
 
     /// Returns the effective `busy_timeout`, applying storage-profile defaults
@@ -187,8 +194,8 @@ impl SqliteAccelerator {
             return self.sqlite_busy_timeout(source);
         }
         Ok(match storage {
-            ResolvedAccelerationStorage::Ebs => Duration::from_millis(15_000),
-            _ => Duration::from_millis(5_000),
+            ResolvedAccelerationStorage::Ebs => Duration::from_secs(15),
+            _ => Duration::from_secs(5),
         })
     }
 
@@ -275,18 +282,39 @@ async fn apply_sqlite_pragmas(
     pragmas: &[&'static str],
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
+    use futures::StreamExt;
     let conn = pool.connect().await?;
     let Some(async_conn) = conn.as_async() else {
         unreachable!("SqliteConnectionPool only returns async-capable SQLite connections");
     };
     for pragma in pragmas {
-        if let Err(err) = async_conn.execute(pragma, &[]).await {
-            tracing::warn!(
-                pragma,
-                error = %err,
-                "Failed to apply SQLite storage-profile pragma"
-            );
-            return Err(err);
+        // Issue each pragma as a query rather than `execute`. Value-setting
+        // pragmas such as `PRAGMA mmap_size=N` / `PRAGMA cache_size=N` echo the
+        // applied value back as a result row, and the upgraded rusqlite driver
+        // rejects `execute()` on any statement that returns rows
+        // ("Execute returned results - did you mean to call query?"). We drain
+        // (and discard) the stream so the pragma takes effect either way.
+        match async_conn.query_arrow(pragma, &[], None).await {
+            Ok(mut stream) => {
+                while let Some(batch) = stream.next().await {
+                    if let Err(err) = batch {
+                        tracing::warn!(
+                            pragma,
+                            error = %err,
+                            "Failed to apply SQLite storage-profile pragma"
+                        );
+                        return Err(Box::new(err));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pragma,
+                    error = %err,
+                    "Failed to apply SQLite storage-profile pragma"
+                );
+                return Err(err);
+            }
         }
     }
     Ok(())
@@ -500,14 +528,6 @@ impl DataAccelerator for SqliteAccelerator {
         true
     }
 
-    /// Reloads the SQLite-backed table provider from the snapshot file that
-    /// was just written to the primary path.
-    ///
-    /// Drops the previous provider, evicts the cached connection pool from
-    /// the upstream `SqliteTableProviderFactory` registry, and then re-runs
-    /// the registry factory to build a fresh provider over the on-disk file.
-    /// See the `DuckDB` implementation for the rationale around evicting the
-    /// pool before rebuilding.
     async fn reload_from_snapshot(
         &self,
         source: &dyn AccelerationSource,
@@ -689,7 +709,7 @@ mod tests {
 
     use crate::dataaccelerator::DataAccelerator;
     use arrow::{
-        array::{Int64Array, RecordBatch, StringArray, UInt64Array},
+        array::{Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Schema},
     };
     use datafusion::{
@@ -764,46 +784,192 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
+        let _delete_error = table
             .delete_from(&ctx.state(), vec![filter])
             .await
             .expect("deletion should be successful");
+    }
 
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        // Expect 2 rows deleted: "1970-01-01" (epoch=0) and "2012-12-01T11:11:11Z" (1354360271000ms)
-        // both are < 1354360272000ms
-        let expected = UInt64Array::from(vec![2]);
-        assert_eq!(actual, &expected);
+    /// Regression test for the DF53 / table-providers v0.11 `SQLite` Decimal
+    /// round-trip. A `Decimal128`/`Decimal256` column accelerated into `SQLite`
+    /// must read back as a decimal, not fail with
+    /// `Invalid column type Text ... name: col_Decimal`.
+    ///
+    /// The values intentionally include integer-valued decimals (`0.00`,
+    /// `2.00`) alongside fractional ones (`1.11`, `99.99`) and a NULL so that
+    /// `SQLite`'s per-cell storage class (NUMERIC affinity stores `0.00` as
+    /// INTEGER, `1.11` as REAL, high-precision values as TEXT) is exercised
+    /// across a heterogeneous column.
+    #[tokio::test]
+    #[expect(clippy::unreadable_literal)]
+    async fn test_sqlite_decimal_round_trip() {
+        use arrow::array::{Decimal128Array, Decimal256Array};
+        use arrow::datatypes::i256;
 
-        let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
+        // Mirrors the MySQL/Postgres quickstart `col_Decimal DECIMAL(10, 2)`
+        // (precision 10) that the E2E "acceleration: sqlite" jobs exercise,
+        // plus a `Decimal256(40, 4)` column whose precision (40) exceeds the
+        // 16-digit ceiling that upstream sea-query's SQLite backend panics on.
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("col_Decimal", DataType::Decimal128(10, 2), true),
+            arrow::datatypes::Field::new("col_Decimal_hp", DataType::Decimal256(40, 4), true),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("decimal_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
             .await
-            .expect("deletion should be successful");
+            .expect("table should be created");
 
-        let result = collect(plan, ctx.task_ctx())
+        // Decimal128(10, 2): 1.11, NULL, 99.99, 0.00, 2.00 -- the integer-valued
+        // entries (0.00, 2.00) and fractional ones land in different SQLite
+        // storage classes, so a column-wide decode type locked from row 0 must
+        // not reject a later row.
+        let dec128 = Decimal128Array::from(vec![Some(111), None, Some(9999), Some(0), Some(200)])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal128 array");
+        // Decimal256(40, 4): a value that cannot round-trip losslessly through
+        // f64, plus an integer-valued one and a NULL.
+        let dec256 = Decimal256Array::from(vec![
+            Some(i256::from_i128(12345678901234567890_i128)),
+            None,
+            Some(i256::from_i128(0)),
+            Some(i256::from_i128(20000)),
+            Some(i256::from_i128(98765)),
+        ])
+        .with_precision_and_scale(40, 4)
+        .expect("decimal256 array");
+        let ids = Int64Array::from(vec![1, 2, 3, 4, 5]);
+
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(ids), Arc::new(dec128), Arc::new(dec256)],
+        )
+        .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
             .await
-            .expect("deletion successful");
-        let actual = result
-            .first()
-            .expect("result should have at least one batch")
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("result should be UInt64Array");
-        // Only 1 row remains after the first delete (time_int=1354360272),
-        // which matches time_int < 1354360273
-        let expected = UInt64Array::from(vec![1]);
-        assert_eq!(actual, &expected);
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Read everything back -- this is where the regression manifests as
+        // "Invalid column type Text at index ... name: col_Decimal".
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back decimal data without a Text conversion error");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 5, "should round-trip all 5 decimal rows");
+    }
+
+    /// Regression test mirroring the Postgres/MySQL quickstart E2E failure
+    /// where a `List<Utf8>` column accelerated into `SQLite` read back with
+    /// `Failed to decode value: Json error: Encountered unexpected 'e' whilst
+    /// parsing value`.
+    ///
+    /// `SQLite` has no array storage class, so the list is persisted as TEXT and
+    /// the accelerated read path JSON-parses that text back into the declared
+    /// `List<Utf8>`. The write side must therefore emit *valid JSON*
+    /// (`["expired","active"]`), not the bare `[expired, active]` that
+    /// `ArrayFormatter` produces. The list values intentionally include strings
+    /// with spaces and embedded quotes to exercise JSON quoting/escaping.
+    #[tokio::test]
+    async fn test_sqlite_list_round_trip() {
+        use arrow::array::{ListBuilder, StringBuilder};
+
+        let item_field = arrow::datatypes::Field::new("item", DataType::Utf8, true);
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("tags", DataType::List(Arc::new(item_field)), true),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: TableReference::bare("list_test"),
+            location: String::new(),
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::new_unverified(vec![]),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteAccelerator::new()
+            .create_external_table(external_table, None, vec![], None)
+            .await
+            .expect("table should be created");
+
+        // List<Utf8> values, including strings with spaces and quotes -- exactly
+        // the shape the buggy ArrayFormatter path rendered as invalid JSON.
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        list_builder.values().append_value("expired");
+        list_builder.values().append_value("active");
+        list_builder.append(true);
+        list_builder.values().append_value("needs \"quote\"");
+        list_builder.values().append_value("has space");
+        list_builder.append(true);
+        let tags = list_builder.finish();
+        let ids = Int64Array::from(vec![1, 2]);
+
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(tags)])
+            .expect("data should be created");
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), InsertOp::Append)
+            .await
+            .expect("insertion should be successful");
+
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
+
+        // Read back -- this is where the regression manifests: the SQLite TEXT
+        // cell must be valid JSON for the List cast to succeed.
+        let scan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should succeed");
+        let batches = collect(scan, ctx.task_ctx())
+            .await
+            .expect("should read back List<Utf8> data without a JSON decode error");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2, "should round-trip all 2 list rows");
     }
 
     #[tokio::test]

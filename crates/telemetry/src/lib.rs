@@ -480,6 +480,27 @@ pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyV
         .record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
+static CAYENNE_CDC_ABSORBED_DELETE_KEYS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts CDC Delete-event keys absorbed by the in-memory CDC tier
+/// (`cdc_durability: memory`) as RAM tombstones instead of being routed onto
+/// the durable staged path. Each absorbed key defers its durability to the
+/// covering mem-tier checkpoint, exactly like in-memory upserts. `dimensions`
+/// should carry `table`.
+pub fn track_cayenne_cdc_absorbed_delete_keys(keys: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_ABSORBED_DELETE_KEYS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_cdc_absorbed_delete_keys_total")
+                .with_description(
+                    "CDC Delete-event keys absorbed as in-memory CDC tier tombstones (durability deferred to the covering mem-tier checkpoint) instead of taking the durable staged path.",
+                )
+                .with_unit("keys")
+                .build()
+        })
+        .add(keys, dimensions);
+}
+
 static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 /// Build-once accessor for the compaction-duration histogram. The first call
@@ -491,16 +512,19 @@ fn cayenne_compaction_duration_ms() -> &'static Histogram<f64> {
     CAYENNE_COMPACTION_DURATION_MS.get_or_init(|| {
         cayenne_operational_meter()
             .f64_histogram("cayenne_compaction_duration_ms")
-            .with_description("Wall-clock time of Cayenne background compaction passes.")
+            .with_description(
+                "Wall-clock time of Cayenne compaction passes (kind=full current-snapshot rewrite | subset protected-snapshot merge).",
+            )
             .with_unit("ms")
             .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
             .build()
     })
 }
 
-/// Records the wall-clock duration of a Cayenne background compaction pass.
-/// `dimensions` should carry `table` and `result` (`"completed"` | `"failed"`).
-/// The histogram's count doubles as the compaction-pass counter.
+/// Records the wall-clock duration of a Cayenne compaction pass. `dimensions`
+/// should carry `table`, `kind` (`"full"` current-snapshot rewrite | `"subset"`
+/// protected-snapshot merge), and `result` (`"completed"` | `"failed"`). The
+/// histogram's count doubles as the per-kind compaction-pass counter.
 pub fn track_cayenne_compaction_duration(duration: Duration, dimensions: &[KeyValue]) {
     cayenne_compaction_duration_ms().record(duration.as_secs_f64() * 1000.0, dimensions);
 }
@@ -543,6 +567,7 @@ fn cayenne_compaction_memory_exhausted() -> &'static Counter<u64> {
 /// Counts compaction passes that failed because the dedicated compaction memory
 /// pool could not satisfy a reservation (`ResourcesExhausted`). A non-zero rate
 /// means the carve fraction is too small for the rewrite working set.
+/// `dimensions` should carry `table` and `kind` (`"full"` | `"subset"`).
 pub fn track_cayenne_compaction_memory_exhausted(dimensions: &[KeyValue]) {
     cayenne_compaction_memory_exhausted().add(1, dimensions);
 }
@@ -618,6 +643,41 @@ pub fn track_cayenne_inline_rewrite_fallback(dimensions: &[KeyValue]) {
                 .build()
         })
         .add(1, dimensions);
+}
+
+static CAYENNE_SCAN_FILES_LISTED: OnceLock<Counter<u64>> = OnceLock::new();
+static CAYENNE_SCAN_FILES_PRUNED: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts Vortex data files considered ("listed") and skipped ("pruned") at
+/// scan listing time via the #11234 footer min/max statistics. The pruned/listed
+/// ratio is the read-amplification signal: sorted compaction tightens per-file
+/// ranges so listing-time pruning skips more files for an aligned filter.
+/// `dimensions` should carry `table`.
+pub fn track_cayenne_scan_files(listed: u64, pruned: u64, dimensions: &[KeyValue]) {
+    if listed > 0 {
+        CAYENNE_SCAN_FILES_LISTED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_listed_total")
+                    .with_description(
+                        "Vortex data files considered at scan listing time (before footer-statistics pruning).",
+                    )
+                    .build()
+            })
+            .add(listed, dimensions);
+    }
+    if pruned > 0 {
+        CAYENNE_SCAN_FILES_PRUNED
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .u64_counter("cayenne_scan_files_pruned_total")
+                    .with_description(
+                        "Vortex data files skipped at scan listing time by footer min/max statistics.",
+                    )
+                    .build()
+            })
+            .add(pruned, dimensions);
+    }
 }
 
 static CAYENNE_INLINE_CACHE_DELTA_POPULATES: OnceLock<Counter<u64>> = OnceLock::new();
@@ -734,6 +794,13 @@ pub struct CayenneAutotuneState {
     pub target_file_size_mb: u64,
     /// Live write/encode concurrency (0 = session default).
     pub write_concurrency: u64,
+    /// Live in-memory CDC durability tier byte cap (`cdc_durability: memory`);
+    /// `0` ⇒ no per-table cap (the process-global mem-tier budget still bounds RAM).
+    pub mem_tier_max_bytes: u64,
+    /// Measured fraction of ingested rows that are deletes (EWMA, `[0, 1]`).
+    pub delete_fraction: f64,
+    /// Arrival-interval coefficient of variation (burstiness); ~0 steady, `> 1` spiky.
+    pub arrival_cv: f64,
 }
 
 static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -747,6 +814,9 @@ static CAYENNE_AT_COMPACTION_INTERVAL_MS: OnceLock<Gauge<u64>> = OnceLock::new()
 static CAYENNE_AT_COMPACTION_TRIGGER_FILES: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_TARGET_FILE_SIZE_MB: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_DELETE_FRACTION: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_ARRIVAL_CV: OnceLock<Gauge<f64>> = OnceLock::new();
 
 /// Emit the auto-tuner state gauges for one table. `dimensions` should carry
 /// `table`. Called on each background tick.
@@ -856,19 +926,48 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.write_concurrency, dimensions);
+    CAYENNE_AT_MEM_TIER_MAX_BYTES
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_autotune_mem_tier_max_bytes")
+                .with_description(
+                    "Current (live) in-memory CDC durability tier byte cap (0 = no per-table cap).",
+                )
+                .with_unit("By")
+                .build()
+        })
+        .record(state.mem_tier_max_bytes, dimensions);
+    CAYENNE_AT_DELETE_FRACTION
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_delete_fraction")
+                .with_description("Measured fraction of ingested rows that are deletes (EWMA).")
+                .build()
+        })
+        .record(state.delete_fraction, dimensions);
+    CAYENNE_AT_ARRIVAL_CV
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .f64_gauge("cayenne_ingest_arrival_cv")
+                .with_description(
+                    "Arrival-interval coefficient of variation (burstiness); ~0 steady, > 1 spiky.",
+                )
+                .build()
+        })
+        .record(state.arrival_cv, dimensions);
 }
 
 static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();
 
 /// Counts dynamic auto-tune adjustments applied. `dimensions` should carry
-/// `table` and `knob`. A non-zero rate means the closed loop is actively
+/// `table` and `actuator`. A non-zero rate means the closed loop is actively
 /// adapting the table to its observed workload.
 pub fn track_cayenne_autotune_adjustment(dimensions: &[KeyValue]) {
     CAYENNE_AT_ADJUSTMENTS
         .get_or_init(|| {
             cayenne_operational_meter()
                 .u64_counter("cayenne_autotune_adjustments_total")
-                .with_description("Dynamic auto-tune adjustments applied, by knob.")
+                .with_description("Dynamic auto-tune adjustments applied, by actuator.")
                 .build()
         })
         .add(1, dimensions);
@@ -880,7 +979,9 @@ static CAYENNE_COMPACTION_MERGED_BYTES: OnceLock<Histogram<u64>> = OnceLock::new
 /// output (≈ the resulting compacted file size). Compare its distribution
 /// against `cayenne_autotune_target_file_size_mb` to see whether compaction is
 /// trending to the target file size or stalling below it (a read-amplification
-/// signal the adaptive tuner cares about). `dimensions` should carry `table`.
+/// signal the adaptive tuner cares about). `dimensions` should carry `table`
+/// and `kind` (currently always `"subset"` — the full current-snapshot rewrite
+/// path does not yet emit this metric).
 pub fn track_cayenne_compaction_merged_bytes(bytes: u64, dimensions: &[KeyValue]) {
     const MIB: f64 = 1024.0 * 1024.0;
     CAYENNE_COMPACTION_MERGED_BYTES
