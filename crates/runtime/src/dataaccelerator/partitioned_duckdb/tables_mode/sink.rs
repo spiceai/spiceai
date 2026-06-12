@@ -17,7 +17,6 @@ limitations under the License.
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use datafusion::common::{Constraints, utils::quote_identifier};
 use datafusion::datasource::sink::DataSink;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::{
@@ -25,12 +24,13 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{DisplayAs, DisplayFormatType, metrics::MetricsSet},
 };
-use datafusion_table_providers::duckdb::{DuckDB, TableDefinition};
-use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+use datafusion_table_providers::duckdb::write::execute_analyze_sql;
+use datafusion_table_providers::duckdb::write_settings::DuckDBWriteSettings;
+use datafusion_table_providers::duckdb::{
+    DuckDB, RelationName, TableDefinition, TableManager, ViewCreator,
+};
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use datafusion_table_providers::util::column_reference::ColumnReference;
-use datafusion_table_providers::util::constraints::get_primary_keys_from_constraints;
-use datafusion_table_providers::util::indexes::IndexType;
+use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use datafusion_table_providers::util::retriable_error::{
     check_and_mark_retriable_error, to_retriable_data_write_error,
@@ -38,11 +38,8 @@ use datafusion_table_providers::util::retriable_error::{
 use duckdb::Transaction;
 use futures::StreamExt;
 use snafu::prelude::*;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::dataaccelerator::UpsertOptions;
+use std::collections::HashMap;
+use std::time::SystemTime;
 use std::{any::Any, fmt, sync::Arc};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -51,33 +48,6 @@ use crate::dataaccelerator::partitioned_duckdb::tables_mode::insert::BatchPartit
 use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::{
     PartitionBufferConfig, PartitionBufferFactory, PartitionData,
 };
-use crate::dataaccelerator::upsert_dedup::deduplicate_batch;
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DuckDBWriteSettings {
-    recompute_statistics_on_write: bool,
-}
-
-impl DuckDBWriteSettings {
-    #[must_use]
-    pub(crate) fn from_params(params: &HashMap<String, String>) -> Self {
-        let recompute_statistics_on_write = params
-            .get("recompute_statistics_on_write")
-            .is_none_or(|value| !value.eq_ignore_ascii_case("false"));
-
-        Self {
-            recompute_statistics_on_write,
-        }
-    }
-}
-
-impl Default for DuckDBWriteSettings {
-    fn default() -> Self {
-        Self {
-            recompute_statistics_on_write: true,
-        }
-    }
-}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -95,26 +65,6 @@ pub enum Error {
     #[snafu(display("Failed to register Arrow scan view for DuckDB ingestion: {source}"))]
     UnableToRegisterArrowScanView { source: duckdb::Error },
 
-    #[snafu(display(
-        "Failed to register Arrow scan view to build DuckDB table creation statement: {source}"
-    ))]
-    UnableToRegisterArrowScanViewForTableCreation { source: duckdb::Error },
-
-    #[snafu(display("Unable to create duckdb table: {source}"))]
-    UnableToCreateDuckDBTable { source: duckdb::Error },
-
-    #[snafu(display("Unable to drop duckdb table: {source}"))]
-    UnableToDropDuckDBTable { source: duckdb::Error },
-
-    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
-    UnableToQueryData { source: duckdb::Error },
-
-    #[snafu(display("Unable to create index on duckdb table: {source}"))]
-    UnableToCreateIndexOnDuckDBTable { source: duckdb::Error },
-
-    #[snafu(display("Unable to rollback transaction: {source}"))]
-    UnableToRollbackTransaction { source: duckdb::Error },
-
     #[snafu(display("Failed to get system time since epoch: {source}"))]
     UnableToGetSystemTime { source: std::time::SystemTimeError },
 
@@ -125,18 +75,6 @@ pub enum Error {
     ConstraintViolation {
         source: datafusion_table_providers::util::constraints::Error,
     },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-static TEMP_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn unique_name_suffix() -> Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context(UnableToGetSystemTimeSnafu)?;
-    let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-    Ok(nanos.saturating_add(TEMP_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)))
 }
 
 #[derive(Clone)]
@@ -151,8 +89,6 @@ pub struct DuckDBPartitionedDataSink {
     overwrite: InsertOp,
     on_conflict: Option<OnConflict>,
     upsert_options: UpsertOptions,
-    constraints: Option<Constraints>,
-    indexes: Vec<(ColumnReference, IndexType)>,
     schema: SchemaRef,
     partitioner: Arc<BatchPartitioner>,
     write_settings: DuckDBWriteSettings,
@@ -182,9 +118,7 @@ impl DataSink for DuckDBPartitionedDataSink {
         let table_definition = Arc::clone(&self.table_definition);
         let overwrite = self.overwrite;
         let on_conflict = self.on_conflict.clone();
-        let indexes = self.indexes.clone();
-        let constraints = self.constraints.clone();
-        let write_settings = self.write_settings;
+        let write_settings = self.write_settings.clone();
 
         let (batch_tx, batch_rx): (
             Sender<(String, PartitionData)>,
@@ -206,8 +140,6 @@ impl DataSink for DuckDBPartitionedDataSink {
                         on_conflict.as_ref(),
                         on_commit_transaction,
                         &schema,
-                        constraints.clone(),
-                        &indexes,
                         &write_settings,
                     )?,
                     InsertOp::Append | InsertOp::Replace => insert_append(
@@ -217,8 +149,6 @@ impl DataSink for DuckDBPartitionedDataSink {
                         on_conflict.as_ref(),
                         on_commit_transaction,
                         &schema,
-                        constraints.clone(),
-                        &indexes,
                         &write_settings,
                     )?,
                 };
@@ -243,26 +173,17 @@ impl DataSink for DuckDBPartitionedDataSink {
             let batches = partitioner.partition_batch(&batch)?;
 
             for (partition_name, batch) in batches {
-                let partition_batches = if let Some(constraints) = &self.constraints {
-                    let deduped_batch = deduplicate_batch(&batch, constraints, &upsert_options)?;
-                    // `validate_batch_with_constraints` now takes an owned `Vec<RecordBatch>` plus
-                    // an `&datafusion_table_providers::util::constraints::UpsertOptions`
-                    // (datafusion-table-providers `sgrebnov/spiceai-53`). Map our local
-                    // (field-identical) `UpsertOptions` to that type; the call is a constraint check
-                    // (dedup already applied above) so its returned batches are discarded.
-                    let tp_upsert_options =
-                        datafusion_table_providers::util::constraints::UpsertOptions::default()
-                            .with_remove_duplicates(upsert_options.remove_duplicates)
-                            .with_last_write_wins(upsert_options.last_write_wins);
+                let partition_batches = if let Some(constraints) =
+                    self.table_definition.constraints()
+                {
                     datafusion_table_providers::util::constraints::validate_batch_with_constraints(
-                        vec![deduped_batch.clone()],
+                        vec![batch],
                         constraints,
-                        &tp_upsert_options,
+                        &upsert_options,
                     )
                     .await
                     .context(ConstraintViolationSnafu)
-                    .map_err(to_datafusion_error)?;
-                    vec![deduped_batch]
+                    .map_err(to_datafusion_error)?
                 } else {
                     vec![batch]
                 };
@@ -324,283 +245,39 @@ impl DataSink for DuckDBPartitionedDataSink {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PartitionTableManager {
-    definition_name: String,
-    table_name: String,
-    schema: SchemaRef,
-    constraints: Option<Constraints>,
-    indexes: Vec<(ColumnReference, IndexType)>,
-}
+/// Creates a new `TableDefinition` for a partition based on an existing table definition.
+///
+/// This helper function creates a new table definition with the specified name while
+/// copying over indexes and constraints from the original table definition.
+fn create_partition_table_definition(
+    base_table_definition: &TableDefinition,
+    partition_table_name: String,
+) -> Arc<TableDefinition> {
+    let mut partition_table_def = TableDefinition::new(
+        RelationName::new(partition_table_name),
+        base_table_definition.schema(),
+    );
 
-impl PartitionTableManager {
-    fn new(
-        definition_name: String,
-        schema: SchemaRef,
-        constraints: Option<Constraints>,
-        indexes: Vec<(ColumnReference, IndexType)>,
-    ) -> Self {
-        Self {
-            table_name: definition_name.clone(),
-            definition_name,
-            schema,
-            constraints,
-            indexes,
-        }
+    // Copy indexes and constraints from the original table definition
+    let indexes = base_table_definition.indexes();
+    if !indexes.is_empty() {
+        partition_table_def = partition_table_def.with_indexes(indexes.to_vec());
     }
 
-    fn from_table_name(
-        definition_name: String,
-        table_name: String,
-        schema: SchemaRef,
-        constraints: Option<Constraints>,
-        indexes: Vec<(ColumnReference, IndexType)>,
-    ) -> Self {
-        Self {
-            definition_name,
-            table_name,
-            schema,
-            constraints,
-            indexes,
-        }
+    if let Some(constraints) = base_table_definition.constraints() {
+        partition_table_def = partition_table_def.with_constraints(constraints.clone());
     }
 
-    fn with_internal(mut self, is_internal: bool) -> Result<Self> {
-        if is_internal {
-            self.table_name = self.generate_internal_name()?;
-        }
-        Ok(self)
-    }
-
-    fn definition_name(&self) -> &str {
-        &self.definition_name
-    }
-
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn generate_internal_name(&self) -> Result<String> {
-        let suffix = unique_name_suffix()?;
-        Ok(format!(
-            "__data_{table_name}_{suffix}",
-            table_name = self.definition_name
-        ))
-    }
-
-    fn create_table(&self, pool: Arc<DuckDbConnectionPool>, tx: &Transaction<'_>) -> Result<()> {
-        let mut db_conn = pool.connect_sync().context(DbConnectionPoolSnafu)?;
-        let duckdb_conn =
-            DuckDB::duckdb_conn(&mut db_conn).map_err(|source| Error::DbConnectionPool {
-                source: Box::new(source),
-            })?;
-
-        let mut create_stmt = self.get_table_create_statement(duckdb_conn)?;
-        let primary_keys = self
-            .constraints
-            .as_ref()
-            .map(|constraints| get_primary_keys_from_constraints(constraints, &self.schema))
-            .unwrap_or_default();
-
-        if !primary_keys.is_empty() && !create_stmt.contains("PRIMARY KEY") {
-            let primary_key_clause = format!(", PRIMARY KEY ({}));", primary_keys.join(", "));
-            create_stmt = create_stmt.replace(");", &primary_key_clause);
-        }
-
-        tx.execute(&create_stmt, [])
-            .context(UnableToCreateDuckDBTableSnafu)?;
-        Ok(())
-    }
-
-    fn get_table_create_statement(&self, duckdb_conn: &mut DuckDbConnection) -> Result<String> {
-        let tx = duckdb_conn
-            .conn
-            .transaction()
-            .context(UnableToBeginTransactionSnafu)?;
-        let empty_batch = RecordBatch::new_empty(Arc::clone(&self.schema));
-        let record_batch_reader = arrow::array::RecordBatchIterator::new(
-            vec![empty_batch].into_iter().map(Ok),
-            Arc::clone(&self.schema),
-        );
-        let stream = FFI_ArrowArrayStream::new(Box::new(record_batch_reader));
-
-        let suffix = unique_name_suffix()?;
-        let view_name = format!(
-            "__scan_{}_{suffix}",
-            sanitize_identifier_fragment(self.table_name())
-        );
-        tx.register_arrow_scan_view(&view_name, &stream)
-            .context(UnableToRegisterArrowScanViewForTableCreationSnafu)?;
-
-        let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM {view_name}",
-            table_name = quote_identifier(self.table_name()),
-            view_name = quote_identifier(&view_name)
-        );
-        tx.execute(&sql, [])
-            .context(UnableToCreateDuckDBTableSnafu)?;
-
-        let create_stmt = tx
-            .query_row(
-                "SELECT sql FROM duckdb_tables() WHERE table_name = ?",
-                [self.table_name()],
-                |row| row.get::<usize, String>(0),
-            )
-            .context(UnableToQueryDataSnafu)?;
-
-        let create_stmt = create_stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS");
-        tx.rollback().context(UnableToRollbackTransactionSnafu)?;
-
-        Ok(create_stmt)
-    }
-
-    fn list_other_internal_tables(&self, tx: &Transaction<'_>) -> Result<Vec<(Self, u64)>> {
-        let pattern = format!("__data_{}%", self.definition_name());
-        let mut stmt = tx
-            .prepare("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE ?")
-            .context(UnableToQueryDataSnafu)?;
-        let mut rows = stmt.query([pattern]).context(UnableToQueryDataSnafu)?;
-
-        let mut tables = Vec::new();
-        while let Some(row) = rows.next().context(UnableToQueryDataSnafu)? {
-            let table_name: String = row.get(0).context(UnableToQueryDataSnafu)?;
-            if table_name == self.table_name {
-                continue;
-            }
-            let Some(inner_name) = table_name.strip_prefix("__data_") else {
-                continue;
-            };
-            let Some((inner_table_name, timestamp)) = inner_name.rsplit_once('_') else {
-                continue;
-            };
-            if inner_table_name != self.definition_name() {
-                continue;
-            }
-            let Ok(timestamp) = timestamp.parse::<u64>() else {
-                continue;
-            };
-            tables.push((
-                Self::from_table_name(
-                    self.definition_name.clone(),
-                    table_name,
-                    Arc::clone(&self.schema),
-                    self.constraints.clone(),
-                    self.indexes.clone(),
-                ),
-                timestamp,
-            ));
-        }
-
-        tables.sort_by_key(|left| left.1);
-        Ok(tables)
-    }
-
-    fn delete_table(&self, tx: &Transaction<'_>) -> Result<()> {
-        tx.execute(
-            &format!(
-                "DROP TABLE IF EXISTS {}",
-                quote_identifier(self.table_name())
-            ),
-            [],
-        )
-        .context(UnableToDropDuckDBTableSnafu)?;
-        Ok(())
-    }
-
-    fn create_view(&self, tx: &Transaction<'_>) -> Result<()> {
-        if self.table_name == self.definition_name {
-            return Ok(());
-        }
-
-        tx.execute(
-            &format!(
-                "CREATE OR REPLACE VIEW {base_table} AS SELECT * FROM {internal_table}",
-                base_table = quote_identifier(self.definition_name()),
-                internal_table = quote_identifier(self.table_name())
-            ),
-            [],
-        )
-        .context(UnableToCreateDuckDBTableSnafu)?;
-        Ok(())
-    }
-
-    fn current_indexes(&self, tx: &Transaction<'_>) -> Result<HashSet<String>> {
-        let mut stmt = tx
-            .prepare("SELECT index_name FROM duckdb_indexes() WHERE table_name = ?")
-            .context(UnableToQueryDataSnafu)?;
-        let mut rows = stmt
-            .query([self.table_name()])
-            .context(UnableToQueryDataSnafu)?;
-
-        let mut indexes = HashSet::new();
-        while let Some(row) = rows.next().context(UnableToQueryDataSnafu)? {
-            indexes.insert(
-                row.get::<usize, String>(0)
-                    .context(UnableToQueryDataSnafu)?,
-            );
-        }
-        Ok(indexes)
-    }
-
-    fn create_indexes(&self, tx: &Transaction<'_>) -> Result<()> {
-        for (index_index, (columns, index_type)) in self.indexes.iter().enumerate() {
-            let unique = if *index_type == IndexType::Unique {
-                "UNIQUE "
-            } else {
-                ""
-            };
-            let index_name = self.index_name(index_index, columns);
-            let columns = columns
-                .iter()
-                .map(quote_identifier)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "CREATE {unique}INDEX IF NOT EXISTS {index_name} ON {table_name} ({columns})",
-                index_name = quote_identifier(&index_name),
-                table_name = quote_identifier(self.table_name())
-            );
-            tx.execute(&sql, [])
-                .context(UnableToCreateIndexOnDuckDBTableSnafu)?;
-        }
-        Ok(())
-    }
-
-    fn index_name(&self, index_index: usize, columns: &ColumnReference) -> String {
-        let columns = columns.iter().collect::<Vec<_>>().join("_");
-        format!(
-            "idx_{}_{}_{}",
-            sanitize_identifier_fragment(self.table_name()),
-            index_index,
-            sanitize_identifier_fragment(&columns)
-        )
-    }
-}
-
-fn sanitize_identifier_fragment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
-}
-
-fn execute_analyze_sql(tx: &Transaction<'_>, table_name: &str) {
-    let sql = format!("ANALYZE {}", quote_identifier(table_name));
-    if let Err(error) = tx.execute(&sql, []) {
-        tracing::warn!("Failed to analyze DuckDB table {table_name}: {error}");
-    }
+    Arc::new(partition_table_def)
 }
 
 impl DuckDBPartitionedDataSink {
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         pool: Arc<DuckDbConnectionPool>,
         table_definition: Arc<TableDefinition>,
         overwrite: InsertOp,
         on_conflict: Option<OnConflict>,
         upsert_options: UpsertOptions,
-        constraints: Option<Constraints>,
-        indexes: Vec<(ColumnReference, IndexType)>,
         schema: SchemaRef,
         partitioner: Arc<BatchPartitioner>,
     ) -> Self {
@@ -610,8 +287,6 @@ impl DuckDBPartitionedDataSink {
             overwrite,
             on_conflict,
             upsert_options,
-            constraints,
-            indexes,
             schema,
             partitioner,
             write_settings: DuckDBWriteSettings::default(),
@@ -647,7 +322,6 @@ impl DisplayAs for DuckDBPartitionedDataSink {
     }
 }
 
-#[expect(clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref)]
 fn insert_overwrite(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
@@ -655,8 +329,6 @@ fn insert_overwrite(
     on_conflict: Option<&OnConflict>,
     on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
-    constraints: Option<Constraints>,
-    indexes: &[(ColumnReference, IndexType)],
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
@@ -675,16 +347,13 @@ fn insert_overwrite(
 
     // Snapshot all existing partition tables (main views) before writing new data,
     // so we can later drop any views and internal tables that are not present in the latest refresh.
-    let mut candidates_to_drop =
-        get_existing_partition_tables(&tx, table_definition, schema, constraints.clone(), indexes)?;
+    let mut candidates_to_drop = get_existing_partition_tables(&tx, table_definition)?;
 
     tracing::debug!("Initial load for {}", table_definition.name());
     let (num_rows, tables) = write_to_tables(
         table_definition,
         &tx,
         schema,
-        constraints,
-        indexes,
         batch_rx,
         on_conflict,
         &cloned_pool,
@@ -713,11 +382,11 @@ fn insert_overwrite(
             })?;
 
         if write_settings.recompute_statistics_on_write {
-            execute_analyze_sql(&tx, new_table.table_name());
+            execute_analyze_sql(&tx, &new_table.table_name().to_string());
         }
 
         // partition still exists so should NOT be deleted
-        candidates_to_drop.remove(new_table.definition_name());
+        candidates_to_drop.remove(&new_table.definition_name().to_string());
     }
 
     // Drop obsolete partition tables that no longer exist after the latest full refresh.
@@ -755,7 +424,6 @@ fn insert_overwrite(
     Ok(num_rows)
 }
 
-#[expect(clippy::too_many_arguments, clippy::trivially_copy_pass_by_ref)]
 fn insert_append(
     pool: Arc<DuckDbConnectionPool>,
     table_definition: &Arc<TableDefinition>,
@@ -763,8 +431,6 @@ fn insert_append(
     on_conflict: Option<&OnConflict>,
     on_commit_transaction: tokio::sync::oneshot::Receiver<()>,
     schema: &SchemaRef,
-    constraints: Option<Constraints>,
-    indexes: &[(ColumnReference, IndexType)],
     write_settings: &DuckDBWriteSettings,
 ) -> datafusion::common::Result<u64> {
     let cloned_pool = Arc::clone(&pool);
@@ -790,8 +456,6 @@ fn insert_append(
         table_definition,
         &tx,
         schema,
-        constraints,
-        indexes,
         batch_rx,
         on_conflict,
         &cloned_pool,
@@ -801,7 +465,7 @@ fn insert_append(
 
     if write_settings.recompute_statistics_on_write {
         for table in &tables {
-            execute_analyze_sql(&tx, table.table_name());
+            execute_analyze_sql(&tx, &table.table_name().to_string());
         }
     }
 
@@ -850,24 +514,21 @@ fn insert_append(
     Ok(num_rows)
 }
 
-#[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn write_to_tables(
     table_definition: &Arc<TableDefinition>,
     tx: &Transaction<'_>,
     schema: &SchemaRef,
-    constraints: Option<Constraints>,
-    indexes: &[(ColumnReference, IndexType)],
     mut data_batches: Receiver<(String, PartitionData)>,
     on_conflict: Option<&OnConflict>,
     pool: &Arc<DuckDbConnectionPool>,
     with_internal: bool,
-) -> datafusion::common::Result<(u64, Vec<Arc<PartitionTableManager>>)> {
+) -> datafusion::common::Result<(u64, Vec<Arc<TableManager>>)> {
     let mut total_rows = 0u64;
 
     let start_main = SystemTime::now();
 
     // Track which partitions have already been created to avoid duplicate table creation and return back
-    let mut created_partitions: HashMap<String, Arc<PartitionTableManager>> = HashMap::new();
+    let mut created_partitions: HashMap<String, Arc<TableManager>> = HashMap::new();
 
     tracing::debug!(
         "Starting partitioned table writes for {}",
@@ -883,20 +544,18 @@ fn write_to_tables(
         } else {
             // Create new partition table
             let partition_table_name = format!("{partition}/{}", table_definition.name());
+            let partition_table_def =
+                create_partition_table_definition(table_definition, partition_table_name);
+
             let partition_table = Arc::new(
-                PartitionTableManager::new(
-                    partition_table_name,
-                    Arc::clone(schema),
-                    constraints.clone(),
-                    indexes.to_vec(),
-                )
-                .with_internal(with_internal)
-                .map_err(to_datafusion_error)?,
+                TableManager::new(partition_table_def)
+                    .with_internal(with_internal)
+                    .map_err(table_providers_duckdb_to_datafusion_error)?,
             );
 
             partition_table
                 .create_table(Arc::clone(pool), tx)
-                .map_err(to_datafusion_error)?;
+                .map_err(table_providers_duckdb_to_datafusion_error)?;
 
             created_partitions.insert(partition.clone(), Arc::clone(&partition_table));
             partition_table
@@ -946,50 +605,35 @@ fn write_to_tables(
     Ok((total_rows, created_partitions.into_values().collect()))
 }
 
-#[expect(clippy::needless_pass_by_value)]
 fn write_data_chunk_to_table(
-    table: &PartitionTableManager,
+    table: &TableManager,
     tx: &Transaction<'_>,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
     on_conflict: Option<&OnConflict>,
 ) -> datafusion::common::Result<u64> {
-    let batch_reader =
-        arrow::array::RecordBatchIterator::new(batches.into_iter().map(Ok), Arc::clone(&schema));
+    let batch_reader = arrow::array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
     let stream = FFI_ArrowArrayStream::new(Box::new(batch_reader));
 
-    let suffix = unique_name_suffix().map_err(to_datafusion_error)?;
+    let current_ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context(UnableToGetSystemTimeSnafu)
+        .map_err(to_datafusion_error)?
+        .as_millis();
 
-    let view_name = format!(
-        "__scan_{}_{suffix}",
-        sanitize_identifier_fragment(table.table_name())
-    );
+    let view_name = format!("__scan_{}_{current_ts}", table.table_name());
 
     tx.register_arrow_scan_view(&view_name, &stream)
         .context(UnableToRegisterArrowScanViewSnafu)
         .map_err(to_datafusion_error)?;
 
-    let mut insert_sql = format!(
-        "INSERT INTO {table_name} SELECT * FROM {view_name}",
-        table_name = quote_identifier(table.table_name()),
-        view_name = quote_identifier(&view_name)
-    );
-    if let Some(on_conflict) = on_conflict {
-        let on_conflict_sql = on_conflict.build_on_conflict_statement(&schema);
-        insert_sql.push(' ');
-        insert_sql.push_str(&on_conflict_sql);
-    }
-    let rows = tx
-        .execute(&insert_sql, [])
-        .context(UnableToCreateDuckDBTableSnafu)
-        .map_err(to_datafusion_error)?;
+    let view = ViewCreator::from_name(RelationName::new(view_name));
+    let rows = view
+        .insert_into(table, tx, on_conflict)
+        .map_err(table_providers_duckdb_to_datafusion_error)?;
 
-    tx.execute(
-        &format!("DROP VIEW IF EXISTS {}", quote_identifier(&view_name)),
-        [],
-    )
-    .context(UnableToDropDuckDBTableSnafu)
-    .map_err(to_datafusion_error)?;
+    view.drop(tx)
+        .map_err(table_providers_duckdb_to_datafusion_error)?;
 
     Ok(rows as u64)
 }
@@ -1004,13 +648,13 @@ fn write_data_chunk_to_table(
 /// # Errors
 /// Returns a `DataFusion` error if the SQL execution fails or if the file cannot be read
 fn write_parquet_file_to_table(
-    table: &PartitionTableManager,
+    table: &TableManager,
     tx: &Transaction<'_>,
     file_path: &std::path::Path,
 ) -> datafusion::common::Result<u64> {
     let sql = format!(
-        "INSERT INTO {table_name} SELECT * FROM read_parquet(?, hive_partitioning=false)",
-        table_name = quote_identifier(table.table_name())
+        r#"INSERT INTO "{table_name}" SELECT * FROM read_parquet(?, hive_partitioning=false)"#,
+        table_name = table.table_name()
     );
 
     let file_path_str = file_path.to_string_lossy();
@@ -1032,14 +676,10 @@ fn write_parquet_file_to_table(
 }
 
 /// Gets all existing partition tables for a given base table definition.
-#[expect(clippy::needless_pass_by_value)]
 fn get_existing_partition_tables(
     tx: &Transaction<'_>,
     base_table_definition: &Arc<TableDefinition>,
-    schema: &SchemaRef,
-    constraints: Option<Constraints>,
-    indexes: &[(ColumnReference, IndexType)],
-) -> datafusion::common::Result<HashMap<String, PartitionTableManager>> {
+) -> datafusion::common::Result<HashMap<String, TableManager>> {
     let base_table_name = base_table_definition.name();
 
     let pattern = format!("%/{base_table_name}");
@@ -1054,15 +694,9 @@ fn get_existing_partition_tables(
 
     while let Some(row) = rows.next().map_err(to_retriable_data_write_error)? {
         let table_name: String = row.get(0).map_err(to_retriable_data_write_error)?;
-        existing_partitions.insert(
-            table_name.clone(),
-            PartitionTableManager::new(
-                table_name,
-                Arc::clone(schema),
-                constraints.clone(),
-                indexes.to_vec(),
-            ),
-        );
+        let partition_table_def =
+            create_partition_table_definition(base_table_definition, table_name.clone());
+        existing_partitions.insert(table_name, TableManager::new(partition_table_def));
     }
 
     Ok(existing_partitions)
@@ -1071,13 +705,13 @@ fn get_existing_partition_tables(
 /// Drops a partition view used by full refresh and all its associated internal tables.
 ///
 /// # Arguments
-/// * `view` - The partition view to drop. This should be the view itself, not an internal table used by the view.
+/// * `view` - The [`TableManager`] representing the partition view to drop. This should be the view itself, not an internal table used by the view.
 /// * `tx` - The active `DuckDB` transaction used to execute the drop operations.
 ///
 /// # Errors
 /// Returns an error if any internal table or the view cannot be dropped.
 fn drop_partition_view(
-    view: &PartitionTableManager,
+    view: &TableManager,
     tx: &Transaction<'_>,
 ) -> datafusion::common::Result<()> {
     tracing::debug!(
@@ -1096,10 +730,7 @@ fn drop_partition_view(
     }
 
     tx.execute(
-        &format!(
-            "DROP VIEW IF EXISTS {}",
-            quote_identifier(view.table_name())
-        ),
+        &format!(r#"DROP VIEW IF EXISTS "{}""#, view.table_name()),
         [],
     )
     .map_err(to_retriable_data_write_error)?;
@@ -1111,25 +742,25 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
+fn table_providers_duckdb_to_datafusion_error(
+    error: datafusion_table_providers::duckdb::Error,
+) -> DataFusionError {
+    DataFusionError::External(Box::new(error))
+}
+
 #[cfg(test)]
 mod test {
     use crate::dataaccelerator::partitioned_duckdb::tables_mode::partition_buffer::config::PartitionBufferType;
 
     use super::*;
     use arrow::array::{Int64Array, StringArray};
-    use datafusion::catalog::TableProviderFactory;
-    use datafusion::common::{TableReference, ToDFSchema};
     use datafusion::execution::TaskContext;
-    use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::CreateExternalTable;
     use datafusion::physical_plan::RecordBatchStream;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::col;
-    use datafusion_table_providers::duckdb::write::DuckDBTableWriter;
     use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
     use runtime_table_partition::expression::PartitionedBy;
-    use std::ops::Deref;
-    use std::thread;
+    use std::{thread, time::Duration};
 
     fn get_mem_duckdb() -> Arc<DuckDbConnectionPool> {
         Arc::new(
@@ -1137,68 +768,16 @@ mod test {
         )
     }
 
-    struct TestTableDefinition {
-        definition: Arc<TableDefinition>,
-        schema: SchemaRef,
-    }
-
-    impl TestTableDefinition {
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-    }
-
-    impl Deref for TestTableDefinition {
-        type Target = Arc<TableDefinition>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.definition
-        }
-    }
-
-    fn get_test_schema() -> SchemaRef {
-        Arc::new(arrow::datatypes::Schema::new(vec![
+    fn get_test_table_definition() -> Arc<TableDefinition> {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
             arrow::datatypes::Field::new("region", arrow::datatypes::DataType::Utf8, false),
-        ]))
-    }
+        ]));
 
-    async fn get_test_table_definition() -> TestTableDefinition {
-        let schema = get_test_schema();
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema))
-            .expect("to convert Arrow schema to DataFusion schema");
-        let cmd = CreateExternalTable {
-            schema: df_schema,
-            name: TableReference::bare("test_table"),
-            location: String::new(),
-            file_type: String::new(),
-            table_partition_cols: vec![],
-            if_not_exists: true,
-            or_replace: false,
-            definition: None,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::new(),
-            constraints: Constraints::new_unverified(vec![]),
-            column_defaults: HashMap::default(),
-            temporary: false,
-        };
-
-        let factory = crate::dataaccelerator::duckdb::create_factory();
-        let ctx = SessionContext::new();
-        let table_provider = factory
-            .create(&ctx.state(), &cmd)
-            .await
-            .expect("to create DuckDB table provider");
-        let writer = table_provider
-            .as_any()
-            .downcast_ref::<DuckDBTableWriter>()
-            .expect("DuckDB table provider should be a writer");
-
-        TestTableDefinition {
-            definition: writer.table_definition(),
+        Arc::new(TableDefinition::new(
+            RelationName::new("test_table"),
             schema,
-        }
+        ))
     }
 
     fn make_partition_batch(schema: &SchemaRef, region: &str, ids: &[i64]) -> RecordBatch {
@@ -1216,24 +795,23 @@ mod test {
     }
 
     fn verify_state_after_write(
-        tx: &Transaction<'_>,
-        table_definition: &TestTableDefinition,
+        tx: &duckdb::Transaction,
+        table_definition: &Arc<TableDefinition>,
         target_partitions: &[&str],
         expected_rows_per_partition: i64,
         should_have_internal_tables: bool,
     ) {
         for partition in target_partitions {
             let partition_table_name = format!("{partition}/{}", table_definition.name());
-            let partitioned_table = PartitionTableManager::new(
-                partition_table_name,
-                table_definition.schema(),
-                None,
-                Vec::new(),
+
+            let partitioned_table_definition = TableDefinition::new(
+                RelationName::new(partition_table_name),
+                Arc::clone(&table_definition.schema()),
             );
 
             // Verify that partitioned tables were created (one for each region)
-            let mut internal_tables = partitioned_table
-                .list_other_internal_tables(tx)
+            let mut internal_tables = partitioned_table_definition
+                .list_internal_tables(tx)
                 .expect("to list internal tables");
 
             if should_have_internal_tables {
@@ -1247,7 +825,7 @@ mod test {
                 // Verify that data was written to a partitioned table
                 let rows = tx
                     .query_row(
-                        &format!("SELECT COUNT(1) FROM \"{}\"", table_name.table_name()),
+                        &format!("SELECT COUNT(1) FROM \"{table_name}\""),
                         [],
                         |row| row.get::<_, i64>(0),
                     )
@@ -1269,7 +847,7 @@ mod test {
                 .query_row(
                     &format!(
                         "SELECT COUNT(1) FROM \"{view_name}\"",
-                        view_name = partitioned_table.definition_name()
+                        view_name = partitioned_table_definition.name()
                     ),
                     [],
                     |row| row.get::<_, i64>(0),
@@ -1284,22 +862,20 @@ mod test {
     }
 
     fn verify_partition_does_not_exist(
-        tx: &Transaction<'_>,
-        table_definition: &TestTableDefinition,
+        tx: &duckdb::Transaction,
+        table_definition: &Arc<TableDefinition>,
         partition_name: &str,
         with_internal: bool,
     ) {
         let partition_table_name = format!("{partition_name}/{}", table_definition.name());
-        let partitioned_table = PartitionTableManager::new(
-            partition_table_name,
-            table_definition.schema(),
-            None,
-            Vec::new(),
+        let partitioned_table_definition = TableDefinition::new(
+            RelationName::new(partition_table_name),
+            Arc::clone(&table_definition.schema()),
         );
 
         if with_internal {
-            let internal_tables = partitioned_table
-                .list_other_internal_tables(tx)
+            let internal_tables = partitioned_table_definition
+                .list_internal_tables(tx)
                 .expect("to list internal tables");
 
             assert_eq!(
@@ -1311,7 +887,7 @@ mod test {
 
         let main_table_exists_result = tx.query_row(
             "SELECT COUNT(1) FROM information_schema.tables WHERE table_name = ?1",
-            [partitioned_table.definition_name().to_string()],
+            [partitioned_table_definition.name().to_string()],
             |row| row.get::<_, i64>(0),
         );
 
@@ -1326,56 +902,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn sanitize_identifier_fragment_replaces_partition_separators() {
-        assert_eq!(
-            sanitize_identifier_fragment("region=us-east-1/test_table"),
-            "region_us_east_1_test_table"
-        );
-    }
-
-    #[test]
-    fn unique_name_suffix_does_not_collide_for_fast_calls() {
-        let suffixes = (0..256)
-            .map(|_| unique_name_suffix().expect("suffix generation should succeed"))
-            .collect::<HashSet<_>>();
-
-        assert_eq!(suffixes.len(), 256);
-    }
-
-    #[test]
-    fn current_indexes_queries_duckdb_indexes_table_function() {
-        let pool = get_mem_duckdb();
-        let schema = get_test_schema();
-        let table_name = "region=us-east-1/test_table";
-        let mut conn = pool.connect_sync().expect("to connect");
-        let duckdb = DuckDB::duckdb_conn(&mut conn).expect("to get duckdb conn");
-        let tx = duckdb.conn.transaction().expect("to begin transaction");
-
-        tx.execute(
-            &format!(
-                "CREATE TABLE {} (id BIGINT, region VARCHAR)",
-                quote_identifier(table_name)
-            ),
-            [],
-        )
-        .expect("to create table");
-        tx.execute(
-            &format!(
-                "CREATE INDEX {} ON {} (id)",
-                quote_identifier("idx_current_indexes_test"),
-                quote_identifier(table_name)
-            ),
-            [],
-        )
-        .expect("to create index");
-
-        let table = PartitionTableManager::new(table_name.to_string(), schema, None, Vec::new());
-        let indexes = table.current_indexes(&tx).expect("to query indexes");
-
-        assert!(indexes.contains("idx_current_indexes_test"));
-    }
-
     #[tokio::test]
     async fn test_write_overwrite() {
         // Test scenario:
@@ -1384,7 +910,7 @@ mod test {
         // Expected behavior: Data sink creates partitioned tables, writes data to them, and creates views, old internal tables are deleted
         let pool = get_mem_duckdb();
 
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
 
         // Create partitioner by name - partition by "region" column
         let partitioned_by = PartitionedBy {
@@ -1407,8 +933,6 @@ mod test {
             InsertOp::Overwrite,
             None,
             UpsertOptions::default(),
-            None,
-            Vec::new(),
             table_definition.schema(),
             partitioner,
         );
@@ -1508,7 +1032,7 @@ mod test {
         // Expected behavior: Old partition table should be removed, only new partition should exist
         let pool = get_mem_duckdb();
 
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
 
         // Create partitioner by name - partition by "region" column
         let partitioned_by = PartitionedBy {
@@ -1531,8 +1055,6 @@ mod test {
             InsertOp::Overwrite,
             None,
             UpsertOptions::default(),
-            None,
-            Vec::new(),
             table_definition.schema(),
             partitioner,
         );
@@ -1623,10 +1145,10 @@ mod test {
         tx2.rollback().expect("to rollback");
     }
 
-    #[tokio::test]
-    async fn test_insert_overwrite_waits_for_commit_signal() {
+    #[test]
+    fn test_insert_overwrite_waits_for_commit_signal() {
         let pool = get_mem_duckdb();
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
         let schema = table_definition.schema();
 
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(2);
@@ -1635,11 +1157,10 @@ mod test {
         let batch = make_partition_batch(&schema, "us-east-1", &[1, 2]);
 
         batch_tx
-            .send((
+            .blocking_send((
                 "region=us-east-1".to_string(),
                 PartitionData::Batches(vec![batch]),
             ))
-            .await
             .expect("to send partition batch");
         drop(batch_tx);
 
@@ -1658,12 +1179,12 @@ mod test {
                     None,
                     commit_rx,
                     &schema,
-                    None,
-                    &[],
                     &write_settings,
                 )
             }
         });
+
+        thread::sleep(Duration::from_millis(50));
 
         commit_tx.send(()).expect("to send commit signal");
 
@@ -1675,10 +1196,10 @@ mod test {
         assert_eq!(rows, 2, "expected rows to be written after commit signal");
     }
 
-    #[tokio::test]
-    async fn test_insert_append_waits_for_commit_signal() {
+    #[test]
+    fn test_insert_append_waits_for_commit_signal() {
         let pool = get_mem_duckdb();
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
         let schema = table_definition.schema();
 
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(2);
@@ -1687,11 +1208,10 @@ mod test {
         let batch = make_partition_batch(&schema, "us-west-1", &[10, 11, 12]);
 
         batch_tx
-            .send((
+            .blocking_send((
                 "region=us-west-1".to_string(),
                 PartitionData::Batches(vec![batch]),
             ))
-            .await
             .expect("to send partition batch");
         drop(batch_tx);
 
@@ -1710,12 +1230,12 @@ mod test {
                     None,
                     commit_rx,
                     &schema,
-                    None,
-                    &[],
                     &write_settings,
                 )
             }
         });
+
+        thread::sleep(Duration::from_millis(50));
 
         commit_tx.send(()).expect("to send commit signal");
 
@@ -1735,7 +1255,7 @@ mod test {
         // Expected behavior: Data sink creates partitioned tables, writes data to them
         let pool = get_mem_duckdb();
 
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
 
         // Create partitioner by name - partition by "region" column
         let partitioned_by = PartitionedBy {
@@ -1758,8 +1278,6 @@ mod test {
             InsertOp::Append,
             None,
             UpsertOptions::default(),
-            None,
-            Vec::new(),
             table_definition.schema(),
             partitioner,
         );
@@ -1848,7 +1366,7 @@ mod test {
         // Test scenario: Use parquet buffer instead of memory buffer
         // Expected behavior: Data sink creates partitioned tables using parquet files as intermediate storage
         let pool = get_mem_duckdb();
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
 
         // Create partitioner by name - partition by "region" column
         let partitioned_by = PartitionedBy {
@@ -1878,8 +1396,6 @@ mod test {
             InsertOp::Overwrite,
             None,
             UpsertOptions::default(),
-            None,
-            Vec::new(),
             table_definition.schema(),
             partitioner,
         )
@@ -1933,7 +1449,7 @@ mod test {
         // Test scenario: Large batch that exceeds partition threshold multiple times with parquet buffer
         // Expected behavior: Multiple parquet files created and flushed to DuckDB
         let pool = get_mem_duckdb();
-        let table_definition = get_test_table_definition().await;
+        let table_definition = get_test_table_definition();
 
         let partitioned_by = PartitionedBy {
             name: "region".to_string(),
@@ -1962,8 +1478,6 @@ mod test {
             InsertOp::Overwrite,
             None,
             UpsertOptions::default(),
-            None,
-            Vec::new(),
             table_definition.schema(),
             partitioner,
         )

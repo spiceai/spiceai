@@ -241,11 +241,11 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
             let Some(maybe_duck_exec) =
                 SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&p)?
             else {
-                return exec_err!("DuckDBAggregatePushdownMarkerExec was found with no DuckSqlExec child. This is a bug.");
+                return exec_err!("DuckDBAggregatePushdownMarkerExec was found with no DuckSqlExec child. This is a bug.")
             };
 
             let Some(duck_exec) = concrete!(maybe_duck_exec, ConcreteDuckSqlExec) else {
-                return exec_err!("Cannot cast DuckSqlExec for rewriting. This is a bug.");
+                return exec_err!("Cannot cast DuckSqlExec for rewriting. This is a bug.")
             };
 
             let optimized_sql = unparser.plan_to_sql(&marker.logical_plan)?;

@@ -66,7 +66,6 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
     pub fn new() -> Arc<Self> {
         Arc::new(DuckDBIntermediateIndexMaterializationOptimizer {})
     }
-
     /// Split a SQL AST expression into conjunctive parts
     /// This mimics `datafusion::logical_expr::utils::split_conjunction` but for SQL AST
     fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
@@ -374,6 +373,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Find DuckSqlExec
         let Some(exec) = SearchVisitor::first_concrete_down::<ConcreteDuckSqlExec>(&plan)? else {
             return Ok(plan);
         };
@@ -386,6 +386,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
             return Ok(plan);
         }
 
+        // Get its SQL + statement
         let sql = duck_exec.sql().map_err(|e| {
             DataFusionError::Execution(format!("Unable to generate DuckDB SQL: {e}"))
         })?;
@@ -403,6 +404,7 @@ impl PhysicalOptimizerRule for DuckDBIntermediateIndexMaterializationOptimizer {
 
         let old_exec_key = PlanNodeKey::from(exec.as_ref());
 
+        // Finally, replace the old DuckSqlExec with the optimized one
         let transformed = plan.transform_down(|node| {
             let node_key = PlanNodeKey::from(node.as_ref());
 

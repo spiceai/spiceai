@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    any::Any,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::{any::Any, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -30,9 +27,7 @@ use datafusion::{
 use datafusion_expr::LogicalPlanBuilder;
 use datafusion_table_providers::{
     duckdb::{DuckDB, RelationName, TableDefinition},
-    sql::db_connection_pool::{
-        dbconnection::duckdbconn::DuckDbConnection, duckdbpool::DuckDbConnectionPool,
-    },
+    sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
 use futures::future::try_join_all;
 use llms::embeddings::Embed;
@@ -55,9 +50,6 @@ pub use hnsw::DuckDBHnswOptions;
 pub use metric::DuckDBDistanceMetric;
 
 use query_table::DuckDBVectorQueryTable;
-
-static VSS_INSTALLED: OnceLock<()> = OnceLock::new();
-static VSS_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone)]
 pub struct DuckDBVectorQueryContext {
@@ -119,27 +111,23 @@ impl DuckDBVectorIndex {
     }
 
     /// Creates (or no-ops if already present) the HNSW index for this vector column on
-    /// the given DuckDB table. Loads and installs VSS as needed.
+    /// the given DuckDB table. VSS is statically linked into our DuckDB build (see
+    /// duckdb-sources/extension/vss) and auto-loaded; the pool's `LOAD vss` connection
+    /// setup query makes it available, so no `INSTALL vss` is required.
     fn create_hnsw_index_on_table(
         &self,
         table_name: &str,
-        conn: &DuckDbConnection,
+        conn: &duckdb::Connection,
     ) -> DataFusionResult<()> {
         let embedding_column = embedding_col(&self.embedded_column);
-        install_vss_once(conn)?;
-        conn.conn
-            .execute("LOAD vss", [])
-            .map_err(to_execution_error)?;
-        conn.conn
-            .execute("SET hnsw_enable_experimental_persistence = true", [])
+        conn.execute("LOAD vss", []).map_err(to_execution_error)?;
+        conn.execute("SET hnsw_enable_experimental_persistence = true", [])
             .map_err(to_execution_error)?;
         let index_name = DuckDBHnswOptions::index_name_for(table_name, &embedding_column);
         let create_sql = self
             .hnsw
             .create_index_sql(table_name, &embedding_column, &index_name);
-        conn.conn
-            .execute(&create_sql, [])
-            .map_err(to_execution_error)?;
+        conn.execute(&create_sql, []).map_err(to_execution_error)?;
 
         tracing::debug!(
             table = %table_name,
@@ -283,8 +271,9 @@ impl Index for DuckDBVectorIndex {
                 .connect_sync()
                 .map_err(to_execution_error)?;
             let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_execution_error)?;
-            let table_name = resolve_current_table_name(ctx.table_definition.name(), duckdb_conn)?;
-            index.create_hnsw_index_on_table(&table_name, duckdb_conn)
+            let table_name =
+                resolve_current_table_name(ctx.table_definition.name(), &duckdb_conn.conn)?;
+            index.create_hnsw_index_on_table(&table_name, &duckdb_conn.conn)
         })
         .await
         .map_err(|e| DataFusionError::Execution(format!("HNSW index creation task failed: {e}")))?
@@ -295,37 +284,13 @@ impl Index for DuckDBVectorIndex {
 // Shared utilities
 // ---------------------------------------------------------------------------
 
-fn install_vss_once(conn: &DuckDbConnection) -> DataFusionResult<()> {
-    if VSS_INSTALLED.get().is_some() {
-        return Ok(());
-    }
-
-    let _install_guard = VSS_INSTALL_LOCK.lock().map_err(|error| {
-        DataFusionError::Execution(format!("Failed to lock DuckDB VSS install guard: {error}"))
-    })?;
-    if VSS_INSTALLED.get().is_none() {
-        if conn.conn.execute("LOAD vss", []).is_ok() {
-            let _ = VSS_INSTALLED.set(());
-            return Ok(());
-        }
-
-        conn.conn
-            .execute("INSTALL vss", [])
-            .map_err(to_execution_error)?;
-        let _ = VSS_INSTALLED.set(());
-    }
-
-    Ok(())
-}
-
 pub(super) fn resolve_current_table_name(
     table_rel_name: &RelationName,
-    conn: &DuckDbConnection,
+    conn: &duckdb::Connection,
 ) -> DataFusionResult<String> {
     let definition_name = table_rel_name.to_string();
     let prefix = format!("__data_{definition_name}_");
     let mut stmt = conn
-        .conn
         .prepare("SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, ?)")
         .map_err(to_execution_error)?;
     let rows = stmt

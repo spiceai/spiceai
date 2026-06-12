@@ -291,10 +291,6 @@ mod tests {
     /// here — keeping this free of cross-test interference.
     #[tokio::test]
     async fn acquire_encode_permits_is_noop_when_unset() {
-        assert!(
-            acquire_encode_permits(8, WriteClass::Delta)
-                .await
-                .is_none()
-        );
+        assert!(acquire_encode_permits(8, WriteClass::Delta).await.is_none());
     }
 }

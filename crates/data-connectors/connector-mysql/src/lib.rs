@@ -192,25 +192,17 @@ impl DataConnectorFactory for MySQLFactory {
                 );
             }
 
-            let zero_date_behavior = match params.parameters.get("zero_date_behavior").ok() {
-                Some(value) if value.expose_secret().eq_ignore_ascii_case("null") => {
-                    MysqlZeroDateBehavior::Null
-                }
-                Some(value) if value.expose_secret().eq_ignore_ascii_case("error") => {
-                    MysqlZeroDateBehavior::Error
-                }
-                Some(value) => {
-                    return Err(DataConnectorError::InvalidConfigurationNoSource {
-                        dataconnector: "mysql".to_string(),
-                        connector_component: params.component.clone(),
-                        message: format!(
-                            "Invalid zero_date_behavior value '{}'. Expected 'null' or 'error'.",
-                            value.expose_secret()
-                        ),
-                    }
-                    .into());
-                }
-                None => MysqlZeroDateBehavior::default(),
+            let zero_date_behavior = match params
+                .parameters
+                .get("zero_date_behavior")
+                .ok()
+                .map(|s| s.expose_secret().to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("error") => MysqlZeroDateBehavior::Error,
+                // `one_of_ignore_ascii_case` validation has already rejected anything other
+                // than "null" / "error"; default + any other value falls through to Null.
+                _ => MysqlZeroDateBehavior::Null,
             };
 
             if let Some(time_zone) = params.parameters.get("time_zone").expose().ok() {
