@@ -1502,9 +1502,9 @@ mod tests {
             vec![
                 byte_key(0),
                 byte_key(1),
-                wide_key.clone(),
+                wide_key,
                 byte_key(3),
-                empty_key.clone(),
+                empty_key,
                 byte_key(6),
             ], // alternating + width mix + fused entry
             vec![byte_key(2), byte_key(2), byte_key(3), byte_key(2)], // duplicates

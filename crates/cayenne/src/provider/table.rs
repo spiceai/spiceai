@@ -16774,13 +16774,13 @@ mod tests {
     /// that listing.
     #[test]
     fn retired_dir_grace_elapses_past_retirement_and_listing() {
-        let grace = std::time::Duration::from_secs(120);
+        let grace = std::time::Duration::from_mins(2);
         let t0 = std::time::Instant::now();
         // Within grace of retirement: not due.
         assert!(!CayenneTableProvider::retired_dir_grace_elapsed(
             t0,
             None,
-            t0 + std::time::Duration::from_secs(60),
+            t0 + std::time::Duration::from_mins(1),
             grace
         ));
         // Grace fully past retirement, never listed: due.
@@ -20828,7 +20828,7 @@ mod tests {
     /// Pins that DF53's hash-join DYNAMIC filter installs probe-side pruning
     /// even when the fact table has a resident in-memory CDC tier (the scan is
     /// then union(file branch, bare memory branch)). Verified to HOLD today at
-    /// this shape — DataFusion routes the pushdown through the union per-child
+    /// this shape — `DataFusion` routes the pushdown through the union per-child
     /// and installs on the file branch — so this guards against a future
     /// regression in that routing. NOTE: the SF-100 dimension-join slowdown
     /// under memory mode (q20 322ms -> 65s, supplier-join set 4-200x) is NOT
@@ -20934,6 +20934,11 @@ mod tests {
     /// mem_tier_apply_throughput --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "timed perf repro; run explicitly with --ignored --nocapture"]
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        reason = "perf-repro arithmetic on small constants (KEYS/WINDOW/round ≪ 2^52)"
+    )]
     async fn mem_tier_apply_throughput_stays_flat_under_checkpoint_loop() {
         const KEYS: i64 = 100_000; // fixed keyspace — every round supersedes
         const ROUNDS: usize = 48;
@@ -21230,12 +21235,12 @@ mod tests {
         // reinsert_sequence and NO per-key insert_record.
         insert_batch(
             &provider,
-            id_value_batch(Arc::clone(&schema), &ids, &vec![100; 8]),
+            id_value_batch(Arc::clone(&schema), &ids, &[100; 8]),
         )
         .await;
         insert_batch(
             &provider,
-            id_value_batch(Arc::clone(&schema), &ids, &vec![200; 8]),
+            id_value_batch(Arc::clone(&schema), &ids, &[200; 8]),
         )
         .await;
 
