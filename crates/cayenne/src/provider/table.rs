@@ -1936,6 +1936,20 @@ pub struct CayenneTableProvider {
     /// append-heavy inline CDC writes don't query the metastore after every
     /// burst just to decide whether to checkpoint.
     inlined_row_count: Arc<AtomicI64>,
+    /// Physical row count of the DURABLE inline corpus (`cayenne_inlined_data`)
+    /// ONLY — unlike [`Self::inlined_row_count`], which also nets in resident
+    /// mem-tier rows. Drives the zero-corpus fast path in
+    /// `rebuild_inlined_cache_full`: when this reads exactly 0 the rebuild
+    /// installs an empty generation-current view WITHOUT a metastore round
+    /// trip (the dominant rebuild cost when CDC flows purely through the RAM
+    /// tier). Initialized from the authoritative metastore count at open
+    /// (the tier is empty then, so the count IS the durable corpus), adjusted
+    /// by every durable inline publish (`publish_inlined_mutation` — the
+    /// single funnel for `commit_inlined_mutation` commits), re-synced from
+    /// authoritative catalog stats reads, and zeroed by checkpoint clears /
+    /// overwrite. Conservative: the fast path requires exactly 0; any other
+    /// value falls through to the full metastore read.
+    durable_inlined_row_count: Arc<AtomicI64>,
     /// Inline-memtable cache generation counter.
     ///
     /// Incremented (with `Release` ordering) by every
@@ -3069,12 +3083,12 @@ struct MergedScanDeletions {
 }
 
 /// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
-/// tier rows being encoded into the new snapshot), keyed by deletion
-/// strategy. Splits the tier's tombstones at durable-commit time: a tombstoned
-/// key WITH a corpus row was re-inserted after its delete and must carry the
-/// reinsert marker so the flushed row stays visible; a tombstoned key WITHOUT
-/// one is a pure delete and must be committed delete-only (a phantom reinsert
-/// marker would resurrect older durable copies on the main scan path). See
+/// tier rows being encoded into the new snapshot), keyed by deletion strategy.
+/// Splits the tier's tombstones at durable-commit time: a tombstoned key WITH a
+/// corpus row was re-inserted after its delete and must carry the reinsert
+/// marker so the flushed row stays visible; a tombstoned key WITHOUT one is a
+/// pure delete and must be committed delete-only (a phantom reinsert marker
+/// would resurrect older durable copies on the main scan path). See
 /// `commit_mem_tier_checkpoint_metadata`.
 enum CheckpointCorpusKeys {
     Int64(HashSet<i64>),
@@ -5327,6 +5341,9 @@ impl CayenneTableProvider {
             table_memory,
             inline_checkpoint_scheduled: Arc::new(AtomicBool::new(false)),
             inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
+            // At open the mem tier is empty, so the metastore count fetched
+            // above is exactly the durable-corpus row count.
+            durable_inlined_row_count: Arc::new(AtomicI64::new(inlined_row_count)),
             inlined_generation: Arc::new(AtomicU64::new(0)),
             inlined_structural_epoch: Arc::new(AtomicU64::new(0)),
             merged_scan_deletions: Arc::new(arc_swap::ArcSwapOption::const_empty()),
@@ -6124,6 +6141,7 @@ impl CayenneTableProvider {
             table_memory: Arc::clone(&self.table_memory),
             inline_checkpoint_scheduled: Arc::clone(&self.inline_checkpoint_scheduled),
             inlined_row_count: Arc::clone(&self.inlined_row_count),
+            durable_inlined_row_count: Arc::clone(&self.durable_inlined_row_count),
             inlined_generation: Arc::clone(&self.inlined_generation),
             inlined_structural_epoch: Arc::clone(&self.inlined_structural_epoch),
             merged_scan_deletions: Arc::clone(&self.merged_scan_deletions),
@@ -8027,7 +8045,21 @@ impl CayenneTableProvider {
         published_seq: Option<i64>,
     ) {
         let appended_rows = i64::try_from(appended_rows).unwrap_or(i64::MAX);
-        self.adjust_cached_inlined_row_count(appended_rows.saturating_sub(removed_rows));
+        let durable_delta = appended_rows.saturating_sub(removed_rows);
+        self.adjust_cached_inlined_row_count(durable_delta);
+        // Mirror the delta onto the durable-corpus-only counter (the
+        // zero-corpus rebuild fast path): this publish is the single in-memory
+        // funnel for durable `cayenne_inlined_data` commits, and the commit
+        // durably inserted `appended_rows` rows and removed `removed_rows`
+        // rows. Adjusted BEFORE the generation bump below, so a reader that
+        // observes the new generation (`Acquire`) also observes the updated
+        // count; a reader racing ahead of the bump may still see 0, which is
+        // exactly the pre-publish state its watermark capture hides anyway.
+        let _ = self.durable_inlined_row_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(durable_delta)),
+        );
         // Advance the visibility watermark BEFORE bumping the generation: the
         // generation bump's `Release` store (paired with the Acquire load in
         // `read_inlined_batches`) publishes the watermark store, so a scan that
@@ -8081,6 +8113,12 @@ impl CayenneTableProvider {
     /// entry: an inline rewrite/removal, a newly published tombstone (whose
     /// re-filter can hide rows in older cached entries), a checkpoint clear, an
     /// overwrite that wipes the inline tables, and open-time orphan recovery.
+    ///
+    /// A mem-tier (RAM) append is deliberately EXEMPT even though it adds
+    /// tombstones: those tombstones live in the tier snapshot, are never baked
+    /// into the cached view, and every consumer re-applies them at use-site
+    /// against the tier snapshot it captured (`pruned_inlined_batches`) — so
+    /// the cached view stays valid across appends. See `append_to_mem_tier`.
     fn bump_inlined_structural_epoch(&self) {
         self.inlined_structural_epoch
             .fetch_add(1, Ordering::Release);
@@ -11570,6 +11608,9 @@ impl CayenneTableProvider {
     /// the cached entries are still a valid base) would be unsound.
     pub(crate) fn invalidate_inlined_cache(&self) {
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        // The durable corpus was wiped atomically with the catalog operation
+        // that triggered this invalidation.
+        self.durable_inlined_row_count.store(0, Ordering::Relaxed);
         // cycle-5 TASK 1: the corpus was wiped/replaced, so pending tombstone
         // removals reference rows that no longer exist — drop them. The structural
         // bump below fences off any concurrent delta cache built against the old
@@ -12567,6 +12608,29 @@ impl CayenneTableProvider {
         // the next delta miss (an idempotent no-op if already reflected). This is
         // exactly analogous to `materialized_through_sequence` above.
         let tombstone_delta_seq = self.pending_tombstone_deltas.lock().seq;
+
+        // Zero-corpus fast path: when the durable inline corpus is provably
+        // empty (`durable_inlined_row_count` — maintained by every durable
+        // inline publish/clear and re-synced from authoritative catalog stats
+        // reads — is exactly 0), skip the metastore round trip and install an
+        // empty generation-current view directly. This is byte-equivalent to
+        // the `inlined.is_empty()` branch below (empty view, no deletion-map
+        // load): the only durable rows the counter can lag are commits whose
+        // publish has not run yet, and those carry a sequence above the
+        // watermark captured above, so the full read would skip them too. The
+        // common hit is memory-mode CDC (rows flow through the RAM tier and
+        // the corpus stays empty between durable fallbacks), but the gate is
+        // equally valid in file mode after a checkpoint clear. Conservative:
+        // any non-zero value takes the full read.
+        if self.durable_inlined_row_count.load(Ordering::Relaxed) == 0 {
+            return Ok(Self::assemble_inlined_cache(
+                generation,
+                structural_epoch,
+                materialized_through_sequence,
+                tombstone_delta_seq,
+                Vec::new(),
+            ));
+        }
 
         let inlined = self
             .catalog
@@ -13617,9 +13681,12 @@ impl CayenneTableProvider {
     /// `delete_sequence = base` for the tombstones (hiding prior copies of
     /// superseded PKs) and `data_sequence = base + 1` for the appended rows (so
     /// the fresh rows are visible above their own tombstones). The visibility
-    /// swap happens under the listing fence and is published by an
-    /// `inlined_generation` bump, exactly like the durable inline path — so a
-    /// concurrent scan observes the append atomically.
+    /// swap is a single `ArcSwap` store of the new tier under the
+    /// `mem_tier_publish_lock`, so a concurrent scan captures the pre- or
+    /// post-append tier atomically. The inline cache generation/structural
+    /// epoch are deliberately NOT bumped — the append never touches the durable
+    /// inline corpus, and tier tombstones are applied per scan against the
+    /// scan's captured tier snapshot (see the invariant comment in the body).
     ///
     /// Does NOT persist a durable BLOB and does NOT advance the source slot; the
     /// slot ack is deferred to [`Self::checkpoint_mem_tier`]. The caller has
@@ -13721,13 +13788,32 @@ impl CayenneTableProvider {
             // throughput bottleneck (an eager lock-held O(tier) re-filter
             // measured ~72% of `cdc_path_inmemory`).
             self.mem_tier.store(Arc::new(next));
-            // A new tombstone can retroactively hide rows already materialized in
-            // a cached inline/mem view, so this is a STRUCTURAL change (full
-            // re-read on the next scan), matching the durable tombstone path.
-            self.bump_inlined_structural_epoch();
+            // INVARIANT — a mem-tier append must NOT bump `inlined_generation`
+            // or `inlined_structural_epoch`: it never mutates the metastore
+            // inline corpus, so the cached inline VIEW (`inlined_cache`) remains
+            // a valid materialization of the durable corpus. Visibility of
+            // inline rows superseded by this append's tombstones is enforced PER
+            // SCAN at use-site: `pruned_inlined_batches` re-filters the captured
+            // view against the scan's CAPTURED tier snapshot
+            // (`apply_tombstone_removal_to_entry` against
+            // `mem_tier_deletion_maps(mem_tier)`), and file-backed rows are
+            // hidden via the merged deletion snapshot
+            // (`merged_deletion_snapshot`) plus the per-branch key filters.
+            // Bumping here (the previous behavior) forced every concurrent scan
+            // into a full metastore rebuild per append; under sustained CDC,
+            // appends outpaced rebuilds and `scan()` starved in its
+            // capture-retry loop until a checkpoint zeroed the row count.
+            // Durable-path mutations (inline rewrite/insert, tombstone publish,
+            // checkpoint clears, overwrite, open-time recovery) still bump —
+            // only the RAM-tier append is exempt.
+            //
             // Keep the merged-scan-deletions memo CURRENT in lockstep: extend it
             // by this append's tombstone delta (O(delta)) and re-key it to the
-            // post-append (version, structural-epoch). Without this the memo can
+            // post-append tier version (the structural epoch is unchanged by a
+            // tier append — see the invariant above — so the stored key matches
+            // what a scan-time `merged_deletion_snapshot` lookup computes; a
+            // concurrent durable structural bump simply misses the memo and
+            // rebuilds, exactly as before). Without this the memo can
             // never hit under sustained CDC (every append re-keys the tier) and
             // each scan pays an O(tier) merged-index rebuild — the churn-coupled
             // 175-247x collapse the `mem_tier_join_shapes` live lanes measure.
@@ -14258,6 +14344,9 @@ impl CayenneTableProvider {
                 .await?;
             self.inlined_row_count
                 .store(stats.record_count, Ordering::Relaxed);
+            // Authoritative catalog read: re-sync the durable-corpus counter.
+            self.durable_inlined_row_count
+                .store(stats.record_count, Ordering::Relaxed);
 
             if stats.entry_count > 0 {
                 tracing::info!(
@@ -14397,6 +14486,9 @@ impl CayenneTableProvider {
             .clear_inlined_data_and_deletes(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count.store(0, Ordering::Relaxed);
+        // The durable corpus is now empty: arm the zero-corpus rebuild fast
+        // path (the structural bump below forces that rebuild).
+        self.durable_inlined_row_count.store(0, Ordering::Relaxed);
         // b1★ (cycle-4): the catalog `DELETE FROM cayenne_inlined_delete` above
         // removed EVERY tombstone for this table, including any whose durable
         // `published = 1` flip was still deferred (recorded in
@@ -14499,6 +14591,9 @@ impl CayenneTableProvider {
             .get_inlined_data_stats(&self.table_metadata.table_id)
             .await?;
         self.inlined_row_count
+            .store(stats.record_count, Ordering::Relaxed);
+        // Authoritative catalog read: re-sync the durable-corpus counter.
+        self.durable_inlined_row_count
             .store(stats.record_count, Ordering::Relaxed);
 
         let Some(pressure) = inline_memtable_pressure_with_thresholds(
@@ -16321,10 +16416,55 @@ impl TableProvider for CayenneTableProvider {
         // triple atomically under `scan_state_lock.read()`. This serializes with
         // non-staged publish paths that update the deletion view and protected
         // snapshot map without taking the listing fence.
+        //
+        // The capture is BOUNDED. Each miss (the cached inline view is not
+        // generation-current) drops the guard, rebuilds the cache, and retries;
+        // on the FINAL attempt the just-rebuilt view is accepted EVEN IF the
+        // live generation advanced again during the rebuild. That is safe: the
+        // deletion snapshot and protected-snapshot map captured in the SAME
+        // read-locked block are at-least-as-new as the view, mem-tier tombstones
+        // are re-applied to the view at use-site against the scan's captured
+        // tier snapshot (`pruned_inlined_batches` below), and file-backed rows
+        // flow through the merged deletion snapshot + per-branch key filters —
+        // so a row the (at-most-one-rebuild-stale) view has not baked out is
+        // still hidden downstream. Without the bound, any writer that advances
+        // the generation faster than one rebuild completes (a durable-publish
+        // burst) starves this scan indefinitely.
+        let max_capture_attempts: u32 = 3;
+        let capture_wait_start = Instant::now();
+        let mut capture_attempts: u32 = 0;
         let (deletion_snapshot, protected_map, inlined_view) = loop {
+            capture_attempts += 1;
+            let final_attempt = capture_attempts >= max_capture_attempts;
             let captured = {
                 let _view_guard = self.scan_state_lock.read().await;
-                self.try_read_inlined_view_for_scan().map(|inlined_view| {
+                let view = match self.try_read_inlined_view_for_scan() {
+                    Some(view) => Some(view),
+                    // Final attempt: accept the freshest available view (the
+                    // rebuild preceding this attempt stored a real, at most
+                    // one-rebuild-stale cache). The WARN doubles as the
+                    // scan-starvation instrumentation; it is naturally
+                    // rate-limited by firing only after the generation outran
+                    // a full rebuild on every prior attempt.
+                    None if final_attempt => {
+                        tracing::warn!(
+                            target: "cayenne::scan",
+                            table = %self.table_metadata.table_name,
+                            attempts = capture_attempts,
+                            waited_ms = u64::try_from(
+                                capture_wait_start.elapsed().as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                            "inlined-view capture kept missing under concurrent \
+                             inline publishes; accepting the freshest rebuilt \
+                             view (the deletion + tier snapshots captured in \
+                             this same block keep visibility correct)"
+                        );
+                        Some(Arc::clone(&self.inlined_cache.load().view))
+                    }
+                    None => None,
+                };
+                view.map(|inlined_view| {
                     (
                         self.pk_deletion_snapshot(),
                         self.protected_snapshots.load_full(),
@@ -21234,6 +21374,358 @@ mod tests {
             query_count_star(&ctx, &reopened, "mem_tier_cross_tier").await,
             3,
             "reopened disk-tier state must preserve exact COUNT(*)"
+        );
+    }
+
+    /// A RAM-tier CDC append must NOT invalidate the inline-view cache: it
+    /// never mutates the metastore inline corpus, so `append_to_mem_tier`
+    /// (exercised here via the memory-mode CDC upsert path; the delete-only
+    /// entry `write_cdc_delete_keys_in_memory` delegates to the same append)
+    /// must leave `inlined_generation` AND `inlined_structural_epoch`
+    /// untouched and the cached view entry reusable — while the appended rows
+    /// are still immediately visible to scans (tier visibility is the
+    /// `ArcSwap` tier swap, not a generation bump). The pre-fix per-append
+    /// structural bump forced every concurrent scan into a full metastore
+    /// rebuild, which sustained CDC could outrun indefinitely (scan
+    /// starvation).
+    #[tokio::test]
+    async fn mem_tier_append_does_not_invalidate_inline_cache() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "mem_append_keeps_inline_cache",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed PK=1 into the DURABLE inline corpus and warm the cached view.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let view_before = provider
+            .cached_inlined_view()
+            .await
+            .expect("warm the inline view cache");
+        assert!(!view_before.is_empty(), "precondition: PK=1 must be inline");
+        let gen_before = provider.inlined_generation();
+        let epoch_before = provider.inlined_structural_epoch();
+        let durable_rows_before = provider.durable_inlined_row_count.load(Ordering::Relaxed);
+
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[2], &[20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("memory-mode CDC append");
+        assert_eq!(
+            write.in_memory_epoch(),
+            Some(1),
+            "precondition: the append must take the RAM-tier path"
+        );
+
+        assert_eq!(
+            provider.inlined_generation(),
+            gen_before,
+            "a mem-tier append must not advance inlined_generation"
+        );
+        assert_eq!(
+            provider.inlined_structural_epoch(),
+            epoch_before,
+            "a mem-tier append must not advance the structural epoch"
+        );
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            durable_rows_before,
+            "a mem-tier append must not change the durable-corpus row counter"
+        );
+        let view_after = provider
+            .cached_inlined_view()
+            .await
+            .expect("inline view stays readable");
+        assert!(
+            Arc::ptr_eq(&view_before, &view_after),
+            "the cached inline view entry must be REUSED (no rebuild) across a mem-tier append"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "mem_append_keeps_inline_cache").await,
+            vec![(1, 10), (2, 20)],
+            "tier rows must be visible to scans without any generation bump"
+        );
+    }
+
+    /// The no-bump invariant's correctness half: an inline view captured BEFORE
+    /// a RAM-tier append (the cache is deliberately NOT invalidated by the
+    /// append) must still hide an inline row whose PK that append tombstones,
+    /// because visibility is enforced at use-site — `pruned_inlined_batches`
+    /// re-filters the captured view against the scan's captured tier snapshot —
+    /// not by the view being pre-filtered at build time.
+    #[tokio::test]
+    async fn stale_inline_view_refiltered_against_captured_tier_hides_superseded_row() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "stale_view_tier_refilter",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Seed PK=1 inline and capture the view BEFORE the tier append.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        let view_before_append = provider
+            .cached_inlined_view()
+            .await
+            .expect("capture the pre-append inline view");
+        assert!(
+            !view_before_append.is_empty(),
+            "precondition: PK=1 must be inline"
+        );
+
+        // RAM-tier upsert of PK=1: appends the new row to the tier and
+        // tombstones the prior (inline) copy IN THE TIER only.
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[100])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("memory-mode CDC upsert of the inline PK");
+        assert_eq!(
+            write.in_memory_epoch(),
+            Some(1),
+            "precondition: the upsert must take the RAM-tier path"
+        );
+
+        // Use-site filter: the OLD view re-filtered against the tier snapshot
+        // captured AFTER the append (exactly the scan-time pairing) must hide
+        // the superseded inline copy.
+        let tier_after_append = provider.mem_tier.load_full();
+        let visible = provider
+            .pruned_inlined_batches(&view_before_append, &tier_after_append, None)
+            .expect("re-filter the captured view against the captured tier");
+        let visible_pairs = collect_id_value_pairs_from_batches(&visible);
+        assert!(
+            visible_pairs.iter().all(|(id, _)| *id != 1),
+            "the tier tombstone must hide the superseded inline copy of PK=1 \
+             from the pre-append view, got {visible_pairs:?}"
+        );
+
+        // End-to-end: a real scan serves the PK exactly once, with the new value.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "stale_view_tier_refilter").await,
+            vec![(1, 100)],
+            "exactly one visible copy of PK=1 (the tier row), old inline copy hidden"
+        );
+    }
+
+    /// The scan-time inlined-view capture loop is BOUNDED. With a pathological
+    /// concurrent writer advancing `inlined_generation` continuously (a
+    /// generation-current capture can never be observed), the scan must still
+    /// complete — accepting the freshest rebuilt view on the final attempt and
+    /// emitting the starvation WARN — instead of spinning until the churn
+    /// stops (the pre-fix behavior, which this test would turn into a hang /
+    /// timeout failure).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_capture_loop_bounded_under_continuous_generation_churn() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_inline_enabled_upsert_table("scan_capture_bounded", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // Inline rows must be present, or the empty-corpus short-circuit
+        // bypasses the capture loop entirely.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        assert!(provider.cached_inlined_row_count() > 0);
+
+        // Churn thread: advance the generation continuously so EVERY
+        // generation-currency check in the capture loop misses.
+        let generation = Arc::clone(&provider.inlined_generation);
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    generation.fetch_add(1, Ordering::Release);
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        let scan_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.scan(&ctx.state(), None, &[], None),
+        )
+        .await;
+        stop.store(true, Ordering::Release);
+        churn.join().expect("churn thread joins");
+
+        let plan = scan_result
+            .expect(
+                "scan must terminate within the attempt bound under continuous generation churn",
+            )
+            .expect("scan plan builds");
+
+        // The accepted (at-most-one-rebuild-stale) view must still serve the
+        // inline row exactly once.
+        let mut stream = datafusion_physical_plan::execute_stream(plan, ctx.task_ctx())
+            .expect("execute churned scan plan");
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.expect("batch"));
+        }
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&batches),
+            vec![(1, 10)],
+            "the scan built under churn must serve the inline row exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_delete_only_publish_decrements_durable_inline_counter() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_inline_enabled_upsert_table("durable_delete_only_counter", ctx.runtime_env())
+                .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            1,
+            "precondition: one row is resident in the durable inline corpus"
+        );
+
+        provider.publish_inlined_mutation(0, 1, None);
+
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            0,
+            "a durable delete-only publish must decrement the durable inline corpus"
+        );
+    }
+
+    /// Zero-corpus rebuild fast path: when the durable inline corpus is
+    /// provably empty, an inline-cache rebuild must not touch the metastore.
+    /// Proven by renaming `cayenne_inlined_data` out from under the catalog
+    /// via a direct `SQLite` connection: the rebuild succeeds (installing an
+    /// empty generation-current view) iff it skipped the read, and flipping
+    /// the durable-count signal to non-zero makes the SAME rebuild fail —
+    /// proving the gate is exactly the durable-corpus counter.
+    #[tokio::test]
+    async fn inline_rebuild_skips_metastore_when_durable_corpus_empty() {
+        let ctx = SessionContext::new();
+        let runtime_env = ctx.runtime_env();
+        let (provider, _catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+            "zero_corpus_rebuild_fast_path",
+            Arc::clone(&runtime_env),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            0,
+            "precondition: a fresh table has an empty durable inline corpus"
+        );
+
+        // Rows resident in RAM only: the durable corpus stays empty while the
+        // table is non-empty (the exact CDC memory-mode steady state).
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let write = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1], &[10])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("memory-mode CDC append");
+        assert_eq!(write.in_memory_epoch(), Some(1));
+        assert!(
+            provider.cached_inlined_row_count() > 0,
+            "the resident row count includes tier rows"
+        );
+        assert_eq!(
+            provider.durable_inlined_row_count.load(Ordering::Relaxed),
+            0,
+            "tier rows must not count toward the durable corpus"
+        );
+
+        // Poison the metastore read path: any `get_inlined_data` round trip
+        // from here on errors with `no such table`.
+        let db_path = tmp.path().join("metadata").join("cayenne.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open metastore db directly");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("busy timeout");
+        conn.execute_batch(
+            "ALTER TABLE cayenne_inlined_data RENAME TO cayenne_inlined_data_hidden;",
+        )
+        .expect("hide the inline-data table");
+
+        // Force a structural miss (the full-rebuild path) and rebuild: the
+        // zero-corpus fast path must succeed WITHOUT the metastore read.
+        provider.bump_inlined_structural_epoch();
+        let batches = provider
+            .read_inlined_batches()
+            .await
+            .expect("zero-corpus rebuild must skip the metastore round trip");
+        assert!(batches.is_empty(), "the installed view is empty");
+
+        // Control: a non-zero durable-count signal must take the metastore
+        // read — which the rename poisons — proving the fast path (not luck)
+        // carried the previous rebuild.
+        provider
+            .durable_inlined_row_count
+            .store(1, Ordering::Relaxed);
+        provider.bump_inlined_structural_epoch();
+        assert!(
+            provider.read_inlined_batches().await.is_err(),
+            "a non-empty durable-corpus signal must reach the (poisoned) metastore read"
+        );
+
+        // Restore the empty signal: the fast path applies again.
+        provider
+            .durable_inlined_row_count
+            .store(0, Ordering::Relaxed);
+        provider.bump_inlined_structural_epoch();
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("fast path applies again once the signal is 0")
+                .is_empty()
+        );
+
+        // Un-poison and verify the table still scans end-to-end.
+        conn.execute_batch(
+            "ALTER TABLE cayenne_inlined_data_hidden RENAME TO cayenne_inlined_data;",
+        )
+        .expect("restore the inline-data table");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "zero_corpus_rebuild_fast_path").await,
+            vec![(1, 10)],
+            "the RAM-tier row remains visible throughout"
         );
     }
 
