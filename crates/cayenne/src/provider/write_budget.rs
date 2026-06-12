@@ -191,10 +191,9 @@ async fn acquire_from(
             )
         }
     };
-    let main_count = gate.as_ref().map_or_else(
-        || shards.clamp(1, budget.total),
-        |g| -> usize { g.num_permits().max(1) },
-    );
+    let main_count = gate
+        .as_ref()
+        .map_or_else(|| shards.clamp(1, budget.total), |g| g.num_permits().max(1));
     let main_count = u32::try_from(main_count).unwrap_or(u32::MAX);
     let main = Arc::clone(&budget.semaphore)
         .acquire_many_owned(main_count)
