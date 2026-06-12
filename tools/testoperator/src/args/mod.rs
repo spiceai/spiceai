@@ -102,6 +102,14 @@ pub struct CommonArgs {
     #[arg(short, long, default_value = "spiced")]
     pub(crate) spiced_path: String,
 
+    /// Launch spiced on this SSH target (`[user@]host`) instead of locally. With this
+    /// set, `--spiced-path` refers to the spiced binary ON that host. testoperator
+    /// drives the OLTP load + source Postgres locally (loopback-fast) while spiced runs
+    /// on the remote box and replicates over the network — and owns the remote spiced
+    /// lifecycle end-to-end (launch, readiness, teardown), so no manual orchestration.
+    #[arg(long)]
+    pub(crate) spiced_host: Option<String>,
+
     /// The number of seconds to wait for the spiced instance to become ready
     #[arg(long, default_value = "30")]
     pub(crate) ready_wait: u64,

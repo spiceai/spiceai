@@ -65,7 +65,25 @@ pub enum SpicedInstance {
         tempdir: TempDir,
         version: SpicedVersion,
     },
+    /// A spiced instance launched and owned by testoperator on a remote host over
+    /// SSH. Addressed like [`SpicedInstance::External`] (Flight/HTTP/metrics URLs
+    /// point at the remote host); its process lifecycle is managed via SSH.
+    Remote {
+        ssh_target: String,
+        flight_url: String,
+        http_base_url: String,
+        metrics_url: String,
+        remote_pid: Option<u32>,
+        remote_workdir: String,
+        version: SpicedVersion,
+    },
 }
+
+/// Fixed ports the remote spiced binds (and that testoperator addresses it on).
+/// These match spiced's defaults so no host-side config is required.
+const REMOTE_FLIGHT_PORT: u16 = 50051;
+const REMOTE_HTTP_PORT: u16 = 8090;
+const REMOTE_METRICS_PORT: u16 = 9090;
 
 pub struct StartRequest {
     spiced_path: PathBuf,
@@ -73,6 +91,9 @@ pub struct StartRequest {
     tempdir: TempDir,
     data_dir: Option<PathBuf>,
     additional_args: Vec<String>,
+    /// When set, spiced is launched on this SSH target (`[user@]host`) instead of
+    /// locally. `spiced_path` is then interpreted as the spiced path on that host.
+    spiced_host: Option<String>,
     prepared: bool,
 }
 
@@ -85,12 +106,25 @@ impl StartRequest {
             prepared: false,
             data_dir: None,
             additional_args: Vec::new(),
+            spiced_host: None,
         })
     }
 
     #[must_use]
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = Some(data_dir);
+        self
+    }
+
+    /// Launch spiced on a remote host over SSH instead of locally.
+    ///
+    /// `ssh_target` is an `[user@]host` accepted by `ssh`/`scp`. This decouples
+    /// the spiced (accelerator) box from the box running testoperator + the OLTP
+    /// load + source Postgres — so the OLTP path stays loopback-fast while spiced
+    /// gets its own machine. testoperator owns the remote lifecycle end-to-end.
+    #[must_use]
+    pub fn with_spiced_host(mut self, ssh_target: Option<String>) -> Self {
+        self.spiced_host = ssh_target;
         self
     }
 
@@ -190,6 +224,13 @@ impl SpicedInstance {
     /// - If the spiced instance fails to start
     /// - If the spicepod definition fails to serialize
     pub async fn start(mut start_request: StartRequest) -> Result<Self> {
+        // Remote launch: spiced runs on another host over SSH. testoperator owns
+        // its full lifecycle, so the decoupled topology is a single command with
+        // no manual start/stop/ordering steps.
+        if let Some(ssh_target) = start_request.spiced_host.clone() {
+            return Self::start_remote(start_request, ssh_target);
+        }
+
         // Check if spiced is already running
         let spiced_path_str = start_request.spiced_path.to_string_lossy().to_string();
         if spiced_path_str.starts_with("http://") || spiced_path_str.starts_with("https://") {
@@ -262,13 +303,87 @@ impl SpicedInstance {
         })
     }
 
-    #[must_use]
-    pub fn version(&self) -> &str {
-        let Self::Owned { version, .. } = self else {
-            return "unknown";
+    /// Launch spiced on `ssh_target` over SSH and return a [`SpicedInstance::Remote`].
+    ///
+    /// `spiced_path` is the path to the spiced binary ON the remote host. The
+    /// serialized spicepod is shipped to a remote working directory and spiced is
+    /// launched from there (it reads `spicepod.yaml` from its cwd), bound on
+    /// `0.0.0.0` so the box running testoperator + the OLTP load can reach it. The
+    /// instance owns the remote process and tears it down on `stop`/drop.
+    ///
+    /// # Errors
+    /// - SSH/scp failures, a failed version probe, or a missing launch PID.
+    fn start_remote(mut start_request: StartRequest, ssh_target: String) -> Result<Self> {
+        if !start_request.prepared {
+            start_request.prepare()?;
+        }
+        let host = remote_host(&ssh_target);
+        let spiced_path = start_request.spiced_path.to_string_lossy().to_string();
+        let workdir = format!("/tmp/testoperator-spiced-{}", std::process::id());
+        let spicepod_local = start_request.tempdir.path().join("spicepod.yaml");
+
+        // 1. Remote working dir + ship the spicepod.
+        ssh_run(&ssh_target, &format!("mkdir -p {workdir}"))?;
+        scp_to_remote(&spicepod_local, &ssh_target, &format!("{workdir}/spicepod.yaml"))?;
+
+        // 2. Probe the remote spiced version (also validates the binary is present).
+        let version_out = ssh_run(&ssh_target, &format!("{spiced_path} --version"))?;
+        let version = short_version(String::from_utf8_lossy(&version_out.stdout).trim());
+
+        // 3. Launch spiced detached, capturing its PID. Drop any inherited
+        //    `--metrics` pair — we bind it on the reachable interface ourselves.
+        let extra = strip_metrics_args(&start_request.additional_args).join(" ");
+        let launch = format!(
+            "cd {workdir} && nohup {spiced_path} --telemetry-enabled=false \
+             --flight 0.0.0.0:{REMOTE_FLIGHT_PORT} --metrics 0.0.0.0:{REMOTE_METRICS_PORT} {extra} \
+             </dev/null >{workdir}/spiced.log 2>&1 & echo $!"
+        );
+        let launch_out = ssh_run(&ssh_target, &launch)?;
+        let Some(remote_pid) = String::from_utf8_lossy(&launch_out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()
+        else {
+            anyhow::bail!(
+                "Remote spiced launch returned no PID (stdout={:?} stderr={:?})",
+                String::from_utf8_lossy(&launch_out.stdout),
+                String::from_utf8_lossy(&launch_out.stderr),
+            );
         };
 
-        version.0.as_str()
+        eprintln!(
+            "Launched remote spiced on {ssh_target} (pid {remote_pid}, workdir {workdir}); \
+             Flight http://{host}:{REMOTE_FLIGHT_PORT}"
+        );
+
+        Ok(Self::Remote {
+            ssh_target,
+            flight_url: format!("http://{host}:{REMOTE_FLIGHT_PORT}"),
+            http_base_url: format!("http://{host}:{REMOTE_HTTP_PORT}"),
+            metrics_url: format!("http://{host}:{REMOTE_METRICS_PORT}/metrics"),
+            remote_pid: Some(remote_pid),
+            remote_workdir: workdir,
+            version: SpicedVersion::new(version),
+        })
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        match self {
+            Self::Owned { version, .. } | Self::Remote { version, .. } => version.0.as_str(),
+            Self::Existing | Self::External { .. } => "unknown",
+        }
+    }
+
+    /// The `/metrics` URL to scrape, when it differs from the local default
+    /// (i.e. for a [`SpicedInstance::Remote`] on another host). `None` means the
+    /// caller should use its built-in local default.
+    #[must_use]
+    pub fn metrics_url(&self) -> Option<&str> {
+        match self {
+            Self::Remote { metrics_url, .. } => Some(metrics_url.as_str()),
+            _ => None,
+        }
     }
 
     pub fn get_tempdir_path(&self) -> Result<PathBuf> {
@@ -308,7 +423,9 @@ impl SpicedInstance {
         }
 
         let flight_url = match self {
-            Self::External { flight_url, .. } => flight_url.as_str(),
+            Self::External { flight_url, .. } | Self::Remote { flight_url, .. } => {
+                flight_url.as_str()
+            }
             Self::Existing | Self::Owned { .. } => FLIGHT_URL,
         };
 
@@ -349,7 +466,9 @@ impl SpicedInstance {
         };
 
         let flight_url = match self {
-            Self::External { flight_url, .. } => flight_url.as_str(),
+            Self::External { flight_url, .. } | Self::Remote { flight_url, .. } => {
+                flight_url.as_str()
+            }
             Self::Existing | Self::Owned { .. } => FLIGHT_URL,
         };
 
@@ -386,7 +505,9 @@ impl SpicedInstance {
     #[must_use]
     pub fn http_base_url(&self) -> &str {
         match self {
-            Self::External { http_base_url, .. } => http_base_url.as_str(),
+            Self::External { http_base_url, .. } | Self::Remote { http_base_url, .. } => {
+                http_base_url.as_str()
+            }
             Self::Existing | Self::Owned { .. } => HTTP_BASE_URL,
         }
     }
@@ -438,28 +559,51 @@ impl SpicedInstance {
     ///
     /// - If the spiced instance fails to exit
     pub fn stop(&mut self) -> Result<()> {
-        let Self::Owned { child, .. } = self else {
-            return Ok(());
-        };
+        match self {
+            Self::Owned { child, .. } => {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // Send a SIGTERM to the spiced instance and wait for it to exit
+                    let Ok(pid_i32) = child.id().try_into() else {
+                        anyhow::bail!("Failed to convert pid to i32");
+                    };
+                    nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid_i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    )?;
+                    child.wait()?;
+                }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Send a SIGTERM to the spiced instance and wait for it to exit
-            let Ok(pid_i32) = child.id().try_into() else {
-                anyhow::bail!("Failed to convert pid to i32");
-            };
-            nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid_i32),
-                nix::sys::signal::Signal::SIGTERM,
-            )?;
-            child.wait()?;
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // On Windows, we can use the built-in process termination
-            child.kill()?;
-            child.wait()?;
+                #[cfg(target_os = "windows")]
+                {
+                    // On Windows, we can use the built-in process termination
+                    child.kill()?;
+                    child.wait()?;
+                }
+            }
+            Self::Remote {
+                ssh_target,
+                remote_pid,
+                remote_workdir,
+                ..
+            } => {
+                if let Some(pid) = remote_pid.take() {
+                    // Surface the remote log tail for diagnostics before teardown.
+                    if let Ok(o) =
+                        ssh_run(ssh_target, &format!("tail -n 40 {remote_workdir}/spiced.log"))
+                    {
+                        eprint!(
+                            "--- remote spiced.log (tail) ---\n{}",
+                            String::from_utf8_lossy(&o.stdout)
+                        );
+                    }
+                    ssh_run(
+                        ssh_target,
+                        &format!("kill {pid} 2>/dev/null; sleep 1; kill -9 {pid} 2>/dev/null; true"),
+                    )?;
+                }
+            }
+            Self::Existing | Self::External { .. } => {}
         }
 
         Ok(())
@@ -505,15 +649,101 @@ fn derive_http_base_url(flight_url: &str) -> String {
 
 impl Drop for SpicedInstance {
     fn drop(&mut self) {
-        let Self::Owned { child, .. } = self else {
-            return;
-        };
-
-        match child.kill() {
-            Ok(()) => (),
-            Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
+        match self {
+            Self::Owned { child, .. } => {
+                if let Err(e) = child.kill() {
+                    eprintln!("Failed to kill spiced instance: {e}");
+                }
+            }
+            // Best-effort remote teardown if `stop` wasn't called (e.g. on panic).
+            Self::Remote {
+                ssh_target,
+                remote_pid,
+                ..
+            } => {
+                if let Some(pid) = remote_pid.take() {
+                    let _ = ssh_run(ssh_target, &format!("kill -9 {pid} 2>/dev/null; true"));
+                }
+            }
+            Self::Existing | Self::External { .. } => {}
         }
     }
+}
+
+/// The host portion of an `[user@]host` SSH target (used to build URLs).
+fn remote_host(ssh_target: &str) -> String {
+    ssh_target
+        .rsplit('@')
+        .next()
+        .unwrap_or(ssh_target)
+        .to_string()
+}
+
+/// Run a command on the remote host over SSH, erroring on a non-zero exit.
+fn ssh_run(ssh_target: &str, remote_cmd: &str) -> Result<std::process::Output> {
+    let out = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg(ssh_target)
+        .arg(remote_cmd)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ssh {ssh_target} `{remote_cmd}` failed (status {}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out)
+}
+
+/// Copy a local file to the remote host over scp.
+fn scp_to_remote(local: &std::path::Path, ssh_target: &str, remote_path: &str) -> Result<()> {
+    let out = Command::new("scp")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg(local)
+        .arg(format!("{ssh_target}:{remote_path}"))
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "scp {} -> {ssh_target}:{remote_path} failed: {}",
+            local.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Reduce a raw `spiced --version` string to its `vX.Y.Z` head (mirrors `start`).
+fn short_version(version: &str) -> String {
+    match (version.contains('-'), version.contains('+')) {
+        (true, _) => version.split('-').next().unwrap_or(version).to_string(),
+        (false, true) => version.split('+').next().unwrap_or(version).to_string(),
+        (false, false) => version.to_string(),
+    }
+}
+
+/// Drop any `--metrics <addr>` pair from launch args; the remote binds its own.
+fn strip_metrics_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--metrics" {
+            skip_next = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 #[cfg(test)]

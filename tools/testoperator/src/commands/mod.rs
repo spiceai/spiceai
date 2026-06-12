@@ -436,6 +436,9 @@ fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRe
             .with_additional_args(vec!["--metrics".to_string(), "0.0.0.0:9090".to_string()]);
     }
 
+    // When set, spiced is launched on this SSH target instead of locally.
+    start_request = start_request.with_spiced_host(args.spiced_host.clone());
+
     Ok(start_request)
 }
 

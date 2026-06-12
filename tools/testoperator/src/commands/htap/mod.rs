@@ -75,6 +75,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
+    // When spiced runs on a remote host, its `/metrics` lives there — scrape that
+    // URL instead of the local default. `None` means use the local default.
+    let metrics_scrape_url = spiced_instance.metrics_url().map(str::to_string);
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
@@ -122,7 +125,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let health_monitor = HealthMonitor::spawn()?;
 
     // Always scrape spiced metrics in HTAP mode — replication metrics are essential.
-    let metrics_scraper = Some(MetricsScraper::spawn()?);
+    let metrics_scraper = Some(match &metrics_scrape_url {
+        Some(url) => MetricsScraper::spawn_with_url(url.clone())?,
+        None => MetricsScraper::spawn()?,
+    });
 
     // 3. Start the OLTP workload in the background.
     let oltp_stop = CancellationToken::new();
@@ -319,7 +325,14 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             report.emit();
             // If replication failed to converge, re-scrape the live lag one more time for diagnostics
             if report.converged_at.is_none() {
-                match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+                let rescrape = match &metrics_scrape_url {
+                    Some(url) => {
+                        crate::spiced_metrics::MetricsScraper::scrape_once_with_url(url.clone())
+                            .await
+                    }
+                    None => crate::spiced_metrics::MetricsScraper::scrape_once().await,
+                };
+                match rescrape {
                     Ok(metrics) => {
                         reporting::emit_replication_metrics(
                             &metrics,
@@ -374,7 +387,13 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     // For Cayenne backend report additional metrics
-    match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+    let final_scrape = match &metrics_scrape_url {
+        Some(url) => {
+            crate::spiced_metrics::MetricsScraper::scrape_once_with_url(url.clone()).await
+        }
+        None => crate::spiced_metrics::MetricsScraper::scrape_once().await,
+    };
+    match final_scrape {
         Ok(final_metrics) => reporting::emit_cayenne_compaction_metrics(&final_metrics),
         Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
     }

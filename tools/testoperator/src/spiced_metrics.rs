@@ -115,8 +115,14 @@ pub struct MetricsScraper {
 }
 
 impl MetricsScraper {
-    /// Start a background scraper task
+    /// Start a background scraper task against the local default `/metrics`.
     pub fn spawn() -> anyhow::Result<Self> {
+        Self::spawn_with_url(METRICS_URL.to_string())
+    }
+
+    /// Start a background scraper against an explicit `/metrics` URL — used when
+    /// spiced runs on a remote host (the URL then points at that host).
+    pub fn spawn_with_url(metrics_url: String) -> anyhow::Result<Self> {
         let cancel_token = CancellationToken::new();
         let task_token = cancel_token.clone();
 
@@ -134,7 +140,7 @@ impl MetricsScraper {
                         return SpicedMetrics { samples: all_samples };
                     }
                     () = tokio::time::sleep(SAMPLE_INTERVAL) => {
-                        match Self::scrape_metrics(&client).await {
+                        match Self::scrape_metrics(&client, &metrics_url).await {
                             Ok(samples) => {
                                 for sample in samples {
                                     all_samples
@@ -186,13 +192,18 @@ impl MetricsScraper {
     /// Unlike the background scraper, this fetches the current metrics exactly
     /// once and returns them aggregated as `SpicedMetrics`.
     pub async fn scrape_once() -> anyhow::Result<SpicedMetrics> {
+        Self::scrape_once_with_url(METRICS_URL.to_string()).await
+    }
+
+    /// One-shot scrape of an explicit `/metrics` URL (remote-host aware).
+    pub async fn scrape_once_with_url(metrics_url: String) -> anyhow::Result<SpicedMetrics> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
             .context("Failed to create metrics scraper HTTP client")?;
 
         let mut all_samples: HashMap<String, Vec<MetricSample>> = HashMap::new();
-        for sample in Self::scrape_metrics(&client).await? {
+        for sample in Self::scrape_metrics(&client, &metrics_url).await? {
             all_samples
                 .entry(sample.name.clone())
                 .or_default()
@@ -204,9 +215,12 @@ impl MetricsScraper {
     }
 
     /// Scrape metrics from the spiced /metrics endpoint
-    async fn scrape_metrics(client: &reqwest::Client) -> anyhow::Result<Vec<MetricSample>> {
+    async fn scrape_metrics(
+        client: &reqwest::Client,
+        metrics_url: &str,
+    ) -> anyhow::Result<Vec<MetricSample>> {
         let response = client
-            .get(METRICS_URL)
+            .get(metrics_url)
             .send()
             .await
             .context("Failed to fetch metrics endpoint")?;
