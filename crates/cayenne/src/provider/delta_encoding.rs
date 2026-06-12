@@ -159,7 +159,13 @@ pub(crate) fn effective_level(
                 u64::try_from(target_size_bytes).unwrap_or(u64::MAX) / AUTO_LIGHT_DENOMINATOR;
             match estimated_bytes {
                 Some(bytes) if bytes < threshold.max(1) => AUTO_LIGHT_LEVEL,
-                _ => FULL_LEVEL,
+                // Unknown size means an opaque staged CDC stream (e.g. the
+                // off-fence mem-tier checkpoint) — transient and rewritten by
+                // compaction, so encode it LIGHT rather than paying the full
+                // BtrBlocks cascade (incl. the FSST symbol-table double-train)
+                // on the CDC hot path. Only a known-large delta takes FULL.
+                None => AUTO_LIGHT_LEVEL,
+                Some(_) => FULL_LEVEL,
             }
         }
     }
