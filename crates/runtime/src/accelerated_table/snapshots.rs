@@ -161,6 +161,56 @@ pub(crate) fn canonical_checkpoint_schema(
     ))
 }
 
+/// Like [`canonical_checkpoint_schema`], but prefers the ACCELERATOR's own field
+/// definition for a column whose type or nullability has diverged from the
+/// federated source.
+///
+/// Used when re-deriving the checkpoint schema at checkpoint time: a live
+/// (in-place) widening evolution of the accelerator (e.g. Cayenne CDC widening
+/// `Int32` -> `Int64`, or relaxing `NOT NULL`) moves the engine table ahead of
+/// the start-time federated schema. Preferring the source def there — as
+/// `canonical_checkpoint_schema` does — would revert the persisted checkpoint to
+/// the older, narrower type and desync it from the live engine table. For
+/// unchanged columns the source def is kept (source-accurate nullability /
+/// encoding), so this is byte-identical to `canonical_checkpoint_schema` when
+/// nothing has evolved. Non-materialized federated (`refresh_sql`) columns are
+/// still appended.
+fn live_accelerator_checkpoint_schema(
+    accelerator_schema: &SchemaRef,
+    federated_schema: &SchemaRef,
+) -> SchemaRef {
+    let mut fields: Vec<FieldRef> = accelerator_schema
+        .fields()
+        .iter()
+        .filter(|field| !is_reserved_caching_column(field.name()))
+        .map(|field| {
+            federated_schema.field_with_name(field.name()).map_or_else(
+                |_| Arc::clone(field),
+                |source_field| {
+                    if source_field.data_type() == field.data_type()
+                        && source_field.is_nullable() == field.is_nullable()
+                    {
+                        Arc::new(source_field.clone())
+                    } else {
+                        Arc::clone(field)
+                    }
+                },
+            )
+        })
+        .collect();
+
+    for source_field in federated_schema.fields() {
+        if !fields.iter().any(|f| f.name() == source_field.name()) {
+            fields.push(Arc::new(source_field.as_ref().clone()));
+        }
+    }
+
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        federated_schema.metadata().clone(),
+    ))
+}
+
 /// Spawns a task that periodically creates snapshots at the specified interval.
 ///
 /// The task uses the checkpointer's `last_checkpoint_time()` to determine when the next
@@ -427,7 +477,7 @@ pub async fn create_checkpoint_and_snapshot(
     // byte-identical when the accelerator schema has not changed since start.
     let live_checkpoint_schema;
     let checkpoint_schema = if let (Some(acc), Some(fed)) = (accelerator, federated_schema) {
-        live_checkpoint_schema = canonical_checkpoint_schema(&acc.schema(), fed);
+        live_checkpoint_schema = live_accelerator_checkpoint_schema(&acc.schema(), fed);
         &live_checkpoint_schema
     } else {
         checkpoint_schema
@@ -511,5 +561,52 @@ async fn get_row_count(
             tracing::debug!(dataset = %dataset_name, error = %e, "Failed to get DataFrame for row count query");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+
+    /// A live (in-place) widening evolution moves the accelerator ahead of the
+    /// start-time federated schema; the checkpoint must record the accelerator's
+    /// evolved field defs (not revert to the older source types), while keeping
+    /// the source def for unchanged columns and still appending non-materialized
+    /// source columns.
+    #[test]
+    fn live_accelerator_checkpoint_schema_prefers_evolved_types() {
+        let federated = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("w", DataType::Utf8, false),
+            // A non-materialized source column (e.g. refresh_sql projection).
+            Field::new("src_only", DataType::Float64, true),
+        ]));
+        let accelerator = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true), // widened Int32 -> Int64
+            Field::new("w", DataType::Utf8, true),  // relaxed NOT NULL -> nullable
+            Field::new("tag", DataType::Utf8, true), // added column
+        ]));
+
+        let checkpoint = live_accelerator_checkpoint_schema(&accelerator, &federated);
+        let field = |name: &str| {
+            checkpoint
+                .field_with_name(name)
+                .expect("field present in checkpoint schema")
+                .clone()
+        };
+
+        // Unchanged column keeps its (source-accurate) definition.
+        assert_eq!(field("id").data_type(), &DataType::Int64);
+        // Widened type uses the accelerator's evolved type, not the source's.
+        assert_eq!(field("v").data_type(), &DataType::Int64);
+        // Relaxed nullability uses the accelerator's evolved nullability.
+        assert!(field("w").is_nullable());
+        // Added column comes from the accelerator.
+        assert_eq!(field("tag").data_type(), &DataType::Utf8);
+        // Non-materialized source column is still appended.
+        assert_eq!(field("src_only").data_type(), &DataType::Float64);
     }
 }
