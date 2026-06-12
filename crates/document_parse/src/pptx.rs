@@ -53,6 +53,13 @@ impl PptxParser {
 
 impl DocumentParser for PptxParser {
     fn parse(&self, raw: &Bytes) -> Result<Arc<dyn Document>> {
+        // Cap the decompressed size of each slide entry to defend against
+        // decompression ("zip") bombs: a small malicious .pptx whose slide
+        // XML inflates to many gigabytes would otherwise drive an unbounded
+        // `read_to_string` and OOM the process. 64 MiB is far above any
+        // legitimate slide.
+        const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
+
         let cursor = Cursor::new(raw.clone());
         let mut archive = ZipArchive::new(cursor)
             .boxed()
@@ -75,18 +82,12 @@ impl DocumentParser for PptxParser {
 
         let mut slides: Vec<String> = Vec::with_capacity(slide_paths.len());
         for path in slide_paths {
-            let mut entry = archive
+            let entry = archive
                 .by_name(&path)
                 .boxed()
                 .context(InternalParsingSnafu {
                     format: DocumentType::Pptx,
                 })?;
-            // Cap the decompressed size of each slide entry to defend against
-            // decompression ("zip") bombs: a small malicious .pptx whose slide
-            // XML inflates to many gigabytes would otherwise drive an unbounded
-            // `read_to_string` and OOM the process. 64 MiB is far above any
-            // legitimate slide.
-            const MAX_SLIDE_BYTES: u64 = 64 * 1024 * 1024;
             let mut xml = String::new();
             let read = entry
                 .take(MAX_SLIDE_BYTES + 1)

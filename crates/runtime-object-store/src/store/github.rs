@@ -415,12 +415,8 @@ mod tests {
         validate_github_component("repository", "spice.ai_demo-1", false).expect("repo");
         validate_github_component("revision", "refs/heads/trunk", true).expect("rev with slashes");
         validate_github_component("revision", "v1.2.3", true).expect("tag");
-        validate_github_component(
-            "revision",
-            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            true,
-        )
-        .expect("sha");
+        validate_github_component("revision", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", true)
+            .expect("sha");
     }
 
     #[test]
@@ -435,9 +431,7 @@ mod tests {
         // Organizations/repositories may not contain '/'.
         assert!(validate_github_component("organization", "org/with/slash", false).is_err());
         // URL-structure-breaking characters are rejected in every component.
-        for bad in [
-            "a?b", "a#b", "a@b", "a%2fb", "a b", "a\\b", "a:b", "a\nb",
-        ] {
+        for bad in ["a?b", "a#b", "a@b", "a%2fb", "a b", "a\\b", "a:b", "a\nb"] {
             assert!(
                 validate_github_component("repository", bad, false).is_err(),
                 "{bad:?} should be rejected"

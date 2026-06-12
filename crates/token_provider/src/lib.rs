@@ -80,8 +80,9 @@ impl TokenProvider for StaticTokenProvider {
     fn dyn_hash(&self) -> String {
         // Domain-separated SHA-256 of the secret, so this stable identity is
         // one-way: it can serve as a registry/dedup key (and is safe to log)
-        // without ever exposing the underlying token. (Previously a reversible
-        // `DefaultHasher` of the raw secret.)
+        // without ever exposing the underlying token. (Previously a
+        // `DefaultHasher` of the raw secret: non-cryptographic, and — being
+        // seeded by a per-process `RandomState` — not even stable across runs.)
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut hasher = Sha256::new();
         hasher.update(b"spice/static-token-provider/v1\0");
