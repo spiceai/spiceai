@@ -120,7 +120,6 @@ async fn run_inner(
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance

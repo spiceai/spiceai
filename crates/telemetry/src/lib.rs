@@ -480,6 +480,27 @@ pub fn track_cayenne_write_phase_duration(duration: Duration, dimensions: &[KeyV
         .record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
+static CAYENNE_CDC_ABSORBED_DELETE_KEYS: OnceLock<Counter<u64>> = OnceLock::new();
+
+/// Counts CDC Delete-event keys absorbed by the in-memory CDC tier
+/// (`cdc_durability: memory`) as RAM tombstones instead of being routed onto
+/// the durable staged path. Each absorbed key defers its durability to the
+/// covering mem-tier checkpoint, exactly like in-memory upserts. `dimensions`
+/// should carry `table`.
+pub fn track_cayenne_cdc_absorbed_delete_keys(keys: u64, dimensions: &[KeyValue]) {
+    CAYENNE_CDC_ABSORBED_DELETE_KEYS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_counter("cayenne_cdc_absorbed_delete_keys_total")
+                .with_description(
+                    "CDC Delete-event keys absorbed as in-memory CDC tier tombstones (durability deferred to the covering mem-tier checkpoint) instead of taking the durable staged path.",
+                )
+                .with_unit("keys")
+                .build()
+        })
+        .add(keys, dimensions);
+}
+
 static CAYENNE_COMPACTION_DURATION_MS: OnceLock<Histogram<f64>> = OnceLock::new();
 
 /// Build-once accessor for the compaction-duration histogram. The first call

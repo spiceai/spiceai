@@ -363,6 +363,13 @@ pub(crate) struct WriteSample {
     pub bytes: u64,
     /// Total apply wall time for the batch (the runtime's response: how long
     /// *we* took to absorb it).
+    ///
+    /// Under `cdc_durability: memory` this includes any synchronous mem-tier
+    /// admission stall — the per-table BYTE-cap spill and the global-budget
+    /// wait — which are the only writer-blocking mem-tier events: the tier's
+    /// AGE cap is enforced by the non-blocking background checkpoint tick and
+    /// never appears here. The `apply_vs_arrival` "behind" signal therefore
+    /// reflects genuine backpressure, not scheduled age flushes.
     pub apply: Duration,
     /// Wall time since the previous batch (the offered-load interval). `None`
     /// for the first batch.
