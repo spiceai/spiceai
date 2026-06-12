@@ -683,15 +683,36 @@ fn remote_host(ssh_target: &str) -> String {
 }
 
 /// Run a command on the remote host over SSH, erroring on a non-zero exit.
+///
+/// The command is piped to `bash -s` rather than passed as an ssh argument, so it
+/// runs under bash regardless of the remote user's login shell (e.g. fish, which
+/// rejects `$!`/`&` job-control syntax used by the detached launch command).
 fn ssh_run(ssh_target: &str, remote_cmd: &str) -> Result<std::process::Output> {
-    let out = Command::new("ssh")
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
         .arg(ssh_target)
-        .arg(remote_cmd)
-        .output()?;
+        .arg("bash")
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to open ssh stdin for {ssh_target}"))?;
+        stdin.write_all(remote_cmd.as_bytes())?;
+    } // drop stdin -> EOF so the remote bash runs and exits
+
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         anyhow::bail!(
             "ssh {ssh_target} `{remote_cmd}` failed (status {}): {}",
