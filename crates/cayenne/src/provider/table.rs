@@ -626,6 +626,19 @@ impl CayenneCdcWrite {
         self.rows
     }
 
+    /// Number of rows this write deleted — the on-conflict deletion publish for
+    /// this batch (file/inline tombstones resolved against existing rows; one of
+    /// the two key vectors is populated per PK strategy). Feeds the adaptive
+    /// controller's delete-fraction signal, which withholds the write-concurrency
+    /// lever on delete-heavy streams. A directional heuristic, not an exact count
+    /// (pure insert/append batches return 0).
+    #[must_use]
+    pub fn delete_rows(&self) -> u64 {
+        self.prepared_on_conflict.as_ref().map_or(0, |p| {
+            u64::try_from(p.deleted_pk_i64.len() + p.deleted_row_keys.len()).unwrap_or(u64::MAX)
+        })
+    }
+
     /// The in-memory CDC tier epoch this write landed in, when the table is in
     /// `cdc_durability: memory` mode and the batch took the RAM-append path.
     /// `None` for every durable-path write. The runtime uses this to defer the
@@ -2102,11 +2115,6 @@ pub struct CayenneTableProvider {
     /// providers the runtime did not wire up), where the slot advances per-batch
     /// via the normal committer. Shared across writer clones.
     slot_advancer: Arc<ParkingMutex<Option<Arc<dyn crate::provider::mem_tier::SlotAdvancer>>>>,
-    /// Per-table RAM-tier byte cap for memory mode (`cayenne_cdc_mem_tier_max_bytes`,
-    /// or a memory-aware default when 0). `u64::MAX` when the config value is
-    /// non-positive and no default applies (effectively no per-table cap — the
-    /// global budget still bounds aggregate RAM).
-    mem_tier_max_bytes: u64,
     /// Per-table RAM-tier age cap in ms for memory mode
     /// (`cayenne_cdc_mem_tier_max_age_ms`); 0 disables the age trigger.
     mem_tier_max_age_ms: u64,
@@ -3732,13 +3740,15 @@ impl CayenneTableProvider {
             .write_cdc_pipelined(normalized, write_guard)
             .await;
         // Feed the dynamic auto-tuner's rolling ingest accounting: the batch's row
-        // count, the real ingested bytes (tallied above), and the full per-batch
-        // apply wall (lock-wait + write) — the "am I keeping up with the offered
-        // load?" response signal. Cheap and recorded regardless of whether dynamic
-        // tuning is enabled (it also backs the always-on observability gauges).
+        // count, its delete count (the delete-fraction signal), the real ingested
+        // bytes (tallied above), and the full per-batch apply wall (lock-wait +
+        // write) — the "am I keeping up with the offered load?" response signal.
+        // Cheap and recorded regardless of whether dynamic tuning is enabled (it
+        // also backs the always-on observability gauges).
         if let Ok(cdc_write) = &result {
             self.context.record_ingest(
                 cdc_write.rows,
+                cdc_write.delete_rows(),
                 ingest_bytes.load(Ordering::Relaxed),
                 lock_wait_start.elapsed(),
             );
@@ -5268,16 +5278,12 @@ impl CayenneTableProvider {
             &context.runtime_env().memory_pool,
         ));
 
-        // Per-table in-memory CDC tier caps (`cdc_durability: memory`). A
-        // non-positive `cdc_mem_tier_max_bytes` means "no explicit per-table
-        // byte cap" — the process-global byte budget still bounds aggregate RAM,
-        // so this is `u64::MAX` (effectively unbounded per table). The age cap
-        // is passed straight through (0 = age trigger disabled).
-        let mem_tier_max_bytes = if table_metadata.vortex_config.cdc_mem_tier_max_bytes > 0 {
-            u64::try_from(table_metadata.vortex_config.cdc_mem_tier_max_bytes).unwrap_or(u64::MAX)
-        } else {
-            u64::MAX
-        };
+        // Per-table in-memory CDC tier caps (`cdc_durability: memory`). The byte
+        // cap is read live from the context's actuators (seeded from
+        // `cdc_mem_tier_max_bytes`; the adaptive loop may grow it under
+        // backpressure / shrink it under memory pressure) — see
+        // `mem_tier_per_table_cap_breached`. The age cap is passed straight
+        // through (0 = age trigger disabled).
         let mem_tier_max_age_ms = table_metadata.vortex_config.cdc_mem_tier_max_age_ms;
 
         let provider = Self {
@@ -5344,7 +5350,6 @@ impl CayenneTableProvider {
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
-            mem_tier_max_bytes,
             mem_tier_max_age_ms,
             // Local providers can use `ensure_no_incomplete_write`'s
             // non-destructive fast path: it probes `_staging/` and returns if
@@ -6134,7 +6139,6 @@ impl CayenneTableProvider {
             // lock (the seq-ordering invariant requires a single lock per table).
             mem_tier_publish_lock: Arc::clone(&self.mem_tier_publish_lock),
             slot_advancer: Arc::clone(&self.slot_advancer),
-            mem_tier_max_bytes: self.mem_tier_max_bytes,
             mem_tier_max_age_ms: self.mem_tier_max_age_ms,
             staging_wal_present: Arc::clone(&self.staging_wal_present),
             staging_may_have_files: Arc::clone(&self.staging_may_have_files),
@@ -13280,7 +13284,11 @@ impl CayenneTableProvider {
     pub(crate) fn mem_tier_per_table_cap_breached(&self, incoming_bytes: u64) -> bool {
         let cur = self.mem_tier.load();
         let would_be = cur.bytes.saturating_add(incoming_bytes);
-        would_be >= self.mem_tier_max_bytes
+        // Read live: the cap is seeded from `cdc_mem_tier_max_bytes` and may be
+        // adaptively grown (fewer writer-blocking spills under backpressure) or
+        // shrunk (under memory pressure) by the closed-loop controller. A
+        // non-positive config value reads back as `u64::MAX` (no per-table cap).
+        would_be >= self.context.mem_tier_max_bytes_capped()
     }
 
     /// The ONE definition of "the tier's age cap has been reached" — the
@@ -17199,7 +17207,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // tuning is enabled — the accounting is always recorded).
         let table = self.table_metadata.table_name.clone();
         let snap = self.context.ingest_snapshot();
-        let knobs = self.context.live_knob_values();
+        let actuators = self.context.live_actuator_values();
         telemetry::track_cayenne_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
@@ -17208,31 +17216,34 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 read_amp: u64::try_from(read_amp).unwrap_or(0),
                 mem_pressure: snap.mem_pressure.unwrap_or(-1.0),
                 apply_ms: snap.apply_ms,
-                inline_flush_max_bytes: u64::try_from(knobs.inline_flush_max_bytes.max(0))
+                inline_flush_max_bytes: u64::try_from(actuators.inline_flush_max_bytes.max(0))
                     .unwrap_or(0),
-                compaction_interval_ms: knobs.compaction_background_interval_ms,
-                compaction_trigger_files: u64::try_from(knobs.compaction_trigger_files)
+                compaction_interval_ms: actuators.compaction_background_interval_ms,
+                compaction_trigger_files: u64::try_from(actuators.compaction_trigger_files)
                     .unwrap_or(0),
                 target_file_size_mb: u64::try_from(
                     self.context.target_file_size_bytes() / (1024 * 1024),
                 )
                 .unwrap_or(0),
-                write_concurrency: u64::try_from(knobs.write_concurrency).unwrap_or(0),
+                write_concurrency: u64::try_from(actuators.write_concurrency).unwrap_or(0),
+                mem_tier_max_bytes: u64::try_from(actuators.mem_tier_max_bytes.max(0)).unwrap_or(0),
+                delete_fraction: snap.delete_fraction,
+                arrival_cv: snap.arrival_cv,
             },
             &[telemetry::KeyValue::new("table", table.clone())],
         );
 
         // The closed-loop control step. A no-op when dynamic tuning is disabled
-        // (returns `None`); otherwise applies at most one bounded knob change.
+        // (returns `None`); otherwise applies at most one bounded actuator change.
         if let Some(adj) = self.context.retune(super::tuning::MIN_DWELL) {
             telemetry::track_cayenne_autotune_adjustment(&[
                 telemetry::KeyValue::new("table", table.clone()),
-                telemetry::KeyValue::new("knob", adj.knob.as_str()),
+                telemetry::KeyValue::new("actuator", adj.actuator.as_str()),
             ]);
             tracing::info!(
                 target: "cayenne::tuning",
                 table = table.as_str(),
-                knob = adj.knob.as_str(),
+                actuator = adj.actuator.as_str(),
                 new_value = adj.new_value,
                 reason = adj.reason,
                 "Cayenne dynamic auto-tune adjustment applied",

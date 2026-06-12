@@ -956,17 +956,19 @@ impl CayenneAccelerator {
                 );
             }
             config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
-            // `adaptive` depends on extended schema inference. Any emitted
-            // metadata counts: row_count/table_bytes refine memory sizing, while
-            // inferred primary key/index/sort metadata is applied upstream and
-            // feeds the same warm-start / query-health surface. Without any
-            // inferred metadata the loop starts blind, so fall back to `auto` and
-            // tell the operator how to enable it.
+            // Extended schema inference SHARPENS the warm start (row_count/
+            // table_bytes refine the memory sizing; inferred PK/index/sort metadata
+            // feeds the query-health surface), but it is no longer REQUIRED for
+            // `adaptive`: the controller relearns the observed mean row width from
+            // live ingest and converges its actuators from the hardware-derived
+            // warm start regardless. When the metadata is absent, note that the
+            // warm start is coarser but still let the closed loop run.
             if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
-                tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive`: no inferred schema metadata found (set `schema_inference: extended` for a sharper warm-start); starting from the hardware-derived config and adapting from observed ingest."
                 );
-                config.dynamic_tuning = false;
             }
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
@@ -984,7 +986,7 @@ impl CayenneAccelerator {
                     "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
                 );
             }
-            config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
+            config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
                 inline_flush: autotune::is_pinned(
                     acceleration,
                     &[
@@ -1014,6 +1016,7 @@ impl CayenneAccelerator {
                     acceleration,
                     &["cayenne_write_concurrency", "write_concurrency"],
                 ),
+                mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
             };
 
             // Surface cross-parameter and out-of-range issues that parse cleanly
@@ -1474,7 +1477,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
+            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'schema_inference: extended' sharpens 'adaptive's warm-start (inferred cardinality/size) but is not required — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"])
             .default("auto"),
     ],
