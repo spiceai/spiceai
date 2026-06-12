@@ -491,16 +491,28 @@ fn derive_http_base_url(flight_url: &str) -> String {
         });
     let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
     let Ok(mut url) = reqwest::Url::parse(parse_target) else {
-        return format!("{flight_url}:8090");
+        return derive_http_base_url_from_host_port(flight_url);
     };
 
     if url.set_port(Some(8090)).is_err() {
-        return format!("{flight_url}:8090");
+        return derive_http_base_url_from_host_port(parse_target);
     }
     url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
     url.as_str().trim_end_matches('/').to_string()
+}
+
+fn derive_http_base_url_from_host_port(flight_url: &str) -> String {
+    let flight_url = flight_url.trim_end_matches('/');
+    let Some((host, port)) = flight_url.rsplit_once(':') else {
+        return format!("{flight_url}:8090");
+    };
+    if port.parse::<u16>().is_ok() && !host.is_empty() {
+        format!("{host}:8090")
+    } else {
+        format!("{flight_url}:8090")
+    }
 }
 
 impl Drop for SpicedInstance {
@@ -553,5 +565,12 @@ mod tests {
         let instance = SpicedInstance::external("http://[::1]:50051");
 
         assert_eq!(instance.http_base_url(), "http://[::1]:8090");
+    }
+
+    #[test]
+    fn external_derives_http_base_url_for_non_url_flight_address() {
+        let instance = SpicedInstance::external("localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "localhost:8090");
     }
 }

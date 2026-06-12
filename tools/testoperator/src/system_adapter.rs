@@ -269,15 +269,27 @@ fn derive_http_base_url(flight_url: &str) -> Option<String> {
         });
     let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
     let Ok(mut url) = url::Url::parse(parse_target) else {
-        return Some(format!("{flight_url}:8090"));
+        return Some(derive_http_base_url_from_host_port(flight_url));
     };
     url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
     if url.set_port(Some(8090)).is_err() {
-        return Some(format!("{flight_url}:8090"));
+        return Some(derive_http_base_url_from_host_port(parse_target));
     }
     Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn derive_http_base_url_from_host_port(flight_url: &str) -> String {
+    let flight_url = flight_url.trim_end_matches('/');
+    let Some((host, port)) = flight_url.rsplit_once(':') else {
+        return format!("{flight_url}:8090");
+    };
+    if port.parse::<u16>().is_ok() && !host.is_empty() {
+        format!("{host}:8090")
+    } else {
+        format!("{flight_url}:8090")
+    }
 }
 
 #[cfg(test)]
@@ -320,7 +332,7 @@ mod tests {
     fn derive_http_base_url_falls_back_for_non_url_flight_address() {
         assert_eq!(
             derive_http_base_url("localhost:50051"),
-            Some("localhost:50051:8090".to_string())
+            Some("localhost:8090".to_string())
         );
     }
 }

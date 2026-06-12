@@ -61,10 +61,22 @@ datasets:
       on_conflict:
         w_id: upsert
       params:
+        # Explicit even though memory is now the engine default: this pod IS
+        # the memory-durability variant, so its identity must not depend on
+        # the build's default.
         cayenne_cdc_durability: memory
         # Fewer, bigger checkpoints: flush at >=128MiB or 30s age (see header).
         cayenne_cdc_mem_tier_min_flush_bytes: '134217728'
         cayenne_cdc_mem_tier_max_age_ms: '30000'
+        # Per-table resident cap (the synchronous OOM backstop; the periodic
+        # tick owns age/size flushing and never blocks the writer).
+        cayenne_cdc_mem_tier_max_bytes: '1073741824'
+        # KEY deletes: position-mode serializes compaction with writers
+        # (try_lock starvation under continuous CDC = unbounded file/read-amp
+        # growth on the delete-receiving table), and key tombstones ride the
+        # memory tier — CDC Delete events are absorbed in RAM instead of
+        # forcing each delete-bearing burst onto the durable staged path.
+        cayenne_deletion_mode: key
         # Fold protected snapshots faster so folding keeps pace with checkpoint inflow.
         cayenne_compaction_background_interval_ms: '1000'
 
