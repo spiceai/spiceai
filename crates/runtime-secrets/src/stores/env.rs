@@ -83,26 +83,66 @@ pub struct EnvSecretStore {
 impl EnvSecretStore {
     fn load(&self) {
         if let Some(path) = &self.path {
-            match dotenvy::from_path(path) {
-                Ok(()) => return,
-                Err(err) => {
-                    if matches!(err, dotenvy::Error::LineParse(_, _)) {
-                        tracing::warn!("{err}");
-                    } else {
-                        tracing::warn!("Error opening path {}: {err}", path.display());
-                    }
-                }
+            if load_from_iter(path, dotenvy::from_path_iter(path)) {
+                return;
             }
         }
-        if let Err(err) = dotenvy::from_filename(".env.local")
-            && matches!(err, dotenvy::Error::LineParse(_, _))
-        {
-            tracing::warn!(".env.local: {err}");
+        // `.env.local` is loaded before `.env` so that its values take priority:
+        // dotenvy respects existing `std::env` vars and does not overwrite them,
+        // so the first file loaded wins.
+        let _ = dotenvy::from_filename_iter(".env.local").map(|iter| load_iter(iter, ".env.local"));
+        let _ = dotenvy::from_filename_iter(".env").map(|iter| load_iter(iter, ".env"));
+    }
+}
+
+/// Iterates parsed entries from a dotenvy iterator, setting each valid key-value
+/// pair into the environment. Malformed lines are logged with their line number and
+/// content so users can fix them. I/O-level errors (e.g. missing file) are reported
+/// at debug level because the file is optional.
+///
+/// # Safety
+///
+/// `std::env::set_var` is called during store construction (single-threaded init)
+/// before any other threads are spawned.
+fn load_iter<I>(iter: I, label: &str)
+where
+    I: Iterator<Item = Result<(String, String), dotenvy::Error>>,
+{
+    for item in iter {
+        match item {
+            Ok((key, val)) => unsafe {
+                std::env::set_var(key, val);
+            },
+            Err(dotenvy::Error::LineParse(line_num, content)) => {
+                tracing::warn!(
+                    "{label}: line {line_num} is malformed and was skipped: `{content}`"
+                );
+            }
+            Err(err) => {
+                tracing::debug!("{label}: {err}");
+            }
         }
-        if let Err(err) = dotenvy::from_filename(".env")
-            && matches!(err, dotenvy::Error::LineParse(_, _))
-        {
-            tracing::warn!(".env: {err}");
+    }
+}
+
+/// Load entries from a `from_path_iter` / `from_filename_iter` result.
+///
+/// Returns `true` when the file was opened and iterated (even if some lines were
+/// malformed). Returns `false` when the file could not be opened, so the caller
+/// can fall back to the default `.env` / `.env.local` search.
+fn load_from_iter<I, E>(path: &std::path::Path, result: Result<I, E>) -> bool
+where
+    I: Iterator<Item = Result<(String, String), dotenvy::Error>>,
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(iter) => {
+            load_iter(iter, &path.display().to_string());
+            true
+        }
+        Err(err) => {
+            tracing::debug!("Error opening path {}: {err}", path.display());
+            false
         }
     }
 }
@@ -203,6 +243,44 @@ TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
             unsafe {
                 std::env::remove_var(key);
             }
+        }
+    }
+
+    /// Valid entries that appear after a malformed line must still be loaded.
+    /// Before the switch to `from_path_iter`, `dotenvy::from_path` stopped at
+    /// the first parse error and discarded all subsequent lines.
+    #[test]
+    fn test_malformed_line_does_not_block_valid_entries() {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let env_file = temp_dir.path().join(".env.malformed");
+
+        let env_content = r"MALFORMED_VALID_FIRST=first_value
+THIS LINE HAS NO EQUALS SIGN
+MALFORMED_VALID_SECOND=second_value
+";
+        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
+        file.write_all(env_content.as_bytes())
+            .expect("Failed to write test .env file");
+        drop(file);
+
+        let iter = dotenvy::from_path_iter(&env_file).expect("Failed to open .env file");
+        super::load_iter(iter, ".env.malformed");
+
+        assert_eq!(
+            std::env::var("MALFORMED_VALID_FIRST").as_deref(),
+            Ok("first_value"),
+            "Valid entry before malformed line must be loaded"
+        );
+        assert_eq!(
+            std::env::var("MALFORMED_VALID_SECOND").as_deref(),
+            Ok("second_value"),
+            "Valid entry after malformed line must still be loaded"
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("MALFORMED_VALID_FIRST");
+            std::env::remove_var("MALFORMED_VALID_SECOND");
         }
     }
 }
