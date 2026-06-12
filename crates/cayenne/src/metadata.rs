@@ -596,6 +596,12 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Columns to hash-cluster rows by during intra-write sharding (the parallel
+    /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
+    /// the historical behavior); PK-less tables shard round-robin. Ignored for
+    /// sorted tables (`sort_columns` forces a single serial writer).
+    #[serde(default)]
+    pub shard_key_columns: Vec<String>,
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
@@ -958,6 +964,8 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            // Shard key derives from the primary key unless overridden
+            shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
             // `auto`: size-gated light encoding for small deltas (re-encoded
             // by compaction). Local micro A/B (2026-06-06) was neutral on the
