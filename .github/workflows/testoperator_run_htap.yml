@@ -51,11 +51,12 @@ on:
       runner_type:
         description: 'Runner type'
         required: true
-        default: 'spiceai-dev-xlarge-runners'
+        default: 'htap-benchmark'
         type: choice
         options:
           - 'spiceai-dev-large-runners'
           - 'spiceai-dev-xlarge-runners'
+          - 'htap-benchmark'
 jobs:
   run-htap:
     name: Run CH-BenCHmark
@@ -100,26 +101,10 @@ jobs:
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
 
+      # The 'htap-benchmark' runner has a static local PostgreSQL
       - name: Setup CH-benCH PostgreSQL
+        if: github.event.inputs.runner_type != 'htap-benchmark'
         uses: ./.github/actions/setup-chbench-postgres
-
-      - name: Start resource monitor
-        run: |
-          echo -e "timestamp\tpg_cpu_pct\tpg_mem\tpg_block_io\tspiced_cpu_pct\tspiced_rss_kb\ttestop_cpu_pct\ttestop_rss_kb" > /tmp/resource-monitor.tsv
-          (while true; do
-            ts=$(date -u +%H:%M:%S)
-            pg=$(docker stats chbench-pg --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}\t{{.BlockIO}}" 2>/dev/null || echo "0%\t0\t0")
-            spiced_line=$(ps -eo pcpu,rss,comm | grep '[s]piced' | head -1 || true)
-            testop_line=$(ps -eo pcpu,rss,comm | grep '[t]estoperator' | head -1 || true)
-            spiced_cpu=$(echo "$spiced_line" | awk '{print $1+0}')
-            spiced_rss=$(echo "$spiced_line" | awk '{print $2+0}')
-            testop_cpu=$(echo "$testop_line" | awk '{print $1+0}')
-            testop_rss=$(echo "$testop_line" | awk '{print $2+0}')
-            echo -e "${ts}\t${pg}\t${spiced_cpu}\t${spiced_rss}\t${testop_cpu}\t${testop_rss}" >> /tmp/resource-monitor.tsv
-            sleep 10
-          done) &
-          echo $! > /tmp/monitor-pid.txt
-          echo "Resource monitor started (PID: $(cat /tmp/monitor-pid.txt))"
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
@@ -141,17 +126,46 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           CHBENCH_PG_HOST: 127.0.0.1
 
-      - name: Stop resource monitor
+      # Insurance against a crashed/cancelled run leaving an orphaned logical
+      # replication slot behind: an inactive slot keeps pinning WAL until the
+      # next run's prepare() drops it, which can bloat disk on a static PG that
+      # is not torn down between runs. Drop inactive spice_* slots (and their
+      # publications) here so WAL retention is bounded even when no next run
+      # comes. Never fails the job — best-effort cleanup only.
+      - name: Clean up orphaned replication slots and publications
         if: always()
+        env:
+          CHBENCH_PG_HOST: 127.0.0.1
+          CHBENCH_PG_PORT: '5432'
+          CHBENCH_PG_USER: bench
+          CHBENCH_PG_PASS: bench
+          CHBENCH_PG_DB: chbench
         run: |
-          if [ -f /tmp/monitor-pid.txt ]; then
-            kill "$(cat /tmp/monitor-pid.txt)" 2>/dev/null || true
-          fi
+          cat > /tmp/chbench-slot-cleanup.sql <<'SQL'
+          DO $$
+          DECLARE r RECORD;
+          BEGIN
+            FOR r IN
+              SELECT slot_name FROM pg_replication_slots
+              WHERE slot_name LIKE 'spice_%' AND NOT active
+            LOOP
+              RAISE NOTICE 'dropping replication slot %', r.slot_name;
+              PERFORM pg_drop_replication_slot(r.slot_name);
+            END LOOP;
+            FOR r IN
+              SELECT pubname FROM pg_publication WHERE pubname LIKE 'spice_%'
+            LOOP
+              RAISE NOTICE 'dropping publication %', r.pubname;
+              EXECUTE format('DROP PUBLICATION IF EXISTS %I', r.pubname);
+            END LOOP;
+          END $$;
+          SQL
 
-      - name: Upload resource monitor
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: resource-monitor
-          path: /tmp/resource-monitor.tsv
-          retention-days: 7
+          if command -v psql >/dev/null 2>&1; then
+            PGPASSWORD="${CHBENCH_PG_PASS}" psql \
+              -h "${CHBENCH_PG_HOST}" -p "${CHBENCH_PG_PORT}" \
+              -U "${CHBENCH_PG_USER}" -d "${CHBENCH_PG_DB}" \
+              -v ON_ERROR_STOP=0 -f /tmp/chbench-slot-cleanup.sql || true
+          else
+            echo "No psql client found; skipping replication cleanup."
+          fi
