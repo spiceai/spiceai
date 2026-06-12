@@ -334,9 +334,13 @@ impl SpicedInstance {
         //    `--metrics` pair — we bind it on the reachable interface ourselves.
         let extra = strip_metrics_args(&start_request.additional_args).join(" ");
         // Bind HTTP/Flight/metrics on 0.0.0.0 so the box running testoperator can
-        // reach them (spiced defaults all three to 127.0.0.1).
+        // reach them (spiced defaults all three to 127.0.0.1). Launch under `setsid`
+        // (new session) so spiced is fully detached from the SSH session — otherwise
+        // ssh keeps the channel open waiting on the long-lived daemon and the launch
+        // call never returns. `$!` is the setsid PID, which becomes spiced's after
+        // exec, so it is the right PID to track/kill.
         let launch = format!(
-            "cd {workdir} && nohup {spiced_path} --telemetry-enabled=false \
+            "cd {workdir} && setsid {spiced_path} --telemetry-enabled=false \
              --http 0.0.0.0:{REMOTE_HTTP_PORT} --flight 0.0.0.0:{REMOTE_FLIGHT_PORT} \
              --metrics 0.0.0.0:{REMOTE_METRICS_PORT} {extra} \
              </dev/null >{workdir}/spiced.log 2>&1 & echo $!"
