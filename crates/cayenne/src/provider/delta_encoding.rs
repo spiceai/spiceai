@@ -264,8 +264,9 @@ mod tests {
     #[test]
     fn default_is_auto_with_light_small_deltas_and_full_opt_out() {
         // Product decision: `auto` ships as the default — small known-size
-        // deltas encode light; large/unknown writes and maintenance stay on
-        // the full cascade. Level 7 is the explicit opt-out.
+        // deltas and unknown-size (transient, compaction-rewritten) writes
+        // encode light; large known-size writes and maintenance stay on the
+        // full cascade. Level 7 is the explicit opt-out.
         assert_eq!(DeltaEncoding::default(), DeltaEncoding::Auto);
         assert!(
             strategy_builder_for_level(effective_level(
@@ -284,8 +285,8 @@ mod tests {
                 None,
                 TARGET
             ))
-            .is_none(),
-            "default auto must keep unknown-size writes on the full strategy"
+            .is_some(),
+            "default auto must light-encode unknown-size (transient) writes"
         );
         assert!(
             strategy_builder_for_level(effective_level(
@@ -321,10 +322,12 @@ mod tests {
             ),
             FULL_LEVEL
         );
-        // Unknown size -> conservatively full.
+        // Unknown size -> light: an unknown-size staged delta is a transient
+        // CDC stream (the off-fence mem-tier checkpoint) that compaction
+        // rewrites, so it skips the full BtrBlocks cascade on the hot path.
         assert_eq!(
             effective_level(DeltaEncoding::Auto, WriteClass::Delta, None, TARGET),
-            FULL_LEVEL
+            AUTO_LIGHT_LEVEL
         );
     }
 
