@@ -600,11 +600,18 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
                 .expect("Should format batches");
             let plan = pretty.to_string();
 
+            // With federation working the scan appears as VirtualExecutionPlan name=duckdb;
+            // on the scan fallback path it appears as DuckSqlExec. Either indicates that
+            // the DuckDB connector is being used for the table scan.
             assert!(
-                plan.contains("DuckSqlExec"),
+                plan.contains("name=duckdb") || plan.contains("DuckSqlExec"),
                 "expected the connector plan to push a scan down to DuckDB; plan was:\n{plan}"
             );
-            for line in plan.lines().filter(|l| l.contains("DuckSqlExec sql=")) {
+            // json_get_str must not appear in any SQL sent to DuckDB.
+            for line in plan
+                .lines()
+                .filter(|l| l.contains("DuckSqlExec sql=") || l.contains("base_sql="))
+            {
                 assert!(
                     !line.contains("json_get_str"),
                     "json_get_str was pushed into DuckDB SQL (deny-list not applied):\n{line}"
