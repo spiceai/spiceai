@@ -3055,8 +3055,8 @@ struct MergedScanDeletions {
     merged: PkDeletionSnapshot,
 }
 
-/// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline
-/// + tier rows being encoded into the new snapshot), keyed by deletion
+/// PK membership of a mem-tier checkpoint's flushed corpus (the visible inline +
+/// tier rows being encoded into the new snapshot), keyed by deletion
 /// strategy. Splits the tier's tombstones at durable-commit time: a tombstoned
 /// key WITH a corpus row was re-inserted after its delete and must carry the
 /// reinsert marker so the flushed row stays visible; a tombstoned key WITHOUT
@@ -13138,7 +13138,7 @@ impl CayenneTableProvider {
                         .map(|&idx| Arc::clone(batch.column(idx)))
                         .collect();
                     let rows = converter.convert_columns(&pk_columns)?;
-                    for row in rows.iter() {
+                    for row in &rows {
                         keys.insert(Box::from(row.as_ref()));
                     }
                 }
@@ -13414,7 +13414,7 @@ impl CayenneTableProvider {
                 let rows = converter.convert_columns(&pk_columns)?;
                 let mut bytes = 0u64;
                 let mut keys: Vec<Box<[u8]>> = Vec::with_capacity(batch.num_rows());
-                for row in rows.iter() {
+                for row in &rows {
                     let key: Box<[u8]> = Box::from(row.as_ref());
                     // Key bytes + per-entry map overhead.
                     bytes = bytes.saturating_add(key.len() as u64 + 32);
