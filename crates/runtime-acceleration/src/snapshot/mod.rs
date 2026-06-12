@@ -3651,7 +3651,7 @@ mod tests {
 
     #[cfg(feature = "duckdb")]
     async fn read_dataset_metadata(store: &InMemory) -> DatasetMetadata {
-        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).child(METADATA_FILE_NAME);
+        let metadata_path = Path::from(SNAPSHOT_BASE_PATH).join(METADATA_FILE_NAME);
         let metadata_bytes = store
             .get(&metadata_path)
             .await

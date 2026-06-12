@@ -601,7 +601,7 @@ async fn build_mongodb_widen_runtime(duckdb_file: &str) -> Result<Arc<Runtime>, 
     configure_test_datafusion();
     let rt = Arc::new(Runtime::builder().with_app(app).build().await);
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow::anyhow!("Timed out waiting for MongoDB widening dataset to load"));
         }
         () = Arc::clone(&rt).load_components() => {}
