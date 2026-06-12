@@ -481,7 +481,16 @@ fn derive_http_base_url(flight_url: &str) -> String {
         return "https://data.spiceai.io".to_string();
     }
 
-    let Ok(mut url) = reqwest::Url::parse(flight_url) else {
+    let http_flight_url = flight_url
+        .strip_prefix("grpc://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            flight_url
+                .strip_prefix("grpc+tls://")
+                .map(|rest| format!("https://{rest}"))
+        });
+    let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
+    let Ok(mut url) = reqwest::Url::parse(parse_target) else {
         return format!("{flight_url}:8090");
     };
 
@@ -523,6 +532,20 @@ mod tests {
         let instance = SpicedInstance::external("http://localhost:50051");
 
         assert_eq!(instance.http_base_url(), "http://localhost:8090");
+    }
+
+    #[test]
+    fn external_maps_grpc_flight_scheme_to_http() {
+        let instance = SpicedInstance::external("grpc://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "http://localhost:8090");
+    }
+
+    #[test]
+    fn external_maps_grpc_tls_flight_scheme_to_https() {
+        let instance = SpicedInstance::external("grpc+tls://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "https://localhost:8090");
     }
 
     #[test]

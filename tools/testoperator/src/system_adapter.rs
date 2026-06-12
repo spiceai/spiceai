@@ -255,11 +255,24 @@ fn derive_http_base_url(flight_url: &str) -> Option<String> {
         return Some("https://data.spiceai.io".to_string());
     }
 
-    let mut url = url::Url::parse(flight_url).ok()?;
+    let http_flight_url = flight_url
+        .strip_prefix("grpc://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            flight_url
+                .strip_prefix("grpc+tls://")
+                .map(|rest| format!("https://{rest}"))
+        });
+    let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
+    let Ok(mut url) = url::Url::parse(parse_target) else {
+        return Some(format!("{flight_url}:8090"));
+    };
     url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
-    url.set_port(Some(8090)).ok()?;
+    if url.set_port(Some(8090)).is_err() {
+        return Some(format!("{flight_url}:8090"));
+    }
     Some(url.as_str().trim_end_matches('/').to_string())
 }
 
@@ -280,6 +293,30 @@ mod tests {
         assert_eq!(
             derive_http_base_url("http://localhost:50051"),
             Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_flight_scheme_to_http() {
+        assert_eq!(
+            derive_http_base_url("grpc://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_tls_flight_scheme_to_https() {
+        assert_eq!(
+            derive_http_base_url("grpc+tls://localhost:50051"),
+            Some("https://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_falls_back_for_non_url_flight_address() {
+        assert_eq!(
+            derive_http_base_url("localhost:50051"),
+            Some("localhost:50051:8090".to_string())
         );
     }
 }

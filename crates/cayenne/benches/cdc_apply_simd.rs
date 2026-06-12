@@ -54,9 +54,10 @@ limitations under the License.
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch};
+use arrow::array::{Array, BooleanArray, BooleanBufferBuilder, Int64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use cayenne::provider::deletion_index::{DeletionIndex, KeyDeletionIndex, Tombstone};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hash_index::XxHash3BuildHasher;
