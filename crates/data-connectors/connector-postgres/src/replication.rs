@@ -480,14 +480,13 @@ fn replication_params_from_connector_params(
     dataset_name: &str,
 ) -> std::result::Result<ReplicationParams, String> {
     let host = required_string(params, "host")?;
-    let port = optional_string(params, "port")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(5432);
+    let port = optional_parse::<u16>(params, "port", 5432, "a port number (0-65535)")?;
     let user = required_string(params, "user")?;
     let password_str = required_secret(params, "pass")?;
     let database = required_string(params, "db")?;
     let sslmode =
-        config::SslMode::from_str_or_default(optional_string(params, "sslmode").as_deref());
+        config::SslMode::from_str_strict(optional_string(params, "sslmode").as_deref())
+            .map_err(|reason| format!("parameter `{}` {reason}", params.user_param("sslmode")))?;
     let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
 
     // An explicitly-named slot is shareable: every dataset on the same
@@ -509,13 +508,13 @@ fn replication_params_from_connector_params(
                 .unwrap_or_else(|| config::default_publication_name(dataset_name)),
         ),
     };
-    let initial_snapshot = optional_string(params, "replication_initial_snapshot")
-        .is_none_or(|s| parse_bool_default_true(&s));
-    let temporary_slot = optional_string(params, "replication_temporary_slot")
-        .is_some_and(|s| parse_bool_default_false(&s));
-    let status_interval = optional_string(params, "replication_status_interval")
-        .and_then(|s| fundu::parse_duration(&s).ok())
-        .unwrap_or(DEFAULT_STATUS_INTERVAL);
+    let initial_snapshot = optional_bool(params, "replication_initial_snapshot", true)?;
+    let temporary_slot = optional_bool(params, "replication_temporary_slot", false)?;
+    let status_interval = optional_duration(
+        params,
+        "replication_status_interval",
+        DEFAULT_STATUS_INTERVAL,
+    )?;
     let bootstrap_batch_size = optional_usize_in_range(
         params,
         "replication_bootstrap_batch_size",
@@ -591,12 +590,83 @@ fn optional_usize_in_range(
     }
 }
 
-fn parse_bool_default_true(s: &str) -> bool {
-    matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y") || s.is_empty()
+/// Parses an optional boolean parameter strictly. An absent or empty value
+/// uses `default`; a recognized token maps to its boolean; anything else is
+/// rejected rather than silently falling back. Accepts `true/1/yes/y` and
+/// `false/0/no/n` (case-insensitive, surrounding whitespace trimmed).
+///
+/// The lenient predecessors collapsed every unrecognized value to `false`, so
+/// a typo'd `replication_initial_snapshot` silently skipped the bootstrap
+/// snapshot and the accelerator served only post-subscription changes —
+/// missing every pre-existing row with no error.
+fn optional_bool(
+    params: &Parameters,
+    key: &str,
+    default: bool,
+) -> std::result::Result<bool, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(default);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" => Ok(true),
+        "false" | "0" | "no" | "n" => Ok(false),
+        _ => {
+            let user_param = params.user_param(key);
+            Err(format!(
+                "parameter `{user_param}` must be a boolean (true/false), got {raw:?}"
+            ))
+        }
+    }
 }
 
-fn parse_bool_default_false(s: &str) -> bool {
-    matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y")
+/// Parses an optional value via `FromStr`. An absent or empty value uses
+/// `default`; a parse failure is reported with the user-facing parameter name
+/// and `expected` description rather than silently substituting the default.
+fn optional_parse<T>(
+    params: &Parameters,
+    key: &str,
+    default: T,
+    expected: &str,
+) -> std::result::Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(default);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    trimmed.parse::<T>().map_err(|_| {
+        let user_param = params.user_param(key);
+        format!("parameter `{user_param}` must be {expected}, got {raw:?}")
+    })
+}
+
+/// Parses an optional duration parameter strictly. An absent or empty value
+/// uses `default`; an unparseable value is rejected rather than silently
+/// substituting the default.
+fn optional_duration(
+    params: &Parameters,
+    key: &str,
+    default: Duration,
+) -> std::result::Result<Duration, String> {
+    let Some(raw) = optional_string(params, key) else {
+        return Ok(default);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    fundu::parse_duration(trimmed).map_err(|parse_error| {
+        let user_param = params.user_param(key);
+        format!("parameter `{user_param}` must be a duration, got {raw:?}: {parse_error}")
+    })
 }
 
 /// Splits `dataset.from` like `"postgres:public.users"` into (schema, table).
@@ -641,6 +711,147 @@ mod tests {
             "pg",
             crate::PARAMETERS,
         )
+    }
+
+    fn params_with(key: &str, value: &str) -> Parameters {
+        Parameters::new(
+            vec![(key.to_string(), SecretString::from(value))],
+            "pg",
+            crate::PARAMETERS,
+        )
+    }
+
+    fn empty_params() -> Parameters {
+        Parameters::new(vec![], "pg", crate::PARAMETERS)
+    }
+
+    #[test]
+    fn optional_bool_recognizes_true_and_false_tokens() {
+        for v in ["true", "TRUE", "1", "yes", "Y", " true "] {
+            assert_eq!(
+                optional_bool(
+                    &params_with("replication_initial_snapshot", v),
+                    "replication_initial_snapshot",
+                    false
+                ),
+                Ok(true),
+                "expected {v:?} to parse as true"
+            );
+        }
+        for v in ["false", "FALSE", "0", "no", "N", " false "] {
+            assert_eq!(
+                optional_bool(
+                    &params_with("replication_initial_snapshot", v),
+                    "replication_initial_snapshot",
+                    true
+                ),
+                Ok(false),
+                "expected {v:?} to parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_bool_uses_default_when_absent_or_empty() {
+        assert_eq!(
+            optional_bool(&empty_params(), "replication_initial_snapshot", true),
+            Ok(true)
+        );
+        assert_eq!(
+            optional_bool(&empty_params(), "replication_temporary_slot", false),
+            Ok(false)
+        );
+        assert_eq!(
+            optional_bool(
+                &params_with("replication_initial_snapshot", "   "),
+                "replication_initial_snapshot",
+                true
+            ),
+            Ok(true)
+        );
+    }
+
+    // Regression for #11274: a typo'd `replication_initial_snapshot` previously
+    // collapsed to `false`, silently skipping the bootstrap snapshot and
+    // dropping every pre-existing row. It must now error loudly instead.
+    #[test]
+    fn optional_bool_rejects_unrecognized_value() {
+        let result = optional_bool(
+            &params_with("replication_initial_snapshot", "ture"),
+            "replication_initial_snapshot",
+            true,
+        );
+        assert_eq!(
+            result,
+            Err("parameter `pg_replication_initial_snapshot` must be a boolean (true/false), got \"ture\"".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_parse_port_rejects_non_numeric() {
+        let result = optional_parse::<u16>(
+            &params_with("port", "not-a-port"),
+            "port",
+            5432,
+            "a port number (0-65535)",
+        );
+        assert_eq!(
+            result,
+            Err(
+                "parameter `pg_port` must be a port number (0-65535), got \"not-a-port\""
+                    .to_string()
+            )
+        );
+        // Valid + absent paths.
+        assert_eq!(
+            optional_parse::<u16>(&params_with("port", "6543"), "port", 5432, "x"),
+            Ok(6543)
+        );
+        assert_eq!(
+            optional_parse::<u16>(&empty_params(), "port", 5432, "x"),
+            Ok(5432)
+        );
+    }
+
+    #[test]
+    fn optional_duration_rejects_unparseable_value() {
+        let result = optional_duration(
+            &params_with("replication_status_interval", "soon"),
+            "replication_status_interval",
+            DEFAULT_STATUS_INTERVAL,
+        );
+        let err = result.expect_err("invalid duration should error");
+        assert!(
+            err.starts_with(
+                "parameter `pg_replication_status_interval` must be a duration, got \"soon\""
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            optional_duration(
+                &empty_params(),
+                "replication_status_interval",
+                DEFAULT_STATUS_INTERVAL
+            ),
+            Ok(DEFAULT_STATUS_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn sslmode_strict_rejects_unknown_mode() {
+        // A typo must not silently downgrade to `prefer` (TLS/MITM downgrade).
+        match config::SslMode::from_str_strict(Some("verify-ful")) {
+            Err(_) => {}
+            Ok(mode) => panic!("typo `verify-ful` must be rejected, got {mode:?}"),
+        }
+        assert_eq!(
+            config::SslMode::from_str_strict(Some("verify-full")),
+            Ok(config::SslMode::VerifyFull)
+        );
+        assert_eq!(
+            config::SslMode::from_str_strict(None),
+            Ok(config::SslMode::Prefer)
+        );
     }
 
     #[test]
