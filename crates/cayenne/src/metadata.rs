@@ -582,9 +582,9 @@ impl CdcDurability {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "one independent pin flag per adaptive-tunable knob"
+    reason = "one independent pin flag per adaptive-tunable actuator"
 )]
-pub struct PinnedTuningKnobs {
+pub struct PinnedTuningActuators {
     /// The inline-memtable flush caps were operator-set (don't adapt them).
     pub inline_flush: bool,
     /// `cayenne_compaction_background_interval_ms` was operator-set.
@@ -593,6 +593,9 @@ pub struct PinnedTuningKnobs {
     pub compaction_trigger: bool,
     /// `cayenne_write_concurrency` was operator-set.
     pub write_concurrency: bool,
+    /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
+    /// in-memory CDC durability tier byte cap).
+    pub mem_tier: bool,
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
@@ -799,9 +802,9 @@ pub struct VortexConfig {
     #[serde(default)]
     pub dynamic_tuning: bool,
     /// Adaptive-tunable knobs the operator pinned with an explicit value; the
-    /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
+    /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
     #[serde(default)]
-    pub pinned_tuning_knobs: PinnedTuningKnobs,
+    pub pinned_tuning_actuators: PinnedTuningActuators,
 }
 
 fn default_concurrency() -> usize {
@@ -884,11 +887,10 @@ fn default_cdc_mem_tier_max_bytes() -> i64 {
 /// (32 MiB — the serde/engine floor; the accelerator's auto-tune derives 1/8 of
 /// the derived byte cap, clamped 32–128 MiB, when the param is unset, keeping
 /// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot +
-/// delete-vector
-/// files + a listing refresh under the fence; at a 1 s tick a high-rate table
-/// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
-/// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
-/// accumulated churn degrades scans and the apply path. Gating the tick on
+/// delete-vector files + a listing refresh under the fence; at a 1 s tick a
+/// high-rate table would otherwise produce ~600 tiny snapshots per 10 minutes
+/// (measured at SF-100: 408–676 accumulated snapshot dirs per heavy table), and
+/// the accumulated churn degrades scans and the apply path. Gating the tick on
 /// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
 /// flush window while leaving freshness untouched (RAM rows are visible to
 /// queries immediately; only the deferred source-slot ack waits, bounded by
@@ -1035,7 +1037,7 @@ impl Default for VortexConfig {
             cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
-            pinned_tuning_knobs: PinnedTuningKnobs::default(),
+            pinned_tuning_actuators: PinnedTuningActuators::default(),
         }
     }
 }
