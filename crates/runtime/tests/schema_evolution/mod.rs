@@ -653,8 +653,9 @@ async fn assert_column_arrow_type(rt: &Arc<Runtime>, column: &str, arrow_type: &
         .field_with_name(column)
         .expect("queried column present in result schema");
     let actual = format!("{:?}", field.data_type());
-    assert!(
-        actual.contains(arrow_type),
+    assert_eq!(
+        actual.as_str(),
+        arrow_type,
         "expected `{column}` to be `{arrow_type}` after evolution, got `{actual}`"
     );
 }
