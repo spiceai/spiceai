@@ -22415,6 +22415,7 @@ mod tests {
     /// investigation (EXPLAIN q20 at SF-100, join-mode/statistics with a
     /// resident tier) is the open thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Vortex scan temporary declines hash-join dynamic filters by default (DF53 InList list_contains regression fix);"]
     async fn mem_tier_join_probe_keeps_dynamic_filter_pushdown() {
         use arrow::array::Int64Array;
         use datafusion::datasource::MemTable;
