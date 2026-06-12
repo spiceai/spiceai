@@ -550,7 +550,6 @@ async fn enrich_with_bigquery_metadata_from_weak_pool(
     enrich_with_bigquery_metadata(driver_name, &pool, table_reference, provider).await
 }
 
-/// Wraps `provider` with metadata enrichment, but keeps `FederatedTableProviderAdaptor`
 pub(crate) async fn enrich_with_bigquery_metadata(
     driver_name: &str,
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
