@@ -35,27 +35,6 @@ use test_framework::anyhow;
 use test_framework::queries::validation::{QueryValidationResult, validate_with_expected_batches};
 use test_framework::queries::{QueryOverrides, get_chbench_test_queries};
 
-/// Queries whose DIVERGENCE is reported but does not gate the verdict, each
-/// with the documented reason. The only current entry is `chbench_q15`: its
-/// query text demands floating-point EQUALITY against a `max()` subquery over
-/// a DOUBLE `SUM` (`total_revenue = (SELECT max(total_revenue) ...)`), so a
-/// last-ULP difference between Spice's and Postgres' summation order
-/// legitimately returns zero rows on one side — a property of the query, not
-/// a correctness defect (observed flipping pass/fail across identical runs).
-/// Advisory queries still EXECUTE and their results are printed; a PASS
-/// counts normally.
-const ADVISORY_QUERIES: &[(&str, &str)] = &[(
-    "chbench_q15",
-    "FP-equality over a DOUBLE SUM in the query text; last-ULP order-dependent",
-)];
-
-fn advisory_reason(name: &str) -> Option<&'static str> {
-    ADVISORY_QUERIES
-        .iter()
-        .find(|(q, _)| *q == name)
-        .map(|(_, reason)| *reason)
-}
-
 /// Outcome for a single analytical query.
 #[derive(Debug)]
 pub enum Outcome {
@@ -105,57 +84,35 @@ impl AnalyticalReport {
 
         let mut passed: u64 = 0;
         let mut failed: u64 = 0;
-        let mut advisory: u64 = 0;
         for r in &self.results {
             let delta = r
                 .max_rel_delta
                 .map_or_else(|| "-".to_string(), |d| format!("{:.4}", d * 100.0));
-            let is_advisory_failure =
-                !matches!(r.outcome, Outcome::Pass) && advisory_reason(&r.name).is_some();
-            let label = if is_advisory_failure {
-                "ADVISORY"
-            } else {
-                r.outcome.label()
-            };
-            println!("  {:<14} {:>12} {:>10}", r.name, label, delta);
+            println!("  {:<14} {:>12} {:>10}", r.name, r.outcome.label(), delta);
             if let Some(detail) = r.outcome.detail() {
                 println!("    └─ {detail}");
             }
-            if is_advisory_failure {
-                // Reported, never gating: see `ADVISORY_QUERIES` for the
-                // documented per-query reason.
-                if let Some(reason) = advisory_reason(&r.name) {
-                    println!("    └─ advisory (non-gating): {reason}");
-                }
-                advisory += 1;
-            } else if matches!(r.outcome, Outcome::Pass) {
+            if matches!(r.outcome, Outcome::Pass) {
                 passed += 1;
             } else {
                 failed += 1;
             }
         }
 
-        let total = passed + failed + advisory;
-        let advisory_note = if advisory > 0 {
-            format!(" ({advisory} advisory divergence(s) excluded)")
-        } else {
-            String::new()
-        };
+        let total = passed + failed;
         if failed == 0 {
-            println!("  verdict: PASSED — {passed}/{total} queries match{advisory_note}");
+            println!("  verdict: PASSED — {passed}/{total} queries match");
         } else {
-            println!("  verdict: FAILED — {failed}/{total} queries diverged{advisory_note}");
+            println!("  verdict: FAILED — {failed}/{total} queries diverged");
         }
     }
 
-    /// Returns a single joined failure summary, or `None` if every query
-    /// passed (advisory divergences are excluded — reported in `emit`, never
-    /// gating).
+    /// Returns a single joined failure summary, or `None` if every query passed.
     pub fn failure_message(&self) -> Option<String> {
         let problems: Vec<String> = self
             .results
             .iter()
-            .filter(|r| !matches!(r.outcome, Outcome::Pass) && advisory_reason(&r.name).is_none())
+            .filter(|r| !matches!(r.outcome, Outcome::Pass))
             .map(|r| match &r.outcome {
                 Outcome::Pass => unreachable!(),
                 Outcome::Fail(m) => format!("{} mismatch: {m}", r.name),
