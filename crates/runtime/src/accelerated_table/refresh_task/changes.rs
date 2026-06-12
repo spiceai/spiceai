@@ -166,15 +166,27 @@ fn committers_all_support_deferral(
             .all(|committer| committer.supports_deferral())
 }
 
+/// Op-granular durable-path decision for one coalesced burst:
+/// - `Truncate`/`Unknown` rows always force the durable path (whole burst).
+/// - `Delete` rows force it only when the sink cannot absorb key deletes in
+///   RAM (`sink_absorbs_in_memory_deletes`, the Cayenne
+///   `supports_in_memory_cdc_deletes` capability) or the row carries no
+///   primary key (nothing to tombstone — the keyless durable path deletes by
+///   full-row match).
+/// - `Upsert` rows never force it.
 #[cfg(not(windows))]
-fn change_batch_requires_durable_cdc_path(change_batch: &ChangeBatch) -> bool {
+fn change_batch_requires_durable_cdc_path(
+    change_batch: &ChangeBatch,
+    sink_absorbs_in_memory_deletes: bool,
+) -> bool {
     (0..change_batch.record.num_rows()).any(|row| {
-        matches!(
-            ChangeOperationType::from_operation(&change_batch.op(row)),
-            ChangeOperationType::Delete
-                | ChangeOperationType::Truncate
-                | ChangeOperationType::Unknown
-        )
+        match ChangeOperationType::from_operation(&change_batch.op(row)) {
+            ChangeOperationType::Truncate | ChangeOperationType::Unknown => true,
+            ChangeOperationType::Delete => {
+                !sink_absorbs_in_memory_deletes || change_batch.primary_keys(row).is_empty()
+            }
+            ChangeOperationType::Upsert => false,
+        }
     })
 }
 
@@ -1385,9 +1397,22 @@ impl RefreshTask {
 
         #[cfg(not(windows))]
         let can_defer_current_burst = committers_all_support_deferral(&committers);
+        // Capability probe: a key-mode memory-tier Cayenne sink absorbs Delete
+        // events as RAM tombstones (deferring their durability to the covering
+        // checkpoint exactly like upserts), so delete-bearing bursts stay on
+        // the mem path instead of flipping the table durable per burst. Every
+        // other sink reports `false` (here: no Cayenne provider resolves) and
+        // keeps the old behavior.
         #[cfg(not(windows))]
-        let requires_durable_cdc_path =
-            !can_defer_current_burst || change_batch_requires_durable_cdc_path(&coalesced_batch);
+        let sink_absorbs_in_memory_deletes = self
+            .cayenne_accelerator()
+            .is_some_and(CayenneTableProvider::supports_in_memory_cdc_deletes);
+        #[cfg(not(windows))]
+        let requires_durable_cdc_path = !can_defer_current_burst
+            || change_batch_requires_durable_cdc_path(
+                &coalesced_batch,
+                sink_absorbs_in_memory_deletes,
+            );
 
         #[cfg(not(windows))]
         if let Some(queue) = context.deferred_commits
@@ -1633,8 +1658,16 @@ impl RefreshTask {
             match op_type {
                 ChangeOperationType::Delete => {
                     let op_start = Instant::now();
-                    self.process_delete_batch(&change_batch, &row_indices, ctx, session_state)
+                    let absorbed_epoch = self
+                        .process_delete_batch(&change_batch, &row_indices, ctx, session_state)
                         .await?;
+                    // An absorbed delete is RAM-only until the covering
+                    // checkpoint, so its epoch must defer this burst's source
+                    // commit exactly like an in-memory upsert sub-batch.
+                    if let Some(epoch) = absorbed_epoch {
+                        max_in_memory_epoch =
+                            Some(max_in_memory_epoch.map_or(epoch, |cur| cur.max(epoch)));
+                    }
                     tracing::trace!(
                         dataset = %dataset_name,
                         op = "delete",
@@ -1925,14 +1958,54 @@ impl RefreshTask {
         Ok(())
     }
 
+    /// Apply one Delete sub-batch. Returns the Cayenne in-memory CDC tier
+    /// epoch when the deletes were ABSORBED as RAM tombstones
+    /// (`cdc_durability: memory`, key-mode) — the caller must defer the
+    /// burst's source commit on that epoch exactly like an in-memory upsert —
+    /// or `None` when the deletes were applied durably (the historical path).
     async fn process_delete_batch(
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
         ctx: &SessionContext,
         session_state: &SessionState,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<Option<u64>> {
         let dataset_name = &self.dataset_name;
+
+        // In-memory absorption: when the burst-level gate kept this burst on
+        // the mem path, the slot advancer is armed and a capable Cayenne sink
+        // turns the delete rows into mem-tier tombstones, deferring their
+        // durability to the covering checkpoint. `Ok(None)` from the absorb
+        // call (capability lost, inextractable keys, budget refusal after
+        // spill) falls through to the durable path below — safe in either ack
+        // mode, since durable deletes never sit ahead of the source slot.
+        #[cfg(not(windows))]
+        if let Some(cayenne) = self.cayenne_accelerator()
+            && cayenne.supports_in_memory_cdc_deletes()
+            && cayenne.has_slot_advancer()
+            && !row_indices.is_empty()
+            && row_indices
+                .iter()
+                .all(|&row| !change_batch.primary_keys(row).is_empty())
+        {
+            let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
+            let absorbed = cayenne
+                .write_cdc_delete_keys_in_memory(&selected_batch)
+                .await
+                .map_err(DataFusionError::from)
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            if let Some(epoch) = absorbed {
+                tracing::trace!(
+                    dataset = %dataset_name,
+                    rows = row_indices.len(),
+                    epoch,
+                    "Delete sub-batch absorbed into the in-memory CDC tier"
+                );
+                self.update_last_updated_at();
+                return Ok(Some(epoch));
+            }
+        }
 
         let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
             .iter()
@@ -1981,7 +2054,7 @@ impl RefreshTask {
             self.update_last_updated_at();
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -3977,18 +4050,65 @@ mod tests {
             vec![Some("create"), Some("update"), Some("read")],
         );
         assert!(
-            !change_batch_requires_durable_cdc_path(&upsert),
+            !change_batch_requires_durable_cdc_path(&upsert, false),
             "upsert-only bursts may use memory CDC durability"
         );
 
+        // Sink cannot absorb deletes in RAM (capability=false): every
+        // non-upsert op forces the durable path — the historical behavior.
         for op in ["d", "t", "x"] {
             let batch =
                 create_test_change_batch(vec![op], &[vec!["id"]], vec![1], vec![Some("row")]);
             assert!(
-                change_batch_requires_durable_cdc_path(&batch),
-                "operation {op} must force the durable CDC path"
+                change_batch_requires_durable_cdc_path(&batch, false),
+                "operation {op} must force the durable CDC path when the sink cannot absorb deletes"
             );
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_memory_cdc_delete_burst_stays_on_mem_path_when_sink_absorbs() {
+        // A keyed delete-bearing burst stays on the mem path when the sink
+        // absorbs deletes in RAM (capability=true) — including mixed
+        // upsert+delete bursts, the high-load coalesced shape.
+        let delete_only =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("row")]);
+        assert!(
+            !change_batch_requires_durable_cdc_path(&delete_only, true),
+            "a keyed delete burst must stay on the mem path when the sink absorbs deletes"
+        );
+
+        let mixed = create_test_change_batch(
+            vec!["c", "d", "u"],
+            &[vec!["id"], vec!["id"], vec!["id"]],
+            vec![1, 2, 3],
+            vec![Some("create"), Some("delete"), Some("update")],
+        );
+        assert!(
+            !change_batch_requires_durable_cdc_path(&mixed, true),
+            "a mixed upsert+delete burst must stay on the mem path when the sink absorbs deletes"
+        );
+
+        // Truncate and Unknown are never absorbable — durable regardless of
+        // the delete capability.
+        for op in ["t", "x"] {
+            let batch =
+                create_test_change_batch(vec![op], &[vec!["id"]], vec![1], vec![Some("row")]);
+            assert!(
+                change_batch_requires_durable_cdc_path(&batch, true),
+                "operation {op} must force the durable CDC path even when deletes are absorbable"
+            );
+        }
+
+        // A keyless delete row has nothing to tombstone — durable even with
+        // the capability on.
+        let keyless_delete =
+            create_test_change_batch(vec!["d"], &[vec![]], vec![1], vec![Some("row")]);
+        assert!(
+            change_batch_requires_durable_cdc_path(&keyless_delete, true),
+            "a keyless delete row must force the durable CDC path"
+        );
     }
 
     #[cfg(not(windows))]
