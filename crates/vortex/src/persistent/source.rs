@@ -199,6 +199,16 @@ fn contains_dynamic_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.children().into_iter().any(contains_dynamic_filter)
 }
 
+/// Classification of a pushdown filter, determining how it is applied to the Vortex scan.
+enum FilterDisposition {
+    /// Convertible and evaluated inside the Vortex scan (row-level + pruning).
+    RowEval,
+    /// Not row-evaluable, but kept in the file-pruning predicate.
+    PruneOnly,
+    /// Gated dynamic filter: bypasses the Vortex scan entirely.
+    Gated,
+}
+
 impl FileSource for VortexSource {
     fn create_file_opener(
         &self,
@@ -358,27 +368,18 @@ impl FileSource for VortexSource {
         // from the Vortex scan unless explicitly enabled.
         let gate_dynamic = !self.options.dynamic_filter_pushdown;
 
-        enum Class {
-            /// Convertible and evaluated inside the Vortex scan (row-level + pruning).
-            RowEval,
-            /// Not row-evaluable, but kept in the file-pruning predicate.
-            PruneOnly,
-            /// Gated dynamic filter: bypasses the Vortex scan entirely.
-            Gated,
-        }
-
-        let classes: Vec<Class> = filters
+        let classes: Vec<FilterDisposition> = filters
             .iter()
             .map(|expr| {
                 if gate_dynamic && contains_dynamic_filter(expr) {
-                    Class::Gated
+                    FilterDisposition::Gated
                 } else if self
                     .expression_convertor
                     .can_be_pushed_down(expr, self.table_schema.file_schema())
                 {
-                    Class::RowEval
+                    FilterDisposition::RowEval
                 } else {
-                    Class::PruneOnly
+                    FilterDisposition::PruneOnly
                 }
             })
             .collect();
@@ -388,22 +389,24 @@ impl FileSource for VortexSource {
         let prunable = filters
             .iter()
             .zip(&classes)
-            .filter(|(_, class)| !matches!(class, Class::Gated))
+            .filter(|(_, class)| !matches!(class, FilterDisposition::Gated))
             .map(|(expr, _)| Arc::clone(expr));
-        source.full_predicate = match source.full_predicate {
-            Some(predicate) => Some(conjunction(std::iter::once(predicate).chain(prunable))),
-            None => {
-                let prunable: Vec<_> = prunable.collect();
-                (!prunable.is_empty()).then(|| conjunction(prunable))
-            }
+        source.full_predicate = if let Some(predicate) = source.full_predicate {
+            Some(conjunction(std::iter::once(predicate).chain(prunable)))
+        } else {
+            let prunable: Vec<_> = prunable.collect();
+            (!prunable.is_empty()).then(|| conjunction(prunable))
         };
 
         // Only row-evaluable filters enter the Vortex scan predicate.
-        if classes.iter().any(|class| matches!(class, Class::RowEval)) {
+        if classes
+            .iter()
+            .any(|class| matches!(class, FilterDisposition::RowEval))
+        {
             let row_eval = filters
                 .iter()
                 .zip(&classes)
-                .filter(|(_, class)| matches!(class, Class::RowEval))
+                .filter(|(_, class)| matches!(class, FilterDisposition::RowEval))
                 .map(|(expr, _)| Arc::clone(expr));
             let predicate = match source.vortex_predicate {
                 Some(predicate) => conjunction(std::iter::once(predicate).chain(row_eval)),
@@ -416,8 +419,8 @@ impl FileSource for VortexSource {
         let pushdown_result = classes
             .iter()
             .map(|class| match class {
-                Class::RowEval => PushedDown::Yes,
-                Class::PruneOnly | Class::Gated => PushedDown::No,
+                FilterDisposition::RowEval => PushedDown::Yes,
+                FilterDisposition::PruneOnly | FilterDisposition::Gated => PushedDown::No,
             })
             .collect();
 
