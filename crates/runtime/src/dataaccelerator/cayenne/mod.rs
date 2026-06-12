@@ -762,6 +762,20 @@ impl CayenneAccelerator {
                     .collect();
             }
 
+            // Parse shard key columns (the hash-clustering key for intra-write
+            // sharding; the engine derives it from the primary key when unset)
+            if let Some(shard_cols_str) = acceleration
+                .params
+                .get("cayenne_shard_key_columns")
+                .or_else(|| acceleration.params.get("shard_key_columns"))
+            {
+                config.shard_key_columns = shard_cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
             // Upload concurrency: `auto`/unset keeps the available-parallelism
             // default; 0 → warn + minimum 1. The aggregate across all tables is
             // separately bounded by the process-global encode budget.
@@ -1321,8 +1335,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    33,
-    { S3_PARAMS_LEN + 33 },
+    34,
+    { S3_PARAMS_LEN + 34 },
 >(
     S3_PARAMETERS,
     [
@@ -1349,6 +1363,8 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .default("auto"),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("shard_key_columns")
+            .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])

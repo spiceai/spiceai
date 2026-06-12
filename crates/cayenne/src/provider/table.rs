@@ -5673,6 +5673,11 @@ impl CayenneTableProvider {
     /// encoding) and the delta-encoding strategy-override path
     /// (`CayenneContext::write_format_with_strategy`) so the two write paths
     /// produce identically-sharded output formats.
+    ///
+    /// The hash-clustering key is the configured `shard_key_columns` (e.g. the
+    /// source's declared partition/shard key, applied by extended schema
+    /// inference) when set and valid against the schema; otherwise the primary
+    /// key. PK-less tables without a configured key shard round-robin.
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
@@ -5687,8 +5692,34 @@ impl CayenneTableProvider {
         if shard_count <= 1 {
             return None;
         }
-        let shard_key_columns = self
-            .pk_column_indices
+        let shard_key_columns = self.resolved_shard_key_columns();
+        Some(WriteShardConfig {
+            write_concurrency: shard_count,
+            shard_key_columns,
+        })
+    }
+
+    /// The hash-clustering key for intra-write sharding: the configured
+    /// `shard_key_columns` when every column exists in the table schema, else
+    /// the primary-key columns. An invalid configured key warns and falls back
+    /// rather than failing the write.
+    fn resolved_shard_key_columns(&self) -> Vec<String> {
+        let configured = self.context.shard_key_columns();
+        if !configured.is_empty() {
+            let missing: Vec<&String> = configured
+                .iter()
+                .filter(|column| self.table_metadata.schema.field_with_name(column).is_err())
+                .collect();
+            if missing.is_empty() {
+                return configured.to_vec();
+            }
+            tracing::warn!(
+                table = self.table_metadata.table_name.as_str(),
+                missing = ?missing,
+                "Configured shard key columns (`cayenne_shard_key_columns` / `shard_key_columns`) reference columns absent from the table schema; falling back to the primary key shard key"
+            );
+        }
+        self.pk_column_indices
             .iter()
             .filter_map(|&i| {
                 self.table_metadata
@@ -5697,11 +5728,7 @@ impl CayenneTableProvider {
                     .get(i)
                     .map(|f| f.name().clone())
             })
-            .collect::<Vec<_>>();
-        Some(WriteShardConfig {
-            write_concurrency: shard_count,
-            shard_key_columns,
-        })
+            .collect()
     }
 
     /// Requested number of intra-write shards (parallel encoders) for a snapshot
@@ -18596,6 +18623,27 @@ mod tests {
         primary_key: Vec<String>,
         runtime_env: Arc<RuntimeEnv>,
     ) -> (CayenneTableProvider, tempfile::TempDir) {
+        let vortex_config = VortexConfig {
+            sort_columns,
+            ..VortexConfig::default()
+        };
+        create_cayenne_table_with_config(
+            table_name,
+            schema,
+            vortex_config,
+            primary_key,
+            runtime_env,
+        )
+        .await
+    }
+
+    async fn create_cayenne_table_with_config(
+        table_name: &str,
+        schema: SchemaRef,
+        vortex_config: VortexConfig,
+        primary_key: Vec<String>,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("temp dir created");
         let metadata_dir = format!(
             "{}/metadata",
@@ -18609,11 +18657,6 @@ mod tests {
         let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
             as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
-
-        let vortex_config = VortexConfig {
-            sort_columns,
-            ..VortexConfig::default()
-        };
 
         let options = CreateTableOptions {
             table_name: table_name.to_string(),
@@ -18726,6 +18769,69 @@ mod tests {
             .expect("keyed multi-writer config should enable write sharding");
         assert_eq!(write_shard.write_concurrency, 4);
         assert_eq!(write_shard.shard_key_columns, vec!["id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_write_shard_format_configured_shard_key_overrides_primary_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("tenant_id", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            // The source's declared distribution key (e.g. a Postgres partition
+            // key applied by extended schema inference) clusters files by it.
+            shard_key_columns: vec!["tenant_id".to_string()],
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "configured_shard_key",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        let format = provider.write_shard_format(4, tsb, None);
+        let write_shard = format
+            .write_shard()
+            .expect("multi-writer config should enable write sharding");
+        assert_eq!(
+            write_shard.shard_key_columns,
+            vec!["tenant_id".to_string()],
+            "a configured shard key must override the primary-key default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_shard_format_invalid_configured_shard_key_falls_back_to_pk() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let vortex_config = VortexConfig {
+            shard_key_columns: vec!["absent".to_string()],
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "invalid_shard_key",
+            Arc::clone(&schema),
+            vortex_config,
+            vec!["id".to_string()],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let tsb = provider.context.target_file_size_bytes();
+        let format = provider.write_shard_format(4, tsb, None);
+        let write_shard = format
+            .write_shard()
+            .expect("multi-writer config should enable write sharding");
+        assert_eq!(
+            write_shard.shard_key_columns,
+            vec!["id".to_string()],
+            "a shard key referencing a missing column must fall back to the primary key"
+        );
     }
 
     #[tokio::test]
