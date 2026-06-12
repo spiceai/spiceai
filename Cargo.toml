@@ -352,13 +352,13 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7bc9e455d47aa8899acc5c6c91f7448bea5637b2" } # branch: spiceai-58
@@ -483,9 +483,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "2536f5c375a58ed1199fde36ec8d6f0932ba7ad6" } # branch: lukim/spiceai-53-vortex-0.74.0 (Vortex 0.74.0)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "867a22c3369434502b700b351f09f9d25ee22585" } # branch: lukim/scan-improvements (0.74.0 + scan perf + flat decode memo)
