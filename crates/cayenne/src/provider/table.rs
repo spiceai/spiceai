@@ -2134,7 +2134,7 @@ pub struct CayenneTableProvider {
     /// heuristic can neither reap merged-away dirs (the measured 406-dir/89G
     /// leak) nor be handed a fresher anchor safely (a just-minted anchor
     /// defeats every keep-guard and deletes the LIVE current dir mid-scan —
-    /// the NotFound query failures + permanent loss of spill rows).
+    /// the `NotFound` query failures + permanent loss of spill rows).
     retired_snapshot_dirs: Arc<ParkingMutex<HashMap<String, Instant>>>,
     /// Last time a scan resolved a file listing for each snapshot dir,
     /// consulted by `sweep_retired_snapshot_dirs` so a long-running query
@@ -3811,7 +3811,7 @@ impl CayenneTableProvider {
     /// `OLD_SNAPSHOT_CLEANUP_GRACE`: plan-build resolves file paths under the
     /// listing fence but executes after releasing it, so deletion must trail
     /// any plan that could still open the dir's files.
-    const RETIRED_SNAPSHOT_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+    const RETIRED_SNAPSHOT_DIR_GRACE: std::time::Duration = std::time::Duration::from_mins(2);
 
     /// Record that the catalog no longer references these snapshot dirs (their
     /// contents were merged into a successor snapshot). Physical deletion
@@ -13469,7 +13469,7 @@ impl CayenneTableProvider {
     /// serialized by `mem_checkpoint_lock`, so the only interleaving writer is an
     /// append (push-only); this load+store runs under the `mem_tier_publish_lock`
     /// the caller holds (appends also take it to swap the tier), so the
-    /// load_full→retain_after→store is atomic w.r.t. an append's swap and the
+    /// `load_full→retain_after→store` is atomic w.r.t. an append's swap and the
     /// survivor prefix is stable. (The tier swap is decoupled from the listing
     /// fence; only the publish lock serializes tier writers.)
     fn clear_mem_tier_flushed_prefix(&self, flushed_segment_count: usize) {

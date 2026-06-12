@@ -466,6 +466,7 @@ impl SpicedInstance {
     }
 
     /// Returns a `Process` handle when this instance owns a local spiced subprocess.
+    #[must_use]
     pub fn process(&self) -> Option<Process> {
         let Self::Owned { child, .. } = self else {
             return None;
