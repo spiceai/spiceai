@@ -92,6 +92,27 @@ impl InlineFlushCaps {
     };
 }
 
+/// Memory-aware caps for the in-RAM CDC durability tier (`cdc_durability:
+/// memory`). See [`HardwareProfile::mem_tier_caps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemTierCaps {
+    /// Per-table resident byte cap before the writer spills synchronously
+    /// (`cayenne_cdc_mem_tier_max_bytes`).
+    pub max_bytes: i64,
+    /// Minimum resident bytes before the periodic background tick durably
+    /// checkpoints (`cayenne_cdc_mem_tier_min_flush_bytes`).
+    pub min_flush_bytes: i64,
+}
+
+impl MemTierCaps {
+    /// The historical flat defaults (256 MiB cap / 32 MiB flush gate) — the
+    /// derivation floor, so no host regresses below the prior static config.
+    pub const FLOOR: Self = Self {
+        max_bytes: 256 * 1_048_576,
+        min_flush_bytes: 32 * 1_048_576,
+    };
+}
+
 /// Static host signals known at table-registration time.
 ///
 /// All are cheap to read and container-aware where the OS exposes it:
@@ -255,6 +276,51 @@ impl HardwareProfile {
             max_bytes: i64::try_from(bytes).unwrap_or(i64::MAX),
             max_rows: i64::try_from(rows).unwrap_or(i64::MAX),
             max_segments: i64::try_from(segments).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// In-RAM CDC tier caps (`cdc_durability: memory`) from host memory.
+    ///
+    /// * `max_bytes` (the per-table writer-side spill cap) scales at ~1/64 of
+    ///   RAM, clamped to `[256 MiB, 1 GiB]`. It is the synchronous OOM backstop
+    ///   — the only writer-blocking mem-tier event left now that the age cap is
+    ///   enforced solely by the non-blocking 1 s background tick — so on
+    ///   memory-rich hosts a larger cap keeps the writer out of synchronous
+    ///   spills during checkpoint-encode outages, while the floor preserves the
+    ///   historical 256 MiB default on hosts at/under 16 GiB.
+    /// * `min_flush_bytes` (the periodic tick's churn gate) tracks the cap at
+    ///   1/8, clamped to `[32 MiB, 128 MiB]`, preserving the default 256:32
+    ///   ratio so a larger tier flushes proportionally larger (not more
+    ///   frequent, smaller) checkpoint files.
+    ///
+    /// Deliberately **memory-only** (no storage-class input, unlike
+    /// [`Self::inline_flush_caps`]): tier rows are served to scans from RAM —
+    /// there is no per-scan re-read whose cost depends on the metastore medium
+    /// — and the churn the flush gate bounds is snapshot-dir *count*, which is
+    /// medium-independent. The age cap (`cdc_mem_tier_max_age_ms`) and the tick
+    /// interval are NOT derived here: they are time-domain durability-policy
+    /// bounds (crash-replay window / slot-ack cadence), not hardware-capacity
+    /// quantities, so hardware scaling would silently change durability
+    /// semantics.
+    ///
+    /// Fleet coherence: the process-global mem-tier budget (total memory / 4,
+    /// installed at startup) remains the aggregate guard; even at the 1 GiB
+    /// per-table ceiling (reached at ≥ 64 GiB RAM), 8 simultaneously-hot tables
+    /// sum to 8 GiB against a ≥ 16 GiB global budget.
+    #[must_use]
+    pub fn mem_tier_caps(&self) -> MemTierCaps {
+        const CAP_CEIL: u64 = 1024 * MIB;
+        const FLUSH_CEIL: u64 = 128 * MIB;
+        // Floors come from `MemTierCaps::FLOOR` (the historical flat defaults)
+        // so the derivation can never regress a host below the prior static
+        // config — one source of truth for both values.
+        let cap_floor = u64::try_from(MemTierCaps::FLOOR.max_bytes).unwrap_or(u64::MAX);
+        let flush_floor = u64::try_from(MemTierCaps::FLOOR.min_flush_bytes).unwrap_or(u64::MAX);
+        let max_bytes = (self.total_mem_bytes / 64).clamp(cap_floor, CAP_CEIL);
+        let min_flush_bytes = (max_bytes / 8).clamp(flush_floor, FLUSH_CEIL);
+        MemTierCaps {
+            max_bytes: i64::try_from(max_bytes).unwrap_or(i64::MAX),
+            min_flush_bytes: i64::try_from(min_flush_bytes).unwrap_or(i64::MAX),
         }
     }
 }
@@ -764,6 +830,54 @@ mod tests {
         assert_eq!(w.max_rows, (w.max_bytes / 8192).max(64));
     }
 
+    // ---- mem_tier_caps ------------------------------------------------------
+
+    #[test]
+    fn mem_tier_caps_scale_with_memory_only() {
+        let caps = |mem, storage| profile(8, mem, storage).mem_tier_caps();
+
+        // Floor: hosts at/under 16 GiB keep the historical static defaults
+        // (256 MiB cap / 32 MiB flush gate) — zero behavior change there.
+        assert_eq!(
+            caps(8 * GIB, ResolvedAccelerationStorage::Ebs),
+            MemTierCaps::FLOOR
+        );
+        assert_eq!(
+            caps(16 * GIB, ResolvedAccelerationStorage::Ebs),
+            MemTierCaps::FLOOR
+        );
+        assert_eq!(MemTierCaps::FLOOR.max_bytes, 268_435_456); // 256 MiB
+        assert_eq!(MemTierCaps::FLOOR.min_flush_bytes, 33_554_432); // 32 MiB
+
+        // Mid host scales linearly (~1/64 of RAM), flush gate tracks at 1/8.
+        let mid = caps(32 * GIB, ResolvedAccelerationStorage::Ebs);
+        assert_eq!(mid.max_bytes, 536_870_912); // 512 MiB
+        assert_eq!(mid.min_flush_bytes, 67_108_864); // 64 MiB
+
+        // Ceiling: memory-rich hosts cap at 1 GiB / 128 MiB.
+        let big = caps(64 * GIB, ResolvedAccelerationStorage::LocalSsd);
+        assert_eq!(big.max_bytes, 1_073_741_824); // 1 GiB
+        assert_eq!(big.min_flush_bytes, 134_217_728); // 128 MiB
+        assert_eq!(caps(1024 * GIB, ResolvedAccelerationStorage::Tmpfs), big);
+
+        // Storage class is deliberately ignored (tier rows are read from RAM;
+        // churn is file-count-bound) — same memory, any medium, same caps.
+        for storage in [
+            ResolvedAccelerationStorage::Ebs,
+            ResolvedAccelerationStorage::LocalSsd,
+            ResolvedAccelerationStorage::Tmpfs,
+            ResolvedAccelerationStorage::Unknown,
+        ] {
+            assert_eq!(caps(32 * GIB, storage), mid, "{storage:?}");
+        }
+
+        // Degenerate input clamps to the floor, never panics.
+        assert_eq!(
+            caps(0, ResolvedAccelerationStorage::Unknown),
+            MemTierCaps::FLOOR
+        );
+    }
+
     #[test]
     fn workload_profile_from_inferred_and_avg_row_bytes() {
         let inferred = InferredSchema {
@@ -853,6 +967,24 @@ mod tests {
                             assert!((16..=256).contains(&caps.max_segments));
                             assert!(caps.max_rows >= FLOOR_FLUSH_ROWS);
 
+                            let tier = hw.mem_tier_caps();
+                            assert!(
+                                (MemTierCaps::FLOOR.max_bytes..=1024 * 1_048_576)
+                                    .contains(&tier.max_bytes),
+                                "mem-tier cap {} out of bounds for {hw:?}",
+                                tier.max_bytes
+                            );
+                            assert!(
+                                (MemTierCaps::FLOOR.min_flush_bytes..=128 * 1_048_576)
+                                    .contains(&tier.min_flush_bytes),
+                                "mem-tier flush gate {} out of bounds for {hw:?}",
+                                tier.min_flush_bytes
+                            );
+                            assert!(
+                                tier.min_flush_bytes <= tier.max_bytes,
+                                "flush gate must never exceed the cap for {hw:?}"
+                            );
+
                             // Storage-aware file-size override is well-defined.
                             match data {
                                 ResolvedAccelerationStorage::Ebs => {
@@ -894,6 +1026,19 @@ mod tests {
             assert!(
                 fleet_bytes < mem / 2,
                 "fleet cache footprint {fleet_bytes} must stay under half of RAM {mem} (per-table {per_table_bytes})"
+            );
+
+            // The in-RAM CDC tier composes differently: per-table caps may sum
+            // past RAM by design — the process-global tier budget (total/4,
+            // installed at startup) is the aggregate guard that refuses
+            // reservations and forces spills. The per-table invariant is that a
+            // single table's cap always fits within that global budget, so one
+            // table at its cap can still make progress.
+            let tier_cap = u64::try_from(hw.mem_tier_caps().max_bytes).unwrap_or(u64::MAX);
+            assert!(
+                tier_cap <= mem / 4,
+                "per-table mem-tier cap {tier_cap} must fit the global tier budget {} (mem {mem})",
+                mem / 4
             );
         }
     }

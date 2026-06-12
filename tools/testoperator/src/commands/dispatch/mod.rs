@@ -274,7 +274,7 @@ async fn dispatch_workflow_with_concurrency(
         &workflow,
         octo,
         max_concurrent,
-        Duration::from_secs(1800), // 30 mins
+        Duration::from_mins(30), // 30 mins
     )
     .await
     {

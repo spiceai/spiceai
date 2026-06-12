@@ -178,8 +178,8 @@ impl SpiceExtension {
         let retention = Retention::builder()
             .time_column(Some("timestamp".to_string()))
             .time_format(Some(TimeFormat::UnixSeconds))
-            .time_period(Some(Duration::from_secs(1800))) // delete metrics older than 30 minutes
-            .check_interval(Some(Duration::from_secs(300))) // run retention every 5 minutes
+            .time_period(Some(Duration::from_mins(30))) // delete metrics older than 30 minutes
+            .check_interval(Some(Duration::from_mins(5))) // run retention every 5 minutes
             .enabled(true)
             .build();
 
@@ -187,7 +187,7 @@ impl SpiceExtension {
             .time_column("timestamp".to_string())
             .time_format(TimeFormat::UnixSeconds)
             .check_interval(Duration::from_secs(10))
-            .period(Duration::from_secs(1800)); // sync only last 30 minutes from cloud
+            .period(Duration::from_mins(30)); // sync only last 30 minutes from cloud
 
         let metrics_table_reference = get_metrics_table_reference();
 
@@ -261,7 +261,7 @@ impl Extension for SpiceExtension {
             reqwest::Client::builder()
                 .use_rustls_tls()
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(1800))
+                .timeout(Duration::from_mins(30))
                 .build()
                 .boxed()
                 .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?,

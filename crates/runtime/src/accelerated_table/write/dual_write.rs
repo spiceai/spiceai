@@ -748,7 +748,7 @@ mod tests {
     }
 
     struct ErrorExec {
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
         message: String,
     }
 
@@ -759,12 +759,12 @@ mod tests {
                 DataType::UInt64,
                 false,
             )]));
-            let properties = PlanProperties::new(
+            let properties = Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(Arc::clone(&schema)),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            );
+            ));
             Arc::new(Self {
                 properties,
                 message: message.into(),
@@ -795,7 +795,7 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

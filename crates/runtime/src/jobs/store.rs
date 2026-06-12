@@ -24,7 +24,9 @@ use arrow_ipc::writer::StreamWriter;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion,
+};
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -572,7 +574,7 @@ impl JobStore {
         }
 
         // Sort by created_at descending (newest first)
-        jobs.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        jobs.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
 
         Ok(jobs)
     }

@@ -199,7 +199,7 @@ impl PaginationArgument {
     fn format_arguments(&self, cursor: Option<String>) -> String {
         match (self, cursor) {
             (PaginationArgument::First(z), Some(c)) => {
-                format!(r#"first: {z}, after: "{c}""#,)
+                format!(r#"first: {z}, after: "{c}""#)
             }
             (PaginationArgument::First(z), None) => {
                 format!("first: {z}")

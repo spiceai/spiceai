@@ -71,7 +71,7 @@ use datafusion::logical_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
     TableScan, Volatility as DfVolatility,
-    simplify::{ExprSimplifyResult, SimplifyInfo},
+    simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
@@ -619,7 +619,7 @@ impl ScalarUDFImpl for RemoteScalarTableArgUdf {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &dyn SimplifyInfo,
+        _info: &SimplifyContext,
     ) -> std::result::Result<ExprSimplifyResult, DataFusionError> {
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);

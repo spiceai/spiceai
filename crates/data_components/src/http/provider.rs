@@ -729,7 +729,7 @@ impl HttpTableProvider {
             ensure!(
                 path.starts_with('/'),
                 ConfigurationSnafu {
-                    message: format!("health_probe path must start with '/'. Got: '{path}'",)
+                    message: format!("health_probe path must start with '/'. Got: '{path}'")
                 }
             );
             ensure!(
@@ -1504,7 +1504,7 @@ pub struct HttpExec {
     provider: Arc<HttpTableProvider>,
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// When `true`, the partitions are a template that will be expanded
     /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
     deferred_partitions: bool,
@@ -1548,12 +1548,12 @@ impl HttpExec {
         partitions: Vec<PartitionSpec>,
         limit: Option<usize>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(partitions.len()),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             projected_schema,
             provider,
@@ -2091,7 +2091,7 @@ impl ExecutionPlan for HttpExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -4265,7 +4265,7 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
-            max_age: Duration::from_secs(60),
+            max_age: Duration::from_mins(1),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,

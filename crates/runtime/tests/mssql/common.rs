@@ -43,8 +43,8 @@ pub fn make_mssql_dataset(path: &str, name: &str, port: u16) -> Dataset {
 }
 
 pub const MSSQL_ROOT_PASSWORD: &str = "S3cret-integration-test-p@ss";
-const MSSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MSSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MSSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MSSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mssql_docker_container(

@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const JOB_SCHEMA_VERSION: u32 = 1;
 
 /// Default time-to-live for job results (12 hours, matching Databricks)
-pub const DEFAULT_RESULT_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+pub const DEFAULT_RESULT_TTL: Duration = Duration::from_hours(12);
 
 /// Default chunk size for results (10,000 rows)
 pub const DEFAULT_CHUNK_SIZE: usize = 10_000;

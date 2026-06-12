@@ -37,17 +37,16 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use datafusion_datasource::metadata::MetadataColumn;
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
-use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
+use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
 use crate::object::filter::filter_object_meta;
 
-use super::ObjectStoreContext;
+use super::{ObjectStoreContext, metadata::MetadataColumn};
 use url::Url;
 
 pub struct ObjectStoreTextTable {
@@ -150,6 +149,7 @@ impl ObjectStoreTextTable {
         raw: &Bytes,
         formatter: Option<&Arc<dyn DocumentParser>>,
         schema: SchemaRef,
+        metadata_columns: &[MetadataColumn],
     ) -> Result<RecordBatch, ArrowError> {
         let columns = schema
             .fields()
@@ -164,10 +164,13 @@ impl ObjectStoreTextTable {
                         .with_timezone("UTC"),
                 ) as ArrayRef),
                 "size" => Ok(Arc::new(UInt64Array::from(vec![meta.size])) as ArrayRef),
-                _ => Err(ArrowError::SchemaError(format!(
-                    "Unsupported field name: {}",
-                    field.name()
-                ))),
+                metadata_name => metadata_columns
+                    .iter()
+                    .find(|column| column.name() == metadata_name)
+                    .map(|column| column.value_to_array(meta))
+                    .ok_or_else(|| {
+                        ArrowError::SchemaError(format!("Unsupported field name: {}", field.name()))
+                    }),
             })
             .collect::<Result<Vec<ArrayRef>, ArrowError>>()?;
 
@@ -220,6 +223,7 @@ impl TableProvider for ObjectStoreTextTable {
             object_metas,
             self.ctx.clone(),
             self.document_formatter.clone(),
+            self.metadata_columns.clone(),
         )))
     }
 
@@ -245,10 +249,11 @@ impl TableProvider for ObjectStoreTextTable {
 pub struct ObjectStoreTextExec {
     projected_schema: SchemaRef,
     object_metas: Arc<Vec<ObjectMeta>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
+    metadata_columns: Arc<Vec<MetadataColumn>>,
 }
 
 impl std::fmt::Debug for ObjectStoreTextExec {
@@ -281,7 +286,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -329,6 +334,7 @@ impl ExecutionPlan for ObjectStoreTextExec {
                 self.formatter.clone(),
                 Arc::clone(&self.object_metas),
                 self.schema(),
+                Arc::clone(&self.metadata_columns),
             ),
         )))
     }
@@ -340,18 +346,20 @@ impl ObjectStoreTextExec {
         object_metas: Vec<ObjectMeta>,
         ctx: ObjectStoreContext,
         formatter: Option<Arc<dyn DocumentParser>>,
+        metadata_columns: Vec<MetadataColumn>,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
             object_metas: Arc::new(object_metas),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             ctx,
             formatter,
+            metadata_columns: Arc::new(metadata_columns),
         }
     }
 }
@@ -361,6 +369,7 @@ pub(crate) fn to_sendable_stream(
     formatter: Option<Arc<dyn DocumentParser>>,
     object_metas: Arc<Vec<ObjectMeta>>,
     schema: SchemaRef,
+    metadata_columns: Arc<Vec<MetadataColumn>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         for object_meta in object_metas.iter() {
@@ -373,7 +382,7 @@ pub(crate) fn to_sendable_stream(
                 Bytes::new()
             };
 
-            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema)) {
+            match ObjectStoreTextTable::to_record_batch(object_meta, &bytz, formatter.as_ref(), Arc::clone(&schema), &metadata_columns) {
                 Ok(batch) => {
                     yield Ok(batch);
                 },

@@ -1266,19 +1266,19 @@ async fn test_pending_writer_wal_survives_compaction_trigger_impl(
 struct FailingStreamExec {
     schema: SchemaRef,
     stream: std::sync::Mutex<Option<SendableRecordBatchStream>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FailingStreamExec {
     fn new(schema: SchemaRef, stream: SendableRecordBatchStream) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             },
-        );
+        ));
         Self {
             schema,
             stream: std::sync::Mutex::new(Some(stream)),
@@ -1312,7 +1312,7 @@ impl ExecutionPlan for FailingStreamExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

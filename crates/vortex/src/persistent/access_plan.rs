@@ -7,8 +7,8 @@ use std::sync::Arc;
 use datafusion_common::Statistics;
 use datafusion_datasource::PartitionedFile;
 use object_store::ObjectMeta;
-use vortex::scan::ScanBuilder;
-use vortex::scan::Selection;
+use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::scan::selection::Selection;
 
 /// Custom Vortex-specific information that can be provided by external indexes or other sources.
 ///

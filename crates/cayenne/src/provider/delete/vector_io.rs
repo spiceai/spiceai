@@ -48,6 +48,12 @@ use uuid::Uuid;
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
 use crate::provider::{Error, Result};
 
+#[derive(Debug, Clone, Copy)]
+struct KeyDeletionReadState {
+    delete_sequence: i64,
+    reinsert_sequence: Option<i64>,
+}
+
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
 /// File extension used for deletion-vector files.
@@ -395,9 +401,10 @@ impl<'a> DeletionVectorWriter<'a> {
 ///
 /// # Returns
 ///
-/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence)`.
+/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence, reinserted_row_keys)`.
 /// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
 /// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
+/// - `reinserted_row_keys`: Map of PK bytes -> max reinsert sequence number derived from delete-file metadata
 ///
 /// # Errors
 ///
@@ -405,9 +412,17 @@ impl<'a> DeletionVectorWriter<'a> {
 #[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
-) -> datafusion_common::Result<(HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>)> {
+) -> datafusion_common::Result<(
+    HashMap<String, RoaringBitmap>,
+    HashMap<Box<[u8]>, i64>,
+    HashMap<Box<[u8]>, i64>,
+)> {
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
-    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    // Metadata-only publish: keep delete and reinsert sequence state in one map
+    // while reading key-based vectors. This avoids cloning every key in the hot
+    // read loop just to update a second map; the legacy return shape is derived
+    // once after all files are scanned.
+    let mut key_row_state: HashMap<Box<[u8]>, KeyDeletionReadState> = HashMap::new();
     let file_count = delete_files.len();
 
     tracing::debug!(
@@ -445,6 +460,10 @@ pub fn detect_deletion_type_and_read(
 
         // Get the sequence number for this delete file (for sequence-based ordering)
         let file_sequence = delete_file.sequence_number;
+        // Metadata-only publish: the per-commit reinsert sequence carried on this
+        // file's row (None for legacy rows / pure deletes — those fall back to the
+        // `cayenne_insert_record` table at the load site).
+        let file_reinsert = delete_file.reinsert_sequence;
 
         for batch_result in reader {
             let batch = batch_result.map_err(|e| {
@@ -468,11 +487,18 @@ pub fn detect_deletion_type_and_read(
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
                         let key = row_key_array.value(i).to_vec().into_boxed_slice();
-                        // Track max delete sequence for each PK
-                        deleted_row_keys
-                            .entry(key)
-                            .and_modify(|seq| *seq = (*seq).max(file_sequence))
-                            .or_insert(file_sequence);
+                        let entry = key_row_state.entry(key).or_insert(KeyDeletionReadState {
+                            delete_sequence: file_sequence,
+                            reinsert_sequence: file_reinsert,
+                        });
+                        entry.delete_sequence = entry.delete_sequence.max(file_sequence);
+                        if let Some(reinsert) = file_reinsert {
+                            entry.reinsert_sequence = Some(
+                                entry
+                                    .reinsert_sequence
+                                    .map_or(reinsert, |seq| seq.max(reinsert)),
+                            );
+                        }
                     }
                 }
             } else {
@@ -521,6 +547,15 @@ pub fn detect_deletion_type_and_read(
         );
     }
 
+    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(key_row_state.len());
+    let mut reinserted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    for (key, state) in key_row_state {
+        if let Some(reinsert_sequence) = state.reinsert_sequence {
+            reinserted_row_keys.insert(key.clone(), reinsert_sequence);
+        }
+        deleted_row_keys.insert(key, state.delete_sequence);
+    }
+
     let total_position_based: u64 = per_file_row_ids.values().map(RoaringBitmap::len).sum();
     tracing::debug!(
         "Loaded {} position-based deletions across {} files + {} key-based deleted rows from {} deletion vector files",
@@ -530,7 +565,7 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    Ok((per_file_row_ids, deleted_row_keys))
+    Ok((per_file_row_ids, deleted_row_keys, reinserted_row_keys))
 }
 
 // ============================================================================
@@ -659,6 +694,10 @@ fn build_delete_file(
         deletion_type,
         // Sequence number is set by the caller after getting the current sequence from catalog
         sequence_number: table.current_sequence_number,
+        // Metadata-only publish: the per-commit reinsert sequence is stamped by the
+        // catalog commit (it owns the upsert's insert_sequence); a freshly built
+        // file is None until then. Pure deletes / position files keep None.
+        reinsert_sequence: None,
     })
 }
 

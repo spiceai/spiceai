@@ -55,7 +55,7 @@ pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 
     base_plan: Arc<dyn ExecutionPlan>,
 
@@ -93,7 +93,7 @@ impl ExecutionPlan for EmbeddingTableExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -157,12 +157,17 @@ impl EmbeddingTableExec {
     fn compute_properties(
         base_plan: &Arc<dyn ExecutionPlan>,
         projected_schema: &SchemaRef,
-    ) -> PlanProperties {
+    ) -> Arc<PlanProperties> {
         let eq_properties = EquivalenceProperties::new(Arc::clone(projected_schema));
         let partitioning = base_plan.properties().partitioning.clone();
         let emission_type = base_plan.pipeline_behavior();
         let boundedness = base_plan.boundedness();
-        PlanProperties::new(eq_properties, partitioning, emission_type, boundedness)
+        Arc::new(PlanProperties::new(
+            eq_properties,
+            partitioning,
+            emission_type,
+            boundedness,
+        ))
     }
 }
 
@@ -393,7 +398,7 @@ pub(super) async fn get_vectors(
     // Filter out nulls or empty strings before calling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
         .enumerate()
-        .partition(|(_, o)| o.is_none() || o.is_some_and(str::is_empty));
+        .partition(|(_, o)| o.is_none_or(str::is_empty));
     let nulls: Vec<usize> = null_pairs.into_iter().map(|(i, _)| i).collect();
     let column: Vec<String> = values
         .iter()
@@ -903,7 +908,7 @@ async fn get_vectors_with_chunker(
 
     // These are offsets for both the vectors and the content offsets.
     // They tell the [`ListArray`] how many vectors/offsets are in each row of the input/output table.
-    let offsets = OffsetBuffer::<i32>::from_lengths(lengths.into_iter());
+    let offsets = OffsetBuffer::<i32>::from_lengths(lengths);
 
     let vectors = ListArray::try_new(
         Arc::new(Field::new_fixed_size_list(

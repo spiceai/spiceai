@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
@@ -671,6 +672,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -725,6 +728,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            cdc_param_overrides: None,
         }
     }
 
@@ -828,6 +832,16 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`.
+    pub fn with_cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
         self
     }
 
@@ -1223,7 +1237,8 @@ impl Refresher {
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
-        .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+        .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -2481,10 +2496,10 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(Arc::clone(&checkpoint)),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(|result| {
                     if let NextRefresh::WaitFor(duration) = result {
-                        duration <= Duration::from_secs(60) && duration > Duration::ZERO
+                        duration <= Duration::from_mins(1) && duration > Duration::ZERO
                     } else {
                         false
                     }
@@ -2525,7 +2540,7 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: Some(checkpoint),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2545,7 +2560,7 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2555,9 +2570,9 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
-                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_secs(900)),
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_mins(15)),
                 ),
             },
             TestCase {
@@ -2665,31 +2680,31 @@ mod tests {
             TestCase {
                 description: "Checkpoint just happened, should wait full interval",
                 last_checkpoint_time: now,
-                check_interval: Duration::from_secs(60),
-                expected_wait_time: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
+                expected_wait_time: Duration::from_mins(1),
             },
             TestCase {
                 description: "Checkpoint happened 30 seconds ago, should wait 30 seconds",
                 last_checkpoint_time: now - Duration::from_secs(30),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(30),
             },
             TestCase {
                 description: "Checkpoint happened 45 seconds ago, should wait 15 seconds",
                 last_checkpoint_time: now - Duration::from_secs(45),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(15),
             },
             TestCase {
                 description: "Checkpoint happened 59 seconds ago, should wait 1 second",
                 last_checkpoint_time: now - Duration::from_secs(59),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(1),
             },
             TestCase {
                 description: "Checkpoint happened more than interval ago, should refresh immediately",
                 last_checkpoint_time: now - Duration::from_secs(61),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::ZERO,
             },
         ];

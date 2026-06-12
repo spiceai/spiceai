@@ -40,7 +40,7 @@ pub trait DeletionSink: Send + Sync {
 
 pub struct DeletionExec {
     deletion_sink: Arc<dyn DeletionSink + 'static>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DeletionExec {
@@ -50,12 +50,12 @@ impl DeletionExec {
             DataType::UInt64,
             false,
         )]));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(count_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             deletion_sink,
             properties,
@@ -90,7 +90,7 @@ impl ExecutionPlan for DeletionExec {
         self
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
 

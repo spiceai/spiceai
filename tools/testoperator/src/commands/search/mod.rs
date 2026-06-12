@@ -64,7 +64,9 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .map(|process| process.watch_memory(&memory_token));
 
     println!("Starting benchmark Spicepod...");
 
@@ -141,9 +143,16 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         .with_run_metric(SearchRunMetric::new(rps, p95, score));
 
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
-    metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    metrics.show_run(None)?; // no additional test pass logic applies
 
     // Record benchmark results
     crate::metrics::TEST_DURATION.record(duration_millis_between(finished_at, started_at)?, &[]);
@@ -157,8 +166,10 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     crate::metrics::SEARCH_RPS.record(rps, &[]);
     crate::metrics::SEARCH_P95_RESPONSE_TIME.record(p95, &[]);
     crate::metrics::SCORE.record(score, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
     telemetry.emit().await?;
 
