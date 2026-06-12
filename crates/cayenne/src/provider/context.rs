@@ -590,6 +590,13 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
+            // Opt back into hash-join dynamic-filter pushdown into the scan,
+            // which the vortex layer made opt-in (default-off) as of #11307.
+            // Cayenne's OLAP joins depend on the build-side dynamic filter
+            // reaching the fact scan for file/page pruning (and the probe-side
+            // install asserted by `mem_tier_join_probe_keeps_dynamic_filter_pushdown`);
+            // without it a selective dimension->fact join scans every fact file.
+            dynamic_filter_pushdown: true,
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
