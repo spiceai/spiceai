@@ -8046,11 +8046,11 @@ impl CayenneTableProvider {
         // observes the new generation (`Acquire`) also observes the updated
         // count; a reader racing ahead of the bump may still see 0, which is
         // exactly the pre-publish state its watermark capture hides anyway.
-        let _ = self
-            .durable_inlined_row_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(durable_delta))
-            });
+        let _ = self.durable_inlined_row_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(durable_delta)),
+        );
         // Advance the visibility watermark BEFORE bumping the generation: the
         // generation bump's `Release` store (paired with the Acquire load in
         // `read_inlined_batches`) publishes the watermark store, so a scan that
@@ -21561,7 +21561,9 @@ mod tests {
         churn.join().expect("churn thread joins");
 
         let plan = scan_result
-            .expect("scan must terminate within the attempt bound under continuous generation churn")
+            .expect(
+                "scan must terminate within the attempt bound under continuous generation churn",
+            )
             .expect("scan plan builds");
 
         // The accepted (at-most-one-rebuild-stale) view must still serve the
