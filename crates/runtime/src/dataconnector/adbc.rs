@@ -22,7 +22,6 @@ use adbc_driver_manager::ManagedDriver;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use async_trait::async_trait;
 use data_components::{FieldMetadata, metadata_enriched_table_provider};
-use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
@@ -387,14 +386,13 @@ impl AdbcFactory {
             connection_namespace.schema.as_deref(),
         );
 
-        let federation_enabled =
-            is_query_federation_enabled(&params.parameters).map_err(|e| {
-                DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "adbc".to_string(),
-                    connector_component: params.component.clone(),
-                    message: e.to_string(),
-                }
-            })?;
+        let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
+            DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "adbc".to_string(),
+                connector_component: params.component.clone(),
+                message: e.to_string(),
+            }
+        })?;
 
         let parse_pool_param = |name: &str| -> std::result::Result<Option<u32>, Error> {
             match params.parameters.get(name).expose().ok() {
@@ -553,25 +551,6 @@ async fn enrich_with_bigquery_metadata_from_weak_pool(
 }
 
 /// Wraps `provider` with metadata enrichment, but keeps `FederatedTableProviderAdaptor`
-/// as the outermost layer so the federation analyzer can still discover it.
-fn wrap_provider_with_metadata(
-    provider: Arc<dyn TableProvider>,
-    table_metadata: HashMap<String, String>,
-    field_metadata: FieldMetadata,
-) -> Arc<dyn TableProvider> {
-    if let Some(adaptor) = provider.as_any().downcast_ref::<FederatedTableProviderAdaptor>() {
-        if let Some(inner) = &adaptor.table_provider {
-            let enriched_inner =
-                metadata_enriched_table_provider(Arc::clone(inner), table_metadata, field_metadata);
-            return Arc::new(FederatedTableProviderAdaptor::new_with_provider(
-                Arc::clone(&adaptor.source),
-                enriched_inner,
-            ));
-        }
-    }
-    metadata_enriched_table_provider(provider, table_metadata, field_metadata)
-}
-
 pub(crate) async fn enrich_with_bigquery_metadata(
     driver_name: &str,
     pool: &Arc<ADBCPool<adbc_driver_manager::ManagedDatabase>>,
@@ -587,7 +566,7 @@ pub(crate) async fn enrich_with_bigquery_metadata(
             if table_metadata.is_empty() && field_metadata.is_empty() {
                 provider
             } else {
-                wrap_provider_with_metadata(provider, table_metadata, field_metadata)
+                metadata_enriched_table_provider(provider, table_metadata, field_metadata)
             }
         }
         Err(error) => {
