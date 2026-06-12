@@ -840,7 +840,10 @@ mod tests {
     #[test]
     fn sslmode_strict_rejects_unknown_mode() {
         // A typo must not silently downgrade to `prefer` (TLS/MITM downgrade).
-        assert!(config::SslMode::from_str_strict(Some("verify-ful")).is_err());
+        match config::SslMode::from_str_strict(Some("verify-ful")) {
+            Err(_) => {}
+            Ok(mode) => panic!("typo `verify-ful` must be rejected, got {mode:?}"),
+        }
         assert_eq!(
             config::SslMode::from_str_strict(Some("verify-full")),
             Ok(config::SslMode::VerifyFull)
