@@ -613,6 +613,12 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Columns to hash-cluster rows by during intra-write sharding (the parallel
+    /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
+    /// the historical behavior); PK-less tables shard round-robin. Ignored for
+    /// sorted tables (`sort_columns` forces a single serial writer).
+    #[serde(default)]
+    pub shard_key_columns: Vec<String>,
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
@@ -877,12 +883,11 @@ fn default_cdc_mem_tier_max_bytes() -> i64 {
 /// Default minimum tier size before the PERIODIC tick durably checkpoints
 /// (32 MiB — the serde/engine floor; the accelerator's auto-tune derives 1/8 of
 /// the derived byte cap, clamped 32–128 MiB, when the param is unset, keeping
-/// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot
-/// + delete-vector
-/// files + a listing refresh under the fence; at a 1 s tick a high-rate table
-/// would otherwise produce ~600 tiny snapshots per 10 minutes (measured at
-/// SF-100: 408–676 accumulated snapshot dirs per heavy table), and the
-/// accumulated churn degrades scans and the apply path. Gating the tick on
+/// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot +
+/// delete-vector files + a listing refresh under the fence; at a 1 s tick a
+/// high-rate table would otherwise produce ~600 tiny snapshots per 10 minutes
+/// (measured at SF-100: 408–676 accumulated snapshot dirs per heavy table), and
+/// the accumulated churn degrades scans and the apply path. Gating the tick on
 /// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
 /// flush window while leaving freshness untouched (RAM rows are visible to
 /// queries immediately; only the deferred source-slot ack waits, bounded by
@@ -996,6 +1001,8 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            // Shard key derives from the primary key unless overridden
+            shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
             // `auto`: size-gated light encoding for small deltas (re-encoded
             // by compaction). Local micro A/B (2026-06-06) was neutral on the

@@ -250,6 +250,10 @@ fn http_base_url_from_endpoints(
 
 /// Mirror of `SpicedInstance::external`'s URL inference, exposed here so we can
 /// fall back to a derived HTTP base URL when the adapter doesn't return one.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "returns Option to compose with http_base_url_from_endpoints().or_else(...) at the call site"
+)]
 fn derive_http_base_url(flight_url: &str) -> Option<String> {
     if flight_url.contains("flight.spiceai.io") {
         return Some("https://data.spiceai.io".to_string());
