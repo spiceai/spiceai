@@ -52,7 +52,7 @@ limitations under the License.
 //! up) [`try_reserve_bytes`] always succeeds, so memory mode (if explicitly
 //! opted into without the budget installed) is gated only by the per-table cap.
 //! The runtime binary installs the budget once at startup, sized from total
-//! system/container memory (`resource_monitor::get_total_memory() / 8`). This
+//! system/container memory (`resource_monitor::get_total_memory() / 4`). This
 //! budget is independent of `DataFusion`'s query memory pool.
 
 use std::sync::atomic::{AtomicU64, Ordering};

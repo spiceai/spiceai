@@ -643,14 +643,17 @@ impl<'a> AppendMutationWriter<'a> {
         // write path that no phase metric covered.
         if self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
             let spill_start = Instant::now();
-            let spill_result = self.spill_mem_tier_if_cap_breached(incoming_bytes).await;
+            let spill_result = self
+                .table
+                .spill_mem_tier_if_cap_breached(incoming_bytes)
+                .await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_spill", spill_start);
             spill_result?;
         }
 
         if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
             let wait_start = Instant::now();
-            let admitted = self.wait_for_budget_or_spill(incoming_bytes).await;
+            let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
             record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
             if !admitted? {
                 // Still over budget after waiting AND spilling (other tables
@@ -710,99 +713,6 @@ impl<'a> AppendMutationWriter<'a> {
                 epoch,
             ),
         )))
-    }
-
-    /// Spill (checkpoint) the in-memory CDC tier durable because appending
-    /// `incoming_bytes` would breach the per-table cap, serialized by the
-    /// per-table `mem_checkpoint_lock` so only one checkpoint runs at a time.
-    /// Awaiting the lock when a checkpoint is already in flight provides
-    /// natural backpressure (the WAL apply blocks while that flush runs)
-    /// instead of growing the tier.
-    ///
-    /// DOUBLE-CHECK: the lock-wait IS the pipelined wait behind an in-flight
-    /// background flush — by the time the lock is held, that flush has usually
-    /// already drained the tier below the cap. Re-checking the cap predicate
-    /// under the lock (held across recheck + checkpoint, so no TOCTOU window)
-    /// turns "wait + redundant second whole-tier encode" into just "wait".
-    /// The cap stays a hard bound either way: a skip means the in-flight flush
-    /// already made `incoming_bytes` fit (appends are serialized by the held
-    /// `write_lock`, so nothing regrows the tier before our append).
-    async fn spill_mem_tier_if_cap_breached(&self, incoming_bytes: u64) -> Result<()> {
-        let _guard = self
-            .table
-            .mem_checkpoint_lock_for_writer()
-            .lock_owned()
-            .await;
-        if !self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
-            return Ok(());
-        }
-        self.table.checkpoint_mem_tier().await?;
-        Ok(())
-    }
-
-    /// Global-budget twin of [`Self::spill_mem_tier_if_cap_breached`]: under
-    /// the checkpoint lock, RE-TRY the reservation first — the in-flight
-    /// checkpoint just waited behind released its flushed bytes, so the budget
-    /// often admits the batch with no second encode. The recheck and the spill
-    /// live in ONE helper because `try_reserve_bytes` RESERVES on success:
-    /// returning `true` means this call recorded the caller's single
-    /// reservation (the caller MUST NOT reserve again); `false` means nothing
-    /// is reserved and the tier was checkpointed (releasing its bytes), so the
-    /// caller retries the reservation itself.
-    async fn spill_mem_tier_unless_reserved(&self, incoming_bytes: u64) -> Result<bool> {
-        let _guard = self
-            .table
-            .mem_checkpoint_lock_for_writer()
-            .lock_owned()
-            .await;
-        if mem_tier_budget::try_reserve_bytes(incoming_bytes) {
-            return Ok(true);
-        }
-        self.table.checkpoint_mem_tier().await?;
-        Ok(false)
-    }
-
-    /// Global-budget admission after a failed `try_reserve`: returns whether a
-    /// reservation for `incoming_bytes` is now held. `Ok(false)` means nothing
-    /// is reserved and the caller takes the durable fallback.
-    ///
-    /// The requesting table is often NOT the table holding the budget: a small
-    /// tier can be refused because the biggest table hogs it, and self-spilling
-    /// immediately would evict the small table on the hog's behalf (the
-    /// eviction-victim inversion). So FIRST wait — bounded by
-    /// [`mem_tier_budget::BUDGET_WAIT`] — for ANOTHER table's checkpoint to
-    /// release bytes (typically the hog's own 1 s background tick flushing its
-    /// tier: the hog pays). Only when nothing is released in time does this
-    /// table spill itself (double-checked), retry once, and otherwise hand the
-    /// batch to the durable fallback — the exact pre-wait sequence, so
-    /// sustained overload degrades the same way it always did.
-    ///
-    /// LOCKS: the bounded wait holds NO Cayenne locks — it runs BEFORE the
-    /// per-table `mem_checkpoint_lock` (taken only by the spill below) and
-    /// BEFORE the `mem_tier_publish_lock` (taken inside append/checkpoint).
-    /// The task does hold this table's `write_lock` (the `write_guard` held
-    /// across the whole mem path, today as before), which no checkpoint path
-    /// acquires — so the budget releasers (`checkpoint_mem_tier` →
-    /// `clear_mem_tier_flushed_prefix` on any table, including this table's own
-    /// background tick) can always make progress while we wait, and the wait is
-    /// deadline-bounded regardless.
-    async fn wait_for_budget_or_spill(&self, incoming_bytes: u64) -> Result<bool> {
-        if mem_tier_budget::reserve_bytes_or_wait(incoming_bytes, mem_tier_budget::BUDGET_WAIT)
-            .await
-        {
-            // Another table's flush freed the bytes and the reservation is
-            // already recorded — proceed WITHOUT spilling: the freeing table
-            // paid the flush.
-            return Ok(true);
-        }
-        // Nothing freed within the bound (e.g. the budget is held by idle/cold
-        // tiers whose churn-gated ticks won't flush): self-spill backstop,
-        // exactly the prior behavior.
-        if self.spill_mem_tier_unless_reserved(incoming_bytes).await? {
-            return Ok(true);
-        }
-        // Spilled — our flushed bytes were released; retry the reservation once.
-        Ok(mem_tier_budget::try_reserve_bytes(incoming_bytes))
     }
 
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
