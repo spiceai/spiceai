@@ -2928,13 +2928,19 @@ impl DataFusion {
                                 );
                                 if !is_file_update {
                                     // Evolution failed and we will not drop-recreate: pin
-                                    // back to the existing (un-evolved) checkpoint schema so
-                                    // the registered provider matches the engine table.
+                                    // back to the un-evolved engine-table schema so the
+                                    // registered provider matches it. Use `comparison_schema`,
+                                    // not `existing_schema`: for `refresh_sql` the canonical
+                                    // checkpoint schema appends non-materialized source
+                                    // columns the accelerator never wrote, so registering it
+                                    // would over-declare columns the engine table lacks.
+                                    // `comparison_schema` is restricted to the materialized
+                                    // set (and equals `existing_schema` for non-`refresh_sql`).
                                     // Widened source data is cast down on write
-                                    // (block-equivalent) and a restart retries the
-                                    // idempotent evolve. file_update falls through to the
-                                    // drop-recreate path below.
-                                    return Ok(Some(Arc::clone(&existing_schema)));
+                                    // (block-equivalent) and a restart retries the idempotent
+                                    // evolve. file_update falls through to the drop-recreate
+                                    // path below.
+                                    return Ok(Some(Arc::clone(&comparison_schema)));
                                 }
                             }
                         }
