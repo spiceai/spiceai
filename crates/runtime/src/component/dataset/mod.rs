@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow_schema::SchemaRef;
+
 use super::{find_first_delimiter, validate_identifier};
 use crate::{Runtime, component::access::AccessMode, dataaccelerator::AccelerationSource};
 use acceleration::{Acceleration, Engine};
@@ -41,6 +43,7 @@ pub mod declared_schema;
 pub mod declared_type;
 pub mod metadata;
 pub mod replication;
+pub mod schema_inference;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -113,6 +116,12 @@ pub enum Error {
 
     #[snafu(display("Invalid configuration for '{config_key}': {message}"))]
     InvalidConfiguration { config_key: String, message: String },
+
+    #[snafu(display("Invalid column type in dataset '{dataset}': {source}"))]
+    InvalidColumnType {
+        dataset: String,
+        source: declared_schema::DeclaredSchemaError,
+    },
 
     #[snafu(display(
         "'snapshots_batches' is required when setting 'snapshots_trigger: batches'. For details, visit: https://spiceai.org/docs/features/data-acceleration/snapshots"
@@ -281,6 +290,44 @@ impl Display for CheckAvailability {
     }
 }
 
+/// Selects the depth of source-schema inference. Base column/type inference is
+/// always performed; `Extended` additionally infers primary key, indexes, and
+/// sort/clustering columns to fill unspecified acceleration settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaInference {
+    /// Base column/type inference only (default).
+    #[default]
+    Standard,
+    /// Also auto-detect and apply primary key, indexes, and sort columns from the source.
+    Extended,
+}
+
+impl SchemaInference {
+    /// Whether extended (deeper) schema inference is enabled.
+    #[must_use]
+    pub fn is_extended(self) -> bool {
+        matches!(self, SchemaInference::Extended)
+    }
+}
+
+impl From<spicepod_dataset::SchemaInference> for SchemaInference {
+    fn from(schema_inference: spicepod_dataset::SchemaInference) -> Self {
+        match schema_inference {
+            spicepod_dataset::SchemaInference::Standard => SchemaInference::Standard,
+            spicepod_dataset::SchemaInference::Extended => SchemaInference::Extended,
+        }
+    }
+}
+
+impl Display for SchemaInference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaInference::Standard => write!(f, "standard"),
+            SchemaInference::Extended => write!(f, "extended"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -289,6 +336,10 @@ pub struct Dataset {
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
+    /// Arrow schema derived from `columns[].type` declarations. `None` when no
+    /// column carries an explicit type. Connectors merge this with their inferred
+    /// schema so declared types take precedence.
+    pub schema: Option<SchemaRef>,
     pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
@@ -306,6 +357,7 @@ pub struct Dataset {
     pub vectors: Option<VectorStore>,
     pub full_text_search: Option<spicepod::fts::FtsStore>,
     pub check_availability: CheckAvailability,
+    pub schema_inference: SchemaInference,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -317,6 +369,7 @@ impl std::fmt::Debug for Dataset {
             .field("params", &self.params)
             .field("metadata", &self.metadata)
             .field("columns", &self.columns)
+            .field("schema", &self.schema)
             .field("has_metadata_table", &self.has_metadata_table)
             .field("replication", &self.replication)
             .field("time_column", &self.time_column)
@@ -333,6 +386,7 @@ impl std::fmt::Debug for Dataset {
             .field("vectors", &self.vectors)
             .field("full_text_search", &self.full_text_search)
             .field("check_availability", &self.check_availability)
+            .field("schema_inference", &self.schema_inference)
             .finish_non_exhaustive()
     }
 }
@@ -360,6 +414,7 @@ impl PartialEq for Dataset {
             && self.vectors == other.vectors
             && self.full_text_search == other.full_text_search
             && self.check_availability == other.check_availability
+            && self.schema_inference == other.schema_inference
     }
 }
 

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::get_app_and_start_request;
+use super::get_dataset_app_and_start_request;
 use crate::{args::LoadTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use std::time::Duration;
 use test_framework::{
@@ -64,7 +64,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
             .with_api_key(args.api_key.clone());
         (app, instance)
     } else {
-        let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
+        let (app, start_request) = get_dataset_app_and_start_request(&args.test_args).await?;
         let instance = SpicedInstance::start(start_request).await?;
         (app, instance)
     };
@@ -138,10 +138,12 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let (baseline_query_set, test_builder) = super::build_test_with_validation(
         &args.test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_query_executor(executor.clone()),
+            .with_query_executor(executor.clone())
+            .with_validate(args.test_args.validate),
     )
     .await?;
 
@@ -160,14 +162,16 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let baseline_duration = Duration::from_secs(baseline_duration_secs);
 
     // baseline run
-    println!("Running baseline throughput test for {baseline_duration_secs}s",);
+    println!("Running baseline throughput test for {baseline_duration_secs}s");
 
     let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
+        &app,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_query_executor(executor.clone()),
+            .with_query_executor(executor.clone())
+            .with_validate(args.test_args.validate),
     )
     .await?;
 
@@ -189,7 +193,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // Memory monitoring is only available for owned spiced instances (not external)
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|p| p.watch_memory(&memory_token));
 
     // load test
@@ -213,7 +216,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
         .with_query_executor(executor)
-        .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
+        .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds)
+        .with_validate(args.test_args.validate);
 
     // Add streaming metrics sender if exporter is configured
     if let Some(exporter) = &streaming_exporter {
@@ -221,7 +225,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
 
     let (query_set, test_builder) =
-        super::build_test_with_validation(&args.test_args, test_builder).await?;
+        super::build_test_with_validation(&args.test_args, &app, test_builder).await?;
 
     // Use the same query overrides that were applied in build_test_with_validation
     let query_overrides = args
@@ -265,11 +269,11 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = if let Some(readings) = memory_readings {
-        observe_memory(memory_token, readings).await?
+    let memory_usage = if let Some(readings) = memory_readings {
+        Some(observe_memory(memory_token, readings).await?)
     } else {
         println!("Memory monitoring not available for external spiced instances");
-        (0.0, 0.0)
+        None
     };
 
     // Record per-query metrics for load test
@@ -306,15 +310,21 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     }
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
     println!("Baseline metrics:");
     let baseline_records = baseline_metrics.build_records()?;
     print_batches(&baseline_records)?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;

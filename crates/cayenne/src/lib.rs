@@ -61,6 +61,7 @@ pub mod catalog_provider;
 pub mod cayenne_catalog;
 #[cfg(feature = "partition-table-provider")]
 pub mod ddl;
+pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub mod logical_optimizer;
@@ -80,13 +81,16 @@ pub use catalog_provider::{
 };
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
-    DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete, ObjectStoreConfig,
-    PartitionMetadata, TableMetadata, TableStatistics,
+    CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
+    ObjectStoreConfig, PartitionMetadata, TableMetadata, TableStatistics,
 };
+pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, TimeRetentionFilterBuilder,
+    PreparedOverwrite, PreparedStagedAppend, SlotAdvancer, TimeRetentionFilterBuilder,
+    set_compaction_runtime_env, set_compaction_runtime_handle, set_global_encode_concurrency,
+    set_global_mem_tier_bytes, set_global_memory_budget,
 };
 pub use schema::transform_schema_for_vortex;

@@ -32,6 +32,7 @@ use crate::dynamodb::schema::infer_arrow_schema_from_rows;
 use crate::dynamodb::stream::{StreamError, process_batch, record_batch_to_change_batch};
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use crate::dynamodb::unnest::unnest_dynamodb_rows;
+use crate::schema_discovery::merge_inferred_and_declared_schemas;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use aws_config::SdkConfig;
@@ -87,12 +88,22 @@ pub struct DynamoDBTableProvider {
     pub ready_lag: Duration,
     json_nesting: Option<JsonNesting>,
     write_parallelism: usize,
+    streams_enabled: bool,
 }
 
 type DynamoDBItemStream =
     dyn Stream<Item = DataFusionResult<HashMap<String, AttributeValue>>> + Send + 'static;
 
 const DEFAULT_PARTITIONS: usize = 8;
+
+struct TableMetadata {
+    schema: SchemaRef,
+    partition_key: String,
+    sort_key: Option<String>,
+    flattened_fields: HashSet<String>,
+    item_count: Option<i64>,
+    streams_enabled: bool,
+}
 
 impl DynamoDBTableProvider {
     /// Creates a new `DynamoDB` table provider.
@@ -113,6 +124,7 @@ impl DynamoDBTableProvider {
         metrics_collector: Arc<MetricsCollector>,
         json_nesting: Option<&JsonNesting>,
         write_parallelism: usize,
+        declared_schema: Option<SchemaRef>,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
@@ -124,16 +136,23 @@ impl DynamoDBTableProvider {
                 .build(),
         );
 
-        let (table_schema, partition_key, sort_key, flattened_fields, table_total_item_count) =
-            Self::fetch_table_metadata(
-                Arc::clone(&db_client),
-                &table_name,
-                unnest_depth,
-                schema_infer_max_records,
-                &time_format,
-                json_nesting,
-            )
-            .await?;
+        let TableMetadata {
+            schema: table_schema,
+            partition_key,
+            sort_key,
+            flattened_fields,
+            item_count: table_total_item_count,
+            streams_enabled,
+        } = Self::fetch_table_metadata(
+            Arc::clone(&db_client),
+            &table_name,
+            unnest_depth,
+            schema_infer_max_records,
+            &time_format,
+            json_nesting,
+            declared_schema,
+        )
+        .await?;
 
         // Check that all static fields are present in the table schema
         if let Some(static_fields) =
@@ -192,6 +211,7 @@ impl DynamoDBTableProvider {
             ready_lag,
             json_nesting: json_nesting.cloned(),
             write_parallelism,
+            streams_enabled,
         })
     }
 
@@ -265,7 +285,14 @@ impl DynamoDBTableProvider {
             ready_lag,
             json_nesting: None,
             write_parallelism,
+            streams_enabled: false,
         })
+    }
+
+    /// Returns `true` if `DynamoDB` Streams is enabled on the underlying table.
+    #[must_use]
+    pub fn streams_enabled(&self) -> bool {
+        self.streams_enabled
     }
 
     /// Fetch partition key and sort key from `DynamoDB` table metadata.
@@ -315,13 +342,8 @@ impl DynamoDBTableProvider {
         schema_infer_max_records: i32,
         time_format: &str,
         json_nesting: Option<&JsonNesting>,
-    ) -> Result<(
-        SchemaRef,
-        String,
-        Option<String>,
-        HashSet<String>,
-        Option<i64>,
-    )> {
+        declared_schema: Option<SchemaRef>,
+    ) -> Result<TableMetadata> {
         let response = db_client
             .describe_table()
             .table_name(table_name)
@@ -340,6 +362,8 @@ impl DynamoDBTableProvider {
         if *table_status != TableStatus::Active {
             return TableStatusIsNotActiveSnafu.fail();
         }
+
+        let streams_enabled = table.latest_stream_arn.is_some();
 
         let key_schema = table.key_schema();
 
@@ -375,9 +399,26 @@ impl DynamoDBTableProvider {
             .to_vec();
 
         if rows.is_empty() {
-            return Err(Error::EmptyTable {
-                table_name: table_name.to_string(),
-            });
+            return match declared_schema {
+                Some(schema) => {
+                    tracing::debug!(
+                        "DynamoDB table {table_name:?} is empty; using declared schema. \
+                         Only columns declared in `columns:` will be tracked until the \
+                         table contains data that can be used for schema inference."
+                    );
+                    Ok(TableMetadata {
+                        schema,
+                        partition_key,
+                        sort_key,
+                        flattened_fields: HashSet::new(),
+                        item_count: table.item_count,
+                        streams_enabled,
+                    })
+                }
+                None => Err(Error::EmptyTable {
+                    table_name: table_name.to_string(),
+                }),
+            };
         }
 
         let (unnested_rows, flattened_fields) = match unnest_depth {
@@ -396,7 +437,8 @@ impl DynamoDBTableProvider {
             &final_rows[..final_rows.len().min(2)]
         );
 
-        let schema = infer_arrow_schema_from_rows(&final_rows, time_format)?;
+        let inferred_schema = infer_arrow_schema_from_rows(&final_rows, time_format)?;
+        let schema = merge_inferred_and_declared_schemas(inferred_schema, declared_schema.as_ref());
 
         tracing::debug!(
             "DynamoDB inferred schema: table_name={:?}, schema={:?}",
@@ -404,13 +446,14 @@ impl DynamoDBTableProvider {
             schema
         );
 
-        Ok((
+        Ok(TableMetadata {
             schema,
             partition_key,
             sort_key,
             flattened_fields,
-            table.item_count,
-        ))
+            item_count: table.item_count,
+            streams_enabled,
+        })
     }
 
     fn get_partitions_from_table_size(&self) -> usize {
@@ -698,7 +741,7 @@ pub struct DynamoDBTableProviderExec {
     projected_schema: SchemaRef,
     unnest_depth: Option<usize>,
     time_format: Arc<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     json_nesting: Option<JsonNesting>,
 }
 
@@ -720,12 +763,12 @@ impl DynamoDBTableProviderExec {
             unnest_depth,
             time_format,
             json_nesting,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(partitions),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 }
@@ -759,7 +802,7 @@ impl ExecutionPlan for DynamoDBTableProviderExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

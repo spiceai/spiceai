@@ -56,7 +56,7 @@ use util::expr::combine_exprs_balanced;
 /// triggering a new revalidation to avoid duplicate upstream requests during the SWR window.
 pub type InFlightRevalidations = Arc<Mutex<HashSet<String>>>;
 
-pub const CACHE_REFRESHED_AT_COLUMN: &str = "fetched_at";
+pub const CACHE_REFRESHED_AT_COLUMN: &str = "_fetched_at";
 
 /// Reserved column name added to caching-mode accelerator storage to scope
 /// cached rows by [`runtime_request_context::CacheNamespace`]. The column is
@@ -1682,7 +1682,7 @@ pub type SynchronizedChildren = Arc<RwLock<Vec<Arc<dyn TableProvider>>>>;
 /// Caching acceleration execution plan that checks staleness and triggers background refresh
 pub struct CachingAccelerationScanExec {
     input: Arc<dyn ExecutionPlan>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     /// Maximum time data is considered "fresh" - can be served without refresh
     max_age: Option<Duration>,
     /// Time window after `max_age` during which stale data can be served while revalidating
@@ -1728,11 +1728,14 @@ impl CachingAccelerationScanExec {
         // Default max_age (TTL) to 30 seconds if not specified
         let max_age = max_age.or(Some(Duration::from_secs(30)));
 
-        let plan_properties = input
-            .properties()
-            .clone()
-            .with_emission_type(EmissionType::Final)
-            .with_partitioning(Partitioning::UnknownPartitioning(1));
+        let plan_properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_emission_type(EmissionType::Final)
+                .with_partitioning(Partitioning::UnknownPartitioning(1)),
+        );
 
         Self {
             input,
@@ -1780,7 +1783,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         self.input.schema()
     }
 
-    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.plan_properties
     }
 
@@ -2001,7 +2004,7 @@ mod cache_namespace_column_tests {
     fn reserved_column_name_is_case_insensitive() {
         assert!(is_reserved_caching_column(CACHE_NAMESPACE_COLUMN));
         assert!(is_reserved_caching_column("__SPICE_CACHE_NAMESPACE"));
-        assert!(!is_reserved_caching_column("fetched_at"));
+        assert!(!is_reserved_caching_column("_fetched_at"));
         assert!(!is_reserved_caching_column("request_path"));
     }
 
@@ -2590,7 +2593,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2630,7 +2633,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2670,7 +2673,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2710,7 +2713,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = None; // No stale-while-revalidate
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2740,7 +2743,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2764,7 +2767,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2805,7 +2808,7 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&[batch], max_age, stale_while_revalidate)
@@ -2829,7 +2832,7 @@ mod tests {
             .expect("Time went backwards")
             .as_nanos() as i64;
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Duration::from_secs(30);
         #[expect(clippy::cast_possible_truncation)]
         let max_age_nanos = max_age.as_nanos() as i64;
@@ -2902,7 +2905,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_freshness_empty_batches() {
         let batches: Vec<RecordBatch> = Vec::new();
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let stale_while_revalidate = Some(Duration::from_secs(30));
 
         let freshness = check_cache_freshness(&batches, max_age, stale_while_revalidate)
@@ -2988,14 +2991,14 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let freshness =
             check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
 
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
-            "Batches without fetched_at column should be expired"
+            "Batches without _fetched_at column should be expired"
         );
     }
 
@@ -3017,14 +3020,14 @@ mod tests {
         )
         .expect("Failed to create batch");
 
-        let max_age = Duration::from_secs(60);
+        let max_age = Duration::from_mins(1);
         let freshness =
             check_cache_freshness(&[batch], max_age, None).expect("Should check freshness");
 
         assert_eq!(
             freshness,
             CacheFreshness::Expired,
-            "Batches with NULL fetched_at should be expired"
+            "Batches with NULL _fetched_at should be expired"
         );
     }
 
@@ -3106,7 +3109,7 @@ mod tests {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time went backwards")
                 .as_nanos()
-                - Duration::from_secs(120).as_nanos()) as i64;
+                - Duration::from_mins(2).as_nanos()) as i64;
             // All entries have the same stale timestamp
             let timestamp = TimestampNanosecondArray::from(vec![
                 Some(two_min_ago),
@@ -3140,8 +3143,8 @@ mod tests {
             col("request_query").eq(lit("id=1")),
         ];
 
-        let max_age = Some(Duration::from_secs(60)); // 60 second TTL
-        let stale_while_revalidate = Some(Duration::from_secs(300)); // 5 minute SWR window
+        let max_age = Some(Duration::from_mins(1)); // 60 second TTL
+        let stale_while_revalidate = Some(Duration::from_mins(5)); // 5 minute SWR window
         let in_flight_revalidations: InFlightRevalidations =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
 

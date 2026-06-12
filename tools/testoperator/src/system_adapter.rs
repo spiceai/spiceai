@@ -52,7 +52,7 @@ impl SystemAdapterSession {
     /// callers can always run teardown in their cleanup path regardless of
     /// whether the test succeeded.
     pub async fn teardown(mut self) {
-        match self.client.teardown(self.run_id).await {
+        match self.client.teardown(self.run_id, false).await {
             Ok(response) if response.ok => {
                 println!(
                     "System adapter teardown ({transport}, run_id={run_id}): ok",
@@ -102,7 +102,7 @@ pub async fn acquire(args: &CommonArgs) -> anyhow::Result<(SpicedInstance, Syste
     println!("System adapter setup ({transport}, run_id={run_id})");
 
     let response = client
-        .setup(run_id, metadata, HashMap::new(), None)
+        .setup(run_id, metadata, HashMap::new())
         .await
         .map_err(|e| anyhow::anyhow!("system adapter setup failed: {e}"))?;
 
@@ -137,23 +137,23 @@ fn interpret_setup_response(
     response: &system_adapter_protocol::SetupResponse,
 ) -> anyhow::Result<(String, Option<String>, Option<String>)> {
     if !matches!(
-        response.driver,
+        response.read_driver,
         system_adapter_protocol::AdbcDriver::Flightsql
     ) {
         anyhow::bail!(
             "system adapter returned unsupported driver `{driver}`; testoperator only \
              drives `flightsql` SUTs today",
-            driver = response.driver,
+            driver = response.read_driver,
         );
     }
 
     let flight_url = response
-        .db_kwargs
+        .read_db_kwargs
         .get("uri")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "system adapter setup response missing required `uri` in db_kwargs \
+                "system adapter setup response missing required `uri` in read_db_kwargs \
                  for driver=flightsql"
             )
         })?
@@ -166,10 +166,10 @@ fn interpret_setup_response(
     // FlightSQL ADBC kwarg `password`. We stash it on the SpicedInstance so the
     // HTTP readiness probe and Flight SQL client both authenticate properly.
     let api_key = response
-        .db_kwargs
+        .read_db_kwargs
         .get("password")
         .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
+        .filter(|s: &&str| !s.is_empty())
         .map(str::to_string);
 
     Ok((flight_url, api_key, http_base_url))
@@ -250,11 +250,77 @@ fn http_base_url_from_endpoints(
 
 /// Mirror of `SpicedInstance::external`'s URL inference, exposed here so we can
 /// fall back to a derived HTTP base URL when the adapter doesn't return one.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "returns Option to compose with http_base_url_from_endpoints().or_else(...) at the call site"
+)]
 fn derive_http_base_url(flight_url: &str) -> Option<String> {
     if flight_url.contains("flight.spiceai.io") {
         return Some("https://data.spiceai.io".to_string());
     }
-    flight_url
-        .rfind(':')
-        .map(|last_colon| format!("{base}:8090", base = &flight_url[..last_colon]))
+
+    let http_flight_url = flight_url
+        .strip_prefix("grpc://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            flight_url
+                .strip_prefix("grpc+tls://")
+                .map(|rest| format!("https://{rest}"))
+        });
+    let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
+    let Ok(mut url) = url::Url::parse(parse_target) else {
+        return Some(format!("{flight_url}:8090"));
+    };
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    if url.set_port(Some(8090)).is_err() {
+        return Some(format!("{flight_url}:8090"));
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_http_base_url;
+
+    #[test]
+    fn derive_http_base_url_handles_missing_flight_port() {
+        assert_eq!(
+            derive_http_base_url("https://example.com"),
+            Some("https://example.com:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_replaces_flight_port() {
+        assert_eq!(
+            derive_http_base_url("http://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_flight_scheme_to_http() {
+        assert_eq!(
+            derive_http_base_url("grpc://localhost:50051"),
+            Some("http://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_maps_grpc_tls_flight_scheme_to_https() {
+        assert_eq!(
+            derive_http_base_url("grpc+tls://localhost:50051"),
+            Some("https://localhost:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_http_base_url_falls_back_for_non_url_flight_address() {
+        assert_eq!(
+            derive_http_base_url("localhost:50051"),
+            Some("localhost:50051:8090".to_string())
+        );
+    }
 }

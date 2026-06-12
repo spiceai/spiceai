@@ -553,3 +553,69 @@ pub static OLTP_TPMC: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .with_unit("txn/min")
         .build()
 });
+
+pub static QPH: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("qph")
+        .with_description("Queries completed per hour (QPH).")
+        .with_unit("queries/hour")
+        .build()
+});
+
+pub static CAYENNE_INGEST_READ_AMP_P99: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("cayenne_ingest_read_amp_p99")
+        .with_description(
+            "p99 Cayenne read amplification (protected snapshots a scan must merge) per table over the under-load window — the query-impact signal of compaction keeping up.",
+        )
+        .with_unit("snapshots")
+        .build()
+});
+
+pub static CAYENNE_INGEST_READ_AMP_P90: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("cayenne_ingest_read_amp_p90")
+        .with_description(
+            "p90 Cayenne read amplification (protected snapshots a scan must merge) per table over the under-load window.",
+        )
+        .with_unit("snapshots")
+        .build()
+});
+
+pub static CAYENNE_COMPACTION_PASSES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_compaction_passes")
+        .with_description("Cayenne compaction passes during the test, per table and kind.")
+        .with_unit("passes")
+        .build()
+});
+
+pub static CAYENNE_COMPACTION_MERGED_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    meter()
+        .u64_gauge("cayenne_compaction_merged_bytes")
+        .with_description(
+            "Total output bytes written by Cayenne compaction during the test, per table and kind.",
+        )
+        .with_unit("bytes")
+        .build()
+});
+
+pub static CAYENNE_COMPACTION_DURATION_P99_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("cayenne_compaction_duration_p99_ms")
+        .with_description(
+            "p99 wall-clock time of a Cayenne compaction pass, per table and kind — high p99 means each pass is slow, so compaction can't drain files faster than CDC creates them and read amplification climbs.",
+        )
+        .with_unit("ms")
+        .build()
+});
+
+pub static CAYENNE_COMPACTION_DURATION_P90_MS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    meter()
+        .f64_gauge("cayenne_compaction_duration_p90_ms")
+        .with_description(
+            "p90 wall-clock time of a Cayenne compaction pass, per table and kind — the typical pass cost (pair with p99 to spot tail stalls).",
+        )
+        .with_unit("ms")
+        .build()
+});

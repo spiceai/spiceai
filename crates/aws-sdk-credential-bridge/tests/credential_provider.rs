@@ -20,8 +20,8 @@ use aws_sdk_cognitoidentity as cognito_identity;
 use aws_sdk_cognitoidentityprovider as cognito_idp;
 use aws_sdk_cognitoidentityprovider::types::AuthFlowType;
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
-use iceberg_storage_opendal::AwsCredentialLoad;
 use object_store::CredentialProvider;
+use reqsign_core::{Context, ProvideCredential};
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -100,16 +100,14 @@ async fn s3_credential_provider_caches_calls_for_iceberg() {
         .await
         .expect("To Create S3CredentialProvider");
 
-    let client = reqwest::Client::new();
-
     let first_credentials = credential_provider
-        .load_credential(client.clone())
+        .provide_credential(&Context::new())
         .await
         .expect("To Fetch Credentials")
         .expect("To Find Valid Credentials");
 
     let second_credentials = credential_provider
-        .load_credential(client)
+        .provide_credential(&Context::new())
         .await
         .expect("To Fetch Credentials")
         .expect("To Find Valid Credentials");

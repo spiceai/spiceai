@@ -12,7 +12,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **Deletion vectors** stored as Arrow IPC files for position-based deletion, plus an in-memory PK index (`DeletionIndex` for Int64 PKs / `KeyDeletionIndex` for composite or non-integer PKs) for key-based deletion. Sequence-numbered for Iceberg-style upsert semantics.
 - **Staging WAL** (`provider/staging_wal.rs`) provides crash-safe append commit via tmp+fsync+rename of the WAL marker, atomic rename of staged Vortex files into the current snapshot, and self-healing recovery on the next provider open.
 - **Tiered small-files compaction** (`provider/compaction.rs`) triggered best-effort after writes and periodically by a per-table background compactor, gated by a shared per-accelerator semaphore so a fleet of tables can't oversubscribe the writer pool.
-- **CDC apply pipelining** (`provider/mutation_writer::write_cdc_pipelined`): Stage A writes Vortex files into the staging dir under the staging WAL; Stage B (move + listing-cache invalidation) is spawned as a finalize task so the next burst's Stage A can begin work. Stage A and Stage B always preserve burst order.
+- **CDC apply pipelining** (`provider/mutation_writer::write_cdc_pipelined`): Stage A writes Vortex files into the staging dir under the staging WAL; Stage B (move + listing-cache invalidation, plus on-conflict deletion publish for upserts) is spawned as a finalize task so the next burst's Stage A can begin work. On-conflict upserts pipeline too — they stage into a protected snapshot whose deletions are resolved and published by the finalize task; a burst that replaces *inlined* rows (which the staged on-conflict commit cannot represent, only known after validation) stages optimistically and then falls back to a synchronous publish that reuses the staged files (the `cdc_path_inline_fallback` write-phase metric tracks how often this happens). Stage A and Stage B always preserve burst order.
 - **Sequence-based ordering** (Iceberg-style) for correct delete/insert visibility across snapshots.
 - **Partitioning** via composite partition keys (with cross-partition atomic-commit coordination in the runtime).
 - **PK conflict detection opt-out** (`cayenne_pk_conflict_detection: none`) for append-only CDC workloads where the source enforces PK uniqueness and the ingestion path cannot replay existing rows.
@@ -426,7 +426,7 @@ Cayenne ships five optimizer rules that work together to keep multi-way HTAP joi
 
 - **`CayennePropagateFilterAcrossEquiJoinKeys`** (logical) — predicate transitive closure for non-key dim-table filters. DataFusion's stock `infer_join_predicates` only propagates filters that already reference the join key; this rule introduces `Filter(other_side.key IN (SELECT this_side.key FROM dim_subtree))` for `Inner`, `LeftSemi`, and `RightSemi` joins where the selective filter is on a non-key column (e.g. `n_name = 'CHINA'`). Subqueries are tagged with `__cayenne_xclos__` and the rule refuses to re-introduce a propagated filter for the same target key, so the rule terminates under fixed-point iteration.
 - **`CayenneInListToRangeRewrite`** (logical) — rewrites long consecutive integer `IN` lists into half-open ranges, so PK scans see a tight `[lo, hi)` predicate the file pruner can use.
-- **`CayenneJoinRewriter`** (physical) — for inner-join `HashJoinExec` nodes (the only shape DataFusion pushes join-derived dynamic filters through), swaps DataFusion's default in-list dynamic-filter accumulator for `ExactLeftAccumulator`. The exact accumulator produces a precise dynamic filter when the build side fits in a configurable byte budget (`cayenne.exact_join_filter_max_bytes`), falling back to `RangeBounds + BloomFilter` otherwise. DataFusion's filter-pushdown phase then plants the resulting `Arc<DynamicFilterPhysicalExpr>` into the right-side scan's `FileSource`.
+- **Inner-join probe filtering** is handled by DataFusion 53's *native* hash-join dynamic-filter pushdown — no Cayenne-specific physical rule. For inner joins (the only shape DataFusion pushes join-derived dynamic filters through), `HashJoinExec` plants an `Arc<DynamicFilterPhysicalExpr>` into the right-side scan's `FileSource` during the filter-pushdown phase, and the build side populates it at execute-time with a combined predicate: min/max **bounds** (for statistics-based file/row-group/segment pruning) plus a **membership** check — an `InList` for build sides within `datafusion.execution.hash_join_inlist_pushdown_max_size` (sized from `runtime.query.memory_limit` per partition by the Spice session builder) or a hash-table lookup for larger ones. This natively supersedes the former forked `ExactLeftAccumulator` accumulator seam.
 - **`CayenneDynamicFilterSharing`** (physical) — when a dynamic filter has been pushed into one `CayenneAccelerationExec`, installs the same `Arc<DynamicFilterPhysicalExpr>` on sibling `CayenneAccelerationExec`s backed by the same underlying table and equi-joined column set. Applies to `Inner`, `LeftSemi`, and `RightSemi` parent joins (anti joins excluded — sharing would drop rows they're meant to preserve).
 - **`CayenneAntiJoinSortMergeRewriter`** (physical) — DataFusion's `HashJoinExec` build side is non-spillable. For same-source Cayenne semi/anti joins above a 10M-row exact build-side threshold (`cayenne.sort_merge_min_rows`) and exceeding a fraction of the query memory pool (`cayenne.sort_merge_memory_pool_fraction`, default 0.125 of `runtime.query.memory_limit`), the rule rewrites the hash join into a `SortMergeJoinExec` with explicit spillable `SortExec` inputs. Inner/outer joins keep `HashJoinExec`.
 
@@ -493,9 +493,11 @@ The runtime accelerator (`runtime/src/dataaccelerator/cayenne/mod.rs`) recognize
 | `cayenne_metastore`                              | `sqlite` (default) or `turso` (requires `turso` build feature).                                                             | `sqlite`                                                                  |
 | `cayenne_unsupported_type_action`                | `error` (default), `string`, `warn`, `ignore`.                                                                              | `error`                                                                   |
 | `cayenne_segment_cache_mb`                       | Vortex segment cache in MB.                                                                                                 | `256`                                                                     |
+| `cayenne_pk_keyset_cache_mb`                     | Resident PK-keyset cache cap per table (drives the exact-keyset vs. bloom-fallback deletion path). Accounted against `runtime.query.memory_limit`. | memory-derived (~1/32 of total, clamped `[256, 8192]`)      |
 | `cayenne_target_file_size_mb`                    | Vortex file target size in MB.                                                                                              | `256`                                                                     |
 | `cayenne_sort_columns`                           | Comma-separated sort columns.                                                                                               | (none)                                                                    |
 | `cayenne_compression_strategy`                   | `btrblocks` or `zstd`.                                                                                                      | `btrblocks`                                                               |
+| `cayenne_delta_encoding`                         | Delta-write encoding level: `auto` (default), `none`, or an explicit level `0`–`10` (`7`+ is full). Tunes per-write delta encoding. | `auto`                                                            |
 | `cayenne_pk_conflict_detection`                  | `auto` or `none`.                                                                                                           | `auto`                                                                    |
 | `cayenne_upload_concurrency`                     | Concurrent multipart upload fan-out.                                                                                        | `available_parallelism()`                                                 |
 | `cayenne_write_concurrency`                      | Writer partition override for unsorted ingests. The sort-and-rewrite compaction path always writes serially.                | `target_partitions`                                                       |
@@ -530,6 +532,21 @@ When the data tier targets S3 Express One Zone (either via an `s3://...--x-s3/..
 | `cayenne_s3_unsigned_payload` | Skip SHA-256 payload signing for S3 Express requests (session-based auth makes payload signing redundant).                                               | `true`                               |
 
 The runtime-global Vortex footer-metadata cache is sized via `runtime.params.cayenne_footer_cache_mb`; when set, the configured value is persisted in the metastore to detect cross-restart drift. Memory accounting for the PK keyset cache, sort/merge join build-side rewrites, and inline-memtable buffers is integrated with `runtime.query.memory_limit` (the canonical Spicepod v2 path; the legacy `runtime.memory_limit` is auto-migrated with a deprecation warning).
+
+### Metastore (SQLite) tuning parameters
+
+These are runtime-global `runtime.params` (not per-dataset). They tune the SQLite metastore's pragmas; the defaults match the previously-hardcoded values, and are applied once at startup.
+
+| Parameter                                     | Description                                                                                                                                      | Default          |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------- |
+| `cayenne_metastore_cache_mb`                  | SQLite page-cache size (per connection × pool).                                                                                                  | `256`            |
+| `cayenne_metastore_mmap_mb`                   | SQLite `mmap_size`.                                                                                                                              | `1024` (1 GiB)   |
+| `cayenne_metastore_busy_timeout_ms`           | `busy_timeout` — how long a writer waits for the lock before erroring.                                                                          | `30000`          |
+| `cayenne_metastore_wal_autocheckpoint_pages`  | Inline WAL auto-checkpoint threshold in pages; `0` disables the inline checkpoint so it never fires inside a hot commit (the background maintenance tick drains the WAL instead). | `0`              |
+| `cayenne_metastore_wal_truncate_threshold_mb` | WAL size above which the background-tick checkpoint escalates PASSIVE→TRUNCATE to reclaim the `-wal` file (never on the hot write path).         | `160`            |
+| `cayenne_metastore_auto_vacuum`               | `none`, `incremental`, or `full`. Takes effect only on a fresh DB.                                                                              | `none`           |
+
+The metastore always runs in WAL journal mode with `synchronous = NORMAL`.
 
 ## Relationship to the DuckLake specification
 
@@ -774,9 +791,9 @@ The `cayenne_unsupported_type_action` parameter controls handling:
 
 Secondary indexes are not supported. Primary keys drive efficient upserts and deletions.
 
-#### MVCC
+#### Concurrency / MVCC
 
-Full MVCC (multi-version concurrency control) is not supported.
+Cayenne provides Iceberg-style **sequence-number snapshot isolation**: each write commits at a monotonic sequence number, deletions apply by sequence, and readers see a consistent snapshot — so concurrent reads never observe a torn write. What is *not* yet supported is general multi-version concurrency control with **time-travel queries** (reading an arbitrary historical snapshot); snapshot expiration and time-travel are tracked under Future enhancements.
 
 ### Future enhancements
 
@@ -867,7 +884,7 @@ Cayenne synthesizes several established database/storage techniques. The list be
 
 ### Query execution
 
-- **Apache DataFusion** — the embedded query engine Cayenne integrates with as a `TableProvider`. Cayenne plugs into DataFusion's logical and physical optimizer pipelines via `CayennePropagateFilterAcrossEquiJoinKeys`, `CayenneInListToRangeRewrite`, `CayenneJoinRewriter`, `CayenneAntiJoinSortMergeRewriter`, and `CayenneDynamicFilterSharing`.
+- **Apache DataFusion** — the embedded query engine Cayenne integrates with as a `TableProvider`. Cayenne plugs into DataFusion's logical and physical optimizer pipelines via `CayennePropagateFilterAcrossEquiJoinKeys`, `CayenneInListToRangeRewrite`, `CayennePushDownSemiJoin`, `CayenneReassociateCrossJoin`, `CayenneAntiJoinSortMergeRewriter`, and `CayenneDynamicFilterSharing`, while relying on DataFusion 53's native hash-join dynamic-filter pushdown for the ordinary inner-join probe side.
   - [Apache DataFusion](https://datafusion.apache.org/)
   - Andrew Lamb et al., *"Apache Arrow DataFusion: A Fast, Embeddable, Modular Analytic Query Engine"*, SIGMOD 2024 Industrial Track. <https://www.cidrdb.org/cidr2024/papers/p17-lamb.pdf>
 

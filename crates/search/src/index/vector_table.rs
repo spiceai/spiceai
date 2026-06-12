@@ -219,7 +219,7 @@ impl TableProvider for VectorScanTableProvider {
             &columns_requested,
             filters,
         ) {
-            let lp = Self::apply_proj_and_filter(
+            let mut builder = Self::apply_proj_and_filter(
                 LogicalPlanBuilder::scan(
                     "base_table",
                     Arc::new(DefaultTableSource::new(Arc::clone(&self.table_provider))),
@@ -227,8 +227,18 @@ impl TableProvider for VectorScanTableProvider {
                 )?,
                 &columns_requested,
                 filters,
-            )?
-            .build()?;
+            )?;
+
+            // The caller's TableScan may carry a `fetch` that was just pushed down by
+            // DataFusion's LimitPushdown. The schema-sufficient branch builds a fresh
+            // inner LogicalPlan against the base table, so we must re-apply the limit
+            // here — otherwise the inner plan's TableScan keeps `fetch=None` and the
+            // underlying provider scans the whole table.
+            if limit.is_some() {
+                builder = builder.limit(0, limit)?;
+            }
+
+            let lp = builder.build()?;
 
             return state.create_physical_plan(&lp).await;
         }
@@ -390,7 +400,7 @@ mod tests {
             self
         }
 
-        fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
             self.0.properties()
         }
 
@@ -738,6 +748,62 @@ mod tests {
             TableReference::parse_str("my_vectored_table"),
             "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' ORDER BY pk desc LIMIT 5",
             "scan_table_join_for_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/8368>: when the
+    /// outer query carries a `LIMIT` that DataFusion pushes onto the `TableScan` as
+    /// `fetch=N`, `VectorScanTableProvider::scan` receives `limit=Some(N)`. The
+    /// schema-sufficient branch must re-apply the limit on the inner plan so it
+    /// reaches the base table provider — otherwise the underlying scan runs without
+    /// a limit and reads far more data than necessary.
+    #[tokio::test]
+    pub async fn test_vector_scan_limit_pushdown_schema_sufficient() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+        ]));
+
+        let p = VectorScanTableProvider::try_new(
+            Arc::new(ExplainMemTable::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+                "BaseTable",
+            )),
+            &(Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
+                    Field::new("pk", DataType::Int64, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                ]),
+            )) as Arc<dyn VectorIndex>),
+        )
+        .expect("could not make 'VectorScanTableProvider'");
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        // Schema-sufficient: every selected column is in the base table. The bare
+        // `LIMIT` (no `ORDER BY`) lets DataFusion fold the limit into the outer
+        // TableScan's `fetch`, so `VectorScanTableProvider::scan` is called with
+        // `limit=Some(5)`. After the fix the inner BaseTable plan must show
+        // `limit=Some(5)`; before the fix it shows `limit=None`.
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column from my_vectored_table LIMIT 5",
+            "scan_table_limit_pushdown_schema_sufficient",
         )
         .await?;
 

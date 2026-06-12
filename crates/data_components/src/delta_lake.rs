@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::{Array, ArrayData, make_array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use aws_sdk_credential_bridge;
 use chrono::TimeZone;
@@ -34,10 +36,10 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
+use datafusion::logical_expr::{ColumnarValue, Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
-use datafusion::physical_plan::expressions::{CastExpr, Column};
+use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
@@ -48,7 +50,7 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
-use delta_kernel::scan::state::{DvInfo, Stats};
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -96,6 +98,12 @@ pub enum Error {
     ))]
     SnapshotLockError {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to create object store for Delta Lake table {table_url}: {source}"))]
+    ObjectStore {
+        table_url: String,
+        source: object_store::Error,
     },
 }
 
@@ -150,6 +158,7 @@ impl Read for DeltaTableFactory {
 pub struct DeltaTable {
     table_url: Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    parquet_object_store: Arc<dyn object_store::ObjectStore>,
     /// User-facing Arrow schema with logical column names. When the Delta table
     /// uses column mapping (`Name` or `Id` mode), parquet files store data under
     /// physical column names that differ from these logical names.
@@ -174,7 +183,7 @@ impl DeltaTable {
         let mut storage_options: HashMap<String, String> = HashMap::new();
         for (key, value) in options {
             match key.as_ref() {
-                "token" | "endpoint" => {}
+                "token" | "endpoint" | "credential_vending" => {}
                 "client_timeout" => {
                     storage_options.insert("timeout".into(), value.expose_secret().to_string());
                 }
@@ -184,50 +193,105 @@ impl DeltaTable {
             }
         }
 
-        let table_object_store = if table_url.scheme() == "s3" {
-            let region = storage_options.get("aws_region").map(ToString::to_string);
+        // For S3 tables without explicit credentials, use the AWS SDK credential bridge so that
+        // IAM roles, environment-variable chains, and other SDK-managed auth sources are available
+        // for both the delta-kernel engine (log reads) and the parquet reader (data reads).
+        let (parquet_object_store, engine) = if table_url.scheme() == "s3" {
+            let region = storage_options
+                .get("delta_lake_aws_region")
+                .or_else(|| storage_options.get("aws_region"))
+                .map(ToString::to_string);
 
             if let Some(sdk_config) = aws_sdk_credential_bridge::should_use_sdk_credentials(
                 &storage_options,
                 "aws_access_key_id",
                 "aws_secret_access_key",
             ) {
-                // Use AWS SDK credential bridge for IAM role or environment-based authentication.
-                // This allows dynamic credential fetching from IAM roles, environment variables,
-                // or other AWS credential sources at query time.
-                tracing::trace!("Using AWS SDK credentials provider for Delta Lake table");
                 match aws_sdk_credential_bridge::from_s3_url_and_config(
                     &table_url,
                     region,
                     sdk_config.as_ref(),
                     io_runtime.clone(),
                 ) {
-                    Ok(object_store) => Some(object_store),
+                    Ok(sdk_store) => {
+                        tracing::trace!(
+                            "Using AWS SDK credentials provider for Delta Lake table at {table_url}"
+                        );
+                        let sdk_store: Arc<dyn object_store::ObjectStore> = sdk_store.into();
+                        let engine =
+                            Arc::new(DefaultEngine::builder(Arc::clone(&sdk_store)).build());
+                        (sdk_store, engine)
+                    }
                     Err(err) => {
                         tracing::debug!(
-                            "Unable to create S3 object store with AWS SDK credentials for Delta Lake table at {}: {err}",
-                            table_url
+                            "Unable to build AWS SDK object store for Delta Lake table at {table_url}: {err}; falling back to delta_kernel credential resolution"
                         );
-                        None
+                        Self::build_default_stores(&table_url, storage_options)?
                     }
                 }
             } else {
-                tracing::trace!(
-                    "Using delta_kernel's built-in AWS credential resolution for Delta Lake table"
-                );
-                None
+                // Explicit credentials present — pass them through delta_kernel's built-in resolution.
+                Self::build_default_stores(&table_url, storage_options)?
             }
         } else {
-            None
+            Self::build_default_stores(&table_url, storage_options)?
         };
 
-        let engine = match table_object_store {
-            Some(object_store) => Arc::new(DefaultEngine::new(object_store.into())),
-            None => Arc::new(DefaultEngine::new(
-                store_from_url_opts(&table_url, storage_options).map_err(handle_delta_error)?,
-            )),
-        };
+        Self::with_engine(table_url, engine, parquet_object_store)
+    }
 
+    /// Builds the default (non-SDK) object store and delta-kernel engine from `storage_options`.
+    #[expect(clippy::type_complexity)]
+    fn build_default_stores(
+        table_url: &Url,
+        storage_options: HashMap<String, String>,
+    ) -> Result<(
+        Arc<dyn object_store::ObjectStore>,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    )> {
+        let (parquet_store, _) = object_store::parse_url_opts(
+            table_url,
+            storage_options
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .context(ObjectStoreSnafu {
+            table_url: table_url.to_string(),
+        })?;
+        let parquet_store: Arc<dyn object_store::ObjectStore> = Arc::from(parquet_store);
+
+        let engine = Arc::new(
+            DefaultEngine::builder(
+                store_from_url_opts(table_url, storage_options).map_err(handle_delta_error)?,
+            )
+            .build(),
+        );
+
+        Ok((parquet_store, engine))
+    }
+
+    /// Creates a `DeltaTable` backed by a pre-built object store, bypassing
+    /// the credential resolution in [`DeltaTable::from`].
+    ///
+    /// Used by Unity Catalog credential vending, where the store
+    /// authenticates with vended, refresh-aware credentials.
+    pub fn from_object_store(
+        table_location: String,
+        object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
+        let table_url = delta_kernel::try_parse_uri(ensure_folder_location(table_location))
+            .map_err(handle_delta_error)?;
+        // delta-kernel 0.23 removed `DefaultEngine::new`; construct via the
+        // builder (mirrors the `DefaultEngine::builder(..).build()` call above).
+        let engine = Arc::new(DefaultEngine::builder(Arc::clone(&object_store)).build());
+        Self::with_engine(table_url, engine, object_store)
+    }
+
+    fn with_engine(
+        table_url: Url,
+        engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        parquet_object_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<Self> {
         let snapshot = Snapshot::builder_for(table_url.clone())
             .build(engine.as_ref())
             .map_err(handle_delta_error)?;
@@ -255,6 +319,7 @@ impl DeltaTable {
         Ok(Self {
             table_url,
             engine,
+            parquet_object_store,
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
             snapshot: RwLock::new(snapshot),
@@ -461,8 +526,11 @@ fn rewrite_column_names(
 /// Builds a [`ProjectionExec`] that renames columns from physical names back to logical names.
 ///
 /// For columns with nested types (Struct, List, Map) where the physical and logical data types
-/// differ (because nested field names are also physical), wraps the column in a [`CastExpr`]
-/// to trigger Arrow's recursive struct/list/map field renaming.
+/// differ (because nested field names are also physical), wraps the column in a
+/// [`RelabelFieldsExpr`] to recursively rename nested struct/list/map field names. A
+/// `CastExpr` can no longer be used for this: `DataFusion` 53 rejects a struct-to-struct
+/// cast whose source and target fields share no names (the physical names are opaque
+/// column-mapping ids), so the rename must be done as a metadata-only relabel instead.
 fn build_column_mapping_projection(
     exec: Arc<dyn ExecutionPlan>,
     physical_to_logical: &HashMap<String, String>,
@@ -480,13 +548,12 @@ fn build_column_mapping_projection(
                 .unwrap_or_else(|| field.name().clone());
 
             // If the logical field has a different data type (nested field names differ),
-            // wrap in CastExpr to recursively rename nested struct/list/map fields.
+            // relabel the nested struct/list/map field names from physical to logical.
             let expr: Arc<dyn PhysicalExpr> = match logical_schema.field_with_name(&logical_name) {
                 Ok(logical_field) if field.data_type() != logical_field.data_type() => {
-                    Arc::new(CastExpr::new(
+                    Arc::new(RelabelFieldsExpr::new(
                         Arc::new(Column::new(field.name(), i)),
                         logical_field.data_type().clone(),
-                        None,
                     ))
                 }
                 _ => Arc::new(Column::new(field.name(), i)),
@@ -497,6 +564,123 @@ fn build_column_mapping_projection(
         .collect();
 
     Ok(Arc::new(ProjectionExec::try_new(projection_expr, exec)?))
+}
+
+/// Recursively rebuilds `data` so its (possibly nested) field names match
+/// `target_type`, without touching any values, buffers, or null masks.
+///
+/// Delta column mapping stores nested struct/list/map field names under opaque
+/// physical names; the logical schema uses the logical names. Field names live
+/// in the Arrow `DataType`, so renaming is a metadata-only operation: relabel
+/// each child to the matching target nested type (positionally — column mapping
+/// preserves field order), then rebuild this level carrying `target_type`.
+fn relabel_array_data(
+    data: ArrayData,
+    target_type: &DataType,
+) -> std::result::Result<ArrayData, DataFusionError> {
+    if data.data_type() == target_type {
+        return Ok(data);
+    }
+
+    let target_child_types: Vec<DataType> = match target_type {
+        DataType::Struct(fields) => fields.iter().map(|f| f.data_type().clone()).collect(),
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            vec![field.data_type().clone()]
+        }
+        DataType::Map(field, _) => vec![field.data_type().clone()],
+        _ => Vec::new(),
+    };
+
+    let old_children = data.child_data().to_vec();
+    let new_children = if target_child_types.len() == old_children.len() {
+        old_children
+            .into_iter()
+            .zip(target_child_types.iter())
+            .map(|(child, child_target)| relabel_array_data(child, child_target))
+            .collect::<std::result::Result<Vec<_>, DataFusionError>>()?
+    } else {
+        old_children
+    };
+
+    data.into_builder()
+        .data_type(target_type.clone())
+        .child_data(new_children)
+        .build()
+        .map_err(DataFusionError::from)
+}
+
+/// Physical expression that renames the (possibly nested) field names of its
+/// input array to `target_type` without changing any values. Used by Delta
+/// column mapping to map physical field names back to logical names; replaces a
+/// `CastExpr`, which `DataFusion` 53 rejects for structs whose physical and
+/// logical field names don't overlap.
+#[derive(Debug, Clone, Eq)]
+struct RelabelFieldsExpr {
+    arg: Arc<dyn PhysicalExpr>,
+    target_type: DataType,
+}
+
+impl RelabelFieldsExpr {
+    fn new(arg: Arc<dyn PhysicalExpr>, target_type: DataType) -> Self {
+        Self { arg, target_type }
+    }
+}
+
+impl PartialEq for RelabelFieldsExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.arg.eq(&other.arg) && self.target_type.eq(&other.target_type)
+    }
+}
+
+impl std::hash::Hash for RelabelFieldsExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.arg.hash(state);
+        self.target_type.hash(state);
+    }
+}
+
+impl std::fmt::Display for RelabelFieldsExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RELABEL({} AS {})", self.arg, self.target_type)
+    }
+}
+
+impl PhysicalExpr for RelabelFieldsExpr {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn data_type(&self, _input_schema: &Schema) -> std::result::Result<DataType, DataFusionError> {
+        Ok(self.target_type.clone())
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> std::result::Result<bool, DataFusionError> {
+        self.arg.nullable(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> std::result::Result<ColumnarValue, DataFusionError> {
+        let array = self.arg.evaluate(batch)?.into_array(batch.num_rows())?;
+        let relabeled = make_array(relabel_array_data(array.to_data(), &self.target_type)?);
+        Ok(ColumnarValue::Array(relabeled))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> std::result::Result<Arc<dyn PhysicalExpr>, DataFusionError> {
+        Ok(Arc::new(RelabelFieldsExpr::new(
+            Arc::clone(&children[0]),
+            self.target_type.clone(),
+        )))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
 }
 #[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
@@ -600,16 +784,9 @@ impl TableProvider for DeltaTable {
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
 
-        let store = self
-            .engine
-            .get_object_store_for_url(&self.table_url)
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Failed to get object store for table location".to_string(),
-                )
-            })?;
-        let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(store))
-            as Arc<dyn ParquetFileReaderFactory>;
+        let parquet_file_reader_factory = Arc::new(DefaultParquetFileReaderFactory::new(
+            Arc::clone(&self.parquet_object_store),
+        )) as Arc<dyn ParquetFileReaderFactory>;
         let projected_delta_schema = project_delta_schema(
             &self.arrow_schema,
             Arc::clone(&self.delta_schema),
@@ -696,7 +873,7 @@ impl TableProvider for DeltaTable {
             .files
             .iter()
             .flat_map(|file| {
-                file.partition_values.iter().filter_map(|(k, _)| {
+                file.partition_values.keys().filter_map(|k| {
                     let schema = self.schema();
                     // With column mapping, partition value keys use physical names.
                     // Translate to logical name for schema lookup.
@@ -880,17 +1057,17 @@ struct PartitionFileContext {
     _transform: Option<ExpressionRef>,
 }
 
-#[expect(clippy::needless_pass_by_value)]
 #[expect(clippy::cast_sign_loss)]
-fn handle_scan_file(
-    scan_context: &mut ScanContext,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
+fn handle_scan_file(scan_context: &mut ScanContext, scan_file: ScanFile) {
+    let ScanFile {
+        path,
+        size,
+        dv_info,
+        transform,
+        partition_values,
+        ..
+    } = scan_file;
+
     let root_url = &scan_context.table_root;
 
     let path = if root_url.path().ends_with('/') {
@@ -1081,6 +1258,7 @@ fn to_delta_kernel_expr(expr: &Expr) -> Option<Expression> {
         | Expr::Exists(_)
         | Expr::Wildcard { .. }
         | Expr::Unnest { .. }
+        | Expr::SetComparison(_)
         | Expr::OuterReferenceColumn(_, _)
         | Expr::AggregateFunction { .. }
         | Expr::WindowFunction { .. }
@@ -1153,6 +1331,7 @@ fn to_delta_kernel_binary_expression(
         | Operator::HashLongArrow
         | Operator::AtAt
         | Operator::IntegerDivide
+        | Operator::Colon
         | Operator::HashMinus
         | Operator::AtQuestion
         | Operator::Question
@@ -1292,6 +1471,7 @@ fn to_delta_kernel_scalar(scalar: ScalarValue) -> Option<Scalar> {
         | ScalarValue::DurationNanosecond(_)
         | ScalarValue::Union(_, _, _)
         | ScalarValue::Dictionary(_, _)
+        | ScalarValue::RunEndEncoded(_, _, _)
         | ScalarValue::Decimal32(_, _, _)
         | ScalarValue::Decimal64(_, _, _) => None,
     }

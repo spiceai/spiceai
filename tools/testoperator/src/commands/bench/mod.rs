@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{RowCounts, get_app_and_start_request, load_app};
+use super::{RowCounts, get_dataset_app_and_start_request, load_app};
 use crate::{args::DatasetTestArgs, health::HealthMonitor, spiced_metrics::MetricsScraper};
 use chbench_driver::ChBenchDriver as _;
 use std::{
@@ -79,7 +79,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
         let (instance, session) = crate::system_adapter::acquire(&args.common).await?;
         (app, instance, Some(session))
     } else {
-        let (app, start_request) = get_app_and_start_request(&args.common).await?;
+        let (app, start_request) = get_dataset_app_and_start_request(args).await?;
 
         // For chbench, prepare the Postgres source database (schema + seed data) before starting spiced.
         let query_set = args.load_query_set()?;
@@ -87,7 +87,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<RowCounts> {
             let scale_factor = args.scale_factor.unwrap_or(1.0);
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let terminals = (scale_factor * 10.0) as usize;
-            prepare_chbench_source(scale_factor, terminals).await?;
+            prepare_chbench_source(scale_factor, terminals, None).await?;
         }
 
         let instance = SpicedInstance::start(start_request).await?;
@@ -120,7 +120,6 @@ async fn run_inner(
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance
@@ -175,6 +174,7 @@ async fn run_inner(
 
     let (_, test_builder) = super::build_test_with_validation(
         args,
+        &app,
         NotStarted::new()
             .with_parallel_count(1)
             .with_end_condition(EndCondition::QuerySetCompleted(5))
@@ -350,9 +350,11 @@ fn chbench_source_from_env() -> anyhow::Result<chbench_driver::PostgresSourceCon
 ///
 /// `scale_factor` maps to TPC-C warehouses (must be a positive integer >= 1).
 /// `terminals` specifies the target number of terminals.
+/// `rate` optionally caps the workload-wide transaction rate (txn/s); `None` runs the OLTP workload closed-loop at maximum throughput.
 pub(crate) async fn prepare_chbench_source(
     scale_factor: f64,
     terminals: usize,
+    rate: Option<u32>,
 ) -> anyhow::Result<chbench_driver::PostgresChBenchDriver> {
     if scale_factor < 1.0 || scale_factor.fract() != 0.0 {
         anyhow::bail!(
@@ -367,6 +369,7 @@ pub(crate) async fn prepare_chbench_source(
     let config = chbench_driver::ChBenchConfig {
         warehouses,
         terminals,
+        rate,
         ..Default::default()
     };
 

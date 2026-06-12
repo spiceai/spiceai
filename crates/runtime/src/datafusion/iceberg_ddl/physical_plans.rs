@@ -57,6 +57,27 @@ fn ddl_result_schema() -> SchemaRef {
     )]))
 }
 
+async fn create_iceberg_table_provider(
+    catalog: Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+    table_state: &str,
+) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
+    let provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog),
+        namespace.clone(),
+        table_name.to_string(),
+    )
+    .await
+    .map_err(|e| {
+        DataFusionError::Execution(format!(
+            "Failed to create table provider for {table_state} Iceberg table '{table_name}': {e}"
+        ))
+    })?;
+
+    Ok(Arc::new(provider))
+}
+
 #[derive(Debug)]
 struct IcebergDdlAccelerationSource {
     app: Arc<App>,
@@ -140,7 +161,7 @@ pub struct IcebergCreateTableExec {
     dataset_options: DatasetOptions,
     datafusion: Weak<DataFusion>,
     partition_expr_sql: Option<String>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 /// Physical plan for creating an Iceberg schema.
@@ -152,7 +173,7 @@ pub struct IcebergCreateSchemaExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     datafusion: Weak<DataFusion>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for IcebergCreateSchemaExec {
@@ -178,12 +199,12 @@ impl IcebergCreateSchemaExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -216,7 +237,7 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -351,12 +372,12 @@ impl IcebergCreateTableExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -395,7 +416,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -479,19 +500,13 @@ impl ExecutionPlan for IcebergCreateTableExec {
 
             if exists {
                 if if_not_exists {
-                    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-                        IcebergTableProvider::try_new(
-                            Arc::clone(&catalog),
-                            namespace.clone(),
-                            table_name.clone(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create table provider for existing Iceberg table: {e}"
-                            ))
-                        })?,
-                    );
+                    let provider = create_iceberg_table_provider(
+                        Arc::clone(&catalog),
+                        &namespace,
+                        &table_name,
+                        "existing",
+                    )
+                    .await?;
 
                     let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                         return Err(DataFusionError::Execution(format!(
@@ -600,19 +615,9 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 })?;
 
             // Create an IcebergTableProvider for the new table
-            let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-                IcebergTableProvider::try_new(
-                    Arc::clone(&catalog),
-                    namespace.clone(),
-                    table_name.clone(),
-                )
-                .await
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "Failed to create table provider for new Iceberg table: {e}"
-                    ))
-                })?,
-            );
+            let provider =
+                create_iceberg_table_provider(Arc::clone(&catalog), &namespace, &table_name, "new")
+                    .await?;
             // Register in the DataFusion catalog's schema provider
             let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
                 return Err(DataFusionError::Execution(format!(
@@ -1185,7 +1190,7 @@ pub struct IcebergDropTableExec {
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
     _datafusion: Weak<DataFusion>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for IcebergDropTableExec {
@@ -1214,12 +1219,12 @@ impl IcebergDropTableExec {
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             catalog,
             namespace,
@@ -1253,7 +1258,7 @@ impl ExecutionPlan for IcebergDropTableExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

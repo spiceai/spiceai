@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::config::ClusterRole;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
@@ -145,6 +146,15 @@ pub enum Error {
         format_datafusion_error(source)
     ))]
     FailedToWriteData { source: DataFusionError },
+
+    #[snafu(display(
+        "Failed to apply retention_sql to accelerated dataset {dataset_name} after refresh data was written: {}. The accelerated dataset may contain rows that should have been retained away.",
+        format_datafusion_error(source)
+    ))]
+    FailedToApplyRetentionSql {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(display(
         "The accelerated table does not support delete operations. Use a different acceleration engine which supports delete operations. For details, visit: https://spiceai.org/docs/components/data-accelerators"
@@ -371,6 +381,9 @@ pub struct Builder {
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
+    /// Layered over the process-global CDC config.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl Builder {
@@ -420,6 +433,7 @@ impl Builder {
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
+            cdc_param_overrides: None,
         }
     }
 
@@ -667,6 +681,17 @@ impl Builder {
         self
     }
 
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`. These layer on top of the runtime-global
+    /// CDC config only for this dataset's changes stream;
+    pub fn cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -855,6 +880,7 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+        refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1130,7 +1156,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
 
         loop {
             interval.tick().await;
@@ -1415,7 +1441,7 @@ impl TableProvider for AcceleratedTable {
 
         // For caching mode, extend the accelerator scan projection to
         // include the storage-only columns the caching pipeline needs:
-        // `fetched_at` (freshness check inside
+        // `_fetched_at` (freshness check inside
         // `CachingAccelerationScanExec`) and `__spice_cache_namespace`
         // (per-principal isolation `FilterExec` applied below). The added
         // columns are stripped from the user-facing output by
@@ -1611,21 +1637,34 @@ impl TableProvider for AcceleratedTable {
         };
 
         // Compute the target schema based on user's original projection.
-        // SchemaCastScanExec strips extra columns (like fetched_at added for caching)
+        // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
         // and casts types. The schema should match what the user requested.
+        //
+        // Drop the extended-inference hints (`spice.inferred_*`) from this physical
+        // scan-output schema. They stay on the logical `TableProvider::schema()`
+        // chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
+        // row-count/byte-size as table statistics and an accelerator keeps its
+        // tuning warm-start — but their values vary per table, and DataFusion
+        // builds a join's output schema by merging its inputs' schema-level
+        // metadata in input order. Leaving them here lets `join_selection`'s
+        // build/probe swap flip the surviving values, so the rule's output schema
+        // no longer equals its input and the physical-optimizer schema invariant
+        // fails. See `data_components::inferred_schema`.
+        let full_schema = self.schema();
+        let mut metadata = full_schema.metadata().clone();
+        data_components::inferred_schema::strip_inferred_metadata(&mut metadata);
         let target_schema = match projection {
             Some(indices) => {
-                let full_schema = self.schema();
                 let projected_fields: Vec<_> = indices
                     .iter()
                     .filter_map(|&i| full_schema.fields().get(i).cloned())
                     .collect();
-                Arc::new(Schema::new_with_metadata(
-                    projected_fields,
-                    full_schema.metadata().clone(),
-                ))
+                Arc::new(Schema::new_with_metadata(projected_fields, metadata))
             }
-            None => self.schema(),
+            None => Arc::new(Schema::new_with_metadata(
+                full_schema.fields().clone(),
+                metadata,
+            )),
         };
 
         Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
@@ -1846,7 +1885,7 @@ impl TableProvider for AcceleratedTable {
 }
 
 /// Extends projection to include columns required by the caching pipeline
-/// for accelerator scans: `fetched_at` (freshness check) and
+/// for accelerator scans: `_fetched_at` (freshness check) and
 /// `__spice_cache_namespace` (per-principal isolation filter applied as a
 /// hard `FilterExec` on top of the scan).
 ///
@@ -2123,7 +2162,7 @@ mod tests {
         assert_eq!(
             extended,
             vec![0, 2, 3],
-            "Should add fetched_at index at end"
+            "Should add _fetched_at index at end"
         );
     }
 
@@ -2136,7 +2175,7 @@ mod tests {
         assert_eq!(
             extended,
             vec![2, 3],
-            "Should add fetched_at to single column"
+            "Should add _fetched_at to single column"
         );
     }
 

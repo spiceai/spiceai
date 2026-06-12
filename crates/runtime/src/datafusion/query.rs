@@ -316,8 +316,8 @@ impl Query {
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
-            // Distributed-job summary labels — recorded at completion by
-            // `crate::datafusion::query::stage_history::record_stage_history`.
+            // Distributed-job summary labels. Ballista 53 no longer exposes the
+            // scheduler execution graph needed to populate these fields.
             ballista_job_id = tracing::field::Empty,
             stage_count = tracing::field::Empty,
             executor_count = tracing::field::Empty,
@@ -345,8 +345,6 @@ impl Query {
         request_context: Arc<RequestContext>,
         span: Span,
     ) -> Result<QueryHandle> {
-        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-
         // Get the scheduler server
         let scheduler = Self::get_scheduler_server(&self.df)?;
         let tracker = self.tracker;
@@ -586,8 +584,6 @@ impl Query {
     }
 
     async fn run_internal(self, request_context: Arc<RequestContext>) -> Result<QueryResult> {
-        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
-
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "sql_query", input = %self.sql, runtime_query = false);
 
         if let Some(traceparent) = request_context.trace_parent() {
@@ -1741,7 +1737,7 @@ fn scalar_to_json_value(
     value: &ScalarValue,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
-        ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        ScalarValue::Boolean(value) => Ok(value.map_or(Value::Null, Value::Bool)),
         ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
         ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
         ScalarValue::Float64(Some(value)) => number_to_json(*value),
@@ -1767,8 +1763,9 @@ fn scalar_to_json_value(
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
-        ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
-        ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::Union(Some((_, value)), _, _)
+        | ScalarValue::Dictionary(_, value)
+        | ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
         ScalarValue::Null
         | ScalarValue::Float16(None)
         | ScalarValue::Float32(None)
@@ -2612,7 +2609,7 @@ mod tests {
     struct TestExecutionPlan {
         metrics: Option<MetricsSet>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl TestExecutionPlan {
@@ -2620,12 +2617,12 @@ mod tests {
             Self {
                 metrics,
                 children,
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(Arc::new(Schema::empty())),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Final,
                     Boundedness::Bounded,
-                ),
+                )),
             }
         }
     }
@@ -2651,7 +2648,7 @@ mod tests {
             self
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 

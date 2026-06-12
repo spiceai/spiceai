@@ -20,14 +20,14 @@ use std::{fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::TimeZone;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use http::{
     HeaderMap, HeaderValue,
     header::{ACCEPT, AUTHORIZATION, USER_AGENT},
 };
 use object_store::{
-    ClientOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     client::SpawnedReqwestConnector,
     http::{HttpBuilder, HttpStore},
     path::Path,
@@ -128,7 +128,7 @@ impl ObjectStore for GitHubRawObjectStore {
         _payload: PutPayload,
         _opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        Err(object_store::Error::NotImplemented)
+        Err(not_implemented("put_opts"))
     }
 
     async fn put_multipart_opts(
@@ -136,11 +136,19 @@ impl ObjectStore for GitHubRawObjectStore {
         _location: &Path,
         _opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
-        Err(object_store::Error::NotImplemented)
+        Err(not_implemented("put_multipart_opts"))
     }
 
-    async fn delete(&self, _location: &Path) -> Result<(), object_store::Error> {
-        Err(object_store::Error::NotImplemented)
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        locations
+            .map(|location| match location {
+                Ok(_) => Err(not_implemented("delete_stream")),
+                Err(err) => Err(err),
+            })
+            .boxed()
     }
 
     fn list(
@@ -210,19 +218,23 @@ impl ObjectStore for GitHubRawObjectStore {
         &self,
         _prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
-        Err(object_store::Error::NotImplemented)
+        Err(not_implemented("list_with_delimiter"))
     }
 
-    async fn copy(&self, _from: &Path, _to: &Path) -> Result<(), object_store::Error> {
-        Err(object_store::Error::NotImplemented)
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         _from: &Path,
         _to: &Path,
+        _options: CopyOptions,
     ) -> Result<(), object_store::Error> {
-        Err(object_store::Error::NotImplemented)
+        Err(not_implemented("copy_opts"))
+    }
+}
+
+fn not_implemented(operation: &'static str) -> object_store::Error {
+    object_store::Error::NotImplemented {
+        operation: operation.to_string(),
+        implementer: "GitHubRawObjectStore".to_string(),
     }
 }
 
@@ -251,7 +263,7 @@ impl GithubRestClient {
         let client = reqwest::Client::builder()
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()?;
 
         Ok(Self {
@@ -294,7 +306,7 @@ impl GithubRestClient {
 
         let response_status = response.status().as_u16();
         let err_msg =
-            format!("The Github API ({endpoint}) failed with status code {response_status}",);
+            format!("The Github API ({endpoint}) failed with status code {response_status}");
         Err(err_msg.into())
     }
 }

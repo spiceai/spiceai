@@ -385,17 +385,19 @@ impl TursoAccelerator {
 
     /// Per-storage SQLite/Turso pragma overrides applied after pool creation.
     ///
-    /// On EBS-class network-attached storage we bump the page cache and enable
-    /// mmap to absorb random I/O latency. Local SSD, tmpfs, and unknown
-    /// storage keep the engine defaults.
+    /// On EBS-class network-attached storage we bump the page cache to absorb
+    /// random I/O latency. Local SSD, tmpfs, and unknown storage keep the
+    /// engine defaults.
+    ///
+    /// Note: unlike `rusqlite`-backed `SQLite`, the Turso engine does not implement
+    /// `PRAGMA mmap_size` and rejects it as an unknown pragma name, so we only
+    /// tune the supported `cache_size` here.
     fn storage_setup_pragmas(
         storage: ResolvedAccelerationStorage,
     ) -> &'static [(&'static str, &'static str)] {
         match storage {
-            // 200_000 KiB is about a 200 MiB page cache, plus a 256 MiB mmap window.
-            ResolvedAccelerationStorage::Ebs => {
-                &[("cache_size", "-200000"), ("mmap_size", "268435456")]
-            }
+            // 200_000 KiB is about a 200 MiB page cache.
+            ResolvedAccelerationStorage::Ebs => &[("cache_size", "-200000")],
             ResolvedAccelerationStorage::LocalSsd
             | ResolvedAccelerationStorage::Tmpfs
             | ResolvedAccelerationStorage::Unknown => &[],
@@ -656,58 +658,62 @@ impl DataAccelerator for TursoAccelerator {
             columns.join(", ")
         );
 
-        conn.execute(&create_sql, ())
-            .await
-            .map_err(|e| Error::AccelerationCreationFailed {
-                source: Box::new(e),
-            })?;
+        {
+            let _schema_guard = pool.acquire_schema_write_lock().await;
 
-        // Handle indexes if specified
-        if let Some(indexes_str) = cmd.options.get("indexes") {
-            // Parse the indexes option string
-            use datafusion_table_providers::util::hashmap_from_option_string;
-            let indexes = hashmap_from_option_string::<String, String>(indexes_str);
-
-            // Create indexes
-            for (column_ref_str, index_type_str) in indexes {
-                let index_type = crate::component::dataset::acceleration::IndexType::from(
-                    index_type_str.as_str(),
-                );
-                let index_name = format!(
-                    "idx_{}_{}",
-                    table_name,
-                    column_ref_str.replace(['(', ')', ' ', ','], "_")
-                );
-                let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
-                let unique_clause = match &index_type {
-                    crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
-                    crate::component::dataset::acceleration::IndexType::Enabled => "",
-                };
-
-                let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
-                let column_list = format!("({})", sanitized_columns.join(", "));
-
-                let create_index_sql = format!(
-                    "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
-                );
-
-                conn.execute(&create_index_sql, ()).await.map_err(|e| {
-                    Error::AccelerationCreationFailed {
-                        source: Box::new(e),
-                    }
+            conn.execute(&create_sql, ())
+                .await
+                .map_err(|e| Error::AccelerationCreationFailed {
+                    source: Box::new(e),
                 })?;
 
-                tracing::debug!(
-                    "Created {}index '{}' on table '{}' for columns: {}",
-                    if unique_clause.is_empty() {
-                        ""
-                    } else {
-                        "unique "
-                    },
-                    index_name,
-                    table_name,
-                    column_ref_str
-                );
+            // Handle indexes if specified
+            if let Some(indexes_str) = cmd.options.get("indexes") {
+                // Parse the indexes option string
+                use datafusion_table_providers::util::hashmap_from_option_string;
+                let indexes = hashmap_from_option_string::<String, String>(indexes_str);
+
+                // Create indexes
+                for (column_ref_str, index_type_str) in indexes {
+                    let index_type = crate::component::dataset::acceleration::IndexType::from(
+                        index_type_str.as_str(),
+                    );
+                    let index_name = format!(
+                        "idx_{}_{}",
+                        table_name,
+                        column_ref_str.replace(['(', ')', ' ', ','], "_")
+                    );
+                    let quoted_index_name = sanitize_identifier(&index_name, "Index")?;
+                    let unique_clause = match &index_type {
+                        crate::component::dataset::acceleration::IndexType::Unique => "UNIQUE ",
+                        crate::component::dataset::acceleration::IndexType::Enabled => "",
+                    };
+
+                    let sanitized_columns = sanitize_column_reference(&column_ref_str)?;
+                    let column_list = format!("({})", sanitized_columns.join(", "));
+
+                    let create_index_sql = format!(
+                        "CREATE {unique_clause}INDEX IF NOT EXISTS {quoted_index_name} ON {quoted_table_name} {column_list}"
+                    );
+
+                    conn.execute(&create_index_sql, ()).await.map_err(|e| {
+                        Error::AccelerationCreationFailed {
+                            source: Box::new(e),
+                        }
+                    })?;
+
+                    tracing::debug!(
+                        "Created {}index '{}' on table '{}' for columns: {}",
+                        if unique_clause.is_empty() {
+                            ""
+                        } else {
+                            "unique "
+                        },
+                        index_name,
+                        table_name,
+                        column_ref_str
+                    );
+                }
             }
         }
 
@@ -795,6 +801,7 @@ impl DataAccelerator for TursoAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pool = self.get_shared_pool(source).await?;
+        let _schema_guard = pool.acquire_schema_write_lock().await;
         let conn = pool.connect().await?;
         let escaped = table_name.replace('"', "\"\"");
         let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");

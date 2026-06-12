@@ -19,7 +19,7 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 use std::sync::LazyLock;
-use telemetry::DURATION_MS_HISTOGRAM_BUCKETS;
+use telemetry::{CONTENTION_MS_HISTOGRAM_BUCKETS, DURATION_MS_HISTOGRAM_BUCKETS};
 
 pub const METRIC_MAX_TIMESTAMP_BEFORE_REFRESH_MS: &str =
     "dataset_acceleration_max_timestamp_before_refresh_ms";
@@ -177,5 +177,49 @@ pub(crate) static CDC_APPLY_FIXED_COST_MS: LazyLock<Histogram<f64>> = LazyLock::
         .with_description("Duration in milliseconds for fixed-cost phases of CDC apply.")
         .with_unit("ms")
         .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Time the CDC apply loop spent blocked waiting to receive the next batch from
+/// the source-reader channel (i.e. waiting on the replication-slot read + WAL
+/// decode that the reader task performs). This is the discriminator for the
+/// "unaccounted per-batch overhead" gap: a high recv-wait means the apply loop
+/// is *source-bound* (the reader cannot decode/deliver batches fast enough),
+/// while a near-zero recv-wait means the loop is *apply-bound* (the bottleneck
+/// is the accelerator write, e.g. Cayenne's synchronous on-conflict path). Pair
+/// it with `cdc_apply_burst_duration_ms` for full per-batch attribution
+/// (wall-clock ≈ recv-wait + apply-burst).
+pub(crate) static CDC_SOURCE_RECV_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_source_recv_wait_ms")
+        .with_description(
+            "Duration in milliseconds the CDC apply loop waited to receive the next batch from the source-reader channel. High = source-bound (slot read / WAL decode can't keep up); near-zero = apply-bound.",
+        )
+        .with_unit("ms")
+        .with_boundaries(DURATION_MS_HISTOGRAM_BUCKETS.to_vec())
+        .build()
+});
+
+/// Time the CDC apply loop spent in the Phase-2 linger window (#11196) actively
+/// accumulating more envelopes into the current coalesced burst before applying
+/// it — i.e. the wall-clock cost of `cdc_max_coalesce_age_ms`. Recorded only when
+/// the linger window runs (`max_coalesce_age_ms > 0` and the burst had not already
+/// hit the envelope/byte cap). A value near the configured age means the linger is
+/// fully waiting out its deadline (low load); a small value means the burst filled
+/// before the deadline. Always-zero means linger is disabled (the default) — there
+/// is no measurable wait to attribute.
+pub(crate) static CDC_LINGER_WAIT_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("dataset_acceleration_cdc_linger_wait_ms")
+        .with_description(
+            "Duration in milliseconds the CDC apply loop spent in the Phase-2 linger window accumulating envelopes before applying the coalesced burst (cdc_max_coalesce_age_ms).",
+        )
+        .with_unit("ms")
+        // Linger waits are typically sub-100ms (the default cdc_max_coalesce_age_ms
+        // is small), so the shared `DURATION_MS_HISTOGRAM_BUCKETS` — which jumps
+        // straight from 0 to 100ms — would collapse almost every observation into
+        // bucket 0. Use the finer sub-ms→100ms contention buckets, which resolve
+        // the 0.1–50ms band while still reaching the multi-second stall tail.
+        .with_boundaries(CONTENTION_MS_HISTOGRAM_BUCKETS.to_vec())
         .build()
 });

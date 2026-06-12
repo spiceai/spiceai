@@ -33,6 +33,7 @@ use data_components::debezium::change_event::{ChangeEvent, ChangeEventKey};
 use data_components::debezium::{self, change_event};
 use data_components::debezium_kafka::DebeziumKafka;
 use data_components::kafka::{KafkaConfig, KafkaConsumer, KafkaMetrics, KafkaOffset};
+use data_components::schema_discovery::merge_inferred_and_declared_schemas;
 use datafusion::datasource::TableProvider;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+const SCHEMA_INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -333,6 +336,8 @@ impl DataConnector for Debezium {
 
         let topic = dataset.path();
 
+        let declared_schema = dataset.schema.clone();
+
         let metadata_from_accelerator =
             if let Some(debezium_kafka_sys) = debezium_kafka_sys.as_deref() {
                 get_metadata_from_accelerator(debezium_kafka_sys)
@@ -382,10 +387,11 @@ impl DataConnector for Debezium {
                         topic,
                         &self.kafka_config,
                         debezium_kafka_sys.as_deref(),
+                        declared_schema.as_ref(),
                     )
                     .await?
                 } else {
-                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                    let inferred = debezium::arrow::convert_fields_to_arrow_schema(
                         metadata.schema_fields.iter().collect(),
                     )
                     .boxed()
@@ -393,7 +399,11 @@ impl DataConnector for Debezium {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
                     })?;
-                    (metadata, Arc::new(schema))
+                    let schema = merge_inferred_and_declared_schemas(
+                        Arc::new(inferred),
+                        declared_schema.as_ref(),
+                    );
+                    (metadata, schema)
                 };
 
                 // Build the consumer with the sidecar offsets already stashed so
@@ -425,6 +435,8 @@ impl DataConnector for Debezium {
                     topic,
                     &self.kafka_config,
                     debezium_kafka_sys.as_deref(),
+                    declared_schema.as_ref(),
+                    self.schema_evolution,
                 )
                 .await?
             }
@@ -550,6 +562,8 @@ async fn get_metadata_from_kafka(
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    declared_schema: Option<&SchemaRef>,
+    schema_evolution: bool,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_for_dataset(
@@ -571,32 +585,90 @@ async fn get_metadata_from_kafka(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    let msg = match kafka_consumer
-        .next_json::<ChangeEventKey, ChangeEvent>()
-        .await
-    {
-        Ok(Some(msg)) => msg,
-        Ok(None) => {
-            return Err(super::DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "debezium".to_string(),
-                source: "No message received from Kafka.".into(), // TODO: what action can a user take from this error?
-                connector_component: ConnectorComponent::from(dataset),
-            });
-        }
-        Err(e) => {
-            return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
-                dataconnector: "debezium",
-                connector_component: ConnectorComponent::from(dataset),
-            });
+    // Obtain a schema sample and ensure the real consumer has a partition assignment
+    // before `restart_topic` rewinds it.
+    let (key, value) = if schema_evolution {
+        // Poll the real consumer once for partition assignment, and peek the latest
+        // message via a temp consumer for the schema sample.
+        let (_, event) = tokio::try_join!(
+            fetch_first_event(dataset, topic, &kafka_consumer),
+            fetch_latest_change_event(dataset, topic, kafka_config),
+        )?;
+        event
+    } else {
+        // Use a short-timeout peek via a temp consumer.  If no message is available
+        // and the user declared column types, use those as the schema so the dataset
+        // can register without waiting for data.
+        let peek_timeout = if declared_schema.is_some() {
+            Duration::from_secs(5)
+        } else {
+            SCHEMA_INFERENCE_TIMEOUT
+        };
+        let fetch_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+            topic,
+            kafka_config,
+            peek_timeout,
+        )
+        .await;
+
+        match fetch_result {
+            Ok(Some(pair)) => pair,
+            Ok(None) | Err(data_components::kafka::Error::MetadataTopicNotFound { .. }) => {
+                if let Some(declared) = declared_schema {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        "No Kafka message received; using declared schema for Debezium dataset"
+                    );
+                    let metadata = DebeziumKafkaMetadata {
+                        consumer_group_id: kafka_consumer.group_id().to_string(),
+                        topic: topic.to_string(),
+                        primary_keys: primary_keys_from_acceleration(dataset),
+                        schema_fields: vec![],
+                        offsets: Vec::new(),
+                    };
+                    if let Some(sys) = debezium_kafka_sys {
+                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
+                    }
+                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                }
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "debezium".to_string(),
+                    source: format!("No message received from Kafka topic '{topic}'. Create the topic with data or declare `columns` with types to initialize without it.").into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                });
+            }
+            Err(e) => {
+                if let Some(declared) = declared_schema {
+                    tracing::warn!(
+                        dataset = %dataset_name,
+                        "Failed to peek at Kafka topic for schema ({e}); using declared schema"
+                    );
+                    let metadata = DebeziumKafkaMetadata {
+                        consumer_group_id: kafka_consumer.group_id().to_string(),
+                        topic: topic.to_string(),
+                        primary_keys: primary_keys_from_acceleration(dataset),
+                        schema_fields: vec![],
+                        offsets: Vec::new(),
+                    };
+                    if let Some(sys) = debezium_kafka_sys {
+                        let _ = set_metadata_to_accelerator(sys, &metadata).await;
+                    }
+                    return Ok((kafka_consumer, metadata, Arc::clone(declared)));
+                }
+                return Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                });
+            }
         }
     };
 
-    let primary_keys = msg
-        .key()
+    let primary_keys = key
+        .as_ref()
         .map(ChangeEventKey::get_primary_key)
         .unwrap_or_default();
 
-    let Some(schema_fields) = msg.value().get_schema_fields() else {
+    let Some(schema_fields) = value.get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {
             dataconnector: "debezium".to_string(),
             source: "Could not get Arrow schema from Debezium message".into(), // TODO: what action can a user take from this error?
@@ -604,12 +676,13 @@ async fn get_metadata_from_kafka(
         });
     };
 
-    let schema = debezium::arrow::convert_fields_to_arrow_schema(schema_fields.clone())
+    let inferred = debezium::arrow::convert_fields_to_arrow_schema(schema_fields.clone())
         .boxed()
         .context(super::UnableToGetReadProviderSnafu {
             dataconnector: "debezium",
             connector_component: ConnectorComponent::from(dataset),
         })?;
+    let schema = merge_inferred_and_declared_schemas(Arc::new(inferred), declared_schema);
 
     let metadata = DebeziumKafkaMetadata {
         consumer_group_id: kafka_consumer.group_id().to_string(),
@@ -638,18 +711,90 @@ async fn get_metadata_from_kafka(
             connector_component: ConnectorComponent::from(dataset),
         })?;
 
-    Ok((kafka_consumer, metadata, Arc::new(schema)))
+    Ok((kafka_consumer, metadata, schema))
+}
+
+/// Peek at the most recent message on `topic` using a temporary consumer.
+/// Does not touch the real consumer or its group offsets.
+async fn fetch_latest_change_event(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
+    let dataset_name = dataset.name.to_string();
+
+    match KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        SCHEMA_INFERENCE_TIMEOUT,
+    )
+    .await
+    {
+        Ok(Some(pair)) => Ok(pair),
+        Ok(None) => Err(super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "debezium".to_string(),
+            source: format!(
+                "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' within {SCHEMA_INFERENCE_TIMEOUT:?} while inferring schema (schema_evolution=true). Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+            )
+            .into(),
+            connector_component: ConnectorComponent::from(dataset),
+        }),
+        Err(e) => Err(e).boxed().context(super::UnableToGetReadProviderSnafu {
+            dataconnector: "debezium",
+            connector_component: ConnectorComponent::from(dataset),
+        }),
+    }
+}
+
+/// Read the first available message.
+async fn fetch_first_event(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_consumer: &KafkaConsumer,
+) -> super::DataConnectorResult<(Option<ChangeEventKey>, ChangeEvent)> {
+    let dataset_name = dataset.name.to_string();
+
+    let msg = tokio::time::timeout(
+        SCHEMA_INFERENCE_TIMEOUT,
+        kafka_consumer.next_json::<ChangeEventKey, ChangeEvent>(),
+    )
+    .await
+    .map_err(|_elapsed| super::DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "debezium".to_string(),
+        source: format!(
+            "Timed out after {SCHEMA_INFERENCE_TIMEOUT:?} waiting for a message on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+        )
+        .into(),
+        connector_component: ConnectorComponent::from(dataset),
+    })?
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?
+    .ok_or_else(|| super::DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "debezium".to_string(),
+        source: format!(
+            "No messages available on Kafka topic '{topic}' for dataset '{dataset_name}' while inferring schema. Verify the topic exists and the Debezium connector is producing messages. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium"
+        )
+        .into(),
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
+
+    Ok(msg.into_key_value())
 }
 
 /// Peek at the latest Kafka message to detect schema evolution. If the schema has
 /// changed from the cached metadata, update the stored metadata and return the fresh
 /// schema. Falls back to the cached schema if the peek fails or no messages are available.
+/// If `declared_schema` is provided, it is merged into whichever schema is chosen.
 async fn refresh_schema_if_evolved(
     metadata: DebeziumKafkaMetadata,
     dataset: &Dataset,
     topic: &str,
     kafka_config: &KafkaConfig,
     debezium_kafka_sys: Option<&DebeziumKafkaSys>,
+    declared_schema: Option<&SchemaRef>,
 ) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
 
@@ -665,7 +810,7 @@ async fn refresh_schema_if_evolved(
     let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
         topic,
         kafka_config,
-        Duration::from_secs(30),
+        SCHEMA_INFERENCE_TIMEOUT,
     )
     .await;
 
@@ -675,18 +820,27 @@ async fn refresh_schema_if_evolved(
             tracing::debug!(
                 "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
             );
-            return Ok((metadata, Arc::new(cached_schema)));
+            return Ok((
+                metadata,
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+            ));
         }
         Err(e) => {
             tracing::debug!(
                 "Failed to peek at latest Kafka message for schema check on dataset {dataset_name}: {e}. Using cached schema."
             );
-            return Ok((metadata, Arc::new(cached_schema)));
+            return Ok((
+                metadata,
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+            ));
         }
     };
 
     let Some(fresh_fields) = value.get_schema_fields() else {
-        return Ok((metadata, Arc::new(cached_schema)));
+        return Ok((
+            metadata,
+            merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+        ));
     };
 
     let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone()) {
@@ -695,12 +849,18 @@ async fn refresh_schema_if_evolved(
             tracing::warn!(
                 "Failed to convert fresh schema from Kafka for {dataset_name}: {e}. Using cached schema."
             );
-            return Ok((metadata, Arc::new(cached_schema)));
+            return Ok((
+                metadata,
+                merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+            ));
         }
     };
 
     if fresh_schema == cached_schema {
-        return Ok((metadata, Arc::new(cached_schema)));
+        return Ok((
+            metadata,
+            merge_inferred_and_declared_schemas(Arc::new(cached_schema), declared_schema),
+        ));
     }
 
     tracing::info!("Detected schema evolution for dataset {dataset_name}. Updating cached schema.");
@@ -721,5 +881,19 @@ async fn refresh_schema_if_evolved(
         );
     }
 
-    Ok((updated_metadata, Arc::new(fresh_schema)))
+    Ok((
+        updated_metadata,
+        merge_inferred_and_declared_schemas(Arc::new(fresh_schema), declared_schema),
+    ))
+}
+
+/// Returns the primary key column names from `acceleration.primary_key`, used as a
+/// fallback when no Kafka messages are available to extract Debezium primary keys from.
+fn primary_keys_from_acceleration(dataset: &Dataset) -> Vec<String> {
+    dataset
+        .acceleration
+        .as_ref()
+        .and_then(|a| a.primary_key.as_ref())
+        .map(|pk| pk.iter().map(ToString::to_string).collect())
+        .unwrap_or_default()
 }

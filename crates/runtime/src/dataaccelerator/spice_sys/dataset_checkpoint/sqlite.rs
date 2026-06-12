@@ -275,14 +275,11 @@ mod tests {
     use runtime_acceleration::snapshot::SnapshotBehavior;
 
     async fn create_in_memory_sqlite_checkpoint() -> DatasetCheckpoint {
-        let pool = SqliteConnectionPoolFactory::new(
-            "",
-            Mode::Memory,
-            std::time::Duration::from_millis(5000),
-        )
-        .build()
-        .await
-        .expect("to build in-memory sqlite connection pool");
+        let pool =
+            SqliteConnectionPoolFactory::new("", Mode::Memory, std::time::Duration::from_secs(5))
+                .build()
+                .await
+                .expect("to build in-memory sqlite connection pool");
         DatasetCheckpoint::init_sqlite(&pool)
             .await
             .expect("Failed to initialize SQLite");
@@ -297,14 +294,11 @@ mod tests {
     }
 
     async fn create_legacy_sqlite_checkpoint() -> (DatasetCheckpoint, SqliteConnectionPool) {
-        let pool = SqliteConnectionPoolFactory::new(
-            "",
-            Mode::Memory,
-            std::time::Duration::from_millis(5000),
-        )
-        .build()
-        .await
-        .expect("to build in-memory sqlite connection pool");
+        let pool =
+            SqliteConnectionPoolFactory::new("", Mode::Memory, std::time::Duration::from_secs(5))
+                .build()
+                .await
+                .expect("to build in-memory sqlite connection pool");
 
         // Create legacy table without schema_json column
         let conn_sync = pool.connect_sync();

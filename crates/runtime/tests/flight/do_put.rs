@@ -255,7 +255,7 @@ async fn test_metrics_endpoint_rate_limit_e2e() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let metrics_quota = Quota::with_period(Duration::from_secs(60))
+            let metrics_quota = Quota::with_period(Duration::from_mins(1))
                 .expect("to create quota")
                 .allow_burst(NonZeroU32::new(1).expect("should convert 1 to NonZeroU32"));
 

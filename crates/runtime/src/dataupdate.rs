@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use arrow::datatypes::SchemaRef;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -26,6 +26,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::TryStreamExt;
+pub use runtime_datafusion::query_engine::{DataUpdate, UpdateType};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use datafusion::sql::TableReference;
@@ -168,24 +169,6 @@ impl DataUpdateBroadcaster {
 
 use crate::datafusion::error::find_datafusion_root;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum UpdateType {
-    Append,
-    Overwrite,
-    Changes,
-}
-
-#[derive(Debug, Clone)]
-pub struct DataUpdate {
-    pub schema: SchemaRef,
-    pub data: Vec<RecordBatch>,
-    /// The type of update to perform.
-    /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
-    /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
-    /// If `UpdateType::Changes`, the runtime will apply the changes to the existing data.
-    pub update_type: UpdateType,
-}
-
 pub struct StreamingDataUpdate {
     pub data: SendableRecordBatchStream,
     pub update_type: UpdateType,
@@ -230,7 +213,7 @@ impl TryFrom<DataUpdate> for StreamingDataUpdate {
 pub struct StreamingDataUpdateExecutionPlan {
     record_batch_stream: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingDataUpdateExecutionPlan {
@@ -252,12 +235,12 @@ impl StreamingDataUpdateExecutionPlan {
         Self {
             record_batch_stream: Arc::new(Mutex::new(record_batch_stream)),
             schema: Arc::clone(&schema),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
         }
     }
 
@@ -325,7 +308,7 @@ impl ExecutionPlan for StreamingDataUpdateExecutionPlan {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -364,6 +347,7 @@ mod tests {
     use super::*;
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::sql::TableReference;

@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt::Display,
+    sync::Arc,
+};
 
 use arrow::array::RecordBatch;
 use parameterized::{ParameterValue, add_tpch_parameters};
@@ -166,6 +170,17 @@ macro_rules! generate_chbench_queries {
     }
 }
 
+macro_rules! remove_chbench_query {
+    ( $queries:expr, $( $i:literal ),* ) => {
+        {
+            let query_names: Vec<Arc<str>> = vec![ $( concat!("chbench_q", stringify!($i)).into(), )* ];
+            $queries.into_iter()
+                .filter(|query| !query_names.contains(&query.name))
+                .collect()
+        }
+    };
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub name: Arc<str>,
@@ -237,7 +252,10 @@ impl Query {
     /// For example, if `reference_schema` is \"arrow\", the query:
     ///   `SELECT * FROM customer WHERE c_custkey = 1`
     /// becomes:
-    ///   `SELECT * FROM arrow.customer WHERE c_custkey = 1`
+    ///   `SELECT * FROM arrow.customer AS customer WHERE c_custkey = 1`
+    ///
+    /// Each bare table is aliased back to its original name so that column
+    /// qualifications resolve exactly as in the original query.
     ///
     /// Uses `DataFusion`'s SQL parser to parse the query, rewrite all table references,
     /// and unparse back to SQL. This works with any valid SQL query.
@@ -247,41 +265,71 @@ impl Query {
     /// - The SQL query cannot be parsed
     /// - The query contains multiple statements (only single statements are supported)
     pub fn rewrite_with_reference_schema(&self, reference_schema: &str) -> anyhow::Result<Self> {
-        use datafusion::sql::sqlparser::ast::{Ident, ObjectNamePart, visit_relations_mut};
-        use datafusion::sql::sqlparser::parser::Parser;
+        use datafusion::sql::sqlparser::ast::{
+            Ident, ObjectNamePart, TableAlias, TableFactor, VisitMut, VisitorMut,
+        };
         use std::ops::ControlFlow;
 
-        // Parse the SQL query using sqlparser
-        let dialect = datafusion::sql::sqlparser::dialect::PostgreSqlDialect {};
-        let mut statements = Parser::parse_sql(&dialect, &self.sql).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse query '{}' for reference schema rewrite: {}",
-                self.name,
-                e
-            )
-        })?;
-
-        // Should have exactly one statement
-        if statements.len() != 1 {
-            anyhow::bail!(
-                "Query '{}' has {} SQL statements (expected 1) for reference schema rewrite",
-                self.name,
-                statements.len()
-            );
+        // Rewrite every bare (single-part, non-CTE) table reference to live under the
+        // reference schema *and* alias it back to its original name, e.g.
+        // `orders` -> `__test_reference.orders AS orders`. The alias keeps column
+        // qualifications (e.g. `orders.o_orderpriority`) resolving exactly as in the
+        // original query. Without it, qualifying a bare table leaks the reference
+        // schema into the derived names of aggregate output columns on the federated +
+        // prepared-statement (parameterized) planning path, which breaks field
+        // resolution for tpch[parameterized] q12/q14. See spiceai/spiceai#11142.
+        struct ReferenceSchemaRewriter<'a> {
+            reference_schema: &'a str,
+            cte_names: &'a BTreeSet<String>,
         }
 
-        let statement = &mut statements[0];
+        impl VisitorMut for ReferenceSchemaRewriter<'_> {
+            type Break = ();
 
-        // Visit and rewrite all table references in the statement
-        let _ = visit_relations_mut(statement, |table_name| {
-            // Only rewrite if the table doesn't already have a schema prefix (single-part name)
-            if table_name.0.len() == 1 {
-                // Prepend the reference schema to the table name
-                table_name
-                    .0
-                    .insert(0, ObjectNamePart::Identifier(Ident::new(reference_schema)));
+            fn pre_visit_table_factor(
+                &mut self,
+                table_factor: &mut TableFactor,
+            ) -> ControlFlow<Self::Break> {
+                if let TableFactor::Table { name, alias, .. } = table_factor
+                    && name.0.len() == 1
+                {
+                    // Clone the original identifier (and end the borrow of `name`)
+                    // before mutating, but only for plain, non-CTE table names.
+                    let original = match &name.0[0] {
+                        ObjectNamePart::Identifier(ident)
+                            if !self.cte_names.contains(ident.value.as_str()) =>
+                        {
+                            Some(ident.clone())
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(original) = original {
+                        name.0.insert(
+                            0,
+                            ObjectNamePart::Identifier(Ident::new(self.reference_schema)),
+                        );
+                        // Preserve any explicit alias the query already has; only add
+                        // one for tables that were referenced bare.
+                        if alias.is_none() {
+                            *alias = Some(TableAlias {
+                                name: original,
+                                columns: Vec::new(),
+                                explicit: true,
+                            });
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
             }
-            ControlFlow::<()>::Continue(())
+        }
+
+        let mut statement = self.parse_single_statement("reference schema rewrite")?;
+        let cte_names = collect_cte_names(&statement);
+
+        let _ = statement.visit(&mut ReferenceSchemaRewriter {
+            reference_schema,
+            cte_names: &cte_names,
         });
 
         // Unparse the modified statement back to SQL
@@ -294,6 +342,85 @@ impl Query {
             parameters: self.parameters.clone(),
         })
     }
+
+    /// Returns unqualified physical table names referenced by the query.
+    /// Existing schema-qualified tables and CTE references are excluded.
+    ///
+    /// # Errors
+    /// Returns an error if the SQL query cannot be parsed, or if it contains multiple statements.
+    pub fn unqualified_table_names(&self) -> anyhow::Result<BTreeSet<String>> {
+        use datafusion::sql::sqlparser::ast::{ObjectNamePart, visit_relations};
+        use std::ops::ControlFlow;
+
+        let statement = self.parse_single_statement("table name extraction")?;
+        let cte_names = collect_cte_names(&statement);
+        let mut table_names = BTreeSet::new();
+
+        let _ = visit_relations(&statement, |table_name| {
+            if table_name.0.len() == 1
+                && let ObjectNamePart::Identifier(ident) = &table_name.0[0]
+                && !cte_names.contains(ident.value.as_str())
+            {
+                table_names.insert(ident.value.clone());
+            }
+
+            ControlFlow::<()>::Continue(())
+        });
+
+        Ok(table_names)
+    }
+
+    fn parse_single_statement(
+        &self,
+        action: &str,
+    ) -> anyhow::Result<datafusion::sql::sqlparser::ast::Statement> {
+        use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+        let dialect = PostgreSqlDialect {};
+        let mut statements = Parser::parse_sql(&dialect, &self.sql).map_err(|e| {
+            anyhow::anyhow!("Failed to parse query '{}' for {action}: {e}", self.name)
+        })?;
+
+        if statements.len() != 1 {
+            anyhow::bail!(
+                "Query '{}' has {} SQL statements (expected 1) for {action}",
+                self.name,
+                statements.len()
+            );
+        }
+
+        Ok(statements.remove(0))
+    }
+}
+
+fn collect_cte_names(statement: &datafusion::sql::sqlparser::ast::Statement) -> BTreeSet<String> {
+    use datafusion::sql::sqlparser::ast::{Query as SqlQuery, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    #[derive(Default)]
+    struct CteNameCollector {
+        names: BTreeSet<String>,
+    }
+
+    impl Visitor for CteNameCollector {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &SqlQuery) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                self.names.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.value.clone()),
+                );
+            }
+
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut collector = CteNameCollector::default();
+    let _ = statement.visit(&mut collector);
+    collector.names
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
@@ -1228,13 +1355,12 @@ pub fn get_clickbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Que
 #[must_use]
 pub fn get_chbench_test_queries(overrides: Option<QueryOverrides>) -> Vec<Query> {
     let queries = generate_chbench_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
     );
 
-    // Q21 is excluded due to https://github.com/spiceai/spiceai/issues/11010; https://github.com/spiceai/spiceai/issues/11011
-
     match overrides {
-        // No engine-specific overrides yet
+        // https://github.com/spiceai/spiceai/issues/11011
+        Some(QueryOverrides::DuckDB) => remove_chbench_query!(queries, 21),
         Some(_) | None => queries,
     }
 }
@@ -1332,7 +1458,7 @@ mod tests {
 
         assert_eq!(
             rewritten.sql.as_ref(),
-            "SELECT * FROM arrow.customer WHERE c_custkey = 1"
+            "SELECT * FROM arrow.customer AS customer WHERE c_custkey = 1"
         );
         assert_eq!(rewritten.name.as_ref(), "test_query");
         assert!(!rewritten.overridden);
@@ -1350,9 +1476,38 @@ mod tests {
             .rewrite_with_reference_schema("ref_schema")
             .expect("Failed to rewrite query with multiple tables");
 
-        assert_eq!(
-            rewritten.sql.as_ref(),
-            "SELECT * FROM ref_schema.customer AS c JOIN ref_schema.orders AS o ON c.c_custkey = o.o_custkey"
+        let sql = rewritten.sql.as_ref();
+        assert!(sql.contains("ref_schema.customer"));
+        assert!(sql.contains("ref_schema.orders"));
+        assert!(sql.contains("c.c_custkey = o.o_custkey"));
+    }
+
+    #[test]
+    fn test_rewrite_aliases_bare_join_tables() {
+        // Regression for spiceai/spiceai#11142: bare tables in a join (no explicit
+        // alias) must be aliased back to their original name so column references
+        // such as `orders.o_orderpriority` keep resolving against the unqualified
+        // relation, exactly as in the original query. Without the alias, qualifying
+        // `orders` as `ref.orders` leaks the schema into derived aggregate column
+        // names and breaks field resolution on the parameterized/federated path.
+        let query = Query::new(
+            "test_bare_join".into(),
+            "SELECT l_shipmode FROM lineitem JOIN orders ON l_orderkey = o_orderkey".into(),
+            false,
+        );
+
+        let rewritten = query
+            .rewrite_with_reference_schema("ref")
+            .expect("Failed to rewrite bare-join query");
+
+        let sql = rewritten.sql.as_ref();
+        assert!(
+            sql.contains("ref.lineitem AS lineitem"),
+            "bare table `lineitem` should be aliased back to `lineitem`, got: {sql}"
+        );
+        assert!(
+            sql.contains("ref.orders AS orders"),
+            "bare table `orders` should be aliased back to `orders`, got: {sql}"
         );
     }
 
@@ -1404,12 +1559,27 @@ mod tests {
             .expect("Failed to rewrite query with CTE");
 
         let sql = rewritten.sql.as_ref();
-        // Note: The current implementation rewrites ALL table references, including CTE references
-        // This is acceptable for test purposes - if a CTE is prefixed incorrectly, the query will fail
-        // which is fine for validation scenarios
         assert!(sql.contains("arrow.customer"));
         assert!(sql.contains("arrow.orders"));
-        assert!(sql.contains("arrow.cte")); // CTE reference also gets prefixed
+        assert!(sql.contains("FROM cte"));
+        assert!(!sql.contains("arrow.cte"));
+    }
+
+    #[test]
+    fn test_unqualified_table_names_excludes_ctes() {
+        let query = Query::new(
+            "test_cte_tables".into(),
+            "WITH cte AS (SELECT * FROM customer) SELECT * FROM cte JOIN orders ON cte.c_custkey = orders.o_custkey".into(),
+            false,
+        );
+
+        let table_names = query
+            .unqualified_table_names()
+            .expect("Failed to extract table names");
+
+        assert!(table_names.contains("customer"));
+        assert!(table_names.contains("orders"));
+        assert!(!table_names.contains("cte"));
     }
 
     #[test]
@@ -1485,7 +1655,7 @@ mod tests {
 
         assert_eq!(
             rewritten.sql.as_ref(),
-            "SELECT * FROM arrow.customer WHERE c_custkey = $1"
+            "SELECT * FROM arrow.customer AS customer WHERE c_custkey = $1"
         );
         assert!(rewritten.parameters.is_some());
     }
@@ -1502,7 +1672,10 @@ mod tests {
             .rewrite_with_reference_schema("arrow")
             .expect("Failed to rewrite query with overridden flag");
 
-        assert_eq!(rewritten.sql.as_ref(), "SELECT * FROM arrow.customer");
+        assert_eq!(
+            rewritten.sql.as_ref(),
+            "SELECT * FROM arrow.customer AS customer"
+        );
         assert!(rewritten.overridden);
     }
 

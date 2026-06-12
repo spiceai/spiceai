@@ -463,7 +463,7 @@ impl FlightClient {
 
         let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
         let subscription_request =
-            stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
+            stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)]);
 
         let mut req = subscription_request.into_streaming_request();
         self.apply_request_metadata(&mut req, token.as_ref())?;
@@ -564,7 +564,7 @@ impl FlightClient {
         };
 
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{username}:{password}",));
+        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
 
         let val = format!("Basic {val}")
             .parse()

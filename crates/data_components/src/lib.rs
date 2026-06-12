@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::{CatalogProvider, Session},
-    common::{Constraints, Statistics},
+    common::{Constraints, Statistics, stats::Precision},
     datasource::{TableProvider, TableType},
     error::Result as DataFusionResult,
     logical_expr::{LogicalPlan, TableProviderFilterPushDown, dml::InsertOp},
@@ -64,6 +64,50 @@ pub const CLUSTERING_METADATA_KEY: &str = "clustering";
 /// Canonical Arrow schema metadata key for a source-native clustering expression.
 pub const CLUSTERING_KEY_METADATA_KEY: &str = "clustering_key";
 
+/// Schema-level metadata key for an inferred primary key (extended schema inference).
+///
+/// The value is a JSON array of column names in key order, e.g. `["tenant_id","id"]`.
+/// Emitted by connectors that perform extended schema inference and consumed by the
+/// runtime to fill `acceleration.primary_key` when the user left it unset.
+pub const INFERRED_PRIMARY_KEY_METADATA_KEY: &str = "spice.inferred_primary_key";
+
+/// Schema-level metadata key for inferred secondary indexes (extended schema inference).
+///
+/// The value is a JSON array of objects, each describing one index:
+/// `[{ "columns": ["email"], "unique": true }]`.
+pub const INFERRED_INDEXES_METADATA_KEY: &str = "spice.inferred_indexes";
+
+/// Schema-level metadata key for inferred sort/clustering columns (extended schema inference).
+///
+/// The value is a JSON array of objects in sort order, each with a direction:
+/// `[{ "column": "created_at", "desc": true }, { "column": "id", "desc": false }]`.
+pub const INFERRED_SORT_COLUMNS_METADATA_KEY: &str = "spice.inferred_sort_columns";
+
+/// Schema-level metadata key for the rough estimated row count (extended schema inference).
+///
+/// The value is a base-10 integer string. This is a catalog estimate (e.g. Postgres
+/// `pg_class.reltuples`), not a precise count, and is surfaced as table statistics.
+pub const INFERRED_ROW_COUNT_METADATA_KEY: &str = "spice.inferred_row_count";
+
+/// Schema-level metadata key for the rough estimated table byte size (extended schema inference).
+///
+/// The value is a base-10 integer string of bytes (e.g. Postgres `pg_relation_size`).
+pub const INFERRED_TABLE_BYTES_METADATA_KEY: &str = "spice.inferred_table_bytes";
+
+/// Schema-level metadata key for the source's declared distribution/shard key
+/// (extended schema inference): Postgres partition-key columns or the `MongoDB`
+/// shard-key fields.
+///
+/// The value is a JSON array of column names in key order: `["region", "id"]`.
+pub const INFERRED_SHARD_KEY_METADATA_KEY: &str = "spice.inferred_shard_key";
+
+/// Schema-level metadata key for rough per-column statistics (extended schema
+/// inference), e.g. from Postgres `pg_stats`.
+///
+/// The value is a JSON array of objects:
+/// `[{ "column": "created_at", "distinct_count": 100000, "correlation": 0.99 }]`.
+pub const INFERRED_COLUMN_STATS_METADATA_KEY: &str = "spice.inferred_column_stats";
+
 /// Metadata to merge into fields, keyed by field name.
 pub type FieldMetadata = HashMap<String, HashMap<String, String>>;
 
@@ -88,10 +132,14 @@ pub mod ducklake;
 pub mod dynamodb;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+#[cfg(feature = "federation")]
+pub mod federation;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod function_support;
 pub mod iceberg;
+pub mod inferred_schema;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
 #[cfg(feature = "mongodb")]
@@ -342,8 +390,45 @@ impl TableProvider for MetadataEnrichedTableProvider {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
+        // Surface the inferred rough table size as table statistics so the query
+        // optimizer, acceleration sizing, and observability can use it. Prefer the
+        // inner provider's statistics where it has them (they may be exact or
+        // cheaper), filling only the row-count / byte-size fields it leaves `Absent`
+        // with the inferred estimate.
+        match (inferred_statistics(&self.schema), self.inner.statistics()) {
+            (Some(inferred), Some(mut inner)) => {
+                if matches!(inner.num_rows, Precision::Absent) {
+                    inner.num_rows = inferred.num_rows;
+                }
+                if matches!(inner.total_byte_size, Precision::Absent) {
+                    inner.total_byte_size = inferred.total_byte_size;
+                }
+                Some(inner)
+            }
+            (inferred, inner) => inferred.or(inner),
+        }
     }
+}
+
+/// Build `DataFusion` table statistics from the rough row-count / byte-size keys in
+/// `schema`'s metadata, if either was inferred (see [`inferred_schema`]). Column
+/// statistics are left unknown. Returns `None` when no size was inferred.
+fn inferred_statistics(schema: &SchemaRef) -> Option<Statistics> {
+    let inferred = inferred_schema::InferredSchema::from_metadata(schema.metadata());
+    if inferred.row_count.is_none() && inferred.table_bytes.is_none() {
+        return None;
+    }
+
+    let mut stats = Statistics::new_unknown(schema);
+    // Leave a field unset (rather than saturating to `usize::MAX`) when the inferred
+    // u64 doesn't fit `usize` — a wrong, huge estimate is worse than no estimate.
+    if let Some(rows) = inferred.row_count.and_then(|r| usize::try_from(r).ok()) {
+        stats = stats.with_num_rows(Precision::Inexact(rows));
+    }
+    if let Some(bytes) = inferred.table_bytes.and_then(|b| usize::try_from(b).ok()) {
+        stats = stats.with_total_byte_size(Precision::Inexact(bytes));
+    }
+    Some(stats)
 }
 
 #[async_trait]
@@ -372,11 +457,40 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field};
     use datafusion::error::DataFusionError;
-    use datafusion::logical_expr::TableSource;
+    use datafusion::logical_expr::{LogicalPlan, TableSource};
     use datafusion_federation::{
         FederatedTableProviderAdaptor, FederatedTableSource, FederationAnalyzerForLogicalPlan,
         FederationProvider,
     };
+
+    #[test]
+    fn inferred_statistics_from_size_metadata() {
+        let metadata = HashMap::from([
+            (
+                INFERRED_ROW_COUNT_METADATA_KEY.to_string(),
+                "1000".to_string(),
+            ),
+            (
+                INFERRED_TABLE_BYTES_METADATA_KEY.to_string(),
+                "2048".to_string(),
+            ),
+        ]);
+        let schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, false)],
+            metadata,
+        ));
+
+        let stats = inferred_statistics(&schema).expect("inferred size yields statistics");
+        assert_eq!(stats.num_rows, Precision::Inexact(1000));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(2048));
+    }
+
+    #[test]
+    fn no_inferred_statistics_without_size_metadata() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        assert!(inferred_statistics(&schema).is_none());
+    }
 
     #[derive(Debug)]
     struct TestFederationProvider;

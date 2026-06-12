@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::array::{BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::TableReference;
 use futures::{StreamExt, TryStreamExt};
@@ -90,8 +90,8 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<(String, i64, bool)>
         let updated_at = batch
             .column(1)
             .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .ok_or_else(|| anyhow::anyhow!("Expected TimestampNanosecondArray in column 1"))?;
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("Expected TimestampMicrosecondArray in column 1"))?;
         let deleted = batch
             .column(2)
             .as_any()
@@ -247,7 +247,7 @@ async fn test_retention_sql() -> Result<(), anyhow::Error> {
             let load_rt = Arc::clone(&cloned_rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = load_rt.load_components() => {}
@@ -353,7 +353,7 @@ SET
             let pg_initial_ts: i64 = db_conn
                 .conn
                 .query_one(
-                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
+                    "SELECT (EXTRACT(EPOCH FROM updated_at) * 1000000)::BIGINT FROM widgets WHERE name = 'Sample widget';",
                     &[],
                 )
                 .await?
@@ -389,7 +389,7 @@ SET
             let cloned_rt = Arc::clone(&rt);
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(2)) => {
                     panic!("Timeout waiting for components to load");
                 }
                 () = cloned_rt.load_components() => {}
@@ -417,8 +417,8 @@ SET
                 .expect("updated_at column present");
             assert_eq!(
                 updated_field.data_type(),
-                &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                "accelerator should expose updated_at as UTC"
+                &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "accelerator should expose timestamptz updated_at as microsecond UTC (DuckDB's TIMESTAMPTZ precision, #10627)"
             );
 
             let initial_rows = rows_from_batches(&initial_batches)?;

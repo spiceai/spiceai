@@ -17,9 +17,10 @@ limitations under the License.
 //! Staging Write-Ahead Log (WAL) for crash-safe staged appends.
 //!
 //! When a Cayenne table performs a staged append, data files are first written
-//! to a `_staging/` directory and then moved to the active snapshot. The move
-//! is **not** atomic as a batch (individual renames are atomic on local FS, but
-//! the loop over files is not).
+//! to a `_staging/` directory and then moved to the target snapshot. The target
+//! can be either the active snapshot or a protected snapshot that is published
+//! later. The move is **not** atomic as a batch (individual renames are atomic
+//! on local FS, but the loop over files is not).
 //!
 //! The staging WAL bridges this gap:
 //!
@@ -48,8 +49,8 @@ limitations under the License.
 //!   where the visibility flip is a catalog pointer mutation inside a shared
 //!   [`crate::metastore::MetastoreTransaction`]. For the append lifecycle it is
 //!   a no-op.
-//! - [`PreparedStagedAppend::finish`] releases the write guard and returns the
-//!   row count.
+//! - [`PreparedStagedAppend::finish`] completes the typestate transition and
+//!   returns the row count.
 //!
 //! The legacy one-shot [`CayenneStagedAppend::commit`] is reimplemented in terms
 //! of this lifecycle and remains observably identical to the previous behavior.
@@ -62,8 +63,10 @@ use crate::metastore::MetastoreTransaction;
 use crate::provider::Error;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectStorePath;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 
@@ -84,6 +87,8 @@ pub struct CayenneStagedAppend {
     table: CayenneTableProvider,
     write_guard: Option<OwnedMutexGuard<()>>,
     staging_snapshot_id: String,
+    target_snapshot_id: String,
+    target_kind: StagingWalTargetKind,
     row_count: u64,
 }
 
@@ -93,8 +98,55 @@ impl std::fmt::Debug for CayenneStagedAppend {
             .field("table", &self.table.table_name())
             .field("has_write_guard", &self.write_guard.is_some())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("target_snapshot_id", &self.target_snapshot_id)
+            .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
             .finish()
+    }
+}
+
+/// RAII guard for the in-flight staging-append registration taken out at the
+/// start of [`CayenneStagedAppend::prepare`].
+///
+/// `prepare` must register the append as in-flight BEFORE awaiting the WAL write
+/// so a concurrent recovery pass cannot treat the not-yet-durable WAL as a crash
+/// leftover. If that `await` is cancelled (the `prepare` future is dropped),
+/// neither the method's error path nor [`PreparedStagedAppend`]'s `Drop` runs —
+/// so without this guard the registration would leak forever, permanently
+/// blocking compaction (`has_inflight_staging_appends`) and skewing recovery
+/// cleanup. The guard unregisters on drop and is [disarmed](Self::disarm) once a
+/// `PreparedStagedAppend` has taken over the registration (its own `Drop` then
+/// owns the unregister).
+struct InflightStagingAppendGuard<'a> {
+    table: &'a CayenneTableProvider,
+    staging_snapshot_id: &'a str,
+    armed: bool,
+}
+
+impl<'a> InflightStagingAppendGuard<'a> {
+    /// Register `staging_snapshot_id` as in-flight and return an armed guard.
+    fn register(table: &'a CayenneTableProvider, staging_snapshot_id: &'a str) -> Self {
+        table.register_inflight_staging_append(staging_snapshot_id);
+        Self {
+            table,
+            staging_snapshot_id,
+            armed: true,
+        }
+    }
+
+    /// Hand the registration off to a constructed `PreparedStagedAppend` so the
+    /// guard no longer unregisters on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InflightStagingAppendGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.table
+                .unregister_inflight_staging_append(self.staging_snapshot_id);
+        }
     }
 }
 
@@ -105,10 +157,31 @@ impl CayenneStagedAppend {
         staging_snapshot_id: String,
         row_count: u64,
     ) -> Self {
+        let target_snapshot_id = table.get_current_snapshot_id();
+        Self::from_staged_append_to_snapshot(
+            table,
+            write_guard,
+            staging_snapshot_id,
+            target_snapshot_id,
+            StagingWalTargetKind::CurrentSnapshot,
+            row_count,
+        )
+    }
+
+    pub(crate) fn from_staged_append_to_snapshot(
+        table: CayenneTableProvider,
+        write_guard: Option<OwnedMutexGuard<()>>,
+        staging_snapshot_id: String,
+        target_snapshot_id: String,
+        target_kind: StagingWalTargetKind,
+        row_count: u64,
+    ) -> Self {
         Self {
             table,
             write_guard,
             staging_snapshot_id,
+            target_snapshot_id,
+            target_kind,
             row_count,
         }
     }
@@ -132,20 +205,36 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the WAL file fails.
     pub async fn write_wal(&self) -> Result<()> {
-        self.table
-            .write_staging_wal_for(&self.staging_snapshot_id)
-            .await
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .write_staging_wal_for(&self.staging_snapshot_id)
+                .await
+        } else {
+            self.table
+                .write_staging_wal_for_target(
+                    &self.staging_snapshot_id,
+                    &self.target_snapshot_id,
+                    self.target_kind,
+                )
+                .await
+        }
     }
 
-    /// Moves staged files into the current snapshot.
+    /// Moves staged files into the configured target snapshot.
     ///
     /// # Errors
     ///
     /// Returns an error if moving the staged files fails.
     pub async fn move_staged_files(&self) -> Result<()> {
-        self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
-            .await
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+                .await
+        } else {
+            self.table
+                .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
+                .await
+        }
     }
 
     /// Removes the staging WAL after a successful move.
@@ -172,13 +261,32 @@ impl CayenneStagedAppend {
     /// Returns an error if any fallible step in the finalize sequence (write WAL, move files,
     /// or remove WAL) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
+        use super::table::record_cayenne_write_phase;
+
+        // Carve the single `publish` phase into its four cost centers so the
+        // metastore WAL, lock contention, object-store moves, and final commit can
+        // be attributed separately. Under concurrent writes the `publish_lock_wait`
+        // bucket (acquiring the visibility lock + listing fence) is the one that
+        // grows: publishes serialize across the table, so a high lock-wait vs a
+        // high move/commit distinguishes lock-bound from work-bound finalization.
+        let wal_start = Instant::now();
         self.write_wal().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish_wal_write", wal_start);
+
+        let lock_start = Instant::now();
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         let _fence = self.table.lock_listing_fence_write_owned().await;
+        record_cayenne_write_phase(self.table.table_name(), "publish_lock_wait", lock_start);
+
+        let move_start = Instant::now();
         self.move_staged_files().await?;
+        record_cayenne_write_phase(self.table.table_name(), "publish_move_files", move_start);
+
+        let commit_start = Instant::now();
         self.remove_wal().await?;
         self.table
             .publish_current_snapshot_files_changed_under_held_fence();
+        record_cayenne_write_phase(self.table.table_name(), "publish_commit", commit_start);
         Ok(())
     }
 
@@ -201,8 +309,8 @@ impl CayenneStagedAppend {
 
     /// Prepare the staged append for commit.
     ///
-    /// Writes the staging WAL — a durable record of the intent to move the
-    /// already-staged files into the current snapshot directory. After this
+    /// Writes the staging WAL: a durable record of the intent to move the
+    /// already-staged files into the configured target snapshot directory. After this
     /// returns, the caller owns the lifecycle: it must either complete the
     /// commit via [`PreparedStagedAppend::apply_under_barrier`] (and then
     /// [`PreparedStagedAppend::finish`]) or [`PreparedStagedAppend::rollback`]
@@ -214,14 +322,44 @@ impl CayenneStagedAppend {
     ///
     /// Returns an error if writing the staging WAL fails.
     pub async fn prepare(self) -> Result<PreparedStagedAppend> {
-        self.table
-            .write_staging_wal_for(&self.staging_snapshot_id)
-            .await?;
-        self.table
-            .register_inflight_staging_append(&self.staging_snapshot_id);
+        // Register the in-flight append BEFORE its WAL becomes discoverable on
+        // disk. Recovery treats any committed WAL whose id is not in the
+        // in-flight set as a crash leftover; writing the WAL first opened a
+        // window where a concurrent recovery pass could "recover" — move and
+        // delete — an append that was still being prepared.
+        //
+        // The guard reverts the registration on every early exit that does NOT
+        // hand it to a `PreparedStagedAppend`: a WAL-write error AND cancellation
+        // of this future mid-`await` (when neither the error path below nor
+        // `PreparedStagedAppend::drop` would run, which would otherwise leak the
+        // entry forever and permanently block compaction/recovery cleanup). It is
+        // disarmed once the receipt is built, handing the unregister to its `Drop`.
+        let inflight_guard =
+            InflightStagingAppendGuard::register(&self.table, &self.staging_snapshot_id);
+        let wal_write = if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            self.table
+                .write_staging_wal_for(&self.staging_snapshot_id)
+                .await
+        } else {
+            self.table
+                .write_staging_wal_for_target(
+                    &self.staging_snapshot_id,
+                    &self.target_snapshot_id,
+                    self.target_kind,
+                )
+                .await
+        };
+        // On a WAL-write error the `?` returns early here and `inflight_guard`
+        // drops, reverting the registration.
+        wal_write?;
+        // WAL is durable; hand the in-flight registration to the receipt, whose
+        // `Drop` now owns the unregister.
+        inflight_guard.disarm();
         Ok(PreparedStagedAppend {
             table: self.table,
             staging_snapshot_id: self.staging_snapshot_id,
+            target_snapshot_id: self.target_snapshot_id,
+            target_kind: self.target_kind,
             row_count: self.row_count,
         })
     }
@@ -259,6 +397,8 @@ impl CayenneStagedAppend {
 pub struct PreparedStagedAppend {
     table: CayenneTableProvider,
     staging_snapshot_id: String,
+    target_snapshot_id: String,
+    target_kind: StagingWalTargetKind,
     row_count: u64,
 }
 
@@ -267,6 +407,8 @@ impl std::fmt::Debug for PreparedStagedAppend {
         f.debug_struct("PreparedStagedAppend")
             .field("table", &self.table.table_name())
             .field("staging_snapshot_id", &self.staging_snapshot_id)
+            .field("target_snapshot_id", &self.target_snapshot_id)
+            .field("target_kind", &self.target_kind)
             .field("row_count", &self.row_count)
             .finish()
     }
@@ -286,10 +428,66 @@ impl PreparedStagedAppend {
         self.row_count
     }
 
+    async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
+            Some(self.table.write_lock_arc().lock_owned().await)
+        } else {
+            None
+        }
+    }
+
+    fn try_lock_current_snapshot_for_held_barrier(&self) -> Result<Option<OwnedMutexGuard<()>>> {
+        if self.target_kind != StagingWalTargetKind::CurrentSnapshot {
+            return Ok(None);
+        }
+
+        self.table.write_lock_arc().try_lock_owned().map(Some).map_err(|_| Error::Internal {
+            table: self.table.table_name().to_string(),
+            message: "Failed to acquire write_lock while applying a current-snapshot staged append under a held listing fence".to_string(),
+        })
+    }
+
+    fn mark_inflight_complete(&self) {
+        self.table
+            .unregister_inflight_staging_append(&self.staging_snapshot_id);
+        if !self.table.has_inflight_staging_appends() {
+            self.table
+                .staging_wal_present()
+                .store(false, Ordering::Release);
+            self.table
+                .staging_may_have_files()
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn ensure_current_snapshot_target_unchanged(&self) -> Result<()> {
+        if self.target_kind != StagingWalTargetKind::CurrentSnapshot {
+            return Ok(());
+        }
+
+        let current_snapshot_id = self.table.get_current_snapshot_id();
+        if current_snapshot_id == self.target_snapshot_id {
+            return Ok(());
+        }
+
+        Err(Error::IncompleteWrite {
+            table: self.table.table_name().to_string(),
+            message: format!(
+                "Refusing to apply staged append WAL '{}' because it targets current snapshot '{}', but the current snapshot is now '{}'. Manual resolution is required.",
+                self.staging_wal_path().display(),
+                self.target_snapshot_id,
+                current_snapshot_id,
+            ),
+        })
+    }
+
     /// Apply the staged write under the caller's append-side barrier.
     ///
-    /// Performs, in order: move staged files into the current snapshot
-    /// directory; remove the staging WAL; invalidate the list-files cache.
+    /// Performs, in order: move staged files into the target snapshot
+    /// directory; remove the staging WAL; invalidate the list-files cache for
+    /// current-snapshot targets. Current-snapshot targets hold `write_lock`
+    /// while moving files so background compaction cannot interleave with the
+    /// snapshot directory mutation.
     /// The WAL is removed *before* the listing-table refresh to preserve the
     /// existing crash-safety invariant ("WAL absent ⇒ files moved
     /// successfully"); a crash between WAL removal and listing refresh leaves
@@ -305,29 +503,23 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_barrier(&self) -> Result<()> {
+        let _write_guard = self.lock_current_snapshot_for_apply().await;
         let _visibility_guard = self.table.visibility_lock_arc().lock_owned().await;
         // Hold the listing fence for the entire move + WAL removal + listing
         // swap sequence. Without this, `CayenneTableProvider::scan()` (which
         // holds `listing_fence.read()` across DataFusion's listing call) can
         // interleave with the move and observe a torn directory snapshot.
         let _fence = self.table.lock_listing_fence_write_owned().await;
+        self.ensure_current_snapshot_target_unchanged()?;
         self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .publish_current_snapshot_files_changed_under_held_fence();
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
+                .publish_current_snapshot_files_changed_under_held_fence();
         }
         Ok(())
     }
@@ -336,7 +528,10 @@ impl PreparedStagedAppend {
     /// partition's `listing_fence` for write.
     ///
     /// Same observable effect as [`Self::apply_under_barrier`] but skips the
-    /// internal fence acquisition. Used by the cross-partition append
+    /// internal fence acquisition. For current-snapshot targets, this method
+    /// still requires `write_lock` to protect against background compaction.
+    /// It attempts a non-blocking acquisition because the caller already holds
+    /// the listing fence. Used by the cross-partition append
     /// coordinator (#10125 step 6), which locks fences on every participating
     /// partition (sorted to keep concurrent coordinators deadlock-free) for
     /// the duration of one barrier window, calls this method on each, and
@@ -348,23 +543,17 @@ impl PreparedStagedAppend {
     ///
     /// Returns an error if moving the staged files or removing the WAL fails.
     pub async fn apply_under_held_barrier(&self) -> Result<()> {
+        let _write_guard = self.try_lock_current_snapshot_for_held_barrier()?;
+        self.ensure_current_snapshot_target_unchanged()?;
         self.table
-            .move_staged_files_to_current_snapshot(&self.staging_snapshot_id)
+            .move_staged_files_to_snapshot(&self.staging_snapshot_id, &self.target_snapshot_id)
             .await?;
         self.table
             .remove_staging_wal_for(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .publish_current_snapshot_files_changed_under_held_fence();
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
+        if self.target_kind == StagingWalTargetKind::CurrentSnapshot {
             self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
+                .publish_current_snapshot_files_changed_under_held_fence();
         }
         Ok(())
     }
@@ -435,6 +624,7 @@ impl PreparedStagedAppend {
         // Async kept so a future cross-partition coordinator can call
         // `prep.finish().await` uniformly without callers having to know
         // whether finish is sync or async for this mode.
+        self.mark_inflight_complete();
         Ok(self.row_count)
     }
 
@@ -452,16 +642,7 @@ impl PreparedStagedAppend {
         self.table
             .clear_staging_snapshot_dir(&self.staging_snapshot_id)
             .await?;
-        self.table
-            .unregister_inflight_staging_append(&self.staging_snapshot_id);
-        if !self.table.has_inflight_staging_appends() {
-            self.table
-                .staging_wal_present()
-                .store(false, Ordering::Release);
-            self.table
-                .staging_may_have_files()
-                .store(false, Ordering::Release);
-        }
+        self.mark_inflight_complete();
         Ok(())
     }
 }
@@ -477,10 +658,22 @@ pub(crate) struct StagingWal {
     pub table_name: String,
     /// The snapshot directory the staged files should be moved to.
     pub target_snapshot: String,
+    /// Whether `target_snapshot` is the table's active snapshot or a protected
+    /// replacement snapshot that will be published separately after recovery or finalize.
+    #[serde(default)]
+    pub target_kind: StagingWalTargetKind,
     /// Names of the data files in the staging directory.
     pub staged_files: Vec<String>,
     /// ISO-8601 timestamp when this WAL entry was created.
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StagingWalTargetKind {
+    #[default]
+    CurrentSnapshot,
+    ProtectedSnapshot,
 }
 
 #[derive(Debug)]
@@ -506,7 +699,16 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         target_partitions: usize,
     ) -> Result<CayenneStagedAppend> {
+        let lock_wait_start = Instant::now();
         let write_guard = self.write_lock_arc().lock_owned().await;
+        let lock_wait_elapsed = lock_wait_start.elapsed();
+        if lock_wait_elapsed > Duration::from_millis(10) {
+            tracing::debug!(
+                table = self.table_name(),
+                duration_ms = lock_wait_elapsed.as_millis(),
+                "Cayenne write lock acquisition exceeded threshold in begin_staged_append"
+            );
+        }
 
         self.ensure_no_incomplete_write().await?;
 
@@ -542,6 +744,10 @@ impl CayenneTableProvider {
                 self.target_file_size_bytes(),
                 &staging_snapshot_id,
                 target_partitions,
+                // The prepared insert is a lazily-consumed stream of unknown
+                // size; shard across the full write concurrency (prior behavior).
+                None,
+                super::delta_encoding::WriteClass::Delta,
             )
             .await
         {
@@ -581,11 +787,25 @@ impl CayenneTableProvider {
     pub(crate) async fn write_staging_wal_for(&self, staging_snapshot_id: &str) -> Result<()> {
         let current_snapshot = self.get_current_snapshot_id();
 
+        self.write_staging_wal_for_target(
+            staging_snapshot_id,
+            &current_snapshot,
+            StagingWalTargetKind::CurrentSnapshot,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_staging_wal_for_target(
+        &self,
+        staging_snapshot_id: &str,
+        target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
+    ) -> Result<()> {
         if self.table_path().starts_with("s3://") {
-            self.write_staging_wal_s3(staging_snapshot_id, &current_snapshot)
+            self.write_staging_wal_s3(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         } else {
-            self.write_staging_wal_local(staging_snapshot_id, &current_snapshot)
+            self.write_staging_wal_local(staging_snapshot_id, target_snapshot, target_kind)
                 .await?;
         }
         self.staging_wal_present().store(true, Ordering::Release);
@@ -597,6 +817,7 @@ impl CayenneTableProvider {
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
     ) -> Result<()> {
         let staging_dir =
             Self::snapshot_dir_path(self.table_path(), self.table_id(), staging_snapshot_id);
@@ -617,6 +838,7 @@ impl CayenneTableProvider {
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
+            target_kind,
             staged_files,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -633,12 +855,26 @@ impl CayenneTableProvider {
             message: format!("Failed to serialize staging WAL: {e}"),
         })?;
 
-        // Single open + write + fsync, keeping the fd through to `sync_all`.
+        // Single open + write + fsync, keeping the fd through to the sync.
         // The previous revision called `tokio::fs::write` (which opens,
         // writes, drops the fd) and then re-opened the file to call
         // `sync_all` — paying an extra `open(2)` per WAL write on every
         // staged append. Replacing the two opens with one is a small but
         // real per-ingestion saving on the local-FS hot path.
+        //
+        // Ordering tier (`fsync_tier::ordering_sync_tokio_file`), not
+        // `sync_all`: on macOS BOTH std `sync_all` and `sync_data` are
+        // `fcntl(F_FULLFSYNC)` (~4-5 ms full drive-cache flush, measured),
+        // while plain `fsync(2)` is ~66 µs — and plain fsync is the macOS
+        // tier SQLite/DuckDB/Postgres default to. On Linux the helper is
+        // `fdatasync`, which flushes the WAL bytes + the size metadata needed
+        // to read them. Full-platter durability is not load-bearing here:
+        // losing this WAL record in a power-loss window only orphans staging
+        // files that recovery (`ensure_no_incomplete_write`) audits and
+        // discards — and the metastore's own visibility commits are SQLite
+        // `synchronous=NORMAL` (no fullfsync), so a stronger barrier on this
+        // marker file could not raise end-to-end durability anyway. See
+        // `provider/fsync_tier.rs` for the measurements and rationale.
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -646,7 +882,7 @@ impl CayenneTableProvider {
             .open(&tmp_path)
             .await?;
         file.write_all(content.as_bytes()).await?;
-        file.sync_all().await?;
+        super::fsync_tier::ordering_sync_tokio_file(&file).await?;
         drop(file);
 
         if let Err(e) = tokio::fs::rename(&tmp_path, &wal_path).await {
@@ -677,6 +913,7 @@ impl CayenneTableProvider {
         &self,
         staging_snapshot_id: &str,
         target_snapshot: &str,
+        target_kind: StagingWalTargetKind,
     ) -> Result<()> {
         let config = self.require_object_store()?;
 
@@ -715,6 +952,7 @@ impl CayenneTableProvider {
         let wal = StagingWal {
             table_name: self.table_name().to_string(),
             target_snapshot: target_snapshot.to_string(),
+            target_kind,
             staged_files,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -857,6 +1095,21 @@ impl CayenneTableProvider {
             }
         }
 
+        // Exclude the pipelined staged-commit finalize while recovering. The
+        // Stage-B finalize (`apply_under_held_barrier`) moves staged files out
+        // of `_staging/` under `visibility_lock` WITHOUT `write_lock`, while
+        // this recovery runs under `write_lock` only — with no shared lock,
+        // recovery can read a WAL written milliseconds ago by a still-running
+        // finalize and "recover" (move + delete) the staging entries out from
+        // under it (observed live: ENOENT mid-finalize → the changes stream
+        // died permanently with "manual intervention required"). Taking the
+        // visibility lock makes recovery and finalize mutually exclusive.
+        // Lock order is safe: every caller of this function holds `write_lock`
+        // (or runs single-threaded at provider open), matching the staged
+        // publish order `write_lock → visibility_lock`; the finalize task
+        // never takes `write_lock`, so no inversion exists.
+        let _visibility = self.visibility_lock_arc().lock_owned().await;
+
         let mut located_wals = self.read_staging_wals().await?;
         // Sort by the staging snapshot id rather than `wal.created_at`. The
         // staging snapshot id is derived from `Uuid::now_v7()` (see
@@ -871,7 +1124,7 @@ impl CayenneTableProvider {
         located_wals
             .sort_by(|left, right| left.staging_snapshot_id.cmp(&right.staging_snapshot_id));
 
-        let mut recovered_any = false;
+        let mut recovered_current_any = false;
         for located_wal in located_wals {
             if self.staging_append_is_inflight(&located_wal.staging_snapshot_id) {
                 continue;
@@ -905,7 +1158,9 @@ impl CayenneTableProvider {
             }
 
             let current_snapshot = self.get_current_snapshot_id();
-            if current_snapshot != wal.target_snapshot {
+            if wal.target_kind == StagingWalTargetKind::CurrentSnapshot
+                && current_snapshot != wal.target_snapshot
+            {
                 return Err(Error::IncompleteWrite {
                     table: table_name,
                     message: format!(
@@ -1080,10 +1335,8 @@ impl CayenneTableProvider {
                 "Incomplete staged append detected — attempting automated recovery"
             );
 
-            // `current_snapshot` was validated above to equal `wal.target_snapshot`,
-            // so this helper's current-snapshot destination is the WAL target.
             match self
-                .move_staged_files_to_current_snapshot(&staging_snapshot_id)
+                .move_staged_files_to_snapshot(&staging_snapshot_id, &wal.target_snapshot)
                 .await
             {
                 Ok(()) => {
@@ -1108,7 +1361,9 @@ impl CayenneTableProvider {
                         table = table_name.as_str(),
                         "Automated recovery from incomplete write succeeded; table is now writable"
                     );
-                    recovered_any = true;
+                    if wal.target_kind == StagingWalTargetKind::CurrentSnapshot {
+                        recovered_current_any = true;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1130,7 +1385,7 @@ impl CayenneTableProvider {
             }
         }
 
-        if recovered_any {
+        if recovered_current_any {
             self.publish_current_snapshot_files_changed().await;
         }
 
@@ -1138,9 +1393,14 @@ impl CayenneTableProvider {
         // in-flight append is known, clear any orphan pre-WAL staging files
         // and correct the flags so future writes take the fast path. Unparseable
         // committed WALs are errors above; only uncommitted tmp WALs are ignored.
+        //
+        // Cleanup is per-entry (`clear_orphan_staging_dirs`), never a whole-root
+        // delete: an append registering concurrently with this pass must not
+        // lose its staged files (the whole-root variant destroyed a pipelined
+        // finalize's staging dir mid-move — observed live as a permanent
+        // changes-stream failure).
         if !self.has_inflight_staging_appends() {
-            self.staging_may_have_files().store(true, Ordering::Release);
-            self.clear_staging_dir().await?;
+            self.clear_orphan_staging_dirs().await?;
             self.staging_wal_present().store(false, Ordering::Release);
         }
         Ok(())

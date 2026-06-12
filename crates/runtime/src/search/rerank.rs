@@ -45,7 +45,7 @@ use datafusion::common::{Column, exec_err};
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::logical_expr::{ColumnarValue, DocSection, Documentation, Signature, Volatility};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::expressions::Column as PhysicalColumn;
@@ -90,6 +90,53 @@ pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         Ok(sig) => sig,
         Err(_) => Signature::variadic_any(Volatility::Volatile),
     }
+});
+
+static RERANK_DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| Documentation {
+    doc_section: DocSection::default(),
+    description: "Re-ranks search results or table rows using a configured reranker model."
+        .to_string(),
+    syntax_example:
+        "rerank(input, model => 'model_name', document => 'column_name'[, query => 'query text'])"
+            .to_string(),
+    sql_example: None,
+    arguments: Some(vec![
+        (
+            "input".to_string(),
+            "A table reference or nested text_search, vector_search, or rrf invocation."
+                .to_string(),
+        ),
+        (
+            "model".to_string(),
+            "Configured reranker or chat model name.".to_string(),
+        ),
+        (
+            "document".to_string(),
+            "Column containing the text to rerank.".to_string(),
+        ),
+        (
+            "query".to_string(),
+            "Query text; auto-propagated from nested search inputs when possible.".to_string(),
+        ),
+        (
+            "limit".to_string(),
+            "Optional maximum number of reranked rows returned.".to_string(),
+        ),
+        (
+            "strategy".to_string(),
+            "Optional reranking strategy for compatible models.".to_string(),
+        ),
+        (
+            "prompt_template".to_string(),
+            "Optional prompt template when reranking with a chat model.".to_string(),
+        ),
+    ]),
+    alternative_syntax: None,
+    related_udfs: Some(vec![
+        "text_search".to_string(),
+        "vector_search".to_string(),
+        "rrf".to_string(),
+    ]),
 });
 
 /// Output column for reranker scores. Chosen distinct from `_score` /
@@ -458,6 +505,9 @@ impl ScalarUDFImpl for RerankTableFunc {
     }
     fn signature(&self) -> &Signature {
         &RERANK_SIGNATURE
+    }
+    fn documentation(&self) -> Option<&Documentation> {
+        Some(&*RERANK_DOCUMENTATION)
     }
     fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
         Self::scalar_invocation_error()
@@ -889,7 +939,7 @@ struct RerankExec {
     /// Whether the input is a nested search UDTF (affects defensive cap).
     input_is_nested: bool,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl RerankExec {
@@ -904,12 +954,12 @@ impl RerankExec {
         rerank_limit: Option<usize>,
         input_is_nested: bool,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             input,
             output_schema,
@@ -960,7 +1010,7 @@ impl ExecutionPlan for RerankExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

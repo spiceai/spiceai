@@ -75,6 +75,17 @@ pub struct CayenneCatalogProviderConfig {
     pub inline_flush_max_bytes: Option<i64>,
     /// Primary-key conflict detection behavior for inserts.
     pub pk_conflict_detection: Option<PkConflictDetection>,
+    /// Enable the closed-loop adaptive tuner (`cayenne_tuning: adaptive`). When
+    /// `true`, the per-table controller in `provider::context` adapts the
+    /// inline-flush caps, compaction cadence/trigger, and write concurrency over
+    /// time, anchored to the seeded knob values below.
+    pub dynamic_tuning: bool,
+    /// Hardware-seeded background compaction interval (ms). Seeds the adaptive
+    /// controller's starting point; `None` keeps the engine default.
+    pub compaction_background_interval_ms: Option<u64>,
+    /// Hardware-seeded small-file compaction trigger. Seeds the adaptive
+    /// controller's starting point; `None` keeps the engine default.
+    pub compaction_trigger_files: Option<usize>,
 }
 
 /// Errors that can occur when interacting with a Cayenne catalog.
@@ -301,6 +312,15 @@ impl CayenneCatalogProvider {
         if let Some(v) = provider_config.pk_conflict_detection {
             config.pk_conflict_detection = v;
         }
+        if let Some(v) = provider_config.compaction_background_interval_ms {
+            config.compaction_background_interval_ms = v;
+        }
+        if let Some(v) = provider_config.compaction_trigger_files {
+            config.compaction_trigger_files = v;
+        }
+        // Enable the closed loop last so it anchors to the seeded knob values
+        // above (the controller bounds derive from `[floor, 4×seed]`).
+        config.dynamic_tuning = provider_config.dynamic_tuning;
         config
     }
 }
@@ -482,6 +502,15 @@ impl CayenneSchemaProvider {
 
     fn tables_snapshot(&self) -> HashMap<String, Arc<dyn TableProvider>> {
         self.tables.read().clone()
+    }
+
+    /// Synchronous lookup of a cached table provider by name. Unlike the async
+    /// [`SchemaProvider::table`], this reads the in-memory table cache directly,
+    /// so callers that need a table's schema from a sync context (e.g. the
+    /// `executor_table` UDTF's `TableFunctionImpl::call`) can avoid blocking.
+    #[must_use]
+    pub fn table_sync(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        self.tables.read().get(name).cloned()
     }
 
     fn replace_tables(&self, tables: HashMap<String, Arc<dyn TableProvider>>) {

@@ -26,6 +26,35 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
+pub fn begin_shutdown() {
+    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
+#[must_use]
+pub fn shutdown_epoch() -> u64 {
+    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
 ///
 /// # Readiness contract
@@ -108,6 +137,18 @@ impl std::fmt::Display for StreamError {
 #[async_trait]
 pub trait CommitChange {
     async fn commit(&self) -> Result<(), CommitError>;
+
+    /// Whether deferring this commit is crash-safe: the source can re-stream from
+    /// its last durable checkpoint after a crash, so the source offset is advanced
+    /// only after downstream durability. Defaults to `false` (conservative — never
+    /// defer); overridden `true` only by committers backed by a replayable source
+    /// checkpoint (e.g. a Postgres replication slot). Consumers that defer the
+    /// commit behind a later durability fence (in-memory CDC tier) MUST gate that
+    /// deferral on this returning `true`, or a crash could lose data that the
+    /// source can no longer re-stream.
+    fn supports_deferral(&self) -> bool {
+        false
+    }
 }
 
 pub struct ChangeEnvelope {
@@ -485,6 +526,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::{Int32Array, StringArray};
     use std::sync::Arc;
+
+    #[test]
+    fn noop_committer_does_not_support_deferral() {
+        // The conservative default: a committer with no replayable source offset
+        // (`NoOpCommitter` carries synthetic ready-signal envelopes) must NOT be
+        // deferred — deferring it advances nothing and there is nothing to
+        // re-stream, so an in-memory durability tier must never arm on it.
+        assert!(!NoOpCommitter.supports_deferral());
+    }
 
     #[test]
     fn test_wrap_batch_as_change_batch() {

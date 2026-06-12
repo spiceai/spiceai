@@ -69,7 +69,18 @@ runs:
       id: commit-sha
       shell: bash
       run: |
-        echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+        # Key the cache/MinIO artifact by the actually checked-out commit, not
+        # github.sha. The scheduled dispatch builds a branch matrix (trunk +
+        # release/x.y) where every leg shares one github.sha (the trigger SHA),
+        # so keying by github.sha makes the release/x.y leg publish its binary
+        # under trunk's SHA and overwrite the trunk build (last-writer-wins).
+        # Fail fast rather than falling back to github.sha: the fallback would
+        # silently reintroduce the cross-branch collision this fix prevents.
+        sha="$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)" || {
+          echo "Failed to determine checked-out commit SHA. Ensure actions/checkout has run before build-testoperator." >&2
+          exit 1
+        }
+        echo "sha=$sha" >> $GITHUB_OUTPUT
 
     - name: Download testoperator from MinIO
       if: inputs.download_from_minio == 'true' && inputs.force_rebuild != 'true'
@@ -90,7 +101,7 @@ runs:
     - name: Cache testoperator binary
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true'
       id: cache-testoperator
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           target/release/testoperator${{ steps.detect-os.outputs.ext }}
@@ -139,7 +150,7 @@ runs:
 
     - name: Save to cache
       if: inputs.force_rebuild != 'true' && steps.minio-download.outputs.found != 'true' && steps.cache-testoperator.outputs.cache-hit != 'true'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           target/release/testoperator${{ steps.detect-os.outputs.ext }}
@@ -183,7 +194,7 @@ runs:
 
     - name: Upload testoperator artifact
       if: inputs.upload_artifact == 'true'
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: testoperator-${{ steps.detect-os.outputs.os }}
         path: target/release/testoperator${{ steps.detect-os.outputs.ext }}

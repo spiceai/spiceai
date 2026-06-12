@@ -1,0 +1,5 @@
+---
+source: crates/runtime/tests/search/mod.rs
+description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4"
+---
+[]

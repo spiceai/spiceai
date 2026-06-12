@@ -77,6 +77,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("inline_flush_max_bytes")
         .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
         .default("8388608"),
+    ParameterSpec::component("tuning")
+        .description("Auto-tuning mode. 'auto' (default): use static, hardware-derived defaults. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within a hardware-derived [floor, ceiling]. The controller's bounds anchor to the seeded knob values, which are derived from the detected host (cores + cgroup-aware memory + storage class) — no schema inference is needed on the catalog path. An explicit per-knob value (e.g. cayenne_inline_flush_max_bytes) overrides the seed and is pinned under 'adaptive'.")
+        .one_of(&["auto", "adaptive"])
+        .default("auto"),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -100,7 +104,20 @@ impl CayenneCatalogConnector {
         })
     }
 
-    fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
+    async fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
+        // Parse a numeric catalog parameter, warning (and ignoring) on a value
+        // that does not parse, so a typo surfaces instead of being silently
+        // dropped — matching the acceleration-param path's behavior.
+        fn parse_num_param<T: std::str::FromStr>(value: &str, key: &str) -> Option<T> {
+            if let Ok(parsed) = value.parse::<T>() {
+                Some(parsed)
+            } else {
+                tracing::warn!(
+                    "Invalid Cayenne catalog parameter `{key}` value `{value}`; expected a number, ignoring it. See https://spiceai.org/docs/components/catalogs/cayenne"
+                );
+                None
+            }
+        }
         let data_dir = self
             .params
             .get("data_dir")
@@ -119,13 +136,13 @@ impl CayenneCatalogConnector {
             .get("segment_cache_mb")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "segment_cache_mb"));
         let target_file_size_mb = self
             .params
             .get("target_file_size_mb")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "target_file_size_mb"));
         let compression_strategy = self
             .params
             .get("compression_strategy")
@@ -134,67 +151,153 @@ impl CayenneCatalogConnector {
             .and_then(|v| match v.to_lowercase().as_str() {
                 "zstd" => Some(cayenne::metadata::CompressionStrategy::Zstd),
                 "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
-                _ => None,
+                other => {
+                    tracing::warn!(
+                        "Invalid Cayenne catalog parameter `compression_strategy` value `{other}`; expected `zstd` or `btrblocks`, ignoring it."
+                    );
+                    None
+                }
             });
         let pk_conflict_detection = self
             .params
             .get("pk_conflict_detection")
             .expose()
             .ok()
-            .and_then(cayenne::metadata::PkConflictDetection::parse);
+            .and_then(|v| {
+                cayenne::metadata::PkConflictDetection::parse(v).or_else(|| {
+                    tracing::warn!(
+                        "Invalid Cayenne catalog parameter `pk_conflict_detection` value `{v}`; expected `auto` or `none`, ignoring it."
+                    );
+                    None
+                })
+            });
         let upload_concurrency = self
             .params
             .get("upload_concurrency")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| parse_num_param::<usize>(v, "upload_concurrency"))
             .map(|v| v.max(1));
         let write_concurrency = self
             .params
             .get("write_concurrency")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| parse_num_param::<usize>(v, "write_concurrency"))
             .map(|v| v.max(1));
         let inline_max_rows = self
             .params
             .get("inline_max_rows")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_rows"));
         let inline_max_bytes = self
             .params
             .get("inline_max_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_bytes"));
         let inline_max_buffer_bytes = self
             .params
             .get("inline_max_buffer_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok());
+            .and_then(|v| parse_num_param::<usize>(v, "inline_max_buffer_bytes"));
         let inline_flush_max_rows = self
             .params
             .get("inline_flush_max_rows")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_rows"))
             .map(|v| v.max(0));
         let inline_flush_max_segments = self
             .params
             .get("inline_flush_max_segments")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_segments"))
             .map(|v| v.max(0));
         let inline_flush_max_bytes = self
             .params
             .get("inline_flush_max_bytes")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_bytes"))
             .map(|v| v.max(0));
+
+        // Tuning mode (`cayenne_tuning`): `auto` (default) keeps the static,
+        // hardware-derived knobs; `adaptive` additionally runs the closed-loop
+        // controller in `cayenne::provider::context`. Unlike the accelerator
+        // path, the catalog path has no schema inference, so `adaptive` is seeded
+        // purely from the detected `HardwareProfile` — the controller's bounds
+        // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
+        let tuning_mode = self
+            .params
+            .get("tuning")
+            .expose()
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase());
+        if let Some(mode) = &tuning_mode
+            && mode != "auto"
+            && mode != "adaptive"
+        {
+            tracing::warn!(
+                "Invalid Cayenne catalog parameter `tuning` value `{mode}`; expected `auto` or `adaptive`, defaulting to `auto`."
+            );
+        }
+        let dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+
+        // Seed the adaptive-tunable knobs from the host hardware profile (only
+        // when adaptive is requested — `auto` keeps the engine defaults so the
+        // static path is byte-identical to prior behavior). The seed values are
+        // ONLY applied where the operator did not pin the knob explicitly, so an
+        // explicit `cayenne_*` value still wins.
+        let (
+            seed_compaction_background_interval_ms,
+            seed_compaction_trigger_files,
+            seed_inline_flush_max_rows,
+            seed_inline_flush_max_segments,
+            seed_inline_flush_max_bytes,
+            seed_write_concurrency,
+        ) = if dynamic_tuning {
+            use crate::dataaccelerator::cayenne::autotune::{HardwareProfile, WorkloadProfile};
+            // Probe storage under the resolved data/metadata dirs (falling back to
+            // the spice data base path), mirroring the accelerator's detection.
+            let base = crate::spice_data_base_path();
+            let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
+            let metastore_path = metadata_dir.clone().unwrap_or(base);
+            // No StorageProfile override is plumbed on the catalog path; auto-detect.
+            let hw = HardwareProfile::detect(
+                crate::component::dataset::acceleration::StorageProfile::Auto,
+                &data_path,
+                &metastore_path,
+            )
+            .await;
+            // Hardware-only workload profile (no inferred row_count / row width).
+            let wl = WorkloadProfile::default();
+            let caps = hw.inline_flush_caps(&wl);
+            (
+                // Small-write/CDC cadence so the controller has a tick to ride.
+                Some(10_000_u64),
+                Some(4_usize),
+                Some(caps.max_rows),
+                Some(caps.max_segments),
+                Some(caps.max_bytes),
+                // Seed write concurrency to the host core count so the controller's
+                // [1, cores] window is host-appropriate.
+                Some(hw.cores),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        // The seed only applies where the operator did not set the knob; an
+        // explicit catalog param always wins.
+        let inline_flush_max_rows = inline_flush_max_rows.or(seed_inline_flush_max_rows);
+        let inline_flush_max_segments =
+            inline_flush_max_segments.or(seed_inline_flush_max_segments);
+        let inline_flush_max_bytes = inline_flush_max_bytes.or(seed_inline_flush_max_bytes);
+        let write_concurrency = write_concurrency.or(seed_write_concurrency);
 
         CayenneCatalogProviderConfig {
             data_dir,
@@ -213,6 +316,9 @@ impl CayenneCatalogConnector {
             inline_flush_max_rows,
             inline_flush_max_segments,
             inline_flush_max_bytes,
+            dynamic_tuning,
+            compaction_background_interval_ms: seed_compaction_background_interval_ms,
+            compaction_trigger_files: seed_compaction_trigger_files,
         }
     }
 }
@@ -242,7 +348,7 @@ impl CatalogConnector for CayenneCatalogConnector {
         }
 
         let runtime_env = runtime.datafusion().ctx.runtime_env();
-        let provider_config = self.parse_provider_config();
+        let provider_config = self.parse_provider_config().await;
         let refreshable_provider = Arc::new(
             CayenneCatalogProvider::try_new(provider_config, runtime_env)
                 .await
@@ -331,7 +437,7 @@ mod tests {
         .expect("single-prefixed Cayenne catalog params should validate");
         let connector = CayenneCatalogConnector { params };
 
-        let config = connector.parse_provider_config();
+        let config = connector.parse_provider_config().await;
 
         assert_eq!(config.data_dir.as_deref(), Some("/tmp/cayenne-data"));
         assert_eq!(config.upload_concurrency, Some(1));

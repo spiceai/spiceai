@@ -18,15 +18,15 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    datafusion::{DataFusion, query::write_to_json_string},
+    datafusion::query::write_to_json_string,
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use snafu::ResultExt;
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -46,7 +46,7 @@ const DEFAULT_DESCRIPTION: &str = "Execute an SQL query in the Spice.ai SQL Dial
 pub struct SqlTool {
     name: String,
     description: String,
-    df: Arc<DataFusion>,
+    df: Arc<dyn QueryEngine>,
 
     allowed_tables: Option<ResolvedTableAwareAllowlist>,
 }
@@ -54,7 +54,7 @@ pub struct SqlTool {
 impl SqlTool {
     #[must_use]
     pub fn new(
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
         name: Option<&str>,
         description: Option<&str>,
         allowed_tables: Option<ResolvedTableAwareAllowlist>,
@@ -85,7 +85,7 @@ impl SpiceModelTool for SqlTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sql", tool = self.name().to_string(), input = arg);
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
-            let req: SqlToolParams = serde_json::from_str(arg)?;
+            let SqlToolParams { query } = serde_json::from_str(arg)?;
 
             // Defer the read-only gate to the calling principal. The strict
             // read-only validator still fires for ReadOnly / anonymous
@@ -98,20 +98,19 @@ impl SpiceModelTool for SqlTool {
             // checks per-table writability and `access: read_write`.
             let read_only = crate::http::v1::current_principal_requires_read_only().await;
 
-            let mut query_builder = self.df.query_builder(&req.query).read_only(read_only);
+            let mut query_request = QueryRequest::new(&query).read_only(read_only);
+
             if let Some(ref allowlist) = self.allowed_tables {
-                query_builder = query_builder.allow_tables(allowlist.clone());
+                query_request = query_request.allow_tables(allowlist.clone());
             }
 
-            let batches = query_builder
-                .build()
-                .run()
-                .await
-                .boxed()?
-                .data
+            let batches = self
+                .df
+                .execute_query(query_request)
+                .await?
                 .try_collect::<Vec<RecordBatch>>()
                 .await
-                .boxed()?;
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
             Ok(Value::String(write_to_json_string(&batches)?))
         }
@@ -120,7 +119,7 @@ impl SpiceModelTool for SqlTool {
 
         match tool_use_result {
             Ok(value) => {
-                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                let captured_output_json = serde_json::to_string(&value)?;
                 tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
                 Ok(value)
             }
@@ -149,7 +148,10 @@ mod tests {
     //! exists to document the behavior shared with the other tool
     //! surfaces that consult `current_principal_requires_read_only`.
     use super::*;
-    use crate::{datafusion::builder::DataFusionBuilder, status::RuntimeStatus};
+    use crate::{
+        datafusion::{DataFusion, builder::DataFusionBuilder},
+        status::RuntimeStatus,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
     use datafusion::sql::TableReference;
@@ -175,6 +177,7 @@ mod tests {
             )
             .build(),
         );
+        df.set_self_ref();
 
         // Bare table name (not under `runtime.*`) so the writability
         // gate is the only thing being exercised — the validator treats
@@ -195,7 +198,8 @@ mod tests {
         df.mark_dataset_writable(&table_name)
             .expect("dataset marked writable");
 
-        let tool = SqlTool::new(Arc::clone(&df), None, None, None);
+        let query_engine = Arc::clone(&df) as Arc<dyn QueryEngine>;
+        let tool = SqlTool::new(query_engine, None, None, None);
         (df, tool)
     }
 

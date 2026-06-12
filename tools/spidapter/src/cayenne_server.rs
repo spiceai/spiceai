@@ -22,8 +22,8 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use system_adapter_protocol::{
-    AdbcDriver, CreateStagingTableResponse, DatasetConfig, EtlSinkType, Handler, IngestionMetrics,
-    MetricsResponse, ResourceMetrics, Server, SetupResponse, TeardownResponse,
+    AdbcDriver, CreateStagingTableResponse, DatasetConfig, Handler, IngestionMetrics,
+    MetricsResponse, ResourceMetrics, Server, SetupResponse, SinkConfig, TeardownResponse,
 };
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::time::sleep;
@@ -76,7 +76,6 @@ impl Handler for CayenneFlightsqlHandler {
         run_id: Uuid,
         _metadata: HashMap<String, serde_json::Value>,
         datasets: HashMap<String, DatasetConfig>,
-        etl_sink_type: Option<EtlSinkType>,
     ) -> Result<SetupResponse, String> {
         eprintln!("[cayenne] setup: run_id={run_id}");
 
@@ -87,7 +86,6 @@ impl Handler for CayenneFlightsqlHandler {
         let flight_url = format!("grpc://{addr}");
         let grpc_http_url = format!("http://{addr}");
 
-        // Create a per-run working directory for Cayenne data/metadata.
         let working_dir = std::env::temp_dir().join(format!("spidapter-cayenne-{run_id}"));
         tokio::fs::create_dir_all(&working_dir)
             .await
@@ -134,20 +132,38 @@ impl Handler for CayenneFlightsqlHandler {
 
         eprintln!("[cayenne] setup: cayenne-flightsql ready at {flight_url}");
 
-        // When used as an ADBC ETL sink, pre-create all target tables so the
-        // benchmark framework can bulk-ingest into them immediately.
-        if etl_sink_type == Some(EtlSinkType::Adbc) {
-            create_adbc_tables(
-                &state.grpc_http_url,
-                &state.catalog,
-                &state.schema,
-                &datasets,
-            )
-            .await
-            .map_err(|e| format!("Failed to create ADBC tables: {e}"))?;
-        }
+        // Pre-create all target tables for the ADBC write sink.
+        create_adbc_tables(
+            &state.grpc_http_url,
+            &state.catalog,
+            &state.schema,
+            &datasets,
+        )
+        .await
+        .map_err(|e| format!("Failed to create ADBC tables: {e}"))?;
 
-        let db_kwargs = HashMap::from([
+        let catalog_namespace = format!("{}.{}", state.catalog, state.schema);
+
+        let sink_db_kwargs = HashMap::from([
+            (
+                "uri".to_string(),
+                serde_json::Value::String(flight_url.clone()),
+            ),
+            (
+                "username".to_string(),
+                serde_json::Value::String(String::new()),
+            ),
+            (
+                "password".to_string(),
+                serde_json::Value::String(String::new()),
+            ),
+            (
+                "spicebench.write_schema".to_string(),
+                serde_json::Value::String(catalog_namespace.clone()),
+            ),
+        ]);
+
+        let read_db_kwargs = HashMap::from([
             ("uri".to_string(), serde_json::Value::String(flight_url)),
             (
                 "username".to_string(),
@@ -159,23 +175,18 @@ impl Handler for CayenneFlightsqlHandler {
             ),
         ]);
 
-        // When used as an ADBC ETL sink, tell the framework which
-        // catalog.schema to target for table creation and ingestion.
-        let catalog_namespace = etl_sink_type
-            .as_ref()
-            .filter(|t| matches!(t, EtlSinkType::Adbc))
-            .map(|_| format!("{}.{}", state.catalog, state.schema));
-
-        let response = SetupResponse {
-            driver: AdbcDriver::Flightsql,
-            db_kwargs,
-            catalog_namespace,
-            read_driver: None,
-            endpoints: std::collections::HashMap::new(),
-        };
-
         self.runs.insert(run_id, state);
-        Ok(response)
+
+        Ok(SetupResponse {
+            sink: SinkConfig::Adbc {
+                driver: AdbcDriver::Flightsql,
+                db_kwargs: sink_db_kwargs,
+            },
+            read_driver: AdbcDriver::Flightsql,
+            read_db_kwargs,
+            catalog_namespace: Some(catalog_namespace),
+            endpoints: HashMap::new(),
+        })
     }
 
     async fn metrics(
@@ -192,7 +203,11 @@ impl Handler for CayenneFlightsqlHandler {
         })
     }
 
-    async fn teardown(&mut self, run_id: Uuid) -> Result<TeardownResponse, String> {
+    async fn teardown(
+        &mut self,
+        run_id: Uuid,
+        _preserve_resources: bool,
+    ) -> Result<TeardownResponse, String> {
         eprintln!("[cayenne] teardown: run_id={run_id}");
 
         let Some(mut state) = self.runs.remove(&run_id) else {

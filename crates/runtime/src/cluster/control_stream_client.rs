@@ -220,8 +220,7 @@ fn spawn_control_stream(
                         _ = interval.tick() => {
                             let timestamp_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                                .unwrap_or(0);
+                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0));
 
                             let msg = ExecutorControlMessage {
                                 executor_id: heartbeat_executor_id.clone(),
@@ -244,8 +243,7 @@ fn spawn_control_stream(
                 message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
                     timestamp_ms: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-                        .unwrap_or(0),
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0)),
                 })),
             };
             if outbound_tx.send(init_msg).await.is_err() {
@@ -288,6 +286,22 @@ fn spawn_control_stream(
 
             tracing::debug!("Control stream established to scheduler {scheduler_address}");
             backoff.reset();
+
+            // Replay cached PartitionsLoaded acks now that the stream is
+            // established and draining the outbound channel. Datasets that
+            // finished loading before this stream existed (fast initial loads
+            // of small datasets) or before a restarted scheduler reconnected
+            // would otherwise never deliver their readiness ack, leaving them
+            // stuck in `Refreshing`. Spawned so a slow scheduler can't delay
+            // inbound message processing.
+            if let Some(b) = broadcaster.as_ref() {
+                let b = b.clone();
+                let address = scheduler_address.clone();
+                let replay_tx = outbound_tx.clone();
+                tokio::spawn(async move {
+                    b.replay_partitions_loaded(&address, &replay_tx).await;
+                });
+            }
 
             runtime_cluster::metrics::set_executor_scheduler_active_connection(
                 &executor_id,

@@ -28,6 +28,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, PutResult, SchemaResult};
 use arrow_flight::{
@@ -429,6 +430,11 @@ where
         // Create a new Status with the same code and message to avoid cloning the entire Status struct
         return Status::new(status.code(), status.message());
     }
+    if let Some(FlightError::Tonic(status)) =
+        (&e as &dyn std::any::Any).downcast_ref::<FlightError>()
+    {
+        return Status::new(status.code(), status.message());
+    }
     Status::internal(format!("{e}"))
 }
 
@@ -553,6 +559,11 @@ pub enum Error {
     ))]
     ClusterSchedulerNotInitialized {},
 
+    #[snafu(display(
+        "The cluster executor is not initialized, preventing the flight service from starting."
+    ))]
+    ClusterExecutorNotInitialized {},
+
     #[snafu(display("Unable to start internal cluster server: {source}"))]
     UnableToStartClusterServer { source: tonic::transport::Error },
 
@@ -639,7 +650,8 @@ pub async fn start(
         .into_inner();
 
     // Create the OpenTelemetry MetricsService
-    let otel_service = create_metrics_service(rt.datafusion());
+    let query_engine: Arc<dyn runtime_datafusion::query_engine::QueryEngine> = rt.datafusion();
+    let otel_service = create_metrics_service(query_engine);
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();

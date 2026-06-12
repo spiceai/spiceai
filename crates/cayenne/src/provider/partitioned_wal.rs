@@ -52,8 +52,8 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Result;
@@ -140,10 +140,15 @@ impl PartitionedWal {
                 let parent = table_root.to_path_buf(); // the table root
                 let table = table_root.display().to_string();
 
-                // Sync the table root so the _partitioned_wal/ subdir entry is durable.
-                tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
-                    .await
-                    .map_err(|source| Error::TaskPanicked { table, source })??;
+                // Sync the table root so the _partitioned_wal/ subdir entry is
+                // written through (directory ordering tier: plain fsync on
+                // macOS, full fsync elsewhere — see `provider/fsync_tier.rs`).
+                tokio::task::spawn_blocking(move || {
+                    let dir = std::fs::File::open(&parent)?;
+                    crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked { table, source })??;
             }
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(Error::IoError { source }),
@@ -215,7 +220,10 @@ impl PartitionedWal {
             .open(&tmp_path)
             .await?;
         tmp_file.write_all(content.as_bytes()).await?;
-        tmp_file.sync_all().await?;
+        // Ordering tier: see `provider/fsync_tier.rs` — losing this
+        // coordination record in a power-loss window is healed by recovery,
+        // and the metastore's visibility commits are no stronger.
+        super::fsync_tier::ordering_sync_tokio_file(&tmp_file).await?;
         drop(tmp_file);
 
         // Step 2: atomic rename. POSIX rename within the same directory is
@@ -226,10 +234,10 @@ impl PartitionedWal {
             return Err(Error::IoError { source: e });
         }
 
-        // Step 3: fsync the parent dir so the rename is durable across a
-        // power-loss restart.
+        // Step 3: fsync the parent dir (ordering tier) so the rename is
+        // written through before dependent work proceeds.
         if let Ok(dir) = tokio::fs::File::open(&wal_dir).await
-            && let Err(e) = dir.sync_all().await
+            && let Err(e) = super::fsync_tier::ordering_sync_dir_tokio_file(&dir).await
         {
             // Directory fsync is best-effort: on some filesystems / OSes it
             // is a no-op anyway. Log the failure but don't abort — the WAL
@@ -271,9 +279,9 @@ impl PartitionedWal {
         store: &dyn ObjectStore,
         base_prefix: &ObjectStorePath,
     ) -> Result<ObjectStorePath> {
-        let wal_dir = base_prefix.child(PARTITIONED_WAL_DIR);
-        let final_key = wal_dir.child(format!("{}.json", self.commit_id));
-        let tmp_key = wal_dir.child(format!("{}.json.tmp", self.commit_id));
+        let wal_dir = base_prefix.clone().join(PARTITIONED_WAL_DIR);
+        let final_key = wal_dir.clone().join(format!("{}.json", self.commit_id));
+        let tmp_key = wal_dir.join(format!("{}.json.tmp", self.commit_id));
 
         // Compact serialization: see comment in `write_to` for the local-FS
         // path; the S3 case has the same trade-offs plus a smaller PUT payload
@@ -343,7 +351,8 @@ impl PartitionedWal {
                 let wal_dir = table_root.join(PARTITIONED_WAL_DIR);
                 let wal_dir_display = wal_dir.display().to_string();
                 match tokio::task::spawn_blocking(move || {
-                    std::fs::File::open(&wal_dir).and_then(|f| f.sync_all())
+                    std::fs::File::open(&wal_dir)
+                        .and_then(|f| crate::provider::fsync_tier::ordering_sync_dir_std(&f))
                 })
                 .await
                 {
@@ -594,8 +603,8 @@ mod tests {
         // The tmp key for the same commit_id must be cleaned up after the final
         // key is published, so readers only ever see the committed WAL object.
         let tmp_key = base
-            .child(PARTITIONED_WAL_DIR)
-            .child(format!("{}.json.tmp", wal.commit_id));
+            .join(PARTITIONED_WAL_DIR)
+            .join(format!("{}.json.tmp", wal.commit_id));
         assert!(matches!(
             store.get(&tmp_key).await,
             Err(object_store::Error::NotFound { .. })

@@ -50,6 +50,7 @@ reqwest.workspace = true
 runtime = { path = "../../crates/runtime" }
 runtime-auth = { path = "../../crates/runtime-auth" }
 runtime-async = { path = "../../crates/runtime-async" }
+runtime-datafusion = { path = "../../crates/runtime-datafusion" }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
@@ -126,7 +127,6 @@ duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
 ftp = ["connector-ftp", "runtime/ftp"]
-geo = ["runtime/geo"]
 http-functions = ["runtime/http-functions"]
 rate-control = ["runtime/rate-control"]
 wasm-functions = ["runtime/wasm-functions"]
@@ -158,6 +158,7 @@ snapshots = ["runtime/snapshots"]
 client_tls = ["runtime/client_tls"]
 snowflake = ["connector-snowflake", "runtime/snowflake"]
 spark = ["connector-spark", "runtime/spark", "connector-databricks/spark"]
+spicebench = ["runtime/spicebench"]
 sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]

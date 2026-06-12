@@ -35,8 +35,11 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
+use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -61,12 +64,13 @@ use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
 use super::cache::CachedVortexMetadata;
 use super::segment_cache::SharedSegmentCache;
-use super::sink::VortexSink;
+use super::sink::{ShardSpec, VortexSink};
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
@@ -224,12 +228,31 @@ impl ConfigField for ScanConcurrency {
     }
 }
 
+/// Programmatic write-time sharding configuration, set by the caller (e.g. the
+/// Cayenne accelerator) via [`VortexFormat::with_write_shard`].
+///
+/// Absent (or `write_concurrency <= 1`) ⇒ a single serial writer, i.e. the
+/// historical behavior. When present, `VortexSink` fans the write across
+/// `write_concurrency` concurrent shard writers (clamped to the session's
+/// `target_partitions`), routing rows round-robin or hashed by
+/// `shard_key_columns`.
+#[derive(Debug, Clone, Default)]
+pub struct WriteShardConfig {
+    /// Number of concurrent shard writers to fan a single write across.
+    pub write_concurrency: usize,
+    /// Optional key columns to hash-partition rows by (e.g. primary key or
+    /// partition value), resolved by name against the write schema. Empty ⇒
+    /// round-robin distribution.
+    pub shard_key_columns: Vec<String>,
+}
+
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
 pub struct VortexFormat {
     session: VortexSession,
     opts: VortexTableOptions,
     access_plan_provider: Option<Arc<dyn VortexAccessPlanProvider>>,
     segment_cache: Option<Arc<SharedSegmentCache>>,
+    write_shard: Option<WriteShardConfig>,
 }
 
 impl Debug for VortexFormat {
@@ -279,6 +302,13 @@ config_namespace! {
         pub scan_concurrency: ScanConcurrency, default = ScanConcurrency::Auto
         /// Total byte capacity for a path-aware segment cache shared by scans using this format.
         pub segment_cache_size_bytes: Option<usize>, default = None
+        /// Whether to evaluate hash-join *dynamic* filters inside the Vortex scan.
+        ///
+        /// When `false` (default), a dynamic filter pushed down from a hash join
+        /// (e.g. a build-side `IN` list) is not absorbed into the scan's per-row
+        /// predicate or file-pruning predicate; it is left for the join / a
+        /// post-scan `FilterExec` to apply with a hashed probe.
+        pub dynamic_filter_pushdown: bool, default = false
     }
 }
 
@@ -381,13 +411,14 @@ impl VortexFormat {
             .segment_cache_size_bytes
             .and_then(|bytes| u64::try_from(bytes).ok())
             .filter(|bytes| *bytes > 0)
-            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes)));
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, None)));
 
         Self {
             session,
             opts,
             access_plan_provider: None,
             segment_cache,
+            write_shard: None,
         }
     }
 
@@ -409,7 +440,90 @@ impl VortexFormat {
             opts: self.opts.clone(),
             access_plan_provider: Some(access_plan_provider),
             segment_cache: self.segment_cache.clone(),
+            write_shard: self.write_shard.clone(),
         }
+    }
+
+    /// Returns a format that fans writes across `config.write_concurrency`
+    /// concurrent shard writers (clamped to the session `target_partitions`),
+    /// routing rows hashed by `config.shard_key_columns` (or round-robin when
+    /// empty). Used by the Cayenne accelerator to parallelize the Vortex encode.
+    #[must_use]
+    pub fn with_write_shard(&self, config: WriteShardConfig) -> Self {
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache: self.segment_cache.clone(),
+            write_shard: Some(config),
+        }
+    }
+
+    /// Returns a format whose segment cache reports its right-sizing metrics
+    /// (hit rate, fill) under the given `dataset` label. Rebuilds the (empty)
+    /// segment cache to attach the label, so call once at construction before any
+    /// scans run. No-op label-wise when this format has no segment cache.
+    #[must_use]
+    pub fn with_dataset_label(&self, dataset: impl Into<Arc<str>>) -> Self {
+        let dataset = dataset.into();
+        let segment_cache = self
+            .opts
+            .segment_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| Arc::new(SharedSegmentCache::new(bytes, Some(Arc::clone(&dataset)))));
+        Self {
+            session: self.session.clone(),
+            opts: self.opts.clone(),
+            access_plan_provider: self.access_plan_provider.clone(),
+            segment_cache,
+            write_shard: self.write_shard.clone(),
+        }
+    }
+
+    /// The configured intra-write shard config, if write sharding is enabled for
+    /// this format (set via [`Self::with_write_shard`]). Read-only; primarily for
+    /// inspection and tests.
+    #[must_use]
+    pub fn write_shard(&self) -> Option<&WriteShardConfig> {
+        self.write_shard.as_ref()
+    }
+
+    /// Resolve the programmatic [`WriteShardConfig`] into a [`ShardSpec`] for
+    /// the write schema. `None` / `write_concurrency <= 1` ⇒ `Single`; an empty
+    /// key list ⇒ `RoundRobin`; otherwise `Hash` on the named columns. Unknown
+    /// column names fall back to `RoundRobin` rather than failing the write.
+    fn build_shard_spec(&self, schema: &SchemaRef, target_partitions: usize) -> ShardSpec {
+        let Some(write_shard) = self.write_shard.as_ref() else {
+            return ShardSpec::Single;
+        };
+        let partitions = write_shard
+            .write_concurrency
+            .clamp(1, target_partitions.max(1));
+        if partitions <= 1 {
+            return ShardSpec::Single;
+        }
+        if write_shard.shard_key_columns.is_empty() {
+            return ShardSpec::RoundRobin(partitions);
+        }
+        let mut exprs: Vec<PhysicalExprRef> =
+            Vec::with_capacity(write_shard.shard_key_columns.len());
+        for name in &write_shard.shard_key_columns {
+            if let Ok(idx) = schema.index_of(name) {
+                exprs.push(Arc::new(Column::new(name, idx)));
+            } else {
+                // Defensive: the configured key column is absent from the write
+                // schema. Degrade to round-robin rather than fail the write, but
+                // warn — files silently lose key-clustering.
+                tracing::warn!(
+                    column = name.as_str(),
+                    "Vortex write shard key column not found in output schema; \
+                     falling back to round-robin sharding (files will not be key-clustered)"
+                );
+                return ShardSpec::RoundRobin(partitions);
+            }
+        }
+        ShardSpec::Hash { exprs, partitions }
     }
 }
 
@@ -487,9 +601,12 @@ impl FileFormat for VortexFormat {
 
                 SpawnedTask::spawn(async move {
                     // Check if we have cached metadata for this file
-                    if let Some(cached) = cache.get(&object)
-                        && let Some(cached_vortex) =
-                            cached.as_any().downcast_ref::<CachedVortexMetadata>()
+                    if let Some(entry) = cache.get(&object.location)
+                        && entry.is_valid_for(&object)
+                        && let Some(cached_vortex) = entry
+                            .file_metadata
+                            .as_any()
+                            .downcast_ref::<CachedVortexMetadata>()
                     {
                         let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
                         return VortexResult::Ok((object.location, inferred_schema));
@@ -511,7 +628,17 @@ impl FileFormat for VortexFormat {
 
                     // Cache the metadata
                     let cached_metadata = Arc::new(CachedVortexMetadata::new(&vxf));
-                    cache.put(&object, cached_metadata);
+                    // Footer-cache right-sizing telemetry: the accounted footer
+                    // size (what fills the FileMetadataCache budget) per file.
+                    tracing::debug!(
+                        target: "vortex::footer_cache",
+                        path = %object.location,
+                        footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached_metadata.as_ref()),
+                        src = "infer_schema",
+                        "footer cached",
+                    );
+                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
+                    cache.put(&object.location, entry);
 
                     let inferred_schema = vxf.dtype().to_arrow_schema()?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -556,18 +683,22 @@ impl FileFormat for VortexFormat {
 
         let statistics = SpawnedTask::spawn(async move {
             // Try to get cached metadata first
-            let cached_metadata = file_metadata_cache.get(&object).and_then(|cached| {
-                cached
-                    .as_any()
-                    .downcast_ref::<CachedVortexMetadata>()
-                    .map(|m| {
-                        (
-                            m.footer().dtype().clone(),
-                            m.footer().statistics().cloned(),
-                            m.footer().row_count(),
-                        )
-                    })
-            });
+            let cached_metadata = file_metadata_cache
+                .get(&object.location)
+                .filter(|entry| entry.is_valid_for(&object))
+                .and_then(|entry| {
+                    entry
+                        .file_metadata
+                        .as_any()
+                        .downcast_ref::<CachedVortexMetadata>()
+                        .map(|m| {
+                            (
+                                m.footer().dtype().clone(),
+                                m.footer().statistics().cloned(),
+                                m.footer().row_count(),
+                            )
+                        })
+                });
 
             let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
                 metadata
@@ -594,7 +725,16 @@ impl FileFormat for VortexFormat {
 
                 // Cache the metadata
                 let cached = Arc::new(CachedVortexMetadata::new(&vxf));
-                file_metadata_cache.put(&object, cached);
+                // Footer-cache right-sizing telemetry (see infer_schema above).
+                tracing::debug!(
+                    target: "vortex::footer_cache",
+                    path = %object.location,
+                    footer_bytes = datafusion_execution::cache::cache_manager::FileMetadata::memory_size(cached.as_ref()),
+                    src = "infer_stats",
+                    "footer cached",
+                );
+                let entry = CachedFileMetadataEntry::new(object.clone(), cached);
+                file_metadata_cache.put(&object.location, entry);
 
                 (
                     vxf.dtype().clone(),
@@ -644,47 +784,26 @@ impl FileFormat for VortexFormat {
                 let (stats_set, stats_dtype) = file_stats.get(col_idx);
 
                 // Update the total size in bytes.
-                let column_size = stats_set
-                    .get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into())
-                    .unwrap_or_else(|| stats::Precision::inexact(0_usize));
+                let column_size =
+                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
                 sum_of_column_byte_sizes = sum_of_column_byte_sizes
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                // TODO(connor): There's a lot that can go wrong here, should probably handle this
-                // more gracefully...
-                // Find the min statistic.
-                let min = stats_set.get(Stat::Min).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            // Because of DataFusion's Schema evolution, it is possible that the
-                            // type of the min/max stat has changed. Thus we construct the stat as
-                            // the file datatype first and only then do we cast accordingly.
-                            let stat_dtype = Stat::Min.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let target_dtype = DType::from_arrow(field.as_ref());
+                let min = scalar_stat_to_df(
+                    Stat::Min,
+                    stats_set.get(Stat::Min),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
-                // Find the max statistic.
-                let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            let stat_dtype = Stat::Max.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let max = scalar_stat_to_df(
+                    Stat::Max,
+                    stats_set.get(Stat::Max),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -751,7 +870,7 @@ impl FileFormat for VortexFormat {
     async fn create_writer_physical_plan(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        _state: &dyn Session,
+        state: &dyn Session,
         conf: FileSinkConfig,
         order_requirements: Option<LexRequirement>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -789,11 +908,14 @@ impl FileFormat for VortexFormat {
         };
 
         let schema = Arc::clone(conf.output_schema());
+        let target_partitions = state.config().target_partitions().max(1);
+        let shard_spec = self.build_shard_spec(&schema, target_partitions);
         let sink = Arc::new(VortexSink::new(
             conf,
             schema,
             self.session.clone(),
             target_file_size,
+            shard_spec,
         ));
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
@@ -802,7 +924,8 @@ impl FileFormat for VortexFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = VortexSource::new(table_schema, self.session.clone())
             .with_projection_pushdown(self.opts.projection_pushdown)
-            .with_scan_concurrency(self.opts.scan_concurrency);
+            .with_scan_concurrency(self.opts.scan_concurrency)
+            .with_dynamic_filter_pushdown(self.opts.dynamic_filter_pushdown);
 
         if let Some(segment_cache) = self.segment_cache.clone() {
             source = source.with_segment_cache(segment_cache);
@@ -812,10 +935,28 @@ impl FileFormat for VortexFormat {
     }
 }
 
-fn distinct_count_from_is_constant(
-    is_constant: Option<stats::Precision<bool>>,
-) -> Precision<usize> {
-    match is_constant.and_then(stats::Precision::as_exact) {
+fn scalar_stat_to_df(
+    stat: Stat,
+    value: stats::Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+) -> stats::Precision<datafusion_common::ScalarValue> {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
+        return stats::Precision::Absent;
+    };
+
+    value
+        .map(|stat_value| {
+            Scalar::try_new(scalar_dtype, Some(stat_value))?
+                .cast(target_dtype)?
+                .try_to_df()
+        })
+        .transpose()
+        .unwrap_or(stats::Precision::Absent)
+}
+
+fn distinct_count_from_is_constant(is_constant: stats::Precision<bool>) -> Precision<usize> {
+    match is_constant.as_exact() {
         Some(true) => Precision::Exact(1),
         Some(false) | None => Precision::Absent,
     }
@@ -867,16 +1008,104 @@ mod tests {
     #[test]
     fn format_plumbs_footer_initial_read_size() {
         let mut opts = VortexTableOptions::default();
-        opts.set("footer_initial_read_size_bytes", "12345").unwrap();
+        opts.set("footer_initial_read_size_bytes", "12345")
+            .expect("setting footer_initial_read_size_bytes should succeed");
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
     }
 
+    fn schema_with(cols: &[(&str, arrow_schema::DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|(n, t)| arrow_schema::Field::new(*n, t.clone(), false))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn shard_format(write_concurrency: usize, keys: &[&str]) -> VortexFormat {
+        VortexFormat::new(VortexSession::default()).with_write_shard(WriteShardConfig {
+            write_concurrency,
+            shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
+    #[test]
+    fn build_shard_spec_without_write_shard_is_single() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        let format = VortexFormat::new(VortexSession::default());
+        assert!(matches!(
+            format.build_shard_spec(&schema, 8),
+            ShardSpec::Single
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_clamps_write_concurrency_to_target_partitions() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // Asking for 100 shards with target_partitions=4 must clamp to 4.
+        match shard_format(100, &["k"]).build_shard_spec(&schema, 4) {
+            ShardSpec::Hash { partitions, .. } => assert_eq!(partitions, 4),
+            _ => panic!("expected Hash with clamped partitions=4"),
+        }
+    }
+
+    #[test]
+    fn build_shard_spec_one_partition_is_single() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // write_concurrency 8 but target_partitions 1 → clamp to 1 → Single.
+        assert!(matches!(
+            shard_format(8, &["k"]).build_shard_spec(&schema, 1),
+            ShardSpec::Single
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_no_keys_is_round_robin() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        assert!(matches!(
+            shard_format(4, &[]).build_shard_spec(&schema, 8),
+            ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_unknown_key_falls_back_to_round_robin() {
+        let schema = schema_with(&[("k", arrow_schema::DataType::Int64)]);
+        // "missing" is absent from the schema → degrade to round-robin (warns),
+        // never silently produce a Hash over a bogus column.
+        assert!(matches!(
+            shard_format(4, &["missing"]).build_shard_spec(&schema, 8),
+            ShardSpec::RoundRobin(4)
+        ));
+    }
+
+    #[test]
+    fn build_shard_spec_composite_keys_hash_all_columns() {
+        let schema = schema_with(&[
+            ("w_id", arrow_schema::DataType::Int64),
+            ("d_id", arrow_schema::DataType::Int64),
+            ("payload", arrow_schema::DataType::Utf8),
+        ]);
+        match shard_format(4, &["w_id", "d_id"]).build_shard_spec(&schema, 8) {
+            ShardSpec::Hash { exprs, partitions } => {
+                assert_eq!(partitions, 4);
+                assert_eq!(exprs.len(), 2, "composite key must hash both columns");
+                let names: String = exprs.iter().map(ToString::to_string).collect();
+                assert!(
+                    names.contains("w_id") && names.contains("d_id"),
+                    "hash exprs must reference both key columns, got: {names}"
+                );
+            }
+            _ => panic!("expected Hash over the composite key"),
+        }
+    }
+
     #[test]
     fn format_plumbs_target_file_size_mb() {
         let mut opts = VortexTableOptions::default();
-        opts.set("target_file_size_mb", "123").unwrap();
+        opts.set("target_file_size_mb", "123")
+            .expect("setting target_file_size_mb should succeed");
 
         let format = VortexFormat::new_with_options(VortexSession::default(), opts);
         assert_eq!(format.options().target_file_size_mb, 123);
@@ -903,18 +1132,22 @@ mod tests {
     #[test]
     fn format_plumbs_projection_pushdown_modes() {
         let mut opts = VortexTableOptions::default();
-        opts.set("projection_pushdown", "auto").unwrap();
+        opts.set("projection_pushdown", "auto")
+            .expect("setting projection_pushdown to auto should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::Auto);
         assert!(opts.projection_pushdown.enabled());
 
-        opts.set("projection_pushdown", "on").unwrap();
+        opts.set("projection_pushdown", "on")
+            .expect("setting projection_pushdown to on should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
         assert!(opts.projection_pushdown.enabled());
 
-        opts.set("projection_pushdown", "true").unwrap();
+        opts.set("projection_pushdown", "true")
+            .expect("setting projection_pushdown to true should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::On);
 
-        opts.set("projection_pushdown", "off").unwrap();
+        opts.set("projection_pushdown", "off")
+            .expect("setting projection_pushdown to off should succeed");
         assert_eq!(opts.projection_pushdown, ProjectionPushdown::Off);
         assert!(!opts.projection_pushdown.enabled());
     }
@@ -922,33 +1155,40 @@ mod tests {
     #[test]
     fn format_plumbs_scan_concurrency_modes() {
         let mut opts = VortexTableOptions::default();
-        opts.set("scan_concurrency", "auto").unwrap();
+        opts.set("scan_concurrency", "auto")
+            .expect("setting scan_concurrency to auto should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Auto);
 
-        opts.set("scan_concurrency", "off").unwrap();
+        opts.set("scan_concurrency", "off")
+            .expect("setting scan_concurrency to off should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
 
-        opts.set("scan_concurrency", "00").unwrap();
+        opts.set("scan_concurrency", "00")
+            .expect("setting scan_concurrency to 00 should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Off);
 
-        opts.set("scan_concurrency", "3").unwrap();
+        opts.set("scan_concurrency", "3")
+            .expect("setting scan_concurrency to 3 should succeed");
         assert_eq!(opts.scan_concurrency, ScanConcurrency::Explicit(3));
     }
 
     #[test]
     fn distinct_count_is_exact_only_for_exact_constant_true() {
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(true))),
+            distinct_count_from_is_constant(stats::Precision::exact(true)),
             Precision::Exact(1)
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(false))),
+            distinct_count_from_is_constant(stats::Precision::exact(false)),
             Precision::Absent
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::inexact(true))),
+            distinct_count_from_is_constant(stats::Precision::inexact(true)),
             Precision::Absent
         );
-        assert_eq!(distinct_count_from_is_constant(None), Precision::Absent);
+        assert_eq!(
+            distinct_count_from_is_constant(stats::Precision::Absent),
+            Precision::Absent
+        );
     }
 }

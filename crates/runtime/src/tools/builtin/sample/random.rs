@@ -20,13 +20,12 @@ use std::{
 };
 
 use super::SampleFrom;
-use crate::datafusion::DataFusion;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
 use tracing::Span;
 use tracing_futures::Instrument;
 use util::security::quote_table_reference;
@@ -53,32 +52,31 @@ impl Display for RandomSampleParams {
 impl SampleFrom for RandomSampleParams {
     async fn sample(
         &self,
-        df: Arc<DataFusion>,
+        df: Arc<dyn QueryEngine>,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
         let current_span = Span::current();
         let tbl = TableReference::parse_str(self.tbl.as_str());
         let tbl_quoted = quote_table_reference(&tbl);
 
         let batches = async {
-            df.query_builder(&format!(
-                "SELECT * FROM {tbl} LIMIT {limit}",
-                limit = self.limit,
-                tbl = tbl_quoted,
-            ))
-            .build()
-            .run()
-            .await
-            .boxed()?
-            .data
-            .try_collect::<Vec<RecordBatch>>()
-            .await
-            .boxed()
+            let stream = df
+                .execute_query(QueryRequest::new(format!(
+                    "SELECT * FROM {tbl} LIMIT {limit}",
+                    limit = self.limit,
+                    tbl = tbl_quoted,
+                )))
+                .await?;
+            stream
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
         }
         .instrument(current_span)
         .await?;
 
-        let schema = Arc::new(df.get_arrow_schema(tbl).await.boxed()?);
+        let schema = Arc::new(df.get_arrow_schema(tbl).await?);
 
-        concat_batches(&schema, batches.iter()).boxed()
+        concat_batches(&schema, batches.iter())
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 }

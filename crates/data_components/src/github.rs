@@ -415,7 +415,7 @@ where
         .build();
 
     let mut exponential_backoff = ExponentialBackoff {
-        max_elapsed_time: Some(std::time::Duration::from_secs(300)), // 5 minutes max total retry time
+        max_elapsed_time: Some(std::time::Duration::from_mins(5)), // 5 minutes max total retry time
         ..ExponentialBackoff::default()
     };
 
@@ -677,7 +677,7 @@ impl GithubRestClient {
     ) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_mins(2))
             .build()?;
 
         Ok(GithubRestClient {

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use crate::sql_expr::to_sql_preserving_precedence;
 use arrow::{
     array::{Array, RecordBatch, array},
@@ -22,7 +23,6 @@ use arrow::{
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
@@ -41,6 +41,7 @@ use arrow_flight::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
+    common::Statistics,
     common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -86,7 +87,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to create SQL query (flightsql). {source} An unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL { source: DataFusionError },
 
     #[snafu(display("Query execution failed (flightsql). {source}"))]
     UnableToQueryArrowFlight { source: FlightError },
@@ -133,6 +134,7 @@ pub struct FlightSQLFactory {
     client: FlightSqlClient,
     endpoint: String,
     cookie_store: Arc<CookieStore>,
+    function_support: Option<FunctionSupport>,
 }
 
 impl FlightSQLFactory {
@@ -142,7 +144,16 @@ impl FlightSQLFactory {
             client,
             endpoint,
             cookie_store,
+            function_support: None,
         }
+    }
+
+    /// Install the federation function deny-list so Spice-only UDFs are evaluated
+    /// locally instead of pushed into the Flight SQL server (#10703).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: FunctionSupport) -> Self {
+        self.function_support = Some(function_support);
+        self
     }
 }
 
@@ -160,7 +171,8 @@ impl Read for FlightSQLFactory {
                 table_reference,
                 Arc::clone(&self.cookie_store),
             )
-            .await?,
+            .await?
+            .with_function_support(self.function_support.clone()),
         );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
@@ -177,6 +189,12 @@ pub struct FlightSQLTable {
     table_reference: TableReference,
     schema: SchemaRef,
     cookie_store: Arc<CookieStore>,
+    /// Optional statistics to attach to the scan this provider produces.
+    statistics: Option<Statistics>,
+    /// Federation function deny-list. Functions on the list (Spice-only UDFs such
+    /// as `json_get_str`) are evaluated locally instead of pushed into the SQL
+    /// sent to the Flight SQL server. See issue #10703.
+    function_support: Option<FunctionSupport>,
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -197,6 +215,8 @@ impl FlightSQLTable {
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
+            statistics: None,
+            function_support: None,
         })
     }
 
@@ -216,7 +236,23 @@ impl FlightSQLTable {
             schema,
             join_push_down_context: format!("endpoint={endpoint}"),
             cookie_store,
+            statistics: None,
+            function_support: None,
         }
+    }
+
+    /// Attach statistics to be reported by the scans this provider creates.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Option<Statistics>) -> Self {
+        self.statistics = statistics;
+        self
+    }
+
+    /// Install the federation function deny-list (see [`FunctionSupport`]).
+    #[must_use]
+    pub fn with_function_support(mut self, function_support: Option<FunctionSupport>) -> Self {
+        self.function_support = function_support;
+        self
     }
 
     pub async fn from_static(
@@ -363,7 +399,7 @@ impl FlightSQLTable {
         let flight_info = client
             .execute(format!("SELECT * FROM {table_reference} LIMIT 1"), None)
             .await
-            .context(UnableToRetrieveSchemaArrowSnafu {
+            .context(UnableToRetrieveSchemaFlightSnafu {
                 table_name: table_reference.to_string(),
             })?;
         for tkt in flight_info
@@ -375,7 +411,7 @@ impl FlightSQLTable {
                 client
                     .do_get(tkt.clone())
                     .await
-                    .context(UnableToRetrieveSchemaArrowSnafu {
+                    .context(UnableToRetrieveSchemaFlightSnafu {
                         table_name: table_reference.to_string(),
                     })?;
             let batches = stream.try_collect::<Vec<_>>().await.context(
@@ -401,7 +437,7 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FlightSqlExec::new(
+        let exec = FlightSqlExec::new(
             projections,
             schema,
             &self.table_reference,
@@ -409,7 +445,14 @@ impl FlightSQLTable {
             filters,
             limit,
             Arc::clone(&self.cookie_store),
-        )?))
+        )?;
+        // Project the table-level statistics onto the scan's (projected) output
+        // schema so the column-statistics list lines up with the output columns.
+        let exec = match &self.statistics {
+            Some(stats) => exec.with_statistics(stats.clone().project(projections)),
+            None => exec,
+        };
+        Ok(Arc::new(exec))
     }
 }
 
@@ -463,7 +506,7 @@ pub struct FlightSqlExec {
     filters: Vec<Expr>,
     limit: Option<usize>,
     sort_exprs: Vec<PhysicalSortExpr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     cookie_store: Arc<CookieStore>,
     metrics: ExecutionPlanMetricsSet,
     /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
@@ -472,6 +515,12 @@ pub struct FlightSqlExec {
     /// the typed `Arc<RequestContext>` extension from the `TaskContext`
     /// session config and constructs a header from its `trace_parent()`.
     trace_parent: Option<String>,
+    /// Statistics for the rows this scan produces. Defaults to unknown; the
+    /// planner that builds the scan can supply real statistics (e.g. row
+    /// counts sourced from cluster partition metadata) via
+    /// [`FlightSqlExec::with_statistics`] so downstream optimizer rules such as
+    /// hash-join build-side selection can use them.
+    statistics: Statistics,
 }
 
 impl FlightSqlExec {
@@ -485,6 +534,7 @@ impl FlightSqlExec {
         cookie_store: Arc<CookieStore>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
+        let statistics = Statistics::new_unknown(&projected_schema);
         Ok(Self {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
@@ -492,16 +542,27 @@ impl FlightSqlExec {
             filters: filters.to_vec(),
             limit,
             sort_exprs: Vec::new(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store,
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: None,
+            statistics,
         })
+    }
+
+    /// Attach statistics describing the rows this scan produces. The schema of
+    /// the statistics' column list is expected to match the (projected) output
+    /// schema; callers that only know the row count can use
+    /// `Statistics::new_unknown(schema).with_num_rows(...)`.
+    #[must_use]
+    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
+        self.statistics = statistics;
+        self
     }
 
     /// Set an explicit W3C `traceparent` header value to forward on each
@@ -587,7 +648,7 @@ impl FlightSqlExec {
                         format!("({sql})")
                     })
                 })
-                .collect::<expr::Result<Vec<_>>>()
+                .collect::<DataFusionResult<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
@@ -667,7 +728,7 @@ impl ExecutionPlan for FlightSqlExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -705,15 +766,16 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: self.limit,
             sort_exprs,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
+            statistics: self.statistics.clone(),
         };
 
         Ok(SortOrderPushdownResult::Exact {
@@ -774,6 +836,15 @@ impl ExecutionPlan for FlightSqlExec {
         Some(self.metrics.clone_inner())
     }
 
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+        // Single output partition (`UnknownPartitioning(1)`), so per-partition
+        // statistics for partition 0 are the whole scan's statistics.
+        match partition {
+            None | Some(0) => Ok(self.statistics.clone()),
+            Some(_) => Ok(Statistics::new_unknown(&self.projected_schema)),
+        }
+    }
+
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
@@ -793,10 +864,11 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: merged_limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
+            statistics: self.statistics.clone(),
         };
 
         Some(Arc::new(new_plan))
@@ -920,7 +992,7 @@ pub fn query_to_stream(
                                 }
                             }
                         },
-                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
+                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error } ))
                 }
             }
         };

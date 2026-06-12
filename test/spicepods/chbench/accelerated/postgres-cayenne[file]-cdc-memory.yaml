@@ -1,0 +1,209 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-cdc-memory
+
+# In-memory CDC durability variant of the non-tuned postgres-cayenne[file] baseline. The 7 mutated
+# TPC-C tables (refresh_mode: changes) run `cayenne_cdc_durability: memory`: each CDC batch is
+# appended to an in-RAM tier and the source replication-slot ack is deferred to a periodic /
+# cap-triggered checkpoint, collapsing the per-batch durability cost (the single-writer metastore
+# txn) that walls CDC throughput. On crash the un-checkpointed tail is replayed from the slot; the
+# apply is PK-idempotent, so the result is exactly-once. The RAM tier is bounded by a per-table
+# byte cap plus a process-global byte budget, so it spills (checkpoints) rather than OOMing.
+#
+# Checkpoint-churn tuning (measured at SF-100, 10K txn/s): every durable checkpoint costs a new
+# snapshot dir + delete-vector files + a protected-snapshot entry that scans must union until
+# compaction folds it. At small/frequent checkpoints the heavy tables hit "high protected snapshot
+# amplification" (stock reached the warn threshold of 24) because folding can't keep pace with
+# inflow on a saturated box, degrading both OLAP and the CDC apply. Fewer, BIGGER checkpoints cut
+# the inflow ~4x and a 1s compaction tick folds ~3x faster. Query freshness is unaffected — RAM
+# rows are visible to queries immediately on append; only the source-slot ack (the crash-replay
+# window) moves out to <=30s, which is exactly what the slot is for.
+#
+# Everything else matches the baseline: storage stays `mode: file` (memory durability is the CDC
+# write-path tier, not in-memory acceleration) and every other knob is auto-derived. The static
+# reference tables use refresh_mode: full, which is not the small-write/CDC profile, so
+# `cayenne_cdc_durability` does not apply to them — it is set only on the changes tables (the
+# runtime would otherwise warn and fall back to file).
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of in-memory CDC durability, not caching/history overhead.
+
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+
+  - from: postgres:warehouse
+    name: warehouse
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      primary_key: w_id
+      on_conflict:
+        w_id: upsert
+      params:
+        # Explicit even though memory is now the engine default: this pod IS
+        # the memory-durability variant, so its identity must not depend on
+        # the build's default.
+        cayenne_cdc_durability: memory
+        # Fewer, bigger checkpoints: flush at >=128MiB or 30s age (see header).
+        cayenne_cdc_mem_tier_min_flush_bytes: '134217728'
+        cayenne_cdc_mem_tier_max_age_ms: '30000'
+        # Per-table resident cap (the synchronous OOM backstop; the periodic
+        # tick owns age/size flushing and never blocks the writer).
+        cayenne_cdc_mem_tier_max_bytes: '1073741824'
+        # KEY deletes: position-mode serializes compaction with writers
+        # (try_lock starvation under continuous CDC = unbounded file/read-amp
+        # growth on the delete-receiving table), and key tombstones ride the
+        # memory tier — CDC Delete events are absorbed in RAM instead of
+        # forcing each delete-bearing burst onto the durable staged path.
+        cayenne_deletion_mode: key
+        # Fold protected snapshots faster so folding keeps pace with checkpoint inflow.
+        cayenne_compaction_background_interval_ms: '1000'
+
+  - from: postgres:district
+    name: district
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (d_w_id, d_id)
+      on_conflict:
+        (d_w_id, d_id): upsert
+
+  - from: postgres:customer
+    name: customer
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (c_w_id, c_d_id, c_id)
+      on_conflict:
+        (c_w_id, c_d_id, c_id): upsert
+
+  - from: postgres:new_order
+    name: new_order
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (no_w_id, no_d_id, no_o_id)
+      on_conflict:
+        (no_w_id, no_d_id, no_o_id): upsert
+
+  - from: postgres:oorder
+    name: oorder
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (o_w_id, o_d_id, o_id)
+      on_conflict:
+        (o_w_id, o_d_id, o_id): upsert
+
+  - from: postgres:order_line
+    name: order_line
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (ol_w_id, ol_d_id, ol_o_id, ol_number)
+      on_conflict:
+        (ol_w_id, ol_d_id, ol_o_id, ol_number): upsert
+
+  - from: postgres:stock
+    name: stock
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration:
+      <<: *cayenne_accel
+      primary_key: (s_w_id, s_i_id)
+      on_conflict:
+        (s_w_id, s_i_id): upsert
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # refresh_mode: full is not the small-write/CDC profile, so cayenne_cdc_durability
+  # does not apply here — left at the default (file).
+
+  - from: postgres:item
+    name: item
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: i_id
+      on_conflict:
+        i_id: upsert
+
+  - from: postgres:region
+    name: region
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: r_regionkey
+      on_conflict:
+        r_regionkey: upsert
+
+  - from: postgres:nation
+    name: nation
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: n_nationkey
+      on_conflict:
+        n_nationkey: upsert
+
+  - from: postgres:supplier
+    name: supplier
+    params:
+      <<: *postgres_params
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      primary_key: su_suppkey
+      on_conflict:
+        su_suppkey: upsert

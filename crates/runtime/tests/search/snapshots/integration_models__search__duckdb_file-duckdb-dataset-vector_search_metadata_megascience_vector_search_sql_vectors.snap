@@ -1,5 +1,0 @@
----
-source: crates/runtime/tests/search/mod.rs
-description: "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;"
----
-"HTTP error: 400 Bad Request - Execution error: Binder Error: HNSW indexes can only be created in in-memory databases, or when the configuration option 'hnsw_enable_experimental_persistence' is set to true."

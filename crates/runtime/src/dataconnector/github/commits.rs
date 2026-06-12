@@ -698,8 +698,8 @@ fn can_evaluate_ref_expr(expr: &Expr) -> bool {
                 column.name == "ref"
                     && matches!(op, Operator::Eq | Operator::NotEq)
                     && scalar_utf8_value(&value)
-                        .filter(|value| !value.is_empty())
-                        .is_some()
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty())
             } else {
                 false
             }

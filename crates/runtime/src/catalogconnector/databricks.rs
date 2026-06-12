@@ -36,7 +36,10 @@ use data_components::unity_catalog::CatalogId;
 use data_components::unity_catalog::Endpoint;
 use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
-use data_components::unity_catalog::provider::UnityCatalogProvider;
+use data_components::unity_catalog::credential_vending::VendedDeltaTableFactory;
+use data_components::unity_catalog::provider::{
+    ReadTableProviderFactory, UCTableProviderFactory, UnityCatalogProvider,
+};
 use datafusion::sql::TableReference;
 use runtime_rate_control::RateController;
 use runtime_secrets::get_params_with_secrets;
@@ -77,6 +80,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
+    ParameterSpec::component("credential_vending").description(
+        "When set to 'enabled' (requires 'mode' to be 'delta_lake'), short-lived storage credentials for each table are fetched from the Unity Catalog credential vending API instead of using static storage credentials. Defaults to 'disabled'.",
+    ),
     ParameterSpec::runtime("mode")
         .description("The execution mode for querying against Databricks.")
         .default("spark_connect"),
@@ -322,14 +328,44 @@ impl CatalogConnector for Databricks {
         let client = Arc::new(unity_catalog);
 
         let mode = self.params.get("mode").expose().ok();
-        let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
-            (
-                Arc::new(DeltaTableFactory::new(
+        let credential_vending = match params.get("credential_vending").expose().ok() {
+            Some("enabled") => true,
+            None | Some("disabled") => false,
+            Some(other) => {
+                return Err(super::Error::InvalidConfigurationNoSource {
+                    connector: "databricks".into(),
+                    message: format!(
+                        "Invalid value '{other}' for 'databricks_credential_vending'. Valid values: 'enabled', 'disabled'."
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                });
+            }
+        };
+        if credential_vending && mode != Some("delta_lake") {
+            return Err(super::Error::InvalidConfigurationNoSource {
+                connector: "databricks".into(),
+                message:
+                    "'databricks_credential_vending' is only supported when 'mode' is 'delta_lake'."
+                        .into(),
+                connector_component: ConnectorComponent::from(catalog),
+            });
+        }
+        let table_creator: Arc<dyn UCTableProviderFactory> = if mode == Some("delta_lake") {
+            if credential_vending {
+                Arc::new(VendedDeltaTableFactory::new(
+                    Arc::clone(&client),
                     params.to_secret_map(),
                     runtime.tokio_io_runtime(),
-                )) as Arc<dyn Read>,
-                table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
-            )
+                ))
+            } else {
+                Arc::new(ReadTableProviderFactory::new(
+                    Arc::new(DeltaTableFactory::new(
+                        params.to_secret_map(),
+                        runtime.tokio_io_runtime(),
+                    )) as Arc<dyn Read>,
+                    table_reference_creator_delta_lake,
+                ))
+            }
         } else if mode == Some("sql_warehouse") {
             let sql_warehouse_id = params.get("sql_warehouse_id").expose().ok_or_else(|p| {
                 super::Error::InvalidConfigurationNoSource {
@@ -375,10 +411,10 @@ impl CatalogConnector for Databricks {
                     connector_component: ConnectorComponent::from(catalog),
                 })?;
 
-            (
+            Arc::new(ReadTableProviderFactory::new(
                 Arc::new(read_provider) as Arc<dyn Read>,
-                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
-            )
+                table_reference_creator_spark,
+            ))
         } else {
             // Default to spark_connect
             let cluster_id = params.get("cluster_id").ok_or_else(|p| {
@@ -413,17 +449,16 @@ impl CatalogConnector for Databricks {
                 connector_component: ConnectorComponent::from(catalog),
             })?;
 
-            (
+            Arc::new(ReadTableProviderFactory::new(
                 Arc::new(read_provider) as Arc<dyn Read>,
-                table_reference_creator_spark as fn(&UCTable) -> Option<TableReference>,
-            )
+                table_reference_creator_spark,
+            ))
         };
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,
             CatalogId(catalog_id),
             table_creator,
-            table_reference_creator,
             catalog.include.clone(),
         )
         .await
@@ -604,6 +639,7 @@ mod tests {
             data_source_format: "DELTA".to_string(),
             columns: vec![],
             storage_location: storage_location.map(ToString::to_string),
+            table_id: None,
         }
     }
 
@@ -728,6 +764,7 @@ mod tests {
             data_source_format: "PARQUET".to_string(),
             columns: vec![],
             storage_location: Some("s3://bucket/orders".to_string()),
+            table_id: None,
         };
         let reference =
             table_reference_creator_spark(&table).expect("spark creator should always return Some");
@@ -791,7 +828,7 @@ mod tests {
         assert_eq!(config.statement_max_retries, 21);
         assert!(!config.disable_on_permanent_error);
         assert_eq!(config.connect_timeout, std::time::Duration::from_secs(5));
-        assert_eq!(config.request_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(config.request_timeout, std::time::Duration::from_mins(2));
     }
 
     #[test]

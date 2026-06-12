@@ -127,6 +127,8 @@ impl TryToDataFusion<ScalarValue> for Scalar {
             DType::FixedSizeList(..) => {
                 vortex_bail!("fixed-size list scalar conversion is not supported")
             }
+            DType::Union(..) => vortex_bail!("union scalar conversion is not supported"),
+            DType::Variant(_) => vortex_bail!("variant scalar conversion is not supported"),
             DType::Extension(ext) => {
                 let storage_scalar = self.as_extension().to_storage_scalar();
 
@@ -186,42 +188,54 @@ impl FromDataFusion<ScalarValue> for Scalar {
     fn from_df(value: &ScalarValue) -> VortexResult<Scalar> {
         Ok(match value {
             ScalarValue::Null => Scalar::null(DType::Null),
-            ScalarValue::Boolean(b) => b
-                .map(Scalar::from)
-                .unwrap_or_else(|| Scalar::null(DType::Bool(Nullability::Nullable))),
-            ScalarValue::Float16(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F16, Nullability::Nullable))
-            }),
-            ScalarValue::Float32(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F32, Nullability::Nullable))
-            }),
-            ScalarValue::Float64(f) => f.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::F64, Nullability::Nullable))
-            }),
-            ScalarValue::Int8(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I8, Nullability::Nullable))
-            }),
-            ScalarValue::Int16(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I16, Nullability::Nullable))
-            }),
-            ScalarValue::Int32(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable))
-            }),
-            ScalarValue::Int64(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable))
-            }),
-            ScalarValue::UInt8(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U8, Nullability::Nullable))
-            }),
-            ScalarValue::UInt16(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U16, Nullability::Nullable))
-            }),
-            ScalarValue::UInt32(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U32, Nullability::Nullable))
-            }),
-            ScalarValue::UInt64(i) => i.map(Scalar::from).unwrap_or_else(|| {
-                Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable))
-            }),
+            ScalarValue::Boolean(b) => b.map_or_else(
+                || Scalar::null(DType::Bool(Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float16(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float32(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Float64(f) => f.map_or_else(
+                || Scalar::null(DType::Primitive(PType::F64, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int8(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I8, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int16(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int32(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::Int64(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::I64, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt8(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U8, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt16(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U16, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt32(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U32, Nullability::Nullable)),
+                Scalar::from,
+            ),
+            ScalarValue::UInt64(i) => i.map_or_else(
+                || Scalar::null(DType::Primitive(PType::U64, Nullability::Nullable)),
+                Scalar::from,
+            ),
             ScalarValue::Utf8(s) | ScalarValue::Utf8View(s) | ScalarValue::LargeUtf8(s) => {
                 s.as_ref().map_or_else(
                     || Scalar::null(DType::Utf8(Nullability::Nullable)),
@@ -380,7 +394,9 @@ mod tests {
         #[case] vortex_scalar: Scalar,
         #[case] expected_df_scalar: ScalarValue,
     ) {
-        let result = vortex_scalar.try_to_df().unwrap();
+        let result = vortex_scalar
+            .try_to_df()
+            .expect("primitive vortex scalar should convert to df");
         assert_eq!(result, expected_df_scalar);
     }
 
@@ -396,7 +412,9 @@ mod tests {
         #[case] vortex_scalar: Scalar,
         #[case] expected_df_scalar: ScalarValue,
     ) {
-        let result = vortex_scalar.try_to_df().unwrap();
+        let result = vortex_scalar
+            .try_to_df()
+            .expect("bool/null vortex scalar should convert to df");
         assert_eq!(result, expected_df_scalar);
     }
 
@@ -418,7 +436,9 @@ mod tests {
         #[case] vortex_scalar: Scalar,
         #[case] expected_df_scalar: ScalarValue,
     ) {
-        let result = vortex_scalar.try_to_df().unwrap();
+        let result = vortex_scalar
+            .try_to_df()
+            .expect("string/binary vortex scalar should convert to df");
         assert_eq!(result, expected_df_scalar);
     }
 
@@ -475,7 +495,9 @@ mod tests {
         #[case] vortex_scalar: Scalar,
         #[case] expected_df_scalar: ScalarValue,
     ) {
-        let result = vortex_scalar.try_to_df().unwrap();
+        let result = vortex_scalar
+            .try_to_df()
+            .expect("decimal vortex scalar should convert to df");
         assert_eq!(result, expected_df_scalar);
     }
 
@@ -517,8 +539,12 @@ mod tests {
 
         // For non-null values, convert both back to DataFusion for comparison
         if !result.is_null() {
-            let result_df = result.try_to_df().unwrap();
-            let expected_df = expected_vortex.try_to_df().unwrap();
+            let result_df = result
+                .try_to_df()
+                .expect("converted vortex scalar should convert back to df");
+            let expected_df = expected_vortex
+                .try_to_df()
+                .expect("expected vortex scalar should convert to df");
             assert_eq!(result_df, expected_df);
         }
     }
@@ -606,7 +632,9 @@ mod tests {
     ))]
     #[case::binary(Scalar::binary(ByteBuffer::from(vec![1u8, 2, 3, 4, 5]), Nullability::NonNullable))]
     fn test_round_trip_conversions(#[case] original: Scalar) {
-        let df_scalar = original.try_to_df().unwrap();
+        let df_scalar = original
+            .try_to_df()
+            .expect("original vortex scalar should convert to df");
         let round_trip = Scalar::from_df(&df_scalar)
             .expect("round-trip DataFusion scalar should convert back to Vortex scalar");
 
@@ -627,8 +655,12 @@ mod tests {
 
         if !original.is_null() {
             // For non-null values, compare by converting both to DataFusion scalars
-            let original_df = original.try_to_df().unwrap();
-            let round_trip_df = round_trip.try_to_df().unwrap();
+            let original_df = original
+                .try_to_df()
+                .expect("original vortex scalar should convert to df for comparison");
+            let round_trip_df = round_trip
+                .try_to_df()
+                .expect("round-trip vortex scalar should convert to df for comparison");
             assert_eq!(
                 original_df, round_trip_df,
                 "Value mismatch for scalar: {:?}",
@@ -673,7 +705,9 @@ mod tests {
     )]
     fn test_null_handling(#[case] vortex_null: Scalar, #[case] expected_df_null: ScalarValue) {
         // Test Vortex -> DataFusion
-        let df_result = vortex_null.try_to_df().unwrap();
+        let df_result = vortex_null
+            .try_to_df()
+            .expect("null vortex scalar should convert to df");
         assert_eq!(df_result, expected_df_null);
 
         // Test DataFusion -> Vortex
@@ -694,7 +728,14 @@ mod tests {
     fn test_utf8_variants(#[case] variant: ScalarValue) {
         let result = Scalar::from_df(&variant)
             .expect("UTF-8 DataFusion scalar should convert to Vortex scalar");
-        assert_eq!(result.as_utf8().value().unwrap().as_str(), "test string");
+        assert_eq!(
+            result
+                .as_utf8()
+                .value()
+                .expect("converted scalar should hold a utf8 value")
+                .as_str(),
+            "test string"
+        );
     }
 
     #[rstest]
@@ -709,7 +750,7 @@ mod tests {
             .as_binary()
             .value()
             .cloned()
-            .unwrap()
+            .expect("converted scalar should hold a binary value")
             .into_inner()
             .into();
         assert_eq!(result_bytes, vec![1u8, 2, 3, 4, 5]);

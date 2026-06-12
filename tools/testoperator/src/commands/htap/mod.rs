@@ -17,6 +17,9 @@ limitations under the License.
 //! HTAP test command — runs concurrent TPC-C OLTP workload against the source
 //! Postgres database while executing CH-benCH analytical queries through spiced.
 
+mod correctness;
+mod reporting;
+mod spice;
 mod staleness;
 
 use std::sync::Arc;
@@ -68,14 +71,16 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let terminals = args.terminals.unwrap_or((scale_factor * 10.0) as usize);
     let duration = Duration::from_secs(test_args.common.duration);
     let driver: Arc<dyn chbench_driver::ChBenchDriver> =
-        Arc::new(prepare_chbench_source(scale_factor, terminals).await?);
+        Arc::new(prepare_chbench_source(scale_factor, terminals, args.rate).await?);
 
     // 2. Start spiced.
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(test_args.common.ready_wait))
@@ -103,6 +108,12 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
             KeyValue::new("scale_factor", scale_factor.to_string()),
             KeyValue::new("terminals", terminals.to_string()),
             KeyValue::new("duration_secs", duration.as_secs().to_string()),
+            KeyValue::new("concurrency", test_args.common.concurrency.to_string()),
+            KeyValue::new(
+                "target_oltp_rate",
+                args.rate
+                    .map_or_else(|| "unlimited".to_string(), |r| r.to_string()),
+            ),
         ])
         .build();
 
@@ -137,8 +148,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
 
     let (_, test_builder) = super::build_test_with_validation(
         test_args,
+        &app,
         NotStarted::new()
-            .with_parallel_count(1)
+            .with_parallel_count(test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 test_args.common.duration,
             )))
@@ -173,7 +185,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Htap)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
@@ -206,12 +221,35 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    // Calculate analytical throughput — QPH (queries per hour).
+    let completed_queries: usize = metrics.metrics.iter().map(|q| q.iterations).sum();
+    let elapsed = Duration::from_millis(
+        u64::try_from(metrics.finished_at.saturating_sub(metrics.started_at)).unwrap_or(0),
+    );
+    let elapsed_secs = elapsed.as_secs_f64();
+    #[expect(clippy::cast_precision_loss)]
+    let qph = if elapsed_secs > 0.0 {
+        completed_queries as f64 / elapsed_secs * 3600.0
+    } else {
+        0.0
+    };
+    crate::metrics::QPH.record(qph, &[]);
+
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
+    println!(
+        "  QPH (analytical queries/hour): {qph:.1} ({completed_queries} queries in {elapsed_secs:.1}s)"
+    );
 
     // 8. Report OLTP results.
     println!("\n=== TPC-C OLTP ===");
@@ -241,17 +279,127 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(metrics) = spiced_metrics {
+        reporting::emit_replication_metrics(&metrics, "under load", true);
+        // For Cayenne backend report additional metrics
+        reporting::emit_cayenne_read_amp_percentiles(&metrics);
+    }
+
+    // 10. Data-correctness gate: OLTP has stopped, so wait for replication to
+    //     fully drain (bounded by the test duration) and then assert that
+    //     source and Spice row counts match for every replicated table.
+    let probe_tables: Vec<String> = driver
+        .probe_tables()
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+    // One handle over both the query client and the low-level Flight client,
+    // reused by the correctness and analytical gates below.
+    let spice_clients = {
+        let query = spiced_instance.spice_client(None, true).await?;
+        let flight = spiced_instance.flight_client(None).await?;
+        spice::SpiceClients::new(query, flight)
+    };
+
+    let correctness_result = correctness::verify_after_drain(
+        Arc::clone(&driver),
+        &spice_clients,
+        &probe_tables,
+        duration,
+    )
+    .await;
+
     let health_report = health_monitor.stop().await;
 
-    if let Some(ref metrics) = spiced_metrics {
-        emit_replication_metrics(metrics);
+    let mut error_messages = Vec::new();
+
+    // Record correctness results (including OpenTelemetry metrics) before flushing telemetry below.
+    match correctness_result {
+        Ok(report) => {
+            report.emit();
+            // If replication failed to converge, re-scrape the live lag one more time for diagnostics
+            if report.converged_at.is_none() {
+                match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+                    Ok(metrics) => {
+                        reporting::emit_replication_metrics(
+                            &metrics,
+                            "post-drain re-scrape",
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to re-scrape replication metrics after non-convergence: {e}"
+                        );
+                    }
+                }
+            }
+            let row_count_message = report.failure_message();
+            if let Some(message) = row_count_message.clone() {
+                error_messages.push(message);
+            }
+
+            // Analytical-correctness gate runs only when the row-count gate fully passed (replication converged + every table matches).
+            // Otherwise the underlying data is known to diverge, so comparing analytical query results adds no signal.
+            if row_count_message.is_none() {
+                let query_overrides = test_args
+                    .query_overrides
+                    .clone()
+                    .map(test_framework::queries::QueryOverrides::from);
+                let analytical_result = correctness::verify_analytical_results(
+                    Arc::clone(&driver),
+                    &spice_clients,
+                    query_overrides,
+                )
+                .await;
+
+                match analytical_result {
+                    Ok(analytical) => {
+                        analytical.emit();
+                        if let Some(message) = analytical.failure_message() {
+                            error_messages.push(message);
+                        }
+                    }
+                    Err(e) => {
+                        error_messages.push(format!("HTAP analytical-query error: {e}"));
+                    }
+                }
+            } else {
+                println!("\nSkipping analytical-query gate — row-count gate did not pass");
+            }
+        }
+        Err(e) => {
+            error_messages.push(format!("HTAP data-correctness error: {e}"));
+        }
+    }
+
+    // For Cayenne backend report additional metrics
+    match crate::spiced_metrics::MetricsScraper::scrape_once().await {
+        Ok(final_metrics) => reporting::emit_cayenne_compaction_metrics(&final_metrics),
+        Err(e) => eprintln!("Failed to scrape final Cayenne compaction metrics: {e}"),
     }
 
     telemetry.emit().await?;
+
+    // Optional: hold spiced alive after the benchmark so you can run ad-hoc
+    // queries against it. Set SPICED_KEEP_ALIVE to block here until you press
+    // Enter; spiced is still serving on its usual HTTP (8090) / Flight ports.
+    if std::env::var_os("SPICED_KEEP_ALIVE").is_some() {
+        let workdir = spiced_instance
+            .get_tempdir_path()
+            .map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string());
+        println!(
+            "\nSPICED_KEEP_ALIVE set — spiced is still running for manual queries \
+             spiced working dir: {workdir}\n\
+             Press Enter to stop spiced and finish the run..."
+        );
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+    }
+
     spiced_instance.stop()?;
 
     let health_report = health_report?;
-    let mut error_messages = Vec::new();
 
     if !test_succeeded {
         error_messages.push(format!(
@@ -269,132 +417,4 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Emits replication metrics scraped from spiced's `/metrics` endpoint.
-fn emit_replication_metrics(metrics: &crate::spiced_metrics::SpicedMetrics) {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    // Collect replication metrics per dataset from scraped samples.
-    // Gauges (lag_ms, lag_bytes): use the last observed value — represents the
-    // pipeline state when the scraper stopped (while OLTP was still active).
-    // Counters (inserts, updates, deletes): use the last value (monotonic total).
-    let mut lag_ms: BTreeMap<String, f64> = BTreeMap::new();
-    let mut lag_bytes: BTreeMap<String, f64> = BTreeMap::new();
-    let mut inserts: BTreeMap<String, f64> = BTreeMap::new();
-    let mut updates: BTreeMap<String, f64> = BTreeMap::new();
-    let mut deletes: BTreeMap<String, f64> = BTreeMap::new();
-    let mut recv_errors: BTreeMap<String, f64> = BTreeMap::new();
-    let mut reconnects: BTreeMap<String, f64> = BTreeMap::new();
-
-    let gauge_metrics = [
-        (
-            "dataset_postgres_replication_lag_ms",
-            &mut lag_ms as &mut BTreeMap<String, f64>,
-        ),
-        ("dataset_postgres_replication_lag_bytes", &mut lag_bytes),
-    ];
-    let counter_metrics = [
-        (
-            "dataset_postgres_replication_inserts_total",
-            &mut inserts as &mut BTreeMap<String, f64>,
-        ),
-        ("dataset_postgres_replication_updates_total", &mut updates),
-        ("dataset_postgres_replication_deletes_total", &mut deletes),
-        (
-            "dataset_postgres_replication_recv_errors_total",
-            &mut recv_errors,
-        ),
-        (
-            "dataset_postgres_replication_reconnects_total",
-            &mut reconnects,
-        ),
-    ];
-
-    for (metric_name, map) in gauge_metrics {
-        if let Some(samples) = metrics.samples.get(metric_name) {
-            for sample in samples {
-                let dataset = sample
-                    .labels
-                    .get("name")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                // Gauge: last value wins (overwrites previous).
-                map.insert(dataset, sample.value);
-            }
-        }
-    }
-
-    for (metric_name, map) in counter_metrics {
-        if let Some(samples) = metrics.samples.get(metric_name) {
-            for sample in samples {
-                let dataset = sample
-                    .labels
-                    .get("name")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                // Counter: last observed value is the total.
-                map.insert(dataset, sample.value);
-            }
-        }
-    }
-
-    if lag_ms.is_empty()
-        && lag_bytes.is_empty()
-        && inserts.is_empty()
-        && updates.is_empty()
-        && deletes.is_empty()
-        && recv_errors.is_empty()
-        && reconnects.is_empty()
-    {
-        return;
-    }
-
-    println!("\nReplication Metrics (last scrape from spiced)");
-    // Header
-    println!(
-        "  {:<14} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "dataset",
-        "lag_ms",
-        "lag_bytes",
-        "inserts",
-        "updates",
-        "deletes",
-        "recv_errs",
-        "reconnects"
-    );
-
-    let all_datasets: BTreeSet<&String> = lag_ms
-        .keys()
-        .chain(lag_bytes.keys())
-        .chain(inserts.keys())
-        .chain(updates.keys())
-        .chain(deletes.keys())
-        .chain(recv_errors.keys())
-        .chain(reconnects.keys())
-        .collect();
-
-    let mut worst_lag_ms: f64 = 0.0;
-    for dataset in &all_datasets {
-        let l_ms = lag_ms.get(*dataset).copied().unwrap_or(0.0);
-        let l_bytes = lag_bytes.get(*dataset).copied().unwrap_or(0.0);
-        let ins = inserts.get(*dataset).copied().unwrap_or(0.0);
-        let upd = updates.get(*dataset).copied().unwrap_or(0.0);
-        let del = deletes.get(*dataset).copied().unwrap_or(0.0);
-        let recv = recv_errors.get(*dataset).copied().unwrap_or(0.0);
-        let reconn = reconnects.get(*dataset).copied().unwrap_or(0.0);
-        println!(
-            "  {dataset:<14} {l_ms:>10.0} {l_bytes:>12.0} {ins:>10.0} {upd:>10.0} {del:>10.0} {recv:>10.0} {reconn:>10.0}",
-        );
-
-        crate::metrics::REPLICATION_LAG_MS
-            .record(l_ms, &[KeyValue::new("dataset", (*dataset).clone())]);
-        if l_ms > worst_lag_ms {
-            worst_lag_ms = l_ms;
-        }
-    }
-    println!();
-
-    // Headline: worst replication lag across all datasets.
-    crate::metrics::REPLICATION_LAG_MS.record(worst_lag_ms, &[]);
 }

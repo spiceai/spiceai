@@ -1,0 +1,149 @@
+version: v1
+kind: Spicepod
+name: postgres-cayenne[file]-adaptive
+
+# Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
+# the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
+# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
+# within the environment-derived [floor, ceiling] as the workload shifts.
+#
+# `schema_inference: extended` (per dataset) does double duty here, so nothing else is hand-set:
+#   - It auto-detects the primary key, secondary indexes, and (non-CDC) sort columns from the
+#     PostgreSQL source and seeds an `upsert` on_conflict on the inferred PK — exactly what
+#     `refresh_mode: changes` needs to apply UPDATE/DELETE events. So PK / on_conflict / indexes
+#     are intentionally NOT declared below; inference fills them (it is gap-filling only and never
+#     overrides a user-set value, so declaring them would just suppress the very thing we test).
+#   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
+#     gates on; without extended inference adaptive silently falls back to `auto` (static).
+# Background compaction stays at the auto-derived (non-zero) default — the controller rides its
+# tick. No per-knob value is set anywhere: an explicit knob would *pin* it under adaptive
+# (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
+#
+# sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
+# comparison isolates the effect of adaptive tuning, not caching/history overhead.
+
+postgres_connection_params: &postgres_params
+  pg_host: 127.0.0.1
+  pg_port: 5432
+  pg_db: chbench
+  pg_user: bench
+  pg_pass: bench
+  pg_sslmode: disable
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: false
+
+datasets:
+  # ---- TPC-C core tables (mutated by OLTP workload) ----
+  # No primary_key / on_conflict / indexes: `schema_inference: extended` detects them from the
+  # PostgreSQL source and seeds the upsert on_conflict the CDC (changes) path requires.
+
+  - from: postgres:warehouse
+    name: warehouse
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_warehouse
+      pg_replication_initial_snapshot: 'true'
+    acceleration: &cayenne_accel
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: changes
+      params: &cayenne_params
+        cayenne_tuning: adaptive
+
+  - from: postgres:district
+    name: district
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_district
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:customer
+    name: customer
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_customer
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:new_order
+    name: new_order
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_new_order
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:oorder
+    name: oorder
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_oorder
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:order_line
+    name: order_line
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_order_line
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  - from: postgres:stock
+    name: stock
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+      pg_replication_slot: spice_stock
+      pg_replication_initial_snapshot: 'true'
+    acceleration: *cayenne_accel
+
+  # ---- Static reference tables (no OLTP mutations, full refresh) ----
+  # Same: PK / on_conflict / indexes come from extended inference.
+
+  - from: postgres:item
+    name: item
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: &cayenne_accel_full
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      params: *cayenne_params
+
+  - from: postgres:region
+    name: region
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:nation
+    name: nation
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full
+
+  - from: postgres:supplier
+    name: supplier
+    schema_inference: extended
+    params:
+      <<: *postgres_params
+    acceleration: *cayenne_accel_full

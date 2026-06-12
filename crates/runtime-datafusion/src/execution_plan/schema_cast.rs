@@ -52,7 +52,7 @@ pub struct SchemaCastScanExec {
     target_schema: SchemaRef,
     /// The actual output schema (target schema with nullability adjustments from input)
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SchemaCastScanExec {
@@ -119,12 +119,12 @@ impl SchemaCastScanExec {
         }
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             eq_properties,
             input.output_partitioning().clone(),
             emission_type,
             boundedness,
-        );
+        ));
         Self {
             input,
             target_schema: schema,
@@ -156,6 +156,10 @@ impl fmt::Debug for SchemaCastScanExec {
 // for example, the recently added `gather_filters_for_pushdown` defaults to `all_unsupported` but we likely want `from_children`
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for SchemaCastScanExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "SchemaCastScanExec"
     }
@@ -171,7 +175,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -254,11 +258,6 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         self.input.metrics()
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.input.statistics()
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
@@ -395,12 +394,12 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, true),
-            Field::new("fetched_at", DataType::Int64, true),
+            Field::new("_fetched_at", DataType::Int64, true),
         ]))
     }
 
     fn expected_output_schema() -> SchemaRef {
-        // User expects only 2 columns (no fetched_at)
+        // User expects only 2 columns (no _fetched_at)
         Arc::new(Schema::new(vec![
             Field::new("request_path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, true),
@@ -410,7 +409,7 @@ mod tests {
     #[test]
     fn test_schema_returns_expected_schema_not_input_schema() {
         // Simulates the cache HIT scenario from GitHub issue #9019:
-        // Input has 3 columns (including internal fetched_at), but user only requested 2 columns.
+        // Input has 3 columns (including internal _fetched_at), but user only requested 2 columns.
         // SchemaCastScanExec should return the expected 2-column schema, not the input's 3-column schema.
         let input = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
         let expected_schema = expected_output_schema();
@@ -421,7 +420,7 @@ mod tests {
         assert_eq!(
             actual_schema.fields().len(),
             2,
-            "Schema should have 2 fields, not 3 (fetched_at should be stripped)"
+            "Schema should have 2 fields, not 3 (_fetched_at should be stripped)"
         );
         assert_eq!(
             actual_schema.field(0).name(),

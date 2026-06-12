@@ -19,6 +19,8 @@ use std::{collections::HashMap, time::Duration};
 use bollard::secret::HealthConfig;
 #[cfg(feature = "duckdb")]
 use spicepod::acceleration::{OnConflictBehavior, RefreshMode};
+#[cfg(feature = "duckdb")]
+use spicepod::component::dataset::SchemaInference;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -29,8 +31,8 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
 const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
-const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
@@ -50,6 +52,23 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     if accelerated {
         dataset.acceleration = Some(Acceleration::default());
     }
+    dataset
+}
+
+/// Like [`make_mongodb_dataset`] (DuckDB-accelerated, full refresh) but opts into
+/// `schema_inference: extended` with no explicit primary key, so the runtime infers
+/// `_id` as the primary key and surfaces the collection's secondary indexes and sort
+/// order. The non-CDC counterpart to [`make_mongodb_change_stream_dataset_inferred`].
+#[cfg(feature = "duckdb")]
+pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    let mut dataset = make_mongodb_dataset(path, name, port, false);
+    dataset.schema_inference = SchemaInference::Extended;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    });
     dataset
 }
 
@@ -77,6 +96,39 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some("_id".to_string()),
         on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
+        ..Default::default()
+    });
+    dataset
+}
+
+/// Like [`make_mongodb_change_stream_dataset`] but omits `primary_key` and
+/// `on_conflict`, relying on `schema_inference: extended` to infer `_id` as the
+/// primary key (and seed the matching upsert) so `MongoDB` Streams work without
+/// manual configuration.
+#[cfg(feature = "duckdb")]
+pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port: u16) -> Dataset {
+    let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
+    let connection_string =
+        format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0&tls=false");
+    let params = HashMap::from([
+        ("mongodb_connection_string".to_string(), connection_string),
+        (
+            "change_stream_batch_max_duration".to_string(),
+            "100ms".to_string(),
+        ),
+        (
+            "change_stream_max_await_time".to_string(),
+            "100ms".to_string(),
+        ),
+        ("change_stream_batch_size".to_string(), "10".to_string()),
+    ]);
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    // No primary_key / on_conflict — extended inference supplies `_id` + upsert.
+    dataset.schema_inference = SchemaInference::Extended;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        refresh_mode: Some(RefreshMode::Changes),
         ..Default::default()
     });
     dataset

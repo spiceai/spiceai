@@ -1,0 +1,22 @@
+---
+source: crates/runtime/tests/search/mod.rs
+description: "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer, 4) WHERE subject != 'math' ORDER BY _score DESC, id"
+---
+[
+  {
+    "id": 890,
+    "_score": 0.263
+  },
+  {
+    "id": 1303,
+    "_score": 0.213
+  },
+  {
+    "id": 449,
+    "_score": 0.159
+  },
+  {
+    "id": 819,
+    "_score": 0.152
+  }
+]

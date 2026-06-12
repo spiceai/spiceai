@@ -18,7 +18,6 @@
         clippy::redundant_closure_for_method_calls,
         clippy::uninlined_format_args,
         clippy::unreadable_literal,
-        clippy::unwrap_used,
         reason = "vendored upstream tests intentionally keep upstream fixture style"
     )
 )]
@@ -52,6 +51,7 @@ where
         match self {
             Precision::Exact(v) => DFPrecision::Exact(v),
             Precision::Inexact(v) => DFPrecision::Inexact(v),
+            Precision::Absent => DFPrecision::Absent,
         }
     }
 }
@@ -110,7 +110,10 @@ mod common_tests {
                     factory.get_ext().to_uppercase(),
                     Arc::new(DefaultTableFactory::new()),
                 )
-                .with_object_store(&Url::try_from("file://").unwrap(), store.clone());
+                .with_object_store(
+                    &Url::try_from("file://").expect("file:// should parse as a URL"),
+                    store.clone(),
+                );
 
             if let Some(file_formats) = session_state_builder.file_formats() {
                 file_formats.push(factory as _);

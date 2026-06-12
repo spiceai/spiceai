@@ -28,14 +28,19 @@ pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_extract";
 pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_extract_all";
 
-/// Converts the `cosine_distance` UDF into `DuckDB` `array_cosine_distance` function:
-/// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
+/// Shared conversion for Spice vector UDFs that have a native `DuckDB` ARRAY
+/// equivalent taking two equal-length `FLOAT[N]` operands (e.g.
+/// `array_cosine_distance`, `array_inner_product`).
 ///
-///  - replaces `make_array` function with the array constructor (`make_array` is not supported in `DuckDB`)
-///  - casts to `DuckDB` Array (`FixedSizeList`)
-pub(crate) fn cosine_distance_to_sql(
+///  - replaces the `make_array` constructor with a `DuckDB` array literal
+///    (`make_array` is not supported in `DuckDB`)
+///  - applies the required `::FLOAT[N]` cast to array operands (only FLOAT
+///    embeddings are currently supported)
+///  - emits a call to `duckdb_fn`
+fn spice_array_fn_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
+    duckdb_fn: &str,
 ) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
     let ast_args: Vec<ast::Expr> = args
         .iter()
@@ -63,6 +68,7 @@ pub(crate) fn cosine_distance_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -80,6 +86,7 @@ pub(crate) fn cosine_distance_to_sql(
                         Some(num_elements),
                     )),
                     kind: ast::CastKind::DoubleColon,
+                    array: false,
                     format: None,
                 })
             }
@@ -89,9 +96,7 @@ pub(crate) fn cosine_distance_to_sql(
         .try_collect()?;
 
     let ast_fn = ast::Expr::Function(Function {
-        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
-            "array_cosine_distance",
-        ))]),
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(duckdb_fn))]),
         args: ast::FunctionArguments::List(ast::FunctionArgumentList {
             duplicate_treatment: None,
             args: ast_args
@@ -109,6 +114,26 @@ pub(crate) fn cosine_distance_to_sql(
     });
 
     Ok(Some(ast_fn))
+}
+
+/// Converts the `cosine_distance` UDF into `DuckDB`'s `array_cosine_distance`:
+/// `https://duckdb.org/docs/sql/functions/array.html#array_cosine_distancearray1-array2`
+pub(crate) fn cosine_distance_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    spice_array_fn_to_sql(unparser, args, "array_cosine_distance")
+}
+
+/// Converts the `inner_product` UDF into `DuckDB`'s `array_inner_product` (dot
+/// product, `sum(a[i] * b[i])`): both compute the same value, so federating the
+/// call to `DuckDB` (>= 1.5.3) is exact.
+/// `https://duckdb.org/docs/sql/functions/array.html#array_inner_productarray1-array2`
+pub(crate) fn inner_product_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    spice_array_fn_to_sql(unparser, args, "array_inner_product")
 }
 
 /// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
@@ -139,6 +164,7 @@ pub(crate) fn array_distance_to_sql(
                 Some(n),
             )),
             kind: ast::CastKind::DoubleColon,
+            array: false,
             format: None,
         }
     };
@@ -204,82 +230,74 @@ pub(super) enum DuckDBRegexpFunction {
 impl DuckDBRegexpFunction {
     fn process_args(&self, ast_args: &mut Vec<FunctionArg>) -> Result<(), DataFusionError> {
         match self {
-            DuckDBRegexpFunction::Match => {
-                if ast_args.len() == 3 {
-                    // regexp_extract has 4 positional args, position 3 = group not flags
-                    // bump flags to 4, insert default 0 group
-                    ast_args.insert(
-                        2,
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                            ValueWithSpan {
-                                value: sqlparser::ast::Value::Number("0".to_string(), false),
-                                span: sqlparser::tokenizer::Span::empty(),
-                            },
-                        ))),
-                    );
-                }
+            DuckDBRegexpFunction::Match if ast_args.len() == 3 => {
+                // regexp_extract has 4 positional args, position 3 = group not flags
+                // bump flags to 4, insert default 0 group
+                ast_args.insert(
+                    2,
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(ValueWithSpan {
+                        value: sqlparser::ast::Value::Number("0".to_string(), false),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    }))),
+                );
             }
-            DuckDBRegexpFunction::Count => {
-                if ast_args.len() == 3 {
-                    // arg #3 is start position
-                    // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
-                    let Some(start_arg) = ast_args.get(2) else {
-                        unreachable!("start_arg should be present")
-                    };
+            DuckDBRegexpFunction::Count if ast_args.len() == 3 => {
+                // arg #3 is start position
+                // DuckDB has no equivalent for column or function name, but we can use list slicing if an integer start is specified
+                let Some(start_arg) = ast_args.get(2) else {
+                    unreachable!("start_arg should be present")
+                };
 
-                    match start_arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
-                            ValueWithSpan {
-                                value: sqlparser::ast::Value::Number(num_str, _),
-                                ..
-                            },
-                        ))) => {
-                            let start: u64 = num_str.parse().map_err(|e| {
+                match start_arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Value(
+                        ValueWithSpan {
+                            value: sqlparser::ast::Value::Number(num_str, _),
+                            ..
+                        },
+                    ))) => {
+                        let start: u64 = num_str.parse().map_err(|e| {
                             DataFusionError::Plan(format!(
                                 "Could not parse start position {num_str} as integer for function {}: {e}", self.federated_function_name()
                             ))
                         })?;
-                            // DuckDB uses 0-based indexing, DataFusion uses 1-based indexing
-                            if start < 1 {
-                                return Err(DataFusionError::Plan(format!(
-                                    "Start position must be a positive integer for regular expression function {}, received {start}",
-                                    self.federated_function_name()
-                                )));
-                            }
-                            let duckdb_start = start - 1;
-                            ast_args.remove(2);
-
-                            // wrap the input column/value with a substring. ``substring(string, start[, length])``
-                            // length can be omitted as only the start value is specified
-                            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
-                                ast_args.first()
-                            else {
-                                unreachable!("input_arg should be present")
-                            };
-
-                            ast_args[0] =
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
-                                    expr: Box::new(expr.clone()),
-                                    substring_from: Some(Box::new(ast::Expr::Value(
-                                        ValueWithSpan {
-                                            value: sqlparser::ast::Value::Number(
-                                                duckdb_start.to_string(),
-                                                false,
-                                            ),
-                                            span: sqlparser::tokenizer::Span::empty(),
-                                        },
-                                    ))),
-                                    substring_for: None,
-                                    special: true,
-                                    shorthand: false,
-                                }));
-                        }
-                        _ => {
+                        // DuckDB uses 0-based indexing, DataFusion uses 1-based indexing
+                        if start < 1 {
                             return Err(DataFusionError::Plan(format!(
-                                "Only integer start positions are supported for regular expression function {} with DuckDB",
+                                "Start position must be a positive integer for regular expression function {}, received {start}",
                                 self.federated_function_name()
                             )));
                         }
+                        let duckdb_start = start - 1;
+                        ast_args.remove(2);
+
+                        // wrap the input column/value with a substring. ``substring(string, start[, length])``
+                        // length can be omitted as only the start value is specified
+                        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
+                            ast_args.first()
+                        else {
+                            unreachable!("input_arg should be present")
+                        };
+
+                        ast_args[0] =
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(ast::Expr::Substring {
+                                expr: Box::new(expr.clone()),
+                                substring_from: Some(Box::new(ast::Expr::Value(ValueWithSpan {
+                                    value: sqlparser::ast::Value::Number(
+                                        duckdb_start.to_string(),
+                                        false,
+                                    ),
+                                    span: sqlparser::tokenizer::Span::empty(),
+                                }))),
+                                substring_for: None,
+                                special: true,
+                                shorthand: false,
+                            }));
+                    }
+                    _ => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Only integer start positions are supported for regular expression function {} with DuckDB",
+                            self.federated_function_name()
+                        )));
                     }
                 }
             }
@@ -488,6 +506,36 @@ mod tests {
     }
 
     #[test]
+    fn test_inner_product_to_sql_column_and_scalar() {
+        // inner_product(column, [4,5,6]) must unparse to DuckDB's native
+        // array_inner_product with the ::FLOAT[N] casts the array functions need.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let args = vec![
+            Expr::Column(Column {
+                relation: Some(TableReference::from("table_name")),
+                name: "embedding".to_string(),
+                spans: Spans::new(),
+            }),
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array_udf(),
+                vec![
+                    Expr::Literal(ScalarValue::Float32(Some(4.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(5.0)), None),
+                    Expr::Literal(ScalarValue::Float32(Some(6.0)), None),
+                ],
+            )),
+        ];
+
+        let result = inner_product_to_sql(&unparser, &args)
+            .expect("should execute successfully")
+            .expect("should return expression");
+        let expected =
+            r#"array_inner_product("table_name"."embedding", [4.0, 5.0, 6.0]::FLOAT[3])"#;
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
     fn test_array_distance_to_sql_literal_and_column() {
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
@@ -523,5 +571,45 @@ mod tests {
 
         let expected = "array_distance([0.1, 0.2]::FLOAT[2], [0.3, 0.4]::FLOAT[2])";
         assert_eq!(result.to_string(), expected);
+    }
+
+    #[test]
+    fn test_rand_to_random() {
+        // `rand` is a deny-listed Spice function that the federation deny-list
+        // nonetheless lets push down to DuckDB *because* this dialect rewrites it
+        // into DuckDB's native `random()`. This test backs that pushdown claim:
+        // if the rewrite ever broke, pushing `rand` to DuckDB would emit invalid
+        // SQL.
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let result = rand_to_random(&unparser, &[])
+            .expect("should execute successfully")
+            .expect("should return expression");
+        assert_eq!(result.to_string(), "random()");
+    }
+
+    #[test]
+    fn duckdb_native_function_names_advertises_denylisted_pushables() {
+        // The federation deny-list relies on these names to let `cosine_distance`
+        // and `rand` push down to DuckDB, so the dialect must advertise them.
+        let names = crate::dialect::duckdb_native_function_names();
+        assert!(
+            names.contains(&runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME),
+            "duckdb_native_function_names() missing cosine_distance; got {names:?}"
+        );
+        assert!(
+            names.contains(&runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME),
+            "duckdb_native_function_names() missing inner_product; got {names:?}"
+        );
+        assert!(
+            names.contains(&"rand"),
+            "duckdb_native_function_names() missing rand; got {names:?}"
+        );
+        // Derived from the same override list, so they cannot drift.
+        assert_eq!(
+            names.len(),
+            crate::dialect::duckdb_scalar_overrides().len(),
+            "name list and scalar-override list must have the same length"
+        );
     }
 }

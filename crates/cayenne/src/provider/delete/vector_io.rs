@@ -48,6 +48,12 @@ use uuid::Uuid;
 use crate::metadata::{DeleteFile, DeletionType, TableMetadata};
 use crate::provider::{Error, Result};
 
+#[derive(Debug, Clone, Copy)]
+struct KeyDeletionReadState {
+    delete_sequence: i64,
+    reinsert_sequence: Option<i64>,
+}
+
 /// Directory under the table snapshot where deletion vectors are stored.
 const DELETION_DIR_NAME: &str = "deletions";
 /// File extension used for deletion-vector files.
@@ -194,115 +200,152 @@ impl<'a> DeletionVectorWriter<'a> {
         &self,
         specs: Vec<DeletionVectorWriteSpec>,
     ) -> Result<Vec<DeletionVectorWriteResult>> {
-        let mut results = Vec::with_capacity(specs.len());
+        let specs: Vec<DeletionVectorWriteSpec> =
+            specs.into_iter().filter(|spec| !spec.is_empty()).collect();
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        for spec in specs {
-            if spec.is_empty() {
-                continue;
+        let deletion_dir = self.table_snapshot_deletion_dir();
+        let snapshot_dir = deletion_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| Error::Internal {
+                table: self.table.path.clone(),
+                message: format!(
+                    "Deletion vector directory '{}' has no snapshot parent",
+                    deletion_dir.display()
+                ),
+            })?;
+
+        // Ensure the deletions/ subdirectory exists (once per call — it was
+        // previously re-checked per spec, a no-op after the first).
+        // If we just created it, sync its parent (the snapshot directory)
+        // so the subdir entry is durable on local FS.
+        //
+        // This is required for the same contract we now enforce for
+        // snapshot directories themselves (ensure_snapshot_dir_exists)
+        // and for the _partitioned_wal/ coordination directory:
+        // on POSIX, mkdir in a directory updates the parent's metadata.
+        // A crash immediately after this create_dir_all but before the
+        // subsequent file write + file fsync + catalog record could
+        // otherwise leave a catalog entry pointing at a deletions/
+        // directory whose creation was lost.
+        //
+        // The sync is one-time per snapshot (first deletion vector
+        // written to it). Subsequent deletions reuse the directory.
+        let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
+            Ok(()) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir_all(&deletion_dir).await?;
+                true
             }
+            Err(source) => return Err(Error::IoError { source }),
+        };
+        if sync_snapshot_parent {
+            let table = self.table.path.clone();
+            // Directory ordering tier (plain fsync on macOS, full fsync
+            // on other platforms) — see `provider/fsync_tier.rs`.
+            tokio::task::spawn_blocking(move || {
+                let dir = std::fs::File::open(&snapshot_dir)?;
+                crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
+            })
+            .await
+            .map_err(|source| Error::TaskPanicked { table, source })??;
+        }
 
-            let deletion_dir = self.table_snapshot_deletion_dir();
-            let snapshot_dir = deletion_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| Error::Internal {
-                    table: self.table.path.clone(),
-                    message: format!(
-                        "Deletion vector directory '{}' has no snapshot parent",
-                        deletion_dir.display()
-                    ),
-                })?;
-
-            // Ensure the deletions/ subdirectory exists.
-            // If we just created it, sync its parent (the snapshot directory)
-            // so the subdir entry is durable on local FS.
-            //
-            // This is required for the same contract we now enforce for
-            // snapshot directories themselves (ensure_snapshot_dir_exists)
-            // and for the _partitioned_wal/ coordination directory:
-            // on POSIX, mkdir in a directory updates the parent's metadata.
-            // A crash immediately after this create_dir_all but before the
-            // subsequent file write + file fsync + catalog record could
-            // otherwise leave a catalog entry pointing at a deletions/
-            // directory whose creation was lost.
-            //
-            // The sync is one-time per snapshot (first deletion vector
-            // written to it). Subsequent deletions reuse the directory.
-            let sync_snapshot_parent = match tokio::fs::create_dir(&deletion_dir).await {
-                Ok(()) => true,
-                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    tokio::fs::create_dir_all(&deletion_dir).await?;
-                    true
-                }
-                Err(source) => return Err(Error::IoError { source }),
-            };
-            if sync_snapshot_parent {
-                let table = self.table.path.clone();
-                tokio::task::spawn_blocking(move || std::fs::File::open(&snapshot_dir)?.sync_all())
-                    .await
-                    .map_err(|source| Error::TaskPanicked { table, source })??;
-            }
-
+        // Write every spec's deletion-vector file CONCURRENTLY. The files are
+        // independent (one per spec, UUIDv7 filenames), so their writes + file
+        // fsyncs overlap on the blocking pool — on network-attached storage
+        // (EBS) this turns N serialized ~1 ms fsync round-trips into ~1 round
+        // of in-flight barriers. `try_join_all` preserves spec order in the
+        // returned results.
+        let write_futures = specs.into_iter().map(|spec| {
             let file_path = Self::deletion_file_path(&deletion_dir);
-
-            let (batch, schema, count, identifiers, source_data_file_path) = match spec.identifiers
-            {
-                DeletionIdentifier::PositionBased {
-                    file_path: source_file,
-                    mut row_ids,
-                    pre_sorted,
-                } => {
-                    if pre_sorted {
-                        debug_assert!(
-                            row_ids.windows(2).all(|w| w[0] < w[1]),
-                            "pre_sorted=true but row_ids is not strictly increasing",
-                        );
-                    } else {
-                        row_ids.sort_unstable();
-                        row_ids.dedup();
-                    }
-                    let count = row_ids.len();
-                    let schema = position_based_deletion_schema();
-                    let batch = build_position_based_batch(&schema, &row_ids)?;
-                    (
-                        batch,
-                        schema,
-                        count,
+            let table_name = self.table.table_name.clone();
+            async move {
+                let (batch, schema, count, identifiers, source_data_file_path) =
+                    match spec.identifiers {
                         DeletionIdentifier::PositionBased {
-                            file_path: source_file.clone(),
-                            row_ids,
+                            file_path: source_file,
+                            mut row_ids,
                             pre_sorted,
-                        },
-                        Some(source_file),
-                    )
-                }
-                DeletionIdentifier::KeyBased(mut row_keys) => {
-                    // Sort and deduplicate keys
-                    row_keys.sort();
-                    row_keys.dedup();
-                    let count = row_keys.len();
-                    let schema = key_based_deletion_schema();
-                    let batch = build_key_based_batch(&schema, &row_keys)?;
-                    (
-                        batch,
-                        schema,
-                        count,
-                        DeletionIdentifier::KeyBased(row_keys),
-                        None,
-                    )
-                }
-            };
+                        } => {
+                            if pre_sorted {
+                                debug_assert!(
+                                    row_ids.windows(2).all(|w| w[0] < w[1]),
+                                    "pre_sorted=true but row_ids is not strictly increasing",
+                                );
+                            } else {
+                                row_ids.sort_unstable();
+                                row_ids.dedup();
+                            }
+                            let count = row_ids.len();
+                            let schema = position_based_deletion_schema();
+                            let batch = build_position_based_batch(&schema, &row_ids)?;
+                            (
+                                batch,
+                                schema,
+                                count,
+                                DeletionIdentifier::PositionBased {
+                                    file_path: source_file.clone(),
+                                    row_ids,
+                                    pre_sorted,
+                                },
+                                Some(source_file),
+                            )
+                        }
+                        DeletionIdentifier::KeyBased(mut row_keys) => {
+                            // Sort and deduplicate keys
+                            row_keys.sort();
+                            row_keys.dedup();
+                            let count = row_keys.len();
+                            let schema = key_based_deletion_schema();
+                            let batch = build_key_based_batch(&schema, &row_keys)?;
+                            (
+                                batch,
+                                schema,
+                                count,
+                                DeletionIdentifier::KeyBased(row_keys),
+                                None,
+                            )
+                        }
+                    };
 
-            let file_size_bytes = write_deletion_file(
-                &file_path,
-                Arc::clone(&schema),
-                batch,
-                &self.table.table_name,
-            )
-            .await?;
+                let file_size_bytes =
+                    write_deletion_file(&file_path, Arc::clone(&schema), batch, &table_name)
+                        .await?;
 
-            // Determine deletion type from identifiers
+                Ok::<_, Error>((
+                    file_path,
+                    count,
+                    file_size_bytes,
+                    identifiers,
+                    source_data_file_path,
+                ))
+            }
+        });
+        let written = futures::future::try_join_all(write_futures).await?;
+
+        // ONE coalesced deletions/-dir sync for the whole batch of files
+        // (replaces the previous per-file parent-dir fsync): a directory fsync
+        // flushes ALL of its pending entries, so syncing once after every file
+        // exists provides the same dirent durability at 1/N the barrier count.
+        // Must complete before the catalog records any of the paths.
+        {
+            let table = self.table.path.clone();
+            let deletion_dir_for_sync = deletion_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let dir = std::fs::File::open(&deletion_dir_for_sync)?;
+                crate::provider::fsync_tier::ordering_sync_dir_std(&dir)
+            })
+            .await
+            .map_err(|source| Error::TaskPanicked { table, source })??;
+        }
+
+        let mut results = Vec::with_capacity(written.len());
+        for (file_path, count, file_size_bytes, identifiers, source_data_file_path) in written {
             let deletion_type = match &identifiers {
                 DeletionIdentifier::PositionBased { .. } => DeletionType::PositionBased,
                 DeletionIdentifier::KeyBased(_) => DeletionType::KeyBased,
@@ -358,9 +401,10 @@ impl<'a> DeletionVectorWriter<'a> {
 ///
 /// # Returns
 ///
-/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence)`.
+/// A tuple of `(per_file_row_ids, key_based_row_keys_with_sequence, reinserted_row_keys)`.
 /// - `per_file_row_ids`: Map of source data file path -> `RoaringBitmap` of deleted row positions
 /// - `key_based_row_keys_with_sequence`: Map of PK bytes -> max delete sequence number
+/// - `reinserted_row_keys`: Map of PK bytes -> max reinsert sequence number derived from delete-file metadata
 ///
 /// # Errors
 ///
@@ -368,9 +412,17 @@ impl<'a> DeletionVectorWriter<'a> {
 #[expect(clippy::type_complexity)]
 pub fn detect_deletion_type_and_read(
     delete_files: Vec<DeleteFile>,
-) -> datafusion_common::Result<(HashMap<String, RoaringBitmap>, HashMap<Box<[u8]>, i64>)> {
+) -> datafusion_common::Result<(
+    HashMap<String, RoaringBitmap>,
+    HashMap<Box<[u8]>, i64>,
+    HashMap<Box<[u8]>, i64>,
+)> {
     let mut per_file_row_ids: HashMap<String, RoaringBitmap> = HashMap::new();
-    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    // Metadata-only publish: keep delete and reinsert sequence state in one map
+    // while reading key-based vectors. This avoids cloning every key in the hot
+    // read loop just to update a second map; the legacy return shape is derived
+    // once after all files are scanned.
+    let mut key_row_state: HashMap<Box<[u8]>, KeyDeletionReadState> = HashMap::new();
     let file_count = delete_files.len();
 
     tracing::debug!(
@@ -408,6 +460,10 @@ pub fn detect_deletion_type_and_read(
 
         // Get the sequence number for this delete file (for sequence-based ordering)
         let file_sequence = delete_file.sequence_number;
+        // Metadata-only publish: the per-commit reinsert sequence carried on this
+        // file's row (None for legacy rows / pure deletes — those fall back to the
+        // `cayenne_insert_record` table at the load site).
+        let file_reinsert = delete_file.reinsert_sequence;
 
         for batch_result in reader {
             let batch = batch_result.map_err(|e| {
@@ -431,11 +487,18 @@ pub fn detect_deletion_type_and_read(
                 for i in 0..row_key_array.len() {
                     if !row_key_array.is_null(i) {
                         let key = row_key_array.value(i).to_vec().into_boxed_slice();
-                        // Track max delete sequence for each PK
-                        deleted_row_keys
-                            .entry(key)
-                            .and_modify(|seq| *seq = (*seq).max(file_sequence))
-                            .or_insert(file_sequence);
+                        let entry = key_row_state.entry(key).or_insert(KeyDeletionReadState {
+                            delete_sequence: file_sequence,
+                            reinsert_sequence: file_reinsert,
+                        });
+                        entry.delete_sequence = entry.delete_sequence.max(file_sequence);
+                        if let Some(reinsert) = file_reinsert {
+                            entry.reinsert_sequence = Some(
+                                entry
+                                    .reinsert_sequence
+                                    .map_or(reinsert, |seq| seq.max(reinsert)),
+                            );
+                        }
                     }
                 }
             } else {
@@ -484,6 +547,15 @@ pub fn detect_deletion_type_and_read(
         );
     }
 
+    let mut deleted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(key_row_state.len());
+    let mut reinserted_row_keys: HashMap<Box<[u8]>, i64> = HashMap::new();
+    for (key, state) in key_row_state {
+        if let Some(reinsert_sequence) = state.reinsert_sequence {
+            reinserted_row_keys.insert(key.clone(), reinsert_sequence);
+        }
+        deleted_row_keys.insert(key, state.delete_sequence);
+    }
+
     let total_position_based: u64 = per_file_row_ids.values().map(RoaringBitmap::len).sum();
     tracing::debug!(
         "Loaded {} position-based deletions across {} files + {} key-based deleted rows from {} deletion vector files",
@@ -493,7 +565,7 @@ pub fn detect_deletion_type_and_read(
         file_count
     );
 
-    Ok((per_file_row_ids, deleted_row_keys))
+    Ok((per_file_row_ids, deleted_row_keys, reinserted_row_keys))
 }
 
 // ============================================================================
@@ -559,33 +631,30 @@ async fn write_deletion_file(
         //
         // 1. Stream Arrow IPC into the file.
         // 2. Recover the underlying std::fs::File from the writer and fsync
-        //    its data (sync_all flushes data + metadata). A previous revision
-        //    also re-opened the file to fsync it a second time — that
-        //    reopen+fsync was redundant work on every delete and has been
-        //    removed.
-        // 3. fsync the parent directory so the new directory entry is durable
-        //    across a power-loss restart — without this, the catalog can
-        //    record a delete file path that fails to resolve after a crash
-        //    because the file's inode is on disk but the dirent isn't.
+        //    its data with the ordering tier (`fsync_tier::ordering_sync_std`:
+        //    plain fsync on macOS, fdatasync on Linux — on macOS both std
+        //    `sync_all` AND `sync_data` are F_FULLFSYNC ~4-5 ms, while the
+        //    catalog commit referencing this file is SQLite
+        //    synchronous=NORMAL, so a full drive-cache flush here cannot
+        //    raise end-to-end durability; see `provider/fsync_tier.rs`). A
+        //    previous revision also re-opened the file to fsync it a second
+        //    time — that reopen+fsync was redundant work on every delete and
+        //    has been removed.
+        //
+        // The parent-directory fsync (so the new dirent is written through
+        // before the catalog records the path) is NOT done here: the caller
+        // (`DeletionVectorWriter::write`) writes all of a batch's deletion
+        // files concurrently and issues ONE coalesced deletions/-dir sync
+        // after they complete — same dirent durability, 1/N the barriers.
         let file = std::fs::File::create(&output_path)?;
         let mut writer = FileWriter::try_new(file, &schema)?;
         writer.write(&batch)?;
         writer.finish()?;
         let inner = writer.into_inner()?;
-        inner.sync_all()?;
+        crate::provider::fsync_tier::ordering_sync_std(&inner)?;
         drop(inner);
 
         let metadata = std::fs::metadata(&output_path)?;
-
-        // Best-effort parent-dir fsync. Matches the partitioned_wal /
-        // staging_wal write patterns: a failure here is unusual and logged
-        // by the caller; the deletion file's content is already durable
-        // regardless.
-        if let Some(parent) = output_path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
 
         Ok(metadata.len())
     })
@@ -625,6 +694,10 @@ fn build_delete_file(
         deletion_type,
         // Sequence number is set by the caller after getting the current sequence from catalog
         sequence_number: table.current_sequence_number,
+        // Metadata-only publish: the per-commit reinsert sequence is stamped by the
+        // catalog commit (it owns the upsert's insert_sequence); a freshly built
+        // file is None until then. Pure deletes / position files keep None.
+        reinsert_sequence: None,
     })
 }
 

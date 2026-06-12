@@ -402,6 +402,7 @@ impl DataConnector for DynamoDB {
             Arc::clone(&self.metrics_collector),
             parse_json_nesting_static_fields(dataset)?.as_ref(),
             write_parallelism,
+            dataset.schema.clone(),
         )
         .await
         .map_err(|e| DataConnectorError::UnableToGetReadProvider {
@@ -409,6 +410,22 @@ impl DataConnector for DynamoDB {
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })?;
+
+        let is_changes_mode = dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|a| a.enabled && a.refresh_mode == Some(RefreshMode::Changes));
+
+        if is_changes_mode && !provider.streams_enabled() {
+            return Err(DataConnectorError::UnableToGetReadProvider {
+                dataconnector: "dynamodb".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(data_components::dynamodb::Error::StreamsNotEnabled {
+                    table_name: table_name.to_string(),
+                }),
+            });
+        }
+
         Ok(Arc::new(provider))
     }
 
@@ -692,7 +709,7 @@ fn resume_from_checkpoint_stream(
                         Duration::from_secs(CHECKPOINT_EXPIRATION_HOURS * 60 * 60);
                     let checkpoint_age = checkpoint_updated_at
                         .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .unwrap_or(Duration::from_secs(24 * 60 * 60)); // Assume old if no timestamp
+                        .unwrap_or(Duration::from_hours(24)); // Assume old if no timestamp
 
                     if checkpoint_age < CHECKPOINT_AGE_THRESHOLD {
                         // Checkpoint is fresh (<18h), ShardNotFound is unexpected - propagate error

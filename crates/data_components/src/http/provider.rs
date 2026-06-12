@@ -729,7 +729,7 @@ impl HttpTableProvider {
             ensure!(
                 path.starts_with('/'),
                 ConfigurationSnafu {
-                    message: format!("health_probe path must start with '/'. Got: '{path}'",)
+                    message: format!("health_probe path must start with '/'. Got: '{path}'")
                 }
             );
             ensure!(
@@ -850,7 +850,7 @@ impl HttpTableProvider {
                 true,
             ),
             Field::new(
-                "fetched_at",
+                "_fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 true,
             ),
@@ -1504,7 +1504,7 @@ pub struct HttpExec {
     provider: Arc<HttpTableProvider>,
     partitions: Vec<PartitionSpec>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// When `true`, the partitions are a template that will be expanded
     /// at runtime by `HttpWithDeferredParamsExec`. Display shows `partitions=deferred`.
     deferred_partitions: bool,
@@ -1548,12 +1548,12 @@ impl HttpExec {
         partitions: Vec<PartitionSpec>,
         limit: Option<usize>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
             Partitioning::UnknownPartitioning(partitions.len()),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             projected_schema,
             provider,
@@ -1818,7 +1818,7 @@ impl HttpExec {
                 }
                 Ok(Arc::new(builder.finish()) as ArrayRef)
             }
-            "fetched_at" => {
+            "_fetched_at" => {
                 use arrow::array::TimestampNanosecondArray;
                 Ok(Arc::new(TimestampNanosecondArray::from(vec![
                     timestamp_nanos;
@@ -1831,7 +1831,7 @@ impl HttpExec {
         }
     }
 
-    /// Compute the per-batch `fetched_at` timestamp in nanoseconds since
+    /// Compute the per-batch `_fetched_at` timestamp in nanoseconds since
     /// the Unix epoch, preferring the response `Date` header and falling
     /// back to the current system time.
     fn compute_fetched_at_nanos(fetch_result: &HttpFetchResult) -> DataFusionResult<i64> {
@@ -2091,7 +2091,7 @@ impl ExecutionPlan for HttpExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -4234,7 +4234,7 @@ mod tests {
         assert_eq!(schema.field(4).name(), "content");
         assert_eq!(schema.field(5).name(), "response_status");
         assert_eq!(schema.field(6).name(), "response_headers");
-        assert_eq!(schema.field(7).name(), "fetched_at");
+        assert_eq!(schema.field(7).name(), "_fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
@@ -4256,7 +4256,7 @@ mod tests {
         assert!(!schema.field(4).is_nullable()); // content is not nullable
         assert!(!schema.field(5).is_nullable()); // response_status is not nullable
         assert!(schema.field(6).is_nullable()); // response_headers is nullable
-        assert!(schema.field(7).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(7).is_nullable()); // _fetched_at is nullable
     }
 
     #[tokio::test]
@@ -4265,7 +4265,7 @@ mod tests {
         let request_headers = r#"{"x-sandbox-id":"sandbox-1"}"#.to_string();
         let fetch_result = HttpFetchResult {
             content: r#"[{"id":1},{"id":2}]"#.to_string(),
-            max_age: Duration::from_secs(60),
+            max_age: Duration::from_mins(1),
             detected_format: "json".to_string(),
             response_date: None,
             response_status: 200,
@@ -6852,6 +6852,47 @@ mod tests {
         assert_eq!(details[0].as_deref(), Some("[1,2,3]"));
         assert_eq!(details[1].as_deref(), Some("\"scalar\""));
         assert_eq!(details[2].as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_non_json_rows_are_preserved() {
+        // Regression for https://github.com/spiceai/spiceai/issues/11155.
+        // A `SELECT *` against an HTTP dataset that declares `columns:`
+        // used to crash with "Internal Error" when the endpoint returned a
+        // non-JSON body (e.g. fetching the base URL with no path). The
+        // batch builder must instead preserve the raw row and produce
+        // NULL static fields.
+        let (exec, nesting) = nested_exec(&["id", "details"], "details");
+        let rows = vec![
+            "<!DOCTYPE html><html>not json</html>".to_string(),
+            String::new(),                   // empty body (e.g. 5xx)
+            r#"{"id": "abc", "#.to_string(), // truncated/malformed JSON
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(
+                None,
+                None,
+                None,
+                None,
+                &rows,
+                &empty_fetch_result(),
+                &nesting,
+            )
+            .expect("non-JSON rows must not crash batch construction");
+        assert_eq!(batch.num_rows(), 3);
+        for v in string_col(&batch, "id") {
+            assert!(v.is_none(), "non-JSON rows must have NULL static fields");
+        }
+        let details = string_col(&batch, "details");
+        // Raw HTML preserved as a JSON string in the catch-all column.
+        assert_eq!(
+            details[0].as_deref(),
+            Some(r#""<!DOCTYPE html><html>not json</html>""#)
+        );
+        // Empty body => catch-all NULL.
+        assert!(details[1].is_none(), "empty body => catch-all NULL");
+        // Malformed JSON preserved verbatim as a JSON string.
+        assert_eq!(details[2].as_deref(), Some(r#""{\"id\": \"abc\", ""#));
     }
 
     #[test]

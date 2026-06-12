@@ -34,6 +34,7 @@ use bollard::secret::HealthConfig;
 use runtime::Runtime;
 use spicepod::acceleration::{Mode, RefreshMode};
 use spicepod::component::caching::SQLResultsCacheConfig;
+use spicepod::semantic::Column;
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -52,7 +53,8 @@ const PORT4: u16 = 8004;
 const PORT5: u16 = 8005;
 const PORT6: u16 = 8006;
 const PORT7: u16 = 8007;
-const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const PORT8: u16 = 8008;
+const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_dynamodb_docker_container(
@@ -104,7 +106,7 @@ async fn wait_for_dynamodb_host_port(port: u16) -> Result<(), anyhow::Error> {
     ))
 }
 
-async fn wait_for_dynamodb_source_rows(
+pub(super) async fn wait_for_dynamodb_source_rows(
     client: &Client,
     table_name: &str,
     expected_rows: usize,
@@ -136,7 +138,7 @@ async fn wait_for_dynamodb_source_rows(
     ))
 }
 
-async fn ensure_dataset_rows(
+pub(super) async fn ensure_dataset_rows(
     rt: &Runtime,
     table_name: &str,
     expected_rows: usize,
@@ -197,7 +199,7 @@ pub fn make_dynamodb_dataset(
     dataset
 }
 
-async fn create_table(client: &Client, table_name: &str) {
+pub(super) async fn create_table(client: &Client, table_name: &str) {
     client
         .create_table()
         .attribute_definitions(
@@ -228,7 +230,7 @@ async fn create_table(client: &Client, table_name: &str) {
         .expect("Table created");
 }
 
-fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
+pub(super) fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
     let config = SdkConfig::builder()
         .endpoint_url(format!("http://localhost:{port}"))
         .credentials_provider(SharedCredentialsProvider::new(Credentials::from_keys(
@@ -241,7 +243,7 @@ fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
     Client::new(&config)
 }
 
-async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
+pub(super) async fn insert_rows(client: &Client, table_name: &str, range: Range<usize>) {
     for i in range {
         client
             .put_item()
@@ -313,7 +315,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -414,7 +416,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -440,7 +442,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
         .await
 }
 
-async fn run_and_snapshot_query(
+pub(super) async fn run_and_snapshot_query(
     rt: &Runtime,
     query: &str,
     test_name: &str,
@@ -693,7 +695,7 @@ async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: 
     }
 }
 
-async fn wait_for_dataset_rows(
+pub(super) async fn wait_for_dataset_rows(
     rt: &Runtime,
     table_name: &str,
     expected_rows: usize,
@@ -839,7 +841,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -889,7 +891,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1031,7 +1033,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1083,7 +1085,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1152,7 +1154,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 1: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1204,7 +1206,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let cloned_rt = Arc::new(rt.clone());
 
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(60)) => {
+                    () = tokio::time::sleep(Duration::from_mins(1)) => {
                         return Err(anyhow::Error::msg("Phase 3: Timed out waiting for datasets to load"));
                     }
                     () = cloned_rt.load_components() => {}
@@ -1330,7 +1332,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -1342,6 +1344,89 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
                 &rt,
                 &format!("SELECT * FROM {table_name}"),
                 "dynamodb_streams_cayenne_file_acceleration",
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                anyhow::Error::msg(e.to_string())
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Verifies that a DynamoDB-accelerated dataset with a declared schema initializes
+/// successfully when the source table is empty, then becomes queryable once rows
+/// are inserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some(
+        "integration=debug,runtime=debug,data_components=debug,info",
+    ));
+
+    let table_name = "declared_schema_test";
+    let access_key = "foo";
+    let secret_key = "bar";
+
+    test_request_context()
+        .scope(async {
+            let running_container = start_dynamodb_docker_container(PORT8).await?;
+            let client = get_client(PORT8, access_key, secret_key);
+
+            // Create table with streams but do NOT insert any rows yet.
+            create_table(&client, table_name).await;
+
+            // Build dataset with explicit column type declarations so the runtime
+            // can initialize schema without scanning any rows.
+            let mut ds = make_dynamodb_dataset(table_name, PORT8, access_key, secret_key, true);
+            ds.columns = vec![
+                Column::new("id").with_type("text"),
+                Column::new("name").with_type("text"),
+                Column::new("version").with_type("bigint"),
+            ];
+
+            let app = AppBuilder::new("dynamodb_declared_schema_test")
+                .with_dataset(ds)
+                .with_sql_cache(SQLResultsCacheConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Expect successful load even though the table is empty.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_mins(1)) => {
+                    return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Schema should reflect declared columns.
+            run_and_snapshot_query(
+                &rt,
+                &format!("DESCRIBE {table_name}"),
+                "declared_schema_empty_table_schema",
+            )
+            .await?;
+
+            // Insert rows into the source table.
+            insert_rows(&client, table_name, 0..3).await;
+            wait_for_dynamodb_source_rows(&client, table_name, 3, 30).await?;
+
+            // Rows should become visible via the accelerated dataset.
+            ensure_dataset_rows(&rt, table_name, 3, 30).await?;
+            run_and_snapshot_query(
+                &rt,
+                &format!("SELECT * FROM {table_name} ORDER BY id"),
+                "declared_schema_empty_table_data",
             )
             .await?;
 

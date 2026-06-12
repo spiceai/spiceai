@@ -16,6 +16,7 @@ limitations under the License.
 #![allow(dead_code, clippy::allow_attributes)]
 
 mod dml;
+mod schema_registration;
 pub(super) mod streams;
 
 use std::collections::HashMap;
@@ -64,7 +65,7 @@ async fn dynamodb_schema() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -106,7 +107,7 @@ async fn dynamodb_scan_no_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -140,7 +141,7 @@ async fn dynamodb_query_no_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -180,7 +181,7 @@ async fn dynamodb_query_with_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -220,7 +221,7 @@ async fn dynamodb_aggregation() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -258,7 +259,7 @@ async fn dynamodb_nulls() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -298,7 +299,7 @@ async fn dynamodb_not_nulls() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -338,7 +339,7 @@ async fn dynamodb_temporal() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -378,7 +379,7 @@ async fn dynamodb_timestamp_filter_pushdown() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -418,7 +419,7 @@ async fn dynamodb_collections() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -458,7 +459,7 @@ async fn dynamodb_timestamp_filter() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -497,7 +498,7 @@ async fn dynamodb_nested_projection_no_nested_filter() -> Result<(), anyhow::Err
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -537,7 +538,7 @@ async fn dynamodb_nested_projection_with_nested_filter() -> Result<(), anyhow::E
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -584,7 +585,7 @@ async fn dynamodb_json_nesting_simple() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -627,7 +628,7 @@ async fn dynamodb_json_nesting_with_unnest() -> Result<(), anyhow::Error> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
                 () = cloned_rt.load_components() => {}
@@ -739,7 +740,7 @@ async fn wait_for_table_deleted(
     table_name: &str,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(60);
+    let timeout = std::time::Duration::from_mins(1);
     let mut last_error = None;
 
     while start_time.elapsed() <= timeout {
@@ -767,7 +768,7 @@ async fn wait_for_table_active(
     table_name: &str,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(60);
+    let timeout = std::time::Duration::from_mins(1);
     let mut last_status = None;
 
     while start_time.elapsed() <= timeout {

@@ -52,7 +52,7 @@ pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock
 });
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
-    runtime_ready_check_with_timeout(rt, Duration::from_secs(120)).await;
+    runtime_ready_check_with_timeout(rt, Duration::from_mins(2)).await;
 }
 
 pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
@@ -174,8 +174,10 @@ pub(crate) fn init_tracing_with_task_history_captured_context(
 
     let (ballista_transform, ballista_retention) =
         runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
+    let query_engine: std::sync::Arc<dyn runtime_datafusion::query_engine::QueryEngine> =
+        rt.datafusion();
     let task_history_exporter = TaskHistoryExporter::new(
-        rt.datafusion(),
+        query_engine,
         TaskHistoryCapturedOutput::Truncated,
         captured_context,
         None, // min_sql_duration_ms

@@ -17,6 +17,7 @@ arrow-csv.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
+arrow-row.workspace = true
 arrow-schema = { workspace = true, features = ["serde"] }
 arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
@@ -30,7 +31,7 @@ aws-sdk-glue.workspace = true
 aws-sdk-s3.workspace = true
 aws-sdk-sts = { workspace = true, optional = true }
 axum.workspace = true
-axum-extra = { version = "0.12.5", features = ["typed-header"] }
+axum-extra = { version = "0.12.5", features = ["typed-header", "query"] }
 ballista-core = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-scheduler = { workspace = true }
@@ -70,7 +71,6 @@ event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
-geodatafusion = { workspace = true, optional = true }
 globset.workspace = true
 governor.workspace = true
 graphql-parser.workspace = true
@@ -307,7 +307,6 @@ dynamodb = [
 extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["runtime-object-store/ftp"]
-geo = ["dep:geodatafusion"]
 http-functions = ["runtime-datafusion-udfs/http-functions"]
 rate-control = []
 wasm-functions = ["runtime-datafusion-udfs/wasm-functions"]
@@ -364,6 +363,9 @@ snowflake = [
     "data_components/snowflake",
 ]
 spark = ["data_components/spark_connect"]
+# Registers the Cayenne catalog connector. Intended for benchmarking only;
+# deliberately excluded from the default feature set.
+spicebench = []
 sqlite = [
     "dep:tokio-rusqlite",
     "db_connection_pool/sqlite",
@@ -380,7 +382,7 @@ turso = [
     "dep:rusqlite",
     "runtime-acceleration/turso",
 ]
-vortex = ["ballista-core/vortex", "ballista-executor/vortex"]
+vortex = []
 [target.'cfg(not(windows))'.dependencies]
 cayenne = { path = "../cayenne", features = ["turso", "partition-table-provider"] }
 vortex.workspace = true

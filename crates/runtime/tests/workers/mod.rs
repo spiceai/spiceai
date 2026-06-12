@@ -105,7 +105,7 @@ async fn test_worker_with_cron() -> Result<(), anyhow::Error> {
             tokio::time::sleep(time_till_second(30, Some(2))).await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
@@ -170,7 +170,7 @@ async fn test_sql_worker_with_cron() -> Result<(), anyhow::Error> {
             tokio::time::sleep(time_till_second(15, Some(2))).await;
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}

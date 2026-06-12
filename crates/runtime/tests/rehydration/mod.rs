@@ -311,7 +311,7 @@ async fn init_spice_app(
     let cloned_rt = Arc::new(rt.clone());
 
     tokio::select! {
-        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
             return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
         }
         () = cloned_rt.load_components() => {}
@@ -337,7 +337,7 @@ fn create_test_dataset(
     if let Some(db_file_path) = db_file_path {
         let params = SpicepodParams::from_string_map(
             vec![(
-                format!("{acceleration_engine}_file",),
+                format!("{acceleration_engine}_file"),
                 db_file_path.to_string(),
             )]
             .into_iter()

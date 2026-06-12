@@ -19,6 +19,7 @@ pub use format::ScanConcurrency;
 pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
+pub use format::WriteShardConfig;
 pub use source::VortexSource;
 
 #[cfg(test)]
@@ -72,7 +73,7 @@ mod tests {
 
         let summary = session
             .write_options()
-            .write(&mut writer, st.to_array_stream())
+            .write(&mut writer, st.into_array().to_array_stream())
             .await?;
 
         writer.shutdown().await?;
@@ -209,7 +210,10 @@ mod tests {
 
         // Register an in-memory object store for the test.
         let store = Arc::new(InMemory::new());
-        ctx.register_object_store(&url::Url::try_from("file://").unwrap(), store);
+        ctx.register_object_store(
+            &url::Url::try_from("file://").expect("file:// should parse as a URL"),
+            store,
+        );
 
         // [create]
         ctx.sql(

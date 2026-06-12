@@ -1,3 +1,4 @@
+use crate::function_support::contains_unsupported_functions;
 use async_trait::async_trait;
 use datafusion_federation::sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
     sql::{TableReference, unparser::dialect::Dialect},
 };
@@ -16,7 +18,7 @@ impl FlightTable {
     fn create_federated_table_source(self: Arc<Self>) -> Arc<dyn FederatedTableSource> {
         let table_name = self.table_reference.clone();
         tracing::trace!(
-            %self.table_reference,
+            ?self.table_reference,
             "create_federated_table_source"
         );
         let schema = Arc::clone(&self.schema);
@@ -46,6 +48,15 @@ impl SQLExecutor for FlightTable {
 
     fn dialect(&self) -> Arc<dyn Dialect> {
         Arc::clone(&self.dialect)
+    }
+
+    fn can_execute_plan(&self, plan: &LogicalPlan) -> bool {
+        // Don't federate plans referencing a deny-listed Spice-only function
+        // (e.g. json_get_str); the Flight server has no such function, so
+        // evaluate those locally instead. See issue #10703.
+        self.function_support.as_ref().is_none_or(|func_supp| {
+            !contains_unsupported_functions(plan, func_supp).unwrap_or(false)
+        })
     }
 
     fn execute(

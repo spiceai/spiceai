@@ -30,8 +30,8 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::RwLock;
 
 use crate::refresh_skip::RefreshSkipTableProvider;
@@ -358,6 +358,13 @@ mod tests {
         }
     }
 
+    fn not_implemented(operation: &str) -> object_store::Error {
+        object_store::Error::NotImplemented {
+            operation: operation.to_string(),
+            implementer: "HeadOnlyObjectStore".to_string(),
+        }
+    }
+
     impl std::fmt::Display for HeadOnlyObjectStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "HeadOnlyObjectStore")
@@ -373,32 +380,12 @@ mod tests {
             stream::empty().boxed()
         }
 
-        async fn head(&self, _location: &Path) -> object_store::Result<object_store::ObjectMeta> {
-            let mut guard = self.responses.lock().await;
-            guard.pop_front().ok_or(object_store::Error::NotImplemented)
-        }
-
-        async fn put(
-            &self,
-            _location: &Path,
-            _payload: object_store::PutPayload,
-        ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
             _payload: object_store::PutPayload,
             _opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            unimplemented!()
-        }
-
-        async fn put_multipart(
-            &self,
-            _location: &Path,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             unimplemented!()
         }
 
@@ -410,26 +397,30 @@ mod tests {
             unimplemented!()
         }
 
-        async fn get(&self, _location: &Path) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
-        }
-
         async fn get_opts(
             &self,
             _location: &Path,
-            _options: object_store::GetOptions,
+            options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            unimplemented!()
+            if !options.head {
+                return Err(not_implemented("get_opts without head option"));
+            }
+            let mut guard = self.responses.lock().await;
+            let meta = guard
+                .pop_front()
+                .ok_or_else(|| not_implemented("get_opts"))?;
+            Ok(object_store::GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::empty())),
+                attributes: object_store::Attributes::default(),
+                range: 0..0,
+                meta,
+            })
         }
 
-        async fn delete(&self, _location: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-
-        fn delete_stream<'a>(
-            &'a self,
-            _locations: BoxStream<'a, object_store::Result<Path>>,
-        ) -> BoxStream<'a, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
             unimplemented!()
         }
 
@@ -440,11 +431,12 @@ mod tests {
             unimplemented!()
         }
 
-        async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-            unimplemented!()
-        }
-
-        async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             unimplemented!()
         }
     }

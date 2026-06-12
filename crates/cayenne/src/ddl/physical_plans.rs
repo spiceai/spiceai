@@ -63,13 +63,13 @@ fn ddl_result_schema() -> SchemaRef {
     )]))
 }
 
-fn ddl_plan_properties(schema: SchemaRef) -> PlanProperties {
-    PlanProperties::new(
+fn ddl_plan_properties(schema: SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema),
         Partitioning::UnknownPartitioning(1),
         EmissionType::Final,
         Boundedness::Bounded,
-    )
+    ))
 }
 
 fn merge_count_schema() -> SchemaRef {
@@ -91,7 +91,7 @@ pub struct CayenneCreateTableExec {
     params: CreateTableParams,
     catalog_list: Arc<dyn CatalogProviderList>,
     runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneCreateTableExec {
@@ -139,7 +139,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -215,7 +215,7 @@ pub struct CayenneDropTableExec {
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneDropTableExec {
@@ -266,7 +266,7 @@ impl ExecutionPlan for CayenneDropTableExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -333,7 +333,7 @@ pub struct CayenneCreateSchemaExec {
     if_not_exists: bool,
     df_catalog_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for CayenneCreateSchemaExec {
@@ -382,7 +382,7 @@ impl ExecutionPlan for CayenneCreateSchemaExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -457,7 +457,7 @@ pub struct CayenneMergeExec {
     /// Target-side ON key column names, used to build deletion filters.
     target_key_columns: Vec<String>,
     /// Output properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CayenneMergeExec {
@@ -470,12 +470,12 @@ impl CayenneMergeExec {
         target_key_columns: Vec<String>,
     ) -> Self {
         let schema = merge_count_schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             join_plan,
             target_provider,
@@ -509,7 +509,7 @@ impl ExecutionPlan for CayenneMergeExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

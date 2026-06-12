@@ -872,6 +872,9 @@ async fn handle_executor_message(
         ExecutorMessage::PartitionsLoaded(loaded) => {
             handle_partitions_loaded(executor_id, loaded, datafusion).await;
         }
+        ExecutorMessage::ExecutorStatistics(stats_msg) => {
+            handle_executor_statistics(executor_id, stats_msg, datafusion);
+        }
         ExecutorMessage::Shutdown(shutdown) => {
             let reason = if shutdown.reason.is_empty() {
                 "executor shutdown".to_string()
@@ -921,6 +924,32 @@ async fn notify_scheduler_executor_shutdown(
         .map_err(|e| format!("Failed to notify scheduler about executor shutdown: {e}"))?;
 
     Ok(())
+}
+
+/// Records a per-table [`ExecutorStatistics`] report into the scheduler's
+/// in-memory `ExecutorRegistry`, where it's read at query-planning time to size
+/// the coordinator's per-executor federated scans. Decoupled from readiness.
+fn handle_executor_statistics(
+    executor_id: &str,
+    msg: &runtime_proto::ExecutorStatistics,
+    datafusion: &DataFusion,
+) {
+    let resolved = TableReference::parse_str(&msg.table_name)
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table = TableReference::full(
+        Arc::<str>::clone(&resolved.catalog),
+        Arc::<str>::clone(&resolved.schema),
+        Arc::<str>::clone(&resolved.table),
+    );
+    let stats = runtime_cluster::decode_statistics(&msg.statistics);
+    if let (Some(stats), Some(registry)) = (stats, datafusion.executor_registry()) {
+        registry.record_executor_statistics(
+            table,
+            executor_id.to_string(),
+            stats,
+            msg.column_names.clone(),
+        );
+    }
 }
 
 /// Records a `PartitionsLoaded` ack from an executor and, if all assigned
@@ -978,6 +1007,8 @@ async fn handle_partitions_loaded(
         "Received PartitionsLoaded ack"
     );
 
+    // Statistics now flow via the dedicated ExecutorStatistics message
+    // (handle_executor_statistics); PartitionsLoaded is readiness-only.
     tracker
         .replace(table.clone(), executor_id.to_string(), partition_expr_bytes)
         .await;
@@ -987,7 +1018,7 @@ async fn handle_partitions_loaded(
     // Fail closed: if we can't refresh we may be looking at a stale
     // assignment, which could flip a dataset to `Ready` based on outdated
     // executor membership. Skip this evaluation and let the next ack or
-    // reconcile cycle retry.
+    // readiness sweep retry.
     if let Err(err) = partition_store.refresh().await {
         tracing::warn!(
             table = %loaded.table_name,
@@ -995,36 +1026,122 @@ async fn handle_partitions_loaded(
         );
         return;
     }
-    let Some(metadata) = partition_store.get_cached_table_metadata(&table) else {
-        // No partition metadata yet — likely raced with first discovery
-        // cycle; the next reconcile will re-evaluate.
+
+    evaluate_table_readiness(datafusion, &table).await;
+}
+
+/// Evaluates whether every assigned partition for `table` is covered by an
+/// executor ack and, if so, flips the dataset's status to `Ready`. Reads the
+/// partition store's *cached* metadata — callers must refresh the store
+/// first. No-op when the dataset is already `Ready`, when partition metadata
+/// hasn't been seeded yet, or when ack coverage is incomplete.
+///
+/// `table` must be the canonical (fully resolved) reference — the same form
+/// `handle_partitions_loaded` uses as the tracker key.
+pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &TableReference) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
         return;
     };
 
-    if tracker.is_table_loaded(&table, &metadata, datafusion).await {
-        // Find the dataset key that was registered as `Refreshing` at init
-        // time. The original key may be bare/partial (`foo`) while the
-        // canonical form is full (`spice.public.foo`); calling
-        // `update_dataset(&canonical)` would create a *new* status entry and
-        // leave the original stuck in `Refreshing`, keeping `/v1/ready` at
-        // 503. Match by resolve-equality to update the existing entry.
-        let target = datafusion
-            .runtime_status
-            .get_dataset_statuses()
-            .into_keys()
-            .find(|key| {
-                key.clone()
-                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
-                    == resolved
-            })
-            .unwrap_or_else(|| table.clone());
+    let resolved = table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+    // Find the dataset keys registered at init time. The original key may be
+    // bare/partial (`foo`) while the canonical form is full
+    // (`spice.public.foo`); calling `update_dataset(&canonical)` would create
+    // a *new* status entry and leave the original stuck in `Refreshing`,
+    // keeping `/v1/ready` at 503. Match by resolve-equality to update the
+    // existing entries. Collect *all* matches: an ack that arrived before
+    // dataset registration can have created a canonical-key entry alongside
+    // the registered bare key, and every resolve-equal entry must reach
+    // `Ready` for `/v1/ready` to flip.
+    let matching: Vec<(TableReference, crate::status::ComponentStatus)> = datafusion
+        .runtime_status
+        .get_dataset_statuses()
+        .into_iter()
+        .filter(|(key, _)| {
+            key.clone()
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                == resolved
+        })
+        .collect();
+    let pending: Vec<TableReference> = matching
+        .iter()
+        .filter(|(_, status)| !matches!(status, crate::status::ComponentStatus::Ready))
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    // Every matching entry is already `Ready` — skip so re-acks and periodic
+    // readiness sweeps don't re-emit the status-change log/metric every time.
+    // (No matching entry at all still proceeds: the ack may have arrived
+    // before the dataset registered its status, in which case the canonical
+    // entry is created below.)
+    if pending.is_empty() && !matching.is_empty() {
+        return;
+    }
+
+    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
+        // No partition metadata yet — the ack raced the first discovery
+        // cycle; the readiness sweep after the next reconcile re-evaluates.
+        return;
+    };
+
+    if tracker.is_table_loaded(table, &metadata, datafusion).await {
         tracing::info!(
-            table = %loaded.table_name,
+            table = %table,
             "All assigned partitions loaded; marking dataset Ready"
         );
-        datafusion
-            .runtime_status
-            .update_dataset(&target, crate::status::ComponentStatus::Ready);
+        if pending.is_empty() {
+            datafusion
+                .runtime_status
+                .update_dataset(table, crate::status::ComponentStatus::Ready);
+        } else {
+            for key in pending {
+                datafusion
+                    .runtime_status
+                    .update_dataset(&key, crate::status::ComponentStatus::Ready);
+            }
+        }
+    }
+}
+
+/// Re-evaluates readiness for every table with at least one recorded executor
+/// ack. Called from the partition-assignment task after metadata seeding and
+/// after each reconcile cycle: an ack that arrives *before* the table's
+/// partition metadata is seeded (e.g. replayed by an executor that connected
+/// while the scheduler was still starting up) is recorded in the tracker but
+/// can't flip the dataset to `Ready` at arrival time — this sweep picks it up
+/// once metadata exists.
+pub(crate) async fn evaluate_acked_tables_readiness(datafusion: &DataFusion) {
+    let Some(tracker) = datafusion.partition_load_tracker.as_ref() else {
+        return;
+    };
+    let Some(partition_store) = datafusion
+        .partition_service
+        .as_ref()
+        .map(|s| Arc::clone(&s.partition_store))
+    else {
+        return;
+    };
+
+    let acked = tracker.acked_tables().await;
+    if acked.is_empty() {
+        return;
+    }
+    if let Err(err) = partition_store.refresh().await {
+        tracing::warn!("Skipping readiness sweep: partition store refresh failed: {err}");
+        return;
+    }
+    for table in acked {
+        evaluate_table_readiness(datafusion, &table).await;
     }
 }
 
@@ -1035,7 +1152,7 @@ async fn handle_partitions_loaded(
 /// register unpartitioned entries in the executor's partition map so that queries
 /// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
-async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+pub(crate) async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;
 
@@ -1099,6 +1216,13 @@ async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference>
 /// Encodes a slice of `RecordBatch` into Arrow IPC streaming format.
 ///
 /// Returns an empty vec if no batches are provided.
+///
+/// A single [`StreamWriter`] is constructed once and reused across every batch
+/// in the stream (the dictionary-tracking and, where enabled, compression
+/// context live on the writer). This is the cheap hot path Arrow 58.1/58.2
+/// optimized for; constructing a writer (or compression codec) per batch would
+/// re-emit the schema/dictionaries and rebuild the codec each time. Do not
+/// move the writer construction inside the loop.
 fn encode_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>, arrow::error::ArrowError> {
     if batches.is_empty() {
         return Ok(Vec::new());
@@ -1397,5 +1521,43 @@ mod tests {
             result.contains("local_task_history"),
             "Expected local_task_history in: {result}"
         );
+    }
+
+    #[test]
+    fn test_encode_batches_to_ipc_empty_is_empty() {
+        let encoded = encode_batches_to_ipc(&[]).expect("encoding empty slice should succeed");
+        assert!(encoded.is_empty());
+    }
+
+    /// Round-trips multiple batches through a single IPC stream. This both
+    /// exercises the multi-batch path and guards the writer-reuse invariant:
+    /// one `StreamWriter` must emit a single, well-formed stream that a single
+    /// `StreamReader` decodes back into every original batch in order.
+    #[test]
+    fn test_encode_batches_to_ipc_reuses_writer_across_batches() {
+        use arrow::array::Int64Array;
+        use arrow_ipc::reader::StreamReader;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |vals: Vec<i64>| {
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vals))])
+                .expect("batch should be valid")
+        };
+        let batches = vec![batch(vec![1, 2, 3]), batch(vec![4, 5]), batch(vec![6])];
+
+        let encoded = encode_batches_to_ipc(&batches).expect("encoding should succeed");
+
+        let reader = StreamReader::try_new(std::io::Cursor::new(encoded), None)
+            .expect("stream reader should parse the single reused-writer stream");
+        let decoded: Vec<RecordBatch> = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("all batches should decode");
+
+        assert_eq!(decoded.len(), batches.len());
+        let total_rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 6);
+        for (got, want) in decoded.iter().zip(batches.iter()) {
+            assert_eq!(got, want);
+        }
     }
 }

@@ -46,7 +46,7 @@ use serde_json::{Map, Value};
 use spicepod::component::function::{Function, FunctionArg, FunctionKind};
 use tools::SpiceModelTool;
 
-use crate::datafusion::DataFusion;
+use runtime_datafusion::query_engine::{QueryEngine, QueryRequest};
 
 /// Build a [`FunctionAsTool`] from a user-declared [`Function`]. Fails
 /// when the function's signature references Arrow types the tool bridge
@@ -58,7 +58,7 @@ use crate::datafusion::DataFusion;
 /// JSON-encodable, or when `signature.returns` is missing.
 pub fn build(
     decl: &Function,
-    df: Weak<DataFusion>,
+    df: Weak<dyn QueryEngine>,
 ) -> Result<FunctionAsTool, FunctionToolBuildError> {
     if decl.kind != FunctionKind::Scalar {
         return Err(FunctionToolBuildError::UnsupportedFunctionKind {
@@ -125,7 +125,7 @@ pub struct FunctionAsTool {
     name: String,
     description: Option<String>,
     args: Vec<FunctionArg>,
-    df: Weak<DataFusion>,
+    df: Weak<dyn QueryEngine>,
 }
 
 impl std::fmt::Debug for FunctionAsTool {
@@ -180,15 +180,11 @@ impl SpiceModelTool for FunctionAsTool {
         let read_only = crate::http::v1::current_principal_requires_read_only().await;
 
         let batches = df
-            .query_builder(&sql)
-            .read_only(read_only)
-            .build()
-            .run()
+            .execute_query(QueryRequest::new(&sql).read_only(read_only))
             .await
             .map_err(|e| {
                 Box::<dyn std::error::Error + Send + Sync>::from(format!("query failed: {e}"))
             })?
-            .data
             .try_collect::<Vec<_>>()
             .await?;
 

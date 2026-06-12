@@ -25,6 +25,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -207,6 +208,45 @@ fn file_scan_configs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&FileScanConfig> {
     configs
 }
 
+/// Counts file-backed scan sources (snapshot generations) and the total files
+/// across them in `plan`, returning `(snapshots_scanned, files_scanned)`.
+///
+/// Unlike [`file_scan_configs`], this walks the WHOLE subtree and does not stop at
+/// non-identity-preserving wrappers: for read-amplification reporting we want every
+/// `DataSourceExec` that touches disk regardless of the per-snapshot deletion filter,
+/// sort, or other operator sitting above it.
+fn count_file_scan_sources(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+    let mut snapshots = 0;
+    let mut files = 0;
+    accumulate_file_scan_sources(plan, &mut snapshots, &mut files);
+    (snapshots, files)
+}
+
+fn accumulate_file_scan_sources(
+    plan: &Arc<dyn ExecutionPlan>,
+    snapshots: &mut usize,
+    files: &mut usize,
+) {
+    if let Some(data_source_exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
+        if let Some(file_scan_config) = data_source_exec
+            .data_source()
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+        {
+            *snapshots += 1;
+            *files += file_scan_config
+                .file_groups
+                .iter()
+                .map(FileGroup::len)
+                .sum::<usize>();
+        }
+        return;
+    }
+    for child in plan.children() {
+        accumulate_file_scan_sources(child, snapshots, files);
+    }
+}
+
 /// Walks `plan` looking for underlying file-backed `DataSourceExec` nodes,
 /// descending only through a whitelist of operators that are known to preserve
 /// scan identity, plus `UnionExec` for mixed file + inlined-memory scans.
@@ -271,6 +311,7 @@ fn collect_file_scan_configs<'a>(
 /// the ones that live in other crates or are crate-private. Adding a new
 /// wrapper requires touching this function explicitly — that's intentional;
 /// it stops a future operator from silently being treated as transparent.
+#[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let any = plan.as_any();
     if any.downcast_ref::<ProjectionExec>().is_some()
@@ -418,12 +459,29 @@ impl DisplayAs for CayenneAccelerationExec {
         _t: datafusion_physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        write!(f, "CayenneAccelerationExec")
+        // Surface read amplification: how many file-backed snapshots this scan unions
+        // (base + un-compacted protected snapshots) and the total Vortex files across
+        // them. Each query re-scans and merge-filters every generation, so a rising
+        // `snapshots_scanned` is the signal that compaction is behind. This is the
+        // structural read-tax that otherwise had to be hand-counted from the plan tree.
+        //
+        // NB: a full subtree walk, NOT `file_scan_configs` — the latter intentionally
+        // stops at non-identity-preserving nodes (the per-snapshot deletion filter is
+        // one), which would undercount the snapshots to zero on a real scan plan.
+        let (snapshots_scanned, files_scanned) = count_file_scan_sources(&self.inner);
+        write!(
+            f,
+            "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
+        )
     }
 }
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "CayenneAccelerationExec"
     }
@@ -443,7 +501,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
     }
 
@@ -535,11 +593,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.inner.statistics()
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         self.inner.partition_statistics(partition)
     }
@@ -605,19 +658,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let result = self.inner.try_pushdown_sort(order)?;
         Ok(result
             .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
-    }
-}
-
-pub(crate) trait IsCayenneAccelerationExec {
-    /// Returns true if the execution plan is a `CayenneAccelerationExec`
-    fn is_cayenne_acceleration_exec(&self) -> bool;
-}
-
-impl IsCayenneAccelerationExec for Arc<dyn ExecutionPlan> {
-    fn is_cayenne_acceleration_exec(&self) -> bool {
-        self.as_any()
-            .downcast_ref::<CayenneAccelerationExec>()
-            .is_some()
     }
 }
 
@@ -705,6 +745,31 @@ mod tests {
         // return None rather than misattributing identity.
         let exec = CayenneAccelerationExec::new(one_partition_plan());
         assert!(exec.scan_identity().is_none());
+    }
+
+    /// Frozen/clean partition: a scan with no deletion filter (the wrapper is
+    /// applied directly over the file scan) must surface the inner plan's
+    /// `Exact` per-partition statistics unchanged — this is the join-side
+    /// selection / pruning signal that the deletion-filter path deliberately
+    /// relaxes to `Inexact` only when deletions are present.
+    #[test]
+    fn cayenne_exec_passes_through_exact_partition_statistics() {
+        use datafusion_common::stats::Precision;
+
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics should be available");
+        assert_eq!(
+            stats.num_rows,
+            Precision::Exact(3),
+            "clean scan must keep the inner plan's exact row count"
+        );
+        // Aggregate over all partitions must likewise stay exact.
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics should be available");
+        assert_eq!(agg.num_rows, Precision::Exact(3));
     }
 
     #[test]

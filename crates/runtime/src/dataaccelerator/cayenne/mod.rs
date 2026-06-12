@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// `pub(crate)` (not private) so the Cayenne *catalog* connector
+// (`crate::catalogconnector::cayenne`) can seed the adaptive-tuning knobs from
+// the same hardware-derived profile this accelerator path uses.
+pub(crate) mod autotune;
 pub mod partitioned_insert_strategy;
 pub mod s3;
 pub mod snapshot_engine;
@@ -55,9 +59,6 @@ use super::{
 };
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::dataaccelerator::cayenne::s3::{S3_PARAMETERS, S3_PARAMS_LEN};
-use crate::dataaccelerator::storage::{
-    ResolvedAccelerationStorage, resolve_acceleration_storage_async,
-};
 use crate::dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed};
 use crate::parameters::ParameterSpec;
 use crate::register_data_accelerator;
@@ -159,34 +160,27 @@ impl Default for CayenneAccelerator {
     }
 }
 
-fn parse_usize(acceleration: &Acceleration, key: &str, default: usize) -> usize {
-    acceleration
-        .params
-        .get(key)
-        .map_or(default, |v| {
-            v.parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    "An invalid '{key}' value was provided: '{v}'. Expected a positive integer, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-                );
-                default
-            })
-        })
-}
-
-fn parse_u64_with_hint(
+fn parse_u64_aliases_with_hint(
     acceleration: &Acceleration,
-    key: &str,
+    keys: &[&str],
     default: u64,
     semantic_hint: &str,
 ) -> u64 {
-    acceleration.params.get(key).map_or(default, |v| {
-        v.parse::<u64>().unwrap_or_else(|_| {
-            tracing::warn!(
-                "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, defaulting to {default}. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
-            );
-            default
+    keys.iter()
+        .find_map(|&key| {
+            acceleration.params.get(key).and_then(|v| {
+                v.parse::<u64>().map_or_else(
+                    |_| {
+                        tracing::warn!(
+                            "An invalid '{key}' value was provided: '{v}'. Expected an unsigned integer{semantic_hint}, ignoring the value. For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                        );
+                        None
+                    },
+                    Some,
+                )
+            })
         })
-    })
+        .unwrap_or(default)
 }
 
 fn parse_optional_usize<'a>(
@@ -223,14 +217,12 @@ const SMALL_WRITE_INLINE_MAX_ROWS: usize = cayenne::metadata::DEFAULT_INLINE_MAX
 const SMALL_WRITE_INLINE_MAX_BYTES: usize = cayenne::metadata::DEFAULT_INLINE_MAX_BYTES;
 const SMALL_WRITE_INLINE_MAX_BUFFER_BYTES: usize =
     cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES;
-const SMALL_WRITE_INLINE_FLUSH_MAX_ROWS: i64 = 2_048;
-const SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS: i64 = 16;
-const SMALL_WRITE_INLINE_FLUSH_MAX_BYTES: i64 = 2 * 1_048_576;
-const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_secs(300);
+const APPEND_SMALL_WRITE_REFRESH_INTERVAL_THRESHOLD: Duration = Duration::from_mins(5);
 
 fn apply_refresh_mode_defaults(
     config: &mut cayenne::metadata::VortexConfig,
     acceleration: &Acceleration,
+    inline_flush_caps: autotune::InlineFlushCaps,
 ) {
     if uses_small_write_refresh_profile(acceleration) {
         config.compaction_trigger_files = SMALL_WRITE_COMPACTION_TRIGGER_FILES;
@@ -238,12 +230,18 @@ fn apply_refresh_mode_defaults(
             SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS;
         config.compaction_trigger_snapshot_age_ms = SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS;
         config.compaction_background_interval_ms = SMALL_WRITE_COMPACTION_BACKGROUND_INTERVAL_MS;
+        // Per-entry inline-admission caps stay static by design: inlined entries
+        // are re-read on every scan with no zone-map pruning, so raising them is
+        // pure read-amp (see `provider::table` inlining-caps comment).
         config.inline_max_rows = SMALL_WRITE_INLINE_MAX_ROWS;
         config.inline_max_bytes = SMALL_WRITE_INLINE_MAX_BYTES;
         config.inline_max_buffer_bytes = SMALL_WRITE_INLINE_MAX_BUFFER_BYTES;
-        config.inline_flush_max_rows = SMALL_WRITE_INLINE_FLUSH_MAX_ROWS;
-        config.inline_flush_max_segments = SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS;
-        config.inline_flush_max_bytes = SMALL_WRITE_INLINE_FLUSH_MAX_BYTES;
+        // Memtable flush caps scale with machine memory + metastore storage class
+        // (see `autotune::HardwareProfile::inline_flush_caps`). Explicit operator
+        // params still override these in the param-resolution pass below.
+        config.inline_flush_max_rows = inline_flush_caps.max_rows;
+        config.inline_flush_max_segments = inline_flush_caps.max_segments;
+        config.inline_flush_max_bytes = inline_flush_caps.max_bytes;
     } else {
         config.inline_max_rows = 0;
         config.inline_max_bytes = 0;
@@ -261,6 +259,44 @@ fn uses_small_write_refresh_profile(acceleration: &Acceleration) -> bool {
     }
 }
 
+/// Whether the resolved `on_conflict` performs an upsert (replace existing rows
+/// on a primary-key conflict) versus do-nothing. This is the heavy-update CDC
+/// signal the keyset auto-derivation keys off: upsert tables can size the keyset
+/// to the source cardinality (then fall to the cheap bloom past the budget),
+/// whereas a do-nothing table cannot use the bloom (its false positives would
+/// wrongly drop rows) and keeps the conservative default.
+fn is_upsert_on_conflict(
+    on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+) -> bool {
+    matches!(
+        on_conflict,
+        Some(datafusion_table_providers::util::on_conflict::OnConflict::Upsert(_))
+    )
+}
+
+/// Build the auto-tune [`autotune::WorkloadProfile`] from the dataset's refresh
+/// mode, its resolved primary keys / `on_conflict`, and any extended-schema-
+/// inference metadata carried on the Arrow schema (`spice.inferred_row_count` /
+/// `spice.inferred_table_bytes`, see `data_components::inferred_schema`). Every
+/// signal degrades gracefully: an unknown one falls back to the hardware-only
+/// derivation.
+fn build_workload_profile(
+    acceleration: Option<&Acceleration>,
+    schema: &Schema,
+    primary_keys: &[String],
+    on_conflict: Option<&datafusion_table_providers::util::on_conflict::OnConflict>,
+) -> autotune::WorkloadProfile {
+    let small_write = acceleration.is_some_and(uses_small_write_refresh_profile);
+    let inferred =
+        data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata());
+    autotune::WorkloadProfile::from_inferred(
+        small_write,
+        primary_keys,
+        is_upsert_on_conflict(on_conflict),
+        &inferred,
+    )
+}
+
 /// Returns true if the path is a local filesystem path (not a remote object store).
 ///
 /// Local paths include:
@@ -273,6 +309,26 @@ fn is_local_path(path: &str) -> bool {
     !path.contains("://") || path.starts_with("file://")
 }
 
+/// Strip a `file:`/`file://` scheme (including an optional authority such as
+/// `localhost`) so on-disk storage detection receives a real filesystem path.
+/// `resolve_metadata_dir` can return such URIs (since `cayenne_file_path` accepts
+/// them); feeding `file:///x` or `file://localhost/x` into `Path::new` would make
+/// `Auto` storage detection misclassify it as `Unknown`. Returns a borrowed slice
+/// (no owned path), so callers can pass the result directly as `&str`.
+fn fs_probe_path(path: &str) -> &str {
+    if let Some(rest) = path.strip_prefix("file://") {
+        // `rest` is either `/abs/path` (empty authority, e.g. `file:///x`) or
+        // `authority/abs/path` (e.g. `localhost/abs/path`); the filesystem path
+        // begins at the first '/'.
+        match rest.find('/') {
+            Some(slash) => &rest[slash..],
+            None => rest,
+        }
+    } else {
+        path.strip_prefix("file:").unwrap_or(path)
+    }
+}
+
 impl CayenneAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -282,8 +338,7 @@ impl CayenneAccelerator {
     #[must_use]
     pub fn with_footer_cache_mb(footer_cache_mb: Option<usize>) -> Self {
         let permits = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+            .map_or(1, std::num::NonZeroUsize::get)
             .max(1);
         Self {
             catalog: Arc::new(OnceCell::new()),
@@ -481,25 +536,29 @@ impl CayenneAccelerator {
         table_name: &str,
         source: &dyn AccelerationSource,
     ) -> cayenne::metadata::VortexConfig {
-        Self::get_vortex_config_with_footer_cache(table_name, source, None).await
+        let small_write = source
+            .acceleration()
+            .is_some_and(uses_small_write_refresh_profile);
+        let workload = autotune::WorkloadProfile::hardware_only(small_write);
+        Self::get_vortex_config_with_footer_cache(table_name, source, None, &workload).await
     }
 
     async fn get_vortex_config_with_footer_cache(
         table_name: &str,
         source: &dyn AccelerationSource,
         footer_cache_mb: Option<usize>,
+        workload: &autotune::WorkloadProfile,
     ) -> cayenne::metadata::VortexConfig {
         let mut config = cayenne::metadata::VortexConfig {
             footer_cache_mb,
             ..Default::default()
         };
 
-        // Storage-aware default for target Vortex file size on local disk.
-        // Smaller files reduce write amplification on EBS-class network
-        // storage; larger files improve scan throughput on tmpfs / RAM-backed
-        // mounts. Skip for S3 (cayenne_file_path/s3:// or s3_zone_ids) where
-        // we always use the engine default; the network-attached object
-        // store doesn't benefit from local mount classification.
+        // Auto-tune the memory-/cpu-/storage-sensitive Vortex knobs from a
+        // single detected host profile so they move together for the host
+        // instead of being set in isolation. Every numeric knob below also
+        // accepts the literal `auto` (or being left unset) to opt into this
+        // derivation; an explicit value always overrides it. See `autotune`.
         if let Some(acceleration) = source.acceleration() {
             let is_s3 = acceleration
                 .params
@@ -509,51 +568,87 @@ impl CayenneAccelerator {
                     .params
                     .get("cayenne_file_path")
                     .is_some_and(|p| p.starts_with("s3://"));
-            let user_set_file_size = acceleration
-                .params
-                .contains_key("cayenne_target_file_size_mb");
+            let small_write = uses_small_write_refresh_profile(acceleration);
 
-            if !is_s3
-                && !user_set_file_size
-                && let Ok(data_dir) = CayenneAccelerator::new().cayenne_data_dir(source)
-            {
-                let storage =
-                    resolve_acceleration_storage_async(acceleration.storage_profile, &data_dir)
-                        .await;
-                let storage_default = match storage {
-                    ResolvedAccelerationStorage::Ebs => Some(256_usize),
-                    ResolvedAccelerationStorage::Tmpfs => Some(64_usize),
-                    ResolvedAccelerationStorage::LocalSsd
-                    | ResolvedAccelerationStorage::Unknown => None,
-                };
-                if let Some(size_mb) = storage_default {
-                    tracing::debug!(
-                        target: "spiced::acceleration::cayenne",
-                        table = %table_name,
-                        configured = %acceleration.storage_profile,
-                        resolved = ?storage,
-                        target_file_size_mb = size_mb,
-                        "Applying storage-aware default cayenne_target_file_size_mb"
-                    );
-                    config.target_vortex_file_size_mb = size_mb;
-                }
+            // Detect the host profile once: cores, cgroup-aware memory, and the
+            // storage medium under both the Vortex data files and the metastore
+            // (where the inline-memtable BLOBs live and the per-scan re-read cost
+            // is paid). A remote (`s3://`) or empty data path classifies as
+            // Unknown — correct, since the storage-aware file-size override below
+            // is skipped for object stores. `*_dir` may be a `file://` URI, so
+            // strip the scheme before probing the real filesystem path.
+            let data_dir = CayenneAccelerator::new().cayenne_data_dir(source).ok();
+            let metadata_dir = CayenneAccelerator::resolve_metadata_dir(Some(acceleration));
+            let hw = autotune::HardwareProfile::detect(
+                acceleration.storage_profile,
+                data_dir.as_deref().map_or("", fs_probe_path),
+                fs_probe_path(&metadata_dir),
+            )
+            .await;
+
+            // Storage-aware target Vortex file size on local disk (the `auto`
+            // baseline): smaller files reduce write amplification on EBS-class
+            // network storage; larger files improve scan throughput on RAM-backed
+            // mounts. Skipped for S3, where the engine default is kept. An
+            // explicit operator value (or `auto`) is then applied on top.
+            if !is_s3 && let Some(size_mb) = hw.target_file_size_mb_override() {
+                config.target_vortex_file_size_mb = size_mb;
             }
-        }
-
-        if let Some(acceleration) = source.acceleration() {
-            apply_refresh_mode_defaults(&mut config, acceleration);
-
-            config.segment_cache_mb = parse_usize(
+            config.target_vortex_file_size_mb = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_segment_cache_mb",
-                config.segment_cache_mb,
+                &["cayenne_target_file_size_mb"],
+                config.target_vortex_file_size_mb,
             );
 
-            // Parse file size options
-            config.target_vortex_file_size_mb = parse_usize(
+            // Inline-memtable flush caps scale with memory + the metastore's
+            // storage medium; only the small-write/CDC profile inlines, so other
+            // profiles keep the floor (the caps are then ignored downstream).
+            let inline_flush_caps = if small_write {
+                hw.inline_flush_caps(workload)
+            } else {
+                autotune::InlineFlushCaps::FLOOR
+            };
+            apply_refresh_mode_defaults(&mut config, acceleration, inline_flush_caps);
+
+            // In-RAM CDC tier caps (`cdc_durability: memory`) scale with host
+            // memory only — see `autotune::HardwareProfile::mem_tier_caps`.
+            // Derived for the small-write/CDC profile (memory mode is forced
+            // back to `file` for every other profile below, where these knobs
+            // are inert); explicit operator params still override in the
+            // param-resolution pass below. The age cap and checkpoint interval
+            // deliberately keep their static defaults: they are time-domain
+            // durability bounds (crash-replay window / slot-ack cadence), not
+            // hardware-capacity quantities.
+            if small_write {
+                let tier_caps = hw.mem_tier_caps();
+                config.cdc_mem_tier_max_bytes = tier_caps.max_bytes;
+                config.cdc_mem_tier_min_flush_bytes = tier_caps.min_flush_bytes;
+            }
+
+            // Vortex segment cache: memory-aware `auto` default (scales up on
+            // memory-rich hosts, never below the historical 256 MiB), overridable.
+            config.segment_cache_mb = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_target_file_size_mb",
-                config.target_vortex_file_size_mb,
+                &["cayenne_segment_cache_mb"],
+                hw.segment_cache_mb(),
+            );
+
+            // PK keyset cache: `auto`/unset → memory-derived default; 0 → warn +
+            // minimum 1 MiB (mirroring upload_concurrency); else the operator value.
+            config.pk_keyset_cache_mb = Some(
+                match autotune::read_knob(
+                    acceleration,
+                    &["cayenne_pk_keyset_cache_mb", "pk_keyset_cache_mb"],
+                ) {
+                    autotune::Knob::Auto => hw.pk_keyset_cache_mb(workload),
+                    autotune::Knob::Set(0) => {
+                        tracing::warn!(
+                            "Invalid cayenne_pk_keyset_cache_mb value of 0. Using minimum value of 1 MB."
+                        );
+                        1
+                    }
+                    autotune::Knob::Set(mb) => mb,
+                },
             );
 
             // Parse compression strategy
@@ -574,6 +669,22 @@ impl CayenneAccelerator {
                 }
             }
 
+            // Parse delta-write encoding level ('auto' or 0..=10, zstd-style).
+            // Applies only to fresh delta writes; compaction outputs always use
+            // the full default encoding. See `cayenne::metadata::DeltaEncoding`.
+            if let Some(encoding_str) = acceleration.params.get("cayenne_delta_encoding") {
+                match encoding_str.parse::<cayenne::metadata::DeltaEncoding>() {
+                    Ok(encoding) => {
+                        config.delta_encoding = encoding;
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            "Dataset '{table_name}' contains an invalid `cayenne_delta_encoding` - {reason}. Defaulting to 'auto'.",
+                        );
+                    }
+                }
+            }
+
             if let Some((key, value)) = ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
                 .iter()
                 .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
@@ -586,6 +697,105 @@ impl CayenneAccelerator {
                     );
                 }
             }
+
+            if let Some((key, value)) = ["cayenne_deletion_mode", "deletion_mode"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::DeletionMode::parse(value) {
+                    config.deletion_mode = mode;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: auto, key, position. Defaulting to auto."
+                    );
+                }
+            }
+
+            // Auto-resolve the deletion mode for delete-receiving CDC tables:
+            // under `refresh_mode: changes`, position mode is pathological when
+            // DELETE events arrive continuously — position-delete compaction
+            // must serialize with writers (`try_lock`), so a continuously
+            // written table starves its own compaction and file count grows
+            // unboundedly, while key mode compacts concurrently with writers
+            // and rides the in-memory CDC tier. A schema-time auto cannot know
+            // the delete rate, so prefer the mode that degrades gracefully in
+            // both cases. Gated strictly: only an unresolved `auto`, only the
+            // changes/CDC refresh mode, and only when a primary key exists
+            // (key mode requires one) — explicit `position`/`key` configs and
+            // every non-CDC profile keep today's position resolution
+            // (merge-on-read pushdown, zero per-row scan CPU).
+            if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
+                && acceleration.refresh_mode == Some(RefreshMode::Changes)
+                && workload.has_primary_key
+            {
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+                tracing::debug!(
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (CDC refresh mode with a primary key). Key-based deletes compact concurrently with writers; set `cayenne_deletion_mode: position` to opt back into merge-on-read position deletes."
+                );
+            }
+
+            // CDC durability mode (file | memory). Memory mode appends CDC
+            // batches to an in-RAM tier and defers the source slot ack to a
+            // checkpoint; it is only meaningful for the small-write/CDC
+            // profile, so it is forced back to `file` for other profiles
+            // below. Memory is the DEFAULT (A/B-validated faster than `file`
+            // on the CDC profile end-to-end: analytical QPH, replication lag,
+            // and disk footprint, at identical convergence); `file` remains
+            // the explicit conservative opt-out.
+            let mut cdc_durability_explicit = false;
+            if let Some((key, value)) = ["cayenne_cdc_durability", "cdc_durability"]
+                .iter()
+                .find_map(|key| acceleration.params.get(*key).map(|value| (*key, value)))
+            {
+                if let Some(mode) = cayenne::metadata::CdcDurability::parse(value) {
+                    config.cdc_durability = mode;
+                    cdc_durability_explicit = true;
+                } else {
+                    tracing::warn!(
+                        "Dataset '{table_name}' contains an invalid `{key}` value: '{value}'. Expected one of: file, memory. Using the default (memory, eligibility-gated)."
+                    );
+                }
+            }
+            if config.cdc_durability.is_memory() && !uses_small_write_refresh_profile(acceleration)
+            {
+                // Warn only when memory was explicitly requested: memory is
+                // the DEFAULT now, so every full/snapshot-profile dataset
+                // lands here by design and silently keeps the durable path.
+                if cdc_durability_explicit {
+                    tracing::warn!(
+                        "Dataset '{table_name}' set `cayenne_cdc_durability: memory` but is not using the small-write/CDC refresh profile (refresh_mode: changes/caching, or append with refresh_check_interval <= 5m). In-memory CDC durability only applies to that profile; using `file`."
+                    );
+                }
+                config.cdc_durability = cayenne::metadata::CdcDurability::File;
+            }
+            config.cdc_mem_tier_max_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &["cayenne_cdc_mem_tier_max_bytes", "cdc_mem_tier_max_bytes"],
+                config.cdc_mem_tier_max_bytes,
+            );
+            config.cdc_mem_tier_max_age_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &["cayenne_cdc_mem_tier_max_age_ms", "cdc_mem_tier_max_age_ms"],
+                config.cdc_mem_tier_max_age_ms,
+                " (milliseconds)",
+            );
+            config.cdc_mem_tier_min_flush_bytes = parse_usize_aliases_as_i64(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_min_flush_bytes",
+                    "cdc_mem_tier_min_flush_bytes",
+                ],
+                config.cdc_mem_tier_min_flush_bytes,
+            );
+            config.cdc_mem_tier_checkpoint_interval_ms = parse_u64_aliases_with_hint(
+                acceleration,
+                &[
+                    "cayenne_cdc_mem_tier_checkpoint_interval_ms",
+                    "cdc_mem_tier_checkpoint_interval_ms",
+                ],
+                config.cdc_mem_tier_checkpoint_interval_ms,
+                " (milliseconds)",
+            );
 
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
@@ -600,86 +810,96 @@ impl CayenneAccelerator {
                     .collect();
             }
 
-            if let Some((upload_concurrency_key, parsed_upload_concurrency)) = parse_optional_usize(
+            // Parse shard key columns (the hash-clustering key for intra-write
+            // sharding; the engine derives it from the primary key when unset)
+            if let Some(shard_cols_str) = acceleration
+                .params
+                .get("cayenne_shard_key_columns")
+                .or_else(|| acceleration.params.get("shard_key_columns"))
+            {
+                config.shard_key_columns = shard_cols_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+
+            // Upload concurrency: `auto`/unset keeps the available-parallelism
+            // default; 0 → warn + minimum 1. The aggregate across all tables is
+            // separately bounded by the process-global encode budget.
+            match autotune::read_knob(
                 acceleration,
                 &["cayenne_upload_concurrency", "upload_concurrency"],
             ) {
-                if parsed_upload_concurrency == 0 {
+                autotune::Knob::Auto => {}
+                autotune::Knob::Set(0) => {
                     tracing::warn!(
-                        "Invalid {upload_concurrency_key} value of 0. Using minimum value of 1."
+                        "Invalid cayenne_upload_concurrency value of 0. Using minimum value of 1."
                     );
                     config.upload_concurrency = 1;
-                } else {
-                    config.upload_concurrency = parsed_upload_concurrency;
                 }
+                autotune::Knob::Set(n) => config.upload_concurrency = n,
             }
 
-            if let Some((write_concurrency_key, parsed_write_concurrency)) = parse_optional_usize(
+            // Write concurrency: `auto`/unset leaves the per-write default
+            // (session target_partitions, capped at the host core count and the
+            // global encode budget); 0 → warn + minimum 1.
+            match autotune::read_knob(
                 acceleration,
                 &["cayenne_write_concurrency", "write_concurrency"],
             ) {
-                if parsed_write_concurrency == 0 {
+                autotune::Knob::Auto => {}
+                autotune::Knob::Set(0) => {
                     tracing::warn!(
-                        "Invalid {write_concurrency_key} value of 0. Using minimum value of 1."
+                        "Invalid cayenne_write_concurrency value of 0. Using minimum value of 1."
                     );
                     config.write_concurrency = Some(1);
-                } else {
-                    config.write_concurrency = Some(parsed_write_concurrency);
                 }
+                autotune::Knob::Set(n) => config.write_concurrency = Some(n),
             }
 
-            config.compaction_trigger_files = parse_usize(
+            config.compaction_trigger_files = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_trigger_files",
+                &["cayenne_compaction_trigger_files"],
                 config.compaction_trigger_files,
             );
-            config.compaction_trigger_protected_snapshots = parse_usize(
+            config.compaction_trigger_protected_snapshots = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_trigger_protected_snapshots",
+                &["cayenne_compaction_trigger_protected_snapshots"],
                 config.compaction_trigger_protected_snapshots,
             );
-            let age = crate::accelerated_table::refresh_task::changes::cdc_config_from_params(
-                &source.app().runtime.params,
-            )
-            .max_coalesce_age_ms;
-
-            if age > 0 {
-                config.compaction_trigger_snapshot_age_ms = age;
-            } else {
-                config.compaction_trigger_snapshot_age_ms = parse_u64_with_hint(
-                    acceleration,
-                    "cayenne_compaction_trigger_snapshot_age_ms",
-                    config.compaction_trigger_snapshot_age_ms,
-                    "; 0 disables the age trigger",
-                );
-            }
-            config.compaction_max_levels = parse_usize(
+            config.compaction_trigger_snapshot_age_ms = autotune::auto_or_u64(
                 acceleration,
-                "cayenne_compaction_max_levels",
+                &["cayenne_compaction_trigger_snapshot_age_ms"],
+                config.compaction_trigger_snapshot_age_ms,
+            );
+            config.compaction_max_levels = autotune::auto_or_usize(
+                acceleration,
+                &["cayenne_compaction_max_levels"],
                 config.compaction_max_levels,
             );
-            config.compaction_max_files_per_pick = parse_usize(
+            config.compaction_max_files_per_pick = autotune::auto_or_usize(
                 acceleration,
-                "cayenne_compaction_max_files_per_pick",
+                &["cayenne_compaction_max_files_per_pick"],
                 config.compaction_max_files_per_pick,
             );
 
-            config.inline_max_rows = parse_usize_aliases(
+            config.inline_max_rows = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_rows", "inline_max_rows"],
                 config.inline_max_rows,
             );
-            config.inline_max_bytes = parse_usize_aliases(
+            config.inline_max_bytes = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_bytes", "inline_max_bytes"],
                 config.inline_max_bytes,
             );
-            config.inline_max_buffer_bytes = parse_usize_aliases(
+            config.inline_max_buffer_bytes = autotune::auto_or_usize(
                 acceleration,
                 &["cayenne_inline_max_buffer_bytes", "inline_max_buffer_bytes"],
                 config.inline_max_buffer_bytes,
             );
-            config.inline_flush_max_rows = parse_usize_aliases_as_i64(
+            config.inline_flush_max_rows = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_rows",
@@ -689,7 +909,7 @@ impl CayenneAccelerator {
                 ],
                 config.inline_flush_max_rows,
             );
-            config.inline_flush_max_segments = parse_usize_aliases_as_i64(
+            config.inline_flush_max_segments = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_segments",
@@ -699,7 +919,7 @@ impl CayenneAccelerator {
                 ],
                 config.inline_flush_max_segments,
             );
-            config.inline_flush_max_bytes = parse_usize_aliases_as_i64(
+            config.inline_flush_max_bytes = autotune::auto_or_i64(
                 acceleration,
                 &[
                     "cayenne_inline_flush_max_bytes",
@@ -710,23 +930,137 @@ impl CayenneAccelerator {
                 config.inline_flush_max_bytes,
             );
 
-            config.compaction_background_interval_ms = parse_u64_with_hint(
+            config.compaction_background_interval_ms = autotune::auto_or_u64(
                 acceleration,
-                "cayenne_compaction_background_interval_ms",
+                &["cayenne_compaction_background_interval_ms"],
                 config.compaction_background_interval_ms,
-                "; 0 disables the background task",
             );
 
-            tracing::debug!(
+            // Tuning mode (`cayenne_tuning`): `auto` (default) derives correct
+            // values statically from the detected environment + inferred schema;
+            // `adaptive` additionally runs the closed-feedback loop that adapts
+            // the knobs over time within the environment-derived [floor, ceiling].
+            // Independently, an explicit per-knob value always overrides the
+            // derived value — and under `adaptive` it *pins* that knob, so the
+            // loop leaves it alone (its bounds collapse to a point downstream).
+            let tuning_mode = acceleration
+                .params
+                .get("cayenne_tuning")
+                .map(|v| v.trim().to_ascii_lowercase());
+            if let Some(mode) = &tuning_mode
+                && mode != "auto"
+                && mode != "adaptive"
+            {
+                tracing::warn!(
+                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
+                );
+            }
+            config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+            // Extended schema inference SHARPENS the warm start (row_count/
+            // table_bytes refine the memory sizing; inferred PK/index/sort metadata
+            // feeds the query-health surface), but it is no longer REQUIRED for
+            // `adaptive`: the controller relearns the observed mean row width from
+            // live ingest and converges its actuators from the hardware-derived
+            // warm start regardless. When the metadata is absent, note that the
+            // warm start is coarser but still let the closed loop run.
+            if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive`: no inferred schema metadata found (set `schema_inference: extended` for a sharper warm-start); starting from the hardware-derived config and adapting from observed ingest."
+                );
+            }
+            // The closed-loop controller rides the per-table background compaction
+            // task's tick; with that task disabled (interval == 0) it would never
+            // run (nor emit the autotune gauges), so adaptive falls back to auto.
+            if config.dynamic_tuning && config.compaction_background_interval_ms == 0 {
+                tracing::warn!(
+                    "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
+                );
+                config.dynamic_tuning = false;
+            }
+            if config.dynamic_tuning {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
+                );
+            }
+            config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
+                inline_flush: autotune::is_pinned(
+                    acceleration,
+                    &[
+                        "cayenne_inline_flush_max_bytes",
+                        "inline_flush_max_bytes",
+                        "cayenne_inline_memtable_max_bytes",
+                        "inline_memtable_max_bytes",
+                        "cayenne_inline_flush_max_rows",
+                        "inline_flush_max_rows",
+                        "cayenne_inline_memtable_max_rows",
+                        "inline_memtable_max_rows",
+                        "cayenne_inline_flush_max_segments",
+                        "inline_flush_max_segments",
+                        "cayenne_inline_memtable_max_segments",
+                        "inline_memtable_max_segments",
+                    ],
+                ),
+                compaction_interval: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_compaction_background_interval_ms"],
+                ),
+                compaction_trigger: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_compaction_trigger_files"],
+                ),
+                write_concurrency: autotune::is_pinned(
+                    acceleration,
+                    &["cayenne_write_concurrency", "write_concurrency"],
+                ),
+                mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
+            };
+
+            // Surface cross-parameter and out-of-range issues that parse cleanly
+            // but won't behave as intended (silently clamped at use, or don't
+            // compose with each other) — see `VortexConfig::config_warnings`.
+            for warning in config.config_warnings(hw.cores) {
+                tracing::warn!(
+                    "Dataset '{table_name}': {warning} For details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#configuration"
+                );
+            }
+
+            // One structured line per table recording the host basis and the
+            // knobs `auto` resolved to, so an operator (or a benchmark sweep) can
+            // see exactly what was chosen on this host — the observability that
+            // makes "works regardless of the host machine" verifiable.
+            tracing::info!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                cores = hw.cores,
+                total_mem_mib = hw.total_mem_bytes / (1024 * 1024),
+                data_storage = %hw.data_storage,
+                metastore_storage = %hw.metastore_storage,
                 runtime_footer_cache_mb = ?config.footer_cache_mb,
-                "Cayenne Vortex config: segment_cache={}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, pk_conflict_detection={}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}",
+                tuning = if config.dynamic_tuning { "adaptive" } else { "auto" },
+                // Inferred workload signals (from extended schema inference). When
+                // these are `None`/false the schema wasn't inferred for this table,
+                // so the data-aware sizing fell back to hardware-only and adaptive
+                // (if requested) was gated off — makes that immediately visible.
+                inferred_row_count = ?workload.row_count,
+                inferred_table_bytes = ?workload.table_bytes,
+                inferred_extended_schema = workload.inferred_metadata.is_present(),
+                has_primary_key = workload.has_primary_key,
+                is_upsert = workload.is_upsert,
+                "Cayenne auto-tuned config: segment_cache={}MB, pk_keyset_cache={:?}MB, target_file_size={}MB, upload_concurrency={}, write_concurrency_override={:?}, sort_columns={:?}, compression_strategy={:?}, delta_encoding={}, pk_conflict_detection={}, deletion_mode={:?}, compaction_trigger_files={}, compaction_trigger_protected_snapshots={}, compaction_trigger_snapshot_age_ms={}, compaction_max_levels={}, compaction_max_files_per_pick={}, compaction_background_interval_ms={}, inline_max_rows={}, inline_max_bytes={}, inline_max_buffer_bytes={}, inline_flush_max_rows={}, inline_flush_max_segments={}, inline_flush_max_bytes={}, cdc_durability={}, cdc_mem_tier_max_bytes={}, cdc_mem_tier_min_flush_bytes={}",
                 config.segment_cache_mb,
+                config.pk_keyset_cache_mb,
                 config.target_vortex_file_size_mb,
                 config.upload_concurrency,
                 config.write_concurrency,
                 config.sort_columns,
                 config.compression_strategy,
+                config.delta_encoding,
                 config.pk_conflict_detection.as_str(),
+                config.deletion_mode,
                 config.compaction_trigger_files,
                 config.compaction_trigger_protected_snapshots,
                 config.compaction_trigger_snapshot_age_ms,
@@ -739,6 +1073,9 @@ impl CayenneAccelerator {
                 config.inline_flush_max_rows,
                 config.inline_flush_max_segments,
                 config.inline_flush_max_bytes,
+                config.cdc_durability.as_str(),
+                config.cdc_mem_tier_max_bytes,
+                config.cdc_mem_tier_min_flush_bytes,
             );
         }
 
@@ -885,9 +1222,19 @@ impl CayenneAccelerator {
 
         // Check if using S3 Express One Zone storage
         let is_s3_express = s3::is_s3_express_data_path(source);
-        let vortex_config =
-            Self::get_vortex_config_with_footer_cache(table_name, source, self.footer_cache_mb)
-                .await;
+        let workload = build_workload_profile(
+            acceleration,
+            schema.as_ref(),
+            &primary_keys,
+            on_conflict.as_ref(),
+        );
+        let vortex_config = Self::get_vortex_config_with_footer_cache(
+            table_name,
+            source,
+            self.footer_cache_mb,
+            &workload,
+        )
+        .await;
 
         // Build S3 object store if using S3 Express One Zone storage
         let object_store =
@@ -915,8 +1262,11 @@ impl CayenneAccelerator {
         };
 
         // Create shared Cayenne context with the runtime's RuntimeEnv
-        let context =
-            cayenne::CayenneContext::new(&table_options.vortex_config, Arc::clone(&runtime_env));
+        let context = cayenne::CayenneContext::new(
+            &table_options.vortex_config,
+            Arc::clone(&runtime_env),
+            table_name,
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -951,6 +1301,14 @@ impl CayenneAccelerator {
         let spawned = provider.spawn_background_compaction(Arc::clone(&self.compaction_semaphore));
         if spawned {
             tracing::debug!("Background compaction task spawned for Cayenne table {table_name}",);
+        }
+        // Periodic mem-tier checkpoint (cdc_durability: memory only); a no-op for
+        // file-mode tables. This is what advances the deferred source slot ack on
+        // an idle/pure-upsert stream so replication lag stays bounded.
+        if provider.spawn_background_mem_tier_checkpoint() {
+            tracing::debug!(
+                "Background mem-tier checkpoint task spawned for Cayenne table {table_name}",
+            );
         }
         Ok(provider)
     }
@@ -1031,8 +1389,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    24,
-    { S3_PARAMS_LEN + 24 },
+    39,
+    { S3_PARAMS_LEN + 39 },
 >(
     S3_PARAMETERS,
     [
@@ -1050,25 +1408,36 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["string", "error", "ignore", "warn"])
             .default("string"),
         ParameterSpec::component("segment_cache_mb")
-            .description("Size of the in-memory Vortex segment cache in MB. Set > 0 to cache decompressed data segments. Default: 256 MB")
-            .default("256"),
+            .description("Size of the in-memory Vortex decompressed-segment cache in MB. 'auto' (default, or when unset) scales with machine memory (~1/128 of RAM) but never below 256 MB and never above 1024 MB. Set an explicit MB value to override.")
+            .default("auto"),
+        ParameterSpec::component("pk_keyset_cache_mb")
+            .description("Byte budget (in MB) for the in-memory primary-key index used to detect upsert conflicts during CDC ingestion. Within budget an exact keyset is kept; over budget, upsert tables fall back to a bounded bloom existence filter (avoiding the per-batch full-table rebuild) while DoNothing tables rebuild from a scan. When unset, an optimal default is derived from available machine memory."),
         ParameterSpec::component("target_file_size_mb")
-            .description("Target size for Vortex data files in MB. Default: 256 MB. Adjust as needed for S3 Express or remote upload scenarios.")
-            .default("256"),
+            .description("Target size for Vortex data files in MB. 'auto' (default, or when unset) is storage-aware: 256 MB on EBS-class network storage, 64 MB on RAM-backed (tmpfs) mounts, and the 256 MB engine default on local SSD / unknown / S3. Set an explicit MB value to override.")
+            .default("auto"),
         ParameterSpec::component("sort_columns")
             .description("Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id')."),
+        ParameterSpec::component("shard_key_columns")
+            .description("Comma-separated list of columns to hash-cluster rows by during intra-write sharding (the parallel encode fan-out), e.g. 'tenant_id'. When unset, the shard key derives from the primary key (PK-hash clustering); tables without a primary key shard round-robin. Extended schema inference (schema_inference: extended) fills this from the source's declared partition/shard key when the user leaves it unset. Ignored for sorted tables: sort_columns forces a single serial writer."),
         ParameterSpec::component("compression_strategy")
             .description("Compression strategy to use for Vortex files. Options: 'btrblocks' (default), 'zstd'")
             .one_of(&["btrblocks", "zstd"])
             .default("btrblocks"),
+        ParameterSpec::component("delta_encoding")
+            .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
+            .default("auto"),
         ParameterSpec::component("pk_conflict_detection")
             .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
             .one_of(&["auto", "none"])
             .default("auto"),
+        ParameterSpec::component("deletion_mode")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.")
+            .one_of(&["auto", "key", "position"])
+            .default("auto"),
         ParameterSpec::component("upload_concurrency")
-            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. Defaults to available CPU parallelism."),
+            .description("Maximum number of concurrent file uploads when writing multiple Vortex files. 'auto' (or unset) uses available CPU parallelism. The aggregate encode concurrency across all Cayenne tables is separately bounded by a process-global budget sized to the host core count."),
         ParameterSpec::component("write_concurrency")
-            .description("Optional writer partition override for unsorted Cayenne ingests. Defaults to runtime.query.target_partitions."),
+            .description("Writer partition override (parallel encoders) for unsorted Cayenne ingests. 'auto' (or unset) uses a small fixed default of 4, capped at the host core count (= runtime.query.target_partitions) and the process-global encode budget — deliberately not the full core count, because each table is sized independently and the per-table values sum across tables under concurrent CDC. Raise it explicitly for a table that needs more encode parallelism."),
         ParameterSpec::component("compaction_trigger_files")
             .description("Minimum number of small Vortex files in the current snapshot before tiered compaction runs. A 'small' file is one whose size is below cayenne_target_file_size_mb / 4. Default: 4 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8 otherwise."),
         ParameterSpec::component("compaction_trigger_protected_snapshots")
@@ -1095,6 +1464,32 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Maximum inline entries before checkpointing inline data to Vortex. Default: 16 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 64 otherwise."),
         ParameterSpec::component("inline_flush_max_bytes")
             .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 2097152 for refresh_mode: caching, changes, or append with refresh_check_interval <= 5m; 8388608 otherwise."),
+        ParameterSpec::component("cdc_durability")
+            .description("Durability mode for the inline CDC write path. 'memory' (default, eligibility-gated) appends batches to an in-RAM tier and defers the source slot ack to a periodic/cap-triggered checkpoint, collapsing per-batch durability cost; on crash the un-checkpointed tail is replayed from the source slot (the apply is PK-idempotent, so exactly-once). Bounded by a per-table byte cap and a process-global byte budget so it cannot OOM. The memory path applies only to the small-write/CDC profile and non-partitioned tables; other profiles use 'file'. 'file' persists each CDC batch durably before advancing the source slot and remains the explicit conservative opt-out.")
+            .one_of(&["file", "memory"])
+            .default("memory"),
+        ParameterSpec::component("cdc_mem_tier_max_bytes")
+            .description("Per-table RAM-tier byte cap before a forced spill (checkpoint) and slot advance, in cdc_durability: memory mode only. Auto-derived from host memory (~1/64 of RAM, clamped to 256 MiB - 1 GiB; 256 MiB on hosts at or under 16 GiB) — a rare backstop now that the non-fence-blocking background checkpointer is the primary flush. Set 0 to disable the per-table cap; the process-global byte budget still bounds aggregate resident memory. When both are set, whichever is breached first triggers the spill."),
+        ParameterSpec::component("cdc_mem_tier_max_age_ms")
+            .description("Max wall-clock milliseconds a RAM-tier epoch may age before a forced checkpoint, in cdc_durability: memory mode only. Bounds the crash-replay window and the deferred source-slot ack for tables that never reach a byte threshold. Default 10000 (10 s). Set 0 to disable the age trigger."),
+        ParameterSpec::component("cdc_mem_tier_min_flush_bytes")
+            .description("Minimum resident RAM-tier bytes before the periodic background tick durably checkpoints, in cdc_durability: memory mode only. Bounds snapshot/delete-file churn: below this size a tick is skipped unless the tier age reached cdc_mem_tier_max_age_ms. Query freshness is unaffected (RAM rows are visible immediately); only the deferred slot ack waits. The write-path byte-cap spill is not gated. Auto-derived as 1/8 of the derived cdc_mem_tier_max_bytes (clamped to 32-128 MiB; 32 MiB on hosts at or under 16 GiB). Set 0 to flush on every tick."),
+        ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
+            .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
+        ParameterSpec::component("tuning")
+            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'schema_inference: extended' sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"])
+            .default("auto"),
+        ParameterSpec::runtime("cdc_prefetch_buffer")
+            .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
+        ParameterSpec::runtime("cdc_max_coalesced_envelopes")
+            .description("Per-dataset override for the maximum number of CDC envelopes coalesced into a single accelerator write."),
+        ParameterSpec::runtime("cdc_max_coalesced_bytes")
+            .description("Per-dataset override for the byte budget (in bytes) of a coalesced CDC burst."),
+        ParameterSpec::runtime("cdc_max_coalesce_age_ms")
+            .description("Per-dataset override for the linger window (ms) the CDC apply loop waits for additional envelopes before flushing."),
+        ParameterSpec::runtime("cdc_commit_timeout_ms")
+            .description("Per-dataset override for the CDC source-side commit timeout (ms)."),
     ],
 );
 
@@ -1617,10 +2012,17 @@ impl DataAccelerator for CayenneAccelerator {
             // Create partition creator
             let unsupported_type_action = Self::get_unsupported_type_action(source);
             let is_s3_express = s3::is_s3_express_data_path(source);
+            let workload = build_workload_profile(
+                source.acceleration(),
+                arrow_schema.as_ref(),
+                &primary_keys,
+                on_conflict.as_ref(),
+            );
             let vortex_config = Self::get_vortex_config_with_footer_cache(
                 &table_name,
                 source,
                 self.footer_cache_mb,
+                &workload,
             )
             .await;
 
@@ -1904,7 +2306,7 @@ impl CayennePartitionCreator {
         // Create shared Cayenne context with cache once, to be shared across all partitions.
         // This ensures all partitions share the same footer/segment caches instead of
         // each partition creating its own cache.
-        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env);
+        let context = cayenne::CayenneContext::new(&vortex_config, runtime_env, &table_name);
 
         Self {
             table_name,
@@ -2464,6 +2866,27 @@ mod tests {
     }
 
     #[test]
+    fn test_fs_probe_path_strips_file_scheme() {
+        // file:// URIs are reduced to their filesystem path for storage detection.
+        assert_eq!(
+            fs_probe_path("file:///data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("file:/data/cayenne"), "/data/cayenne");
+        // An explicit authority (e.g. localhost) is dropped down to the path.
+        assert_eq!(
+            fs_probe_path("file://localhost/data/cayenne"),
+            "/data/cayenne"
+        );
+        // Plain paths pass through unchanged.
+        assert_eq!(
+            fs_probe_path("/data/cayenne/metadata"),
+            "/data/cayenne/metadata"
+        );
+        assert_eq!(fs_probe_path("relative/metadata"), "relative/metadata");
+    }
+
+    #[test]
     fn test_resolve_metadata_dir_with_explicit_metadata_dir() {
         let acceleration = Acceleration {
             params: [(
@@ -2644,18 +3067,12 @@ mod tests {
                 config.inline_max_buffer_bytes,
                 SMALL_WRITE_INLINE_MAX_BUFFER_BYTES
             );
-            assert_eq!(
-                config.inline_flush_max_rows,
-                SMALL_WRITE_INLINE_FLUSH_MAX_ROWS
-            );
-            assert_eq!(
-                config.inline_flush_max_segments,
-                SMALL_WRITE_INLINE_FLUSH_MAX_SEGMENTS
-            );
-            assert_eq!(
-                config.inline_flush_max_bytes,
-                SMALL_WRITE_INLINE_FLUSH_MAX_BYTES
-            );
+            // Flush caps are memory/storage-derived; exact scaling is pinned in
+            // `test_inline_flush_caps_scale_with_memory_and_storage`. Here assert the
+            // deterministic [floor, ceiling] bounds they hold on any host/medium.
+            assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+            assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
+            assert!((16..=256).contains(&config.inline_flush_max_segments));
         }
 
         let mut dataset = DatasetBuilder::try_new("append_hot".to_string(), "append_hot")
@@ -2682,10 +3099,9 @@ mod tests {
             config.compaction_trigger_protected_snapshots,
             SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS
         );
-        assert_eq!(
-            config.inline_flush_max_rows,
-            SMALL_WRITE_INLINE_FLUSH_MAX_ROWS
-        );
+        assert!((2 * 1_048_576..=256 * 1_048_576).contains(&config.inline_flush_max_bytes));
+        assert!((2_048..=262_144).contains(&config.inline_flush_max_rows));
+        assert!((16..=256).contains(&config.inline_flush_max_segments));
     }
 
     #[tokio::test]
@@ -2824,6 +3240,193 @@ mod tests {
             config.pk_conflict_detection,
             cayenne::metadata::PkConflictDetection::None
         );
+    }
+
+    #[tokio::test]
+    async fn test_documented_cdc_mem_tier_params_are_resolved() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut dataset = DatasetBuilder::try_new("cdc_hot".to_string(), "cdc_hot")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        dataset.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: [
+                ("cdc_mem_tier_max_bytes".to_string(), "123456".to_string()),
+                ("cdc_mem_tier_max_age_ms".to_string(), "7890".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let config = CayenneAccelerator::get_vortex_config("cdc_hot", &dataset).await;
+
+        assert_eq!(config.cdc_mem_tier_max_bytes, 123_456);
+        assert_eq!(config.cdc_mem_tier_max_age_ms, 7_890);
+    }
+
+    /// Unset mem-tier caps are auto-derived from host memory for the CDC
+    /// profile (range-asserted, since the test host's RAM varies), while a
+    /// non-small-write profile keeps the static serde defaults untouched.
+    #[tokio::test]
+    async fn test_cdc_mem_tier_caps_auto_derived_for_small_write() {
+        const MIB: i64 = 1024 * 1024;
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let mut cdc = DatasetBuilder::try_new("cdc_auto_tier".to_string(), "cdc_auto_tier")
+            .expect("dataset builder")
+            .with_app(Arc::clone(&app))
+            .with_runtime(Arc::clone(&rt))
+            .build()
+            .expect("dataset");
+        cdc.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            ..Default::default()
+        });
+        let config = CayenneAccelerator::get_vortex_config("cdc_auto_tier", &cdc).await;
+        assert!(
+            (256 * MIB..=1024 * MIB).contains(&config.cdc_mem_tier_max_bytes),
+            "derived cap {} outside [256 MiB, 1 GiB]",
+            config.cdc_mem_tier_max_bytes
+        );
+        assert!(
+            (32 * MIB..=128 * MIB).contains(&config.cdc_mem_tier_min_flush_bytes),
+            "derived flush gate {} outside [32 MiB, 128 MiB]",
+            config.cdc_mem_tier_min_flush_bytes
+        );
+        assert!(
+            config.cdc_mem_tier_min_flush_bytes <= config.cdc_mem_tier_max_bytes,
+            "flush gate must not exceed the cap"
+        );
+        // Time-domain knobs are NOT hardware-derived.
+        assert_eq!(config.cdc_mem_tier_max_age_ms, 10_000);
+        assert_eq!(config.cdc_mem_tier_checkpoint_interval_ms, 1_000);
+
+        let mut full = DatasetBuilder::try_new("full_tier".to_string(), "full_tier")
+            .expect("dataset builder")
+            .with_app(app)
+            .with_runtime(rt)
+            .build()
+            .expect("dataset");
+        full.acceleration = Some(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            ..Default::default()
+        });
+        let config = CayenneAccelerator::get_vortex_config("full_tier", &full).await;
+        assert_eq!(
+            config.cdc_mem_tier_max_bytes,
+            256 * MIB,
+            "non-small-write profiles keep the static default (knob is inert there)"
+        );
+        assert_eq!(config.cdc_mem_tier_min_flush_bytes, 32 * MIB);
+    }
+
+    /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
+    /// datasets whose workload has a primary key; explicit configs and every
+    /// other profile keep their value (and Auto's downstream position
+    /// resolution) untouched.
+    #[tokio::test]
+    async fn test_deletion_mode_auto_resolves_to_key_for_cdc_pk_tables() {
+        let app = Arc::new(AppBuilder::new("test").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+
+        let build = |name: &str,
+                     refresh_mode: RefreshMode,
+                     params: Vec<(String, String)>,
+                     app: &Arc<app::App>,
+                     rt: &Arc<crate::Runtime>| {
+            let mut ds = DatasetBuilder::try_new(name.to_string(), name)
+                .expect("dataset builder")
+                .with_app(Arc::clone(app))
+                .with_runtime(Arc::clone(rt))
+                .build()
+                .expect("dataset");
+            ds.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(refresh_mode),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            ds
+        };
+        let pk_workload = autotune::WorkloadProfile {
+            small_write: true,
+            has_primary_key: true,
+            is_upsert: true,
+            pk_arity: 1,
+            ..Default::default()
+        };
+
+        // CDC (changes) + PK + unset mode → auto-resolves to Key.
+        let ds = build("cdc_pk", RefreshMode::Changes, vec![], &app, &rt);
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_pk",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Key);
+
+        // Explicit `position` on the same shape is respected.
+        let ds = build(
+            "cdc_pk_pos",
+            RefreshMode::Changes,
+            vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
+            &app,
+            &rt,
+        );
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_pk_pos",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(
+            config.deletion_mode,
+            cayenne::metadata::DeletionMode::Position
+        );
+
+        // CDC without a PK stays Auto (downstream resolution: position — the
+        // only mechanism a PK-less table has).
+        let ds = build("cdc_nopk", RefreshMode::Changes, vec![], &app, &rt);
+        let nopk_workload = autotune::WorkloadProfile {
+            small_write: true,
+            ..Default::default()
+        };
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "cdc_nopk",
+            &ds,
+            None,
+            &nopk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+
+        // A non-CDC profile with a PK stays Auto (position downstream).
+        let ds = build("full_pk", RefreshMode::Full, vec![], &app, &rt);
+        let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
+            "full_pk",
+            &ds,
+            None,
+            &pk_workload,
+        )
+        .await;
+        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
     }
 
     #[tokio::test]

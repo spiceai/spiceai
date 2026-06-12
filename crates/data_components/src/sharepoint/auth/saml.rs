@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, RwLock};
 
 /// Default grace period before expiry when we consider the token stale and
 /// eagerly re-exchange.
-const EXPIRY_GRACE: Duration = Duration::from_secs(60);
+const EXPIRY_GRACE: Duration = Duration::from_mins(1);
 
 /// RFC 7522 grant type URI.
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:saml2-bearer";
@@ -240,7 +240,6 @@ fn validate_assertion_encoding(assertion: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -252,18 +251,19 @@ mod tests {
     fn base64url_assertion_validates() {
         // "hello world" in base64url
         let s = general_purpose::URL_SAFE_NO_PAD.encode("hello world");
-        validate_assertion_encoding(&s).unwrap();
+        validate_assertion_encoding(&s).expect("base64url assertion should validate");
     }
 
     #[test]
     fn padded_base64url_also_validates() {
         let s = general_purpose::URL_SAFE.encode("hi");
-        validate_assertion_encoding(&s).unwrap();
+        validate_assertion_encoding(&s).expect("padded base64url assertion should validate");
     }
 
     #[test]
     fn rejects_bogus_assertion() {
-        let err = validate_assertion_encoding("!!not-base64!!").unwrap_err();
+        let err = validate_assertion_encoding("!!not-base64!!")
+            .expect_err("invalid base64 assertion should be rejected");
         assert!(matches!(err, Error::AssertionEncoding { .. }));
     }
 
@@ -406,8 +406,14 @@ mod tests {
             scope: None,
             authority_host_override: Some(base),
         });
-        let t1 = flow.acquire_token().await.unwrap();
-        let t2 = flow.acquire_token().await.unwrap();
+        let t1 = flow
+            .acquire_token()
+            .await
+            .expect("first acquire_token should succeed");
+        let t2 = flow
+            .acquire_token()
+            .await
+            .expect("second acquire_token should hit cache and succeed");
         assert_eq!(t1.access_token.expose_secret(), "T1");
         assert_eq!(t2.access_token.expose_secret(), "T1");
         // Cache hit on the second call — only one HTTP request total.
@@ -428,7 +434,10 @@ mod tests {
             scope: None,
             authority_host_override: Some(base),
         });
-        let err = flow.exchange_once().await.unwrap_err();
+        let err = flow
+            .exchange_once()
+            .await
+            .expect_err("token exchange should fail on rejection");
         match err {
             Error::TokenRejected { code, description } => {
                 assert_eq!(code, "invalid_grant");
@@ -452,7 +461,10 @@ mod tests {
             scope: Some("https://custom.example/.default offline_access".into()),
             authority_host_override: Some(base),
         });
-        let _ = flow.exchange_once().await.unwrap();
+        let _ = flow
+            .exchange_once()
+            .await
+            .expect("exchange_once with custom scope should succeed");
         let req = &captured.lock().await[0];
         assert!(
             req.contains("scope=https%3A%2F%2Fcustom.example%2F.default"),

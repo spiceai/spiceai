@@ -122,9 +122,42 @@ pub fn snapshot_stream(
             .context(BootstrapSnafu)
             .map_err(super::err_to_stream)?;
 
-        // Stream rows out of the snapshot transaction.
+        // Stream rows out of the snapshot transaction. Select exactly the
+        // dataset's columns (not `*`): columns outside the dataset schema —
+        // whatever their types — are never fetched. Columns whose Arrow type
+        // is text-derived are cast to `::text` so the wire type matches what
+        // the builders read:
+        //   - Utf8/LargeUtf8: the provider maps uuid/json(b)/inet/citext/enum
+        //     and friends to Arrow strings, but tokio-postgres only
+        //     deserializes genuine text wire types into String. `::text`
+        //     yields each type's canonical text form (a no-op for real text)
+        //     — the same representation pgoutput emits on the WAL path.
+        //   - Decimal128: read as text and parsed by the shared numeric
+        //     parser (NUMERIC has no native String deserialization).
+        //   - List/Dictionary: Postgres array literal / enum label, parsed by
+        //     the same builder the WAL path uses.
+        let select_list = dataset_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let ident = quote_ident(f.name());
+                if matches!(
+                    f.data_type(),
+                    DataType::List(_)
+                        | DataType::Dictionary(_, _)
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Decimal128(_, _)
+                ) {
+                    format!("{ident}::text")
+                } else {
+                    ident
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let select_sql = format!(
-            "SELECT * FROM {schema}.{table}",
+            "SELECT {select_list} FROM {schema}.{table}",
             schema = quote_ident(&schema_name),
             table = quote_ident(&table_name),
         );
@@ -205,6 +238,15 @@ pub fn snapshot_stream(
                     .collect::<Result<Vec<_>>>()
                     .map_err(super::err_to_stream)?;
                 yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, false);
+                if let Some(percent) = metrics.bootstrap_progress_percent() {
+                    tracing::debug!(
+                        dataset = %dataset_name,
+                        rows = total_rows,
+                        expected = ?metrics.bootstrap_rows_expected(),
+                        progress_percent = percent,
+                        "initial snapshot bootstrap progress"
+                    );
+                }
             }
         }
 
@@ -241,6 +283,7 @@ pub fn snapshot_stream(
         tracing::info!(
             dataset = %dataset_name,
             rows = total_rows,
+            expected = ?metrics.bootstrap_rows_expected(),
             "initial snapshot bootstrap complete"
         );
 
@@ -334,6 +377,10 @@ enum BootstrapBuilder {
     TimestampMicros(TimestampMicrosecondBuilder, Option<Arc<str>>),
     TimestampNanos(TimestampNanosecondBuilder, Option<Arc<str>>),
     Decimal128(Decimal128Builder, u8, i8),
+    /// Array or enum (dictionary) column. Fetched as `::text` — the same
+    /// representation pgoutput emits on the WAL path — and parsed by the same
+    /// builder the WAL path uses, so both paths share one implementation.
+    TextCast(super::changes::FieldBuilder),
 }
 
 impl BootstrapBuilder {
@@ -365,10 +412,13 @@ impl BootstrapBuilder {
                 *precision,
                 *scale,
             ),
-            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            DataType::List(_) | DataType::Dictionary(_, _) => {
+                Self::TextCast(super::changes::FieldBuilder::new(data_type)?)
+            }
+            DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
                 return PgOutputDecodeSnafu {
                     message: format!(
-                        "bootstrap: array/list types are not supported yet ({data_type}). \
+                        "bootstrap: list type {data_type} is not supported yet. \
                          Cast the column to a scalar type on the source, or exclude it."
                     ),
                 }
@@ -596,6 +646,20 @@ impl BootstrapBuilder {
                     }
                 }
             }
+            Self::TextCast(fb) => {
+                // Fetched as `::text` — array literal or enum label.
+                let v: Option<String> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read column (as text): {e}"),
+                    })?;
+                match v {
+                    Some(s) => fb.append(
+                        Some(&super::pgoutput::Value::Text(s)),
+                        super::changes::ChangeOp::Create,
+                    )?,
+                    None => fb.append_null(),
+                }
+            }
             Self::Decimal128(b, _precision, scale) => {
                 // Read NUMERIC as text from Postgres; parse to i128 with the
                 // dataset's declared scale. Uses the same routine as the WAL
@@ -651,6 +715,10 @@ impl BootstrapBuilder {
                 })
             }
             Self::Decimal128(b, _, _) => Arc::new(b.finish()),
+            Self::TextCast(fb) => {
+                let placeholder = super::changes::FieldBuilder::Utf8(StringBuilder::new());
+                std::mem::replace(fb, placeholder).finish()
+            }
         }
     }
 }

@@ -20,6 +20,7 @@ use super::refresh::get_timestamp;
 use super::sink::AccelerationSink;
 use super::synchronized_table::SynchronizedTable;
 use crate::accelerated_table::caching::CacheRefreshHelper;
+use crate::accelerated_table::retention;
 use crate::accelerated_table::timestamp_metrics_utils::with_find_max_timestamp_in_stream;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::builder::{AnalyzerRulesBuilder, get_df_default_config};
@@ -86,7 +87,7 @@ use snafu::{OptionExt, ResultExt};
 use spicepod::metric::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
@@ -265,11 +266,19 @@ pub struct RefreshTaskBuilder {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Shared flag that `AcceleratedTable::scan` checks to decide whether the
+    /// initial data load has completed. Set to `true` just before the status
+    /// transitions to `Ready` so there is no window where the runtime reports
+    /// ready but scans still see `initial_load_completed == false`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// State for `refresh_mode: snapshot`. Required when the refresh mode is
     /// [`RefreshMode::Snapshot`]; ignored otherwise.
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
+    /// Per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl RefreshTaskBuilder {
@@ -298,8 +307,10 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
+            initial_load_completed: None,
             is_s3_express_acceleration: false,
             snapshot_refresh_state: None,
+            cdc_param_overrides: None,
         }
     }
 
@@ -352,6 +363,15 @@ impl RefreshTaskBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_initial_load_completed(
+        mut self,
+        initial_load_completed: Arc<AtomicBool>,
+    ) -> RefreshTaskBuilder {
+        self.initial_load_completed = Some(initial_load_completed);
+        self
+    }
+
     /// Set whether the acceleration uses S3 Express One Zone storage.
     #[must_use]
     pub fn with_s3_express_acceleration(mut self, is_s3_express: bool) -> RefreshTaskBuilder {
@@ -366,6 +386,18 @@ impl RefreshTaskBuilder {
         state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     ) -> RefreshTaskBuilder {
         self.snapshot_refresh_state = state;
+        self
+    }
+
+    /// Provide per-dataset `cdc_*` parameter overrides. These layer on top of
+    /// the process-global [`changes::CdcConfig`] only for this dataset's
+    /// changes stream.
+    #[must_use]
+    pub fn with_cdc_param_overrides(
+        mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> RefreshTaskBuilder {
+        self.cdc_param_overrides = overrides;
         self
     }
 
@@ -422,9 +454,11 @@ impl RefreshTaskBuilder {
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
+            initial_load_completed: self.initial_load_completed,
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             snapshot_refresh_state: self.snapshot_refresh_state,
             cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
+            cdc_param_overrides: self.cdc_param_overrides,
         }
     }
 }
@@ -447,6 +481,8 @@ pub struct RefreshTask {
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
     last_updated_at: Arc<AtomicI64>,
+    /// Shared flag set to `true` just before status transitions to `Ready`.
+    initial_load_completed: Option<Arc<AtomicBool>>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
@@ -454,6 +490,8 @@ pub struct RefreshTask {
     snapshot_refresh_state: Option<crate::accelerated_table::snapshots::SnapshotRefreshState>,
     /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
     cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+    /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
+    pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for RefreshTask {
@@ -660,7 +698,7 @@ impl RefreshTask {
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
             RefreshMode::Caching => {
-                // For caching mode, identify and refresh stale rows based on fetched_at and TTL
+                // For caching mode, identify and refresh stale rows based on _fetched_at and TTL
                 return self.refresh_stale_cached_rows(refresh).await;
             }
             RefreshMode::Snapshot => {
@@ -715,6 +753,7 @@ impl RefreshTask {
                 Some(start_time),
                 streaming_data_update,
                 refresh.display_sql().as_deref(),
+                refresh.write_retention_sql_delete_expr.clone(),
             )
             .await
         {
@@ -829,6 +868,7 @@ impl RefreshTask {
         start_time: Option<SystemTime>,
         data_update: StreamingDataUpdate,
         sql: Option<&str>,
+        retention_sql_delete_expr: Option<Expr>,
     ) -> Result<(), RetryError<super::Error>> {
         let dataset_name = self.dataset_name.clone();
 
@@ -932,6 +972,19 @@ impl RefreshTask {
             return Err(e);
         }
 
+        let retention_error = if let Some(retention_sql_delete_expr) = retention_sql_delete_expr {
+            retention::apply_retention_filters_once(
+                &self.dataset_name,
+                &self.accelerator,
+                retention_sql_delete_expr,
+                &self.io_runtime,
+            )
+            .await
+            .err()
+        } else {
+            None
+        };
+
         let refresh_stat = on_written_data_stat_available.try_recv().ok();
 
         if let (Some(start_time), Some(stat)) = (start_time, &refresh_stat) {
@@ -947,13 +1000,34 @@ impl RefreshTask {
             }
         }
 
+        let num_rows = refresh_stat.as_ref().map_or(0, |s| s.num_rows);
+
+        if let Some(error) = retention_error {
+            self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
+
+            let error_message = format!(
+                "Failed to apply retention_sql after writing data for dataset {}: {}",
+                self.dataset_name,
+                format_datafusion_error(&error)
+            );
+            self.set_refresh_status(
+                sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+
+            return Err(RetryError::permanent(
+                super::Error::FailedToApplyRetentionSql {
+                    dataset_name: self.dataset_name.to_string(),
+                    source: error,
+                },
+            ));
+        }
+
         self.set_refresh_status(sql, status::ComponentStatus::Ready)
             .await;
 
-        self.maybe_update_last_updated_at(
-            &data_update.update_type,
-            refresh_stat.map_or(0, |s| s.num_rows),
-        );
+        self.maybe_update_last_updated_at(&data_update.update_type, num_rows);
 
         Ok(())
     }
@@ -1428,7 +1502,9 @@ impl RefreshTask {
             let disable_federation = self.disable_federation;
             let io_runtime = self.io_runtime.clone();
 
-            let managed_stream = managed_runtime::run_record_batch_stream_on_runtime(
+            let managed_stream: runtime_datafusion::managed_runtime::ManagedRecordBatchStream<
+                UpdateType,
+            > = managed_runtime::run_record_batch_stream_on_runtime(
                 cpu_runtime_handle,
                 request_context,
                 span,
@@ -1980,6 +2056,13 @@ impl RefreshTask {
         let is_error = status.is_error();
         let is_ready = status == status::ComponentStatus::Ready;
 
+        // Mark initial load complete BEFORE updating the runtime status to Ready.
+        // This closes the race window where `is_ready()` returns true but
+        // `AcceleratedTable::scan` still sees `initial_load_completed == false`.
+        if is_ready && let Some(flag) = &self.initial_load_completed {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+
         // runtime status update
         self.update_component_status(status).await;
 
@@ -2077,7 +2160,8 @@ impl RefreshTask {
             | super::Error::UnableToScanTableProvider { source }
             | super::Error::UnableToCreateMemTableFromUpdate { source }
             | super::Error::FailedToQueryLatestTimestamp { source }
-            | super::Error::FailedToWriteData { source } => {
+            | super::Error::FailedToWriteData { source }
+            | super::Error::FailedToApplyRetentionSql { source, .. } => {
                 // Match against an Internal error with the message "Non Panic Task error":
                 // <https://github.com/apache/datafusion/blob/f6c92fecb23c927bdc6a9feb058f03a2fb61d63f/datafusion/physical-plan/src/stream.rs#L132>
                 if let DataFusionError::Internal(msg) = &source
@@ -2605,6 +2689,78 @@ mod tests {
         };
 
         assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_retention_failure_after_insert_is_permanent_and_advances_watermark() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        let accelerator = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("accelerator mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated_table = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("federated mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(federated_table));
+
+        let task = RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            TableReference::bare("retention_failure_after_insert"),
+            federated,
+            None,
+            Arc::clone(&accelerator),
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        )
+        .build();
+
+        let update_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .expect("update batch should be created");
+        let update_stream: SendableRecordBatchStream = Box::pin(
+            MemoryStream::try_new(vec![update_batch], Arc::clone(&schema), None)
+                .expect("update stream should be created"),
+        );
+        let update = StreamingDataUpdate::new(update_stream, UpdateType::Append);
+
+        let result = task
+            .write_streaming_data_update(
+                None,
+                update,
+                None,
+                Some(col("missing_retention_column").eq(datafusion::prelude::lit(1_i32))),
+            )
+            .await;
+
+        let Err(RetryError::Permanent(super::super::Error::FailedToApplyRetentionSql {
+            dataset_name,
+            ..
+        })) = result
+        else {
+            panic!("retention failure after insert should return a permanent retention error");
+        };
+        assert_eq!(dataset_name, "retention_failure_after_insert");
+        assert!(
+            task.last_updated_at
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "append watermark should advance after the insert commits"
+        );
+
+        let ctx = SessionContext::new();
+        let plan = accelerator
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("accelerator scan should succeed");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("accelerator rows should be collected");
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(row_count, 1, "insert should remain committed");
     }
 
     /// Tests that `max_timestamp_df` returns the maximum value for integer time columns

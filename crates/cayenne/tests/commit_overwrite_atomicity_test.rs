@@ -120,6 +120,8 @@ async fn plant_full_pre_overwrite_state(
         file_size_bytes: 128,
         deletion_type: DeletionType::PositionBased,
         sequence_number: 7,
+        // Position-based file: carries no keys, so no re-insert sequence.
+        reinsert_sequence: None,
     };
     catalog
         .add_delete_file(delete_file)
@@ -191,6 +193,7 @@ async fn plant_full_pre_overwrite_state(
             delete_count: 2,
             sequence_number: 23,
             created_at: String::new(),
+            published: true,
         })
         .await
         .expect("add_inlined_delete");
@@ -201,6 +204,7 @@ async fn plant_full_pre_overwrite_state(
             table_id: table_id.to_string(),
             statistics_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
             num_rows: 42,
+            ndv_sketches: None,
         })
         .await
         .expect("upsert_table_statistics");

@@ -29,11 +29,30 @@ pub use config::{ChBenchConfig, PostgresSourceConfig};
 pub use metrics::OltpReport;
 pub use txn::TxnType;
 
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
 use ::rand::SeedableRng;
 use ::rand::rngs::StdRng;
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use datafusion_table_providers::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use futures::TryStreamExt;
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
+use secrecy::SecretBox;
 use snafu::{Snafu, ensure};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
+
+/// Shared rate limiter gating the aggregate OLTP transaction rate across all terminals.
+type OltpRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -47,6 +66,12 @@ pub enum Error {
         "{failed}/{total} OLTP terminal(s) failed — benchmark results are unreliable"
     ))]
     OltpTerminalFailures { failed: usize, total: usize },
+
+    #[snafu(display("Invalid OLTP target rate: {rate} (must be > 0)"))]
+    InvalidRate { rate: u32 },
+
+    #[snafu(display("Failed to {action}: {message}"))]
+    Arrow { action: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,6 +102,17 @@ pub trait ChBenchDriver: Send + Sync {
     /// Returns microseconds since Unix epoch, or `None` if the table is empty
     /// or the column doesn't exist.
     async fn max_bench_ts(&self, table: &str) -> Result<Option<i64>>;
+
+    /// Read `COUNT(*)` from the *source* for a given table.
+    async fn row_count(&self, table: &str) -> Result<i64>;
+
+    /// Execute an arbitrary read-only SQL statement against the source and
+    /// return the results as Arrow `RecordBatch`es.
+    ///
+    /// Used by the analytical-query gate to produce ground-truth results
+    /// for CH-benCH queries that are then compared against the same query run
+    /// through Spice.
+    async fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>>;
 }
 
 /// Postgres-backed CH-benCH driver.
@@ -84,6 +120,10 @@ pub struct PostgresChBenchDriver {
     client: tokio_postgres::Client,
     config: ChBenchConfig,
     source: PostgresSourceConfig,
+    /// Postgres pool that returns query results as Arrow `RecordBatch`es,
+    /// kept separate from `client` because the analytical-query gate
+    /// needs Arrow output to compare against Spice results
+    arrow_client: OnceCell<Arc<PostgresConnectionPool>>,
 }
 
 impl PostgresChBenchDriver {
@@ -111,7 +151,27 @@ impl PostgresChBenchDriver {
             client,
             config,
             source,
+            arrow_client: OnceCell::new(),
         })
+    }
+
+    /// Build the Arrow-returning connection pool from the source config.
+    async fn build_arrow_client(&self) -> Result<Arc<PostgresConnectionPool>> {
+        let mut params: HashMap<String, SecretBox<str>> = HashMap::new();
+        params.insert("host".into(), SecretBox::from(self.source.host.clone()));
+        params.insert("port".into(), SecretBox::from(self.source.port.to_string()));
+        params.insert("db".into(), SecretBox::from(self.source.db.clone()));
+        params.insert("user".into(), SecretBox::from(self.source.user.clone()));
+        params.insert("pass".into(), SecretBox::from(self.source.pass.clone()));
+        params.insert("sslmode".into(), SecretBox::from("disable".to_string()));
+
+        let pool = PostgresConnectionPool::new(params)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: "build PostgresConnectionPool".into(),
+                message: e.to_string(),
+            })?;
+        Ok(Arc::new(pool))
     }
 }
 
@@ -151,17 +211,41 @@ impl ChBenchDriver for PostgresChBenchDriver {
 
         let assignments = txn::TerminalAssignment::compute(terminals, warehouses);
 
-        println!(
-            "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}",
-        );
+        // A single shared, work-conserving limiter caps the aggregate transaction rate across all terminals.
+        let rate_limiter = match self.config.rate {
+            Some(rate) => {
+                let cells = NonZeroU32::new(rate).ok_or(Error::InvalidRate { rate })?;
+                Some(Arc::new(RateLimiter::direct(Quota::per_second(cells))))
+            }
+            None => None,
+        };
+
+        match self.config.rate {
+            Some(rate) => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate={rate} txn/s",
+            ),
+            None => println!(
+                "Starting OLTP workload: {warehouses} warehouse(s), {terminals} terminals, mix={mix:?}, target rate=unlimited",
+            ),
+        }
 
         let mut handles = Vec::with_capacity(terminals);
         for (terminal_id, &assignment) in assignments.iter().enumerate() {
             let conn_str = self.source.connection_string();
             let stop = stop.clone();
+            let rate_limiter = rate_limiter.clone();
 
             handles.push(tokio::spawn(async move {
-                run_terminal(terminal_id, &conn_str, stop, assignment, mix, base_seed).await
+                run_terminal(
+                    terminal_id,
+                    &conn_str,
+                    stop,
+                    assignment,
+                    mix,
+                    base_seed,
+                    rate_limiter,
+                )
+                .await
             }));
         }
 
@@ -216,6 +300,47 @@ impl ChBenchDriver for PostgresChBenchDriver {
         let ts: Option<chrono::DateTime<chrono::Utc>> = rows[0].get(0);
         Ok(ts.map(|t| t.timestamp_micros()))
     }
+
+    async fn row_count(&self, table: &str) -> Result<i64> {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        let rows = self
+            .client
+            .query(&query, &[])
+            .await
+            .map_err(|source| Error::Sql {
+                action: format!("query COUNT(*) from {table}"),
+                source,
+            })?;
+        Ok(rows.first().map_or(0, |row| row.get::<_, i64>(0)))
+    }
+
+    async fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let client = self
+            .arrow_client
+            .get_or_try_init(|| self.build_arrow_client())
+            .await?;
+
+        let conn = client.connect_direct().await.map_err(|e| Error::Arrow {
+            action: "acquire Postgres connection".into(),
+            message: e.to_string(),
+        })?;
+
+        let stream = conn
+            .query_arrow(sql, &[], None)
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("execute arrow query: {sql}"),
+                message: e.to_string(),
+            })?;
+
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::Arrow {
+                action: format!("collect arrow query results: {sql}"),
+                message: e.to_string(),
+            })
+    }
 }
 
 /// Run a single OLTP terminal loop until cancelled.
@@ -226,6 +351,7 @@ async fn run_terminal(
     assignment: txn::TerminalAssignment,
     mix: [u32; 5],
     base_seed: u64,
+    rate_limiter: Option<Arc<OltpRateLimiter>>,
 ) -> Result<metrics::OltpMetrics> {
     let (mut client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
         .await
@@ -254,6 +380,14 @@ async fn run_terminal(
     loop {
         if stop.is_cancelled() {
             break;
+        }
+
+        // Wait for a slot from the shared rate limiter (work-conserving across all terminals)
+        if let Some(limiter) = &rate_limiter {
+            tokio::select! {
+                () = limiter.until_ready() => {}
+                () = stop.cancelled() => break,
+            }
         }
 
         let txn_type = txn::pick_txn_type(&mut rng, &mix);

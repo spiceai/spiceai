@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::BTreeMap, time::Duration};
 
+use crate::args::DeploymentMode;
 use reqwest::Client;
 use spice_cloud_client::{
     CloudClient,
@@ -82,7 +83,7 @@ pub(crate) fn build_cloud_client(
     let token = spice_cloud_token(api_key_override)?;
     Ok(CloudClient::new(&base_url)?
         .with_token(token)
-        .with_timeout(Duration::from_secs(600))?)
+        .with_timeout(Duration::from_mins(10))?)
 }
 
 /// Default resource allocation shared by scheduler and executor when no overrides are provided.
@@ -143,6 +144,7 @@ pub(crate) async fn ensure_spice_cloud_app(
     cloud: &CloudClient,
     app_name: &str,
     config: &AppCreateConfig,
+    deployment_mode: &DeploymentMode,
 ) -> anyhow::Result<i64> {
     let apps = cloud.list_apps().await?;
     if let Some(app) = apps.into_iter().find(|a| a.name == app_name) {
@@ -162,39 +164,48 @@ pub(crate) async fn ensure_spice_cloud_app(
     );
 
     // Executor — same resource defaults as scheduler; each field overridable independently.
-    let executor = Some(AppExecutor {
-        replicas: Some(config.executor_replicas),
-        resources: Some(resources_over(
-            default_resources(),
-            config.executor_memory_limit.as_deref(),
-            config.executor_cpu_limit.as_deref(),
-            config.executor_cpu_request.as_deref(),
-            config.executor_memory_request.as_deref(),
-            config.ephemeral_storage_limit_gb.as_deref(),
-        )),
-        storage_size_gb: config.executor_storage_size_gb,
-    });
-
-    let create_result = cloud
-        .create_app(&CreateAppRequest {
-            name: app_name.to_string(),
-            description: None,
-            visibility: "private".to_string(),
-            cname: Some(cname),
-            tags: {
-                let mut tags = BTreeMap::from([("kind".to_string(), "cluster".to_string())]);
-                if let Some(org) = &config.organization_tag {
-                    tags.insert("organization".to_string(), org.clone());
-                }
-                Some(tags)
-            },
-            replicas: config.app_replicas,
-            resources: Some(resources),
-            executor,
-            storage_size_gb: None,
+    let executor = if matches!(deployment_mode, DeploymentMode::Cluster) {
+        Some(AppExecutor {
+            replicas: Some(config.executor_replicas),
+            resources: Some(resources_over(
+                default_resources(),
+                config.executor_memory_limit.as_deref(),
+                config.executor_cpu_limit.as_deref(),
+                config.executor_cpu_request.as_deref(),
+                config.executor_memory_request.as_deref(),
+                config.ephemeral_storage_limit_gb.as_deref(),
+            )),
+            storage_size_gb: config.executor_storage_size_gb,
         })
-        .await;
+    } else {
+        None
+    };
 
+    let create_app_request = CreateAppRequest {
+        name: app_name.to_string(),
+        description: None,
+        visibility: "private".to_string(),
+        cname: Some(cname),
+        tags: {
+            let mut tags = BTreeMap::new();
+            if matches!(deployment_mode, DeploymentMode::Cluster) {
+                tags.insert("kind".to_string(), "cluster".to_string());
+            }
+            if let Some(org) = &config.organization_tag {
+                tags.insert("organization".to_string(), org.clone());
+            }
+            Some(tags)
+        },
+        replicas: config.app_replicas,
+        resources: Some(resources),
+        executor,
+        storage_size_gb: None,
+    };
+
+    eprintln!("[stdio] CreateAppRequest: {create_app_request:?}");
+
+    let create_result = cloud.create_app(&create_app_request).await;
+    eprintln!("[stdio] create_result: {create_result:?}");
     match create_result {
         Ok(app) => {
             apply_storage_config(cloud, app.id, config).await?;
@@ -311,22 +322,20 @@ pub(crate) async fn create_deployment(
     cloud: &CloudClient,
     app_id: i64,
     channel: Option<&UpdateChannel>,
+    debug: bool,
 ) -> anyhow::Result<()> {
-    let created = cloud
-        .create_deployment(
-            app_id,
-            &CreateDeploymentRequest {
-                image: None,
-                image_tag: None,
-                replicas: Some(1),
-                branch: None,
-                commit_sha: None,
-                commit_message: None,
-                channel: channel.map(ToString::to_string),
-                debug: false,
-            },
-        )
-        .await?;
+    let req = CreateDeploymentRequest {
+        image: None,
+        image_tag: None,
+        replicas: Some(1),
+        branch: None,
+        commit_sha: None,
+        commit_message: None,
+        channel: channel.map(ToString::to_string),
+        debug,
+    };
+    eprintln!("[stdio] CreateDeploymentRequest: {req:?}");
+    let created = cloud.create_deployment(app_id, &req).await?;
     eprintln!("Deployment {} created", created.id);
     Ok(())
 }
@@ -401,6 +410,15 @@ pub(crate) fn flight_url_from_cname(cname: &str) -> String {
 /// App names can only contain letters, numbers, and hyphens.
 /// Truncated to 42 characters to leave room for Kubernetes name prefixes
 /// and suffixes (e.g. `spicepod-{name}-scheduler-0` must be ≤63 chars).
+pub(crate) fn run_id_short(run_id: &uuid::Uuid) -> String {
+    run_id
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn sanitize_app_name(name: &str) -> String {
     let sanitized: String = name
         .chars()
@@ -414,4 +432,74 @@ pub(crate) fn sanitize_app_name(name: &str) -> String {
         .take(42)
         .collect();
     sanitized.trim_end_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── run_id_short ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_id_short_returns_first_uuid_segment() {
+        let id = uuid::Uuid::parse_str("dc2829d1-007a-453e-aa5b-f268ba958b8a").expect("valid uuid");
+        assert_eq!(run_id_short(&id), "dc2829d1");
+    }
+
+    #[test]
+    fn run_id_short_for_nil_uuid() {
+        assert_eq!(run_id_short(&uuid::Uuid::nil()), "00000000");
+    }
+
+    // ── flight_url_from_cname ─────────────────────────────────────────────────
+
+    #[test]
+    fn flight_url_replaces_data_suffix_with_flight() {
+        assert_eq!(
+            flight_url_from_cname("us-east-1-dev-aws-data"),
+            "https://us-east-1-dev-aws-flight.spiceai.io"
+        );
+    }
+
+    #[test]
+    fn flight_url_leaves_non_data_cname_unchanged() {
+        assert_eq!(
+            flight_url_from_cname("us-east-1-dev-aws-flight"),
+            "https://us-east-1-dev-aws-flight.spiceai.io"
+        );
+    }
+
+    #[test]
+    fn flight_url_only_strips_trailing_data_suffix() {
+        // "data" appearing in the middle must not be stripped
+        assert_eq!(
+            flight_url_from_cname("us-data-aws-data"),
+            "https://us-data-aws-flight.spiceai.io"
+        );
+    }
+
+    // ── sanitize_app_name ────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_app_name_replaces_special_chars_with_hyphens() {
+        // trailing hyphen from '!' is stripped by trim_end_matches('-')
+        assert_eq!(sanitize_app_name("hello_world!"), "hello-world");
+        assert_eq!(sanitize_app_name("hello world"), "hello-world");
+    }
+
+    #[test]
+    fn sanitize_app_name_preserves_alphanumeric_and_hyphens() {
+        assert_eq!(sanitize_app_name("my-app-123"), "my-app-123");
+    }
+
+    #[test]
+    fn sanitize_app_name_truncates_at_42_chars() {
+        let long = "a".repeat(50);
+        assert_eq!(sanitize_app_name(&long).len(), 42);
+    }
+
+    #[test]
+    fn sanitize_app_name_trims_trailing_hyphens() {
+        assert_eq!(sanitize_app_name("app---"), "app");
+    }
 }

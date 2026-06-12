@@ -16,15 +16,15 @@ limitations under the License.
 
 //! Physical optimizer rules for Cayenne execution plans.
 //!
-//! # No-spill build-side memory strategy (q21 / chbench multi-way joins)
+//! # No-spill build-side memory strategy for wide multi-way joins
 //!
 //! `DataFusion`'s `HashJoinExec` build side is non-spillable. Under the runtime
-//! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide chbench
-//! shapes such as q21 (a 5-way join feeding a correlated `NOT EXISTS` self-join
-//! over `order_line`) exhaust the `HashJoinInput[N]` reservations because each
-//! build-side hash table independently materializes its full keyspace.
+//! memory pool (`GreedyMemoryPool` wrapped in `TrackConsumersPool`), wide
+//! multi-way joins with correlated semi/anti subplans can exhaust the
+//! `HashJoinInput[N]` reservations because each build-side hash table
+//! independently materializes its full keyspace.
 //!
-//! The q21 fix is layered so each optimizer rule handles the part `DataFusion`
+//! The optimizer strategy is layered so each rule handles the part `DataFusion`
 //! cannot currently spill or infer on its own:
 //!
 //! 1. **Logical predicate propagation.**
@@ -32,10 +32,10 @@ limitations under the License.
 //!    introduces explicit `InSubquery` filters for equi-join keys when the
 //!    selective predicate is on a non-key column. `DataFusion`'s stock
 //!    `infer_join_predicates` only fires when the predicate already references
-//!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). For q21
-//!    the filter is `n_name = 'CHINA'`, so the Cayenne rule exposes the
-//!    `nation → supplier → stock/order_line` cardinality bound before
-//!    `push_down_filter` plants it into scans.
+//!    a join key (`WHERE n_nationkey = 5` → `WHERE s_nationkey = 5`). When the
+//!    selective filter is on a non-key dimension column, the Cayenne rule
+//!    exposes the dimension-to-fact cardinality bound before `push_down_filter`
+//!    plants it into scans.
 //!
 //! 2. **Cross-scan dynamic filter sharing.** When a join's
 //!    `Arc<DynamicFilterPhysicalExpr>` is pushed into one
@@ -58,14 +58,27 @@ limitations under the License.
 //!    Ordinary inner/outer joins stay with `HashJoinExec` unless another
 //!    optimizer rule supplies a more targeted win.
 //!
-//! [`CayenneJoinRewriter`] still handles the ordinary inner-join probe side by
-//! swapping the default in-list accumulator for [`ExactLeftAccumulator`], which
-//! produces a precise dynamic filter (or falls back to `RangeBounds` +
-//! `BloomFilter`) that `DataFusion`'s filter-pushdown phase plants into the
-//! right-side `CayenneAccelerationExec`'s `FileSource`.
+//! The ordinary inner-join probe side is handled by `DataFusion` 53's *native*
+//! hash-join dynamic-filter pushdown. For inner joins (the only shape
+//! `DataFusion` pushes join-derived dynamic filters through),
+//! `HashJoinExec::gather_filters_for_pushdown` plants an
+//! `Arc<DynamicFilterPhysicalExpr>` into the right-side scan during the
+//! filter-pushdown phase, and `SharedBuildAccumulator` populates it at
+//! execute-time with a combined predicate: min/max **bounds** (for
+//! statistics-based row-group/file/segment skipping) *and* a **membership**
+//! check — an `InList` for small build sides (within
+//! `datafusion.execution.hash_join_inlist_pushdown_max_size`, which the Spice
+//! runtime session builder sizes from `runtime.query.memory_limit` per
+//! partition) or a hash-table lookup for larger ones. This natively supersedes
+//! the previous forked
+//! `ExactLeftAccumulator` seam (exact `InList` with min/max + bloom fallback),
+//! so no Cayenne-specific accumulator swap is required. The
+//! `CayenneAccelerationExec` scan already accepts the pushed filter via its
+//! `gather_filters_for_pushdown`/`handle_child_pushdown_result` hooks, and
+//! [`CayenneDynamicFilterSharing`] then fans it out to equi-joined same-source
+//! sibling scans.
 //!
-//! ## Audit notes (verified 2026-05-14 against the q21 explain snapshot at
-//! `crates/test-framework/src/snapshot/snapshots/explain/test_framework__snapshot__file[parquet]-cayenne[file]-indexes_tpch_q21_explain.snap`)
+//! ## Audit notes
 //!
 //! * **Cayenne table statistics are `Exact` at the physical-plan boundary.**
 //!   The chain `CayenneTableProvider::statistics`
@@ -76,12 +89,12 @@ limitations under the License.
 //!   `SessionConfig::default().collect_statistics()` is `true`, so
 //!   `ListingTable::do_collect_statistics` is exercised for every scan.
 //!   `CayenneAccelerationExec::partition_statistics` simply delegates to the
-//!   inner `DataSourceExec`, so the value reaches `JoinSelection`. The q21
-//!   explain plan confirms `should_swap_join_order` picks the smaller side as
-//!   build at every level (nation/supplier on the LEFT, lineitem on the
-//!   RIGHT), so the residual OOM is *not* attributable to fuzzy stats — it is
-//!   the **logical** join order locking in the SQL `FROM` order and applying
-//!   the nation filter last.
+//!   inner `DataSourceExec`, so the value reaches `JoinSelection`. Representative
+//!   explain plans confirm `should_swap_join_order` picks the smaller side as
+//!   build at every level, so poor behavior on wide joins is *not* attributable
+//!   to fuzzy stats — the logical optimizer must also avoid preserving SQL
+//!   `FROM`-order cross joins when the parent join predicates can be evaluated
+//!   inside a selective branch first.
 //!
 //! * **Build-side projections are minimal.** Every `CayenneAccelerationExec`
 //!   in the snapshot terminates in a `DataSourceExec` whose `projection=[...]`
@@ -91,25 +104,24 @@ limitations under the License.
 //!   `[l_orderkey, l_suppkey]`, etc. No additional `ProjectionExec` insertion
 //!   above the build side is required.
 //!
-//! With these layers active, q21 is included in
-//! `test_framework::queries::get_chbench_test_queries`.
+//! With these layers active, wide join and semi/anti-join workloads can stay on
+//! spillable or pruned execution paths more often.
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, IntervalUnit, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, NullEquality, extensions_options};
 use datafusion::config::{ConfigExtension, ConfigOptions};
-use datafusion::error::DataFusionError;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
@@ -120,10 +132,17 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::provider::CayenneAccelerationExec;
-use crate::provider::scan::{IsCayenneAccelerationExec, ScanDynamicFilter, ScanIdentity};
+use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
+use crate::provider::scan::{ScanDynamicFilter, ScanIdentity};
 
 /// Optimizer rule that rewrites `HashJoinExec` nodes to use `ExactLeftAccumulator`
 /// when the probe side is a `CayenneAccelerationExec`.
+///
+/// Opt-in: this rule is only registered when the runtime
+/// `cayenne_optimizer_rules.exact_join_filter` flag is enabled. By default the
+/// ordinary inner-join probe filter is handled by `DataFusion` 53's native
+/// hash-join dynamic-filter pushdown (whose `InList` budget is raised in the
+/// runtime session builder's `configure_hash_join_memory_limits`).
 #[derive(Default)]
 pub struct CayenneJoinRewriter;
 
@@ -158,11 +177,11 @@ impl std::fmt::Debug for CayenneDynamicFilterSharing {
 /// sort-merge join when the build side is large enough to risk OOM.
 ///
 /// `DataFusion`'s `HashJoinExec` always materializes its left input as the
-/// non-spillable build side regardless of join type. For q21, that build side
-/// can be a large multi-way `order_line` result for `NOT EXISTS` / `EXISTS`
-/// decorrelations. Sort-merge preserves those semi/anti semantics while
-/// keeping the build side spillable; ordinary inner/outer joins are left alone
-/// because their hash join can still be the faster plan.
+/// non-spillable build side regardless of join type. For wide semi/anti-join
+/// decorrelations, that build side can be a large multi-way result. Sort-merge
+/// preserves those semi/anti semantics while keeping the build side spillable;
+/// ordinary inner/outer joins are left alone because their hash join can still
+/// be the faster plan.
 #[derive(Default)]
 pub struct CayenneAntiJoinSortMergeRewriter;
 
@@ -171,6 +190,8 @@ pub struct CayenneAntiJoinSortMergeRewriter;
 /// in-memory hash table is usually faster than two explicit sort buffers.
 const ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS: usize = 10_000_000;
 const ANTI_JOIN_SORT_MERGE_MEMORY_POOL_FRACTION: f64 = 0.125;
+const EXACT_JOIN_FILTER_MIN_PROBE_ROWS: usize = 100_000;
+const EXACT_JOIN_FILTER_MIN_PROBE_TO_BUILD_RATIO: usize = 10;
 
 extensions_options! {
     /// Cayenne optimizer configuration.
@@ -186,6 +207,12 @@ extensions_options! {
 
         /// Maximum estimated LEFT/build-side join-key bytes before preserving DataFusion's default hash-join accumulator instead of using Cayenne's exact in-list accumulator.
         pub exact_join_filter_max_bytes: usize, default = DEFAULT_MAXIMUM_SHARED_INLIST_MEMORY_BYTES
+
+        /// Minimum known RIGHT/probe-side row count before using Cayenne's exact in-list accumulator.
+        pub exact_join_filter_min_probe_rows: usize, default = EXACT_JOIN_FILTER_MIN_PROBE_ROWS
+
+        /// Minimum known RIGHT/probe-side to LEFT/build-side row-count ratio before using Cayenne's exact in-list accumulator. Set to 0 to disable the ratio gate.
+        pub exact_join_filter_min_probe_to_build_ratio: usize, default = EXACT_JOIN_FILTER_MIN_PROBE_TO_BUILD_RATIO
     }
 }
 
@@ -388,8 +415,8 @@ fn try_rewrite_large_same_source_join(
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
     // Semi/anti joins are the clear-win target: `HashJoinExec` builds the LEFT
-    // input into a non-spillable hash table, while these q21-shaped joins do
-    // not have the same dynamic-filter fallback as ordinary inner joins.
+    // input into a non-spillable hash table, while these joins do not have the
+    // same dynamic-filter fallback as ordinary inner joins.
     if !matches!(
         hash_join.join_type(),
         JoinType::LeftAnti | JoinType::RightAnti | JoinType::LeftSemi | JoinType::RightSemi,
@@ -419,8 +446,8 @@ fn try_rewrite_large_same_source_join(
 
     // When a memory gate is configured, it's the *primary* signal — the row gate
     // becomes irrelevant unless the byte estimate is unavailable. This lets the
-    // rule catch wide-row builds (e.g. q21 self-joins over `stock` at SF1) whose
-    // row count is well below the row threshold but whose materialised hash
+    // rule catch wide-row builds whose row count is well below the row
+    // threshold but whose materialised hash
     // table would still exhaust the memory pool. When the gate is *inactive*
     // (no memory pool wired through config — direct DataFusion users), fall back
     // to the row-count threshold alone.
@@ -603,24 +630,36 @@ fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<
     }
 }
 
-fn exact_join_filter_build_estimate(hash_join: &HashJoinExec) -> Option<(usize, usize)> {
-    let build_row_count = spillable_rewrite_build_input_exact_rows(hash_join)?;
+fn exact_join_filter_build_key_bytes(
+    hash_join: &HashJoinExec,
+    build_row_count: usize,
+    max_build_bytes: usize,
+) -> Option<usize> {
     let build_schema = hash_join.left().schema();
-    let join_key_width = hash_join
-        .on()
-        .iter()
-        .try_fold(0_usize, |width, (left_key, _)| {
-            let data_type = left_key.data_type(build_schema.as_ref()).ok()?;
-            if !supports_exact_join_filter_fallback(&data_type) {
-                return None;
-            }
-            Some(width.saturating_add(estimated_arrow_width(&data_type)?))
-        })?;
+    let mut estimated_build_bytes = 0_usize;
 
-    Some((
-        build_row_count,
-        build_row_count.saturating_mul(join_key_width),
-    ))
+    for (left_key, _) in hash_join.on() {
+        let data_type = left_key.data_type(build_schema.as_ref()).ok()?;
+        if !supports_exact_join_filter_fallback(&data_type) {
+            return None;
+        }
+
+        let key_width = estimated_arrow_width(&data_type)?;
+        estimated_build_bytes =
+            estimated_build_bytes.saturating_add(build_row_count.saturating_mul(key_width));
+        if estimated_build_bytes > max_build_bytes {
+            break;
+        }
+    }
+
+    Some(estimated_build_bytes)
+}
+
+fn exact_join_filter_probe_rows(hash_join: &HashJoinExec) -> Option<usize> {
+    match hash_join.right().partition_statistics(None).ok()?.num_rows {
+        Precision::Exact(row_count) | Precision::Inexact(row_count) => Some(row_count),
+        Precision::Absent => None,
+    }
 }
 
 fn supports_exact_join_filter_fallback(data_type: &DataType) -> bool {
@@ -663,11 +702,48 @@ fn should_rewrite_with_exact_accumulator(hash_join: &HashJoinExec, config: &Conf
 
     let optimizer_config = cayenne_optimizer_config(config);
     let max_build_bytes = optimizer_config.exact_join_filter_max_bytes;
-    let Some((build_row_count, estimated_build_bytes)) =
-        exact_join_filter_build_estimate(hash_join)
+    let Some(build_row_count) = spillable_rewrite_build_input_exact_rows(hash_join) else {
+        tracing::debug!(
+            "Keeping HashJoinExec default accumulator because exact build-side row statistics are unavailable"
+        );
+        return false;
+    };
+
+    let Some(probe_row_count) = exact_join_filter_probe_rows(hash_join) else {
+        tracing::debug!(
+            "Keeping HashJoinExec default accumulator because probe-side row statistics are unavailable"
+        );
+        return false;
+    };
+
+    if probe_row_count < optimizer_config.exact_join_filter_min_probe_rows {
+        tracing::debug!(
+            probe_row_count,
+            min_probe_rows = optimizer_config.exact_join_filter_min_probe_rows,
+            "Keeping HashJoinExec default accumulator because the Cayenne probe side is too small for exact join-filter collection to pay off"
+        );
+        return false;
+    }
+
+    let min_probe_to_build_ratio = optimizer_config.exact_join_filter_min_probe_to_build_ratio;
+    if build_row_count > 0
+        && min_probe_to_build_ratio > 0
+        && probe_row_count < build_row_count.saturating_mul(min_probe_to_build_ratio)
+    {
+        tracing::debug!(
+            build_row_count,
+            probe_row_count,
+            min_probe_to_build_ratio,
+            "Keeping HashJoinExec default accumulator because the Cayenne probe side is not much larger than the build-side key domain"
+        );
+        return false;
+    }
+
+    let Some(estimated_build_bytes) =
+        exact_join_filter_build_key_bytes(hash_join, build_row_count, max_build_bytes)
     else {
         tracing::debug!(
-            "Keeping HashJoinExec default accumulator because exact build-side join-key statistics or fallback-compatible key types are unavailable"
+            "Keeping HashJoinExec default accumulator because fallback-compatible build-side join-key types are unavailable"
         );
         return false;
     };
@@ -904,6 +980,10 @@ impl std::fmt::Debug for CayenneJoinRewriter {
 
 /// Flatten transparent nodes (like `ProjectionExec` that just pass through columns)
 /// to find the underlying plan node.
+// `CoalesceBatchesExec` is deprecated in DF53 (superseded by arrow-rs
+// `BatchCoalescer`) but the physical planner still emits it, so we keep seeing
+// through it here — mirrors `provider::scan::is_identity_preserving_wrapper`.
+#[expect(deprecated)]
 fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     // ProjectionExec is transparent if it just passes through columns
     if let Some(projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
@@ -923,8 +1003,35 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
         return flatten_transparent_nodes(repartitioned.input());
     }
 
-    if let Some(coalesce) = plan.as_any().downcast_ref::<CoalesceBatchesExec>() {
+    if let Some(coalesce) =
+        plan.as_any()
+            .downcast_ref::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+    {
         return flatten_transparent_nodes(coalesce.input());
+    }
+
+    // Deletion-filter execs sit directly above the Cayenne scan whenever
+    // key-deletes are pending. They preserve the child's schema and
+    // partitioning (they only remove deleted rows), so for the purpose of
+    // identifying a Cayenne-backed scan on a join build/probe side they are
+    // transparent — see through them so the dynamic-filter join rewrite still
+    // fires on tables undergoing CDC deletes.
+    if let Some(int64_delete) = plan.as_any().downcast_ref::<Int64PkDeletionFilterExec>() {
+        let children = int64_delete.children();
+        let Some(input) = children.first() else {
+            return plan;
+        };
+
+        return flatten_transparent_nodes(input);
+    }
+
+    if let Some(key_delete) = plan.as_any().downcast_ref::<KeyBasedDeletionFilterExec>() {
+        let children = key_delete.children();
+        let Some(input) = children.first() else {
+            return plan;
+        };
+
+        return flatten_transparent_nodes(input);
     }
 
     if let Some(schema_cast_scan) = plan.as_any().downcast_ref::<SchemaCastScanExec>() {
@@ -942,7 +1049,11 @@ fn flatten_transparent_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn Executio
 fn hash_join_build_side_is_cayenne(join: &HashJoinExec) -> bool {
     let build_side = flatten_transparent_nodes(join.left());
 
-    if build_side.is_cayenne_acceleration_exec() {
+    if build_side
+        .as_any()
+        .downcast_ref::<CayenneAccelerationExec>()
+        .is_some()
+    {
         true
     } else if let Some(nested_join) = build_side.as_any().downcast_ref::<HashJoinExec>() {
         // Recursively check the build side of the nested join
@@ -1022,11 +1133,15 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
                 return Ok(Transformed::no(node));
             };
 
-            if !is_cayenne_backed_join(hash_join) {
+            if *hash_join.join_type() != JoinType::Inner {
                 return Ok(Transformed::no(node));
             }
 
             if hash_join.null_equality() != NullEquality::NullEqualsNothing {
+                return Ok(Transformed::no(node));
+            }
+
+            if !is_cayenne_backed_join(hash_join) {
                 return Ok(Transformed::no(node));
             }
 
@@ -1050,10 +1165,11 @@ impl PhysicalOptimizerRule for CayenneJoinRewriter {
 mod tests {
     use super::{
         ANTI_JOIN_SORT_MERGE_MIN_EXACT_ROWS, CayenneAntiJoinSortMergeRewriter,
-        CayenneDynamicFilterSharing, CayenneJoinRewriter, CayenneOptimizerConfig, FilterAddition,
+        CayenneDynamicFilterSharing, CayenneOptimizerConfig, FilterAddition,
         apply_filter_additions, plan_schema_fields,
     };
     use crate::provider::CayenneAccelerationExec;
+    use crate::provider::scan::ScanDynamicFilter;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::config::ConfigOptions;
@@ -1061,7 +1177,6 @@ mod tests {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
-    use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
@@ -1082,7 +1197,6 @@ mod tests {
     use object_store::ObjectMeta;
     use object_store::ObjectStore;
     use object_store::path::Path;
-    use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -1175,16 +1289,6 @@ mod tests {
             ])
             .with_updated_node(Arc::new(source)))
         }
-    }
-
-    fn memory_exec(column_name: &str) -> Arc<dyn ExecutionPlan> {
-        memory_exec_with_type(column_name, DataType::Int32)
-    }
-
-    fn memory_exec_with_type(column_name: &str, data_type: DataType) -> Arc<dyn ExecutionPlan> {
-        let schema = Arc::new(Schema::new(vec![Field::new(column_name, data_type, false)]));
-        MemorySourceConfig::try_new_exec(&[vec![]], schema, None)
-            .expect("memory exec should be valid")
     }
 
     fn file_exec(
@@ -1375,25 +1479,9 @@ mod tests {
             None,
             PartitionMode::Partitioned,
             null_equality,
+            false,
         )
         .expect("hash join should be valid")
-    }
-
-    fn join_with_right(right: Arc<dyn ExecutionPlan>) -> HashJoinExec {
-        hash_join(memory_exec("left_id"), right, "left_id", "right_id")
-    }
-
-    fn optimize(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        optimize_with_config(plan, &ConfigOptions::default())
-    }
-
-    fn optimize_with_config(
-        plan: Arc<dyn ExecutionPlan>,
-        config: &ConfigOptions,
-    ) -> Arc<dyn ExecutionPlan> {
-        CayenneJoinRewriter::new()
-            .optimize(plan, config)
-            .expect("optimizer should succeed")
     }
 
     fn optimize_filter_sharing(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -1431,197 +1519,6 @@ mod tests {
         cayenne_config.sort_merge_memory_pool_bytes = sort_merge_memory_pool_bytes;
         config.extensions.insert(cayenne_config);
         config
-    }
-
-    fn config_with_exact_join_filter_max_bytes(max_bytes: usize) -> ConfigOptions {
-        let mut config = ConfigOptions::default();
-        let cayenne_config = CayenneOptimizerConfig {
-            exact_join_filter_max_bytes: max_bytes,
-            ..CayenneOptimizerConfig::default()
-        };
-        config.extensions.insert(cayenne_config);
-        config
-    }
-
-    fn plan_snapshot(plan: &Arc<dyn ExecutionPlan>) -> String {
-        displayable(plan.as_ref()).indent(true).to_string()
-    }
-
-    #[test]
-    fn rewrites_hash_join_with_cayenne_probe_side() {
-        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-        let join = Arc::new(join_with_right(right));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
-                .is_some(),
-            "Cayenne-backed joins should use ExactLeftAccumulator"
-        );
-    }
-
-    #[test]
-    fn leaves_hash_join_without_cayenne_probe_side_unchanged() {
-        let right = memory_exec("right_id");
-        let join = Arc::new(join_with_right(right));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Non-Cayenne joins should keep the default accumulator"
-        );
-    }
-
-    #[test]
-    fn leaves_null_equal_hash_join_unchanged() {
-        let left = memory_exec("left_id");
-        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-        let join = Arc::new(hash_join_with_null_equality(
-            left,
-            right,
-            "left_id",
-            "right_id",
-            NullEquality::NullEqualsNull,
-        ));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Null-equal joins should keep the default accumulator to preserve probe NULL matches"
-        );
-    }
-
-    #[test]
-    fn leaves_non_inner_hash_join_unchanged() {
-        let left = memory_exec("left_id");
-        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-        let join = Arc::new(hash_join_with_join_type(
-            left,
-            right,
-            "left_id",
-            "right_id",
-            JoinType::LeftSemi,
-            NullEquality::NullEqualsNothing,
-        ));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Non-inner joins should keep DataFusion's default accumulator"
-        );
-    }
-
-    #[test]
-    fn leaves_hash_join_with_unknown_build_stats_unchanged() {
-        let schema = order_line_schema();
-        let left = file_exec(&schema, "left.vortex", None);
-        let right = cayenne_file_exec(&schema, "right.vortex", None);
-        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Joins without exact build-side row statistics should keep DataFusion's default accumulator"
-        );
-    }
-
-    #[test]
-    fn leaves_large_exact_build_side_unchanged() {
-        let schema = order_line_schema();
-        let left = file_exec_with_statistics(
-            &schema,
-            "left.vortex",
-            None,
-            Statistics::new_unknown(&schema).with_num_rows(Precision::Exact(2)),
-        );
-        let right = cayenne_file_exec(&schema, "right.vortex", None);
-        let join = Arc::new(hash_join(left, right, "order_id", "order_id"));
-        let config = config_with_exact_join_filter_max_bytes(8);
-
-        let optimized = optimize_with_config(join, &config);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Estimated exact join-filter bytes above the budget should keep DataFusion's default accumulator"
-        );
-    }
-
-    #[test]
-    fn leaves_hash_join_with_unsupported_exact_fallback_type_unchanged() {
-        let left = memory_exec_with_type("left_id", DataType::Boolean);
-        let right = Arc::new(CayenneAccelerationExec::new(memory_exec_with_type(
-            "right_id",
-            DataType::Boolean,
-        )));
-        let join = Arc::new(hash_join(left, right, "left_id", "right_id"));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized.as_any().downcast_ref::<HashJoinExec>().is_some(),
-            "Join-key types without a real exhausted-memory fallback should keep DataFusion's default accumulator"
-        );
-    }
-
-    #[test]
-    fn rewrites_hash_join_through_transparent_projection() {
-        let right_input = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-        let right_schema = right_input.schema();
-        let right = Arc::new(
-            ProjectionExec::try_new(
-                vec![(
-                    col("right_id", &right_schema).expect("projection column should exist"),
-                    "right_id".to_string(),
-                )],
-                right_input,
-            )
-            .expect("projection should be valid"),
-        );
-        let join = Arc::new(join_with_right(right));
-
-        let optimized = optimize(join);
-
-        assert!(
-            optimized
-                .as_any()
-                .downcast_ref::<HashJoinExec<ExactLeftAccumulator>>()
-                .is_some(),
-            "Transparent wrappers over Cayenne scans should still use ExactLeftAccumulator"
-        );
-    }
-
-    #[test]
-    fn rewrites_nested_cayenne_probe_join_chain() {
-        let nested_left = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_left_id")));
-        let nested_right = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_right_id")));
-        let nested_join = Arc::new(hash_join(
-            nested_left,
-            nested_right,
-            "nested_left_id",
-            "nested_right_id",
-        ));
-        let top_join = Arc::new(hash_join(
-            memory_exec("top_id"),
-            nested_join,
-            "top_id",
-            "nested_left_id",
-        ));
-
-        let optimized = optimize(top_join);
-        let snapshot = plan_snapshot(&optimized);
-
-        assert_eq!(
-            2,
-            snapshot.matches("accumulator=ExactLeftAccumulator").count(),
-            "The top join and nested Cayenne probe join should both use ExactLeftAccumulator"
-        );
     }
 
     #[test]
@@ -2158,8 +2055,8 @@ mod tests {
         );
     }
 
-    /// q21-shape regression: low row count but wide projection produces a build
-    /// big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
+    /// Wide-build regression: low row count but wide projection produces a
+    /// build big enough to OOM `HashJoinExec`'s non-spillable hash table. The byte gate
     /// must catch this case even though the row count is below
     /// `sort_merge_min_rows`.
     #[test]
@@ -2338,41 +2235,108 @@ mod tests {
         );
     }
 
+    /// Recursively find the first `CayenneAccelerationExec` in a plan tree.
+    /// Collects the dynamic filters attached to the first `CayenneAccelerationExec`
+    /// found anywhere in `plan` (depth-first). Returns an empty vec if there is no
+    /// Cayenne scan or it carries no dynamic filters.
+    fn cayenne_scan_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> Vec<ScanDynamicFilter> {
+        if let Some(cayenne) = plan.as_any().downcast_ref::<CayenneAccelerationExec>() {
+            return cayenne.dynamic_filters();
+        }
+        for child in plan.children() {
+            let filters = cayenne_scan_dynamic_filters(child);
+            if !filters.is_empty()
+                || child
+                    .as_any()
+                    .downcast_ref::<CayenneAccelerationExec>()
+                    .is_some()
+            {
+                return filters;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Runs `DataFusion`'s Post-phase physical filter pushdown — the phase that
+    /// plants hash-join dynamic filters into probe-side scans.
+    fn push_down_filters(
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+        FilterPushdown::new_post_optimization()
+            .optimize(plan, config)
+            .expect("post-optimization filter pushdown should succeed")
+    }
+
+    /// Regression test for the DF53 *native* hash-join dynamic-filter pushdown
+    /// that replaced the forked `ExactLeftAccumulator` accumulator seam.
+    ///
+    /// For an inner join whose probe (right) side is a `CayenneAccelerationExec`,
+    /// `DataFusion`'s Post-phase `FilterPushdown` must plant a
+    /// `DynamicFilterPhysicalExpr` into the Cayenne scan's underlying file
+    /// source. This is the effect the old `CayenneJoinRewriter` rule used to
+    /// secure via a custom accumulator; the native path now provides it (with a
+    /// min/max bounds + InList/hash-table membership filter) with no
+    /// Cayenne-specific physical rule.
     #[test]
-    fn snapshots_cayenne_probe_join_explain_plan() {
-        let right = Arc::new(CayenneAccelerationExec::new(memory_exec("right_id")));
-        let join = Arc::new(join_with_right(right));
+    fn native_inner_join_plants_dynamic_filter_into_cayenne_probe_scan() {
+        let schema = order_line_schema();
+        let build = file_exec(&schema, "build.vortex", None);
+        let probe = cayenne_file_exec(&schema, "probe.vortex", None);
+        let join: Arc<dyn ExecutionPlan> =
+            Arc::new(hash_join(build, probe, "order_id", "order_id"));
 
-        let optimized = optimize(join);
+        // Default config keeps `optimizer.enable_join_dynamic_filter_pushdown`
+        // (and the umbrella `enable_dynamic_filter_pushdown`) enabled.
+        let config = ConfigOptions::default();
+        assert!(
+            config.optimizer.enable_join_dynamic_filter_pushdown,
+            "native join dynamic-filter pushdown is expected to default on"
+        );
 
-        insta::assert_snapshot!(
-            "cayenne_probe_join_uses_exact_accumulator_explain",
-            plan_snapshot(&optimized)
+        let optimized = push_down_filters(join, &config);
+
+        let filters = cayenne_scan_dynamic_filters(&optimized);
+
+        assert!(
+            !filters.is_empty(),
+            "DataFusion's native inner-join dynamic filter should reach the Cayenne probe scan; \
+             got plan: {}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        assert!(
+            filters.iter().any(|f| f.columns().contains("order_id")),
+            "the planted dynamic filter should reference the equi-join key column"
         );
     }
 
+    /// Companion to the inner-join regression: `DataFusion` only pushes
+    /// join-derived dynamic filters through **inner** joins
+    /// (`HashJoinExec::allow_join_dynamic_filter_pushdown`). A semi join must
+    /// therefore *not* plant a dynamic filter into the Cayenne scan — the OOM
+    /// mitigation for semi-join shapes (e.g. CH-benCH Q18) is handled by the
+    /// separate logical `CayennePushDownSemiJoin` rule and by
+    /// `CayenneAntiJoinSortMergeRewriter`, not by this pushdown path.
     #[test]
-    fn snapshots_nested_cayenne_probe_join_explain_plan() {
-        let nested_left = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_left_id")));
-        let nested_right = Arc::new(CayenneAccelerationExec::new(memory_exec("nested_right_id")));
-        let nested_join = Arc::new(hash_join(
-            nested_left,
-            nested_right,
-            "nested_left_id",
-            "nested_right_id",
-        ));
-        let top_join = Arc::new(hash_join(
-            memory_exec("top_id"),
-            nested_join,
-            "top_id",
-            "nested_left_id",
+    fn native_semi_join_does_not_plant_dynamic_filter_into_cayenne_probe_scan() {
+        let schema = order_line_schema();
+        let build = file_exec(&schema, "build.vortex", None);
+        let probe = cayenne_file_exec(&schema, "probe.vortex", None);
+        let join: Arc<dyn ExecutionPlan> = Arc::new(hash_join_with_join_type(
+            build,
+            probe,
+            "order_id",
+            "order_id",
+            JoinType::RightSemi,
+            NullEquality::NullEqualsNothing,
         ));
 
-        let optimized = optimize(top_join);
+        let optimized = push_down_filters(join, &ConfigOptions::default());
 
-        insta::assert_snapshot!(
-            "nested_cayenne_probe_join_uses_exact_accumulator_explain",
-            plan_snapshot(&optimized)
+        assert!(
+            cayenne_scan_dynamic_filters(&optimized).is_empty(),
+            "DataFusion does not push join dynamic filters through semi joins"
         );
     }
 }

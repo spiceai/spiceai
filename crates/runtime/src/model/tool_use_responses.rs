@@ -531,9 +531,9 @@ fn make_responses_stream(
                             }
                         }
                         ResponseStreamEvent::ResponseCompleted(_)
-                        | ResponseStreamEvent::ResponseIncomplete(_) => {
+                        | ResponseStreamEvent::ResponseIncomplete(_)
                             // Only process tools if we haven't already done so and there are spice tools
-                            if !should_process_tools {
+                            if !should_process_tools => {
                                 let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
                                 let has_spice_tools = {
                                     let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
@@ -550,7 +550,6 @@ fn make_responses_stream(
                                     should_process_tools = true;
                                 }
                             }
-                        }
                         _ => {}
                     }
 

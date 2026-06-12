@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
@@ -39,6 +40,7 @@ use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser;
+use datafusion_expr::Expr;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::RngExt;
@@ -208,6 +210,10 @@ pub struct Refresh {
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
     pub(crate) caching_ttl: Option<Duration>,
+    /// Retention SQL delete expression to apply after a successful accelerator write.
+    /// Currently populated only for Arrow and `PartitionedArrow` accelerators;
+    /// `DuckDB` and Cayenne apply retention in their own write paths.
+    pub(crate) write_retention_sql_delete_expr: Option<Expr>,
 }
 
 /// [`RefreshOverrides`] specifies the configurable options for a individual run of a refresh task.
@@ -614,6 +620,7 @@ impl Default for Refresh {
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
+            write_retention_sql_delete_expr: None,
         }
     }
 }
@@ -665,6 +672,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -719,6 +728,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            cdc_param_overrides: None,
         }
     }
 
@@ -822,6 +832,16 @@ impl Refresher {
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
+        self
+    }
+
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`.
+    pub fn with_cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
         self
     }
 
@@ -970,6 +990,9 @@ impl Refresher {
         refresh_task_runner =
             refresh_task_runner.with_snapshot_refresh_state(self.snapshot_refresh_state.clone());
 
+        refresh_task_runner = refresh_task_runner
+            .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+
         let mut refresh_task_runner = refresh_task_runner.build();
 
         let (start_refresh, mut on_refresh_complete) = refresh_task_runner.start()?;
@@ -1113,34 +1136,39 @@ impl Refresher {
                     Some(res) = on_refresh_complete.recv() => {
                         tracing::debug!("Received refresh task completion callback: {res:?}");
 
-                        if matches!(res, Ok(())) {
+                        let refresh_succeeded = matches!(&res, Ok(()));
+                        // A retention failure can happen after a successful write, so cached
+                        // query results must be invalidated even though the refresh reports an error.
+                        let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
+
+                        if refresh_succeeded {
                             if let Some(notifier) = &notifier {
                                 notify_refresh_done(&dataset_name, &refresh, Arc::clone(notifier)).await;
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
+                        }
 
-                            if let Some(cache_provider_ref) = caching.as_ref() {
-                                // No cache provider means runtime is shutting down and cache is already cleaned up
-                                if let Some(cache_provider) = cache_provider_ref.upgrade()
-                                    && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
-                                    }
-                            }
+                        if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
+                            // No cache provider means runtime is shutting down and cache is already cleaned up
+                            if let Some(cache_provider) = cache_provider_ref.upgrade()
+                                && let Err(e) = cache_provider.invalidate_for_table(dataset_name.clone()) {
+                                    tracing::warn!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                                }
+                        }
 
-                            if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                                let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
-                                create_checkpoint_and_snapshot(
-                                    checkpointer,
-                                    snapshot_manager.as_ref(),
-                                    &federated_schema,
-                                    &snapshot_mutex,
-                                    &dataset_name,
-                                    &last_updated_at,
-                                    ForceCreate(false),
-                                    Some(&accelerator),
-                                    refresh_sql.as_deref(),
-                                ).await;
-                            }
+                        if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
+                            create_checkpoint_and_snapshot(
+                                checkpointer,
+                                snapshot_manager.as_ref(),
+                                &federated_schema,
+                                &snapshot_mutex,
+                                &dataset_name,
+                                &last_updated_at,
+                                ForceCreate(false),
+                                Some(&accelerator),
+                                refresh_sql.as_deref(),
+                            ).await;
                         }
 
                         // The initial load has completed, let's synchronize further refreshes with the existing table and shutdown this refresher
@@ -1208,7 +1236,9 @@ impl Refresher {
         .with_metrics(self.metrics.clone())
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
-        .with_s3_express_acceleration(self.is_s3_express_acceleration);
+        .with_s3_express_acceleration(self.is_s3_express_acceleration)
+        .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -1254,6 +1284,13 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+fn refresh_result_changed_accelerator(result: &super::Result<()>) -> bool {
+    matches!(
+        result,
+        Ok(()) | Err(super::Error::FailedToApplyRetentionSql { .. })
+    )
 }
 
 async fn notify_refresh_done(
@@ -1361,6 +1398,28 @@ mod tests {
         ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.stored_refresh_sql.clone())
         }
+    }
+
+    #[test]
+    fn test_refresh_result_changed_accelerator() {
+        assert!(refresh_result_changed_accelerator(&Ok(())));
+
+        assert!(refresh_result_changed_accelerator(&Err(
+            super::super::Error::FailedToApplyRetentionSql {
+                dataset_name: "retained_table".to_string(),
+                source: datafusion::error::DataFusionError::Execution(
+                    "retention failed after write".to_string(),
+                ),
+            }
+        )));
+
+        assert!(!refresh_result_changed_accelerator(&Err(
+            super::super::Error::FailedToRefreshDataset {
+                source: datafusion::error::DataFusionError::Execution(
+                    "source refresh failed before write".to_string(),
+                ),
+            }
+        )));
     }
 
     async fn setup_and_test(
@@ -2437,10 +2496,10 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(Arc::clone(&checkpoint)),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(|result| {
                     if let NextRefresh::WaitFor(duration) = result {
-                        duration <= Duration::from_secs(60) && duration > Duration::ZERO
+                        duration <= Duration::from_mins(1) && duration > Duration::ZERO
                     } else {
                         false
                     }
@@ -2481,7 +2540,7 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: Some(checkpoint),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2501,7 +2560,7 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2511,9 +2570,9 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
-                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_secs(900)),
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_mins(15)),
                 ),
             },
             TestCase {
@@ -2621,31 +2680,31 @@ mod tests {
             TestCase {
                 description: "Checkpoint just happened, should wait full interval",
                 last_checkpoint_time: now,
-                check_interval: Duration::from_secs(60),
-                expected_wait_time: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
+                expected_wait_time: Duration::from_mins(1),
             },
             TestCase {
                 description: "Checkpoint happened 30 seconds ago, should wait 30 seconds",
                 last_checkpoint_time: now - Duration::from_secs(30),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(30),
             },
             TestCase {
                 description: "Checkpoint happened 45 seconds ago, should wait 15 seconds",
                 last_checkpoint_time: now - Duration::from_secs(45),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(15),
             },
             TestCase {
                 description: "Checkpoint happened 59 seconds ago, should wait 1 second",
                 last_checkpoint_time: now - Duration::from_secs(59),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(1),
             },
             TestCase {
                 description: "Checkpoint happened more than interval ago, should refresh immediately",
                 last_checkpoint_time: now - Duration::from_secs(61),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::ZERO,
             },
         ];
