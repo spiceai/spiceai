@@ -7,3 +7,9 @@ tests:
     duration: 600
     ready_wait: 600
     rate: 10000
+  bench:
+    spicepod_path: accelerated/postgres-cayenne[file]-full-refresh.yaml
+    query_set: chbench
+    runner_type: spiceai-dev-xlarge-runners
+    scale_factor: 100
+    ready_wait: 600
