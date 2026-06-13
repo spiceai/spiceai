@@ -29,7 +29,7 @@ use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::postgres_replication::{
     ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
-    config, start_replication_stream,
+    SchemaEvolutionPolicy, config, start_replication_stream_with_policy,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
@@ -124,6 +124,22 @@ pub fn build_changes_stream(
         })
     });
 
+    // Map the dataset-level `on_schema_change` policy onto the replication
+    // stream. `Block` (the default) preserves today's behavior verbatim; the
+    // other policies let the stream adopt widening source-relation changes
+    // mid-stream (the runtime apply loop still enforces the per-policy
+    // evolution set). `OnSchemaChange` is `Copy`, so capture it by value.
+    let schema_evolution_policy = match dataset.on_schema_change {
+        runtime::component::dataset::OnSchemaChange::Block => SchemaEvolutionPolicy::Block,
+        runtime::component::dataset::OnSchemaChange::Fail => SchemaEvolutionPolicy::Fail,
+        runtime::component::dataset::OnSchemaChange::AppendNewColumns => {
+            SchemaEvolutionPolicy::AppendNewColumns
+        }
+        runtime::component::dataset::OnSchemaChange::SyncAllColumns => {
+            SchemaEvolutionPolicy::SyncAllColumns
+        }
+    };
+
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -200,7 +216,7 @@ pub fn build_changes_stream(
             metrics,
         };
 
-        let mut inner = start_replication_stream(input);
+        let mut inner = start_replication_stream_with_policy(input, schema_evolution_policy);
         while let Some(item) = inner.next().await {
             yield item?;
         }
