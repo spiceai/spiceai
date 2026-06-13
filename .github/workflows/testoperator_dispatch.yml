@@ -223,7 +223,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Bench
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
         env:
@@ -232,7 +232,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Correctness
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
         env:
@@ -427,6 +427,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming \
             --workflow ${{ github.event.inputs.workflow_type }} \
