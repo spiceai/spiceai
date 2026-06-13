@@ -805,6 +805,53 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
     #[serde(default)]
     pub pinned_tuning_actuators: PinnedTuningActuators,
+    /// Which widening schema differences detected at table open (the requested
+    /// schema vs the stored metastore schema) may be committed in place via
+    /// `update_table_schema` instead of pinning the stored schema. Set by the
+    /// runtime accelerator from the dataset's `on_schema_change` policy
+    /// (`append_new_columns` / `sync_all_columns`); the default
+    /// [`SchemaEvolutionMode::Disabled`] keeps the legacy pin-stored-schema
+    /// behavior verbatim (`on_schema_change: block`/`fail`, or omitted).
+    /// Runtime-only — never compared by `configuration_matches`.
+    #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
+    pub schema_evolution: SchemaEvolutionMode,
+}
+
+/// Evolution set permitted when a widening schema difference is detected at
+/// table open. Mirrors the runtime's `on_schema_change` policy semantics:
+/// `append_new_columns` evolves added nullable columns only, `sync_all_columns`
+/// evolves the full widening set (added columns + lossless type widening +
+/// nullability relax).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaEvolutionMode {
+    /// Never evolve the stored schema (legacy behavior: pin the stored schema
+    /// and warn on any difference).
+    #[default]
+    Disabled,
+    /// Evolve added nullable columns only (`on_schema_change: append_new_columns`).
+    AddColumnsOnly,
+    /// Evolve the full widening set (`on_schema_change: sync_all_columns`).
+    Widen,
+}
+
+impl SchemaEvolutionMode {
+    /// `true` when this is [`SchemaEvolutionMode::Disabled`] (the serde
+    /// skip-serializing predicate, so stored `vortex_config_json` stays
+    /// byte-identical for non-evolving tables).
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, SchemaEvolutionMode::Disabled)
+    }
+
+    /// Whether `plan` falls within this mode's evolution set.
+    #[must_use]
+    pub fn allows(&self, plan: &arrow_tools::schema_evolution::WideningPlan) -> bool {
+        match self {
+            SchemaEvolutionMode::Disabled => false,
+            SchemaEvolutionMode::AddColumnsOnly => plan.is_additive_only(),
+            SchemaEvolutionMode::Widen => true,
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -1038,6 +1085,7 @@ impl Default for VortexConfig {
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
+            schema_evolution: SchemaEvolutionMode::default(),
         }
     }
 }

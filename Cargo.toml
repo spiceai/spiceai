@@ -352,13 +352,13 @@ flatbuffers = "25.2.10"
 # Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
 # so we specify git deps here directly. The [patch.crates-io] entries below exist to override
 # transitive vortex dependencies pulled in by other patched crates.
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-btrblocks = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
 
 x509-certificate = "0.25.0"
 spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "7bc9e455d47aa8899acc5c6c91f7448bea5637b2" } # branch: spiceai-58
@@ -483,9 +483,9 @@ arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a4037
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" } # branch: lukim/spiceai-58.3.0
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "18a40370d014a0f8eed12ee0d5a914e8cb2070d8" }      # branch: lukim/spiceai-58.3.0
 
-vortex = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
+vortex = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
 vortex-datafusion = { path = "crates/vortex" }
-vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
-vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "ccaa556270c4f907cca15edd4f0883e639510fbb" } # branch: spiceai-53 (Vortex 0.74.0 + intra-file split spiceai/vortex#62 + per-execution kernel cache)
+vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
+vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "31c65376000614431134c9a287d920cf45c9237f" } # spiceai-53
