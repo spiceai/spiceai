@@ -159,5 +159,93 @@ fn bench_apply_partial_deletion_filter_per_scan(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_apply_partial_deletion_filter_per_scan);
+// ============================================================================
+// Rank-1 mechanism: a threshold-bearing (protected-snapshot) probe skips the
+// huge low-seq base run and walks only the small recent runs. This isolates the
+// per-probe GET cost a protected scan pays on bloom-hit (base-resident) rows.
+// ============================================================================
+
+/// Base (bootstrap) run sizes — the accumulated low-seq deletions a protected
+/// snapshot must NOT pay to walk. Large entries leave L2/L3 so the avoided base
+/// GET is a real DRAM miss (the mechanism the lever targets).
+const BASE_RUN_SIZES: &[usize] = &[100_000, 1_000_000, 5_000_000];
+/// Recent applicable deletions living in `active` (seqs above the cutoff).
+const RECENT_DELETES: usize = 2_000;
+/// Bloom-hit probes per iteration (base-resident PKs — the GET fires).
+const PROBE_COUNT: usize = 4_096;
+
+/// A long-lived index under a protected snapshot: a big low-seq base run
+/// (PKs `0..base`, seqs `1..=base`) plus a small recent `active` tier
+/// (seqs `> base`). Returns `(index, S = base)` so a protected probe skips the
+/// base run (`max_delete_seq = base <= S`) and walks only `active`.
+fn build_base_plus_recent(base: usize) -> (Arc<DeletionIndex>, i64) {
+    let mut entries = HashMap::with_capacity(base);
+    for i in 0..base {
+        let pk = i64::try_from(i).expect("base size fits in i64");
+        entries.insert(pk, pk + 1); // delete_seq = pk + 1, so max_delete_seq = base
+    }
+    let mut idx = DeletionIndex::from_map(entries);
+    let cutoff = i64::try_from(base).expect("base size fits in i64");
+    let recent: Vec<(i64, i64)> = (0..RECENT_DELETES)
+        .map(|j| {
+            let off = i64::try_from(j).expect("recent count fits in i64");
+            (cutoff + off, cutoff + 1 + off) // new PKs, seqs strictly above the cutoff
+        })
+        .collect();
+    idx = idx.extend_max_deletes(recent);
+    (Arc::new(idx), cutoff)
+}
+
+/// Lane A (main scan / pre-rank-1 behaviour): `get` fuses every run, so each
+/// bloom-hit pays the base-run GET. Lane B (protected snapshot / rank-1):
+/// `get_with_min_seq(Some(S))` skips the base run and walks only `active`.
+fn bench_probe_run_skip(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_probe_run_skip");
+    group.sample_size(10);
+
+    for &base in BASE_RUN_SIZES {
+        let (cache, cutoff) = build_base_plus_recent(base);
+        // Spread probes across the whole base to defeat prefetch (DRAM misses).
+        let step = (base / PROBE_COUNT).max(1);
+        let pks: Vec<i64> = (0..PROBE_COUNT)
+            .map(|k| i64::try_from((k * step) % base).expect("pk fits in i64"))
+            .collect();
+        group.throughput(Throughput::Elements(PROBE_COUNT as u64));
+        let id = format!("base={base}");
+
+        let (ca, pa) = (Arc::clone(&cache), pks.clone());
+        group.bench_with_input(BenchmarkId::new("fuse_all_none", &id), &base, |b, _| {
+            b.iter(|| {
+                let mut hits = 0_u64;
+                for &pk in &pa {
+                    if black_box(ca.get(pk)).is_some() {
+                        hits += 1;
+                    }
+                }
+                black_box(hits);
+            });
+        });
+
+        let (cb, pb) = (Arc::clone(&cache), pks.clone());
+        group.bench_with_input(BenchmarkId::new("skip_base_some_s", &id), &base, |b, _| {
+            b.iter(|| {
+                let mut applied = 0_u64;
+                for &pk in &pb {
+                    if black_box(cb.get_with_min_seq(pk, Some(cutoff))).is_some() {
+                        applied += 1;
+                    }
+                }
+                black_box(applied);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_apply_partial_deletion_filter_per_scan,
+    bench_probe_run_skip
+);
 criterion_main!(benches);
