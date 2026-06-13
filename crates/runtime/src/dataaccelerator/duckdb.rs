@@ -43,7 +43,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::{Session, TableProviderFactory},
-    common::{Constraints, Statistics, utils::quote_identifier},
+    common::{Constraints, Statistics},
     datasource::{TableProvider, TableType},
     execution::{SendableRecordBatchStream, context::SessionContext},
     logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
@@ -888,6 +888,31 @@ impl OnRefreshConfig {
     }
 }
 
+/// Render the `ORDER BY` clause for the on-refresh sort, always
+/// double-quoting column names (escaping embedded quotes). Unconditional
+/// quoting matters: `datafusion::common::utils::quote_identifier` leaves
+/// all-lowercase identifiers bare, so a sort column named after a reserved
+/// word (`order`, `from`, `end`, ...) would fail to parse in `DuckDB` and
+/// permanently break every refresh of the dataset.
+fn on_refresh_order_by_clause(sort_columns: &[SortColumn]) -> String {
+    sort_columns
+        .iter()
+        .map(|sc| {
+            let nulls = match sc.nulls_first {
+                Some(true) => " NULLS FIRST",
+                Some(false) => " NULLS LAST",
+                None => "",
+            };
+            format!(
+                "\"{}\" {}{nulls}",
+                sc.column.replace('"', "\"\""),
+                sc.direction
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn make_on_refresh_write_handler(
     dataset_name: String,
     config: OnRefreshConfig,
@@ -935,19 +960,7 @@ fn make_on_refresh_write_handler(
         // Sorting recreates the table from scratch via CREATE OR REPLACE; primary
         // keys, indexes, and FK constraints are not preserved by this path.
         if !config.sort_columns.is_empty() {
-            let order_by_clause: String = config
-                .sort_columns
-                .iter()
-                .map(|sc| {
-                    let nulls = match sc.nulls_first {
-                        Some(true) => " NULLS FIRST",
-                        Some(false) => " NULLS LAST",
-                        None => "",
-                    };
-                    format!("{} {}{nulls}", quote_identifier(&sc.column), sc.direction)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+            let order_by_clause = on_refresh_order_by_clause(&config.sort_columns);
 
             let sort_sql = format!(
                 "CREATE OR REPLACE TABLE \"{internal_table_name}\" AS SELECT * FROM \"{internal_table_name}\" ORDER BY {order_by_clause}"
@@ -2117,6 +2130,69 @@ mod tests {
         assert!(
             Arc::ptr_eq(&schema_before, &cmd.schema),
             "schema Arc should be unchanged when no rules match"
+        );
+    }
+
+    #[test]
+    fn on_refresh_order_by_clause_always_quotes_identifiers() {
+        use crate::datafusion::sort_columns::{SortColumn, SortDirection};
+
+        let clause = super::on_refresh_order_by_clause(&[
+            // Lowercase reserved word: `quote_identifier` would leave it bare
+            // and DuckDB would reject the generated SQL.
+            SortColumn::asc("order"),
+            // Mixed case with an embedded quote: must be escaped by doubling.
+            SortColumn {
+                column: "Weird\"Name".to_string(),
+                direction: SortDirection::Desc,
+                nulls_first: Some(true),
+            },
+            SortColumn {
+                column: "plain".to_string(),
+                direction: SortDirection::Asc,
+                nulls_first: Some(false),
+            },
+        ]);
+
+        assert_eq!(
+            clause,
+            "\"order\" ASC, \"Weird\"\"Name\" DESC NULLS FIRST, \"plain\" ASC NULLS LAST"
+        );
+    }
+
+    #[test]
+    fn on_refresh_sort_sql_executes_in_duckdb_for_reserved_word_columns() {
+        use crate::datafusion::sort_columns::SortColumn;
+
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB connection opens");
+        conn.execute_batch(
+            "CREATE TABLE \"tbl\" (\"order\" INTEGER, \"from\" VARCHAR);
+             INSERT INTO \"tbl\" VALUES (2, 'b'), (1, 'a'), (3, 'c');",
+        )
+        .expect("setup table with reserved-word column names");
+
+        // The exact SQL shape `make_on_refresh_write_handler` executes.
+        let clause = super::on_refresh_order_by_clause(&[
+            SortColumn::desc("order"),
+            SortColumn::asc("from"),
+        ]);
+        let sort_sql =
+            format!("CREATE OR REPLACE TABLE \"tbl\" AS SELECT * FROM \"tbl\" ORDER BY {clause}");
+        conn.execute(&sort_sql, [])
+            .expect("on-refresh sort SQL must parse with reserved-word sort columns");
+
+        let mut stmt = conn
+            .prepare("SELECT \"order\" FROM \"tbl\"")
+            .expect("select rewritten table");
+        let values: Vec<i32> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query rewritten table")
+            .collect::<Result<_, _>>()
+            .expect("read sorted values");
+        assert_eq!(
+            values,
+            vec![3, 2, 1],
+            "rows must be rewritten in sort order"
         );
     }
 }
