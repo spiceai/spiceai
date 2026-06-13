@@ -573,6 +573,12 @@ where
 {
     map: Arc<HashMap<K, TombstoneEntry, S>>,
     max_delete_seq: i64,
+    /// Bloom over this run's deletion keys (insert-only entries excluded, like the
+    /// global bloom). A probe skips this run's map GET when the key is absent —
+    /// and a protected probe, which already skips the base run by `max_delete_seq`,
+    /// can therefore avoid the large global bloom entirely and consult only the
+    /// recent runs' (smaller) blooms (v1.1).
+    bloom: Arc<SplitBlockBloomFilter>,
 }
 
 /// Seq-partitioned generalization of [`LayeredTombstones`]: the single frozen
@@ -683,18 +689,21 @@ where
             map.insert(key, outcome.entry);
         }
         let entry_count = map.len();
+        let bloom = Arc::new(bloom);
         let runs = if entry_count == 0 {
             Vec::new()
         } else {
             vec![Arc::new(RunData {
                 map: Arc::new(map),
                 max_delete_seq: run_max_delete_seq,
+                // The base run holds every deletion, so its bloom IS the global one.
+                bloom: Arc::clone(&bloom),
             })]
         };
         Self {
             runs,
             active: PersistentHashMap::default(),
-            bloom: Arc::new(bloom),
+            bloom,
             max_sequence_number,
             min_deleted_key,
             max_deleted_key,
@@ -725,22 +734,32 @@ where
         acc
     }
 
-    /// Effective entry for `key`, fusing `active` + the runs that could carry a
-    /// delete newer than `min_delete_seq` (`None` ⇒ all runs).
+    /// Tombstone for `key` (its bloom `hash` precomputed by the wrapper), gated by
+    /// the per-run blooms: a run is skipped when it can't carry an applicable
+    /// delete (`max_delete_seq <= S`) or when its bloom misses `key`. The wrapper
+    /// applies the global bloom as the fast-reject for `None` (main-scan) probes;
+    /// protected (`Some(S)`) probes never touch the large global bloom — their
+    /// applicable runs are the recent, small ones (v1.1).
+    ///
+    /// Per-run blooms have no false negatives, so this returns exactly the
+    /// per-side-max fusion over the applicable runs + active — identical
+    /// visibility to fusing every applicable run directly; the blooms only skip
+    /// GETs that would miss.
     #[inline]
-    fn fused_entry(&self, key: &K, min_delete_seq: Option<i64>) -> Option<TombstoneEntry> {
-        Self::fuse(&self.active, &self.runs, key, |run| {
-            min_delete_seq.is_none_or(|s| run.max_delete_seq > s)
-        })
-    }
-
-    /// Tombstone for `key` (applicable-runs fused), bypassing the bloom (the
-    /// wrappers do the bloom check first, keeping the reject path inlined).
-    #[inline]
-    fn tombstone_of(&self, key: &K, min_delete_seq: Option<i64>) -> Option<Tombstone> {
-        self.fused_entry(key, min_delete_seq)
-            .as_ref()
-            .and_then(Tombstone::from_entry)
+    fn tombstone_of(&self, key: &K, hash: u64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
+        let mut acc = self.active.get(key).copied();
+        for run in &self.runs {
+            if min_delete_seq.is_some_and(|s| run.max_delete_seq <= s) {
+                continue;
+            }
+            if !run.bloom.might_contain(hash) {
+                continue;
+            }
+            if let Some(e) = run.map.get(key) {
+                acc = Some(merged_entry(acc, e.delete_seq, e.insert_seq).entry);
+            }
+        }
+        acc.as_ref().and_then(Tombstone::from_entry)
     }
 
     /// All effective entries, each key once with its fully-fused (all-runs +
@@ -842,15 +861,20 @@ where
             let mut map: HashMap<K, TombstoneEntry, S> =
                 HashMap::with_capacity_and_hasher(active.len(), S::default());
             let mut run_max = SEQUENCE_ABSENT;
+            let run_bloom = SplitBlockBloomFilter::new(bloom_capacity_for(active.len()));
             for (key, entry) in active.iter() {
-                if entry.delete_seq != SEQUENCE_ABSENT && entry.delete_seq > run_max {
-                    run_max = entry.delete_seq;
+                if entry.delete_seq != SEQUENCE_ABSENT {
+                    if entry.delete_seq > run_max {
+                        run_max = entry.delete_seq;
+                    }
+                    run_bloom.insert(bloom_hash_of(key));
                 }
                 map.insert(*key, *entry);
             }
             runs.push(Arc::new(RunData {
                 map: Arc::new(map),
                 max_delete_seq: run_max,
+                bloom: Arc::new(run_bloom),
             }));
             active = PersistentHashMap::default();
         }
@@ -872,11 +896,18 @@ where
                 map.insert(*key, m.entry);
             }
             let max_delete_seq = older.max_delete_seq.max(newer.max_delete_seq);
+            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(map.len()));
+            for (key, entry) in map.iter() {
+                if entry.delete_seq != SEQUENCE_ABSENT {
+                    bloom.insert(bloom_hash_of(key));
+                }
+            }
             runs.insert(
                 0,
                 Arc::new(RunData {
                     map: Arc::new(map),
                     max_delete_seq,
+                    bloom: Arc::new(bloom),
                 }),
             );
         }
@@ -902,6 +933,53 @@ where
             .map(|r| r.map.len().saturating_mul(base_entry_bytes))
             .sum();
         run_bytes.saturating_add(self.active.len().saturating_mul(delta_entry_bytes))
+    }
+}
+
+/// Bench-only handles for the rank-1 write-side A/B: old [`LayeredTombstones`]
+/// vs new [`LayeredRuns`] `extend` (the CDC-apply path). The new core fuses over
+/// runs for the distinct-key counters and does inline fold; the old core appends
+/// to delta and rebuilds delta→base at the threshold. Doc-hidden; removed
+/// together with `LayeredTombstones`.
+#[doc(hidden)]
+pub mod bench_support {
+    use super::{DeletionIndexHasher, LayeredRuns, LayeredTombstones, hash_key_i64};
+
+    /// Old delta+base core, wrapped so the private type is never exposed.
+    #[derive(Clone)]
+    pub struct OldHandle(LayeredTombstones<i64, DeletionIndexHasher>);
+    /// New seq-partitioned runs core, wrapped the same way.
+    #[derive(Clone)]
+    pub struct NewHandle(LayeredRuns<i64, DeletionIndexHasher>);
+
+    impl OldHandle {
+        #[must_use]
+        pub fn build(deletes: &[(i64, i64)]) -> Self {
+            Self(LayeredTombstones::from_iters(
+                deletes.iter().copied(),
+                std::iter::empty::<(i64, i64)>(),
+                |k| hash_key_i64(*k),
+            ))
+        }
+        #[must_use]
+        pub fn extend(&self, adds: &[(i64, i64, i64)]) -> Self {
+            Self(self.0.extend(adds.iter().copied(), |k| hash_key_i64(*k)))
+        }
+    }
+
+    impl NewHandle {
+        #[must_use]
+        pub fn build(deletes: &[(i64, i64)]) -> Self {
+            Self(LayeredRuns::from_iters(
+                deletes.iter().copied(),
+                std::iter::empty::<(i64, i64)>(),
+                |k| hash_key_i64(*k),
+            ))
+        }
+        #[must_use]
+        pub fn extend(&self, adds: &[(i64, i64, i64)]) -> Self {
+            Self(self.0.extend(adds.iter().copied(), |k| hash_key_i64(*k)))
+        }
     }
 }
 
@@ -1093,10 +1171,13 @@ impl DeletionIndex {
     #[inline]
     #[must_use]
     pub fn get_with_min_seq(&self, pk: i64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
-        if !self.core.bloom.might_contain(hash_key_i64(pk)) {
+        let hash = hash_key_i64(pk);
+        // Global bloom is the fast-reject for main-scan (None) probes only;
+        // protected (Some) probes consult the per-run blooms via tombstone_of.
+        if min_delete_seq.is_none() && !self.core.bloom.might_contain(hash) {
             return None;
         }
-        self.core.tombstone_of(&pk, min_delete_seq)
+        self.core.tombstone_of(&pk, hash, min_delete_seq)
     }
 
     /// Batched bloom-prefiltered lookup: invokes `on_hit(index, tombstone)`
@@ -1141,7 +1222,10 @@ impl DeletionIndex {
             }
             // Pass 2: tier walk for the bloom survivors only.
             for &i in &candidates {
-                if let Some(tombstone) = self.core.tombstone_of(&chunk[i as usize], None) {
+                if let Some(tombstone) =
+                    self.core
+                        .tombstone_of(&chunk[i as usize], hash_key_i64(chunk[i as usize]), None)
+                {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
@@ -1407,10 +1491,11 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let key_hash = hash_key_128(key);
-        if !self.core.bloom.might_contain(bloom_half(key_hash)) {
+        let bloom_hash = bloom_half(key_hash);
+        if min_delete_seq.is_none() && !self.core.bloom.might_contain(bloom_hash) {
             return None;
         }
-        self.core.tombstone_of(&key_hash, min_delete_seq)
+        self.core.tombstone_of(&key_hash, bloom_hash, min_delete_seq)
     }
 
     /// Batched bloom-prefiltered lookup over row-encoded keys: invokes
@@ -1457,7 +1542,11 @@ impl KeyDeletionIndex {
             // Pass 2: tier walk for the bloom survivors only (probed by the
             // retained hash identity; false positives resolve to "absent").
             for &i in &candidates {
-                if let Some(tombstone) = self.core.tombstone_of(&hashes[i as usize], None) {
+                if let Some(tombstone) = self.core.tombstone_of(
+                    &hashes[i as usize],
+                    bloom_half(hashes[i as usize]),
+                    None,
+                ) {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
@@ -1708,7 +1797,7 @@ mod tests {
                             if apply && s_cut.is_some() {
                                 continue;
                             }
-                            let core_t = idx.tombstone_of(&probe, s_cut);
+                            let core_t = idx.tombstone_of(&probe, hash_key_i64(probe), s_cut);
                             assert_eq!(
                                 oracle_visible(core_t, apply, s_cut),
                                 oracle_visible(naive_t, apply, s_cut),
