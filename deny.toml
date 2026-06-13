@@ -38,6 +38,11 @@ ignore = [
   "RUSTSEC-2026-0104",
   # Azure storage dependencies pull `http-types` through `azure_core` 0.21; no safe upgrade is available yet. Owner: data connectors/runtime.
   "RUSTSEC-2026-0174",
+  # `rand` 0.7.3 (unsound) is pulled by `http-types` through Azure `azure_core` 0.21
+  # — the same legacy chain as RUSTSEC-2026-0174; no safe upgrade is available yet,
+  # and the unsoundness (custom-logger `rand::rng()`) is not exercised by this
+  # transitive use. Owner: data connectors/runtime.
+  "RUSTSEC-2026-0097",
 ]
 
 [bans]

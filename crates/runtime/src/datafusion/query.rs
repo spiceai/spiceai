@@ -89,6 +89,7 @@ use crate::datafusion::{
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+use runtime_auth::AuthRequestContext;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -251,8 +252,17 @@ impl Query {
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // Use session-specific context to preserve prepared statements
-            return flight_session.session_context().state();
+            // Only honor the session if it belongs to the current principal. The
+            // session is selected from a client-controlled `x-session-id` header
+            // before authentication runs; binding it to the authenticated
+            // principal here prevents one principal from executing against
+            // another's session (and its prepared statements) if a session id is
+            // leaked.
+            let current = request_context.auth_principal().and_then(|p| p.stable_id());
+            if principal_owns_session(flight_session.owner_stable_id(), current.as_deref()) {
+                // Use session-specific context to preserve prepared statements
+                return flight_session.session_context().state();
+            }
         }
 
         // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
@@ -419,9 +429,16 @@ impl Query {
                 }
             }
             QueryMethod::Plan(logical_plan) => {
-                // For direct plan submission, compute cache key and check cache
-                let plan_cache_key =
-                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+                // For direct plan submission, compute cache key and check cache.
+                // Namespace the key per principal so a plan-submitted result is
+                // never served across principals (mirrors the text-query path).
+                let cache_namespace = request_context.cache_namespace();
+                let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                    Self::plan_hasher(&self.df),
+                    ns_tag,
+                    ns_id,
+                );
 
                 // Check for cached results using the standard cache lookup
                 if let Some(cache_provider) = self.df.results_cache_provider()
@@ -724,10 +741,17 @@ impl Query {
                         }
                     }
                     QueryMethod::Plan(logical_plan) => {
+                        // Namespace the results-cache key per principal so a
+                        // plan-submitted result is never reused across principals.
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_manager = RequestCacheManager::new(
                             CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan)
-                                .as_raw_key(Query::plan_hasher(&ctx.df)),
+                            CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                                Query::plan_hasher(&ctx.df),
+                                ns_tag,
+                                ns_id,
+                            ),
                         );
                         (logical_plan.clone(), None, cache_manager)
                     }
@@ -2023,6 +2047,46 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
                 .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
     )
+}
+
+/// Returns whether a Flight SQL session may be used by the current principal.
+///
+/// An unowned session (`owner` is `None`) is always permitted, preserving
+/// behavior for unauthenticated setups. An owned session is permitted only when
+/// the current principal's stable id matches the owner's — this is the check
+/// that stops a leaked session id from being usable by a different principal.
+fn principal_owns_session(owner: Option<&str>, current_principal: Option<&str>) -> bool {
+    match owner {
+        None => true,
+        Some(owner) => current_principal == Some(owner),
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::principal_owns_session;
+
+    #[test]
+    fn unowned_session_is_always_allowed() {
+        assert!(principal_owns_session(None, None));
+        assert!(principal_owns_session(None, Some("apikey:abc")));
+    }
+
+    #[test]
+    fn owned_session_requires_matching_principal() {
+        // Same principal: allowed.
+        assert!(principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:abc")
+        ));
+        // Different principal: rejected (cross-principal session access).
+        assert!(!principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:xyz")
+        ));
+        // Unauthenticated caller cannot use an owned session.
+        assert!(!principal_owns_session(Some("apikey:abc"), None));
+    }
 }
 
 #[cfg(test)]

@@ -797,6 +797,36 @@ impl CayenneAccelerator {
                 " (milliseconds)",
             );
 
+            // Widening schema evolution at table open is gated on the dataset's
+            // `on_schema_change` policy. The policy lives on the Dataset
+            // component (not on Acceleration), so downcast the source;
+            // non-Dataset sources (views, DDL) and `block`/`fail` keep the
+            // default Disabled = legacy pin-stored-schema behavior verbatim.
+            // `refresh_mode: caching` is excluded from in-place evolution in
+            // v1: its hidden `__spice_cache_namespace` column is appended LAST
+            // and evolution also appends at the end — the positional
+            // disagreement is unfixable via column adds.
+            let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
+            config.schema_evolution = source
+                .as_any()
+                .downcast_ref::<crate::component::dataset::Dataset>()
+                .filter(|_| !is_caching_mode)
+                .map_or(
+                    cayenne::metadata::SchemaEvolutionMode::Disabled,
+                    |dataset| match dataset.on_schema_change {
+                        crate::component::dataset::OnSchemaChange::AppendNewColumns => {
+                            cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
+                        }
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                            cayenne::metadata::SchemaEvolutionMode::Widen
+                        }
+                        crate::component::dataset::OnSchemaChange::Block
+                        | crate::component::dataset::OnSchemaChange::Fail => {
+                            cayenne::metadata::SchemaEvolutionMode::Disabled
+                        }
+                    },
+                );
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -2042,13 +2072,24 @@ impl DataAccelerator for CayenneAccelerator {
                 &primary_keys,
                 on_conflict.as_ref(),
             );
-            let vortex_config = Self::get_vortex_config_with_footer_cache(
+            let mut vortex_config = Self::get_vortex_config_with_footer_cache(
                 &table_name,
                 source,
                 self.footer_cache_mb,
                 &workload,
             )
             .await;
+            // Partitioned tables are excluded from v1 schema evolution
+            // (per-partition catalog tables would evolve lazily as each
+            // partition opens, leaving mixed schemas across partitions);
+            // keep the legacy pin-stored-schema behavior.
+            if !vortex_config.schema_evolution.is_disabled() {
+                tracing::warn!(
+                    dataset = %source.name(),
+                    "on_schema_change schema evolution is not supported for partitioned Cayenne tables; schema changes will not be applied in place"
+                );
+                vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
+            }
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -2231,6 +2272,82 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Recreate the data directory so the next create_external_table works
         tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        Ok(())
+    }
+
+    /// Widening schema evolution for an existing Cayenne table: persist the
+    /// evolved schema to the metastore so the table provider (re)opens with
+    /// it. Existing Vortex data files are NOT rewritten — they are
+    /// self-describing and the scan adapts old files to the evolved schema at
+    /// read time (missing-column null-fill + widened-type cast).
+    ///
+    /// Idempotent: re-applying a plan whose evolved schema is already stored
+    /// is a no-op, so a crash between this engine update and the checkpoint
+    /// update self-heals via restart re-classification.
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+
+        let acceleration = source.acceleration().ok_or_else(|| {
+            Box::new(Error::AccelerationNotEnabled {
+                dataset: Arc::from(source.name().to_string()),
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+        let metastore_type = acceleration
+            .params
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str);
+        let catalog = self
+            .get_or_create_catalog(&metadata_dir, metastore_type)
+            .await?;
+        let table = catalog.get_table(table_name).await.boxed()?;
+
+        // The metastore stores the Vortex-transformed schema (unsupported
+        // types may have been converted), so the evolved schema must go
+        // through the same transform before comparison/persistence.
+        let unsupported_type_action = Self::get_unsupported_type_action(source);
+        let evolved: SchemaRef = Arc::new(transform_schema_for_vortex(
+            plan.evolved_schema.as_ref(),
+            unsupported_type_action,
+        )?);
+
+        if table.schema.as_ref() == evolved.as_ref() {
+            return Ok(());
+        }
+
+        // Re-classify against the STORED schema: re-applies the constraint
+        // guard (Cayenne persists typed PK row-encodings that cannot be
+        // widened in place) and rejects stale/foreign plans.
+        let ctx = EvolutionContext {
+            constraint_columns: &table.primary_key,
+        };
+        match classify(&table.schema, &evolved, &ctx) {
+            SchemaEvolution::Widening(_) => {}
+            // Reorder/nullability-tighten-only: the stored schema stays canonical.
+            SchemaEvolution::Identical => return Ok(()),
+            SchemaEvolution::Incompatible { reason } => {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Cannot evolve Cayenne schema for '{table_name}' in place: {reason}"
+                    )),
+                }));
+            }
+        }
+
+        catalog
+            .update_table_schema(&table.table_id, &evolved)
+            .await
+            .boxed()?;
+        tracing::info!(
+            dataset = %source.name(),
+            "Evolved Cayenne table schema: {}",
+            plan.describe()
+        );
         Ok(())
     }
 
