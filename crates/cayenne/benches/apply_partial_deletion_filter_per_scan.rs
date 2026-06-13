@@ -243,9 +243,94 @@ fn bench_probe_run_skip(c: &mut Criterion) {
     group.finish();
 }
 
+/// Base sizes for the warmed (steady-state) protected-probe bench.
+const WARM_BASE_SIZES: &[usize] = &[1_000_000, 5_000_000];
+/// Deletes applied after the base to drive several freezes. With size-tiering's
+/// FREEZE_CAP (~256K), this is ~3 small frozen recent runs + active.
+const WARM_DELETES: usize = 768_000;
+
+/// Like `build_base_plus_recent` but warms the index to a realistic steady state:
+/// a big base run plus several small (<=FREEZE_CAP) frozen recent runs. This is
+/// the case that matters — it shows whether size-tiering keeps the recent runs
+/// (the only ones a protected probe touches) small + cache-resident regardless
+/// of base size, so the protected probe stays K-independent at steady state.
+fn build_warmed(base: usize) -> (Arc<DeletionIndex>, i64) {
+    let mut entries = HashMap::with_capacity(base);
+    for i in 0..base {
+        let pk = i64::try_from(i).expect("base size fits in i64");
+        entries.insert(pk, pk + 1);
+    }
+    let mut idx = DeletionIndex::from_map(entries);
+    let cutoff = i64::try_from(base).expect("base size fits in i64"); // base run max_delete_seq
+    let mut next = cutoff;
+    let mut seq = cutoff;
+    let mut done = 0;
+    while done < WARM_DELETES {
+        let n = 4_096.min(WARM_DELETES - done);
+        let batch: Vec<(i64, i64)> = (0..n)
+            .map(|_| {
+                let pk = next;
+                next += 1;
+                seq += 1;
+                (pk, seq)
+            })
+            .collect();
+        idx = idx.extend_max_deletes(batch);
+        done += n;
+    }
+    (Arc::new(idx), cutoff)
+}
+
+/// Steady-state protected-probe bench: same lanes as `bench_probe_run_skip` but
+/// on a warmed index (small frozen recent runs present). If `skip_base_some_s`
+/// stays flat across base sizes here, size-tiering realized the K-independence.
+fn bench_probe_run_skip_warmed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_probe_run_skip_warmed");
+    group.sample_size(10);
+
+    for &base in WARM_BASE_SIZES {
+        let (cache, cutoff) = build_warmed(base);
+        let step = (base / PROBE_COUNT).max(1);
+        let pks: Vec<i64> = (0..PROBE_COUNT)
+            .map(|k| i64::try_from((k * step) % base).expect("pk fits in i64"))
+            .collect();
+        group.throughput(Throughput::Elements(PROBE_COUNT as u64));
+        let id = format!("base={base}");
+
+        let (ca, pa) = (Arc::clone(&cache), pks.clone());
+        group.bench_with_input(BenchmarkId::new("fuse_all_none", &id), &base, |b, _| {
+            b.iter(|| {
+                let mut hits = 0_u64;
+                for &pk in &pa {
+                    if black_box(ca.get(pk)).is_some() {
+                        hits += 1;
+                    }
+                }
+                black_box(hits);
+            });
+        });
+
+        let (cb, pb) = (Arc::clone(&cache), pks.clone());
+        group.bench_with_input(BenchmarkId::new("skip_base_some_s", &id), &base, |b, _| {
+            b.iter(|| {
+                let mut applied = 0_u64;
+                for &pk in &pb {
+                    if black_box(cb.get_with_min_seq(pk, Some(cutoff))).is_some() {
+                        applied += 1;
+                    }
+                }
+                black_box(applied);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_apply_partial_deletion_filter_per_scan,
-    bench_probe_run_skip
+    bench_probe_run_skip,
+    bench_probe_run_skip_warmed
 );
 criterion_main!(benches);
