@@ -548,14 +548,21 @@ where
 // Seq-partitioned runs core (rank-1: probe cost independent of accumulated K)
 // =============================================================================
 
-/// Maximum frozen runs kept before a fold merges the two oldest into one. Small,
-/// so a threshold-bearing probe fuses at most this many run lookups (+ active)
-/// and the recent runs stay cache-resident.
+/// Maximum frozen runs kept before a fold merges the smallest adjacent pair.
+/// Size-tiering keeps most runs small + the base stable, so a protected probe
+/// still touches only the recent (small, applicable) runs.
 #[cfg(not(test))]
-const MAX_FROZEN_RUNS: usize = 3;
+const MAX_FROZEN_RUNS: usize = 8;
 /// Small in tests so fold/run-skip behaviour is exercised without huge inputs.
 #[cfg(test)]
 const MAX_FROZEN_RUNS: usize = 3;
+
+/// Cap on the freeze threshold: a frozen run never exceeds ~this many entries, so
+/// the recent runs (and their per-run blooms) stay small + cache-resident no
+/// matter how large the accumulated base grows. Without it the threshold is
+/// `base/4`, making recent runs scale with the base — which bounded the v1.1
+/// protected-probe win at steady state.
+const FREEZE_CAP: usize = 262_144;
 
 /// One frozen run in [`LayeredRuns`]: an immutable entry map plus the per-run
 /// maximum delete sequence. A protected-snapshot probe with cutoff `Some(S)`
@@ -866,7 +873,7 @@ where
 
         // Freeze: active → newest frozen run once it crosses the threshold.
         let total_run_entries: usize = runs.iter().map(|r| r.map.len()).sum();
-        if active.len() >= delta_merge_threshold(total_run_entries) {
+        if active.len() >= delta_merge_threshold(total_run_entries).min(FREEZE_CAP) {
             let mut map: HashMap<K, TombstoneEntry, S> =
                 HashMap::with_capacity_and_hasher(active.len(), S::default());
             let mut run_max = SEQUENCE_ABSENT;
@@ -888,11 +895,24 @@ where
             active = PersistentHashMap::default();
         }
 
-        // Fold: merge the two oldest runs while over the cap (keeps recent runs
-        // small + cache-resident for threshold-bearing probes).
+        // Fold: while over the cap, merge the adjacent pair with the smallest
+        // combined size. Adjacent keeps each run's seq-range coherent (so the
+        // `max_delete_seq` skip stays meaningful); smallest-pair keeps the large
+        // base stable and consolidates the small recent runs among themselves
+        // (size-tiering) — so the runs a protected probe touches stay small + cache-
+        // resident regardless of how much the base accumulates.
         while runs.len() > MAX_FROZEN_RUNS {
-            let older = runs.remove(0);
-            let newer = runs.remove(0);
+            let mut at = 0;
+            let mut smallest = usize::MAX;
+            for i in 0..runs.len() - 1 {
+                let combined = runs[i].map.len().saturating_add(runs[i + 1].map.len());
+                if combined < smallest {
+                    smallest = combined;
+                    at = i;
+                }
+            }
+            let newer = runs.remove(at + 1);
+            let older = runs.remove(at);
             let mut map: HashMap<K, TombstoneEntry, S> = HashMap::with_capacity_and_hasher(
                 older.map.len().saturating_add(newer.map.len()),
                 S::default(),
@@ -912,7 +932,7 @@ where
                 }
             }
             runs.insert(
-                0,
+                at,
                 Arc::new(RunData {
                     map: Arc::new(map),
                     max_delete_seq,
