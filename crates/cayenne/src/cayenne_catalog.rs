@@ -612,6 +612,34 @@ impl CayenneCatalog {
                     return Ok(stored_metadata);
                 }
 
+                // Widening schema evolution (policy-gated by the runtime via
+                // `vortex_config.schema_evolution`): when the schema is the
+                // ONLY configuration difference and the requested schema is a
+                // lossless widening of the stored one within the policy's
+                // evolution set, commit the widened schema and proceed with
+                // the existing table_id/data. Any other difference (or a
+                // disabled policy) keeps the legacy pin-stored-schema path.
+                if !options.vortex_config.schema_evolution.is_disabled()
+                    && configuration_matches_ignoring_schema(&stored_metadata, options)
+                {
+                    match self
+                        .try_widening_schema_evolution(table_name, stored_metadata, options)
+                        .await?
+                    {
+                        Ok(evolved_metadata) => return Ok(evolved_metadata),
+                        Err(stored_metadata_back) => {
+                            log_configuration_differences(
+                                table_name,
+                                &stored_metadata_back,
+                                options,
+                            );
+                            return Err(CatalogError::ChangedConfiguration {
+                                table_name: table_name.to_string(),
+                            });
+                        }
+                    }
+                }
+
                 log_configuration_differences(table_name, &stored_metadata, options);
 
                 Err(CatalogError::ChangedConfiguration {
@@ -622,6 +650,66 @@ impl CayenneCatalog {
                 table_name: table_name.to_string(),
                 source: Box::new(e),
             }),
+        }
+    }
+
+    /// Attempt to evolve the stored schema to the requested one in place.
+    ///
+    /// Returns `Ok(Ok(evolved_metadata))` when the requested schema is a
+    /// lossless widening within the configured
+    /// [`crate::metadata::SchemaEvolutionMode`]'s evolution set and the
+    /// metastore UPDATE committed; `Ok(Err(stored_metadata))` when the change
+    /// is outside the evolution set (block-equivalent — the caller falls back
+    /// to the legacy `ChangedConfiguration` path); `Err(_)` only when the
+    /// metastore UPDATE itself fails.
+    async fn try_widening_schema_evolution(
+        &self,
+        table_name: &str,
+        stored_metadata: TableMetadata,
+        options: &CreateTableOptions,
+    ) -> CatalogResult<std::result::Result<TableMetadata, TableMetadata>> {
+        use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+
+        // Constraint guard: Cayenne persists typed PK row-encodings (and the
+        // Int64Pk deletion-strategy flip keys off the PK type), so widening or
+        // nullability-relaxing a PK column must classify Incompatible.
+        let ctx = EvolutionContext {
+            constraint_columns: &stored_metadata.primary_key,
+        };
+        match classify(&stored_metadata.schema, &options.schema, &ctx) {
+            SchemaEvolution::Widening(plan)
+                if options.vortex_config.schema_evolution.allows(&plan) =>
+            {
+                self.update_table_schema(&stored_metadata.table_id, &plan.evolved_schema)
+                    .await?;
+                tracing::info!(
+                    table = table_name,
+                    "Cayenne table schema evolved in place: {}",
+                    plan.describe()
+                );
+                Ok(Ok(TableMetadata {
+                    schema: Arc::clone(&plan.evolved_schema),
+                    ..stored_metadata
+                }))
+            }
+            SchemaEvolution::Widening(plan) => {
+                tracing::warn!(
+                    table = table_name,
+                    "Cayenne table schema changed ({}), but the change is outside the configured on_schema_change evolution set (append_new_columns only evolves added nullable columns); keeping the previously stored schema. Set on_schema_change: sync_all_columns to evolve type widening and nullability changes.",
+                    plan.describe()
+                );
+                Ok(Err(stored_metadata))
+            }
+            SchemaEvolution::Incompatible { reason } => {
+                tracing::warn!(
+                    table = table_name,
+                    "Cayenne table schema changed but cannot be evolved in place: {reason}. Keeping the previously stored schema."
+                );
+                Ok(Err(stored_metadata))
+            }
+            // A reorder/nullability-tighten-only difference: the stored schema
+            // remains canonical; keep the legacy warn + pin path.
+            SchemaEvolution::Identical => Ok(Err(stored_metadata)),
         }
     }
 
@@ -907,25 +995,7 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
-        let schema_json = {
-            use arrow_ipc::writer::IpcWriteOptions;
-            let write_options = IpcWriteOptions::default();
-            let arrow_flight::IpcMessage(schema_bytes) =
-                arrow_flight::SchemaAsIpc::new(options.schema.as_ref(), &write_options)
-                    .try_into()
-                    .map_err(
-                        |e: arrow_schema::ArrowError| CatalogError::InvalidOperation {
-                            message: "Failed to serialize schema.".to_string(),
-                            source: Box::new(e),
-                        },
-                    )?;
-
-            // Convert to base64 for storage in TEXT column
-            base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                schema_bytes.as_ref(),
-            )
-        };
+        let schema_json = serialize_schema_ipc_base64(options.schema.as_ref())?;
 
         let primary_key_json = if options.primary_key.is_empty() {
             None
@@ -1157,6 +1227,27 @@ impl MetadataCatalog for CayenneCatalog {
             .next()
             .ok_or(CatalogError::TableNotFound {
                 table_name: table_name_owned,
+            })
+    }
+
+    async fn update_table_schema(
+        &self,
+        table_id: &str,
+        schema: &arrow_schema::SchemaRef,
+    ) -> CatalogResult<()> {
+        let schema_json = serialize_schema_ipc_base64(schema.as_ref())?;
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "UPDATE cayenne_table SET schema_json = ?1 WHERE table_id = ?2",
+                params: vec![
+                    MetastoreValue::Text(schema_json),
+                    MetastoreValue::Text(table_id.to_string()),
+                ],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!("Failed to update schema for table {table_id}"),
+                source: Box::new(e),
             })
     }
 
@@ -3592,6 +3683,29 @@ fn sql_text_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Serialize an Arrow schema to the base64 Arrow-IPC form stored in
+/// `cayenne_table.schema_json`. Shared by `create_table` and
+/// `update_table_schema` so both persist byte-identical encodings.
+fn serialize_schema_ipc_base64(schema: &arrow_schema::Schema) -> CatalogResult<String> {
+    use arrow_ipc::writer::IpcWriteOptions;
+    let write_options = IpcWriteOptions::default();
+    let arrow_flight::IpcMessage(schema_bytes) =
+        arrow_flight::SchemaAsIpc::new(schema, &write_options)
+            .try_into()
+            .map_err(
+                |e: arrow_schema::ArrowError| CatalogError::InvalidOperation {
+                    message: "Failed to serialize schema.".to_string(),
+                    source: Box::new(e),
+                },
+            )?;
+
+    // Convert to base64 for storage in TEXT column
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        schema_bytes.as_ref(),
+    ))
+}
+
 /// Encode a `table_id` UUID string as the compact `BLOB` key value bound into
 /// `cayenne_insert_record` (the 16 raw UUID bytes, not the 36-char text). See
 /// [`crate::metastore::table_id_to_key_bytes`] for the encoding contract and
@@ -3664,6 +3778,21 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
 /// Only compares data-affecting fields; runtime tuning parameters like cache sizes
 /// and write/upload concurrency are excluded since they don't affect data correctness.
 fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -> bool {
+    // Compare Arrow schema
+    if stored.schema.as_ref() != options.schema.as_ref() {
+        return false;
+    }
+
+    configuration_matches_ignoring_schema(stored, options)
+}
+
+/// [`configuration_matches`] minus the schema comparison. Used by the widening
+/// schema-evolution path to establish that the schema is the ONLY configuration
+/// difference before consulting the classifier.
+fn configuration_matches_ignoring_schema(
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) -> bool {
     // Compare primary keys
     if stored.primary_key != options.primary_key {
         return false;
@@ -3678,11 +3807,6 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
 
     // Compare partition column
     if stored.partition_column != options.partition_column {
-        return false;
-    }
-
-    // Compare Arrow schema
-    if stored.schema.as_ref() != options.schema.as_ref() {
         return false;
     }
 
