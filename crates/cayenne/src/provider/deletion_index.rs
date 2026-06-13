@@ -749,11 +749,20 @@ where
     fn tombstone_of(&self, key: &K, hash: u64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let mut acc = self.active.get(key).copied();
         for run in &self.runs {
-            if min_delete_seq.is_some_and(|s| run.max_delete_seq <= s) {
-                continue;
-            }
-            if !run.bloom.might_contain(hash) {
-                continue;
+            match min_delete_seq {
+                // Main scan: the global bloom (applied by the wrapper) already
+                // gated this probe; fuse every run without re-checking per-run
+                // blooms. The base run's bloom IS the global one, so re-checking
+                // it is pure overhead that regresses the hot None path (~+30%).
+                None => {}
+                // Protected: skip runs that can't carry an applicable delete, then
+                // gate the rest by their own (small, recent) blooms — never
+                // touching the large global bloom (the high-K win).
+                Some(s) => {
+                    if run.max_delete_seq <= s || !run.bloom.might_contain(hash) {
+                        continue;
+                    }
+                }
             }
             if let Some(e) = run.map.get(key) {
                 acc = Some(merged_entry(acc, e.delete_seq, e.insert_seq).entry);
