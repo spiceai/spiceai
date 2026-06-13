@@ -26,7 +26,7 @@ description: "Query: chbench_q17"
 |               |         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(i_id@0, ol_i_id@0)], filter=CAST(ol_quantity@0 AS Float64) < a@1, projection=[ol_amount@4]     |
 |               |           ProjectionExec: expr=[i_id@0 as i_id, avg(order_line.ol_quantity)@1 as a]                                                                          |
 |               |             AggregateExec: mode=FinalPartitioned, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                   |
-|               |               RepartitionExec: partitioning=Hash([i_id@0], 16), input_partitions=16                                                                          |
+|               |               RepartitionExec: partitioning=Hash([i_id@0], 64), input_partitions=64                                                                          |
 |               |                 AggregateExec: mode=Partial, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                        |
 |               |                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(i_id@0, ol_i_id@0)], projection=[i_id@0, ol_quantity@2]                              |
 |               |                     CoalescePartitionsExec                                                                                                                   |
@@ -36,13 +36,13 @@ description: "Query: chbench_q17"
 |               |                             BytesProcessedExec                                                                                                               |
 |               |                               DataSourceExec: file_groups={4 groups: [<redacted>]}, projection=[i_id, i_data], file_type=vortex, predicate: i_data@4 LIKE %b |
 |               |                     SchemaCastScanExec                                                                                                                       |
-|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=23                                                                         |
+|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                         |
 |               |                         BytesProcessedExec                                                                                                                   |
-|               |                           DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity], file_type=vortex                         |
-|               |           RepartitionExec: partitioning=Hash([ol_i_id@0], 16), input_partitions=16                                                                           |
+|               |                           DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity], file_type=vortex                         |
+|               |           RepartitionExec: partitioning=Hash([ol_i_id@0], 64), input_partitions=64                                                                           |
 |               |             SchemaCastScanExec                                                                                                                               |
-|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=23                                                                                 |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                                 |
 |               |                 BytesProcessedExec                                                                                                                           |
-|               |                   DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity, ol_amount], file_type=vortex                      |
+|               |                   DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity, ol_amount], file_type=vortex                      |
 |               |                                                                                                                                                              |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
