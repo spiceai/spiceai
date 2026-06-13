@@ -270,6 +270,15 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF100
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
   dispatch-input:
     name: Dispatch tests - Input
     runs-on: spiceai-dev-runners
