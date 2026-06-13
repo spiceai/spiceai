@@ -107,6 +107,20 @@ impl QueryTracker {
             &labels,
         );
 
+        // Push per-table query latency DOWN into the Cayenne adaptive tuner (a
+        // no-op for non-Cayenne tables — keyed by table name in a process-global
+        // registry). Successful queries only: an errored query's duration is noise
+        // for the latency/QPH goals. Total wall `query_duration` is the
+        // operator-facing latency. A multi-table query attributes its full latency
+        // to every participant — conservative, biasing toward more query-health
+        // tuning (the safe direction).
+        if self.error_message.is_none() {
+            let latency_ms = f64::from(query_duration.as_secs_f32()) * 1000.0;
+            for ds in self.datasets.iter() {
+                cayenne::record_query_latency(ds.table(), latency_ms);
+            }
+        }
+
         if let Some(err) = &self.error_code {
             labels.push(KeyValue::new("err_code", err.to_string()));
             metrics::FAILURES.add(1, &labels);

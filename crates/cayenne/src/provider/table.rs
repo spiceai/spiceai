@@ -3882,6 +3882,24 @@ impl CayenneTableProvider {
         data: SendableRecordBatchStream,
         task_context: &Arc<datafusion_execution::TaskContext>,
     ) -> Result<CayenneCdcWrite> {
+        self.write_cdc_append_stream_with_source_commit_ts(data, None, task_context)
+            .await
+    }
+
+    /// Like [`Self::write_cdc_append_stream`], but carries the batch's newest
+    /// upstream commit timestamp (ms since the Unix epoch, when the CDC source
+    /// provides one) so the adaptive tuner can compute true end-to-end replication
+    /// lag (`now − source_commit_ts_ms`). The 2-arg form delegates here with `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CDC append cannot be staged or written.
+    pub async fn write_cdc_append_stream_with_source_commit_ts(
+        &self,
+        data: SendableRecordBatchStream,
+        source_commit_ts_ms: Option<i64>,
+        task_context: &Arc<datafusion_execution::TaskContext>,
+    ) -> Result<CayenneCdcWrite> {
         let target_schema = self.table_schema();
         // Tally the in-memory Arrow size of every batch as it streams through, so
         // the auto-tuner sees the real ingest *volume* (bytes/s), not just rows/s.
@@ -3928,6 +3946,7 @@ impl CayenneTableProvider {
                 cdc_write.delete_rows(),
                 ingest_bytes.load(Ordering::Relaxed),
                 lock_wait_start.elapsed(),
+                source_commit_ts_ms,
             );
         }
         result
@@ -17521,6 +17540,7 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let table = self.table_metadata.table_name.clone();
         let snap = self.context.ingest_snapshot();
         let actuators = self.context.live_actuator_values();
+        let goals = self.context.goals();
         telemetry::track_cayenne_autotune_state(
             &telemetry::CayenneAutotuneState {
                 rows_per_sec: snap.rows_per_sec,
@@ -17542,6 +17562,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 mem_tier_max_bytes: u64::try_from(actuators.mem_tier_max_bytes.max(0)).unwrap_or(0),
                 delete_fraction: snap.delete_fraction,
                 arrival_cv: snap.arrival_cv,
+                // Goal signals: measured (−1.0 when unavailable) + target (−1.0
+                // when the goal is unset); the telemetry layer suppresses negatives.
+                replication_lag_secs: snap.replication_lag_secs.unwrap_or(-1.0),
+                goal_replication_lag_secs: goals.replication_lag.map_or(-1.0, |g| g.target),
+                freshness_secs: snap.freshness_secs.unwrap_or(-1.0),
+                goal_freshness_secs: goals.freshness.map_or(-1.0, |g| g.target),
+                query_latency_p99_ms: snap.query_latency_p99_ms.unwrap_or(-1.0),
+                goal_query_latency_ms: goals.query_latency_p99.map_or(-1.0, |g| g.target),
+                qph: snap.qph.unwrap_or(-1.0),
+                goal_qph: goals.qph.map_or(-1.0, |g| g.target),
             },
             &[telemetry::KeyValue::new("table", table.clone())],
         );

@@ -801,6 +801,23 @@ pub struct CayenneAutotuneState {
     pub delete_fraction: f64,
     /// Arrival-interval coefficient of variation (burstiness); ~0 steady, `> 1` spiky.
     pub arrival_cv: f64,
+    /// Measured end-to-end replication lag (seconds); `< 0` ⇒ unavailable (no
+    /// upstream source timestamp seen).
+    pub replication_lag_secs: f64,
+    /// Replication-lag goal target (seconds); `< 0` ⇒ no goal configured.
+    pub goal_replication_lag_secs: f64,
+    /// Measured freshness — age of the newest applied data (seconds); `< 0` ⇒ unavailable.
+    pub freshness_secs: f64,
+    /// Freshness goal target (seconds); `< 0` ⇒ no goal configured.
+    pub goal_freshness_secs: f64,
+    /// Measured p99 query latency on this table (ms); `< 0` ⇒ no queries observed.
+    pub query_latency_p99_ms: f64,
+    /// Query-latency goal target (ms); `< 0` ⇒ no goal configured.
+    pub goal_query_latency_ms: f64,
+    /// Measured query throughput on this table (queries/hour); `< 0` ⇒ unavailable.
+    pub qph: f64,
+    /// QPH goal target (queries/hour); `< 0` ⇒ no goal configured.
+    pub goal_qph: f64,
 }
 
 static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -817,6 +834,14 @@ static CAYENNE_AT_WRITE_CONCURRENCY: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_MEM_TIER_MAX_BYTES: OnceLock<Gauge<u64>> = OnceLock::new();
 static CAYENNE_AT_DELETE_FRACTION: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_ARRIVAL_CV: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_REPLICATION_LAG_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_REPLICATION_LAG_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_FRESHNESS_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_FRESHNESS_SECS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_QUERY_LATENCY_P99_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_QUERY_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_GOAL_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
 
 /// Emit the auto-tuner state gauges for one table. `dimensions` should carry
 /// `table`. Called on each background tick.
@@ -955,6 +980,99 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
                 .build()
         })
         .record(state.arrival_cv, dimensions);
+
+    // Goal signals: the measured high-level metric (always emitted when available)
+    // and, when configured, its goal target. Each is suppressed (sentinel `< 0`)
+    // when the metric is unavailable or the goal is unset, rather than emitting a
+    // misleading 0. Comparing measured vs target shows convergence toward the SLO.
+    if state.replication_lag_secs >= 0.0 {
+        CAYENNE_AT_REPLICATION_LAG_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_replication_lag_seconds")
+                    .with_description(
+                        "Measured end-to-end CDC replication lag (now − newest applied upstream commit timestamp).",
+                    )
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.replication_lag_secs, dimensions);
+    }
+    if state.goal_replication_lag_secs >= 0.0 {
+        CAYENNE_AT_GOAL_REPLICATION_LAG_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_replication_lag_seconds")
+                    .with_description("Configured replication-lag goal target.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.goal_replication_lag_secs, dimensions);
+    }
+    if state.freshness_secs >= 0.0 {
+        CAYENNE_AT_FRESHNESS_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_freshness_seconds")
+                    .with_description("Measured freshness — age of the newest applied data.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.freshness_secs, dimensions);
+    }
+    if state.goal_freshness_secs >= 0.0 {
+        CAYENNE_AT_GOAL_FRESHNESS_SECS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_freshness_seconds")
+                    .with_description("Configured freshness goal target.")
+                    .with_unit("s")
+                    .build()
+            })
+            .record(state.goal_freshness_secs, dimensions);
+    }
+    if state.query_latency_p99_ms >= 0.0 {
+        CAYENNE_AT_QUERY_LATENCY_P99_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_query_latency_p99_ms")
+                    .with_description("Measured p99 query latency on this table (pushed down from the query path).")
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.query_latency_p99_ms, dimensions);
+    }
+    if state.goal_query_latency_ms >= 0.0 {
+        CAYENNE_AT_GOAL_QUERY_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_query_latency_ms")
+                    .with_description("Configured query-latency (p99) goal target.")
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.goal_query_latency_ms, dimensions);
+    }
+    if state.qph >= 0.0 {
+        CAYENNE_AT_QPH
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_query_throughput_qph")
+                    .with_description("Measured query throughput on this table (queries/hour).")
+                    .build()
+            })
+            .record(state.qph, dimensions);
+    }
+    if state.goal_qph >= 0.0 {
+        CAYENNE_AT_GOAL_QPH
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_goal_query_throughput_qph")
+                    .with_description("Configured query-throughput (QPH) goal target.")
+                    .build()
+            })
+            .record(state.goal_qph, dimensions);
+    }
 }
 
 static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();

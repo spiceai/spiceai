@@ -183,6 +183,42 @@ fn parse_u64_aliases_with_hint(
         .unwrap_or(default)
 }
 
+/// Parse a goal duration param (e.g. `"5s"`, `"1m"`, `"250ms"`) to seconds, via
+/// `fundu` for consistency with the other Spice duration knobs (e.g.
+/// `retention_period`). `None` when unset; a warning + `None` when present but
+/// unparseable.
+fn parse_goal_duration_secs(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match fundu::parse_duration(raw) {
+        Ok(d) => Some(d.as_secs_f64()),
+        Err(e) => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' duration '{raw}': {e}; ignoring. Expected a duration like '5s' or '1m'."
+            );
+            None
+        }
+    }
+}
+
+/// Parse a positive goal float param (e.g. queries-per-hour). `None` when unset; a
+/// warning + `None` when present but unparseable or non-positive.
+fn parse_goal_f64(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match raw.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' value '{raw}'; expected a positive number, ignoring."
+            );
+            None
+        }
+    }
+}
+
 fn parse_optional_usize<'a>(
     acceleration: &Acceleration,
     keys: &'a [&'a str],
@@ -1033,6 +1069,46 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
+            }
+            // Goal-driven tuning: parse the high-level SLO setpoints. Times are
+            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. A configured
+            // goal IMPLIES the closed loop (a goal with tuning off is inert),
+            // unless the operator explicitly opted out with `cayenne_tuning: auto`,
+            // and provided the background compaction tick the controller rides is
+            // enabled. Query latency is stored in ms.
+            config.goal_replication_lag_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_replication_lag", table_name);
+            config.goal_freshness_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_freshness", table_name);
+            config.goal_query_latency_ms =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_query_latency", table_name)
+                    .map(|secs| secs * 1000.0);
+            config.goal_convergence_window_secs = parse_goal_duration_secs(
+                acceleration,
+                "cayenne_goal_convergence_window",
+                table_name,
+            );
+            config.goal_qph = parse_goal_f64(acceleration, "cayenne_goal_qph", table_name);
+            let any_goal = config.goal_replication_lag_secs.is_some()
+                || config.goal_freshness_secs.is_some()
+                || config.goal_query_latency_ms.is_some()
+                || config.goal_qph.is_some();
+            if any_goal && tuning_mode.as_deref() == Some("auto") {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set but `cayenne_tuning: auto` explicitly disables the closed loop; the goals will be ignored. Remove `cayenne_tuning: auto` (or set `adaptive`) to enable goal-seeking."
+                );
+            } else if any_goal
+                && !config.dynamic_tuning
+                && config.compaction_background_interval_ms != 0
+            {
+                config.dynamic_tuning = true;
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set: enabling adaptive tuning (goal-seeking closed loop)."
+                );
             }
             if config.dynamic_tuning {
                 tracing::warn!(

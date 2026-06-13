@@ -815,6 +815,28 @@ pub struct VortexConfig {
     /// Runtime-only — never compared by `configuration_matches`.
     #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
     pub schema_evolution: SchemaEvolutionMode,
+    /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
+    /// signal-driven controller for that metric). When any is set, the closed loop
+    /// drives that high-level SLO toward target with small incremental steps,
+    /// converging within `goal_convergence_window_secs`. Set from the
+    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
+    /// with the loop off is inert). Runtime-only — never compared by
+    /// `configuration_matches` (does not affect data layout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_replication_lag_secs: Option<f64>,
+    /// Freshness goal target in seconds (age of the newest queryable data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_freshness_secs: Option<f64>,
+    /// Query-latency (p99) goal target in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_query_latency_ms: Option<f64>,
+    /// Query-throughput goal target in queries per hour (higher is better).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_qph: Option<f64>,
+    /// Convergence window (seconds) for goal-driven tuning. `None` → the default
+    /// (`provider::tuning::DEFAULT_GOAL_CONVERGENCE_WINDOW`, 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_convergence_window_secs: Option<f64>,
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1086,6 +1108,11 @@ impl Default for VortexConfig {
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
             schema_evolution: SchemaEvolutionMode::default(),
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_qph: None,
+            goal_convergence_window_secs: None,
         }
     }
 }
