@@ -2,47 +2,47 @@
 source: crates/test-framework/src/snapshot/mod.rs
 description: "Query: chbench_q17"
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                         |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: sum(order_line.ol_amount) / Float64(2) AS avg_yearly                                                                                             |
-|               |   Aggregate: groupBy=[[]], aggr=[[sum(order_line.ol_amount)]]                                                                                                |
-|               |     Projection: order_line.ol_amount                                                                                                                         |
-|               |       Inner Join: order_line.ol_i_id = t.i_id Filter: CAST(order_line.ol_quantity AS Float64) < t.a                                                          |
-|               |         TableScan: order_line projection=[ol_i_id, ol_quantity, ol_amount]                                                                                   |
-|               |         SubqueryAlias: t                                                                                                                                     |
-|               |           Projection: item.i_id, avg(order_line.ol_quantity) AS a                                                                                            |
-|               |             Aggregate: groupBy=[[item.i_id]], aggr=[[avg(CAST(order_line.ol_quantity AS Float64))]]                                                          |
-|               |               Projection: item.i_id, order_line.ol_quantity                                                                                                  |
-|               |                 Inner Join: item.i_id = order_line.ol_i_id                                                                                                   |
-|               |                   Projection: item.i_id                                                                                                                      |
-|               |                     Filter: item.i_data LIKE Utf8("%b")                                                                                                      |
-|               |                       TableScan: item projection=[i_id, i_data], partial_filters=[item.i_data LIKE Utf8("%b")]                                               |
-|               |                   TableScan: order_line projection=[ol_i_id, ol_quantity]                                                                                    |
-| physical_plan | ProjectionExec: expr=[sum(order_line.ol_amount)@0 / 2 as avg_yearly]                                                                                         |
-|               |   AggregateExec: mode=Final, gby=[], aggr=[sum(order_line.ol_amount)]                                                                                        |
-|               |     CoalescePartitionsExec                                                                                                                                   |
-|               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(order_line.ol_amount)]                                                                                  |
-|               |         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(i_id@0, ol_i_id@0)], filter=CAST(ol_quantity@0 AS Float64) < a@1, projection=[ol_amount@4]     |
-|               |           ProjectionExec: expr=[i_id@0 as i_id, avg(order_line.ol_quantity)@1 as a]                                                                          |
-|               |             AggregateExec: mode=FinalPartitioned, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                   |
-|               |               RepartitionExec: partitioning=Hash([i_id@0], 64), input_partitions=64                                                                          |
-|               |                 AggregateExec: mode=Partial, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                        |
-|               |                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(i_id@0, ol_i_id@0)], projection=[i_id@0, ol_quantity@2]                              |
-|               |                     CoalescePartitionsExec                                                                                                                   |
-|               |                       ProjectionExec: expr=[i_id@0 as i_id]                                                                                                  |
-|               |                         SchemaCastScanExec                                                                                                                   |
-|               |                           CayenneAccelerationExec: snapshots_scanned=1, files_scanned=4                                                                      |
-|               |                             BytesProcessedExec                                                                                                               |
-|               |                               DataSourceExec: file_groups={4 groups: [<redacted>]}, projection=[i_id, i_data], file_type=vortex, predicate: i_data@4 LIKE %b |
-|               |                     SchemaCastScanExec                                                                                                                       |
-|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                         |
-|               |                         BytesProcessedExec                                                                                                                   |
-|               |                           DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity], file_type=vortex                         |
-|               |           RepartitionExec: partitioning=Hash([ol_i_id@0], 64), input_partitions=64                                                                           |
-|               |             SchemaCastScanExec                                                                                                                               |
-|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                                 |
-|               |                 BytesProcessedExec                                                                                                                           |
-|               |                   DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity, ol_amount], file_type=vortex                      |
-|               |                                                                                                                                                              |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                        |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: sum(order_line.ol_amount) / Float64(2) AS avg_yearly                                                                                                            |
+|               |   Aggregate: groupBy=[[]], aggr=[[sum(order_line.ol_amount)]]                                                                                                               |
+|               |     Projection: order_line.ol_amount                                                                                                                                        |
+|               |       Inner Join: order_line.ol_i_id = t.i_id Filter: CAST(order_line.ol_quantity AS Float64) < t.a                                                                         |
+|               |         TableScan: order_line projection=[ol_i_id, ol_quantity, ol_amount]                                                                                                  |
+|               |         SubqueryAlias: t                                                                                                                                                    |
+|               |           Projection: item.i_id, avg(order_line.ol_quantity) AS a                                                                                                           |
+|               |             Aggregate: groupBy=[[item.i_id]], aggr=[[avg(CAST(order_line.ol_quantity AS Float64))]]                                                                         |
+|               |               Projection: item.i_id, order_line.ol_quantity                                                                                                                 |
+|               |                 Inner Join: item.i_id = order_line.ol_i_id                                                                                                                  |
+|               |                   Projection: item.i_id                                                                                                                                     |
+|               |                     Filter: item.i_data LIKE Utf8("%b")                                                                                                                     |
+|               |                       TableScan: item projection=[i_id, i_data], partial_filters=[item.i_data LIKE Utf8("%b")]                                                              |
+|               |                   TableScan: order_line projection=[ol_i_id, ol_quantity]                                                                                                   |
+| physical_plan | ProjectionExec: expr=[sum(order_line.ol_amount)@0 / 2 as avg_yearly]                                                                                                        |
+|               |   AggregateExec: mode=Final, gby=[], aggr=[sum(order_line.ol_amount)]                                                                                                       |
+|               |     CoalescePartitionsExec                                                                                                                                                  |
+|               |       AggregateExec: mode=Partial, gby=[], aggr=[sum(order_line.ol_amount)]                                                                                                 |
+|               |         HashJoinExec: mode=Partitioned, join_type=Inner, on=[(i_id@0, ol_i_id@0)], filter=CAST(ol_quantity@0 AS Float64) < a@1, projection=[ol_amount@4]                    |
+|               |           ProjectionExec: expr=[i_id@0 as i_id, avg(order_line.ol_quantity)@1 as a]                                                                                         |
+|               |             AggregateExec: mode=FinalPartitioned, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                                  |
+|               |               RepartitionExec: partitioning=Hash([i_id@0], 64), input_partitions=64                                                                                         |
+|               |                 AggregateExec: mode=Partial, gby=[i_id@0 as i_id], aggr=[avg(order_line.ol_quantity)]                                                                       |
+|               |                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(i_id@0, ol_i_id@0)], projection=[i_id@0, ol_quantity@2]                                             |
+|               |                     CoalescePartitionsExec                                                                                                                                  |
+|               |                       ProjectionExec: expr=[i_id@0 as i_id]                                                                                                                 |
+|               |                         SchemaCastScanExec                                                                                                                                  |
+|               |                           CayenneAccelerationExec: snapshots_scanned=1, files_scanned=4                                                                                     |
+|               |                             BytesProcessedExec                                                                                                                              |
+|               |                               DataSourceExec: file_groups={4 groups: [<redacted>]}, projection=[i_id, i_data], file_type=vortex, predicate: i_data@4 LIKE %b                |
+|               |                     SchemaCastScanExec                                                                                                                                      |
+|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                                        |
+|               |                         BytesProcessedExec                                                                                                                                  |
+|               |                           DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity], file_type=vortex, predicate: DynamicFilter [ empty ]    |
+|               |           RepartitionExec: partitioning=Hash([ol_i_id@0], 64), input_partitions=64                                                                                          |
+|               |             SchemaCastScanExec                                                                                                                                              |
+|               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                                                |
+|               |                 BytesProcessedExec                                                                                                                                          |
+|               |                   DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[ol_i_id, ol_quantity, ol_amount], file_type=vortex, predicate: DynamicFilter [ empty ] |
+|               |                                                                                                                                                                             |
++---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
