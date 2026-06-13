@@ -184,15 +184,11 @@ async fn run_inner(
     )
     .await?;
 
-    let mut benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
+    let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
         .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars);
-
-    if query_set != test_framework::queries::QuerySet::ChBench {
-        // Skip explain plan snapshot for CH-benCH
-        benchmark_test = benchmark_test.with_explain_plan_snapshot();
-    }
+        .with_progress_bars(!args.common.disable_progress_bars)
+        .with_explain_plan_snapshot();
 
     let benchmark_test = benchmark_test.start()?;
 
