@@ -151,6 +151,14 @@ pub enum Error {
 
     #[snafu(display("Invalid DuckDB acceleration configuration: {detail}"))]
     InvalidConfiguration { detail: Arc<str> },
+
+    #[snafu(display("Schema evolution failed for DuckDB table '{table}': {detail}"))]
+    SchemaEvolutionFailed { table: String, detail: String },
+
+    #[snafu(display(
+        "The data type '{data_type}' is not supported for in-place DuckDB schema evolution"
+    ))]
+    UnsupportedSchemaEvolutionType { data_type: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -768,6 +776,101 @@ impl DataAccelerator for DuckDBAccelerator {
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
     }
+
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(self.get_shared_pool(source).await?);
+        let table_name = table_name.to_owned();
+        let dataset_name = source.name().to_string();
+        let summary = plan.describe();
+        let plan = plan.clone();
+
+        let result = tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let tx = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .transaction()
+                    .boxed()?;
+
+                // DuckDB accelerations have two layouts: a base table with the logical
+                // name (append history), or a view with the logical name over an internal
+                // `__data_{name}_{unix_ms}` table (post-overwrite). Discover the actual
+                // table names from DuckDB metadata; never assume an un-suffixed
+                // `__data_{name}` table exists.
+                let base_table_exists = duckdb_table_exists(&tx, &table_name)?;
+                let internal_tables = list_internal_data_tables(&tx, &table_name)?;
+
+                if base_table_exists
+                    && let Some((internal_table, _)) = internal_tables.last()
+                {
+                    return Err(Error::SchemaEvolutionFailed {
+                        table: table_name.clone(),
+                        detail: format!(
+                            "both an internal table '{internal_table}' and a base table '{table_name}' were found. Manual table migration is required - delete one of them and try again."
+                        ),
+                    }
+                    .into());
+                }
+
+                // For the view layout only the newest internal table is live (DML
+                // resolves to it; older ones are stale leftovers from interrupted
+                // overwrites and are dropped on the next overwrite).
+                let live_table: Option<&str> = if base_table_exists {
+                    Some(table_name.as_str())
+                } else {
+                    internal_tables.last().map(|(name, _)| name.as_str())
+                };
+
+                let Some(live_table) = live_table else {
+                    // No engine table exists yet (e.g. a checkpoint without data); the
+                    // table is created with the evolved schema on the next write.
+                    return Ok(());
+                };
+
+                apply_widening_plan_to_duckdb_table(&tx, live_table, &plan)?;
+
+                // CREATE VIEW binds its column list at creation time, so the logical
+                // view must be recreated for the added columns to become visible.
+                if duckdb_view_exists(&tx, &table_name)?
+                    && let Some((latest_internal, _)) = internal_tables.last()
+                {
+                    let escaped_view = table_name.replace('"', "\"\"");
+                    let escaped_internal = latest_internal.replace('"', "\"\"");
+                    tx.execute(
+                        &format!(
+                            "CREATE OR REPLACE VIEW \"{escaped_view}\" AS SELECT * FROM \"{escaped_internal}\""
+                        ),
+                        [],
+                    )
+                    .boxed()?;
+                }
+
+                tx.commit().boxed()?;
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+        match &result {
+            Ok(()) => tracing::info!(
+                dataset = %dataset_name,
+                "Applied in-place schema evolution to DuckDB acceleration: {summary}"
+            ),
+            Err(e) => tracing::warn!(
+                dataset = %dataset_name,
+                error = %e,
+                "In-place schema evolution failed for DuckDB acceleration: {summary}"
+            ),
+        }
+        result
+    }
 }
 
 fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_changes_refresh: bool) {
@@ -777,6 +880,250 @@ fn apply_changes_refresh_write_defaults(cmd: &mut CreateExternalTable, is_change
             "false".to_string(),
         );
     }
+}
+
+fn duckdb_table_exists(
+    tx: &duckdb::Transaction<'_>,
+    table_name: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = tx
+        .prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = ?")
+        .boxed()?;
+    let mut rows = stmt.query([table_name]).boxed()?;
+    Ok(rows.next().boxed()?.is_some())
+}
+
+fn duckdb_view_exists(
+    tx: &duckdb::Transaction<'_>,
+    view_name: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = tx
+        .prepare("SELECT 1 FROM duckdb_views() WHERE view_name = ? AND NOT internal")
+        .boxed()?;
+    let mut rows = stmt.query([view_name]).boxed()?;
+    Ok(rows.next().boxed()?.is_some())
+}
+
+/// Lists the internal `__data_{table_name}_{unix_ms}` tables backing the logical view
+/// for `table_name`, sorted by creation timestamp ascending (mirrors
+/// `TableDefinition::list_internal_tables` in `datafusion-table-providers`).
+fn list_internal_data_tables(
+    tx: &duckdb::Transaction<'_>,
+    table_name: &str,
+) -> Result<Vec<(String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+    let prefix = format!("__data_{table_name}_");
+    let mut stmt = tx
+        .prepare("SELECT table_name FROM duckdb_tables()")
+        .boxed()?;
+    let mut rows = stmt.query([]).boxed()?;
+
+    let mut tables: Vec<(String, u64)> = Vec::new();
+    while let Some(row) = rows.next().boxed()? {
+        let name: String = row.get(0).boxed()?;
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        // `__data_{table_name}_` could be a prefix of another table's internal tables,
+        // so only accept names whose remainder is a pure unix-ms timestamp.
+        let Ok(timestamp) = suffix.parse::<u64>() else {
+            continue;
+        };
+        tables.push((name, timestamp));
+    }
+    tables.sort_by_key(|(_, timestamp)| *timestamp);
+    Ok(tables)
+}
+
+/// Applies the widening plan to a single live `DuckDB` table: `ADD COLUMN` for missing
+/// added columns, `ALTER COLUMN SET DATA TYPE` for type widenings, and
+/// `ALTER COLUMN DROP NOT NULL` for relaxed nullability. Idempotent: existing columns
+/// are skipped, re-altering to an already-widened type is a no-op cast, and already
+/// nullable columns are not re-relaxed.
+fn apply_widening_plan_to_duckdb_table(
+    tx: &duckdb::Transaction<'_>,
+    live_table: &str,
+    plan: &arrow_tools::schema_evolution::WideningPlan,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let escaped_table = live_table.replace('"', "\"\"");
+
+    // column name -> is_nullable
+    let existing_columns: HashMap<String, bool> = {
+        let mut stmt = tx
+            .prepare("SELECT column_name, is_nullable FROM duckdb_columns() WHERE table_name = ?")
+            .boxed()?;
+        let mut rows = stmt.query([live_table]).boxed()?;
+        let mut columns = HashMap::new();
+        while let Some(row) = rows.next().boxed()? {
+            let name: String = row.get(0).boxed()?;
+            let is_nullable: bool = row.get(1).boxed()?;
+            columns.insert(name, is_nullable);
+        }
+        columns
+    };
+
+    for field in &plan.added_columns {
+        if existing_columns.contains_key(field.name()) {
+            continue;
+        }
+        let ddl_type = arrow_type_to_duckdb_ddl(field.data_type())?;
+        let escaped_column = field.name().replace('"', "\"\"");
+        tx.execute(
+            &format!("ALTER TABLE \"{escaped_table}\" ADD COLUMN \"{escaped_column}\" {ddl_type}"),
+            [],
+        )
+        .map_err(|e| Error::SchemaEvolutionFailed {
+            table: live_table.to_string(),
+            detail: format!(
+                "failed to add column '{column}': {e}",
+                column = field.name()
+            ),
+        })
+        .boxed()?;
+    }
+
+    for widening in &plan.widened_columns {
+        if !existing_columns.contains_key(&widening.name) {
+            return Err(Error::SchemaEvolutionFailed {
+                table: live_table.to_string(),
+                detail: format!(
+                    "column '{column}' to widen from {from} to {to} does not exist",
+                    column = widening.name,
+                    from = widening.from,
+                    to = widening.to
+                ),
+            }
+            .into());
+        }
+        let ddl_type = arrow_type_to_duckdb_ddl(&widening.to)?;
+        let escaped_column = widening.name.replace('"', "\"\"");
+        // The classifier already rejects widening PK/indexed columns, but surface a
+        // clear error if DuckDB refuses the in-place type change anyway.
+        tx.execute(
+            &format!(
+                "ALTER TABLE \"{escaped_table}\" ALTER COLUMN \"{escaped_column}\" SET DATA TYPE {ddl_type}"
+            ),
+            [],
+        )
+        .map_err(|e| Error::SchemaEvolutionFailed {
+            table: live_table.to_string(),
+            detail: format!(
+                "DuckDB refused to widen column '{column}' from {from} to {to}: {e}. Columns referenced by primary keys or indexes cannot be widened in place.",
+                column = widening.name,
+                from = widening.from,
+                to = widening.to
+            ),
+        })
+        .boxed()?;
+    }
+
+    for column in &plan.relaxed_nullability {
+        if existing_columns.get(column).copied().unwrap_or(true) {
+            // Missing (added in this plan) or already nullable: nothing to relax.
+            continue;
+        }
+        let escaped_column = column.replace('"', "\"\"");
+        tx.execute(
+            &format!(
+                "ALTER TABLE \"{escaped_table}\" ALTER COLUMN \"{escaped_column}\" DROP NOT NULL"
+            ),
+            [],
+        )
+        .map_err(|e| Error::SchemaEvolutionFailed {
+            table: live_table.to_string(),
+            detail: format!("failed to relax nullability of column '{column}': {e}"),
+        })
+        .boxed()?;
+    }
+
+    Ok(())
+}
+
+/// Maps an Arrow [`arrow::datatypes::DataType`] to the `DuckDB` DDL type used for
+/// `ALTER TABLE` statements, after applying the same type rewrite rules
+/// (`DUCKDB_TYPE_REWRITE_RULES`) that table creation applies, so evolved columns get
+/// the same engine types a fresh `CREATE TABLE` would produce.
+fn arrow_type_to_duckdb_ddl(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let normalized = arrow_tools::type_rewrite::apply_rules(
+        &arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "c",
+            data_type.clone(),
+            true,
+        )]),
+        DUCKDB_TYPE_REWRITE_RULES,
+    );
+    duckdb_ddl_type(normalized.field(0).data_type())
+}
+
+fn duckdb_ddl_type(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::datatypes::{DataType, IntervalUnit, TimeUnit};
+
+    let ddl = match data_type {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INTEGER".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "UTINYINT".to_string(),
+        DataType::UInt16 => "USMALLINT".to_string(),
+        DataType::UInt32 => "UINTEGER".to_string(),
+        DataType::UInt64 => "UBIGINT".to_string(),
+        DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "BLOB".to_string(),
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale)
+            if *precision <= 38 && *scale >= 0 =>
+        {
+            format!("DECIMAL({precision},{scale})")
+        }
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
+        DataType::Timestamp(unit, None) => match unit {
+            TimeUnit::Second => "TIMESTAMP_S".to_string(),
+            TimeUnit::Millisecond => "TIMESTAMP_MS".to_string(),
+            TimeUnit::Microsecond => "TIMESTAMP".to_string(),
+            TimeUnit::Nanosecond => "TIMESTAMP_NS".to_string(),
+        },
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMP WITH TIME ZONE".to_string(),
+        DataType::Interval(IntervalUnit::MonthDayNano) => "INTERVAL".to_string(),
+        DataType::List(field) | DataType::LargeList(field) => {
+            format!("{}[]", duckdb_ddl_type(field.data_type())?)
+        }
+        DataType::FixedSizeList(field, len) => {
+            format!("{}[{len}]", duckdb_ddl_type(field.data_type())?)
+        }
+        DataType::Struct(fields) => {
+            let inner = fields
+                .iter()
+                .map(|field| {
+                    Ok(format!(
+                        "\"{name}\" {ddl}",
+                        name = field.name().replace('"', "\"\""),
+                        ddl = duckdb_ddl_type(field.data_type())?
+                    ))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?
+                .join(", ");
+            format!("STRUCT({inner})")
+        }
+        other => {
+            return Err(Error::UnsupportedSchemaEvolutionType {
+                data_type: other.to_string(),
+            }
+            .into());
+        }
+    };
+    Ok(ddl)
 }
 
 pub(crate) async fn create_table_provider(
