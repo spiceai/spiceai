@@ -439,7 +439,7 @@ pub async fn get_m2m_token_provider(
     token_provider_registry: &Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn TokenProvider>, Error> {
     token_provider_registry
-        .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+        .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
             DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
                 client_id.to_string(),
@@ -462,7 +462,7 @@ pub async fn get_u2m_token_provider(
 ) -> Result<Arc<dyn TokenProvider>, Error> {
     token_provider_registry
         .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(
-            format!("databricks_u2m_{client_id}"),
+            format!("databricks_u2m_{endpoint}_{client_id}"),
             || async {
                 Ok(DatabricksU2MTokenProvider::new(
                     endpoint.to_string(),

@@ -121,11 +121,16 @@ where
 
         let headers = req.headers();
 
-        // Try to get or create a session for this request
+        // Try to get or create a session for this request. Capture the owning
+        // principal's stable id (if the request names an existing, owned session)
+        // so the session can be bound to its owner at execution time. This layer
+        // runs before auth, so ownership is *recorded* here and *enforced* later
+        // where the authenticated principal is known.
+        let owner_stable_id = self.session_store.owner_stable_id_from_http(req.headers());
         let session_ext = self
             .session_store
             .get_or_create_session_from_http(req.headers(), &self.df.ctx)
-            .map(FlightSessionExtension::new);
+            .map(|ctx| FlightSessionExtension::new(ctx, owner_stable_id));
 
         let mut builder = RequestContext::builder(Protocol::Flight)
             .with_app_opt(self.app.clone())
