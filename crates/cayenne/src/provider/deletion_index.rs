@@ -250,6 +250,7 @@ fn merged_entry(current: Option<TombstoneEntry>, delete_seq: i64, insert_seq: i6
 /// for the tiering design. Key-specific concerns (how a key maps to its bloom
 /// hash) stay in the wrappers and are passed in as functions.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // superseded by LayeredRuns; removed with the test rewrite (Phase 3)
 struct LayeredTombstones<K, S>
 where
     K: Copy + Eq + Hash,
@@ -302,6 +303,7 @@ where
     bloom_capacity: usize,
 }
 
+#[allow(dead_code)]
 impl<K, S> LayeredTombstones<K, S>
 where
     // `Ord` is required to maintain the `min_deleted_key`/`max_deleted_key`
@@ -919,7 +921,7 @@ where
 /// [`extend_max_deletes`](Self::extend_max_deletes) for the full argument.
 #[derive(Debug, Clone)]
 pub struct DeletionIndex {
-    core: LayeredTombstones<i64, DeletionIndexHasher>,
+    core: LayeredRuns<i64, DeletionIndexHasher>,
 }
 
 impl Default for DeletionIndex {
@@ -934,7 +936,7 @@ impl DeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            core: LayeredTombstones::empty(),
+            core: LayeredRuns::empty(),
         }
     }
 
@@ -962,7 +964,7 @@ impl DeletionIndex {
     #[must_use]
     pub fn from_maps(deleted: HashMap<i64, i64>, insert_records: HashMap<i64, i64>) -> Self {
         Self {
-            core: LayeredTombstones::from_iters(
+            core: LayeredRuns::from_iters(
                 deleted.into_iter(),
                 insert_records.into_iter(),
                 |pk| hash_key_i64(*pk),
@@ -1080,10 +1082,21 @@ impl DeletionIndex {
     #[inline]
     #[must_use]
     pub fn get(&self, pk: i64) -> Option<Tombstone> {
+        self.get_with_min_seq(pk, None)
+    }
+
+    /// Like [`get`](Self::get) but applies the protected-snapshot cutoff `S` at
+    /// probe time: frozen runs whose `max_delete_seq <= S` are skipped, so a
+    /// protected-snapshot scan walks only the recent (cache-resident) runs
+    /// rather than the full accumulated deletion set. `None` fuses all runs
+    /// (main scan), byte-identical to [`get`](Self::get).
+    #[inline]
+    #[must_use]
+    pub fn get_with_min_seq(&self, pk: i64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
         if !self.core.bloom.might_contain(hash_key_i64(pk)) {
             return None;
         }
-        self.core.tombstone_of(&pk)
+        self.core.tombstone_of(&pk, min_delete_seq)
     }
 
     /// Batched bloom-prefiltered lookup: invokes `on_hit(index, tombstone)`
@@ -1128,7 +1141,7 @@ impl DeletionIndex {
             }
             // Pass 2: tier walk for the bloom survivors only.
             for &i in &candidates {
-                if let Some(tombstone) = self.core.tombstone_of(&chunk[i as usize]) {
+                if let Some(tombstone) = self.core.tombstone_of(&chunk[i as usize], None) {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
@@ -1242,7 +1255,7 @@ fn bloom_half(hash: u128) -> u64 {
 /// and shared-filter contracts.
 #[derive(Debug, Clone)]
 pub struct KeyDeletionIndex {
-    core: LayeredTombstones<u128, PrehashedBuildHasher>,
+    core: LayeredRuns<u128, PrehashedBuildHasher>,
 }
 
 impl Default for KeyDeletionIndex {
@@ -1256,7 +1269,7 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            core: LayeredTombstones::empty(),
+            core: LayeredRuns::empty(),
         }
     }
 
@@ -1285,7 +1298,7 @@ impl KeyDeletionIndex {
         insert_records: HashMap<Box<[u8]>, i64>,
     ) -> Self {
         Self {
-            core: LayeredTombstones::from_iters(
+            core: LayeredRuns::from_iters(
                 deleted
                     .into_iter()
                     .map(|(key, seq)| (hash_key_128(&key), seq)),
@@ -1384,11 +1397,20 @@ impl KeyDeletionIndex {
     #[inline]
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Tombstone> {
+        self.get_with_min_seq(key, None)
+    }
+
+    /// Like [`get`](Self::get) but applies the protected-snapshot cutoff `S` at
+    /// probe time (skips frozen runs with `max_delete_seq <= S`). `None` fuses
+    /// all runs (main scan), byte-identical to [`get`](Self::get).
+    #[inline]
+    #[must_use]
+    pub fn get_with_min_seq(&self, key: &[u8], min_delete_seq: Option<i64>) -> Option<Tombstone> {
         let key_hash = hash_key_128(key);
         if !self.core.bloom.might_contain(bloom_half(key_hash)) {
             return None;
         }
-        self.core.tombstone_of(&key_hash)
+        self.core.tombstone_of(&key_hash, min_delete_seq)
     }
 
     /// Batched bloom-prefiltered lookup over row-encoded keys: invokes
@@ -1435,7 +1457,7 @@ impl KeyDeletionIndex {
             // Pass 2: tier walk for the bloom survivors only (probed by the
             // retained hash identity; false positives resolve to "absent").
             for &i in &candidates {
-                if let Some(tombstone) = self.core.tombstone_of(&hashes[i as usize]) {
+                if let Some(tombstone) = self.core.tombstone_of(&hashes[i as usize], None) {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
@@ -1503,6 +1525,200 @@ mod tests {
 
     fn key_delete_seq_of(idx: &KeyDeletionIndex, key: &[u8]) -> Option<i64> {
         idx.get(key).map(|t| t.delete_sequence)
+    }
+
+    // ---- Differential oracle for the seq-partitioned runs core (rank-1) ----
+
+    /// Per-side max into the naive reference (`SEQUENCE_ABSENT` = unset side).
+    fn naive_merge(naive: &mut std::collections::BTreeMap<i64, (i64, i64)>, key: i64, d: i64, i: i64) {
+        let e = naive.entry(key).or_insert((SEQUENCE_ABSENT, SEQUENCE_ABSENT));
+        if d != SEQUENCE_ABSENT && (e.0 == SEQUENCE_ABSENT || d > e.0) {
+            e.0 = d;
+        }
+        if i != SEQUENCE_ABSENT && (e.1 == SEQUENCE_ABSENT || i > e.1) {
+            e.1 = i;
+        }
+    }
+
+    /// Replicates `filter_exec::is_pk_visible_*` + `tombstone_visible` so the
+    /// oracle validates the exact visibility the scan path computes.
+    fn oracle_visible(t: Option<Tombstone>, apply: bool, min_delete_seq: Option<i64>) -> bool {
+        match t {
+            None => true,
+            Some(t) => {
+                if min_delete_seq.is_some_and(|m| t.delete_sequence <= m) {
+                    return true;
+                }
+                if apply {
+                    t.insert_sequence.is_some_and(|i| i > t.delete_sequence)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn naive_tombstone(entry: Option<&(i64, i64)>) -> Option<Tombstone> {
+        entry.and_then(|(d, i)| {
+            (*d != SEQUENCE_ABSENT).then_some(Tombstone {
+                delete_sequence: *d,
+                insert_sequence: (*i != SEQUENCE_ABSENT).then_some(*i),
+            })
+        })
+    }
+
+    #[test]
+    fn layered_runs_matches_naive_reference_under_random_ops() {
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let key_space = 80i64;
+
+        for trial in 0..50u64 {
+            let mut idx: LayeredRuns<i64, DeletionIndexHasher> = LayeredRuns::empty();
+            let mut naive: std::collections::BTreeMap<i64, (i64, i64)> =
+                std::collections::BTreeMap::new();
+            let mut seq: i64 = 0;
+            let ops = 40 + rng() % 80;
+
+            for _ in 0..ops {
+                match rng() % 12 {
+                    0 => {
+                        // Re-bootstrap via from_iters (deduped, mirroring from_maps).
+                        let mut dmap: std::collections::HashMap<i64, i64> =
+                            std::collections::HashMap::new();
+                        let mut imap: std::collections::HashMap<i64, i64> =
+                            std::collections::HashMap::new();
+                        let n = rng() % 40;
+                        for _ in 0..n {
+                            let key = (rng() as i64).rem_euclid(key_space);
+                            seq += 1;
+                            dmap.entry(key).and_modify(|e| *e = (*e).max(seq)).or_insert(seq);
+                            if rng() % 3 == 0 {
+                                seq += 1;
+                                imap.entry(key).and_modify(|e| *e = (*e).max(seq)).or_insert(seq);
+                            }
+                        }
+                        naive.clear();
+                        for (k, v) in &dmap {
+                            naive_merge(&mut naive, *k, *v, SEQUENCE_ABSENT);
+                        }
+                        for (k, v) in &imap {
+                            naive_merge(&mut naive, *k, SEQUENCE_ABSENT, *v);
+                        }
+                        idx = LayeredRuns::from_iters(
+                            dmap.iter().map(|(k, v)| (*k, *v)),
+                            imap.iter().map(|(k, v)| (*k, *v)),
+                            |pk| hash_key_i64(*pk),
+                        );
+                    }
+                    1..=6 => {
+                        // Delete burst.
+                        let n = 1 + rng() % 8;
+                        let mut adds = Vec::new();
+                        for _ in 0..n {
+                            let key = (rng() as i64).rem_euclid(key_space);
+                            seq += 1;
+                            adds.push((key, seq, SEQUENCE_ABSENT));
+                            naive_merge(&mut naive, key, seq, SEQUENCE_ABSENT);
+                        }
+                        idx = idx.extend(adds.into_iter(), |pk| hash_key_i64(*pk));
+                    }
+                    _ => {
+                        // Upsert conflicts; sometimes inject an OLD delete seq
+                        // (mirrors extend_max_conflicts grouping by an existing
+                        // tombstone's delete_sequence — breaks tier monotonicity).
+                        let n = 1 + rng() % 6;
+                        let mut adds = Vec::new();
+                        for _ in 0..n {
+                            let key = (rng() as i64).rem_euclid(key_space);
+                            let d = if seq > 5 && rng() % 4 == 0 {
+                                1 + (rng() as i64).rem_euclid(seq)
+                            } else {
+                                seq += 1;
+                                seq
+                            };
+                            seq += 1;
+                            let ins = seq;
+                            adds.push((key, d, ins));
+                            naive_merge(&mut naive, key, d, ins);
+                        }
+                        idx = idx.extend(adds.into_iter(), |pk| hash_key_i64(*pk));
+                    }
+                }
+
+                // ---- invariants vs the naive reference ----
+                let nonempty: std::collections::BTreeMap<i64, (i64, i64)> = naive
+                    .iter()
+                    .filter(|(_, (d, i))| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT)
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                assert_eq!(idx.entry_count, nonempty.len(), "trial {trial}: entry_count");
+                assert_eq!(
+                    idx.delete_count,
+                    nonempty.values().filter(|(d, _)| *d != SEQUENCE_ABSENT).count(),
+                    "trial {trial}: delete_count"
+                );
+                assert_eq!(
+                    idx.insert_count,
+                    nonempty.values().filter(|(_, i)| *i != SEQUENCE_ABSENT).count(),
+                    "trial {trial}: insert_count"
+                );
+                assert_eq!(
+                    idx.max_sequence_number,
+                    nonempty
+                        .values()
+                        .filter_map(|(d, _)| (*d != SEQUENCE_ABSENT).then_some(*d))
+                        .max(),
+                    "trial {trial}: max_sequence_number"
+                );
+                let del_keys: Vec<i64> = nonempty
+                    .iter()
+                    .filter_map(|(k, (d, _))| (*d != SEQUENCE_ABSENT).then_some(*k))
+                    .collect();
+                let naive_range =
+                    del_keys.iter().min().map(|mn| (*mn, *del_keys.iter().max().unwrap()));
+                let idx_range = idx.min_deleted_key.map(|mn| (mn, idx.max_deleted_key.unwrap()));
+                assert_eq!(idx_range, naive_range, "trial {trial}: deleted_key_range");
+
+                // iter_entries: each key exactly once, fully fused.
+                let mut iter_map: std::collections::BTreeMap<i64, (i64, i64)> =
+                    std::collections::BTreeMap::new();
+                for (k, e) in idx.iter_entries() {
+                    assert!(
+                        iter_map.insert(k, (e.delete_seq, e.insert_seq)).is_none(),
+                        "trial {trial}: iter_entries duplicate key {k}"
+                    );
+                }
+                assert_eq!(iter_map, nonempty, "trial {trial}: iter_entries");
+
+                // Run-skipping invariant: visibility matches under every cutoff,
+                // for present and absent keys. (Apply,Some) is skipped — it never
+                // occurs (no such ctor) and insert-side fusion isn't promised
+                // under a cutoff.
+                let cutoffs = [None, Some(-1), Some(0), Some(seq / 2), Some(seq), Some(i64::MAX)];
+                for probe in -2..=key_space + 2 {
+                    let naive_t = naive_tombstone(naive.get(&probe));
+                    for s_cut in cutoffs {
+                        for apply in [false, true] {
+                            if apply && s_cut.is_some() {
+                                continue;
+                            }
+                            let core_t = idx.tombstone_of(&probe, s_cut);
+                            assert_eq!(
+                                oracle_visible(core_t, apply, s_cut),
+                                oracle_visible(naive_t, apply, s_cut),
+                                "trial {trial} key {probe} cutoff {s_cut:?} apply {apply}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2181,24 +2397,25 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Layered-storage tests (frozen base + delta). DELTA_MERGE_MIN is 64 under
-    // cfg(test), so ordinary insert counts cross merge boundaries.
+    // Layered-storage tests (frozen runs + active). DELTA_MERGE_MIN is 64 under
+    // cfg(test), so ordinary insert counts cross freeze boundaries.
     // -------------------------------------------------------------------------
 
     #[test]
-    fn delta_merges_into_base_at_threshold() {
-        // Single-key extends accumulate in the delta until the threshold, then
-        // fold into the frozen base.
+    fn active_freezes_into_run_at_threshold() {
+        // Single-key extends accumulate in `active` until the freeze threshold,
+        // then freeze into a new frozen run (O(1), no fold).
         let mut idx = DeletionIndex::empty();
         for pk in 0..63_i64 {
             idx = idx.extend_max_deletes([(pk, 1)]);
         }
-        assert_eq!(idx.core.delta.len(), 63, "delta below threshold");
-        assert_eq!(idx.core.base.len(), 0);
+        assert_eq!(idx.core.active.len(), 63, "active below threshold");
+        assert_eq!(idx.core.runs.len(), 0);
 
         idx = idx.extend_max_deletes([(63, 1)]);
-        assert_eq!(idx.core.delta.len(), 0, "delta folded into base");
-        assert_eq!(idx.core.base.len(), 64);
+        assert_eq!(idx.core.active.len(), 0, "active frozen into a run");
+        assert_eq!(idx.core.runs.len(), 1);
+        assert_eq!(idx.core.runs[0].map.len(), 64);
 
         // Everything probeable through both tiers' lifetimes.
         for pk in 0..64 {
@@ -2208,49 +2425,54 @@ mod tests {
     }
 
     #[test]
-    fn base_key_update_lands_in_delta_and_wins() {
-        // Force keys into the frozen base, then update one: the merged entry
-        // lives in the delta and overrides the base on probes, without
-        // changing entry counts.
+    fn run_key_update_lands_in_active_and_wins() {
+        // Force keys into a frozen run, then update one: the merged entry lands
+        // in `active` and overrides the run on probes, without changing counts.
         let idx = DeletionIndex::from_map((0..100).map(|pk| (pk, 10_i64)).collect());
-        assert_eq!(idx.core.base.len(), 100);
-        assert_eq!(idx.core.delta.len(), 0);
+        assert_eq!(idx.core.runs.len(), 1);
+        assert_eq!(idx.core.runs[0].map.len(), 100);
+        assert_eq!(idx.core.active.len(), 0);
 
         let updated = idx.extend_max_conflicts([5], 20, 21);
-        assert_eq!(updated.core.base.len(), 100, "base stays frozen");
-        assert_eq!(updated.core.delta.len(), 1, "update lands in delta");
+        assert_eq!(updated.core.runs[0].map.len(), 100, "run stays frozen");
+        assert_eq!(updated.core.active.len(), 1, "update lands in active");
         assert_eq!(updated.len(), 100, "no new entry for an existing key");
         assert_eq!(updated.delete_len(), 100);
         assert_eq!(updated.insert_len(), 1);
 
         let tombstone = updated.get(5).expect("tombstone");
-        assert_eq!(tombstone.delete_sequence, 20, "delta overrides base");
+        assert_eq!(tombstone.delete_sequence, 20, "active overrides the run");
         assert_eq!(tombstone.insert_sequence, Some(21));
 
-        // A stale update is a no-op and must not grow the delta.
+        // A stale update is a no-op and must not grow active.
         let stale = updated.extend_max_deletes([(5, 15)]);
-        assert_eq!(stale.core.delta.len(), 1, "no-op update must not re-insert");
+        assert_eq!(stale.core.active.len(), 1, "no-op update must not re-insert");
         assert_eq!(stale.get(5).expect("tombstone").delete_sequence, 20);
     }
 
     #[test]
-    fn pinned_generation_survives_base_merge() {
-        // A reader pinning a pre-merge generation must keep its exact view
-        // while the writer merges the delta into a new base.
+    fn pinned_generation_survives_freeze() {
+        // A reader pinning a pre-freeze generation must keep its exact view
+        // while the writer accumulates + freezes active into new runs.
         let mut idx = DeletionIndex::empty();
         for pk in 0..50_i64 {
             idx = idx.extend_max_deletes([(pk, 1)]);
         }
         let pinned = idx.clone();
-        let pinned_base = Arc::clone(&pinned.core.base);
+        assert_eq!(pinned.core.runs.len(), 0, "pinned generation is pre-freeze");
 
-        // Cross the merge threshold.
+        // Cross the freeze threshold.
         for pk in 50..130_i64 {
             idx = idx.extend_max_deletes([(pk, 2)]);
         }
         assert!(
-            !Arc::ptr_eq(&pinned_base, &idx.core.base),
-            "merge must produce a fresh base"
+            !idx.core.runs.is_empty(),
+            "writer must have frozen active into a run"
+        );
+        assert_eq!(
+            pinned.core.runs.len(),
+            0,
+            "pinned generation unaffected by the writer's freeze"
         );
 
         // Pinned view: first 50 keys only.
@@ -2305,12 +2527,12 @@ mod tests {
 
     #[test]
     fn iter_entries_yields_latest_values_without_duplicates() {
-        // Keys split across base (merged) and delta (recent update of a base
+        // Keys split across a frozen run and active (recent update of a run
         // key + a brand-new key): iteration must yield each key once with its
         // newest value.
         let idx = DeletionIndex::from_map((0..100).map(|pk| (pk, 1_i64)).collect());
         let idx = idx.extend_max_deletes([(5, 50), (200, 60)]);
-        assert!(idx.core.delta.len() >= 2, "updates must be delta-resident");
+        assert!(idx.core.active.len() >= 2, "updates must be active-resident");
 
         let collected: HashMap<i64, TombstoneEntry> = idx.iter_entries().collect();
         assert_eq!(collected.len(), 101);
