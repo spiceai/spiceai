@@ -543,24 +543,14 @@ pub(crate) fn sample_cpu_pressure() {}
 /// unavailable. Read on the background tick into the snapshot.
 #[must_use]
 pub(crate) fn cpu_pressure() -> Option<f64> {
-    match CPU_PRESSURE_MILLI.load(Ordering::Relaxed) {
-        u64::MAX => None,
-        milli => Some(u64_to_f64(milli) / 1000.0),
-    }
+    milli_to_pressure(CPU_PRESSURE_MILLI.load(Ordering::Relaxed))
 }
 
 #[cfg(target_os = "linux")]
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "pressure is a small non-negative fraction; ×1000 keeps three decimals, capped before the cast"
-)]
 fn store_cpu_pressure(frac: f64) {
-    if !frac.is_finite() || frac < 0.0 {
-        return;
+    if let Some(milli) = pressure_to_milli(frac) {
+        CPU_PRESSURE_MILLI.store(milli, Ordering::Relaxed);
     }
-    let milli = (frac.min(1000.0) * 1000.0).round() as u64;
-    CPU_PRESSURE_MILLI.store(milli, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -779,15 +769,10 @@ impl IngestStats {
     /// (`used / budget`). Sampled on the background tick so the controller can
     /// close the loop on memory (shrink live allocations under pressure). Values
     /// ≥ 1.0 (over budget) are preserved as pressure > 1.
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn set_mem_pressure(&self, fraction: f64) {
-        if !fraction.is_finite() || fraction < 0.0 {
-            return;
+        if let Some(milli) = pressure_to_milli(fraction) {
+            self.mem_pressure_milli.store(milli, Ordering::Relaxed);
         }
-        // Cap at a sane 1000× (pressure is ~0..2 in practice) so the f64→u64
-        // cast can't overflow; ×1000 keeps three decimals of resolution.
-        let milli = (fraction.min(1000.0) * 1000.0).round() as u64;
-        self.mem_pressure_milli.store(milli, Ordering::Relaxed);
     }
 
     /// Fold in an upstream commit timestamp (ms since the Unix epoch) for a freshly
@@ -860,10 +845,7 @@ impl IngestStats {
         } else {
             0.0
         };
-        let mem_pressure = match self.mem_pressure_milli.load(Ordering::Relaxed) {
-            u64::MAX => None,
-            milli => Some(u64_to_f64(milli) / 1000.0),
-        };
+        let mem_pressure = milli_to_pressure(self.mem_pressure_milli.load(Ordering::Relaxed));
         // Burstiness as the coefficient of variation of the inter-batch interval:
         // σ/μ = sqrt(E[x²] − E[x]²) / E[x]. CV ≈ 0 is a metronome-steady stream;
         // CV > 1 means the gap's spread exceeds its mean (spiky). `0` until the
@@ -967,9 +949,14 @@ pub(crate) struct IngestSnapshot {
     /// EWMA fraction of ingested rows that REPLACE an existing key (upsert updates),
     /// in `[0, 1]`. Joins `delete_fraction` in the mutation-heavy gate.
     pub update_fraction: f64,
-    /// Storage medium of the table's data files; slow tier ⇒ bias to fewer/larger files.
+    /// Storage medium of the table's data files, surfaced for observability/telemetry.
+    /// The slow-tier write bias is realized in the static warm-start (the accelerator
+    /// sizes the initial inline-flush by storage class) and dynamically via the
+    /// measured `io_latency_ms` signal — `decide` does not read this field directly.
     pub data_storage: StorageClass,
-    /// Storage medium of the metastore; slow tier ⇒ bias to amortized commits.
+    /// Storage medium of the metastore, surfaced for observability/telemetry. The
+    /// slow-tier commit-amortization bias is realized via the static warm-start and
+    /// the measured `publish_latency_ms` signal — not read by `decide` directly.
     pub metastore_storage: StorageClass,
 }
 
@@ -1563,10 +1550,9 @@ pub(crate) fn decide_with_goals(
     // commits. Each collapses to legacy behavior when its signal is unavailable
     // (`cpu_ok` true, `io_bound`/`publish_bound` false).
     let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
-    let io_bound = ingest_fresh
-        && matches!(s.io_latency_ms, Some(io) if s.arrival_gap_ms > 0.0 && io > IO_BOUND_FRACTION * s.arrival_gap_ms);
-    let publish_bound = ingest_fresh
-        && matches!(s.publish_latency_ms, Some(p) if s.arrival_gap_ms > 0.0 && p > PUBLISH_BOUND_FRACTION * s.arrival_gap_ms);
+    let io_bound = ingest_fresh && latency_bound(s.io_latency_ms, s.arrival_gap_ms, IO_BOUND_FRACTION);
+    let publish_bound =
+        ingest_fresh && latency_bound(s.publish_latency_ms, s.arrival_gap_ms, PUBLISH_BOUND_FRACTION);
 
     // (1) Memory pressure [hard, highest priority]: the cgroup-aware budget is
     // nearly exhausted. Shrink the two live memory buffers — the inline memtable
@@ -1828,8 +1814,7 @@ fn decide_goal(
     // withholds CPU-stealing moves, I/O-bound and mutation-heavy withhold the
     // write-concurrency lever (more shards = more files / key churn).
     let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
-    let io_bound = ingest_fresh
-        && matches!(s.io_latency_ms, Some(io) if s.arrival_gap_ms > 0.0 && io > IO_BOUND_FRACTION * s.arrival_gap_ms);
+    let io_bound = ingest_fresh && latency_bound(s.io_latency_ms, s.arrival_gap_ms, IO_BOUND_FRACTION);
     let mutation_heavy = (s.delete_fraction + s.update_fraction) > MUTATION_HEAVY_FRACTION;
 
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
@@ -2112,6 +2097,32 @@ fn goal_shrink_usize(v: usize, (lo, hi): (usize, usize), violation: f64) -> usiz
 #[expect(clippy::cast_precision_loss)]
 fn u64_to_f64(v: u64) -> f64 {
     v as f64
+}
+
+/// Encode a pressure fraction (memory or CPU `used/budget`) as the ×1000
+/// `AtomicU64` wire value shared by the memory and CPU samplers, or `None` to skip
+/// a non-finite/negative sample. Capped at 1000× so the f64→u64 cast can't
+/// overflow; ×1000 keeps three decimals of resolution.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "capped at 1000× before the cast; the value is a small non-negative fraction"
+)]
+fn pressure_to_milli(fraction: f64) -> Option<u64> {
+    (fraction.is_finite() && fraction >= 0.0).then(|| (fraction.min(1000.0) * 1000.0).round() as u64)
+}
+
+/// Decode the ×1000 pressure wire value back to a fraction; `u64::MAX` is the
+/// "unknown" sentinel (no budget/sample yet).
+fn milli_to_pressure(milli: u64) -> Option<f64> {
+    (milli != u64::MAX).then(|| u64_to_f64(milli) / 1000.0)
+}
+
+/// True when a per-batch latency EWMA exceeds `frac` of the offered-load interval
+/// (`arrival_gap_ms`). Relative gate: unavailable latency or a zero gap ⇒ false
+/// (collapses to legacy behavior). Shared by the I/O- and publish-bound flags.
+fn latency_bound(latency_ms: Option<f64>, arrival_gap_ms: f64, frac: f64) -> bool {
+    matches!(latency_ms, Some(l) if arrival_gap_ms > 0.0 && l > frac * arrival_gap_ms)
 }
 
 /// Clamp `target` to `[lo, hi]` and return it only if it differs from `cur`
