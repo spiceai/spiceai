@@ -40,7 +40,7 @@ description: "Query: chbench_q20"
 |               |                 CayenneAccelerationExec: snapshots_scanned=1, files_scanned=4                                                                                                           |
 |               |                   BytesProcessedExec                                                                                                                                                    |
 |               |                     DataSourceExec: file_groups={4 groups: [<redacted>]}, projection=[n_nationkey, n_name], file_type=vortex, predicate: n_name@1 = CHINA                               |
-|               |           RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=4                                                                                                         |
+|               |           RepartitionExec: partitioning=RoundRobinBatch(64), input_partitions=4                                                                                                         |
 |               |             SchemaCastScanExec                                                                                                                                                          |
 |               |               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=4                                                                                                             |
 |               |                 BytesProcessedExec                                                                                                                                                      |
@@ -50,13 +50,13 @@ description: "Query: chbench_q20"
 |               |           AggregateExec: mode=SinglePartitioned, gby=[s_i_id@0 as s_i_id, s_w_id@1 as s_w_id, s_quantity@2 as s_quantity], aggr=[sum(order_line.ol_quantity)]                           |
 |               |             ProjectionExec: expr=[s_i_id@1 as s_i_id, s_w_id@2 as s_w_id, s_quantity@3 as s_quantity, ol_quantity@0 as ol_quantity]                                                     |
 |               |               HashJoinExec: mode=Partitioned, join_type=Inner, on=[(ol_i_id@0, s_i_id@0)], projection=[ol_quantity@1, s_i_id@2, s_w_id@3, s_quantity@4]                                 |
-|               |                 RepartitionExec: partitioning=Hash([ol_i_id@0], 16), input_partitions=1                                                                                                 |
+|               |                 RepartitionExec: partitioning=Hash([ol_i_id@0], 64), input_partitions=1                                                                                                 |
 |               |                   FilterExec: ol_delivery_d@1 > 1274616000000000, projection=[ol_i_id@0, ol_quantity@2]                                                                                 |
 |               |                     SchemaCastScanExec                                                                                                                                                  |
 |               |                       CayenneAccelerationExec: snapshots_scanned=0, files_scanned=0                                                                                                     |
 |               |                         BytesProcessedExec                                                                                                                                              |
 |               |                           EmptyExec                                                                                                                                                     |
-|               |                 RepartitionExec: partitioning=Hash([s_i_id@0], 16), input_partitions=16                                                                                                 |
+|               |                 RepartitionExec: partitioning=Hash([s_i_id@0], 64), input_partitions=64                                                                                                 |
 |               |                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(i_id@0, s_i_id@0)], projection=[s_i_id@1, s_w_id@2, s_quantity@3]                                               |
 |               |                     CoalescePartitionsExec                                                                                                                                              |
 |               |                       ProjectionExec: expr=[i_id@0 as i_id]                                                                                                                             |
@@ -65,8 +65,8 @@ description: "Query: chbench_q20"
 |               |                             BytesProcessedExec                                                                                                                                          |
 |               |                               DataSourceExec: file_groups={4 groups: [<redacted>]}, projection=[i_id, i_data], file_type=vortex, predicate: i_data@4 LIKE co%                           |
 |               |                     SchemaCastScanExec                                                                                                                                                  |
-|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=27                                                                                                    |
+|               |                       CayenneAccelerationExec: snapshots_scanned=1, files_scanned=75                                                                                                    |
 |               |                         BytesProcessedExec                                                                                                                                              |
-|               |                           DataSourceExec: file_groups={16 groups: [<redacted>]}, projection=[s_i_id, s_w_id, s_quantity], file_type=vortex                                              |
+|               |                           DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[s_i_id, s_w_id, s_quantity], file_type=vortex                                              |
 |               |                                                                                                                                                                                         |
 +---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
