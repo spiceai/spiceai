@@ -56,6 +56,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::metadata::StorageClass;
+
 /// EWMA smoothing factor for the rolling rate/latency estimates. ~0.3 is
 /// responsive enough to follow a workload shift within a handful of batches
 /// while filtering single-batch noise.
@@ -80,12 +82,14 @@ const READ_AMP_HIGH: usize = 8;
 /// Read-amplification below which the table is judged compaction-healthy.
 const READ_AMP_LOW: usize = 3;
 
-/// Fraction of ingested rows that are deletes above which the table is judged
-/// "delete-heavy". Adding write shards (encode parallelism) to a delete-heavy
-/// stream multiplies the per-burst small-file fan-out and worsens delete routing
-/// off the in-memory tier, so the controller withholds the write-concurrency
-/// lever here and leans on buffer/compaction levers instead.
-const DELETE_HEAVY_FRACTION: f64 = 0.2;
+/// Fraction of ingested rows that MUTATE an existing key (deletes + upsert
+/// updates) above which the table is judged "mutation-heavy". Adding write shards
+/// (encode parallelism) to a mutation-heavy stream multiplies the per-burst
+/// small-file fan-out and worsens key routing off the in-memory tier, so the
+/// controller withholds the write-concurrency lever here and leans on
+/// buffer/compaction levers instead. A delete-only stream has zero update
+/// fraction, so this is the legacy delete-heavy gate exactly.
+const MUTATION_HEAVY_FRACTION: f64 = 0.2;
 
 /// Arrival-interval coefficient of variation (σ/μ) above which the offered load
 /// is judged "bursty". A CV > 1 means the inter-batch gap's standard deviation
@@ -107,6 +111,24 @@ const MEM_PRESSURE_HIGH: f64 = 0.85;
 /// (e.g. enlarge the memtable to reduce small-file churn). Hysteresis gap to
 /// [`MEM_PRESSURE_HIGH`] avoids grow/shrink flapping near the limit.
 const MEM_PRESSURE_OK: f64 = 0.75;
+
+/// CPU busy-fraction (of available cores, cgroup-aware) above which the controller
+/// withholds CPU-stealing moves — adding write-encode shards and shrinking the
+/// compaction interval both compete with query threads. Mirrors [`MEM_PRESSURE_HIGH`].
+const CPU_PRESSURE_HIGH: f64 = 0.85;
+
+/// CPU busy-fraction below which those CPU-stealing moves re-enable (hysteresis gap
+/// to [`CPU_PRESSURE_HIGH`], like the memory pair).
+const CPU_PRESSURE_OK: f64 = 0.75;
+
+/// Fraction of the offered-load interval (`arrival_gap_ms`) that per-batch
+/// object-store/disk write latency must exceed for the table to count as
+/// "I/O-bound". Relative (not a fixed-ms cliff) so it scales with the table's rate.
+const IO_BOUND_FRACTION: f64 = 0.5;
+
+/// Same, for per-batch metastore publish latency → "publish-bound" (the
+/// single-writer commit is eating the offered-load window).
+const PUBLISH_BOUND_FRACTION: f64 = 0.5;
 
 const MIB: i64 = 1024 * 1024;
 
@@ -193,6 +215,25 @@ static CGROUP_V2_MEMORY_CURRENT_PATH: OnceLock<Option<String>> = OnceLock::new()
 
 #[cfg(target_os = "linux")]
 static CGROUP_V1_MEMORY_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Process-wide CPU busy-fraction of available cores (cgroup-aware), stored ×1000.
+/// `u64::MAX` = unknown (non-Linux, unreadable, or the first/too-close sample with
+/// no usable delta yet). Process-global: every per-table loop reads this one value,
+/// because CPU is shared across tables (like the memory budget).
+static CPU_PRESSURE_MILLI: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(target_os = "linux")]
+static CGROUP_V2_CPU_STAT_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static CGROUP_V1_CPUACCT_USAGE_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// Previous CPU sample `(cumulative usage µs, wall instant)`. The per-table
+/// background ticks all race to sample one process-global source; the short
+/// critical section computes the busy-fraction delta and swaps in the new sample.
+#[cfg(target_os = "linux")]
+static CPU_PREV_SAMPLE: LazyLock<Mutex<Option<(u64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Install the process memory budget (cgroup-aware total) the dynamic tuner uses
 /// to compute memory pressure. Called once at startup by the runtime, mirroring
@@ -462,6 +503,115 @@ pub(crate) fn sample_mem_pressure(stats: &IngestStats) {
 }
 
 // ---------------------------------------------------------------------------
+// CPU saturation sampler (process-global, cgroup-aware)
+// ---------------------------------------------------------------------------
+
+/// Sample process-wide CPU busy-fraction into the global [`CPU_PRESSURE_MILLI`]:
+/// cgroup v2 `cpu.stat` `usage_usec` (v1 `cpuacct.usage` fallback), as a delta
+/// busy-fraction `Δusage / (Δwall × cores)`. Needs the previous sample; a too-close
+/// interval (< 0.5 s) is skipped so a double-call can't divide by ~0. Called on the
+/// background tick. Linux-only; elsewhere a no-op (pressure stays unknown → the CPU
+/// rule is inert). Process-global because CPU is shared across all per-table loops.
+#[cfg(target_os = "linux")]
+pub(crate) fn sample_cpu_pressure() {
+    let Some(now_usage) = cgroup_cpu_usage_usec() else {
+        return;
+    };
+    let now = Instant::now();
+    let cores = cpu_cores_f64();
+    let mut prev = CPU_PREV_SAMPLE.lock();
+    match *prev {
+        Some((prev_usage, prev_at)) => {
+            let wall_secs = now.saturating_duration_since(prev_at).as_secs_f64();
+            // Skip samples < 0.5 s apart: a tiny denominator makes the ratio noisy
+            // (two ticks can fire close together on a multi-table host). Keep `prev`
+            // and wait for a wider window.
+            if wall_secs >= 0.5 && cores > 0.0 {
+                let busy_secs = u64_to_f64(now_usage.saturating_sub(prev_usage)) / 1_000_000.0;
+                store_cpu_pressure(busy_secs / (wall_secs * cores));
+                *prev = Some((now_usage, now));
+            }
+        }
+        None => *prev = Some((now_usage, now)), // prime; report nothing yet
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn sample_cpu_pressure() {}
+
+/// Current process CPU busy-fraction (of available cores), or `None` when
+/// unavailable. Read on the background tick into the snapshot.
+#[must_use]
+pub(crate) fn cpu_pressure() -> Option<f64> {
+    match CPU_PRESSURE_MILLI.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        milli => Some(u64_to_f64(milli) / 1000.0),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pressure is a small non-negative fraction; ×1000 keeps three decimals, capped before the cast"
+)]
+fn store_cpu_pressure(frac: f64) {
+    if !frac.is_finite() || frac < 0.0 {
+        return;
+    }
+    let milli = (frac.min(1000.0) * 1000.0).round() as u64;
+    CPU_PRESSURE_MILLI.store(milli, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_cores_f64() -> f64 {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    u64_to_f64(u64::try_from(cores).unwrap_or(1))
+}
+
+/// Cumulative CPU usage in microseconds — cgroup v2 `cpu.stat` `usage_usec`, then
+/// v1 `cpuacct.usage` (nanoseconds → µs). `None` when unreadable.
+#[cfg(target_os = "linux")]
+fn cgroup_cpu_usage_usec() -> Option<u64> {
+    if let Some(path) = CGROUP_V2_CPU_STAT_PATH
+        .get_or_init(resolve_cgroup_v2_cpu_stat_path)
+        .as_deref()
+        && let Some(usec) = read_cpu_stat_usage_usec(path)
+    {
+        return Some(usec);
+    }
+    CGROUP_V1_CPUACCT_USAGE_PATH
+        .get_or_init(resolve_cgroup_v1_cpuacct_usage_path)
+        .as_deref()
+        .and_then(read_u64_file)
+        .map(|nanos| nanos / 1_000)
+}
+
+#[cfg(target_os = "linux")]
+fn read_cpu_stat_usage_usec(path: &str) -> Option<u64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        line.strip_prefix("usage_usec ")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v2_cpu_stat_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v2_path()?;
+    let mountpoint = cgroup2_mountpoint().unwrap_or_else(|| "/sys/fs/cgroup".to_string());
+    Some(cgroup_file_path(&mountpoint, &cgroup_path, "cpu.stat"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_v1_cpuacct_usage_path() -> Option<String> {
+    let cgroup_path = process_cgroup_v1_path("cpuacct")?;
+    let mountpoint =
+        cgroup_v1_mountpoint("cpuacct").unwrap_or_else(|| "/sys/fs/cgroup/cpuacct".to_string());
+    Some(cgroup_file_path(&mountpoint, &cgroup_path, "cpuacct.usage"))
+}
+
+// ---------------------------------------------------------------------------
 // Accounting: input + response signals
 // ---------------------------------------------------------------------------
 
@@ -487,11 +637,14 @@ pub(crate) struct WriteSample {
     /// Wall time since the previous batch (the offered-load interval). `None`
     /// for the first batch.
     pub arrival_gap: Option<Duration>,
-    /// Rows in this batch that were deletes (tombstones / on-conflict deletions).
-    /// Feeds the delete-fraction signal: a delete-heavy stream must NOT be sped
-    /// up by adding write shards (more shards multiply the per-burst small-file
-    /// fan-out and worsen delete routing off the in-memory tier).
+    /// Rows in this batch that were true tombstone deletes (the CDC `delete`
+    /// op-group). Feeds the delete fraction of the mutation-heavy signal.
     pub delete_rows: u64,
+    /// Rows in this batch that REPLACED an existing live PK (upsert updates — the
+    /// `superseded` count). Heavy updates churn the keyset and fan out files like
+    /// deletes, so they join `delete_rows` in the mutation-heavy gate. Inserts are
+    /// the remainder (`rows − delete_rows − update_rows`), not stored.
+    pub update_rows: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -506,7 +659,19 @@ struct EwmaInner {
     arrival_gap_ms_sq: f64,
     /// EWMA of the per-batch delete fraction (`delete_rows / rows`), in `[0, 1]`.
     delete_fraction: f64,
+    /// EWMA of the per-batch update fraction (`update_rows / rows`), in `[0, 1]`.
+    /// Joins `delete_fraction` in the mutation-heavy gate.
+    update_fraction: f64,
     samples: u64,
+    /// EWMA per-batch object-store/disk write latency (the `vortex_write` phase),
+    /// ms; paired with `io_samples` for cold-start priming. `0` / no samples ⇒
+    /// the table has not spilled to Vortex (pure-inline) → I/O signal unavailable.
+    io_latency_ms: f64,
+    io_samples: u64,
+    /// EWMA per-batch metastore publish latency (the `publish` phase — the
+    /// single-writer commit), ms; paired with `publish_samples`.
+    publish_latency_ms: f64,
+    publish_samples: u64,
 }
 
 /// Per-table rolling accounting of both the **input** (ingest rate) and the
@@ -582,6 +747,11 @@ impl IngestStats {
         } else {
             0.0
         };
+        let inst_update_fraction = if s.rows > 0 {
+            (u64_to_f64(s.update_rows) / u64_to_f64(s.rows)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         let mut inner = self.inner.lock();
         let prior = inner.samples;
@@ -595,6 +765,7 @@ impl IngestStats {
             prior,
         );
         ewma(&mut inner.delete_fraction, inst_delete_fraction, prior);
+        ewma(&mut inner.update_fraction, inst_update_fraction, prior);
         inner.samples = prior.saturating_add(1);
     }
 
@@ -631,6 +802,25 @@ impl IngestStats {
     /// (ms since the Unix epoch). Feeds the freshness goal.
     pub fn set_last_visible_ts_ms(&self, now_ms: i64) {
         self.last_visible_ts_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Fold one CDC batch's object-store/disk write latency (the `vortex_write`
+    /// phase) into the rolling EWMA. Recorded only on batches that spill to Vortex,
+    /// so a pure-inline table leaves `io_latency_ms` unavailable.
+    pub fn record_io_latency(&self, d: Duration) {
+        let mut inner = self.inner.lock();
+        let prior = inner.io_samples;
+        ewma(&mut inner.io_latency_ms, duration_ms(d), prior);
+        inner.io_samples = prior.saturating_add(1);
+    }
+
+    /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
+    /// single-writer commit) into the rolling EWMA.
+    pub fn record_publish_latency(&self, d: Duration) {
+        let mut inner = self.inner.lock();
+        let prior = inner.publish_samples;
+        ewma(&mut inner.publish_latency_ms, duration_ms(d), prior);
+        inner.publish_samples = prior.saturating_add(1);
     }
 
     /// Replication lag in seconds relative to `now_ms` (age of the newest applied
@@ -702,13 +892,22 @@ impl IngestStats {
             delete_fraction: inner.delete_fraction,
             arrival_cv,
             samples: inner.samples,
-            // The now-relative CDC signals and the query-side metrics are filled in
-            // by `CayenneContext::ingest_snapshot` (which holds the wall clock and
-            // the query-observations handle); `snapshot` itself stays clock-free.
+            // The now-relative CDC signals, the query-side metrics, and the
+            // per-table storage classes are filled in by
+            // `CayenneContext::ingest_snapshot` (which holds the wall clock, the
+            // query-observations handle, and the env profile); `snapshot` stays
+            // clock-free. The CPU/op-mix/latency signals below ARE available here
+            // (a process-global atomic and per-table EWMAs).
             replication_lag_secs: None,
             freshness_secs: None,
             query_latency_p99_ms: None,
             qph: None,
+            cpu_pressure: cpu_pressure(),
+            io_latency_ms: (inner.io_samples > 0).then_some(inner.io_latency_ms),
+            publish_latency_ms: (inner.publish_samples > 0).then_some(inner.publish_latency_ms),
+            update_fraction: inner.update_fraction,
+            data_storage: StorageClass::default(),
+            metastore_storage: StorageClass::default(),
         }
     }
 }
@@ -755,6 +954,23 @@ pub(crate) struct IngestSnapshot {
     /// Query throughput in queries/hour observed on this table, or `None` before a
     /// measurable interval. Higher is better; drives the QPH goal.
     pub qph: Option<f64>,
+    /// Process-wide CPU busy-fraction of available cores (cgroup-aware), or `None`
+    /// when unavailable (non-Linux / unreadable). High ⇒ withhold CPU-stealing
+    /// moves (write-concurrency growth, compaction-interval shrink). Process-global.
+    pub cpu_pressure: Option<f64>,
+    /// EWMA per-batch object-store/disk write latency in ms, or `None` until the
+    /// table spills to Vortex. High vs the arrival interval ⇒ bias to fewer/larger files.
+    pub io_latency_ms: Option<f64>,
+    /// EWMA per-batch metastore publish latency in ms, or `None` before the first
+    /// publish. High vs the arrival interval ⇒ bias to larger inline-flush (amortize commits).
+    pub publish_latency_ms: Option<f64>,
+    /// EWMA fraction of ingested rows that REPLACE an existing key (upsert updates),
+    /// in `[0, 1]`. Joins `delete_fraction` in the mutation-heavy gate.
+    pub update_fraction: f64,
+    /// Storage medium of the table's data files; slow tier ⇒ bias to fewer/larger files.
+    pub data_storage: StorageClass,
+    /// Storage medium of the metastore; slow tier ⇒ bias to amortized commits.
+    pub metastore_storage: StorageClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,8 +1555,18 @@ pub(crate) fn decide_with_goals(
     let ingest_fresh = s.samples > samples_at_last_move;
     let behind = ingest_fresh && s.apply_vs_arrival > BEHIND_RATIO;
     let read_amp_high = s.read_amp > READ_AMP_HIGH;
-    let delete_heavy = s.delete_fraction > DELETE_HEAVY_FRACTION;
+    let mutation_heavy = (s.delete_fraction + s.update_fraction) > MUTATION_HEAVY_FRACTION;
     let bursty = ingest_fresh && s.arrival_cv > BURSTY_ARRIVAL_CV;
+    // Environment gates. CPU-bound withholds CPU-stealing moves (add write shards,
+    // compact more); I/O-/publish-bound (per-batch latency eating the offered-load
+    // window, gated on fresh ingest) biases toward fewer/larger files + amortized
+    // commits. Each collapses to legacy behavior when its signal is unavailable
+    // (`cpu_ok` true, `io_bound`/`publish_bound` false).
+    let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
+    let io_bound = ingest_fresh
+        && matches!(s.io_latency_ms, Some(io) if s.arrival_gap_ms > 0.0 && io > IO_BOUND_FRACTION * s.arrival_gap_ms);
+    let publish_bound = ingest_fresh
+        && matches!(s.publish_latency_ms, Some(p) if s.arrival_gap_ms > 0.0 && p > PUBLISH_BOUND_FRACTION * s.arrival_gap_ms);
 
     // (1) Memory pressure [hard, highest priority]: the cgroup-aware budget is
     // nearly exhausted. Shrink the two live memory buffers — the inline memtable
@@ -1386,7 +1612,7 @@ pub(crate) fn decide_with_goals(
     // hurt by ingest's small-file output. Both are handled here; ingest-speed
     // levers that would worsen query health (more write shards = more files) are
     // held back while read-amp is high.
-    if behind || read_amp_high {
+    if behind || read_amp_high || io_bound || publish_bound {
         // (3) Query health (ingest↔query coupling): too many small files slow
         // scans. Fix at the SOURCE first — a larger memtable checkpoints fewer,
         // larger Vortex files — but only if memory allows; otherwise drain the
@@ -1405,28 +1631,51 @@ pub(crate) fn decide_with_goals(
                     reason: "high read-amp: larger memtable → fewer small files for queries",
                 });
             }
-            if let Some(v) = clamp_move_u64(
-                cur.compaction_background_interval_ms,
-                shrink_u64(cur.compaction_background_interval_ms),
-                b.compaction_background_interval_ms,
-            ) {
+            if cpu_ok
+                && let Some(v) = clamp_move_u64(
+                    cur.compaction_background_interval_ms,
+                    shrink_u64(cur.compaction_background_interval_ms),
+                    b.compaction_background_interval_ms,
+                )
+            {
                 return Some(Adjustment {
                     actuator: Actuator::CompactionIntervalMs,
                     new_value: v,
                     reason: "high read-amp: compact more often to drain small files for queries",
                 });
             }
-            if let Some(v) = clamp_move_usize(
-                cur.compaction_trigger_files,
-                cur.compaction_trigger_files.saturating_sub(1),
-                b.compaction_trigger_files,
-            ) {
+            if cpu_ok
+                && let Some(v) = clamp_move_usize(
+                    cur.compaction_trigger_files,
+                    cur.compaction_trigger_files.saturating_sub(1),
+                    b.compaction_trigger_files,
+                )
+            {
                 return Some(Adjustment {
                     actuator: Actuator::CompactionTriggerFiles,
                     new_value: u64::try_from(v).unwrap_or(0),
                     reason: "high read-amp: lower compaction trigger",
                 });
             }
+        }
+
+        // An I/O- or publish-bound table that is NOT behind grows the memtable to
+        // write fewer, larger files and amortize the per-commit cost — the same
+        // lever the "behind" tier uses first, triggered here by latency. Memory-gated.
+        if (io_bound || publish_bound)
+            && !behind
+            && mem_ok
+            && let Some(v) = clamp_move_i64(
+                cur.inline_flush_max_bytes,
+                grow_i64(cur.inline_flush_max_bytes),
+                b.inline_flush_max_bytes,
+            )
+        {
+            return Some(Adjustment {
+                actuator: Actuator::InlineFlushBytes,
+                new_value: u64::try_from(v).unwrap_or(0),
+                reason: "io/publish-bound: enlarge memtable to amortize commits and write fewer, larger files",
+            });
         }
 
         // (2) Ingest throughput, only when ingest is actually behind. The levers
@@ -1472,8 +1721,12 @@ pub(crate) fn decide_with_goals(
             //    mean more files; ALSO withheld when the stream is delete-heavy,
             //    where extra shards multiply the per-burst small-file fan-out and
             //    worsen delete routing off the in-memory tier.
+            // 3. ... Also withheld when CPU-bound (more shards steal query
+            //    threads) or I/O-bound (more shards = more files = more uploads).
             if s.read_amp <= READ_AMP_LOW
-                && !delete_heavy
+                && !mutation_heavy
+                && cpu_ok
+                && !io_bound
                 && let Some(v) = clamp_move_usize(
                     cur.write_concurrency.max(1),
                     grow_usize(cur.write_concurrency.max(1)),
@@ -1486,12 +1739,15 @@ pub(crate) fn decide_with_goals(
                     reason: "falling behind, buffers maxed: raise write concurrency",
                 });
             }
-            // 4. Last resort: compact more to keep the snapshot lean.
-            if let Some(v) = clamp_move_u64(
-                cur.compaction_background_interval_ms,
-                shrink_u64(cur.compaction_background_interval_ms),
-                b.compaction_background_interval_ms,
-            ) {
+            // 4. Last resort: compact more to keep the snapshot lean — unless
+            //    CPU-bound, where more compaction would steal query threads.
+            if cpu_ok
+                && let Some(v) = clamp_move_u64(
+                    cur.compaction_background_interval_ms,
+                    shrink_u64(cur.compaction_background_interval_ms),
+                    b.compaction_background_interval_ms,
+                )
+            {
                 return Some(Adjustment {
                     actuator: Actuator::CompactionIntervalMs,
                     new_value: v,
@@ -1568,6 +1824,13 @@ fn decide_goal(
     // when genuinely new ingest has arrived since the last move.
     let ingest_v = goals.ingest_violation(s);
     let ingest_violated = ingest_fresh && ingest_v > 0.0;
+    // Environment/data gates (same semantics as the legacy ladder): CPU-bound
+    // withholds CPU-stealing moves, I/O-bound and mutation-heavy withhold the
+    // write-concurrency lever (more shards = more files / key churn).
+    let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
+    let io_bound = ingest_fresh
+        && matches!(s.io_latency_ms, Some(io) if s.arrival_gap_ms > 0.0 && io > IO_BOUND_FRACTION * s.arrival_gap_ms);
+    let mutation_heavy = (s.delete_fraction + s.update_fraction) > MUTATION_HEAVY_FRACTION;
 
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
     // more compaction help queries; shedding write shards cuts file fan-out.
@@ -1585,15 +1848,17 @@ fn decide_goal(
                 reason: "query-latency goal: enlarge memtable → fewer small files for queries",
             });
         }
-        if let Some(v) = clamp_move_u64(
-            cur.compaction_background_interval_ms,
-            goal_shrink_u64(
+        if cpu_ok
+            && let Some(v) = clamp_move_u64(
                 cur.compaction_background_interval_ms,
+                goal_shrink_u64(
+                    cur.compaction_background_interval_ms,
+                    b.compaction_background_interval_ms,
+                    query_v,
+                ),
                 b.compaction_background_interval_ms,
-                query_v,
-            ),
-            b.compaction_background_interval_ms,
-        ) {
+            )
+        {
             return Some(Adjustment {
                 actuator: Actuator::CompactionIntervalMs,
                 new_value: v,
@@ -1661,7 +1926,9 @@ fn decide_goal(
         }
         if !query_violated
             && s.read_amp <= READ_AMP_LOW
-            && s.delete_fraction <= DELETE_HEAVY_FRACTION
+            && !mutation_heavy
+            && cpu_ok
+            && !io_bound
             && let Some(v) = clamp_move_usize(
                 cur.write_concurrency.max(1),
                 goal_grow_usize(cur.write_concurrency.max(1), b.write_concurrency, ingest_v),
@@ -1674,15 +1941,17 @@ fn decide_goal(
                 reason: "replication-lag goal, buffers maxed: raise write concurrency",
             });
         }
-        if let Some(v) = clamp_move_u64(
-            cur.compaction_background_interval_ms,
-            goal_shrink_u64(
+        if cpu_ok
+            && let Some(v) = clamp_move_u64(
                 cur.compaction_background_interval_ms,
+                goal_shrink_u64(
+                    cur.compaction_background_interval_ms,
+                    b.compaction_background_interval_ms,
+                    ingest_v,
+                ),
                 b.compaction_background_interval_ms,
-                ingest_v,
-            ),
-            b.compaction_background_interval_ms,
-        ) {
+            )
+        {
             return Some(Adjustment {
                 actuator: Actuator::CompactionIntervalMs,
                 new_value: v,
@@ -1930,6 +2199,12 @@ mod tests {
             freshness_secs: None,
             query_latency_p99_ms: None,
             qph: None,
+            cpu_pressure: None,
+            io_latency_ms: None,
+            publish_latency_ms: None,
+            update_fraction: 0.0,
+            data_storage: StorageClass::Unknown,
+            metastore_storage: StorageClass::Unknown,
         }
     }
 

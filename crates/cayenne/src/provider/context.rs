@@ -487,6 +487,7 @@ impl CayenneContext {
         &self,
         rows: u64,
         delete_rows: u64,
+        update_rows: u64,
         bytes: u64,
         apply: std::time::Duration,
         source_commit_ts_ms: Option<i64>,
@@ -504,6 +505,7 @@ impl CayenneContext {
             apply,
             arrival_gap,
             delete_rows,
+            update_rows,
         });
         // Fold in the now-relative goal signals. Wall clock (epoch ms), NOT the
         // monotonic `Instant` above: lag/freshness are absolute "now − ts" ages.
@@ -515,6 +517,19 @@ impl CayenneContext {
         // for the backgrounded staged-CDC publish this trails true visibility by
         // the finalize latency, so it is a lower bound on staleness.
         self.ingest_stats.set_last_visible_ts_ms(now_ms);
+    }
+
+    /// Fold one CDC batch's object-store/disk write latency (the `vortex_write`
+    /// phase) into the tuner's rolling EWMA. Called from the write path with the
+    /// duration it already measured for telemetry.
+    pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
+        self.ingest_stats.record_io_latency(d);
+    }
+
+    /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
+    /// single-writer commit) into the tuner's rolling EWMA.
+    pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
+        self.ingest_stats.record_publish_latency(d);
     }
 
     /// A snapshot of the current ingest accounting (rate + response), enriched with
@@ -530,6 +545,10 @@ impl CayenneContext {
         snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
         snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
         snap.qph = self.query_observations.qph();
+        // Per-table static storage classes (detected at registration) — the loop
+        // reasons over them via `IngestSnapshot`, keeping `decide` pure.
+        snap.data_storage = self.config.data_storage_class;
+        snap.metastore_storage = self.config.metastore_storage_class;
         snap
     }
 
@@ -553,6 +572,9 @@ impl CayenneContext {
     pub(crate) fn observe_environment(&self, read_amp: usize) {
         self.ingest_stats.set_read_amp(read_amp);
         tuning::sample_mem_pressure(&self.ingest_stats);
+        // Process-global CPU busy-fraction (cgroup-aware); read by every table's
+        // snapshot. Sampled here once per tick (before `retune`).
+        tuning::sample_cpu_pressure();
     }
 
     /// Run one dynamic-tuning control step from the current accounting, applying

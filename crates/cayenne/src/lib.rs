@@ -82,7 +82,7 @@ pub use catalog_provider::{
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    ObjectStoreConfig, PartitionMetadata, TableMetadata, TableStatistics,
+    ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
