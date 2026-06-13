@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     any::Any,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -31,7 +31,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use parking_lot::Mutex;
 
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
@@ -47,12 +48,69 @@ use datafusion_physical_plan::{
     union::UnionExec,
 };
 
+/// Keeps a scan's snapshot directories alive for the FULL lifetime of the scan —
+/// plan-build AND execution. Increments a per-snapshot in-flight-scan ref-count on
+/// creation and decrements it on `Drop` (when the scan's `ExecutionPlan` and all its
+/// output streams have been dropped). Snapshot GC/cleanup skips any dir with a live
+/// ref, so a long-running query (e.g. a 139s analytical scan) cannot have its Vortex
+/// segment files deleted out from under it by a concurrent compaction. This replaces
+/// the brittle time-based grace, which a query slower than the grace would outlive.
+///
+/// Correctness rests on the listing-flip invariant: a scan captures its snapshot ids
+/// under `listing_fence.read()`, and a compaction's flip takes `listing_fence.write()`,
+/// so after the flip no NEW scan can reference the superseded snapshot — its ref-count
+/// only decreases, and cleanup that observes count 0 can delete it safely.
+#[derive(Debug)]
+pub(crate) struct SnapshotScanRef {
+    refs: Arc<Mutex<HashMap<String, usize>>>,
+    snapshot_ids: Vec<String>,
+}
+
+impl SnapshotScanRef {
+    /// Increment the in-flight-scan ref-count for each snapshot id and return a
+    /// guard that decrements them on drop.
+    pub(crate) fn new(
+        refs: Arc<Mutex<HashMap<String, usize>>>,
+        snapshot_ids: Vec<String>,
+    ) -> Arc<Self> {
+        {
+            let mut map = refs.lock();
+            for id in &snapshot_ids {
+                *map.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        Arc::new(Self { refs, snapshot_ids })
+    }
+}
+
+impl Drop for SnapshotScanRef {
+    fn drop(&mut self) {
+        let mut map = self.refs.lock();
+        for id in &self.snapshot_ids {
+            if let Some(count) = map.get_mut(id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(id);
+                }
+            }
+        }
+    }
+}
+
 /// Wrapper for Cayenne acceleration execution plans.
 /// This is used to identify Cayenne-specific table scans from within the physical plan, once references to the table is lost from the logical plan.
 #[derive(Debug)]
 pub struct CayenneAccelerationExec {
     inner: Arc<dyn ExecutionPlan>,
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
+    /// In-flight-scan ref-count guard for the snapshot dirs this scan reads. Held
+    /// for the plan's lifetime AND injected into each output stream by `execute`,
+    /// so the snapshots stay GC-protected until execution completes. `None` for the
+    /// inner per-snapshot wrappers; set on the outermost wrapper `scan()` returns.
+    /// MUST be carried through every plan-rewriting method (`with_new_children`,
+    /// `with_fetch`, `try_swapping_with_projection`, `reset_state`) or a concurrent
+    /// compaction could GC a snapshot mid-execution.
+    scan_guard: Option<Arc<SnapshotScanRef>>,
 }
 
 impl CayenneAccelerationExec {
@@ -62,6 +120,28 @@ impl CayenneAccelerationExec {
         Self {
             inner,
             scan_identity: OnceLock::new(),
+            scan_guard: None,
+        }
+    }
+
+    /// As [`Self::new`], but carries an in-flight-scan ref-count guard so the
+    /// snapshot dirs this scan reads are not GC'd until execution completes.
+    #[must_use]
+    pub(crate) fn with_guard(inner: Arc<dyn ExecutionPlan>, guard: Arc<SnapshotScanRef>) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: Some(guard),
+        }
+    }
+
+    /// Rewrap `inner`, preserving this node's scan guard (used by plan-rewriting
+    /// trait methods so the GC-protection survives optimizer transforms).
+    fn rewrap(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: self.scan_guard.clone(),
         }
     }
 
@@ -545,7 +625,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let Some(input) = children.into_iter().next() else {
             unreachable!("should have one input");
         };
-        Ok(Arc::new(CayenneAccelerationExec::new(input)))
+        Ok(Arc::new(self.rewrap(input)))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -586,6 +666,15 @@ impl ExecutionPlan for CayenneAccelerationExec {
                 e
             }
         });
+        // Hold the in-flight-scan guard for the stream's lifetime so the snapshot
+        // dirs this scan reads are not GC'd mid-execution. The closure is a no-op
+        // per batch; it drops (releasing the ref-count) when the stream is fully
+        // consumed or dropped. `None` on the inner per-snapshot wrappers.
+        let scan_guard = self.scan_guard.clone();
+        let mapped = mapped.map(move |item| {
+            let _hold = &scan_guard;
+            item
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
@@ -605,7 +694,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         self.inner
             .with_fetch(limit)
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>)
+            .map(|plan| Arc::new(self.rewrap(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -622,11 +711,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         self.inner
             .try_swapping_with_projection(projection)
-            .map(|plan| {
-                plan.map(|plan| {
-                    Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>
-                })
-            })
+            .map(|plan| plan.map(|plan| Arc::new(self.rewrap(plan)) as Arc<dyn ExecutionPlan>))
     }
 
     fn gather_filters_for_pushdown(
