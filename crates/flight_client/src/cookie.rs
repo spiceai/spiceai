@@ -24,9 +24,21 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct CookieStore {
     cookies: RwLock<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for CookieStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Cookie values may carry session tokens; print only the names so a
+        // `{:?}` of this store (or anything that derives `Debug` and embeds it)
+        // cannot leak credentials.
+        let names: Vec<String> = self.cookies.read().keys().cloned().collect();
+        f.debug_struct("CookieStore")
+            .field("cookies", &names)
+            .finish()
+    }
 }
 
 impl CookieStore {
@@ -172,6 +184,26 @@ mod tests {
             .to_string();
         assert!(header.contains("AWSALB=abc123"));
         assert!(header.contains("AWSALBTG=def456"));
+    }
+
+    #[test]
+    fn cookie_store_debug_redacts_values() {
+        let store = CookieStore::new();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("session=supersecretvalue; Path=/"),
+        );
+        store.update_from_headers(&headers);
+
+        // The Debug output may show cookie names but must not leak their values
+        // (which can be session tokens).
+        let debug = format!("{store:?}");
+        assert!(
+            !debug.contains("supersecretvalue"),
+            "Debug leaked cookie value: {debug}"
+        );
+        assert!(debug.contains("session"));
     }
 
     #[test]

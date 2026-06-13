@@ -10642,6 +10642,7 @@ dependencies = [
  "bindgen 0.71.1",
  "nix 0.30.1",
  "snafu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -19857,6 +19858,7 @@ name = "token_provider"
 version = "2.1.0-unstable"
 dependencies = [
  "secrecy",
+ "sha2 0.10.9",
  "snafu",
  "tokio",
  "tracing",
