@@ -241,308 +241,6 @@ fn merged_entry(current: Option<TombstoneEntry>, delete_seq: i64, insert_seq: i6
     }
 }
 
-// =============================================================================
-// Layered core
-// =============================================================================
-
-/// Shared layered-storage core for [`DeletionIndex`] (`K = i64`) and
-/// [`KeyDeletionIndex`] (`K = u128` hash identity). See the [module docs](self)
-/// for the tiering design. Key-specific concerns (how a key maps to its bloom
-/// hash) stay in the wrappers and are passed in as functions.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // superseded by LayeredRuns; removed with the test rewrite (Phase 3)
-struct LayeredTombstones<K, S>
-where
-    K: Copy + Eq + Hash,
-    S: BuildHasher + Default + Clone,
-{
-    /// Frozen flat tier: never mutated after construction, shared across
-    /// generations via `Arc`.
-    base: Arc<HashMap<K, TombstoneEntry, S>>,
-    /// Mutable tier holding writes since the last merge; `O(1)` to snapshot.
-    /// Values here are pre-merged with any base entry for the same key, so a
-    /// delta hit never needs a second base lookup.
-    delta: PersistentHashMap<K, TombstoneEntry, S>,
-    bloom: Arc<SplitBlockBloomFilter>,
-    /// Monotonic upper bound over the **delete** sequences in the current
-    /// immutable entries. Stays exact because indexes are build-once /
-    /// extend-only; any future removal API must recompute it instead of
-    /// carrying a stale high-water mark.
-    /// `CayenneTableProvider::apply_partial_deletion_filter` relies on this
-    /// exact value to decide whether a protected snapshot can skip deletion
-    /// filtering without letting deleted rows through.
-    max_sequence_number: Option<i64>,
-    /// Smallest / largest **deleted** key in the current immutable entries, in
-    /// the key's own ordering. `None` when no key has a recorded deletion.
-    /// Maintained monotonically (build-once / extend-only) exactly like
-    /// `max_sequence_number`; a future removal API must recompute these instead
-    /// of carrying a stale bound. Only the *delete* side populates these (a key
-    /// gaining its first deletion), mirroring the bloom population and
-    /// `delete_count` — insert-only entries are never folded in.
-    ///
-    /// For the Int64 index (`K = i64`) this is a true PK value range and the
-    /// query path (`branch_int64_pk_range` / per-batch gate) uses it to prove a
-    /// scan window is disjoint from every deletion and skip the row probe. For
-    /// the hash-keyed composite index (`K = u128`) the value is a min/max over
-    /// XXH3-128 *hashes* and is meaningless for PK-range pruning, so
-    /// `KeyDeletionIndex` deliberately exposes no `deleted_key_range()` accessor
-    /// (see its impl block).
-    min_deleted_key: Option<K>,
-    max_deleted_key: Option<K>,
-    /// Number of distinct keys across both tiers.
-    entry_count: usize,
-    /// Number of keys with a recorded deletion (= bloom population).
-    delete_count: usize,
-    /// Number of keys with a recorded insert (upsert re-insertion).
-    insert_count: usize,
-    /// Deletion-key count the current `bloom` was sized for
-    /// ([`bloom_capacity_for`]: 2x the deletion count at build time). When
-    /// `delete_count` exceeds it, the extend path rebuilds the bloom from
-    /// scratch into a fresh `Arc`; otherwise it inserts newly-deleted keys
-    /// into the shared filter in place.
-    bloom_capacity: usize,
-}
-
-#[allow(dead_code)]
-impl<K, S> LayeredTombstones<K, S>
-where
-    // `Ord` is required to maintain the `min_deleted_key`/`max_deleted_key`
-    // range. Both concrete key types (`i64`, `u128`) satisfy it, so no caller
-    // breaks; the range is only *exposed* for the ordered Int64 key.
-    K: Copy + Eq + Hash + Ord,
-    S: BuildHasher + Default + Clone,
-{
-    fn empty() -> Self {
-        Self {
-            base: Arc::new(HashMap::default()),
-            delta: PersistentHashMap::default(),
-            bloom: Arc::new(SplitBlockBloomFilter::new(MIN_BLOOM_CAPACITY)),
-            max_sequence_number: None,
-            min_deleted_key: None,
-            max_deleted_key: None,
-            entry_count: 0,
-            delete_count: 0,
-            insert_count: 0,
-            bloom_capacity: MIN_BLOOM_CAPACITY,
-        }
-    }
-
-    /// Bulk-build: deletions land directly in the frozen base (no delta, no
-    /// merges); insert records fold into the same entries.
-    fn from_iters(
-        deleted: impl ExactSizeIterator<Item = (K, i64)>,
-        insert_records: impl Iterator<Item = (K, i64)>,
-        bloom_hash_of: impl Fn(&K) -> u64,
-    ) -> Self {
-        let capacity = bloom_capacity_for(deleted.len());
-        let bloom = SplitBlockBloomFilter::new(capacity);
-        let delete_count = deleted.len();
-        let mut max_sequence_number = None;
-        let mut min_deleted_key: Option<K> = None;
-        let mut max_deleted_key: Option<K> = None;
-        let mut base: HashMap<K, TombstoneEntry, S> =
-            HashMap::with_capacity_and_hasher(delete_count, S::default());
-        for (key, delete_seq) in deleted {
-            bloom.insert(bloom_hash_of(&key));
-            if max_sequence_number.is_none_or(|max| delete_seq > max) {
-                max_sequence_number = Some(delete_seq);
-            }
-            // Fold the deleted key into the running [min,max]. Delete side only,
-            // matching the bloom population and `delete_count`.
-            if min_deleted_key.is_none_or(|min| key < min) {
-                min_deleted_key = Some(key);
-            }
-            if max_deleted_key.is_none_or(|max| key > max) {
-                max_deleted_key = Some(key);
-            }
-            base.insert(
-                key,
-                TombstoneEntry {
-                    delete_seq,
-                    insert_seq: SEQUENCE_ABSENT,
-                },
-            );
-        }
-        let mut insert_count = 0;
-        for (key, insert_seq) in insert_records {
-            insert_count += 1;
-            let outcome = merged_entry(base.get(&key).copied(), SEQUENCE_ABSENT, insert_seq);
-            base.insert(key, outcome.entry);
-        }
-
-        Self {
-            entry_count: base.len(),
-            base: Arc::new(base),
-            delta: PersistentHashMap::default(),
-            bloom: Arc::new(bloom),
-            max_sequence_number,
-            min_deleted_key,
-            max_deleted_key,
-            delete_count,
-            insert_count,
-            bloom_capacity: capacity,
-        }
-    }
-
-    /// Effective entry for `key`: delta overrides base (delta values are
-    /// pre-merged, so the first hit is authoritative).
-    #[inline]
-    fn entry(&self, key: &K) -> Option<&TombstoneEntry> {
-        self.delta.get(key).or_else(|| self.base.get(key))
-    }
-
-    /// Tombstone for `key`, bypassing the bloom filter. Callers must perform
-    /// the bloom check first (the wrappers keep it in their thin `get` bodies
-    /// so the bloom-reject fast path — the overwhelmingly common outcome on
-    /// append-mostly scans — inlines into the per-row probe loop without
-    /// dragging the tier-walk code with it).
-    #[inline]
-    fn tombstone_of(&self, key: &K) -> Option<Tombstone> {
-        self.entry(key).and_then(Tombstone::from_entry)
-    }
-
-    /// Iterate all effective entries (delta first, then base entries the delta
-    /// does not override). Each key yields exactly once with its newest value.
-    fn iter_entries(&self) -> impl Iterator<Item = (K, TombstoneEntry)> + '_ {
-        self.delta.iter().map(|(key, entry)| (*key, *entry)).chain(
-            self.base
-                .iter()
-                .filter(|(key, _)| !self.delta.contains_key(key))
-                .map(|(key, entry)| (*key, *entry)),
-        )
-    }
-
-    /// Core of the extend methods: apply `additions` to a delta snapshot, run
-    /// the bloom policy, then the merge policy. `insert_seq` uses
-    /// [`SEQUENCE_ABSENT`] for "leave this side unchanged".
-    fn extend(
-        &self,
-        additions: impl Iterator<Item = (K, i64, i64)>,
-        bloom_hash_of: impl Fn(&K) -> u64,
-    ) -> Self {
-        let mut delta = self.delta.clone();
-        let mut max_sequence_number = self.max_sequence_number;
-        let mut min_deleted_key = self.min_deleted_key;
-        let mut max_deleted_key = self.max_deleted_key;
-        let mut entry_count = self.entry_count;
-        let mut delete_count = self.delete_count;
-        let mut insert_count = self.insert_count;
-        // Track keys gaining their first deletion so the bloom can be updated
-        // incrementally without re-iterating the entire entry set. Pre-size
-        // from the iterator's hint to skip Vec growth reallocations.
-        let mut new_delete_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
-        for (key, delete_seq, insert_seq) in additions {
-            debug_assert_ne!(
-                delete_seq, SEQUENCE_ABSENT,
-                "real sequences are non-negative"
-            );
-            let current = self.entry_in(&delta, &key);
-            let outcome = merged_entry(current, delete_seq, insert_seq);
-            if outcome.new_key {
-                entry_count += 1;
-            }
-            if outcome.new_delete {
-                delete_count += 1;
-                new_delete_hashes.push(bloom_hash_of(&key));
-                // Fold the newly-deleted key into the running [min,max]. Mirrors
-                // the bloom population; only keys gaining their first deletion
-                // enter the range, never insert-only keys.
-                if min_deleted_key.is_none_or(|min| key < min) {
-                    min_deleted_key = Some(key);
-                }
-                if max_deleted_key.is_none_or(|max| key > max) {
-                    max_deleted_key = Some(key);
-                }
-            }
-            if outcome.new_insert {
-                insert_count += 1;
-            }
-            if max_sequence_number.is_none_or(|max| outcome.entry.delete_seq > max) {
-                max_sequence_number = Some(outcome.entry.delete_seq);
-            }
-            // Skip the delta write when the addition was a no-op (stale
-            // sequences for an existing key): keeps the delta minimal and the
-            // merge cadence honest.
-            if current != Some(outcome.entry) {
-                delta.insert(key, outcome.entry);
-            }
-        }
-
-        // `max_sequence_number` is maintained incrementally above; we do not
-        // re-scan entries here (a full scan would make extends O(N) in debug
-        // builds and noticeably slow the test suite as the index grows).
-        // `from_iters` is the single bulk-build path and recomputes the exact
-        // max from scratch.
-        //
-        // Bloom policy: rebuild from scratch when deletion growth has outpaced
-        // the sized capacity; the new filter takes 2x headroom so the rebuild
-        // cadence is geometric. Otherwise insert only the newly-deleted keys
-        // into the shared filter in place (O(K) relaxed atomic stores; older
-        // pinned generations observe a safe superset — see the module docs).
-        let (bloom, bloom_capacity) = if delete_count > self.bloom_capacity {
-            let new_capacity = bloom_capacity_for(delete_count);
-            let fresh = SplitBlockBloomFilter::new(new_capacity);
-            // A key present in both tiers is inserted twice; bloom inserts are
-            // idempotent, so that is harmless.
-            for (key, entry) in self.base.iter().chain(delta.iter()) {
-                if entry.delete_seq != SEQUENCE_ABSENT {
-                    fresh.insert(bloom_hash_of(key));
-                }
-            }
-            (Arc::new(fresh), new_capacity)
-        } else {
-            for hash in new_delete_hashes {
-                self.bloom.insert(hash);
-            }
-            (Arc::clone(&self.bloom), self.bloom_capacity)
-        };
-
-        // Merge policy: fold the delta into a fresh frozen base once it
-        // crosses the threshold. Old generations keep the previous base Arc,
-        // so the transient cost is one extra base — not one per generation.
-        let (base, delta) = if delta.len() >= delta_merge_threshold(self.base.len()) {
-            let mut merged = HashMap::clone(&self.base);
-            merged.reserve(delta.len());
-            for (key, entry) in &delta {
-                merged.insert(*key, *entry);
-            }
-            (Arc::new(merged), PersistentHashMap::default())
-        } else {
-            (Arc::clone(&self.base), delta)
-        };
-
-        Self {
-            base,
-            delta,
-            bloom,
-            max_sequence_number,
-            min_deleted_key,
-            max_deleted_key,
-            entry_count,
-            delete_count,
-            insert_count,
-            bloom_capacity,
-        }
-    }
-
-    /// Effective-entry lookup against an in-progress delta (plus the frozen
-    /// base), used while applying an additions batch.
-    #[inline]
-    fn entry_in(
-        &self,
-        delta: &PersistentHashMap<K, TombstoneEntry, S>,
-        key: &K,
-    ) -> Option<TombstoneEntry> {
-        delta.get(key).or_else(|| self.base.get(key)).copied()
-    }
-
-    fn approx_bytes(&self, base_entry_bytes: usize, delta_entry_bytes: usize) -> usize {
-        self.base
-            .len()
-            .saturating_mul(base_entry_bytes)
-            .saturating_add(self.delta.len().saturating_mul(delta_entry_bytes))
-    }
-}
 
 // =============================================================================
 // Seq-partitioned runs core (rank-1: probe cost independent of accumulated K)
@@ -572,7 +270,6 @@ const FREEZE_CAP: usize = 262_144;
 /// deletion (insert-only), which never satisfies `> S`, so it is always skipped
 /// under a threshold (correctly: it can't apply a deletion).
 #[derive(Debug)]
-#[allow(dead_code)] // wired into the wrappers in a later Phase-1 commit
 struct RunData<K, S>
 where
     K: Copy + Eq + Hash,
@@ -588,24 +285,22 @@ where
     bloom: Arc<SplitBlockBloomFilter>,
 }
 
-/// Seq-partitioned generalization of [`LayeredTombstones`]: the single frozen
-/// `base` becomes an ordered `runs` vec (oldest first), each tagged with its max
-/// delete sequence; `delta` becomes `active`. A probe fuses `active` with the
-/// runs that could carry a delete newer than the caller's threshold, per-side
-/// max. Unthresholded (main-scan) probes fuse ALL runs — exactly reproducing the
-/// old base+delta fused value; protected-snapshot probes (`Some(S)`) skip runs
-/// with `max_delete_seq <= S`. `active` is always fused (small; its values are
-/// bounded by the same `> S` comparison the caller applies in `tombstone_visible`).
+/// Seq-partitioned deletion-index core: an ordered set of frozen `runs` (oldest
+/// first, each tagged with its max delete sequence) plus a mutable `active` tier.
+/// A probe fuses `active` with the runs that could carry a delete newer than the
+/// caller's threshold, per-side max. Unthresholded (main-scan) probes fuse ALL
+/// runs (the full fused value over every write); protected-snapshot probes
+/// (`Some(S)`) skip runs with `max_delete_seq <= S`. `active` is always fused
+/// (small; its values are bounded by the same `> S` comparison the caller applies
+/// in `tombstone_visible`).
 ///
-/// EQUIVALENCE (vs the old single-fused entry): for `S=None`, fuse-over-all =
-/// per-side max over every write = the old value. For `S=Some`, `(max-over-
-/// applicable > S) <=> (true-max > S)`: a skipped run has `max_delete_seq <= S`
-/// so this key's delete there is `<= S` (can't be the witness for `> S`); an
-/// included run with the true max gives it. Only `Ignore`-mode branches carry
-/// `Some(S)` (no `(Apply,Some)` ctor), so insert-side values in skipped runs are
-/// irrelevant.
+/// EQUIVALENCE of the threshold skip: for `S=None`, fuse-over-all = per-side max
+/// over every write. For `S=Some`, `(max-over-applicable > S) <=> (true-max > S)`:
+/// a skipped run has `max_delete_seq <= S` so this key's delete there is `<= S`
+/// (can't be the witness for `> S`); an included run with the true max gives it.
+/// Only `Ignore`-mode branches carry `Some(S)` (no `(Apply,Some)` ctor), so
+/// insert-side values in skipped runs are irrelevant.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired into the wrappers in a later Phase-1 commit
 struct LayeredRuns<K, S>
 where
     K: Copy + Eq + Hash,
@@ -631,7 +326,6 @@ where
     bloom_capacity: usize,
 }
 
-#[allow(dead_code)] // wired into the wrappers in a later Phase-1 commit
 impl<K, S> LayeredRuns<K, S>
 where
     K: Copy + Eq + Hash + Ord,
@@ -754,28 +448,18 @@ where
     /// GETs that would miss.
     #[inline]
     fn tombstone_of(&self, key: &K, hash: u64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
-        let mut acc = self.active.get(key).copied();
-        for run in &self.runs {
-            match min_delete_seq {
-                // Main scan: the global bloom (applied by the wrapper) already
-                // gated this probe; fuse every run without re-checking per-run
-                // blooms. The base run's bloom IS the global one, so re-checking
-                // it is pure overhead that regresses the hot None path (~+30%).
-                None => {}
-                // Protected: skip runs that can't carry an applicable delete, then
-                // gate the rest by their own (small, recent) blooms — never
-                // touching the large global bloom (the high-K win).
-                Some(s) => {
-                    if run.max_delete_seq <= s || !run.bloom.might_contain(hash) {
-                        continue;
-                    }
-                }
-            }
-            if let Some(e) = run.map.get(key) {
-                acc = Some(merged_entry(acc, e.delete_seq, e.insert_seq).entry);
-            }
-        }
-        acc.as_ref().and_then(Tombstone::from_entry)
+        // Reuse the per-side-max fold (`fuse`) with the run-skip gate:
+        // - None (main scan): the wrapper already applied the global bloom, so
+        //   every run is included (re-checking per-run blooms here — the base
+        //   run's bloom IS the global one — would regress the hot path ~+30%).
+        // - Some(S) (protected): skip runs that can't carry an applicable delete
+        //   or whose per-run bloom misses, never touching the large global bloom.
+        Self::fuse(&self.active, &self.runs, key, |run| match min_delete_seq {
+            None => true,
+            Some(s) => run.max_delete_seq > s && run.bloom.might_contain(hash),
+        })
+        .as_ref()
+        .and_then(Tombstone::from_entry)
     }
 
     /// All effective entries, each key once with its fully-fused (all-runs +
@@ -815,7 +499,10 @@ where
         let mut insert_count = self.insert_count;
         let mut new_delete_hashes: Vec<u64> = Vec::with_capacity(additions.size_hint().0);
         for (key, delete_seq, insert_seq) in additions {
-            debug_assert_ne!(delete_seq, SEQUENCE_ABSENT, "real sequences are non-negative");
+            debug_assert_ne!(
+                delete_seq, SEQUENCE_ABSENT,
+                "real sequences are non-negative"
+            );
             // Counter/bloom/range flags vs the FUSED pre-state (active + all runs).
             let fused = Self::fuse(&active, &runs, &key, |_| true);
             let outcome = merged_entry(fused, delete_seq, insert_seq);
@@ -917,20 +604,26 @@ where
                 older.map.len().saturating_add(newer.map.len()),
                 S::default(),
             );
+            // Build the merged run's bloom in the same passes that build the map:
+            // the merged key carries a delete iff either side did, so inserting
+            // each side's delete keys yields the union (no extra pass over the map).
+            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(
+                older.map.len().saturating_add(newer.map.len()),
+            ));
             for (key, entry) in older.map.iter() {
                 map.insert(*key, *entry);
-            }
-            for (key, entry) in newer.map.iter() {
-                let m = merged_entry(map.get(key).copied(), entry.delete_seq, entry.insert_seq);
-                map.insert(*key, m.entry);
-            }
-            let max_delete_seq = older.max_delete_seq.max(newer.max_delete_seq);
-            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(map.len()));
-            for (key, entry) in map.iter() {
                 if entry.delete_seq != SEQUENCE_ABSENT {
                     bloom.insert(bloom_hash_of(key));
                 }
             }
+            for (key, entry) in newer.map.iter() {
+                let m = merged_entry(map.get(key).copied(), entry.delete_seq, entry.insert_seq);
+                map.insert(*key, m.entry);
+                if entry.delete_seq != SEQUENCE_ABSENT {
+                    bloom.insert(bloom_hash_of(key));
+                }
+            }
+            let max_delete_seq = older.max_delete_seq.max(newer.max_delete_seq);
             runs.insert(
                 at,
                 Arc::new(RunData {
@@ -962,53 +655,6 @@ where
             .map(|r| r.map.len().saturating_mul(base_entry_bytes))
             .sum();
         run_bytes.saturating_add(self.active.len().saturating_mul(delta_entry_bytes))
-    }
-}
-
-/// Bench-only handles for the rank-1 write-side A/B: old [`LayeredTombstones`]
-/// vs new [`LayeredRuns`] `extend` (the CDC-apply path). The new core fuses over
-/// runs for the distinct-key counters and does inline fold; the old core appends
-/// to delta and rebuilds delta→base at the threshold. Doc-hidden; removed
-/// together with `LayeredTombstones`.
-#[doc(hidden)]
-pub mod bench_support {
-    use super::{DeletionIndexHasher, LayeredRuns, LayeredTombstones, hash_key_i64};
-
-    /// Old delta+base core, wrapped so the private type is never exposed.
-    #[derive(Clone)]
-    pub struct OldHandle(LayeredTombstones<i64, DeletionIndexHasher>);
-    /// New seq-partitioned runs core, wrapped the same way.
-    #[derive(Clone)]
-    pub struct NewHandle(LayeredRuns<i64, DeletionIndexHasher>);
-
-    impl OldHandle {
-        #[must_use]
-        pub fn build(deletes: &[(i64, i64)]) -> Self {
-            Self(LayeredTombstones::from_iters(
-                deletes.iter().copied(),
-                std::iter::empty::<(i64, i64)>(),
-                |k| hash_key_i64(*k),
-            ))
-        }
-        #[must_use]
-        pub fn extend(&self, adds: &[(i64, i64, i64)]) -> Self {
-            Self(self.0.extend(adds.iter().copied(), |k| hash_key_i64(*k)))
-        }
-    }
-
-    impl NewHandle {
-        #[must_use]
-        pub fn build(deletes: &[(i64, i64)]) -> Self {
-            Self(LayeredRuns::from_iters(
-                deletes.iter().copied(),
-                std::iter::empty::<(i64, i64)>(),
-                |k| hash_key_i64(*k),
-            ))
-        }
-        #[must_use]
-        pub fn extend(&self, adds: &[(i64, i64, i64)]) -> Self {
-            Self(self.0.extend(adds.iter().copied(), |k| hash_key_i64(*k)))
-        }
     }
 }
 
@@ -1071,11 +717,9 @@ impl DeletionIndex {
     #[must_use]
     pub fn from_maps(deleted: HashMap<i64, i64>, insert_records: HashMap<i64, i64>) -> Self {
         Self {
-            core: LayeredRuns::from_iters(
-                deleted.into_iter(),
-                insert_records.into_iter(),
-                |pk| hash_key_i64(*pk),
-            ),
+            core: LayeredRuns::from_iters(deleted.into_iter(), insert_records.into_iter(), |pk| {
+                hash_key_i64(*pk)
+            }),
         }
     }
 
@@ -1251,10 +895,11 @@ impl DeletionIndex {
             }
             // Pass 2: tier walk for the bloom survivors only.
             for &i in &candidates {
-                if let Some(tombstone) =
-                    self.core
-                        .tombstone_of(&chunk[i as usize], hash_key_i64(chunk[i as usize]), None)
-                {
+                if let Some(tombstone) = self.core.tombstone_of(
+                    &chunk[i as usize],
+                    hash_key_i64(chunk[i as usize]),
+                    None,
+                ) {
                     on_hit(chunk_base + i as usize, tombstone);
                 }
             }
@@ -1524,7 +1169,8 @@ impl KeyDeletionIndex {
         if min_delete_seq.is_none() && !self.core.bloom.might_contain(bloom_hash) {
             return None;
         }
-        self.core.tombstone_of(&key_hash, bloom_hash, min_delete_seq)
+        self.core
+            .tombstone_of(&key_hash, bloom_hash, min_delete_seq)
     }
 
     /// Batched bloom-prefiltered lookup over row-encoded keys: invokes
@@ -1648,8 +1294,15 @@ mod tests {
     // ---- Differential oracle for the seq-partitioned runs core (rank-1) ----
 
     /// Per-side max into the naive reference (`SEQUENCE_ABSENT` = unset side).
-    fn naive_merge(naive: &mut std::collections::BTreeMap<i64, (i64, i64)>, key: i64, d: i64, i: i64) {
-        let e = naive.entry(key).or_insert((SEQUENCE_ABSENT, SEQUENCE_ABSENT));
+    fn naive_merge(
+        naive: &mut std::collections::BTreeMap<i64, (i64, i64)>,
+        key: i64,
+        d: i64,
+        i: i64,
+    ) {
+        let e = naive
+            .entry(key)
+            .or_insert((SEQUENCE_ABSENT, SEQUENCE_ABSENT));
         if d != SEQUENCE_ABSENT && (e.0 == SEQUENCE_ABSENT || d > e.0) {
             e.0 = d;
         }
@@ -1715,10 +1368,14 @@ mod tests {
                         for _ in 0..n {
                             let key = (rng() as i64).rem_euclid(key_space);
                             seq += 1;
-                            dmap.entry(key).and_modify(|e| *e = (*e).max(seq)).or_insert(seq);
+                            dmap.entry(key)
+                                .and_modify(|e| *e = (*e).max(seq))
+                                .or_insert(seq);
                             if rng() % 3 == 0 {
                                 seq += 1;
-                                imap.entry(key).and_modify(|e| *e = (*e).max(seq)).or_insert(seq);
+                                imap.entry(key)
+                                    .and_modify(|e| *e = (*e).max(seq))
+                                    .or_insert(seq);
                             }
                         }
                         naive.clear();
@@ -1775,15 +1432,25 @@ mod tests {
                     .filter(|(_, (d, i))| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT)
                     .map(|(k, v)| (*k, *v))
                     .collect();
-                assert_eq!(idx.entry_count, nonempty.len(), "trial {trial}: entry_count");
+                assert_eq!(
+                    idx.entry_count,
+                    nonempty.len(),
+                    "trial {trial}: entry_count"
+                );
                 assert_eq!(
                     idx.delete_count,
-                    nonempty.values().filter(|(d, _)| *d != SEQUENCE_ABSENT).count(),
+                    nonempty
+                        .values()
+                        .filter(|(d, _)| *d != SEQUENCE_ABSENT)
+                        .count(),
                     "trial {trial}: delete_count"
                 );
                 assert_eq!(
                     idx.insert_count,
-                    nonempty.values().filter(|(_, i)| *i != SEQUENCE_ABSENT).count(),
+                    nonempty
+                        .values()
+                        .filter(|(_, i)| *i != SEQUENCE_ABSENT)
+                        .count(),
                     "trial {trial}: insert_count"
                 );
                 assert_eq!(
@@ -1798,9 +1465,13 @@ mod tests {
                     .iter()
                     .filter_map(|(k, (d, _))| (*d != SEQUENCE_ABSENT).then_some(*k))
                     .collect();
-                let naive_range =
-                    del_keys.iter().min().map(|mn| (*mn, *del_keys.iter().max().unwrap()));
-                let idx_range = idx.min_deleted_key.map(|mn| (mn, idx.max_deleted_key.unwrap()));
+                let naive_range = del_keys
+                    .iter()
+                    .min()
+                    .map(|mn| (*mn, *del_keys.iter().max().unwrap()));
+                let idx_range = idx
+                    .min_deleted_key
+                    .map(|mn| (mn, idx.max_deleted_key.unwrap()));
                 assert_eq!(idx_range, naive_range, "trial {trial}: deleted_key_range");
 
                 // iter_entries: each key exactly once, fully fused.
@@ -1818,7 +1489,14 @@ mod tests {
                 // for present and absent keys. (Apply,Some) is skipped — it never
                 // occurs (no such ctor) and insert-side fusion isn't promised
                 // under a cutoff.
-                let cutoffs = [None, Some(-1), Some(0), Some(seq / 2), Some(seq), Some(i64::MAX)];
+                let cutoffs = [
+                    None,
+                    Some(-1),
+                    Some(0),
+                    Some(seq / 2),
+                    Some(seq),
+                    Some(i64::MAX),
+                ];
                 for probe in -2..=key_space + 2 {
                     let naive_t = naive_tombstone(naive.get(&probe));
                     for s_cut in cutoffs {
@@ -2564,7 +2242,11 @@ mod tests {
 
         // A stale update is a no-op and must not grow active.
         let stale = updated.extend_max_deletes([(5, 15)]);
-        assert_eq!(stale.core.active.len(), 1, "no-op update must not re-insert");
+        assert_eq!(
+            stale.core.active.len(),
+            1,
+            "no-op update must not re-insert"
+        );
         assert_eq!(stale.get(5).expect("tombstone").delete_sequence, 20);
     }
 
@@ -2650,7 +2332,10 @@ mod tests {
         // newest value.
         let idx = DeletionIndex::from_map((0..100).map(|pk| (pk, 1_i64)).collect());
         let idx = idx.extend_max_deletes([(5, 50), (200, 60)]);
-        assert!(idx.core.active.len() >= 2, "updates must be active-resident");
+        assert!(
+            idx.core.active.len() >= 2,
+            "updates must be active-resident"
+        );
 
         let collected: HashMap<i64, TombstoneEntry> = idx.iter_entries().collect();
         assert_eq!(collected.len(), 101);
