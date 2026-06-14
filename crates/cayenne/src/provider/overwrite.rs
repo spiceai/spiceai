@@ -197,6 +197,26 @@ impl PreparedOverwrite {
             .update_listing_table_for_snapshot(&self.new_snapshot_id)
             .await?;
 
+        // Manifest snapshot model: the catalog flip is committed, so the OLD
+        // snapshot's manifest rows are now dead — prune everything but the new
+        // snapshot's rows (authored in `begin_overwrite` with `[S, S]`). Deferred
+        // to here (post-commit), matching the full-rewrite path: a crash between
+        // the flip and this prune leaves only stale rows for a non-live snapshot,
+        // which the GC live-set filter already excludes and a scan never reads.
+        // Best-effort — a failure cannot resurrect rows or lose the overwrite.
+        if let Err(error) = self
+            .table
+            .prune_snapshot_manifest_to(&self.new_snapshot_id)
+            .await
+        {
+            tracing::warn!(
+                table = self.table.table_name(),
+                %error,
+                new_snapshot_id = self.new_snapshot_id.as_str(),
+                "Failed to prune stale snapshot manifest rows after overwrite commit"
+            );
+        }
+
         self.table
             .trigger_old_snapshot_cleanup(&self.new_snapshot_id)
             .await;
@@ -306,6 +326,32 @@ impl CayenneTableProvider {
         if !is_s3 {
             let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
             Self::sync_snapshot_dir(&snapshot_dir).await?;
+        }
+
+        // Manifest snapshot model: reserve ONE sequence `S` for this overwrite
+        // and AUTHOR the new snapshot's manifest with `[S, S]` — every file was
+        // written by this single commit, so that range is exact. Reserving `S`
+        // also advances the monotonic counter past it, so no later write reuses
+        // it. The old snapshot's now-dead manifest rows are pruned in
+        // `PreparedOverwrite::finish` (after the catalog flip commits), mirroring
+        // the full-rewrite path's publish-before-clear ordering. Best-effort: a
+        // failure leaves the scan on directory listing and never loses rows.
+        let overwrite_sequence = self.reserve_sequences_local(1).await.unwrap_or(0);
+        if let Err(error) = self
+            .author_uniform_snapshot_manifest(
+                &new_snapshot_id,
+                overwrite_sequence,
+                overwrite_sequence,
+            )
+            .await
+        {
+            tracing::warn!(
+                table = self.table_name(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author overwrite snapshot manifest before commit; \
+                 scan falls back to directory listing"
+            );
         }
 
         Ok(PreparedOverwrite {

@@ -1484,21 +1484,65 @@ struct SnapshotFilesForScan {
 /// Partition of a snapshot's manifest by a seq-prefix cutoff `T`, the planning
 /// core of an incremental seq-prefix compaction.
 ///
-/// A file is **bake-eligible** when `max_sequence <= T`: every row it holds was
-/// committed at or before `T`, so it may carry a deletion with `delete_seq <= T`
-/// that the rewrite physically applies — these files are consolidated into one
-/// new file. A file is **reference-in-place** when `max_sequence > T`: it holds
-/// only rows newer than every applicable deletion (a `<= T` tombstone deletes a
-/// row that existed at seq `<= T`; a `> T` row was written after, so under
-/// upsert semantics the newer row wins), so it can be referenced unchanged in
-/// the new snapshot without rewriting its bytes — the shrink the manifest model
-/// exists to enable.
+/// A file is **bake-eligible** when `min_sequence <= T`: it holds at least one
+/// row committed at or before `T`, so it may carry a deletion with
+/// `delete_seq <= T` that the rewrite physically applies — these files are
+/// consolidated into one new file with their dead rows removed. A file is
+/// **reference-in-place** when `min_sequence > T`: EVERY row it holds was
+/// committed strictly after `T`, hence after every applicable `<= T` tombstone
+/// (which deletes a row that existed at seq `<= T`; a `> T` row was written
+/// after, so under upsert semantics the newer row wins). Such a file can be
+/// referenced unchanged in the new snapshot without rewriting its bytes — the
+/// shrink the manifest model exists to enable.
+///
+/// The predicate is `min_sequence`, NOT `max_sequence`: a merged file that
+/// STRADDLES the cutoff (`min_sequence <= T < max_sequence`) holds rows at or
+/// below `T`, so it MUST be baked. Splitting on `max_sequence` would put a
+/// straddling file in `reference`, and the subsequent
+/// [`CayenneTableProvider::prune_deletion_index_at_or_below`] would then drop a
+/// `<= T` tombstone that still applied to that file's `<= T` rows — resurrecting
+/// the deleted rows. For single-commit files `min == max`, so this is a no-op;
+/// it only matters for merged/straddling files, which is exactly where the bug
+/// would bite.
 #[derive(Debug, Default)]
 struct SeqPrefixPlan {
-    /// Manifest rows whose `max_sequence <= T` — rewritten into one new file.
+    /// Manifest rows whose `min_sequence <= T` — rewritten into one new file.
     bake: Vec<SnapshotFile>,
-    /// Manifest rows whose `max_sequence > T` — referenced in place unchanged.
+    /// Manifest rows whose `min_sequence > T` — referenced in place unchanged.
     reference: Vec<SnapshotFile>,
+}
+
+/// How `upsert_snapshot_manifest_from_listing` tags each listed file's
+/// `[min_sequence, max_sequence]` — the TRUE per-file commit-seq range the
+/// seq-prefix bake needs, in place of the prior single per-snapshot watermark
+/// (which degenerated `partition_manifest_by_sequence` to all-bake/all-reference
+/// and delivered zero shrink).
+///
+/// The variant is chosen per snapshot kind by the write path, which knows how
+/// the snapshot's files were produced:
+/// - [`Self::Uniform`] — every file shares one `[min, max]`, overwriting any
+///   prior row. Used by a compaction write-site that AUTHORS the snapshot's
+///   manifest with its merged `[min, max]` over the inputs (full-rewrite,
+///   subset merge).
+/// - [`Self::PreserveOrUniform`] — keep any range already recorded for a file
+///   (so a re-list never clobbers a compaction-authored merged range — the
+///   catalog upsert is `INSERT OR REPLACE`), and tag a brand-new (untagged)
+///   file `[min, max]`. Used by `rebuild_live_snapshot_manifests`:
+///   - the CURRENT snapshot uses `[0, current_seq]` — a brand-new file there
+///     has an unknown true min, so `0` keeps it always bake-eligible (never
+///     wrongly referenced-in-place, never resurrecting a row);
+///   - a PROTECTED snapshot uses `[S, S]` where `S` is its single reserved
+///     sequence (the protected-set value) — every row in a fresh
+///     CDC-staged-append / checkpoint snapshot was committed at `S`, so `[S, S]`
+///     is exact and lets the newest, highest-sequence files be referenced in
+///     place (the shrink the lever exists for). A merged subset-compaction
+///     output is a protected snapshot too, but it AUTHORED its merged range at
+///     commit time, so the preserve arm keeps that range rather than the
+///     (delete-seq) protected-set value.
+#[derive(Debug, Clone, Copy)]
+enum ManifestSequenceTag {
+    Uniform { min: i64, max: i64 },
+    PreserveOrUniform { min: i64, max: i64 },
 }
 
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
@@ -4555,8 +4599,10 @@ impl CayenneTableProvider {
                     .next_back()
                     .map(|p| p.as_ref().to_string());
                 let referenced = file_name.as_ref().is_some_and(|name| {
-                    live_referenced
-                        .contains(&Self::manifest_file_relative_path(retiring_snapshot_id, name))
+                    live_referenced.contains(&Self::manifest_file_relative_path(
+                        retiring_snapshot_id,
+                        name,
+                    ))
                 });
                 async move {
                     if referenced {
@@ -10934,13 +10980,19 @@ impl CayenneTableProvider {
     /// equal to the directory listing *by construction* — exactly the invariant
     /// [`Self::debug_assert_manifest_matches_listing`] checks.
     ///
-    /// `sequence` is recorded as BOTH `min_sequence` and `max_sequence` for every
-    /// file: the snapshot's commit-sequence watermark bounds every row it
-    /// contains, so a future seq-prefix bake (`max_sequence <= T`) is sound. Per-
-    /// file `row_count` is sourced best-effort from the persisted per-file stats
-    /// cache (`cayenne_snapshot_file_statistics`) and left `0` when absent — the
-    /// authoritative live count lives in `cayenne_table_statistics`; reading every
-    /// Vortex footer here would be an unbounded write-path I/O regression.
+    /// Each file's `[min_sequence, max_sequence]` is resolved per-file from `tag`
+    /// (a [`ManifestSequenceTag`]) — the TRUE commit-seq range the seq-prefix
+    /// bake needs, in place of the prior single per-snapshot watermark (which
+    /// degenerated `partition_manifest_by_sequence` to all-bake/all-reference and
+    /// delivered zero shrink). For a protected snapshot the tag is the single
+    /// reserved sequence (`[S, S]`); for the current snapshot it preserves the
+    /// merged range a compaction/overwrite already recorded (never clobbers it)
+    /// and tags any brand-new file conservatively (`[0, current_seq]`, always
+    /// bake-eligible). Per-file `row_count` is sourced best-effort from the
+    /// persisted per-file stats cache (`cayenne_snapshot_file_statistics`) and
+    /// left `0` when absent — the authoritative live count lives in
+    /// `cayenne_table_statistics`; reading every Vortex footer here would be an
+    /// unbounded write-path I/O regression.
     ///
     /// Returns the file listing it wrote (so a caller can feed it straight to the
     /// debug-assert). Errors propagate to the caller, which decides whether to
@@ -10950,7 +11002,7 @@ impl CayenneTableProvider {
     async fn upsert_snapshot_manifest_from_listing(
         &self,
         snapshot_id: &str,
-        sequence: i64,
+        tag: ManifestSequenceTag,
     ) -> CatalogResult<Vec<(String, u64)>> {
         let files = self
             .list_snapshot_files_with_sizes(snapshot_id)
@@ -10963,6 +11015,23 @@ impl CayenneTableProvider {
             })?;
 
         let table_id = self.table_metadata.table_id.clone();
+
+        // For the preserve mode, read the snapshot's existing manifest ONCE so a
+        // re-list cannot clobber a merged `[min, max]` the compaction that minted
+        // this snapshot already authored (the catalog upsert is `INSERT OR
+        // REPLACE`). Empty for `Uniform`, where every range is fixed.
+        let existing: std::collections::HashMap<String, (i64, i64)> = match tag {
+            ManifestSequenceTag::PreserveOrUniform { .. } => self
+                .catalog
+                .get_snapshot_files(&table_id, snapshot_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| (f.file_path, (f.min_sequence, f.max_sequence)))
+                .collect(),
+            ManifestSequenceTag::Uniform { .. } => std::collections::HashMap::new(),
+        };
+
         for (file_name, size) in &files {
             // Reuse the per-file footer row count when the scan path already
             // persisted it for this exact (snapshot, file); the manifest entry is
@@ -10976,6 +11045,19 @@ impl CayenneTableProvider {
                 .flatten()
                 .map_or(0, |stats| stats.num_rows);
 
+            let (min_sequence, max_sequence) = match tag {
+                ManifestSequenceTag::Uniform { min, max } => (min, max),
+                // Preserve a compaction-authored merged range; for a brand-new
+                // (untagged) file fall back to `[min, max]` — `[S, S]` for a
+                // protected snapshot (exact), `[0, current_seq]` for the current
+                // snapshot (conservative: `min = 0` keeps it always
+                // bake-eligible, never wrongly referenced, never resurrecting a
+                // deleted row).
+                ManifestSequenceTag::PreserveOrUniform { min, max } => {
+                    existing.get(file_name).copied().unwrap_or((min, max))
+                }
+            };
+
             self.catalog
                 .upsert_snapshot_file(&SnapshotFile {
                     table_id: table_id.clone(),
@@ -10983,8 +11065,8 @@ impl CayenneTableProvider {
                     file_path: file_name.clone(),
                     row_count,
                     file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
-                    min_sequence: sequence,
-                    max_sequence: sequence,
+                    min_sequence,
+                    max_sequence,
                 })
                 .await?;
         }
@@ -11000,14 +11082,78 @@ impl CayenneTableProvider {
     /// it runs AFTER the commit that makes `keep_snapshot_id` current — a commit
     /// that fails then leaves the previously-current snapshot's rows intact
     /// (publish-before-clear).
-    async fn prune_snapshot_manifest_to(&self, keep_snapshot_id: &str) -> CatalogResult<()> {
+    pub(crate) async fn prune_snapshot_manifest_to(
+        &self,
+        keep_snapshot_id: &str,
+    ) -> CatalogResult<()> {
         self.catalog
             .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
             .await
     }
 
-    /// Partition `snapshot_id`'s manifest into bake-eligible (`max_sequence <= T`)
-    /// and reference-in-place (`max_sequence > T`) file sets — the planning step
+    /// Author one snapshot's manifest with a single uniform commit-seq range
+    /// (`[min, max]` on every file). The `pub(crate)` entry the overwrite path
+    /// uses to record its `[S, S]` range without depending on the private
+    /// [`ManifestSequenceTag`]. Returns the listing on success (discarded by
+    /// callers that only need the side effect).
+    pub(crate) async fn author_uniform_snapshot_manifest(
+        &self,
+        snapshot_id: &str,
+        min_sequence: i64,
+        max_sequence: i64,
+    ) -> CatalogResult<Vec<(String, u64)>> {
+        self.upsert_snapshot_manifest_from_listing(
+            snapshot_id,
+            ManifestSequenceTag::Uniform {
+                min: min_sequence,
+                max: max_sequence,
+            },
+        )
+        .await
+    }
+
+    /// Fold the manifest of every snapshot in `snapshot_ids` into one
+    /// `[min over all min_sequence, max over all max_sequence]` — the true
+    /// commit-seq range of a consolidating rewrite that merges those snapshots
+    /// (the full-rewrite folds the whole live set; the subset merge folds its
+    /// selected inputs).
+    ///
+    /// Returns `None` when none of the snapshots has any manifest row (nothing to
+    /// fold — the caller falls back to a conservative range). A snapshot whose
+    /// manifest read fails is skipped (best-effort), so a partial outage shrinks
+    /// the folded set rather than poisoning it.
+    async fn merged_sequence_range_over_snapshots(
+        &self,
+        snapshot_ids: &[String],
+    ) -> Option<(i64, i64)> {
+        let mut range: Option<(i64, i64)> = None;
+        for id in snapshot_ids {
+            let files = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+                .unwrap_or_default();
+            for file in files {
+                range = Some(match range {
+                    None => (file.min_sequence, file.max_sequence),
+                    Some((min, max)) => (min.min(file.min_sequence), max.max(file.max_sequence)),
+                });
+            }
+        }
+        range
+    }
+
+    /// The merged commit-seq range over every LIVE snapshot (current +
+    /// protected) — the true range of a full-rewrite, which materializes the
+    /// whole visible stream. See [`Self::merged_sequence_range_over_snapshots`].
+    async fn merged_sequence_range_over_live_snapshots(&self) -> Option<(i64, i64)> {
+        let mut ids: Vec<String> = vec![self.get_current_snapshot_id()];
+        ids.extend(self.protected_snapshots.load().keys().cloned());
+        self.merged_sequence_range_over_snapshots(&ids).await
+    }
+
+    /// Partition `snapshot_id`'s manifest into bake-eligible (`min_sequence <= T`)
+    /// and reference-in-place (`min_sequence > T`) file sets — the planning step
     /// of an incremental seq-prefix compaction. See [`SeqPrefixPlan`] for the
     /// soundness argument.
     ///
@@ -11017,10 +11163,14 @@ impl CayenneTableProvider {
     ///
     /// The split is purely metadata; it reads no data files. `cutoff` is the
     /// highest delete sequence currently in the deletion index (`T`): every
-    /// applicable tombstone has `delete_seq <= T`, so every file that could be
-    /// affected by one has `min_sequence <= T` and is captured by the
-    /// `max_sequence <= T` bake predicate (a file's `max_sequence >= its
-    /// min_sequence`).
+    /// applicable tombstone has `delete_seq <= T`. A file holding ANY row at
+    /// `write_seq <= T` has `min_sequence <= T` and so is baked (its dead rows
+    /// physically removed); a referenced file has `min_sequence > T`, so all its
+    /// rows were written after every `<= T` tombstone and none of those
+    /// tombstones apply to it. Pruning the index of `<= T` tombstones after the
+    /// commit therefore cannot resurrect a row in a referenced file. The
+    /// `min_sequence` predicate is load-bearing for merged files that straddle
+    /// the cutoff — see [`SeqPrefixPlan`].
     async fn partition_manifest_by_sequence(
         &self,
         snapshot_id: &str,
@@ -11036,7 +11186,7 @@ impl CayenneTableProvider {
 
         let mut plan = SeqPrefixPlan::default();
         for file in manifest {
-            if file.max_sequence <= cutoff {
+            if file.min_sequence <= cutoff {
                 plan.bake.push(file);
             } else {
                 plan.reference.push(file);
@@ -11049,12 +11199,25 @@ impl CayenneTableProvider {
     /// each protected snapshot) from fresh directory listings. Used by the
     /// append path's coalesced post-write maintenance lane.
     ///
-    /// Each snapshot is tagged with its OWN commit sequence: the current
-    /// snapshot's from `cayenne_snapshot_sequence`, and each protected
-    /// snapshot's from the in-memory protected-set value (which IS its
-    /// reservation/threshold sequence). Upsert-only — GC of stale rows is the
-    /// compaction/overwrite/drop paths' job (see the call-site comment). Caller
-    /// MUST hold `compaction_lock` so the live set cannot shift mid-rebuild.
+    /// Per-file sequence ranges are TRUE (no longer a single per-snapshot
+    /// watermark), resolved by snapshot kind:
+    /// - **Protected snapshots** (CDC-staged-append publishes, sync upserts,
+    ///   mem-tier checkpoints) are written by ONE reserved sequence — the
+    ///   in-memory protected-set value, which IS that reservation/threshold
+    ///   sequence. Every file therefore gets `[S, S]` ([`ManifestSequenceTag::Uniform`]),
+    ///   which is exactly correct: by the seq-ordering invariant every row in
+    ///   the snapshot was committed at `S`.
+    /// - **The current snapshot** is the consolidated output of the compaction /
+    ///   overwrite (or genesis) that minted it, so its files carry a MERGED
+    ///   `[min, max]` recorded at that write. This re-list MUST NOT clobber that
+    ///   range, so it runs in [`ManifestSequenceTag::PreserveOrConservative`]
+    ///   mode (keep the recorded range; tag any brand-new file `[0, current_seq]`,
+    ///   always bake-eligible). `current_seq` comes from `cayenne_snapshot_sequence`
+    ///   (0 if absent, e.g. just after an overwrite clears the sequence rows).
+    ///
+    /// Upsert-only — GC of stale rows is the compaction/overwrite/drop paths' job
+    /// (see the call-site comment). Caller MUST hold `compaction_lock` so the
+    /// live set cannot shift mid-rebuild.
     ///
     /// Best-effort: a per-snapshot failure is logged and the rest still run; the
     /// manifest is not yet the scan's file source, so an incomplete manifest
@@ -11071,14 +11234,31 @@ impl CayenneTableProvider {
             .flatten()
             .unwrap_or(0);
 
-        let mut live: Vec<(String, i64)> = vec![(current_snapshot, current_sequence)];
+        // (snapshot_id, how-to-tag-its-files). Both kinds PRESERVE any
+        // compaction-authored merged range; the per-kind default only applies to
+        // a brand-new (untagged) file. Current: `[0, current_seq]` (conservative,
+        // bake-eligible). Protected: `[S, S]` where `S` is the reservation that
+        // wrote every row in a fresh CDC-staged-append / checkpoint snapshot.
+        let mut live: Vec<(String, ManifestSequenceTag)> = vec![(
+            current_snapshot,
+            ManifestSequenceTag::PreserveOrUniform {
+                min: 0,
+                max: current_sequence,
+            },
+        )];
         for (snapshot_id, sequence) in self.protected_snapshots.load().iter() {
-            live.push((snapshot_id.clone(), *sequence));
+            live.push((
+                snapshot_id.clone(),
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: *sequence,
+                    max: *sequence,
+                },
+            ));
         }
 
-        for (snapshot_id, sequence) in &live {
+        for (snapshot_id, tag) in &live {
             match self
-                .upsert_snapshot_manifest_from_listing(snapshot_id, *sequence)
+                .upsert_snapshot_manifest_from_listing(snapshot_id, *tag)
                 .await
             {
                 Ok(files) => {
@@ -11355,18 +11535,29 @@ impl CayenneTableProvider {
         // file / insert record / snapshot-sequence row in one transaction, so
         // the manifest must be durable first to honour the publish-before-clear
         // invariant (a new file set is published before the old deletions are
-        // cleared). Watermark: compaction mints no new sequence and the commit
-        // clears all sequence rows, so tag every consolidated file with the
-        // CURRENT snapshot's recorded sequence (read while its row still exists)
-        // — every live row materialized into the rewrite was committed at or
-        // before it, so `max_sequence <= T` stays sound. The prune
-        // (`prune_snapshot_manifest_to`) is deferred to AFTER the commit
-        // succeeds, so a failed commit leaves the still-current OLD snapshot's
-        // manifest rows intact (only harmless orphan rows for the abandoned new
-        // snapshot remain, which the next successful prune removes). Best-effort:
-        // a manifest failure must not resurrect deleted rows or lose the rewrite,
-        // so log and continue — the scan still reads the directory until the
-        // manifest becomes the file source.
+        // cleared). The prune (`prune_snapshot_manifest_to`) is deferred to
+        // AFTER the commit succeeds, so a failed commit leaves the still-current
+        // OLD snapshot's manifest rows intact (only harmless orphan rows for the
+        // abandoned new snapshot remain, which the next successful prune
+        // removes). Best-effort: a manifest failure must not resurrect deleted
+        // rows or lose the rewrite, so log and continue — the scan still reads
+        // the directory until the manifest becomes the file source.
+        //
+        // Merged range: this rewrite materializes the FULL visible stream
+        // (`visible_file_stream_for_rewrite` = the whole `scan`, i.e. the current
+        // snapshot UNION every protected snapshot, with all deletions applied),
+        // so the consolidated output's true range is `[min over inputs
+        // min_sequence, max over inputs max_sequence]`. Take it over every LIVE
+        // snapshot's manifest (current + protected) — a strict superset of the
+        // inputs that cannot understate `max` or overstate `min`. When no input
+        // manifest is available (legacy/unpopulated), fall back to the
+        // conservative `[0, current table sequence]`, which keeps the output
+        // always bake-eligible (`min = 0`) — never wrongly referenced-in-place.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_live_snapshots()
+            .await
+            .unwrap_or((0, self.table_metadata.current_sequence_number));
+
         // Seq-prefix lever signal (phase 3, observability only — does NOT alter
         // this full-rewrite's behaviour): split the OLD snapshot's manifest at
         // `T` = the highest applicable delete sequence. `reference` is the count
@@ -11402,18 +11593,14 @@ impl CayenneTableProvider {
             }
         }
 
-        let compaction_watermark = self
-            .catalog
-            .get_snapshot_sequence(
-                &self.table_metadata.table_id,
-                &self.get_current_snapshot_id(),
-            )
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
         let manifest_listed = match self
-            .upsert_snapshot_manifest_from_listing(&new_snapshot_id, compaction_watermark)
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
             .await
         {
             Ok(files) => Some(files),
@@ -11920,10 +12107,49 @@ impl CayenneTableProvider {
             }
         }
 
+        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
+
+        // Manifest snapshot model: AUTHOR the merged output's manifest with its
+        // true merged commit-seq range — `[min, max]` over the SELECTED INPUTS'
+        // manifest files — BEFORE the swap publishes the new snapshot. This is
+        // the data-commit range, NOT the protected-set value the swap stores
+        // (`fence_max_delete_seq`, a DELETE sequence — never a write range). The
+        // later `rebuild_live_snapshot_manifests` re-lists this (now-protected)
+        // snapshot in PreserveOrUniform mode, which keeps the range authored here
+        // rather than clobbering it with `[fence_max_delete_seq, ...]`. When no
+        // input manifest is available, fall back to the conservative
+        // `[0, fence_max_delete_seq]` (always bake-eligible — `min = 0` — so a
+        // missing input manifest can never make the output wrongly referenced and
+        // resurrect a deleted row). Best-effort + upsert-only (matches the
+        // full-rewrite path): a manifest failure leaves the scan on directory
+        // listing, never loses rows.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&old_ids)
+            .await
+            .unwrap_or((0, fence_max_delete_seq));
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author merged subset-compaction manifest before swap; \
+                 scan falls back to directory listing"
+            );
+        }
+
         // --- Phase 3: CAS commit. ---
         let phase2_rewrite_ms = phase2_start.elapsed().as_millis();
         let phase3_start = std::time::Instant::now();
-        let old_ids: Vec<String> = inputs.iter().map(|(id, _)| id.clone()).collect();
         let swapped = match self
             .catalog
             .swap_protected_snapshots(
@@ -21758,11 +21984,10 @@ mod tests {
 
         // Populate the manifest deterministically (the production write path does
         // this on a coalesced post-write maintenance pass; calling the primitive
-        // directly removes the timing dependency). The snapshot's committed
-        // sequence is the watermark stamped on every row; default to 0 when no
-        // sequence row exists yet (same fallback `rebuild_live_snapshot_manifests`
-        // uses). The watermark value is irrelevant to this test — it asserts the
-        // resolved file SET, not the per-row sequence tag.
+        // directly removes the timing dependency). This is the current snapshot,
+        // so use the same `PreserveOrUniform` tag `rebuild_live_snapshot_manifests`
+        // uses for it (`[0, current_seq]`). The sequence tag is irrelevant to this
+        // test — it asserts the resolved file SET, not the per-row sequence range.
         let sequence = provider
             .catalog
             .get_snapshot_sequence(&provider.table_metadata.table_id, &snapshot_id)
@@ -21771,7 +21996,13 @@ mod tests {
             .flatten()
             .unwrap_or(0);
         let listed = provider
-            .upsert_snapshot_manifest_from_listing(&snapshot_id, sequence)
+            .upsert_snapshot_manifest_from_listing(
+                &snapshot_id,
+                ManifestSequenceTag::PreserveOrUniform {
+                    min: 0,
+                    max: sequence,
+                },
+            )
             .await
             .expect("manifest population should succeed");
         assert!(
@@ -22200,10 +22431,13 @@ mod tests {
         provider.prune_deletion_index_at_or_below(5); // must not panic
     }
 
-    /// `partition_manifest_by_sequence` splits the manifest at `T`: files with
-    /// `max_sequence <= T` are bake-eligible, files above are referenced in
-    /// place. An empty (unpopulated) manifest returns `None` so the caller falls
-    /// back to the full-snapshot rewrite.
+    /// `partition_manifest_by_sequence` splits the manifest at `T`: single-commit
+    /// files (`min == max`) with sequence `<= T` are bake-eligible, files above
+    /// are referenced in place. An empty (unpopulated) manifest returns `None` so
+    /// the caller falls back to the full-snapshot rewrite. (The straddling
+    /// merged-file case — where the `min_sequence` predicate diverges from
+    /// `max_sequence` — is covered by
+    /// `partition_manifest_by_sequence_bakes_straddling_merged_file`.)
     #[tokio::test]
     async fn partition_manifest_by_sequence_splits_at_cutoff() {
         let ctx = SessionContext::new();
@@ -22222,8 +22456,8 @@ mod tests {
             "an empty manifest must yield None (no seq-prefix split is defined)"
         );
 
-        // Populate three files straddling the cutoff T=5.
-        for (name, max_seq) in [("a.vortex", 3_i64), ("b.vortex", 5), ("c.vortex", 8)] {
+        // Populate three single-commit files (min == max) straddling T=5.
+        for (name, seq) in [("a.vortex", 3_i64), ("b.vortex", 5), ("c.vortex", 8)] {
             provider
                 .catalog
                 .upsert_snapshot_file(&SnapshotFile {
@@ -22232,8 +22466,8 @@ mod tests {
                     file_path: name.to_string(),
                     row_count: 1,
                     file_size_bytes: 100,
-                    min_sequence: max_seq,
-                    max_sequence: max_seq,
+                    min_sequence: seq,
+                    max_sequence: seq,
                 })
                 .await
                 .expect("upsert manifest row");
@@ -22256,13 +22490,182 @@ mod tests {
         assert_eq!(
             bake,
             vec!["a.vortex", "b.vortex"],
-            "max_seq <= T bakes (incl. boundary)"
+            "min_seq <= T bakes (incl. boundary)"
         );
         assert_eq!(
             reference,
             vec!["c.vortex"],
-            "max_seq > T referenced in place"
+            "min_seq > T referenced in place"
         );
+    }
+
+    /// STAGE-1 DELIVERABLE TEST (2). The corrected `min_sequence` predicate: a
+    /// merged file that STRADDLES the cutoff (`min_sequence <= T < max_sequence`)
+    /// MUST be BAKED, never referenced in place. It holds rows at or below `T`,
+    /// so referencing it would let the post-commit
+    /// `prune_deletion_index_at_or_below(T)` drop a `<= T` tombstone that still
+    /// applies to those rows — resurrecting deleted rows. The prior
+    /// `max_sequence <= T` predicate put this file in `reference` (the bug).
+    #[tokio::test]
+    async fn partition_manifest_by_sequence_bakes_straddling_merged_file() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_straddle", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        // T = 5. Three files:
+        //   merged_straddle: [2, 8]  — min <= 5 < max  ⇒ MUST bake
+        //   below:           [1, 4]  — entirely <= 5    ⇒ bake
+        //   above:           [6, 9]  — entirely  > 5    ⇒ reference
+        for (name, min_seq, max_seq) in [
+            ("merged_straddle.vortex", 2_i64, 8_i64),
+            ("below.vortex", 1, 4),
+            ("above.vortex", 6, 9),
+        ] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    file_path: name.to_string(),
+                    row_count: 1,
+                    file_size_bytes: 100,
+                    min_sequence: min_seq,
+                    max_sequence: max_seq,
+                })
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let plan = provider
+            .partition_manifest_by_sequence(&snapshot_id, 5)
+            .await
+            .expect("manifest read")
+            .expect("populated manifest yields a plan");
+
+        let mut bake: Vec<&str> = plan.bake.iter().map(|f| f.file_path.as_str()).collect();
+        let reference: Vec<&str> = plan
+            .reference
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        bake.sort_unstable();
+
+        assert_eq!(
+            bake,
+            vec!["below.vortex", "merged_straddle.vortex"],
+            "a file straddling T (min_sequence <= T < max_sequence) MUST bake — \
+             the resurrect-rows-critical fix vs the old max_sequence predicate"
+        );
+        assert_eq!(
+            reference,
+            vec!["above.vortex"],
+            "only a file entirely above T (min_sequence > T) is referenced in place"
+        );
+    }
+
+    /// STAGE-1 DELIVERABLE TEST (1). Two appends published at distinct sequences
+    /// `S1 < S2` (each lands in its own file-backed protected snapshot) must
+    /// yield manifest rows tagged with that snapshot's OWN sequence — snapshot 1
+    /// `[S1, S1]`, snapshot 2 `[S2, S2]` — NOT both stamped the latest watermark.
+    /// This is the central defect Stage 1 fixes: the prior per-snapshot watermark
+    /// tagged every file in the live set with one sequence, degenerating the
+    /// seq-prefix split.
+    #[tokio::test]
+    async fn rebuild_manifest_tags_each_protected_snapshot_with_its_own_sequence() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "manifest_per_snapshot_seq".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            // Upsert table: each insert publishes a new protected snapshot at its
+            // own reserved sequence.
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                // Inline disabled so each insert lands as an on-disk file in its
+                // protected snapshot dir (the manifest's domain).
+                inline_max_rows: 0,
+                // Pin the background compactor far out so it can't merge the two
+                // protected snapshots out from under the assertion.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+
+        // Two appends with DISTINCT keys → two live protected snapshots (neither
+        // supersedes the other), each at its own reserved sequence S1 < S2.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[1], &[10])).await;
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[2], &[20])).await;
+
+        // The protected set maps each snapshot id -> its reserved sequence.
+        let protected = provider.protected_snapshots.load_full();
+        assert_eq!(
+            protected.len(),
+            2,
+            "two distinct-key upserts should leave two live protected snapshots, got {}",
+            protected.len()
+        );
+        let mut seqs: Vec<i64> = protected.values().copied().collect();
+        seqs.sort_unstable();
+        assert!(
+            seqs[0] < seqs[1],
+            "the two appends must have distinct, increasing sequences (S1 < S2): {seqs:?}"
+        );
+
+        // Run the production manifest rebuild (under the compaction lock the real
+        // post-write maintenance lane holds).
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+
+        // Each protected snapshot's manifest rows must carry ITS OWN sequence as
+        // BOTH min and max — never the other snapshot's (the watermark bug).
+        for (snapshot_id, &expected_seq) in protected.iter() {
+            let rows = provider
+                .catalog
+                .get_snapshot_files(&provider.table_metadata.table_id, snapshot_id)
+                .await
+                .expect("manifest rows");
+            assert!(
+                !rows.is_empty(),
+                "protected snapshot {snapshot_id} should have at least one manifest row"
+            );
+            for row in &rows {
+                assert_eq!(
+                    (row.min_sequence, row.max_sequence),
+                    (expected_seq, expected_seq),
+                    "file {} in snapshot {snapshot_id} must be tagged [S, S] = [{expected_seq}, \
+                     {expected_seq}] (its own reservation), not a shared watermark",
+                    row.file_path,
+                );
+            }
+        }
     }
 
     /// Phase 4 (physical-file GC ref-counting): the relative-path key combines
@@ -22307,8 +22710,9 @@ mod tests {
             // old1 (already retired) still has a stale manifest row of its own.
             row("old1", "old1_dead.vortex"),
         ];
-        let live: HashSet<String> =
-            ["current".to_string(), "protected".to_string()].into_iter().collect();
+        let live: HashSet<String> = ["current".to_string(), "protected".to_string()]
+            .into_iter()
+            .collect();
 
         let referenced = CayenneTableProvider::live_referenced_relative_paths(&all_rows, &live);
 
@@ -22369,7 +22773,10 @@ mod tests {
             .get_all_snapshot_files("some-other-table")
             .await
             .expect("get_all_snapshot_files (other table)");
-        assert!(other.is_empty(), "rows are scoped to the requested table id");
+        assert!(
+            other.is_empty(),
+            "rows are scoped to the requested table id"
+        );
     }
 
     /// Phase 4: ref-counted retired-dir deletion keeps a data file that a live
@@ -22392,8 +22799,9 @@ mod tests {
         // A LIVE snapshot references `retired-snap/kept.vortex` in place. It does
         // NOT reference `retired-snap/orphan.vortex`. Note `kept.vortex` as a
         // bare name is ambiguous; only the snapshot-scoped relative path is.
-        let referenced: HashSet<String> =
-            ["retired-snap/kept.vortex".to_string()].into_iter().collect();
+        let referenced: HashSet<String> = ["retired-snap/kept.vortex".to_string()]
+            .into_iter()
+            .collect();
 
         let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
@@ -22433,8 +22841,7 @@ mod tests {
 
         // The live set references a same-named file but under a DIFFERENT
         // snapshot id, so nothing in `dead-snap` is protected.
-        let referenced: HashSet<String> =
-            ["other-snap/a.vortex".to_string()].into_iter().collect();
+        let referenced: HashSet<String> = ["other-snap/a.vortex".to_string()].into_iter().collect();
 
         let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
             &retired_dir,
