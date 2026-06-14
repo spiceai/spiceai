@@ -1043,9 +1043,9 @@ impl KeyDeletionIndex {
     /// retained per chunk, so survivors probe the maps by hash identity
     /// without re-hashing the key bytes — one hash computation per key, same
     /// as [`get`](Self::get).
-    pub fn get_batch<'k>(
+    pub fn get_batch<K: AsRef<[u8]>>(
         &self,
-        keys: impl IntoIterator<Item = &'k [u8]>,
+        keys: impl IntoIterator<Item = K>,
         mut on_hit: impl FnMut(usize, Tombstone),
     ) {
         // Deletion-keyed bloom: with no recorded deletions every probe would
@@ -1059,7 +1059,11 @@ impl KeyDeletionIndex {
         let mut chunk_base = 0_usize;
         loop {
             hashes.clear();
-            hashes.extend(keys.by_ref().take(BATCH_SWEEP_CHUNK).map(hash_key_128));
+            hashes.extend(
+                keys.by_ref()
+                    .take(BATCH_SWEEP_CHUNK)
+                    .map(|k| hash_key_128(k.as_ref())),
+            );
             if hashes.is_empty() {
                 break;
             }
