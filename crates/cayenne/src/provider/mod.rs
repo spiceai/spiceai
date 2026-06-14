@@ -106,7 +106,10 @@ pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
-pub use tuning::set_global_memory_budget;
+pub use tuning::{
+    QueryObservations, deregister_query_observations, record_query_latency,
+    register_query_observations, set_global_memory_budget,
+};
 pub use write_budget::set_global_encode_concurrency;
 
 // Re-export deletion utilities for advanced use cases
