@@ -19,7 +19,7 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -2156,6 +2156,84 @@ impl MetadataCatalog for CayenneCatalog {
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_snapshot_file_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
+    async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_snapshot_file \
+                      (table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence) \
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params: vec![
+                    MetastoreValue::Text(file.table_id.clone()),
+                    MetastoreValue::Text(file.snapshot_id.clone()),
+                    MetastoreValue::Text(file.file_path.clone()),
+                    MetastoreValue::Integer(file.row_count),
+                    MetastoreValue::Integer(file.file_size_bytes),
+                    MetastoreValue::Integer(file.min_sequence),
+                    MetastoreValue::Integer(file.max_sequence),
+                ],
+            })
+            .await
+    }
+
+    async fn get_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    FROM cayenne_snapshot_file
+                    WHERE table_id = ?1 AND snapshot_id = ?2
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(snapshot_id.to_string()),
+                    ],
+                },
+                |row| {
+                    Ok(SnapshotFile {
+                        table_id: row.get_string(0)?,
+                        snapshot_id: row.get_string(1)?,
+                        file_path: row.get_string(2)?,
+                        row_count: row.get_i64(3)?,
+                        file_size_bytes: row.get_i64(4)?,
+                        min_sequence: row.get_i64(5)?,
+                        max_sequence: row.get_i64(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn clear_snapshot_files_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file \
+                      WHERE table_id = ?1 AND snapshot_id != ?2",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(snapshot_id.to_string()),
+                ],
+            })
+            .await
+    }
+
+    async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await

@@ -1246,6 +1246,32 @@ pub struct SnapshotFileStatistics {
     pub statistics_blob: Vec<u8>,
 }
 
+/// One row of the authoritative per-snapshot data-file manifest
+/// (`cayenne_snapshot_file`). Unlike [`SnapshotFileStatistics`] (a best-effort
+/// pruning cache), the manifest is the COMPLETE file set for a snapshot — every
+/// data file the scan must read. A new snapshot references an existing file by
+/// inserting a row pointing at the same `file_path` (no copy), which is what
+/// lets compaction bake only the dead-heavy files and reference the rest in
+/// place. `min_sequence`/`max_sequence` carry the file's commit-seq range so a
+/// seq-prefix bake (`max_sequence <= T`) is well-defined.
+#[derive(Debug, Clone)]
+pub struct SnapshotFile {
+    /// Table this manifest entry belongs to (`UUIDv7`).
+    pub table_id: String,
+    /// Snapshot this file is a member of (`UUIDv7`).
+    pub snapshot_id: String,
+    /// Object-store path of the `.vortex` data file (as returned by listing).
+    pub file_path: String,
+    /// Live row count in the file.
+    pub row_count: i64,
+    /// `ObjectMeta::size` of the file in bytes.
+    pub file_size_bytes: i64,
+    /// Inclusive minimum commit sequence of the rows in this file.
+    pub min_sequence: i64,
+    /// Inclusive maximum commit sequence of the rows in this file.
+    pub max_sequence: i64,
+}
+
 /// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
 /// Stores per-column statistics (min, max, null count) maintained incrementally

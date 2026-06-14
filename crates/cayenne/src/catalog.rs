@@ -22,7 +22,7 @@ limitations under the License.
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -587,6 +587,29 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear all per-file statistics rows for a table.
     async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Upsert one row of the authoritative per-snapshot data-file manifest
+    /// (`cayenne_snapshot_file`) — the complete file set for a snapshot.
+    async fn upsert_snapshot_file(&self, file: &SnapshotFile) -> CatalogResult<()>;
+
+    /// Get the complete manifest file set for a snapshot. In the manifest
+    /// snapshot model this is the scan's authoritative file source (rather than
+    /// directory listing).
+    async fn get_snapshot_files(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<Vec<SnapshotFile>>;
+
+    /// Drop manifest rows for snapshots other than the given one (snapshot GC).
+    async fn clear_snapshot_files_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Clear all manifest rows for a table.
+    async fn clear_snapshot_files(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is
