@@ -398,6 +398,15 @@ impl CayenneContext {
         self.config.compaction_trigger_protected_snapshots.max(1)
     }
 
+    /// Whether scans should resolve their file set from the per-snapshot
+    /// manifest (`cayenne_snapshot_file`) rather than by listing the snapshot
+    /// directory. Defaults to `false`; the scan falls back to directory listing
+    /// for any snapshot whose manifest is empty even when this is `true`.
+    #[must_use]
+    pub(crate) fn scan_from_manifest(&self) -> bool {
+        self.config.scan_from_manifest
+    }
+
     /// Maximum number of consecutive compaction passes per trigger.
     #[must_use]
     pub(crate) fn compaction_max_levels(&self) -> usize {

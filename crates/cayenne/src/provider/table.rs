@@ -15806,6 +15806,92 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Resolve a snapshot's data files from the manifest (`cayenne_snapshot_file`)
+    /// instead of by listing the snapshot directory.
+    ///
+    /// Returns `Ok(Some(files))` only when the manifest is non-empty AND the scan
+    /// is unpartitioned. The manifest stores bare file *names* (the same strings a
+    /// directory listing yields); each is joined onto the snapshot directory
+    /// prefix and turned into a [`PartitionedFile`] exactly the way
+    /// [`pruned_partition_list`] does for an unpartitioned table — same
+    /// `ObjectMeta`-to-`PartitionedFile` conversion, same zero-size filter — so
+    /// the manifest-built file list is byte-identical to the directory-built one
+    /// for the same snapshot.
+    ///
+    /// Returns `Ok(None)` (the caller then falls back to directory listing) when:
+    /// - the manifest read fails (transient metastore error),
+    /// - the manifest has no rows for this snapshot (written before population,
+    ///   or a post-write rebuild that has not run / failed), or
+    /// - the table is partitioned (`table_partition_cols` non-empty) — the
+    ///   manifest does not persist partition values, so directory listing (which
+    ///   derives them from the path) stays authoritative there.
+    ///
+    /// This `None`-on-empty fallback is what keeps the flag from ever making a
+    /// scan miss a live file: an incomplete manifest degrades to listing, never
+    /// to a short read.
+    async fn manifest_partitioned_files(
+        &self,
+        request: &SnapshotScanListingRequest<'_>,
+    ) -> Option<Vec<PartitionedFile>> {
+        // The manifest carries no partition values; let directory listing own
+        // partitioned tables (it derives the values from the object path).
+        if !request.options.table_partition_cols.is_empty() {
+            return None;
+        }
+
+        let manifest = match self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, request.snapshot_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    snapshot_id = request.snapshot_id,
+                    %error,
+                    "Manifest read failed; scan falls back to directory listing"
+                );
+                return None;
+            }
+        };
+
+        if manifest.is_empty() {
+            // Snapshot predates manifest population, or a post-write rebuild has
+            // not run yet: directory listing is still the authoritative source.
+            return None;
+        }
+
+        // `prefix` is the parsed snapshot-directory path; joining the manifest's
+        // bare file name onto it reproduces the listing's `ObjectMeta.location`
+        // byte-for-byte (the same derivation `stat_moved_files_as_object_metas`
+        // uses for the list-files-cache delta-apply).
+        let prefix = request.table_url.prefix();
+        let files = manifest
+            .into_iter()
+            // Mirror the listing's `size > 0` filter so empty placeholder files
+            // (if any) are excluded identically.
+            .filter(|file| file.file_size_bytes > 0)
+            .map(|file| {
+                let object_meta = ObjectMeta {
+                    location: prefix.clone().join(file.file_path.as_str()),
+                    // `last_modified` is unused by the Vortex scan (it reads
+                    // footer stats by location/size); a fixed epoch keeps the
+                    // value deterministic without an extra stat round-trip.
+                    last_modified: chrono::DateTime::UNIX_EPOCH,
+                    size: u64::try_from(file.file_size_bytes).unwrap_or(0),
+                    e_tag: None,
+                    version: None,
+                };
+                // Same conversion `pruned_partition_list` uses for the
+                // unpartitioned case (`object_meta.into()`).
+                PartitionedFile::from(object_meta)
+            })
+            .collect::<Vec<_>>();
+
+        Some(files)
+    }
+
     async fn list_files_for_snapshot_scan(
         &self,
         request: &SnapshotScanListingRequest<'_>,
@@ -15825,15 +15911,30 @@ impl CayenneTableProvider {
             .config_options()
             .execution
             .meta_fetch_concurrency;
-        let file_list = pruned_partition_list(
-            request.state,
-            store.as_ref(),
-            request.table_url,
-            request.partition_filters,
-            &request.options.file_extension,
-            &request.options.table_partition_cols,
-        )
-        .await?;
+
+        // Manifest-driven file resolution (default OFF). When enabled and the
+        // manifest has rows for this snapshot, the scan's file set comes from
+        // `cayenne_snapshot_file`; otherwise it falls back to directory listing
+        // (dual-source). The two sources are equal by construction — see
+        // `manifest_partitioned_files` and `upsert_snapshot_manifest_from_listing`.
+        let manifest_files = if self.context.scan_from_manifest() {
+            self.manifest_partitioned_files(request).await
+        } else {
+            None
+        };
+        let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
+            match manifest_files {
+                Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
+                None => pruned_partition_list(
+                    request.state,
+                    store.as_ref(),
+                    request.table_url,
+                    request.partition_filters,
+                    &request.options.file_extension,
+                    &request.options.table_partition_cols,
+                )
+                .await?,
+            };
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
             super::file_pruning::build_listing_pruning_predicate(
@@ -21009,6 +21110,192 @@ mod tests {
         assert_eq!(
             collect_value_id_rows(&ctx, direct_plan).await,
             collect_value_id_rows(&ctx, listing_plan).await
+        );
+    }
+
+    /// Phase 2 manifest snapshot model: with `scan_from_manifest` ON, the scan's
+    /// file set is resolved from `cayenne_snapshot_file` (the manifest) instead
+    /// of by listing the snapshot directory — and the two must be EQUAL.
+    ///
+    /// The baseline is DataFusion's own `ListingTable::list_files_for_scan`,
+    /// which always lists the directory regardless of the flag, so it is an
+    /// independent directory-built file set. The provider under test has the flag
+    /// ON, so its `list_files_for_snapshot_scan` routes through the manifest. The
+    /// manifest is populated deterministically via the production primitive
+    /// (`upsert_snapshot_manifest_from_listing`) before the comparison. Equal
+    /// file-group paths AND per-file row-count statistics prove the manifest-built
+    /// listing equals the directory-built listing.
+    ///
+    /// Also asserts the dual-source fallback: with the manifest cleared, the
+    /// manifest resolver returns `None` and the scan falls back to directory
+    /// listing (so an unpopulated manifest can never make a scan miss a file).
+    #[tokio::test]
+    async fn scan_from_manifest_listing_equals_directory_listing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let config = SessionConfig::new()
+            .with_target_partitions(2)
+            .set_usize("datafusion.execution.meta_fetch_concurrency", 1);
+        let ctx = SessionContext::new_with_config(config);
+
+        let vortex_config = VortexConfig {
+            // Route scans through the manifest (the feature under test).
+            scan_from_manifest: true,
+            // Disable the inline memtable so each insert lands as an on-disk
+            // Vortex file in the snapshot dir (the manifest's domain) rather than
+            // being absorbed inline (no file, nothing to list).
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "scan_from_manifest_parity",
+            Arc::clone(&schema),
+            vortex_config,
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        // Two batches → a non-trivial multi-file set to resolve.
+        let rows_per_file = INLINE_MAX_ROWS + 16;
+        for batch_idx in 0..2_usize {
+            let start =
+                i64::try_from(batch_idx * rows_per_file).expect("test batch start fits in i64");
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                make_listing_parity_batch(Arc::clone(&schema), start, rows_per_file),
+            )
+            .await;
+        }
+
+        let snapshot_id = provider.get_current_snapshot_id();
+        let snapshot_dir_url = CayenneTableProvider::snapshot_dir_url(
+            &provider.table_metadata.path,
+            &provider.table_metadata.table_id,
+            &snapshot_id,
+        );
+        let table_url = ListingTableUrl::parse(&snapshot_dir_url).expect("snapshot URL parses");
+        let options = CayenneTableProvider::create_listing_options(
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        );
+        let scan_schema =
+            CayenneTableProvider::snapshot_scan_schema(&provider.table_metadata.schema, &options);
+        let file_limit = Some(rows_per_file + 1);
+
+        // Populate the manifest deterministically (the production write path does
+        // this on a coalesced post-write maintenance pass; calling the primitive
+        // directly removes the timing dependency). The snapshot's committed
+        // sequence is the watermark stamped on every row; default to 0 when no
+        // sequence row exists yet (same fallback `rebuild_live_snapshot_manifests`
+        // uses). The watermark value is irrelevant to this test — it asserts the
+        // resolved file SET, not the per-row sequence tag.
+        let sequence = provider
+            .catalog
+            .get_snapshot_sequence(&provider.table_metadata.table_id, &snapshot_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let listed = provider
+            .upsert_snapshot_manifest_from_listing(&snapshot_id, sequence)
+            .await
+            .expect("manifest population should succeed");
+        assert!(
+            !listed.is_empty(),
+            "the write should have produced at least one on-disk file to populate"
+        );
+
+        let request = SnapshotScanListingRequest {
+            state: &ctx.state(),
+            table_url: &table_url,
+            options: &options,
+            partition_filters: &[],
+            data_filters: &[],
+            snapshot_id: &snapshot_id,
+            limit: file_limit,
+            scan_schema: Arc::clone(&scan_schema),
+        };
+
+        // The manifest resolver must now return a non-empty set (flag is ON and
+        // the manifest is populated), proving the manifest branch is taken.
+        let manifest_only = provider
+            .manifest_partitioned_files(&request)
+            .await
+            .expect("manifest resolver returns Some when the manifest is populated");
+        assert_eq!(
+            manifest_only.len(),
+            listed.len(),
+            "manifest resolver must surface exactly the populated file set"
+        );
+
+        // Manifest-routed scan file listing (flag ON → routes through the manifest).
+        let manifest_files = provider
+            .list_files_for_snapshot_scan(&request)
+            .await
+            .expect("manifest-routed scan file listing should succeed");
+
+        // Directory baseline via DataFusion's ListingTable (flag-independent —
+        // it always lists the snapshot directory).
+        let listing_table = CayenneTableProvider::create_listing_table_with_config(
+            &snapshot_dir_url,
+            Arc::clone(&provider.table_metadata.schema),
+            provider.context.file_format(),
+            &provider.pk_deletion_strategy,
+            ctx.state().config(),
+        )
+        .expect("listing table should be created");
+        let listing_files = listing_table
+            .list_files_for_scan(&ctx.state(), &[], file_limit)
+            .await
+            .expect("ListingTable file listing should succeed");
+
+        assert_eq!(
+            file_group_paths(&manifest_files.file_groups),
+            file_group_paths(&listing_files.file_groups),
+            "manifest-built scan file paths must equal the directory-built listing"
+        );
+        assert_eq!(
+            file_group_row_counts(&manifest_files.file_groups),
+            file_group_row_counts(&listing_files.file_groups),
+            "manifest-built scan per-file row counts must equal the directory-built listing"
+        );
+        assert_eq!(
+            manifest_files.grouped_by_partition,
+            listing_files.grouped_by_partition
+        );
+        assert_eq!(manifest_files.statistics, listing_files.statistics);
+
+        // Dual-source fallback: clear the manifest and the resolver must return
+        // `None`, so the scan falls back to directory listing rather than reading
+        // a short (incomplete) file set.
+        provider
+            .catalog
+            .clear_snapshot_files(&provider.table_metadata.table_id)
+            .await
+            .expect("manifest cleared");
+        assert!(
+            provider
+                .manifest_partitioned_files(&request)
+                .await
+                .is_none(),
+            "an empty manifest must fall back to directory listing (Some -> None)"
+        );
+        // The end-to-end listing must still succeed (and match the directory
+        // baseline) via the fallback even with the flag ON.
+        let fallback_files = provider
+            .list_files_for_snapshot_scan(&request)
+            .await
+            .expect("scan file listing should fall back to directory listing");
+        assert_eq!(
+            file_group_paths(&fallback_files.file_groups),
+            file_group_paths(&listing_files.file_groups),
+            "with an empty manifest the flag-ON scan must fall back to the directory listing"
         );
     }
 

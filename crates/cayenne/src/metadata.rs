@@ -805,6 +805,20 @@ pub struct VortexConfig {
     /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
     #[serde(default)]
     pub pinned_tuning_actuators: PinnedTuningActuators,
+    /// Build the scan's file set from the per-snapshot manifest
+    /// (`cayenne_snapshot_file`) instead of by listing the snapshot directory.
+    ///
+    /// Defaults to `false` (directory listing) so the manifest stays a
+    /// dual-source supplement until it is proven complete on every path. When
+    /// `true`, a scan resolves its data files from the manifest rows for the
+    /// snapshot it pinned; if the manifest is empty for that snapshot (e.g. a
+    /// snapshot written before population, or a transient post-write rebuild
+    /// failure) the scan transparently falls back to directory listing, so this
+    /// flag never makes a scan miss a live file. The manifest is populated to be
+    /// equal to the directory listing by construction (see
+    /// `upsert_snapshot_manifest_from_listing`).
+    #[serde(default)]
+    pub scan_from_manifest: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -1038,6 +1052,9 @@ impl Default for VortexConfig {
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
+            // Directory listing stays the scan's file source by default; the
+            // manifest is a dual-source supplement until proven complete.
+            scan_from_manifest: false,
         }
     }
 }
@@ -1055,6 +1072,30 @@ mod tests {
         assert_eq!(config.upload_concurrency, available_parallelism);
         assert_eq!(config.write_concurrency, None);
         assert_eq!(config.pk_conflict_detection, PkConflictDetection::Auto);
+    }
+
+    /// `scan_from_manifest` must default OFF (directory listing) so the
+    /// per-snapshot manifest stays a dual-source supplement until it is proven
+    /// complete on every path. A regression flipping this default to `true`
+    /// would silently make the manifest the authoritative scan source — guard
+    /// both the struct default and the serde (empty-config) default.
+    #[test]
+    fn test_scan_from_manifest_defaults_off() {
+        assert!(
+            !VortexConfig::default().scan_from_manifest,
+            "scan_from_manifest must default to false (directory listing)"
+        );
+        let from_empty: VortexConfig = serde_json::from_str("{}").expect("valid empty config");
+        assert!(
+            !from_empty.scan_from_manifest,
+            "an empty config must inherit scan_from_manifest = false via serde default"
+        );
+        let opted_in: VortexConfig = serde_json::from_str(r#"{"scan_from_manifest": true}"#)
+            .expect("valid config with scan_from_manifest opt-in");
+        assert!(
+            opted_in.scan_from_manifest,
+            "an explicit scan_from_manifest = true must deserialize as opt-in"
+        );
     }
 
     #[test]
