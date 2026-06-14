@@ -140,6 +140,7 @@ impl CayenneContext {
             inline_flush_max_segments: config.inline_flush_max_segments,
             compaction_background_interval_ms: config.compaction_background_interval_ms,
             compaction_trigger_files: config.compaction_trigger_files,
+            bake_deletion_index_trigger: config.bake_deletion_index_trigger,
             write_concurrency: wc_init,
             mem_tier_max_bytes: config.cdc_mem_tier_max_bytes,
         }));
@@ -177,6 +178,14 @@ impl CayenneContext {
                 )
             } else {
                 (2, 32)
+            },
+            bake_deletion_index_trigger: if pins.bake_deletion_index_trigger {
+                (
+                    config.bake_deletion_index_trigger,
+                    config.bake_deletion_index_trigger,
+                )
+            } else {
+                (1_000, 5_000_000)
             },
             write_concurrency: if pins.write_concurrency {
                 (wc_init, wc_init)
@@ -419,6 +428,16 @@ impl CayenneContext {
             self.config.compaction_max_files_per_pick,
             target_bytes,
         )
+    }
+
+    /// Deletion-index size (live PK tombstone count) at or above which the
+    /// seq-prefix bake is triggered. Read live from the actuator so the adaptive
+    /// controller can move it (`cayenne_bake_deletion_index_trigger`; seeded from
+    /// the config, anchored to
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
+    #[must_use]
+    pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
+        self.live_actuators.bake_deletion_index_trigger()
     }
 
     /// Protected snapshot count that should trigger maintenance compaction.

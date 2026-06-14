@@ -591,6 +591,9 @@ pub struct PinnedTuningActuators {
     pub compaction_interval: bool,
     /// `cayenne_compaction_trigger_files` was operator-set.
     pub compaction_trigger: bool,
+    /// `cayenne_bake_deletion_index_trigger` was operator-set (don't adapt the
+    /// seq-prefix bake's deletion-index trigger).
+    pub bake_deletion_index_trigger: bool,
     /// `cayenne_write_concurrency` was operator-set.
     pub write_concurrency: bool,
     /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
@@ -695,6 +698,18 @@ pub struct VortexConfig {
     /// Defaults to 8.
     #[serde(default = "default_compaction_trigger_files")]
     pub compaction_trigger_files: usize,
+    /// Deletion-index size (count of live PK tombstones) at or above which the
+    /// seq-prefix bake (Stage 2 compaction) is triggered. The bake consolidates
+    /// the settled older prefix of protected snapshots so their tombstones drop
+    /// out of the live merge-on-read deletion index, lowering the per-query probe
+    /// cost — at the cost of write amplification. A larger value bakes less often
+    /// (bounding write-amp); a smaller value bakes more often (smaller index,
+    /// cheaper probe). Key-delete tables only (position-delete tables never bake).
+    ///
+    /// Defaults to 50_000 (see
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`]).
+    #[serde(default = "default_bake_deletion_index_trigger")]
+    pub bake_deletion_index_trigger: usize,
     /// Number of protected snapshots that can accumulate before snapshot-maintenance
     /// compaction is eligible to run. Kept separate from `compaction_trigger_files`
     /// so small-file compaction tuning does not silently change scan amplification
@@ -851,6 +866,15 @@ pub struct VortexConfig {
     /// Build the scan's file set from the per-snapshot manifest
     /// (`cayenne_snapshot_file`) instead of by listing the snapshot directory.
     ///
+    /// EXPERIMENTAL and **off by default**. This path is not yet
+    /// production-hardened: the manifest is maintained as a dual-source supplement
+    /// to directory listing and has not been proven complete on every write/commit
+    /// path, so opting in trades the authoritative listing for a faster-to-resolve
+    /// but less-exercised source. It is **not** required by — and is independent
+    /// of — the seq-prefix deletion-index bake: the bake reads the above-`T`
+    /// protected snapshots via the existing protected-snapshot scan union
+    /// (`protected_snapshots`), never via this manifest.
+    ///
     /// Defaults to `false` (directory listing) so the manifest stays a
     /// dual-source supplement until it is proven complete on every path. When
     /// `true`, a scan resolves its data files from the manifest rows for the
@@ -954,6 +978,10 @@ fn default_upload_concurrency() -> usize {
 
 fn default_compaction_trigger_files() -> usize {
     8
+}
+
+fn default_bake_deletion_index_trigger() -> usize {
+    crate::provider::table::BAKE_DELETION_INDEX_TRIGGER
 }
 
 fn default_compaction_trigger_protected_snapshots() -> usize {
@@ -1153,6 +1181,7 @@ impl Default for VortexConfig {
             upload_concurrency: default_upload_concurrency(),
             write_concurrency: None,
             compaction_trigger_files: default_compaction_trigger_files(),
+            bake_deletion_index_trigger: default_bake_deletion_index_trigger(),
             compaction_trigger_protected_snapshots: default_compaction_trigger_protected_snapshots(
             ),
             compaction_trigger_snapshot_age_ms: default_compaction_trigger_snapshot_age_ms(),

@@ -3381,13 +3381,19 @@ const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
 /// there is no settled prefix and the bake is a no-op.
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 
-/// Deletion-index size (count of live PK tombstones, `delete_len()`) at or above
-/// which a seq-prefix bake is worth triggering. The bake exists to shrink this
-/// index, so it is gated on the very quantity it reduces: below this floor the
-/// per-query probe is already cheap and a bake would only add write-amp. Chosen
-/// well above the steady-state churn of a healthy CDC table so the bake fires
-/// only once tombstones have genuinely accumulated (amortizing its write cost).
-const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
+/// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
+/// or above which a seq-prefix bake is worth triggering. The bake exists to
+/// shrink this index, so it is gated on the very quantity it reduces: below this
+/// floor the per-query probe is already cheap and a bake would only add
+/// write-amp. Chosen well above the steady-state churn of a healthy CDC table so
+/// the bake fires only once tombstones have genuinely accumulated (amortizing
+/// its write cost).
+///
+/// This is the default seed for the `cayenne_bake_deletion_index_trigger` config
+/// param (see [`crate::metadata::default_bake_deletion_index_trigger`]) and the
+/// anchor for the adaptive [`Actuator::BakeDeletionIndexTrigger`] move; the live
+/// value is read per-trigger via `self.context.bake_deletion_index_trigger()`.
+pub(crate) const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
 /// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
@@ -19178,15 +19184,19 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // size (the very quantity it shrinks). The bake exists to keep the
         // merge-on-read deletion index small (≈ half the per-query CPU on the
         // saturated lab), so it fires only once tombstones have genuinely
-        // accumulated past `BAKE_DELETION_INDEX_TRIGGER`. Cheap lock-free
+        // accumulated past the (config/adaptive) bake trigger. Cheap lock-free
         // early-out: a single atomic deletion-snapshot load + count, skipping the
         // compaction lock / fence on the common path where the index is still
         // small. Key-mode only (the method itself re-gates and re-checks under
         // the fence). A committed bake also reduces the protected-snapshot count,
         // so on a bake we return without also running the size-tier subset pass
-        // this tick; the next tick re-evaluates both.
+        // this tick; the next tick re-evaluates both. The trigger is read live
+        // (`cayenne_bake_deletion_index_trigger`, default
+        // `BAKE_DELETION_INDEX_TRIGGER`; the adaptive controller can move it).
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
-        if deletion_index_len >= BAKE_DELETION_INDEX_TRIGGER && !self.should_capture_positions() {
+        if deletion_index_len >= self.context.bake_deletion_index_trigger()
+            && !self.should_capture_positions()
+        {
             match self.bake_seq_prefix_protected_snapshots().await {
                 Ok(true) => return Ok(true),
                 Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
@@ -23740,6 +23750,125 @@ mod tests {
         // Key 2 stays hidden (its surviving tombstone still applies) — no
         // resurrection despite the kept <= T snapshot.
         let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 2),
+            "key 2 stays deleted (tombstone retained) — no resurrection, got {pairs:?}"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (6). The clean-prefix assertion SKIPS the prune
+    /// (but STILL merges) when an OLDER (at-or-below-T) protected snapshot has an
+    /// EMPTY manifest. An empty manifest means its per-file sequence ranges are
+    /// UNKNOWN, so that snapshot is (a) skipped from the bake selection (its split
+    /// is undefined) yet (b) remains a LIVE unselected protected snapshot whose
+    /// rows cannot be proven to be entirely `> T` — so the post-swap prune of
+    /// `<= T` tombstones is conservatively withheld (it could otherwise resurrect
+    /// a still-live row). Distinct from TEST (5): there the kept snapshot had a
+    /// POPULATED manifest with `min_sequence <= T`; here the blocker is the
+    /// empty-manifest (`violating_min = -1`, range-unknown) branch.
+    ///
+    /// Six protected snapshots pinned at 10,20,30,40,50,60. The older prefix is
+    /// the oldest three (ids 0,1,2). We EMPTY id-2's manifest, so only {0,1} (at
+    /// 10,20 ⇒ T=20) are manifest-populated and bake; id-2 stays live with an
+    /// unknown range and blocks the prune. The newest K=3 ({3,4,5}) stay > T.
+    #[tokio::test]
+    async fn seq_prefix_bake_skips_prune_when_older_snapshot_manifest_empty() {
+        let ctx = SessionContext::new();
+        // Pin all six initially; we then empty exactly one older-prefix snapshot.
+        let (provider, _tmp, ids) = build_seq_prefix_fixture(
+            "bake_skips_prune_empty",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50, 60],
+        )
+        .await;
+
+        // Empty the manifest of one OLDER-prefix snapshot (the 3rd oldest, id-2):
+        // there is no per-snapshot manifest delete, so clear ALL rows and re-pin
+        // every snapshot EXCEPT id-2 (re-listing each file exactly as the fixture
+        // does). That leaves id-2 with an empty manifest while the others keep
+        // their pinned [seq, seq] ranges.
+        let table_id = provider.table_metadata.table_id.clone();
+        let empty_id = ids[2].clone();
+        provider
+            .catalog
+            .clear_snapshot_files(&table_id)
+            .await
+            .expect("clear all manifests");
+        let seqs = [10_i64, 20, 30, 40, 50, 60];
+        for (id, &seq) in ids.iter().zip(seqs.iter()) {
+            if id == &empty_id {
+                continue; // leave id-2's manifest empty (range unknown)
+            }
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            assert!(!files.is_empty(), "snapshot {id} must have a data file");
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("re-pin manifest sequence");
+            }
+        }
+        // Sanity: id-2's manifest is genuinely empty; a populated peer is not.
+        assert!(
+            provider
+                .catalog
+                .get_snapshot_files(&table_id, &empty_id)
+                .await
+                .expect("get manifest")
+                .is_empty(),
+            "the older snapshot id-2 must have an empty manifest for this test"
+        );
+
+        // Tombstone at delete_seq 12 (<= T=20). Key 2 physically lives in the
+        // empty-manifest snapshot id-2, which is NOT merged (skipped) and stays
+        // live — so dropping this tombstone would resurrect it.
+        install_int64_deletes(&provider, &[(2, 12)]);
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            baked,
+            "the {{0,1}} prefix still merges even though id-2's manifest is empty"
+        );
+
+        // The empty-manifest older snapshot was skipped from the bake, so it
+        // remains a live protected snapshot (not retired into the merge).
+        assert!(
+            provider.protected_snapshots.load_full().contains_key(&empty_id),
+            "the empty-manifest older snapshot must stay live (skipped from the bake)"
+        );
+
+        // The <= T tombstone MUST survive — an empty-manifest live snapshot has an
+        // unknown range and conservatively blocks the prune.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(2).map(|t| t.delete_sequence),
+            Some(12),
+            "the <= T tombstone must be RETAINED when an older snapshot's manifest is empty"
+        );
+        assert_eq!(
+            tombstones.delete_len(),
+            1,
+            "no tombstone was pruned (range-unknown empty manifest blocks the prune)"
+        );
+
+        // Key 2 stays hidden (its retained tombstone still applies to the live,
+        // unmerged id-2 file) — no resurrection.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune_empty").await;
         assert!(
             !pairs.iter().any(|(id, _)| *id == 2),
             "key 2 stays deleted (tombstone retained) — no resurrection, got {pairs:?}"
