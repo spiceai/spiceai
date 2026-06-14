@@ -132,7 +132,9 @@ use runtime_datafusion::join_accumulator::{
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use crate::maintained_aggregate::{MaintainedAggregateExec, MaintainedAggregateRegistry};
+use crate::maintained_aggregate::{
+    MaintainedAggregateExec, MaintainedAggregateRegistry, aggregate_shape_is_maintainable,
+};
 use crate::provider::CayenneAccelerationExec;
 use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
 use crate::provider::scan::{ScanDynamicFilter, ScanIdentity};
@@ -409,11 +411,7 @@ fn maintained_aggregate_partial_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&
 }
 
 fn is_simple_partial_aggregate(aggregate: &AggregateExec) -> bool {
-    matches!(aggregate.mode(), AggregateMode::Partial)
-        && aggregate.limit_options().is_none()
-        && aggregate.filter_expr().iter().all(Option::is_none)
-        && !aggregate.group_expr().has_grouping_set()
-        && aggregate.group_expr().groups().len() == 1
+    matches!(aggregate.mode(), AggregateMode::Partial) && aggregate_shape_is_maintainable(aggregate)
 }
 
 #[expect(deprecated)]

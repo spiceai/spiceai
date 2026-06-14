@@ -790,14 +790,22 @@ impl AggregateAccumulator {
     }
 }
 
+/// Whether an `AggregateExec`'s shape (independent of its aggregation mode) is one
+/// the maintained-aggregate machinery can serve: no LIMIT folded into the aggregate,
+/// no per-aggregate FILTER, and a single non-`GROUPING SET` grouping. The accepted
+/// `AggregateMode`s differ by call site, so the mode gate is checked separately.
+pub(crate) fn aggregate_shape_is_maintainable(aggregate: &AggregateExec) -> bool {
+    aggregate.limit_options().is_none()
+        && aggregate.filter_expr().iter().all(Option::is_none)
+        && !aggregate.group_expr().has_grouping_set()
+        && aggregate.group_expr().groups().len() == 1
+}
+
 fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateSpec> {
     if !matches!(
         aggregate.mode(),
         AggregateMode::Single | AggregateMode::SinglePartitioned | AggregateMode::Partial
-    ) || aggregate.limit_options().is_some()
-        || aggregate.filter_expr().iter().any(Option::is_some)
-        || aggregate.group_expr().has_grouping_set()
-        || aggregate.group_expr().groups().len() != 1
+    ) || !aggregate_shape_is_maintainable(aggregate)
     {
         return None;
     }

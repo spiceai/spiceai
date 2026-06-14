@@ -2307,7 +2307,7 @@ pub struct CayenneTableProviderBuilder {
 
 struct PendingMaintainedAggregateInsert {
     epoch: u64,
-    batches: Vec<RecordBatch>,
+    batches: Arc<Vec<RecordBatch>>,
 }
 
 struct CayenneTableProviderOpenOptions {
@@ -11487,17 +11487,14 @@ impl CayenneTableProvider {
 
     fn prepare_maintained_aggregate_insert_batches(
         &self,
-        batches: &[RecordBatch],
+        batches: Arc<Vec<RecordBatch>>,
     ) -> Option<PendingMaintainedAggregateInsert> {
         if self.maintained_aggregates.is_empty() || batches.is_empty() {
             return None;
         }
 
         let epoch = self.next_maintained_aggregate_epoch();
-        Some(PendingMaintainedAggregateInsert {
-            epoch,
-            batches: batches.to_vec(),
-        })
+        Some(PendingMaintainedAggregateInsert { epoch, batches })
     }
 
     async fn apply_maintained_aggregate_insert_batches(
@@ -12622,7 +12619,7 @@ impl CayenneTableProvider {
                 self.mark_maintained_aggregates_stale();
                 None
             } else {
-                self.prepare_maintained_aggregate_insert_batches(batches)
+                self.prepare_maintained_aggregate_insert_batches(Arc::new(batches.to_vec()))
             }
         };
 
@@ -14140,7 +14137,7 @@ impl CayenneTableProvider {
                 self.mark_maintained_aggregates_stale();
                 None
             } else {
-                self.prepare_maintained_aggregate_insert_batches(arc_batches.as_slice())
+                self.prepare_maintained_aggregate_insert_batches(Arc::clone(&arc_batches))
             };
             (epoch, maintained_aggregate_insert)
         };
