@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
@@ -25,8 +26,8 @@ use super::synchronized_table::SynchronizedTable;
 use super::{SnapshotCreateTrigger, SnapshotCreationConfig, metrics};
 use crate::accelerated_table::refresh_task::RefreshTask;
 use crate::accelerated_table::snapshots::{
-    SnapshotCallback, create_checkpoint_and_snapshot, create_periodic_snapshot_callback,
-    spawn_snapshot_interval_task,
+    SnapshotCallback, canonical_checkpoint_schema, create_checkpoint_and_snapshot,
+    create_periodic_snapshot_callback, spawn_snapshot_interval_task,
 };
 use crate::component::dataset::TimeFormat;
 use crate::component::dataset::acceleration::{RefreshMode, RefreshOnStartup};
@@ -671,6 +672,8 @@ pub struct Refresher {
     last_updated_at: Arc<AtomicI64>,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
+    /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -725,6 +728,7 @@ impl Refresher {
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
             is_s3_express_acceleration: false,
+            cdc_param_overrides: None,
         }
     }
 
@@ -831,6 +835,16 @@ impl Refresher {
         self
     }
 
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`.
+    pub fn with_cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
+        self
+    }
+
     /// Compute a specific delay based on `period +- rand(0, max_jitter)`.
     fn compute_delay(period: Duration, max_jitter: Option<Duration>) -> Duration {
         match max_jitter {
@@ -889,7 +903,16 @@ impl Refresher {
         };
 
         let checkpointer = self.checkpointer.clone();
+        // Checkpoints (and snapshot metadata) persist the canonical registration
+        // schema — accelerator field order minus the hidden cache-namespace storage
+        // column — not the source-order federated schema, so that evolved column
+        // order is durable across restarts (engines can only append columns).
+        // Captured once for the start-time checkpoint schema AND threaded into the
+        // snapshot tasks so they can re-derive the canonical schema from the LIVE
+        // accelerator at each checkpoint (live schema evolution under CDC).
         let federated_schema = self.federated.schema();
+        let checkpoint_schema =
+            canonical_checkpoint_schema(&self.accelerator.schema(), &federated_schema);
 
         let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
             (AccelerationRefreshMode::Disabled, _) => return Ok(None),
@@ -910,6 +933,7 @@ impl Refresher {
                             snapshot_manager.clone(),
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
+                            Arc::clone(&checkpoint_schema),
                             Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
@@ -927,7 +951,8 @@ impl Refresher {
                             snapshot_manager,
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
-                            self.federated.schema(),
+                            Arc::clone(&checkpoint_schema),
+                            Arc::clone(&federated_schema),
                             Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
@@ -1012,6 +1037,7 @@ impl Refresher {
                         snapshot_manager.clone(),
                         Arc::clone(&self.accelerator_write_mutex),
                         dataset_name.clone(),
+                        Arc::clone(&checkpoint_schema),
                         Arc::clone(&federated_schema),
                         Arc::clone(&self.runtime_status),
                         self.bootstrap_status.clone(),
@@ -1040,7 +1066,7 @@ impl Refresher {
                 let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
                 let runtime_status_clone = Arc::clone(&self.runtime_status);
                 let snapshot_manager_clone = snapshot_manager.clone();
-                let federated_schema_clone = Arc::clone(&federated_schema);
+                let checkpoint_schema_clone = Arc::clone(&checkpoint_schema);
                 let accelerator_write_mutex_clone = Arc::clone(&self.accelerator_write_mutex);
                 let dataset_name_clone = dataset_name.clone();
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
@@ -1059,12 +1085,15 @@ impl Refresher {
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
-                            &federated_schema_clone,
+                            &checkpoint_schema_clone,
                             &accelerator_write_mutex_clone,
                             &dataset_name_clone,
                             &last_updated_at_clone,
                             ForceCreate(true),
                             Some(&accelerator_clone),
+                            // Non-changes path: no live evolution, so the
+                            // start-time checkpoint schema is current.
+                            None,
                             refresh_sql.as_deref(),
                         )
                         .await;
@@ -1147,12 +1176,13 @@ impl Refresher {
                             create_checkpoint_and_snapshot(
                                 checkpointer,
                                 snapshot_manager.as_ref(),
-                                &federated_schema,
+                                &checkpoint_schema,
                                 &snapshot_mutex,
                                 &dataset_name,
                                 &last_updated_at,
                                 ForceCreate(false),
                                 Some(&accelerator),
+                                None,
                                 refresh_sql.as_deref(),
                             ).await;
                         }
@@ -1223,7 +1253,8 @@ impl Refresher {
         .with_on_stream_batch_process_callback(on_batch_process_callback)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
-        .with_initial_load_completed(Arc::clone(&self.initial_load_completed));
+        .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -2481,10 +2512,10 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: Some(Arc::clone(&checkpoint)),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(|result| {
                     if let NextRefresh::WaitFor(duration) = result {
-                        duration <= Duration::from_secs(60) && duration > Duration::ZERO
+                        duration <= Duration::from_mins(1) && duration > Duration::ZERO
                     } else {
                         false
                     }
@@ -2525,7 +2556,7 @@ mod tests {
                 refresh_mode: RefreshMode::Full,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: Some(checkpoint),
-                check_interval: Some(Duration::from_secs(60)),
+                check_interval: Some(Duration::from_mins(1)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2545,7 +2576,7 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Always,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
                     |result| matches!(result, NextRefresh::WaitFor(duration) if duration.is_zero()),
                 ),
@@ -2555,9 +2586,9 @@ mod tests {
                 refresh_mode: RefreshMode::Caching,
                 refresh_on_startup: RefreshOnStartup::Auto,
                 checkpoint: None,
-                check_interval: Some(Duration::from_secs(900)),
+                check_interval: Some(Duration::from_mins(15)),
                 assert_fn: Box::new(
-                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_secs(900)),
+                    |result| matches!(result, NextRefresh::WaitFor(duration) if duration == Duration::from_mins(15)),
                 ),
             },
             TestCase {
@@ -2665,31 +2696,31 @@ mod tests {
             TestCase {
                 description: "Checkpoint just happened, should wait full interval",
                 last_checkpoint_time: now,
-                check_interval: Duration::from_secs(60),
-                expected_wait_time: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
+                expected_wait_time: Duration::from_mins(1),
             },
             TestCase {
                 description: "Checkpoint happened 30 seconds ago, should wait 30 seconds",
                 last_checkpoint_time: now - Duration::from_secs(30),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(30),
             },
             TestCase {
                 description: "Checkpoint happened 45 seconds ago, should wait 15 seconds",
                 last_checkpoint_time: now - Duration::from_secs(45),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(15),
             },
             TestCase {
                 description: "Checkpoint happened 59 seconds ago, should wait 1 second",
                 last_checkpoint_time: now - Duration::from_secs(59),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::from_secs(1),
             },
             TestCase {
                 description: "Checkpoint happened more than interval ago, should refresh immediately",
                 last_checkpoint_time: now - Duration::from_secs(61),
-                check_interval: Duration::from_secs(60),
+                check_interval: Duration::from_mins(1),
                 expected_wait_time: Duration::ZERO,
             },
         ];

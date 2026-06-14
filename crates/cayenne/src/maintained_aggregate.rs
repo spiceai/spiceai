@@ -224,7 +224,7 @@ impl ExecutionPlan for MaintainedAggregateExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
     }
 
@@ -522,7 +522,7 @@ impl MaintainedAggregateView {
                         .collect::<DataFusionResult<Vec<_>>>()?
                 };
 
-                ScalarValue::iter_to_array(scalars.into_iter())
+                ScalarValue::iter_to_array(scalars)
             })
             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
@@ -794,7 +794,7 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     if !matches!(
         aggregate.mode(),
         AggregateMode::Single | AggregateMode::SinglePartitioned | AggregateMode::Partial
-    ) || aggregate.limit().is_some()
+    ) || aggregate.limit_options().is_some()
         || aggregate.filter_expr().iter().any(Option::is_some)
         || aggregate.group_expr().has_grouping_set()
         || aggregate.group_expr().groups().len() != 1

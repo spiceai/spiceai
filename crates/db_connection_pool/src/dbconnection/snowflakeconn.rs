@@ -59,8 +59,8 @@ pub enum Error {
         source: snowflake_api::SnowflakeApiError,
     },
 
-    #[snafu(display("Error executing query: {source}"))]
-    SnowflakeArrowError { source: arrow::error::ArrowError },
+    #[snafu(display("Error reading Snowflake Arrow response: {source}"))]
+    SnowflakeSourceArrowError { source: snowflake_api::ArrowError },
 
     #[snafu(display("Failed to convert Snowflake timestamp value: {reason}"))]
     UnableToCastSnowflakeTimestamp { reason: String },
@@ -116,7 +116,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
         let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
-                names_from_arrow_batches(batches, tables_error)
+                names_from_snowflake_arrow_batches(batches, tables_error)
             }
             snowflake_api::QueryResult::Json(resp) => {
                 names_from_json_rows(&resp.value, tables_error)
@@ -141,7 +141,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
 
         let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
-                names_from_arrow_batches(batches, schemas_error)
+                names_from_snowflake_arrow_batches(batches, schemas_error)
             }
             snowflake_api::QueryResult::Json(resp) => {
                 names_from_json_rows(&resp.value, schemas_error)
@@ -213,10 +213,8 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         );
 
         let mut transformed_stream = stream.map(|batch| {
-            batch.and_then(|batch| {
-                snowflake_schema_cast(&batch)
-                    .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))
-            })
+            let batch = batch.context(SnowflakeSourceArrowSnafu)?;
+            snowflake_schema_cast(&batch)
         });
 
         let Some(first_batch) = transformed_stream.next().await else {
@@ -226,7 +224,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
             )));
         };
 
-        let batch = first_batch.context(SnowflakeArrowSnafu)?;
+        let batch = first_batch?;
 
         let schema = batch.schema();
 
@@ -275,6 +273,15 @@ fn names_from_arrow_batches(
     }
 
     Ok(names)
+}
+
+fn names_from_snowflake_arrow_batches(
+    batches: Vec<snowflake_api::RecordBatch>,
+    make_error: fn(String) -> dbconnection::Error,
+) -> Result<Vec<String>, dbconnection::Error> {
+    // `snowflake-api` returns Arrow 58 `RecordBatch`es, identical to the workspace
+    // `arrow::array::RecordBatch`, so no IPC re-encode is needed.
+    names_from_arrow_batches(batches, make_error)
 }
 
 fn tables_error(msg: String) -> dbconnection::Error {
@@ -1466,7 +1473,7 @@ mod tests {
             ],
         );
 
-        for (epoch, fraction) in epochs.into_iter().zip(fractions.into_iter()) {
+        for (epoch, fraction) in epochs.into_iter().zip(fractions) {
             if let (Some(epoch_val), Some(fraction_val)) = (epoch, fraction) {
                 builder
                     .field_builder::<Int64Builder>(0)

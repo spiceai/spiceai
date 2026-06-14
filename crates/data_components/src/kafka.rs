@@ -54,6 +54,11 @@ pub use rdkafka;
 // the local buffer, eliminating per-tombstone seek overhead.
 const TOMBSTONE_SCAN_WINDOW: i64 = 100;
 
+// Brief pause before retrying a transient poll error during schema peek
+// (`fetch_latest_message`). Long enough to avoid tight spin on a reconnecting
+// broker; short enough to stay within the peek timeout budget.
+const PEEK_TRANSIENT_POLL_BACKOFF: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Kafka consumer: {source}"))]
@@ -117,6 +122,22 @@ pub fn is_unknown_topic_or_partition(e: &Error) -> bool {
         Error::UnableToReceiveMessage {
             source: RdKafkaError::MessageConsumption(RDKafkaErrorCode::UnknownTopicOrPartition)
         }
+    )
+}
+
+/// Returns `true` for Kafka consumption errors that are typically transient during
+/// assign/seek polling (e.g. broker reconnect or partition leader election).
+#[must_use]
+fn is_transient_kafka_consumption_error(error: &rdkafka::error::KafkaError) -> bool {
+    use rdkafka::error::KafkaError as RdKafkaError;
+    use rdkafka::types::RDKafkaErrorCode;
+    matches!(
+        error,
+        RdKafkaError::MessageConsumption(
+            RDKafkaErrorCode::BrokerTransportFailure
+                | RDKafkaErrorCode::AllBrokersDown
+                | RDKafkaErrorCode::OperationTimedOut
+        )
     )
 }
 
@@ -801,6 +822,11 @@ impl KafkaConsumer {
                         }
                     }
                 }
+                Ok(Some(Err(e)))
+                    if is_transient_kafka_consumption_error(&e) && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(PEEK_TRANSIENT_POLL_BACKOFF).await;
+                }
                 Ok(Some(Err(e))) => {
                     return Err(Error::UnableToReceiveMessage { source: e });
                 }
@@ -951,6 +977,13 @@ impl KafkaConsumer {
             .await?
             {
                 best_message = merge_latest_by_timestamp(best_message, candidate);
+            }
+
+            // Reset manual assignment before scanning the next partition.
+            if let Err(e) = temp_consumer.consumer.unassign() {
+                tracing::debug!(
+                    "Failed to unassign Kafka consumer after peeking partition {partition_id}: {e}"
+                );
             }
         }
 

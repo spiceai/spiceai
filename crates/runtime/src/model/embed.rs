@@ -33,6 +33,8 @@ use llms::bedrock::{
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
+use object_store::ObjectStoreExt;
+
 #[cfg(feature = "models")]
 use llms::embeddings::candle::{download_hf_file, tei::TeiEmbed};
 use llms::embeddings::{Embed, Error as EmbedError};
@@ -496,7 +498,7 @@ async fn databricks(
 
         (None, Some(client_id), Some(client_secret)) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+                .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
                     DatabricksM2MTokenProvider::try_new(
                         endpoint.to_string(),
                         client_id.to_string(),
@@ -522,7 +524,7 @@ async fn databricks(
         }
         (None, Some(client_id), None) => {
             let token_provider = token_provider_registry
-                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{client_id}"), || async {
+                .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(format!("databricks_u2m_{endpoint}_{client_id}"), || async {
                     Ok(DatabricksU2MTokenProvider::new(
                         endpoint.to_string(),
                         client_id.to_string(),

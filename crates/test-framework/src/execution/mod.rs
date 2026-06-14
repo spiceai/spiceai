@@ -286,9 +286,9 @@ impl QueryExecutor for HttpExecutor {
 // ============================================================================
 
 /// Maximum interval between status polls for distributed queries (caps exponential backoff)
-const MAX_POLL_INTERVAL: Duration = Duration::from_millis(5000);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum time to wait for a distributed query to complete (1 hour)
-const POLL_TIMEOUT: Duration = Duration::from_secs(3600);
+const POLL_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Distributed query executor - executes queries via async /v1/queries endpoint
 pub struct DistributedExecutor {

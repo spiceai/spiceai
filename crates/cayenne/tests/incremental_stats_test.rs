@@ -22,7 +22,7 @@ limitations under the License.
 //! `num_rows` nets supersedes under upsert (not the sum of inserts), and
 //! per-integer-column NDV (distinct-count) sketches are populated and reasonably
 //! accurate — both surfaced via `CayenneTableProvider::optimizer_table_statistics()`
-//! and DataFusion's `TableProvider::statistics()` optimizer metadata hook.
+//! and `DataFusion`'s `TableProvider::statistics()` optimizer metadata hook.
 
 mod common;
 

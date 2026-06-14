@@ -120,6 +120,8 @@ async fn plant_full_pre_overwrite_state(
         file_size_bytes: 128,
         deletion_type: DeletionType::PositionBased,
         sequence_number: 7,
+        // Position-based file: carries no keys, so no re-insert sequence.
+        reinsert_sequence: None,
     };
     catalog
         .add_delete_file(delete_file)

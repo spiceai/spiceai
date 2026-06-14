@@ -35,6 +35,7 @@ use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::file_sink_config::FileSinkConfig;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::LexRequirement;
 use datafusion_physical_expr::PhysicalExprRef;
@@ -63,6 +64,7 @@ use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::access_plan::VortexAccessPlanProvider;
@@ -291,12 +293,6 @@ config_namespace! {
         /// push safe projection expressions into the scan while keeping unsafe
         /// fragments above the scan.
         pub projection_pushdown: ProjectionPushdown, default = ProjectionPushdown::Off
-        /// Whether the underlying scan may build a `FilePruner` to skip whole files
-        /// using statistics and partition values before opening them.
-        ///
-        /// Defaults to `true` (pruning enabled). When `false`, pruning is disabled
-        /// and every candidate file is opened and scanned.
-        pub file_pruning: bool, default = true
         /// The intra-file scan concurrency, controlling the number of row splits to process
         /// concurrently within each file.
         ///
@@ -306,6 +302,13 @@ config_namespace! {
         pub scan_concurrency: ScanConcurrency, default = ScanConcurrency::Auto
         /// Total byte capacity for a path-aware segment cache shared by scans using this format.
         pub segment_cache_size_bytes: Option<usize>, default = None
+        /// Whether to evaluate hash-join *dynamic* filters inside the Vortex scan.
+        ///
+        /// When `false` (default), a dynamic filter pushed down from a hash join
+        /// (e.g. a build-side `IN` list) is not absorbed into the scan's per-row
+        /// predicate or file-pruning predicate; it is left for the join / a
+        /// post-scan `FilterExec` to apply with a hashed probe.
+        pub dynamic_filter_pushdown: bool, default = false
     }
 }
 
@@ -598,9 +601,12 @@ impl FileFormat for VortexFormat {
 
                 SpawnedTask::spawn(async move {
                     // Check if we have cached metadata for this file
-                    if let Some(cached) = cache.get(&object)
-                        && let Some(cached_vortex) =
-                            cached.as_any().downcast_ref::<CachedVortexMetadata>()
+                    if let Some(entry) = cache.get(&object.location)
+                        && entry.is_valid_for(&object)
+                        && let Some(cached_vortex) = entry
+                            .file_metadata
+                            .as_any()
+                            .downcast_ref::<CachedVortexMetadata>()
                     {
                         let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
                         return VortexResult::Ok((object.location, inferred_schema));
@@ -631,7 +637,8 @@ impl FileFormat for VortexFormat {
                         src = "infer_schema",
                         "footer cached",
                     );
-                    cache.put(&object, cached_metadata);
+                    let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
+                    cache.put(&object.location, entry);
 
                     let inferred_schema = vxf.dtype().to_arrow_schema()?;
                     VortexResult::Ok((object.location, inferred_schema))
@@ -676,18 +683,22 @@ impl FileFormat for VortexFormat {
 
         let statistics = SpawnedTask::spawn(async move {
             // Try to get cached metadata first
-            let cached_metadata = file_metadata_cache.get(&object).and_then(|cached| {
-                cached
-                    .as_any()
-                    .downcast_ref::<CachedVortexMetadata>()
-                    .map(|m| {
-                        (
-                            m.footer().dtype().clone(),
-                            m.footer().statistics().cloned(),
-                            m.footer().row_count(),
-                        )
-                    })
-            });
+            let cached_metadata = file_metadata_cache
+                .get(&object.location)
+                .filter(|entry| entry.is_valid_for(&object))
+                .and_then(|entry| {
+                    entry
+                        .file_metadata
+                        .as_any()
+                        .downcast_ref::<CachedVortexMetadata>()
+                        .map(|m| {
+                            (
+                                m.footer().dtype().clone(),
+                                m.footer().statistics().cloned(),
+                                m.footer().row_count(),
+                            )
+                        })
+                });
 
             let (dtype, file_stats, row_count) = if let Some(metadata) = cached_metadata {
                 metadata
@@ -722,7 +733,8 @@ impl FileFormat for VortexFormat {
                     src = "infer_stats",
                     "footer cached",
                 );
-                file_metadata_cache.put(&object, cached);
+                let entry = CachedFileMetadataEntry::new(object.clone(), cached);
+                file_metadata_cache.put(&object.location, entry);
 
                 (
                     vxf.dtype().clone(),
@@ -772,47 +784,26 @@ impl FileFormat for VortexFormat {
                 let (stats_set, stats_dtype) = file_stats.get(col_idx);
 
                 // Update the total size in bytes.
-                let column_size = stats_set
-                    .get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into())
-                    .unwrap_or_else(|| stats::Precision::inexact(0_usize));
+                let column_size =
+                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
                 sum_of_column_byte_sizes = sum_of_column_byte_sizes
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                // TODO(connor): There's a lot that can go wrong here, should probably handle this
-                // more gracefully...
-                // Find the min statistic.
-                let min = stats_set.get(Stat::Min).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            // Because of DataFusion's Schema evolution, it is possible that the
-                            // type of the min/max stat has changed. Thus we construct the stat as
-                            // the file datatype first and only then do we cast accordingly.
-                            let stat_dtype = Stat::Min.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let target_dtype = DType::from_arrow(field.as_ref());
+                let min = scalar_stat_to_df(
+                    Stat::Min,
+                    stats_set.get(Stat::Min),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
-                // Find the max statistic.
-                let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            let stat_dtype = Stat::Max.dtype(stats_dtype)?;
-                            Scalar::try_new(stat_dtype, Some(stat_val))
-                                .ok()?
-                                .cast(&DType::from_arrow(field.as_ref()))
-                                .ok()?
-                                .try_to_df()
-                                .ok()
-                        })
-                        .transpose()
-                });
+                let max = scalar_stat_to_df(
+                    Stat::Max,
+                    stats_set.get(Stat::Max),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -933,8 +924,8 @@ impl FileFormat for VortexFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = VortexSource::new(table_schema, self.session.clone())
             .with_projection_pushdown(self.opts.projection_pushdown)
-            .with_file_pruning(self.opts.file_pruning)
-            .with_scan_concurrency(self.opts.scan_concurrency);
+            .with_scan_concurrency(self.opts.scan_concurrency)
+            .with_dynamic_filter_pushdown(self.opts.dynamic_filter_pushdown);
 
         if let Some(segment_cache) = self.segment_cache.clone() {
             source = source.with_segment_cache(segment_cache);
@@ -944,10 +935,28 @@ impl FileFormat for VortexFormat {
     }
 }
 
-fn distinct_count_from_is_constant(
-    is_constant: Option<stats::Precision<bool>>,
-) -> Precision<usize> {
-    match is_constant.and_then(stats::Precision::as_exact) {
+fn scalar_stat_to_df(
+    stat: Stat,
+    value: stats::Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+) -> stats::Precision<datafusion_common::ScalarValue> {
+    let Some(scalar_dtype) = stat.dtype(stats_dtype) else {
+        return stats::Precision::Absent;
+    };
+
+    value
+        .map(|stat_value| {
+            Scalar::try_new(scalar_dtype, Some(stat_value))?
+                .cast(target_dtype)?
+                .try_to_df()
+        })
+        .transpose()
+        .unwrap_or(stats::Precision::Absent)
+}
+
+fn distinct_count_from_is_constant(is_constant: stats::Precision<bool>) -> Precision<usize> {
+    match is_constant.as_exact() {
         Some(true) => Precision::Exact(1),
         Some(false) | None => Precision::Absent,
     }
@@ -1144,24 +1153,6 @@ mod tests {
     }
 
     #[test]
-    fn format_file_pruning_default_is_on() {
-        let opts = VortexTableOptions::default();
-        assert!(opts.file_pruning);
-    }
-
-    #[test]
-    fn format_plumbs_file_pruning() {
-        let mut opts = VortexTableOptions::default();
-        opts.set("file_pruning", "false")
-            .expect("setting file_pruning to false should succeed");
-        assert!(!opts.file_pruning);
-
-        opts.set("file_pruning", "true")
-            .expect("setting file_pruning to true should succeed");
-        assert!(opts.file_pruning);
-    }
-
-    #[test]
     fn format_plumbs_scan_concurrency_modes() {
         let mut opts = VortexTableOptions::default();
         opts.set("scan_concurrency", "auto")
@@ -1184,17 +1175,20 @@ mod tests {
     #[test]
     fn distinct_count_is_exact_only_for_exact_constant_true() {
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(true))),
+            distinct_count_from_is_constant(stats::Precision::exact(true)),
             Precision::Exact(1)
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::exact(false))),
+            distinct_count_from_is_constant(stats::Precision::exact(false)),
             Precision::Absent
         );
         assert_eq!(
-            distinct_count_from_is_constant(Some(stats::Precision::inexact(true))),
+            distinct_count_from_is_constant(stats::Precision::inexact(true)),
             Precision::Absent
         );
-        assert_eq!(distinct_count_from_is_constant(None), Precision::Absent);
+        assert_eq!(
+            distinct_count_from_is_constant(stats::Precision::Absent),
+            Precision::Absent
+        );
     }
 }

@@ -305,7 +305,7 @@ async fn test_github_issues() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -444,7 +444,7 @@ async fn test_github_commits() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -721,7 +721,7 @@ async fn test_github_files_ref_resolution() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -868,7 +868,7 @@ async fn test_github_stargazers() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -932,7 +932,7 @@ async fn test_github_org_members() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -993,7 +993,7 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1069,7 +1069,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1134,7 +1134,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1197,7 +1197,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1263,7 +1263,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1326,7 +1326,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1389,7 +1389,7 @@ async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), St
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1492,7 +1492,7 @@ async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), Stri
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1568,7 +1568,7 @@ async fn test_github_workflows() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1638,7 +1638,7 @@ async fn test_github_workflow_runs() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1699,7 +1699,7 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1830,7 +1830,7 @@ async fn test_github_app_files_ref_filter() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -1882,7 +1882,7 @@ async fn test_github_app_issues() -> Result<(), String> {
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}

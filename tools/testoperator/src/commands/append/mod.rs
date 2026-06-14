@@ -100,7 +100,6 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     if let Err(e) = spiced_instance
@@ -133,14 +132,14 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    let test_metrics = test_metrics
+    let mut test_metrics = test_metrics
         .with_spiced_version(metrics.spiced_version.clone())
         .with_testoperator_commit_sha(metrics.commit_sha.clone())
         .with_branch_name(metrics.branch_name.clone());
-    let test_metrics = match memory_usage {
-        Some((max_memory, median_memory)) => test_metrics.with_memory(max_memory, median_memory),
-        None => test_metrics,
-    };
+
+    if let Some((max_memory, median_memory)) = memory_usage {
+        test_metrics = test_metrics.with_memory(max_memory, median_memory);
+    }
 
     let table_count_result = check_table_counts(
         &spiced_instance,
@@ -149,10 +148,11 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
     )
     .await;
 
-    let records = match memory_usage {
-        Some((max_memory, _)) => metrics.with_memory_usage(max_memory).build_records()?,
-        None => metrics.build_records()?,
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
     };
+    let records = metrics.build_records()?;
     print_batches(&records)?;
 
     let health_report = health_monitor.stop().await;

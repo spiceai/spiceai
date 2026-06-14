@@ -559,6 +559,153 @@ impl Drop for BackgroundCompactor {
     }
 }
 
+/// Trait the background mem-tier checkpointer uses to flush a memory-mode
+/// table's RAM tier on a periodic tick.
+///
+/// Implemented by `CayenneTableProvider`. Decouples the scheduler from the
+/// provider (parallel to [`CompactionRunner`]) so the scheduler is unit-testable
+/// with a stub, and keeps the runtime's slot-advancer concern out of this module
+/// — the provider's tick takes the per-table checkpoint lock and calls the
+/// existing `checkpoint_mem_tier`, which fires the slot advancer post-fence.
+#[async_trait::async_trait]
+pub(crate) trait MemTierCheckpointRunner: Send + Sync {
+    /// Run one periodic mem-tier checkpoint. A no-op when the table is not in
+    /// memory mode, is unarmed, or its tier is empty. Errors are logged by the
+    /// implementation (a failed checkpoint must NOT advance the slot — the
+    /// deferred committers stay queued and the next tick retries).
+    async fn run_mem_tier_checkpoint_tick(&self);
+
+    /// Identifier used in log messages.
+    fn mem_tier_checkpoint_target_name(&self) -> &str;
+
+    /// The (possibly re-read) interval to use for the NEXT wake. `None` keeps the
+    /// spawn-time interval. Mirrors [`CompactionRunner::background_interval_hint`]
+    /// so a future auto-tuner can widen/tighten the cadence at runtime.
+    fn checkpoint_interval_hint(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Per-table background mem-tier checkpointer (`cdc_durability: memory`).
+///
+/// Owns a tokio task that wakes every `interval` and runs ONE checkpoint tick
+/// (`run_mem_tier_checkpoint_tick`), which flushes the RAM tier to a durable
+/// Vortex file and advances the deferred source slot ack. Modeled on
+/// [`BackgroundCompactor`]: a `Weak` runner so the task never pins the provider,
+/// a `select!` over `sleep(interval)` vs a shutdown `Notify`, the interval
+/// re-read each wake, and `Drop`-fires-shutdown + a bounded detached-thread drain
+/// so dropping the provider never blocks a Tokio worker.
+///
+/// Unlike the compactor there is NO shared semaphore and NO multi-pass drain
+/// loop: a single `checkpoint_mem_tier` flushes the entire tier in one call, and
+/// the per-table `mem_checkpoint_lock` (taken inside the tick) is the only
+/// serialization needed — it already excludes the write-path spill and the
+/// event-driven checkpoints, so two checkpoints for one table can never overlap.
+pub(crate) struct BackgroundMemTierCheckpointer {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Arc<Notify>,
+}
+
+impl BackgroundMemTierCheckpointer {
+    /// Spawn the periodic checkpoint task. Returns `None` if `interval` is zero
+    /// (the task is disabled — the write-path caps still bound hot tables).
+    pub(crate) fn spawn(
+        runner: Weak<dyn MemTierCheckpointRunner>,
+        interval: Duration,
+    ) -> Option<Self> {
+        if interval.is_zero() {
+            return None;
+        }
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_task = Arc::clone(&shutdown);
+
+        // Spawn onto the dedicated compaction runtime (shared low-priority
+        // background runtime) when one is injected, otherwise the ambient
+        // runtime — same routing as the compactor so background work stays off
+        // the query/refresh runtimes.
+        let handle = spawn_compaction(async move {
+            // Re-read the interval each wake so a future auto-tuner can adjust the
+            // cadence (defaults to the spawn-time interval when no hint is given).
+            let mut current = interval;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(current) => {}
+                    () = shutdown_task.notified() => break,
+                }
+
+                let Some(runner) = runner.upgrade() else {
+                    // Provider dropped — task exits naturally.
+                    break;
+                };
+
+                if let Some(next) = runner.checkpoint_interval_hint() {
+                    current = next;
+                }
+
+                tracing::trace!(
+                    target: "cayenne::mem_tier",
+                    table = runner.mem_tier_checkpoint_target_name(),
+                    "Periodic mem-tier checkpoint wake",
+                );
+
+                // One checkpoint per tick. The tick itself is a no-op on an empty
+                // or unarmed tier and takes the per-table lock only when there is
+                // something to flush, so an idle table costs one cheap wake.
+                runner.run_mem_tier_checkpoint_tick().await;
+            }
+        });
+
+        Some(Self {
+            handle: Some(handle),
+            shutdown,
+        })
+    }
+}
+
+fn drain_and_abort_checkpointer(handle: &JoinHandle<()>) {
+    // Let an in-flight checkpoint finish its current Vortex write before the
+    // surrounding runtime tears down, for the same vortex-io reason as the
+    // compactor drain (a task whose runtime is dropped mid-write panics).
+    let deadline = Instant::now() + COMPACTOR_SHUTDOWN_DRAIN;
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    handle.abort();
+}
+
+fn spawn_checkpointer_drain_thread(handle: JoinHandle<()>) {
+    let handle = Arc::new(Mutex::new(Some(handle)));
+    let handle_for_thread = Arc::clone(&handle);
+
+    match std::thread::Builder::new()
+        .name("cayenne-memtier-checkpoint-drain".to_string())
+        .spawn(move || {
+            let Some(handle) = handle_for_thread.lock().take() else {
+                return;
+            };
+            drain_and_abort_checkpointer(&handle);
+        }) {
+        Ok(join_handle) => drop(join_handle),
+        Err(error) => {
+            if let Some(handle) = handle.lock().take() {
+                handle.abort();
+            }
+            tracing::warn!(target: "cayenne::mem_tier", "Failed to spawn background mem-tier checkpointer drain thread; aborted task immediately: {error}");
+        }
+    }
+}
+
+impl Drop for BackgroundMemTierCheckpointer {
+    fn drop(&mut self) {
+        self.shutdown.notify_one();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        spawn_checkpointer_drain_thread(handle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

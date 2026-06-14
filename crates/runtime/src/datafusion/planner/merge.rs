@@ -67,19 +67,16 @@ pub(super) async fn plan_distributed_merge(
             "Expected Statement::Statement for MERGE".to_string(),
         ));
     };
-    let SQLStatement::Merge {
-        table,
-        source,
-        on,
-        clauses,
-        output,
-        ..
-    } = *sql_stmt
-    else {
+    let SQLStatement::Merge(merge) = *sql_stmt else {
         return Err(DataFusionError::Internal(
             "Expected SQLStatement::Merge".to_string(),
         ));
     };
+    let table = merge.table;
+    let source = merge.source;
+    let on = merge.on;
+    let clauses = merge.clauses;
+    let output = merge.output;
 
     if output.is_some() {
         return Err(DataFusionError::Plan(
@@ -385,12 +382,18 @@ fn validate_and_extract_assignments(
         ));
     }
 
-    let MergeAction::Update { assignments } = &clause.action else {
+    let MergeAction::Update(update) = &clause.action else {
         return Err(DataFusionError::Plan(format!(
             "Only UPDATE SET is supported in WHEN MATCHED, found: {}",
             clause.action
         )));
     };
+    if update.update_predicate.is_some() || update.delete_predicate.is_some() {
+        return Err(DataFusionError::Plan(
+            "MERGE UPDATE predicates are not supported".to_string(),
+        ));
+    }
+    let assignments = &update.assignments;
 
     if assignments.is_empty() {
         return Err(DataFusionError::Plan(
@@ -472,10 +475,10 @@ mod tests {
     }
 
     fn extract_on_and_clauses(stmt: SQLStatement) -> (Box<SQLExpr>, Vec<MergeClause>) {
-        let SQLStatement::Merge { on, clauses, .. } = stmt else {
+        let SQLStatement::Merge(merge) = stmt else {
             panic!("Expected Merge statement");
         };
-        (on, clauses)
+        (merge.on, merge.clauses)
     }
 
     // --- ON clause tests ---
@@ -684,9 +687,10 @@ mod tests {
         let stmt = parse_merge(
             "MERGE INTO my_table USING source ON 1=1 WHEN MATCHED THEN UPDATE SET a = 1",
         );
-        let SQLStatement::Merge { table, .. } = stmt else {
+        let SQLStatement::Merge(merge) = stmt else {
             panic!();
         };
+        let table = merge.table;
         let (name, alias) = extract_table_ref(&table, "target").expect("should succeed");
         assert_eq!(name, "my_table");
         assert_eq!(alias, None);
@@ -698,9 +702,11 @@ mod tests {
             "MERGE INTO my_table AS t USING other AS s ON 1=1 \
              WHEN MATCHED THEN UPDATE SET a = 1",
         );
-        let SQLStatement::Merge { table, source, .. } = stmt else {
+        let SQLStatement::Merge(merge) = stmt else {
             panic!();
         };
+        let table = merge.table;
+        let source = merge.source;
         let (name, alias) = extract_table_ref(&table, "target").expect("should succeed");
         assert_eq!(name, "my_table");
         assert_eq!(alias, Some("t".to_string()));

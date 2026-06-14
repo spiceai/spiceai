@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use crate::sql_expr::to_sql_preserving_precedence;
 use arrow::{
     array::{Array, RecordBatch, array},
@@ -22,8 +23,6 @@ use arrow::{
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use datafusion_table_providers::sql::sql_provider_datafusion::expr;
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use flight_client::{
     MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
     cookie::{CookieService, CookieStore},
@@ -88,7 +87,7 @@ pub enum Error {
     #[snafu(display(
         "Failed to create SQL query (flightsql). {source} An unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL { source: DataFusionError },
 
     #[snafu(display("Query execution failed (flightsql). {source}"))]
     UnableToQueryArrowFlight { source: FlightError },
@@ -374,7 +373,7 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
-            .context(UnableToRetrieveSchemaArrowSnafu {
+            .context(UnableToRetrieveSchemaFlightSnafu {
                 table_name: table_reference.to_string(),
             })?;
 
@@ -387,7 +386,7 @@ impl FlightSQLTable {
                 client
                     .do_get(tkt.clone())
                     .await
-                    .context(UnableToRetrieveSchemaArrowSnafu {
+                    .context(UnableToRetrieveSchemaFlightSnafu {
                         table_name: table_reference.to_string(),
                     })?;
             let batch = stream.try_collect::<Vec<_>>().await.context(
@@ -485,7 +484,7 @@ pub struct FlightSqlExec {
     filters: Vec<Expr>,
     limit: Option<usize>,
     sort_exprs: Vec<PhysicalSortExpr>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     cookie_store: Arc<CookieStore>,
     metrics: ExecutionPlanMetricsSet,
     /// Optional W3C `traceparent` value (e.g. `00-{trace_id}-{span_id}-01`)
@@ -521,12 +520,12 @@ impl FlightSqlExec {
             filters: filters.to_vec(),
             limit,
             sort_exprs: Vec::new(),
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store,
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: None,
@@ -627,7 +626,7 @@ impl FlightSqlExec {
                         format!("({sql})")
                     })
                 })
-                .collect::<expr::Result<Vec<_>>>()
+                .collect::<DataFusionResult<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
@@ -707,7 +706,7 @@ impl ExecutionPlan for FlightSqlExec {
         Arc::clone(&self.projected_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -745,12 +744,12 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: self.limit,
             sort_exprs,
-            properties: PlanProperties::new(
+            properties: Arc::new(PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
                 EmissionType::Incremental,
                 Boundedness::Bounded,
-            ),
+            )),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
@@ -815,10 +814,6 @@ impl ExecutionPlan for FlightSqlExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> DataFusionResult<Statistics> {
-        Ok(self.statistics.clone())
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
         // Single output partition (`UnknownPartitioning(1)`), so per-partition
         // statistics for partition 0 are the whole scan's statistics.
@@ -847,7 +842,7 @@ impl ExecutionPlan for FlightSqlExec {
             filters: self.filters.clone(),
             limit: merged_limit,
             sort_exprs: self.sort_exprs.clone(),
-            properties: self.properties.clone(),
+            properties: Arc::clone(&self.properties),
             cookie_store: Arc::clone(&self.cookie_store),
             metrics: ExecutionPlanMetricsSet::new(),
             trace_parent: self.trace_parent.clone(),
@@ -975,7 +970,7 @@ pub fn query_to_stream(
                                 }
                             }
                         },
-                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error.into()} ))
+                        Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error } ))
                 }
             }
         };
@@ -994,9 +989,18 @@ pub async fn get_client_for_flight_endpoint(
     if ep.location.is_empty() {
         Ok(client.clone())
     } else {
-        let channel = new_tls_flight_channel(&ep.location[0].uri, None).await?;
-        let channel = CookieService::new(channel, Arc::clone(cookie_store));
-        Ok(FlightSqlServiceClient::new(channel))
+        // Some Flight SQL servers (e.g. StarRocks) advertise an internal/cluster-only address
+        // in the endpoint location that's unreachable from external clients. Per the Flight SQL
+        // spec, data served at the same address as the FlightInfo may carry an empty location;
+        // StarRocks instead returns its internal FE address. If we can't reach the advertised
+        // location, fall back to the original connection that served the FlightInfo.
+        match new_tls_flight_channel(&ep.location[0].uri, None).await {
+            Ok(channel) => {
+                let channel = CookieService::new(channel, Arc::clone(cookie_store));
+                Ok(FlightSqlServiceClient::new(channel))
+            }
+            Err(_) => Ok(client.clone()),
+        }
     }
 }
 

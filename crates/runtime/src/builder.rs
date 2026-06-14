@@ -1046,6 +1046,11 @@ fn parse_cayenne_optimizer_rules(
             "anti_join_sort_merge" | "anti_sort_merge" => {
                 rules.set_anti_join_sort_merge(true);
             }
+            // Opt-in: restores the Cayenne `ExactLeftAccumulator` join rewrite
+            // (`CayenneJoinRewriter`). Off by default — the default path uses
+            // DataFusion 53's native inner-join hash-join dynamic-filter pushdown
+            // (min/max bounds + InList/hash-table membership). Naming this rule
+            // re-enables the forked exact in-list accumulator alongside it.
             "exact_join_filter" | "join_rewriter" | "exact_accumulator" => {
                 rules.set_exact_join_filter(true);
             }
@@ -1289,6 +1294,9 @@ mod test {
             CayenneOptimizerRules::all_enabled()
         );
 
+        // `join_rewriter` is an opt-in alias that enables the Cayenne
+        // `ExactLeftAccumulator` rewrite (`exact_join_filter`) alongside any
+        // other named rules, and does not trigger the unknown-rule path.
         let mut selected_rules = CayenneOptimizerRules::none();
         selected_rules.set_filter_propagation(true);
         selected_rules.set_cross_join_reassociation(true);

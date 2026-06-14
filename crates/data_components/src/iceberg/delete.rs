@@ -45,10 +45,9 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
+use iceberg::arrow::FieldMatchMode;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{DataFileFormat, TableProperties};
 use iceberg::table::Table;
@@ -66,7 +65,6 @@ use iceberg::{Catalog, Error as IcebergError};
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
-use iceberg::arrow::FieldMatchMode;
 fn to_df_error(e: IcebergError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -83,9 +81,7 @@ pub(crate) struct IcebergDeleteExec {
     input: Arc<dyn ExecutionPlan>,
     /// Pre-computed equality delete field IDs (primitive, non-float columns).
     equality_ids: Vec<i32>,
-    /// Schema of the count output.
-    count_schema: ArrowSchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl IcebergDeleteExec {
@@ -96,19 +92,18 @@ impl IcebergDeleteExec {
         equality_ids: Vec<i32>,
     ) -> Self {
         let count_schema = Self::make_count_schema();
-        let plan_properties = PlanProperties::new(
+        let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&count_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
 
         Self {
             table,
             catalog,
             input,
             equality_ids,
-            count_schema,
             plan_properties,
         }
     }
@@ -157,7 +152,7 @@ impl ExecutionPlan for IcebergDeleteExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -205,12 +200,15 @@ impl ExecutionPlan for IcebergDeleteExec {
         let table = self.table.clone();
         let catalog = Arc::clone(&self.catalog);
         let input_plan = Arc::clone(&self.input);
-        let count_schema = Arc::clone(&self.count_schema);
+        let count_schema = Self::make_count_schema();
         let equality_ids = self.equality_ids.clone();
 
         let stream = futures::stream::once(async move {
             // Collect all input partitions into a single stream
-            let partition_count = input_plan.output_partitioning().partition_count();
+            let partition_count = input_plan
+                .properties()
+                .output_partitioning()
+                .partition_count();
             let mut total_delete_count: u64 = 0;
 
             // Get the iceberg schema for the equality delete writer

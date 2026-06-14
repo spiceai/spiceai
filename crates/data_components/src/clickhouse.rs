@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::function_support::FunctionSupport;
 use async_trait::async_trait;
 use clickhouse_rs::ClientHandle;
 use datafusion::{datasource::TableProvider, sql::TableReference};
@@ -21,7 +22,6 @@ use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
     sql_provider_datafusion::{self, SqlTable},
 };
-use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use snafu::prelude::*;
 use std::sync::Arc;
 

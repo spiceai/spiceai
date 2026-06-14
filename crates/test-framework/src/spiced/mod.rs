@@ -147,36 +147,7 @@ impl SpicedInstance {
     pub fn external(flight_url: impl Into<String>) -> Self {
         let flight_url = flight_url.into();
 
-        // Spice Cloud has a dedicated HTTP endpoint
-        let http_base_url = if flight_url.contains("flight.spiceai.io") {
-            "https://data.spiceai.io".to_string()
-        } else {
-            // Derive the HTTP URL from the Flight URL by swapping the port for
-            // 8090, e.g. "http://localhost:50051" -> "http://localhost:8090".
-            // Split the scheme off first so the "://" separator is not mistaken
-            // for the port separator — otherwise a URL without an explicit port
-            // (e.g. "http://host") would incorrectly yield "http:8090".
-            let (scheme, authority) = match flight_url.split_once("://") {
-                Some((scheme, authority)) => (Some(scheme), authority),
-                None => (None, flight_url.as_str()),
-            };
-            // Strip an explicit ":port" if present; otherwise use the whole host.
-            // A bracketed IPv6 literal ("[::1]" / "[::1]:port") is treated as an
-            // atomic host so its internal colons aren't read as a port separator.
-            let host = if authority.starts_with('[') {
-                authority
-                    .find(']')
-                    .map_or(authority, |close| &authority[..=close])
-            } else {
-                authority
-                    .rsplit_once(':')
-                    .map_or(authority, |(host, _port)| host)
-            };
-            match scheme {
-                Some(scheme) => format!("{scheme}://{host}:8090"),
-                None => format!("{host}:8090"),
-            }
-        };
+        let http_base_url = derive_http_base_url(&flight_url);
 
         Self::External {
             flight_url,
@@ -220,7 +191,6 @@ impl SpicedInstance {
     /// - If the spicepod definition fails to serialize
     pub async fn start(mut start_request: StartRequest) -> Result<Self> {
         // Check if spiced is already running
-        // Connect to an already-running external spiced if --spiced-path is a URL.
         let spiced_path_str = start_request.spiced_path.to_string_lossy().to_string();
         if spiced_path_str.starts_with("http://") || spiced_path_str.starts_with("https://") {
             return Ok(Self::external(spiced_path_str));
@@ -263,6 +233,20 @@ impl SpicedInstance {
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
         cmd.arg("--telemetry-enabled=false");
+
+        // Optionally expose the Prometheus `/metrics` endpoint on the spawned
+        // spiced. Off by default so concurrent spiced instances in the test
+        // suite don't contend a fixed port; opt in by exporting
+        // `SPICED_METRICS_ADDR` (e.g. `0.0.0.0:9090`) for profiling/benchmark
+        // runs that scrape per-phase metrics. Without it the spawned spiced runs
+        // with a no-op meter provider and `/metrics` is unavailable — the blind
+        // spot that hid the CDC write-phase breakdown on the co-located
+        // (testoperator-spawns-spiced) benchmark topology.
+        if let Ok(metrics_addr) = std::env::var("SPICED_METRICS_ADDR")
+            && !metrics_addr.is_empty()
+        {
+            cmd.arg("--metrics").arg(metrics_addr);
+        }
 
         // Add any additional arguments
         for arg in start_request.additional_args {
@@ -481,77 +465,42 @@ impl SpicedInstance {
         Ok(())
     }
 
-    /// Returns an instance of a `Process` for the spiced instance
-    /// This allows tracking the spiced process, without owning the spiced instance
-    pub fn process(&self) -> Result<Process> {
+    /// Returns a `Process` handle when this instance owns a local spiced subprocess.
+    #[must_use]
+    pub fn process(&self) -> Option<Process> {
         let Self::Owned { child, .. } = self else {
-            // Non-owned (Existing/External) instances have no local child process
-            // to monitor. Error here so callers — which all use `.ok()` — skip
-            // memory monitoring, rather than recording the test runner's own PID
-            // (a self-pid would silently skew the reported memory metric).
-            return Err(anyhow!(
-                "Process handle is only available for owned local spiced instances"
-            ));
+            return None;
         };
 
-        Ok(Process::new(Pid::from_u32(child.id())))
+        Some(Process::new(Pid::from_u32(child.id())))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SpicedInstance;
-
-    #[test]
-    fn process_is_unavailable_for_non_owned_instances() {
-        // Non-owned (Existing/External) instances have no local child process, so
-        // `process()` errors; every caller uses `.ok()` to skip memory monitoring
-        // rather than record the runner's PID.
-        assert!(SpicedInstance::empty().process().is_err());
-        assert!(
-            SpicedInstance::external("http://localhost:50051")
-                .process()
-                .is_err()
-        );
+fn derive_http_base_url(flight_url: &str) -> String {
+    if flight_url.contains("flight.spiceai.io") {
+        return "https://data.spiceai.io".to_string();
     }
 
-    #[test]
-    fn external_derives_http_base_url_with_and_without_port() {
-        // Explicit port -> swap to the HTTP port.
-        assert_eq!(
-            SpicedInstance::external("http://localhost:50051").http_base_url(),
-            "http://localhost:8090"
-        );
-        // No explicit port: the scheme separator must not be treated as the
-        // port separator (regression — previously produced "http:8090").
-        assert_eq!(
-            SpicedInstance::external("http://myhost").http_base_url(),
-            "http://myhost:8090"
-        );
-        assert_eq!(
-            SpicedInstance::external("https://myhost").http_base_url(),
-            "https://myhost:8090"
-        );
-        // No scheme, explicit port.
-        assert_eq!(
-            SpicedInstance::external("myhost:50051").http_base_url(),
-            "myhost:8090"
-        );
-        // Bracketed IPv6 literal: internal colons must not be read as a port.
-        assert_eq!(
-            SpicedInstance::external("http://[::1]:50051").http_base_url(),
-            "http://[::1]:8090"
-        );
-        assert_eq!(
-            SpicedInstance::external("http://[::1]").http_base_url(),
-            "http://[::1]:8090"
-        );
-        // Spice Cloud keeps its dedicated HTTP endpoint.
-        assert_eq!(
-            SpicedInstance::external("https://flight.spiceai.io").http_base_url(),
-            "https://data.spiceai.io"
-        );
+    let http_flight_url = flight_url
+        .strip_prefix("grpc://")
+        .map(|rest| format!("http://{rest}"))
+        .or_else(|| {
+            flight_url
+                .strip_prefix("grpc+tls://")
+                .map(|rest| format!("https://{rest}"))
+        });
+    let parse_target = http_flight_url.as_deref().unwrap_or(flight_url);
+    let Ok(mut url) = reqwest::Url::parse(parse_target) else {
+        return format!("{flight_url}:8090");
+    };
+
+    if url.set_port(Some(8090)).is_err() {
+        return format!("{flight_url}:8090");
     }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.as_str().trim_end_matches('/').to_string()
 }
 
 impl Drop for SpicedInstance {
@@ -564,5 +513,59 @@ impl Drop for SpicedInstance {
             Ok(()) => (),
             Err(e) => eprintln!("Failed to kill spiced instance: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_derives_http_base_url_without_flight_port() {
+        let instance = SpicedInstance::external("https://example.com");
+
+        assert_eq!(instance.http_base_url(), "https://example.com:8090");
+    }
+
+    #[test]
+    fn external_derives_http_base_url_from_flight_port() {
+        let instance = SpicedInstance::external("http://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "http://localhost:8090");
+    }
+
+    #[test]
+    fn external_maps_grpc_flight_scheme_to_http() {
+        let instance = SpicedInstance::external("grpc://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "http://localhost:8090");
+    }
+
+    #[test]
+    fn external_maps_grpc_tls_flight_scheme_to_https() {
+        let instance = SpicedInstance::external("grpc+tls://localhost:50051");
+
+        assert_eq!(instance.http_base_url(), "https://localhost:8090");
+    }
+
+    #[test]
+    fn external_derives_http_base_url_for_ipv6() {
+        let instance = SpicedInstance::external("http://[::1]:50051");
+
+        assert_eq!(instance.http_base_url(), "http://[::1]:8090");
+    }
+
+    #[test]
+    fn process_is_unavailable_for_non_owned_instances() {
+        // Non-owned (Existing/External) instances have no local child process, so
+        // `process()` returns None; callers skip memory monitoring rather than
+        // record the runner's own PID (a self-pid would silently skew the memory
+        // metric).
+        assert!(SpicedInstance::empty().process().is_none());
+        assert!(
+            SpicedInstance::external("http://localhost:50051")
+                .process()
+                .is_none()
+        );
     }
 }

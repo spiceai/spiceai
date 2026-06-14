@@ -227,6 +227,7 @@ impl TursoMetastore {
             file_size_bytes BIGINT NOT NULL,
             source_data_file_path TEXT,
             sequence_number BIGINT NOT NULL DEFAULT 0,
+            reinsert_sequence BIGINT,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -318,6 +319,19 @@ impl TursoMetastore {
             num_rows BIGINT NOT NULL DEFAULT 0,
             ndv_sketches BLOB,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const SNAPSHOT_FILE_STATISTICS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_snapshot_file_statistics (
+            table_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size_bytes BIGINT NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
+            statistics_blob BLOB NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, snapshot_id, file_path)
         )
     ";
 
@@ -518,7 +532,7 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
@@ -526,6 +540,7 @@ impl MetastoreBackend for TursoMetastore {
             Self::INSERT_RECORD_TABLE_DDL,
             Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
             Self::TABLE_STATISTICS_DDL,
+            Self::SNAPSHOT_FILE_STATISTICS_TABLE_DDL,
             Self::INLINED_DATA_TABLE_DDL,
             Self::INLINED_DELETE_TABLE_DDL,
             Self::PK_INDEX_TABLE_DDL
@@ -564,6 +579,15 @@ impl MetastoreBackend for TursoMetastore {
         let _ = conn
             .execute(
                 "ALTER TABLE cayenne_table_statistics ADD COLUMN ndv_sketches BLOB",
+                (),
+            )
+            .await;
+        // Metadata-only publish: per-commit reinsert sequence on delete-file rows;
+        // NULL on legacy rows falls back to cayenne_insert_record. Forward-upgrade
+        // safe; downgrade requires a catalog rebuild (see the sqlite backfill note).
+        let _ = conn
+            .execute(
+                "ALTER TABLE cayenne_delete_file ADD COLUMN reinsert_sequence BIGINT",
                 (),
             )
             .await;

@@ -66,7 +66,6 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     let memory_token = CancellationToken::new();
     let memory_readings = spiced_instance
         .process()
-        .ok()
         .map(|process| process.watch_memory(&memory_token));
 
     println!("Starting benchmark Spicepod...");
@@ -157,10 +156,11 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         None => None,
     };
 
-    match memory_usage {
-        Some((max_memory, _)) => metrics.with_memory_usage(max_memory).show_run(None)?,
-        None => metrics.show_run(None)?,
-    }
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    metrics.show_run(None)?; // no additional test pass logic applies
 
     // Record benchmark results
     crate::metrics::TEST_DURATION.record(duration_millis_between(finished_at, started_at)?, &[]);

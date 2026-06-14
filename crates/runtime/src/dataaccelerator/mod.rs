@@ -465,6 +465,26 @@ pub trait DataAccelerator: Send + Sync {
         Ok(())
     }
 
+    /// Applies a widening schema-evolution plan to an existing table in the acceleration
+    /// engine, in place (without dropping the table or its data).
+    ///
+    /// Implementations must be idempotent: re-applying a plan that was already partially
+    /// or fully applied (e.g. after a crash between the engine DDL and the checkpoint
+    /// update) must succeed without error, so restart-time re-classification self-heals.
+    ///
+    /// The default implementation rejects the call; engines that support in-place schema
+    /// evolution must override this.
+    async fn evolve_table_schema(
+        &self,
+        _table_name: &str,
+        _source: &dyn AccelerationSource,
+        _plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(SchemaEvolutionUnsupported {
+            engine: self.name(),
+        }))
+    }
+
     /// Check if the accelerator is initialized for a component
     fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
         true
@@ -594,6 +614,17 @@ pub type ReloadProviderFactory = Arc<
      (DuckDB, SQLite, Cayenne, or Turso)."
 ))]
 pub struct SnapshotReloadUnsupported {
+    pub engine: &'static str,
+}
+
+/// Error returned by the default [`DataAccelerator::evolve_table_schema`]
+/// implementation when an engine does not support in-place schema evolution.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Acceleration engine '{engine}' does not support in-place schema evolution. \
+     The acceleration must be recreated to apply the new schema."
+))]
+pub struct SchemaEvolutionUnsupported {
     pub engine: &'static str,
 }
 

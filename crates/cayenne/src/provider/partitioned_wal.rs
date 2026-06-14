@@ -52,8 +52,8 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 
-use object_store::ObjectStore;
 use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Result;
@@ -279,9 +279,9 @@ impl PartitionedWal {
         store: &dyn ObjectStore,
         base_prefix: &ObjectStorePath,
     ) -> Result<ObjectStorePath> {
-        let wal_dir = base_prefix.child(PARTITIONED_WAL_DIR);
-        let final_key = wal_dir.child(format!("{}.json", self.commit_id));
-        let tmp_key = wal_dir.child(format!("{}.json.tmp", self.commit_id));
+        let wal_dir = base_prefix.clone().join(PARTITIONED_WAL_DIR);
+        let final_key = wal_dir.clone().join(format!("{}.json", self.commit_id));
+        let tmp_key = wal_dir.join(format!("{}.json.tmp", self.commit_id));
 
         // Compact serialization: see comment in `write_to` for the local-FS
         // path; the S3 case has the same trade-offs plus a smaller PUT payload
@@ -603,8 +603,8 @@ mod tests {
         // The tmp key for the same commit_id must be cleaned up after the final
         // key is published, so readers only ever see the committed WAL object.
         let tmp_key = base
-            .child(PARTITIONED_WAL_DIR)
-            .child(format!("{}.json.tmp", wal.commit_id));
+            .join(PARTITIONED_WAL_DIR)
+            .join(format!("{}.json.tmp", wal.commit_id));
         assert!(matches!(
             store.get(&tmp_key).await,
             Err(object_store::Error::NotFound { .. })

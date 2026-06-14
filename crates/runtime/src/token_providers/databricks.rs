@@ -106,7 +106,7 @@ impl DatabricksM2MTokenProvider {
             let mut next_wait = next_token_refresh_wait(expires_in);
 
             let mut backoff = FibonacciBackoffBuilder::new()
-                .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+                .max_duration(Some(Duration::from_mins(5))) // Cap at 5 minutes
                 .build();
 
             loop {
@@ -132,7 +132,7 @@ impl DatabricksM2MTokenProvider {
                     }
                     Err(e) => {
                         let backoff_duration =
-                            backoff.next_duration().unwrap_or(Duration::from_secs(300));
+                            backoff.next_duration().unwrap_or(Duration::from_mins(5));
                         tracing::error!(
                             "Databricks M2M token refresh failed: {}. Retrying in {:.2?}",
                             e,
@@ -228,7 +228,7 @@ async fn get_m2m_access_token(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await?;
-        return Err(format!("Failed to get access token: HTTP {status}, {error_text}",).into());
+        return Err(format!("Failed to get access token: HTTP {status}, {error_text}").into());
     }
 
     let token_response = response.json::<TokenResponse>().await?;
@@ -439,7 +439,7 @@ pub async fn get_m2m_token_provider(
     token_provider_registry: &Arc<TokenProviderRegistry>,
 ) -> Result<Arc<dyn TokenProvider>, Error> {
     token_provider_registry
-        .get_or_create_provider(format!("databricks_m2m_{client_id}"), || async {
+        .get_or_create_provider(format!("databricks_m2m_{endpoint}_{client_id}"), || async {
             DatabricksM2MTokenProvider::try_new(
                 endpoint.to_string(),
                 client_id.to_string(),
@@ -462,7 +462,7 @@ pub async fn get_u2m_token_provider(
 ) -> Result<Arc<dyn TokenProvider>, Error> {
     token_provider_registry
         .get_or_create_provider::<DatabricksU2MTokenProvider, std::convert::Infallible, _, _>(
-            format!("databricks_u2m_{client_id}"),
+            format!("databricks_u2m_{endpoint}_{client_id}"),
             || async {
                 Ok(DatabricksU2MTokenProvider::new(
                     endpoint.to_string(),

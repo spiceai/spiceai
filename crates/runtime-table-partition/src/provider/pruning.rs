@@ -37,7 +37,6 @@ use datafusion::{
     },
     config::ConfigOptions,
     error::DataFusionError,
-    execution::context::ExecutionProps,
     logical_expr::{
         BinaryExpr, ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF,
         expr::{InList, ScalarFunction},
@@ -154,8 +153,7 @@ fn evaluate_expr(
     guarantees: Vec<(Expr, NullableInterval)>,
 ) -> Result<ScalarValue, DataFusionError> {
     let dfschema = schema.clone().to_dfschema_ref()?;
-    let props = ExecutionProps::new();
-    let context = SimplifyContext::new(&props).with_schema(dfschema);
+    let context = SimplifyContext::default().with_schema(dfschema);
     let simplifier = ExprSimplifier::new(context).with_guarantees(guarantees.clone());
 
     let simplified_expr = simplifier.simplify(expr.clone())?;

@@ -1243,7 +1243,7 @@ impl DataSink for MemSink {
         let mut writable_targets: Vec<_> =
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
 
-        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches.into_iter()) {
+        for (target, mut batches) in writable_targets.iter_mut().zip(new_batches) {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
             match self.overwrite {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).

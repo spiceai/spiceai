@@ -338,40 +338,38 @@ fn extract_columns_from_expr(
             });
             projections.insert(Column::new(relation, &ident.value));
         }
-        Expr::CompoundIdentifier(idents) => {
-            if idents.len() >= 2 {
-                // Last part is the column name, rest is the table reference
-                let col_name = &idents[idents.len() - 1].value;
-                let table_parts: Vec<_> = idents[..idents.len() - 1]
-                    .iter()
-                    .map(|i| &i.value)
-                    .collect();
-                let table_ref_str = table_parts
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
+        Expr::CompoundIdentifier(idents) if idents.len() >= 2 => {
+            // Last part is the column name, rest is the table reference
+            let col_name = &idents[idents.len() - 1].value;
+            let table_parts: Vec<_> = idents[..idents.len() - 1]
+                .iter()
+                .map(|i| &i.value)
+                .collect();
+            let table_ref_str = table_parts
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
 
-                // Check if the first part is an alias
-                let tbl = if table_parts.len() == 1 {
-                    if let Some(resolved) = alias_map.get(table_parts[0]) {
-                        resolved.clone()
-                    } else {
-                        TableReference::parse_str(&table_ref_str).resolve("spice", "public")
-                    }
+            // Check if the first part is an alias
+            let tbl = if table_parts.len() == 1 {
+                if let Some(resolved) = alias_map.get(table_parts[0]) {
+                    resolved.clone()
                 } else {
                     TableReference::parse_str(&table_ref_str).resolve("spice", "public")
-                };
+                }
+            } else {
+                TableReference::parse_str(&table_ref_str).resolve("spice", "public")
+            };
 
-                projections.insert(Column::new(
-                    Some(TableReference::Full {
-                        catalog: Arc::clone(&tbl.catalog),
-                        schema: Arc::clone(&tbl.schema),
-                        table: Arc::clone(&tbl.table),
-                    }),
-                    col_name,
-                ));
-            }
+            projections.insert(Column::new(
+                Some(TableReference::Full {
+                    catalog: Arc::clone(&tbl.catalog),
+                    schema: Arc::clone(&tbl.schema),
+                    table: Arc::clone(&tbl.table),
+                }),
+                col_name,
+            ));
         }
         Expr::BinaryOp { left, right, .. } => {
             extract_columns_from_expr(left, projections, default_table, alias_map);

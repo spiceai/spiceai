@@ -25,9 +25,9 @@ use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::PhysicalExpr;
+use datafusion_physical_plan::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
-use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
@@ -118,16 +118,6 @@ impl VortexSource {
         self
     }
 
-    /// Enable or disable building `DataFusion`'s `FilePruner` for the underlying scan.
-    ///
-    /// When disabled, the opener never prunes files on statistics or partition
-    /// values; every candidate file is opened and scanned.
-    #[must_use]
-    pub fn with_file_pruning(mut self, enabled: bool) -> Self {
-        self.options.file_pruning = enabled;
-        self
-    }
-
     /// Set an [`ExpressionConvertor`] to control how `DataFusion` expressions should be converted and pushed down.
     #[must_use]
     pub fn with_expression_convertor(
@@ -179,6 +169,13 @@ impl VortexSource {
         self
     }
 
+    /// Set whether hash-join dynamic filters are evaluated inside the Vortex scan.
+    #[must_use]
+    pub fn with_dynamic_filter_pushdown(mut self, enabled: bool) -> Self {
+        self.options.dynamic_filter_pushdown = enabled;
+        self
+    }
+
     /// Returns the table options for this source.
     #[must_use]
     pub fn options(&self) -> &VortexTableOptions {
@@ -191,6 +188,25 @@ impl VortexSource {
         self.options = opts;
         self
     }
+}
+
+/// Returns `true` if `expr` is, or contains anywhere in its tree, a
+/// [`DynamicFilterPhysicalExpr`] (e.g. a hash-join build-side filter).
+fn contains_dynamic_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if expr.as_any().is::<DynamicFilterPhysicalExpr>() {
+        return true;
+    }
+    expr.children().into_iter().any(contains_dynamic_filter)
+}
+
+/// Classification of a pushdown filter, determining how it is applied to the Vortex scan.
+enum FilterDisposition {
+    /// Convertible and evaluated inside the Vortex scan (row-level + pruning).
+    RowEval,
+    /// Not row-evaluable, but kept in the file-pruning predicate.
+    PruneOnly,
+    /// Gated dynamic filter: bypasses the Vortex scan entirely.
+    Gated,
 }
 
 impl FileSource for VortexSource {
@@ -255,7 +271,6 @@ impl FileSource for VortexSource {
             file_metadata_cache: self.file_metadata_cache.as_ref().map(Arc::clone),
             segment_cache: self.segment_cache.as_ref().map(Arc::clone),
             projection_pushdown: self.options.projection_pushdown.enabled(),
-            file_pruning: self.options.file_pruning,
             scan_concurrency: Some(scan_concurrency),
         };
 
@@ -349,60 +364,70 @@ impl FileSource for VortexSource {
         let mut source = self.clone();
         source.target_partitions = Some(config.execution.target_partitions.max(1));
 
-        // Combine new filters with existing predicate for file pruning.
-        // This full predicate is used by FilePruner to eliminate files.
-        source.full_predicate = match source.full_predicate {
-            Some(predicate) => Some(conjunction(
-                std::iter::once(predicate).chain(filters.clone()),
-            )),
-            None => Some(conjunction(filters.clone())),
-        };
+        // Hash-join *dynamic* filters (e.g. a build-side `IN` list) are declined
+        // from the Vortex scan unless explicitly enabled.
+        let gate_dynamic = !self.options.dynamic_filter_pushdown;
 
-        let supported_filters = filters
-            .into_iter()
+        let classes: Vec<FilterDisposition> = filters
+            .iter()
             .map(|expr| {
-                if self
+                if gate_dynamic && contains_dynamic_filter(expr) {
+                    FilterDisposition::Gated
+                } else if self
                     .expression_convertor
-                    .can_be_pushed_down(&expr, self.table_schema.file_schema())
+                    .can_be_pushed_down(expr, self.table_schema.file_schema())
                 {
-                    PushedDownPredicate::supported(expr)
+                    FilterDisposition::RowEval
                 } else {
-                    PushedDownPredicate::unsupported(expr)
+                    FilterDisposition::PruneOnly
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        if supported_filters
+        // Combine non-gated filters with the existing predicate for file pruning.
+        // This full predicate is used by FilePruner to eliminate files.
+        let prunable = filters
             .iter()
-            .all(|p| matches!(p.discriminant, PushedDown::No))
-        {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; supported_filters.len()],
-            )
-            .with_updated_node(Arc::new(source) as _));
-        }
-
-        let supported = supported_filters
-            .iter()
-            .filter_map(|p| match p.discriminant {
-                PushedDown::Yes => Some(&p.predicate),
-                PushedDown::No => None,
-            })
-            .cloned();
-
-        let predicate = match source.vortex_predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
-            None => conjunction(supported),
+            .zip(&classes)
+            .filter(|(_, class)| !matches!(class, FilterDisposition::Gated))
+            .map(|(expr, _)| Arc::clone(expr));
+        source.full_predicate = if let Some(predicate) = source.full_predicate {
+            Some(conjunction(std::iter::once(predicate).chain(prunable)))
+        } else {
+            let prunable: Vec<_> = prunable.collect();
+            (!prunable.is_empty()).then(|| conjunction(prunable))
         };
 
-        tracing::debug!(%predicate, "Saving predicate");
+        // Only row-evaluable filters enter the Vortex scan predicate.
+        if classes
+            .iter()
+            .any(|class| matches!(class, FilterDisposition::RowEval))
+        {
+            let row_eval = filters
+                .iter()
+                .zip(&classes)
+                .filter(|(_, class)| matches!(class, FilterDisposition::RowEval))
+                .map(|(expr, _)| Arc::clone(expr));
+            let predicate = match source.vortex_predicate {
+                Some(predicate) => conjunction(std::iter::once(predicate).chain(row_eval)),
+                None => conjunction(row_eval),
+            };
+            tracing::debug!(%predicate, "Saving predicate");
+            source.vortex_predicate = Some(predicate);
+        }
 
-        source.vortex_predicate = Some(predicate);
+        let pushdown_result = classes
+            .iter()
+            .map(|class| match class {
+                FilterDisposition::RowEval => PushedDown::Yes,
+                FilterDisposition::PruneOnly | FilterDisposition::Gated => PushedDown::No,
+            })
+            .collect();
 
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            supported_filters.iter().map(|f| f.discriminant).collect(),
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_result)
+                .with_updated_node(Arc::new(source) as _),
         )
-        .with_updated_node(Arc::new(source) as _))
     }
 
     fn try_pushdown_projection(
@@ -482,5 +507,75 @@ mod tests {
             resolve_scan_concurrency(ScanConcurrency::Off, 16, 1, false),
             1
         );
+    }
+
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+    use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::expressions as df_expr;
+    use vortex::VortexSessionDefault;
+
+    fn int32_source(dynamic_filter_pushdown: bool) -> VortexSource {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table_schema = TableSchema::new(schema, vec![]);
+        VortexSource::new(table_schema, VortexSession::default())
+            .with_dynamic_filter_pushdown(dynamic_filter_pushdown)
+    }
+
+    fn in_list_dynamic_filter() -> Arc<dyn PhysicalExpr> {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let column = Arc::new(df_expr::Column::new("id", 0)) as Arc<dyn PhysicalExpr>;
+        let values = vec![
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(3)))) as Arc<dyn PhysicalExpr>,
+            Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(7)))) as Arc<dyn PhysicalExpr>,
+        ];
+        let in_list = Arc::new(
+            df_expr::InListExpr::try_new(Arc::clone(&column), values, false, &schema)
+                .expect("IN-list expression should be valid"),
+        ) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![column],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(in_list)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as Arc<dyn PhysicalExpr>
+    }
+
+    #[test]
+    fn dynamic_filter_is_declined_by_default() {
+        let source = int32_source(false);
+        let result = source
+            .try_pushdown_filters(vec![in_list_dynamic_filter()], &ConfigOptions::default())
+            .expect("pushdown should succeed");
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+
+        let updated = result.updated_node.expect("updated node should be present");
+        let updated = updated
+            .as_any()
+            .downcast_ref::<VortexSource>()
+            .expect("updated node should be a VortexSource");
+        assert!(updated.vortex_predicate.is_none());
+        assert!(updated.full_predicate.is_none());
+    }
+
+    #[test]
+    fn dynamic_filter_is_pushed_down_when_enabled() {
+        let source = int32_source(true);
+        let result = source
+            .try_pushdown_filters(vec![in_list_dynamic_filter()], &ConfigOptions::default())
+            .expect("pushdown should succeed");
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::Yes]));
+
+        let updated = result.updated_node.expect("updated node should be present");
+        let updated = updated
+            .as_any()
+            .downcast_ref::<VortexSource>()
+            .expect("updated node should be a VortexSource");
+        assert!(updated.vortex_predicate.is_some());
     }
 }

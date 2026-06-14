@@ -37,6 +37,7 @@ use data_components::http::auth::{
 };
 use data_components::http::json_nest::HttpJsonNesting;
 use data_components::rate_limit::RateLimiter;
+use runtime_datafusion::url_table::{is_blocked_internal_hostname, is_internal_ip};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::prelude::*;
@@ -44,6 +45,7 @@ use spicepod::semantic::Column;
 use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
@@ -157,6 +159,13 @@ impl Https {
             return true;
         }
 
+        // Vortex is a structured columnar format handled by the listing connector.
+        // It is only built on non-Windows targets (see `get_file_format_and_extension`).
+        #[cfg(not(windows))]
+        if file_format == "vortex" {
+            return true;
+        }
+
         // JSON format is structured only for static file endpoints.
         // Dynamic API endpoints (with allowed_request_paths, request_query_filters, etc.)
         // should use HttpTableProvider instead.
@@ -179,6 +188,12 @@ impl Https {
                 extension.as_deref(),
                 Some("parquet" | "csv" | "tsv" | "arrow" | "avro" | "jsonl" | "ndjson" | "ldjson")
             ) {
+                return true;
+            }
+
+            // Vortex is only built on non-Windows targets.
+            #[cfg(not(windows))]
+            if extension.as_deref() == Some("vortex") {
                 return true;
             }
 
@@ -795,6 +810,32 @@ impl Https {
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                const MAX_REDIRECTS: usize = 5;
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    return attempt.error("too many redirects");
+                }
+                // SSRF defense-in-depth: refuse to follow a redirect to an
+                // internal target. Reuses the URL-table SSRF classifier so the
+                // two guards stay in lock-step — covering loopback, private/
+                // RFC1918, link-local (incl. the cloud-metadata endpoint),
+                // unique-local, CGNAT, unspecified, multicast, and reserved
+                // ranges for both IPv4 and IPv6, including IPv4-mapped IPv6
+                // forms like `::ffff:169.254.169.254`. Hostname redirects (e.g.
+                // `localhost`) can't be DNS-resolved in this synchronous
+                // closure, so well-known internal names are rejected by literal
+                // match; reqwest resolves any remaining hostnames at connect time.
+                let to_internal = match attempt.url().host() {
+                    Some(url::Host::Ipv4(ip)) => is_internal_ip(IpAddr::V4(ip)),
+                    Some(url::Host::Ipv6(ip)) => is_internal_ip(IpAddr::V6(ip)),
+                    Some(url::Host::Domain(domain)) => is_blocked_internal_hostname(domain),
+                    None => false,
+                };
+                if to_internal {
+                    return attempt.error("redirect to a private address is not allowed");
+                }
+                attempt.follow()
+            }))
             .pool_max_idle_per_host(pool_max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
 
@@ -2352,6 +2393,26 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     async fn test_http_auto_structured_format_detects_compressed_file_extension_param() {
         let connector = test_connector_with(&[("file_extension", ".csv.zst")]).await;
         let dataset = test_dataset("https://example.com/download", RefreshMode::Full, None).await;
+
+        assert!(connector.is_structured_format(&dataset));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_http_structured_format_detects_explicit_vortex() {
+        let connector = test_connector(Some("vortex")).await;
+        let dataset =
+            test_dataset("https://example.com/data.vortex", RefreshMode::Full, None).await;
+
+        assert!(connector.is_structured_format(&dataset));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_http_auto_structured_format_detects_vortex_extension() {
+        let connector = test_connector(None).await;
+        let dataset =
+            test_dataset("https://example.com/data.vortex", RefreshMode::Full, None).await;
 
         assert!(connector.is_structured_format(&dataset));
     }

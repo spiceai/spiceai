@@ -352,6 +352,7 @@ fn collect_file_scan_configs<'a>(
 /// the ones that live in other crates or are crate-private. Adding a new
 /// wrapper requires touching this function explicitly — that's intentional;
 /// it stops a future operator from silently being treated as transparent.
+#[expect(deprecated)]
 fn is_identity_preserving_wrapper(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let any = plan.as_any();
     if any.downcast_ref::<ProjectionExec>().is_some()
@@ -518,6 +519,10 @@ impl DisplayAs for CayenneAccelerationExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for CayenneAccelerationExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "CayenneAccelerationExec"
     }
@@ -537,7 +542,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
     }
 
@@ -629,11 +634,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
         self.inner.metrics()
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        #[expect(deprecated)]
-        self.inner.statistics()
-    }
-
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         self.inner.partition_statistics(partition)
     }
@@ -696,19 +696,6 @@ impl ExecutionPlan for CayenneAccelerationExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
         Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
-    }
-}
-
-pub(crate) trait IsCayenneAccelerationExec {
-    /// Returns true if the execution plan is a `CayenneAccelerationExec`
-    fn is_cayenne_acceleration_exec(&self) -> bool;
-}
-
-impl IsCayenneAccelerationExec for Arc<dyn ExecutionPlan> {
-    fn is_cayenne_acceleration_exec(&self) -> bool {
-        self.as_any()
-            .downcast_ref::<CayenneAccelerationExec>()
-            .is_some()
     }
 }
 
@@ -796,6 +783,31 @@ mod tests {
         // return None rather than misattributing identity.
         let exec = CayenneAccelerationExec::new(one_partition_plan());
         assert!(exec.scan_identity().is_none());
+    }
+
+    /// Frozen/clean partition: a scan with no deletion filter (the wrapper is
+    /// applied directly over the file scan) must surface the inner plan's
+    /// `Exact` per-partition statistics unchanged — this is the join-side
+    /// selection / pruning signal that the deletion-filter path deliberately
+    /// relaxes to `Inexact` only when deletions are present.
+    #[test]
+    fn cayenne_exec_passes_through_exact_partition_statistics() {
+        use datafusion_common::stats::Precision;
+
+        let exec = CayenneAccelerationExec::new(one_partition_plan());
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition statistics should be available");
+        assert_eq!(
+            stats.num_rows,
+            Precision::Exact(3),
+            "clean scan must keep the inner plan's exact row count"
+        );
+        // Aggregate over all partitions must likewise stay exact.
+        let agg = exec
+            .partition_statistics(None)
+            .expect("aggregate statistics should be available");
+        assert_eq!(agg.num_rows, Precision::Exact(3));
     }
 
     #[test]

@@ -27,11 +27,15 @@ async-trait.workspace = true
 data_components = { path = "../../data_components", features = ["duckdb"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["duckdb"] }
-duckdb.workspace = true
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["duckdb"] }
 snafu.workspace = true
+duckdb = { workspace = true, features = [
+	"bundled",
+	"r2d2",
+	"extensions-full",
+] }
 
 [features]
 default = []
