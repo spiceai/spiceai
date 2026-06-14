@@ -5773,6 +5773,18 @@ impl CayenneTableProvider {
             }
         }
 
+        // Manifest snapshot model (phase 5): if the table was last written before
+        // manifest population existed, its live snapshots have data files but no
+        // `cayenne_snapshot_file` rows. Backfill them from the directory listing
+        // now — synchronously and before the provider is returned — so the live
+        // manifest is complete (not partial) before any scan can run. Recovery
+        // above already moved any interrupted staged append into its snapshot, so
+        // the directory listing this reads is the final, committed file set. No
+        // background task is running yet, so this cannot race a write or
+        // compaction. Best-effort: it leaves the manifest empty on failure and
+        // the scan falls back to directory listing.
+        provider.backfill_snapshot_manifest_if_empty().await;
+
         Ok(provider)
     }
 
@@ -11084,6 +11096,67 @@ impl CayenneTableProvider {
                 }
             }
         }
+    }
+
+    /// Manifest snapshot model (phase 5): backfill `cayenne_snapshot_file` for a
+    /// table opened against snapshots that predate manifest population.
+    ///
+    /// A snapshot written before this code existed (or whose post-write rebuild
+    /// never ran because the table has only been read since) has data files on
+    /// disk but no manifest rows. The scan's dual-source fallback handles an
+    /// *empty* manifest by listing the directory, so such a snapshot is read
+    /// correctly even with `scan_from_manifest` on — but it never benefits from
+    /// the manifest, and a half-written manifest would be *wrong* (the scan only
+    /// falls back when the manifest is empty, never when it is partial). This
+    /// pass closes that gap by making the live manifest either complete or empty,
+    /// never partial, before the provider is handed to a caller.
+    ///
+    /// Idempotent and gated on emptiness: if ANY manifest row already exists for
+    /// the table, the write path is maintaining it, so this is a single cheap
+    /// metastore read and returns. Only a table whose manifest is entirely empty
+    /// pays the directory listing — the same listing a scan would do anyway. Runs
+    /// at open before the background compactor starts, so the live set cannot
+    /// shift under it (no lock contention) and no scan can observe a partial
+    /// manifest. Best-effort: any failure leaves the manifest empty and is logged
+    /// — the dual-source read path then lists the directory, so a backfill error
+    /// can never make a scan miss a live file or read one outside its snapshot.
+    async fn backfill_snapshot_manifest_if_empty(&self) {
+        match self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await
+        {
+            Ok(rows) if !rows.is_empty() => {
+                // Manifest already populated (write path or a prior backfill);
+                // leave it to the live write/compaction paths.
+                return;
+            }
+            Ok(_) => {
+                // Empty: fall through to backfill from directory listing.
+            }
+            Err(error) => {
+                // Could not determine emptiness; skip rather than risk writing a
+                // partial manifest atop an unknown state. Directory listing
+                // remains the scan's source.
+                tracing::warn!(
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Snapshot manifest backfill skipped: failed to read existing manifest; \
+                     scan falls back to directory listing"
+                );
+                return;
+            }
+        }
+
+        // Same complete-live-set rebuild the post-write maintenance lane runs
+        // (current ∪ protected, each tagged with its own commit sequence). At
+        // open the background compactor has not started, so `compaction_lock` is
+        // uncontended and the live set is stable for the whole rebuild.
+        tracing::debug!(
+            table = self.table_metadata.table_name.as_str(),
+            "Backfilling empty snapshot manifest from directory listing at open"
+        );
+        self.rebuild_live_snapshot_manifests().await;
     }
 
     /// Debug-only invariant check: the manifest file-name set persisted for
@@ -21791,6 +21864,218 @@ mod tests {
             file_group_paths(&fallback_files.file_groups),
             file_group_paths(&listing_files.file_groups),
             "with an empty manifest the flag-ON scan must fall back to the directory listing"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 5): backfill `cayenne_snapshot_file` on
+    // open for snapshots that predate manifest population.
+    // ----------------------------------------------------------------------
+
+    /// Append-mode (no-PK, on-disk) table over a durable `SQLite` metastore that
+    /// the test can REOPEN. Mirrors `create_memory_mode_upsert_table` but for the
+    /// append shape the backfill test needs: every insert lands as an on-disk
+    /// `.vortex` file (`inline_max_rows: 0`) so there is a real directory listing
+    /// to backfill from. Returns the catalog so the test can clear the manifest
+    /// and reopen against the same durable state.
+    async fn create_reopenable_append_table(
+        table_name: &str,
+        schema: SchemaRef,
+        scan_from_manifest: bool,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (
+        CayenneTableProvider,
+        Arc<dyn MetadataCatalog>,
+        tempfile::TempDir,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("temp dir created");
+        let metadata_dir = format!(
+            "{}/metadata",
+            temp_dir.path().to_str().expect("should be str")
+        );
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("should be str"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let vortex_config = VortexConfig {
+            scan_from_manifest,
+            // On-disk files only: no inline memtable, so each insert is a Vortex
+            // object in the snapshot dir (the manifest's domain).
+            inline_max_rows: 0,
+            ..VortexConfig::default()
+        };
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// Phase 5: a table whose live snapshot has on-disk data files but NO
+    /// manifest rows (it predates manifest population) must have its manifest
+    /// backfilled from the directory listing on open — completely, so the
+    /// `scan_from_manifest`-ON scan reads the right files. The backfilled set must
+    /// equal the directory listing, the backfill must be idempotent across a
+    /// second reopen, and the end-to-end scan must return every row.
+    #[tokio::test]
+    async fn backfill_on_open_populates_empty_manifest_from_directory() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let (provider, catalog, _temp_dir) = create_reopenable_append_table(
+            "manifest_backfill_on_open",
+            Arc::clone(&schema),
+            true, // scan_from_manifest ON: the scan must read the backfilled set
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        // Two batches → a multi-file snapshot to backfill.
+        let rows_per_file = INLINE_MAX_ROWS + 16;
+        let total_rows = 2 * rows_per_file;
+        let ctx = SessionContext::new();
+        for batch_idx in 0..2_usize {
+            let start =
+                i64::try_from(batch_idx * rows_per_file).expect("test batch start fits in i64");
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                make_listing_parity_batch(Arc::clone(&schema), start, rows_per_file),
+            )
+            .await;
+        }
+
+        // Simulate a snapshot written before manifest population existed: drop
+        // every manifest row the write path may have produced. The directory
+        // listing is untouched (the data files stay on disk).
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+        let expected_files = listing_file_names(&provider, &snapshot_id).await;
+        assert!(
+            expected_files.len() >= 2,
+            "the two on-disk-file inserts must produce a multi-file snapshot to backfill"
+        );
+        provider
+            .catalog
+            .clear_snapshot_files(&table_id)
+            .await
+            .expect("clear manifest to simulate a pre-population snapshot");
+        assert!(
+            manifest_file_names(&provider.catalog, &table_id, &snapshot_id)
+                .await
+                .is_empty(),
+            "the manifest must be empty before reopen (simulated pre-population state)"
+        );
+
+        // Reopen the SAME table from the durable metastore. `new_internal` runs
+        // the phase-5 backfill synchronously before returning the provider.
+        drop(provider);
+        let reopened =
+            CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+                .open("manifest_backfill_on_open")
+                .await
+                .expect("reopen table");
+
+        // The backfilled manifest must equal the directory listing exactly — not
+        // a subset (a partial manifest would silently drop files from the scan).
+        let backfilled = manifest_file_names(&reopened.catalog, &table_id, &snapshot_id).await;
+        assert_eq!(
+            backfilled, expected_files,
+            "backfill must reproduce the directory listing exactly (complete, not partial)"
+        );
+
+        // End-to-end: with `scan_from_manifest` ON the scan resolves its files
+        // from the just-backfilled manifest and must return every row.
+        let scanned = scan_sorted_ids(&reopened).await;
+        let expected_ids =
+            (0..i64::try_from(total_rows).expect("row count fits in i64")).collect::<Vec<_>>();
+        assert_eq!(
+            scanned, expected_ids,
+            "the manifest-routed scan over the backfilled manifest must read every row"
+        );
+
+        // Idempotence: a SECOND reopen must see the manifest already populated
+        // (the emptiness gate) and leave it byte-for-byte identical — no duplicate
+        // rows, no churn.
+        drop(reopened);
+        let reopened_again = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .open("manifest_backfill_on_open")
+            .await
+            .expect("reopen table a second time");
+        assert_eq!(
+            manifest_file_names(&reopened_again.catalog, &table_id, &snapshot_id).await,
+            expected_files,
+            "a second open must not re-list or duplicate an already-populated manifest"
+        );
+    }
+
+    /// Phase 5: backfill is gated on the manifest being EMPTY. A table the write
+    /// path has already populated must NOT be re-listed or perturbed on open —
+    /// the live write/compaction paths own it from then on. We prove the gate by
+    /// poisoning the manifest with a sentinel row that the directory listing
+    /// could never produce: if open left it intact, the gate held; if open
+    /// re-listed, the sentinel would be gone.
+    #[tokio::test]
+    async fn backfill_on_open_is_skipped_when_manifest_already_populated() {
+        let runtime_env = SessionContext::new().runtime_env();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let (provider, catalog, _temp_dir) = create_reopenable_append_table(
+            "manifest_backfill_gate",
+            Arc::clone(&schema),
+            false,
+            Arc::clone(&runtime_env),
+        )
+        .await;
+
+        insert_batch(&provider, int64_id_batch(&[1, 2, 3])).await;
+
+        // A row no directory listing could ever yield (the listing only emits
+        // real `.vortex` file names under the snapshot dir).
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+        let sentinel_path = "sentinel-not-a-real-file.vortex".to_string();
+        provider
+            .catalog
+            .upsert_snapshot_file(&SnapshotFile {
+                table_id: table_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                file_path: sentinel_path.clone(),
+                row_count: 0,
+                file_size_bytes: 1,
+                min_sequence: 0,
+                max_sequence: 0,
+            })
+            .await
+            .expect("seed a sentinel manifest row");
+
+        // Reopen: the manifest is non-empty, so the emptiness gate must skip the
+        // backfill entirely and leave the sentinel in place.
+        drop(provider);
+        let reopened = CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .open("manifest_backfill_gate")
+            .await
+            .expect("reopen table");
+        assert!(
+            manifest_file_names(&reopened.catalog, &table_id, &snapshot_id)
+                .await
+                .contains(&sentinel_path),
+            "a non-empty manifest must NOT be re-listed on open (the gate must hold)"
         );
     }
 
