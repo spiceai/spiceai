@@ -13,19 +13,15 @@ description: "SELECT id, answer FROM vector_search(qs, 'second', answer) order b
 |               |   SortPreservingMergeExec: [_score@2 DESC, id@0 ASC NULLS LAST], fetch=4                                                                                         |
 |               |     SortExec: TopK(fetch=4), expr=[_score@2 DESC, id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                             |
 |               |       ProjectionExec: expr=[id@0 as id, answer@2 as answer, _score@1 as _score]                                                                                  |
-|               |         HashJoinExec: mode=CollectLeft, join_type=Left, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@1)], projection=[id@0, _score@1, answer@2]              |
+|               |         HashJoinExec: mode=CollectLeft, join_type=Left, on=[(id@0, id@1)], projection=[id@0, _score@1, answer@2]                                                 |
 |               |           CoalescePartitionsExec                                                                                                                                 |
 |               |             ProjectionExec: expr=[CAST(key@0 AS Int64) as id, 1 - distance@1 as _score]                                                                          |
-|               |               CooperativeExec                                                                                                                                    |
-|               |                 BytesProcessedExec                                                                                                                               |
-|               |                   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                           |
-|               |                     CooperativeExec                                                                                                                              |
-|               |                       S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                               |
-|               |           SchemaCastScanExec                                                                                                                                     |
-|               |             CooperativeExec                                                                                                                                      |
 |               |               BytesProcessedExec                                                                                                                                 |
 |               |                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                             |
-|               |                   CooperativeExec                                                                                                                                |
-|               |                     VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "qs"."answer", "qs"."id" FROM "qs"                                 |
+|               |                   S3VectorsQueryExec (INDEX_NAME_1): limit=100                                                                                                   |
+|               |           SchemaCastScanExec                                                                                                                                     |
+|               |             BytesProcessedExec                                                                                                                                   |
+|               |               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                               |
+|               |                 VirtualExecutionPlan name=duckdb compute_context=:memory: base_sql=SELECT "qs"."answer", "qs"."id" FROM "qs"                                     |
 |               |                                                                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------+
