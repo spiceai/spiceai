@@ -2214,10 +2214,7 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
-    async fn get_all_snapshot_files(
-        &self,
-        table_id: &str,
-    ) -> CatalogResult<Vec<SnapshotFile>> {
+    async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>> {
         self.metastore
             .query_helper(
                 QueryParams {

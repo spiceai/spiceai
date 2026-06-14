@@ -3189,6 +3189,19 @@ impl PkDeletionSnapshot {
         }
     }
 
+    /// Count of keys with a live deletion in this snapshot — the per-query
+    /// merge-on-read probe scales with this, so the seq-prefix bake is triggered
+    /// on it (see `BAKE_DELETION_INDEX_TRIGGER`). `0` for `PositionBased` (those
+    /// tombstones are file-scoped, never seq-tagged, and are out of the bake's
+    /// scope).
+    fn delete_len(&self) -> usize {
+        match self {
+            Self::PositionBased => 0,
+            Self::Int64Pk { tombstones } => tombstones.delete_len(),
+            Self::RowConverterBased { tombstones } => tombstones.delete_len(),
+        }
+    }
+
     /// Extend this snapshot by ONE append's tombstone delta — O(delta), the
     /// persistent-index extend. Used by the append path to keep the
     /// merged-scan-deletions memo CURRENT in lockstep (under sustained CDC the
@@ -3329,6 +3342,36 @@ const PROTECTED_TIER_GROWTH: u64 = 8;
 /// bounding the per-pass read/write amplification regardless of how many
 /// same-tier runs have accumulated.
 const PROTECTED_MERGE_MAX_WIDTH: usize = 32;
+
+// ---------------------------------------------------------------------------
+// Seq-prefix BAKE (Stage 2): shrink the merge-on-read deletion index.
+//
+// The bake is a seq-prefix SELECTION VARIANT of the subset compaction: it
+// consolidates the OLD protected snapshots that form a clean
+// `max_sequence <= T` prefix (applying the deletion snapshot, so the merged
+// output holds only survivors), then prunes the in-memory deletion index of
+// every tombstone with `delete_seq <= T`. The per-query merge-on-read probe
+// scales with the live tombstone count, so a small index is the read-side win.
+// Hardcoded for this validation cut; promote to `CayenneContext` config /
+// adaptive wiring in Stage 3 once the lever is proven.
+// ---------------------------------------------------------------------------
+
+/// How many of the MOST-RECENT protected snapshots the bake leaves UNTOUCHED
+/// (`K`). The newest snapshots receive the active delete stream, so baking them
+/// every pass would re-merge hot deltas for no index shrink (write-amp with no
+/// read win). Keeping a small tail unbaked means each bake consolidates only the
+/// settled older prefix; the cutoff `T` is the highest `max_sequence` among the
+/// snapshots OLDER than this tail. With fewer than `K + 1` protected snapshots
+/// there is no settled prefix and the bake is a no-op.
+const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
+
+/// Deletion-index size (count of live PK tombstones, `delete_len()`) at or above
+/// which a seq-prefix bake is worth triggering. The bake exists to shrink this
+/// index, so it is gated on the very quantity it reduces: below this floor the
+/// per-query probe is already cheap and a bake would only add write-amp. Chosen
+/// well above the steady-state churn of a healthy CDC table so the bake fires
+/// only once tombstones have genuinely accumulated (amortizing its write cost).
+const BAKE_DELETION_INDEX_TRIGGER: usize = 50_000;
 
 /// Classify a protected snapshot's on-disk byte size into an LSM-style size
 /// tier. Tier 0 covers everything up to `base_bytes`; each higher tier covers
@@ -11200,20 +11243,40 @@ impl CayenneTableProvider {
     /// append path's coalesced post-write maintenance lane.
     ///
     /// Per-file sequence ranges are TRUE (no longer a single per-snapshot
-    /// watermark), resolved by snapshot kind:
+    /// watermark), resolved by snapshot kind. BOTH kinds use
+    /// [`ManifestSequenceTag::PreserveOrUniform`] — preserve any range a
+    /// write-site already authored for a file, and apply the per-kind default
+    /// only to a brand-new (untagged) file:
     /// - **Protected snapshots** (CDC-staged-append publishes, sync upserts,
     ///   mem-tier checkpoints) are written by ONE reserved sequence — the
     ///   in-memory protected-set value, which IS that reservation/threshold
-    ///   sequence. Every file therefore gets `[S, S]` ([`ManifestSequenceTag::Uniform`]),
-    ///   which is exactly correct: by the seq-ordering invariant every row in
-    ///   the snapshot was committed at `S`.
-    /// - **The current snapshot** is the consolidated output of the compaction /
-    ///   overwrite (or genesis) that minted it, so its files carry a MERGED
-    ///   `[min, max]` recorded at that write. This re-list MUST NOT clobber that
-    ///   range, so it runs in [`ManifestSequenceTag::PreserveOrConservative`]
-    ///   mode (keep the recorded range; tag any brand-new file `[0, current_seq]`,
-    ///   always bake-eligible). `current_seq` comes from `cayenne_snapshot_sequence`
+    ///   sequence. A fresh file therefore defaults to `[S, S]`, which is exactly
+    ///   correct: by the seq-ordering invariant every row in the snapshot was
+    ///   committed at `S`. (A subset-compaction output is a protected snapshot
+    ///   too, but it AUTHORED its merged `[min, max]` at commit time, so the
+    ///   preserve arm keeps that range rather than the delete-seq threshold.)
+    /// - **The current snapshot** is USUALLY a consolidation/overwrite/genesis
+    ///   output whose files carry a MERGED `[min, max]` recorded at that write —
+    ///   but a plain-append table's current snapshot also accretes raw appends,
+    ///   whose true min is unknown here. So a fresh current-snapshot file
+    ///   defaults to `[0, current_seq]` (always bake-eligible — `min = 0` — never
+    ///   wrongly referenced-in-place), while the preserve arm keeps any
+    ///   authored merged range. `current_seq` comes from `cayenne_snapshot_sequence`
     ///   (0 if absent, e.g. just after an overwrite clears the sequence rows).
+    ///
+    /// **Load-bearing invariant** (the seq-prefix bake depends on it): a file's
+    /// `min_sequence` is a CLEAN WATERMARK — the file holds only rows that are
+    /// free of any deletion with `delete_seq <= min_sequence`. This holds because
+    /// every file-producing path either writes brand-new rows committed at a
+    /// single sequence `S` (so `min_sequence = S` and no `<= S` delete can target
+    /// a row that did not yet exist) or applies the visible deletions at write
+    /// time and records the merged survivor range (so any `<= min_sequence`
+    /// delete is already physically applied). A raw append is conservatively
+    /// tagged `[0, current_seq]`, keeping it bake-eligible rather than asserting a
+    /// clean watermark it cannot prove. This is precisely why
+    /// `partition_manifest_by_sequence` splits on `min_sequence` (not
+    /// `max_sequence`) and why pruning the deletion index at `T` after baking
+    /// every `min_sequence <= T` file resurrects nothing.
     ///
     /// Upsert-only — GC of stale rows is the compaction/overwrite/drop paths' job
     /// (see the call-site comment). Caller MUST hold `compaction_lock` so the
@@ -12261,6 +12324,415 @@ impl CayenneTableProvider {
                 telemetry::KeyValue::new("kind", "subset"),
             ],
         );
+
+        Ok(true)
+    }
+
+    /// Seq-prefix BAKE (Stage 2): consolidate the OLD protected snapshots that
+    /// form a clean `max_sequence <= T` prefix — applying the deletion snapshot so
+    /// the merged output holds only survivors — then PRUNE the in-memory deletion
+    /// index of every tombstone with `delete_seq <= T`, shrinking the per-query
+    /// merge-on-read probe.
+    ///
+    /// This is a SELECTION VARIANT of [`Self::compact_protected_snapshots_subset_inner`]:
+    /// it reuses the identical merge → author-manifest → CAS-swap → retire+sweep
+    /// flow, swapping only (1) the input SELECTOR (seq-prefix instead of size-tier)
+    /// and (2) a post-commit index prune. The merged snapshot is self-contained in
+    /// its own dir; the newer (`min_sequence > T`) protected snapshots are LEFT
+    /// UNTOUCHED — each remains a separate protected snapshot read from its own dir
+    /// with its own threshold by the existing scan union ([`Self::scan_protected_snapshots`]).
+    /// No cross-snapshot file references are created, so no scan/GC/schema change is
+    /// needed; the existing whole-dir retire/sweep reaps the merged inputs.
+    ///
+    /// ## Cutoff `T` and which snapshots are selected
+    ///
+    /// Protected-snapshot ids are `UUIDv7` (lexical == creation order); under CDC
+    /// append, creation order tracks commit sequence. We keep the newest
+    /// [`BAKE_KEEP_RECENT_SNAPSHOTS`] (`K`) snapshots UNBAKED so the active delete
+    /// stream is not re-merged every pass, and consider the older prefix. `T` is
+    /// the highest per-file `max_sequence` over that older prefix's manifests, so
+    /// every selected snapshot trivially has all files `max_sequence <= T`. With
+    /// fewer than `K + 2` protected snapshots there is no merge-worthy settled
+    /// prefix and this is a no-op.
+    ///
+    /// ## Clean-prefix invariant (resurrect-rows-critical)
+    ///
+    /// Pruning `delete_seq <= T` is sound ONLY IF every LIVE snapshot whose files
+    /// reach at or below `T` (`min_sequence <= T`) was merged into the output `M` —
+    /// otherwise a pruned tombstone could still delete a row that physically
+    /// survives in an unmerged snapshot, resurrecting it. After the swap we ASSERT
+    /// that no remaining live snapshot (the current snapshot OR any unselected
+    /// protected snapshot) has `min_sequence <= T`. If the assertion fails (e.g. a
+    /// plain-append current snapshot tagged `[0, current_seq]`), we STILL keep the
+    /// committed merge (publishing a merge is always safe) but SKIP the prune and
+    /// log it. For the CDC-upsert target the data lives in protected snapshots and
+    /// the current snapshot is genesis/compaction-output, so the assertion holds.
+    ///
+    /// Gated to KEY-delete tables ([`Self::should_capture_positions`] false): the
+    /// prune is a no-op for position deletes (file-scoped, not seq-tagged) and
+    /// position-delete subset compaction serializes against writers — out of scope.
+    ///
+    /// Returns `Ok(true)` if a bake merge was committed, `Ok(false)` for a no-op
+    /// (position mode, fewer than `K + 2` protected snapshots, no clean prefix with
+    /// a populated manifest, or the CAS lost a race).
+    async fn bake_seq_prefix_protected_snapshots(&self) -> Result<bool> {
+        // GATE: key-delete tables only. Position deletes are file-scoped (the
+        // prune is a no-op for them) and their subset compaction must serialize
+        // against writers — neither is the seq-prefix bake's domain.
+        if self.should_capture_positions() || self.pk_deletion_strategy.is_position_based() {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping seq-prefix bake: position-delete table (out of scope)",
+            );
+            return Ok(false);
+        }
+
+        let Ok(_guard) = self.compaction_lock.try_lock() else {
+            tracing::trace!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Skipping seq-prefix bake: another compaction pass already running",
+            );
+            return Ok(false);
+        };
+
+        let compaction_start = std::time::Instant::now();
+
+        // --- Phase 1: short fence read — coherent input set. ---
+        // Capture the protected set, each input's deletion threshold, the live
+        // deletion snapshot, and its max delete sequence together under the read
+        // fence (the SAME coherence requirement the size-tier path documents:
+        // a separate max-delete-seq load could observe a newer ArcSwap version
+        // than `deletion_snapshot`, tagging an un-applied deletion as
+        // already-applied and resurrecting the rows it deletes).
+        let (ordered_ids, thresholds, fence_max_delete_seq, deletion_snapshot) = {
+            let _fence = self.listing_fence.read().await;
+            let protected = self.protected_snapshots.load_full();
+            // Need at least K newest-to-keep + 2 to merge an older prefix.
+            if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+                return Ok(false);
+            }
+            let mut ids: Vec<String> = protected.keys().cloned().collect();
+            ids.sort();
+            let thresholds: std::collections::HashMap<String, i64> = ids
+                .iter()
+                .map(|id| (id.clone(), protected.get(id).copied().unwrap_or(0)))
+                .collect();
+            let deletion_snapshot = self.pk_deletion_snapshot();
+            let fence_max_delete_seq = deletion_snapshot.max_sequence_number().unwrap_or(0);
+            (ids, thresholds, fence_max_delete_seq, deletion_snapshot)
+        };
+
+        // --- Seq-prefix selection (replaces size-tier selection). ---
+        // Candidate prefix = all but the newest K (creation-/sequence-ordered).
+        // A candidate is bake-eligible only with a POPULATED manifest (an empty
+        // manifest has no per-file sequence range, so the seq-prefix split is
+        // undefined — defer it to a later pass once the manifest is rebuilt).
+        let split = ordered_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS;
+        let candidate_ids = &ordered_ids[..split];
+        let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
+        let mut cutoff: i64 = i64::MIN;
+        for id in candidate_ids {
+            let files = self
+                .catalog
+                .get_snapshot_files(&self.table_metadata.table_id, id)
+                .await
+                .unwrap_or_default();
+            if files.is_empty() {
+                // No manifest yet → cannot place it in the seq-prefix; skip this
+                // pass. (Selecting it without a manifest would force the
+                // conservative `[0, fence]` author range and could understate T.)
+                continue;
+            }
+            // T accumulates the highest per-file max_sequence over the selected
+            // prefix — every selected file then satisfies `max_sequence <= T`.
+            for f in &files {
+                cutoff = cutoff.max(f.max_sequence);
+            }
+            let threshold = thresholds.get(id).copied().unwrap_or(0);
+            selected.push((id.clone(), threshold));
+        }
+
+        if selected.len() < 2 {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                candidates = candidate_ids.len(),
+                keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+                "Skipping seq-prefix bake: fewer than two manifest-populated older snapshots to bake"
+            );
+            return Ok(false);
+        }
+        // `cutoff` is now the seq-prefix cutoff T (the max max_sequence over the
+        // selected older prefix). It was raised above from `i64::MIN` by at least
+        // one selected file, so it is a real sequence.
+        let prefix_cutoff = cutoff;
+
+        tracing::info!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            input_count = selected.len(),
+            keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+            prefix_cutoff,
+            fence_max_delete_seq,
+            deletion_index_len = deletion_snapshot.delete_len(),
+            "Running seq-prefix bake (consolidating the clean older prefix)"
+        );
+
+        // --- Phase 2: rewrite outside the lock (identical to the size-tier
+        // path): union over selected inputs, each with its own partial deletion
+        // filter, streamed into one fresh snapshot whose dead rows are removed. ---
+        let ctx = self.create_compaction_session_context();
+        let state = ctx.state();
+        let pk_indices = self.pk_column_indices.clone();
+
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(selected.len());
+        for (snapshot_id, threshold) in &selected {
+            let plan = self
+                .create_snapshot_scan_plan(&state, snapshot_id, None, &[], None)
+                .await?;
+            let filtered = self.apply_partial_deletion_filter(
+                plan,
+                &pk_indices,
+                *threshold,
+                &deletion_snapshot,
+            )?;
+            plans.push(filtered);
+        }
+        let merged_plan: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.remove(0)
+        } else {
+            UnionExec::try_new(plans)?
+        };
+        let stream = datafusion_physical_plan::execute_stream(merged_plan, state.task_ctx())?;
+
+        let new_snapshot_id = uuid::Uuid::now_v7().to_string();
+        let is_s3 = self.table_metadata.path.starts_with("s3://");
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
+        }
+
+        let target_size_bytes = self.context.target_file_size_bytes();
+        // The bake is gated to key mode, so the position single-writer cases do
+        // not apply; size the parallel-encode fan-out from the selected inputs'
+        // on-disk bytes exactly as the size-tier path does. `is_position_based()`
+        // is false here (gated above), so `keeps_positions_serial` is false.
+        let mut total_input_bytes: u64 = 0;
+        for (snapshot_id, _) in &selected {
+            total_input_bytes += match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                Ok(files) => files.iter().map(|(_, sz)| *sz).sum(),
+                Err(_) => 0,
+            };
+        }
+        let (target_partitions, estimated_bytes) = subset_merge_write_shape(
+            /* keeps_positions_serial */ false,
+            state.config().target_partitions(),
+            total_input_bytes,
+        );
+        let write_result = self
+            .write_to_snapshot(
+                stream,
+                target_size_bytes,
+                &new_snapshot_id,
+                target_partitions,
+                estimated_bytes,
+                super::delta_encoding::WriteClass::Maintenance,
+            )
+            .await;
+        let (total_rows, _writer_ops, _stats_acc) = match write_result {
+            Ok(result) => result,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if !is_s3 {
+            let snapshot_dir = self.snapshot_dir_path_for(&new_snapshot_id);
+            if let Err(e) = Self::sync_snapshot_dir(&snapshot_dir).await {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        }
+
+        let old_ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
+
+        // AUTHOR the merged output's manifest with its true merged commit-seq
+        // range over the selected inputs (NOT the delete-seq threshold the swap
+        // stores). Identical to the size-tier path; the conservative `[0, fence]`
+        // fallback keeps a manifest-read failure always bake-eligible.
+        let (merged_min, merged_max) = self
+            .merged_sequence_range_over_snapshots(&old_ids)
+            .await
+            .unwrap_or((0, fence_max_delete_seq));
+        if let Err(error) = self
+            .upsert_snapshot_manifest_from_listing(
+                &new_snapshot_id,
+                ManifestSequenceTag::Uniform {
+                    min: merged_min,
+                    max: merged_max,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                "Failed to author merged seq-prefix-bake manifest before swap; \
+                 scan falls back to directory listing"
+            );
+        }
+
+        // --- Phase 3: CAS commit (atomically deactivate inputs, activate M). ---
+        let swapped = match self
+            .catalog
+            .swap_protected_snapshots(
+                &self.table_metadata.table_id,
+                &old_ids,
+                &new_snapshot_id,
+                fence_max_delete_seq,
+            )
+            .await
+        {
+            Ok(swapped) => swapped,
+            Err(e) => {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                return Err(Error::Catalog { source: e });
+            }
+        };
+        if !swapped {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Seq-prefix bake swap aborted (inputs no longer active); discarding output"
+            );
+            self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                .await;
+            return Ok(false);
+        }
+
+        // Bring the in-memory protected set into agreement under the scan fence
+        // (readers capture deletion snapshot + protected set together). We hold
+        // the write fence across BOTH the protected-set swap AND the deletion
+        // index prune below, so no scan combines the post-swap protected set
+        // (M present, inputs gone) with a pre-prune deletion index (or vice
+        // versa). The clean-prefix assertion is evaluated under this same fence
+        // over the now-current live set.
+        let mut clean_prefix_holds = true;
+        let mut violating_min: Option<i64> = None;
+        {
+            let _fence = self.listing_fence.write().await;
+            self.protected_snapshots.rcu(|current| {
+                let mut new_map = (**current).clone();
+                for (id, _) in &selected {
+                    new_map.remove(id);
+                }
+                new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
+                Arc::new(new_map)
+            });
+
+            // CLEAN-PREFIX ASSERTION (resurrect-rows-critical). Over the NEW live
+            // set (current snapshot ∪ post-swap protected set, which now contains
+            // M and the unselected newer snapshots, but NOT the merged-away
+            // inputs), every snapshot's manifest min_sequence MUST be > T.
+            // Otherwise a live snapshot still holds a row at or below T that a
+            // `<= T` tombstone deletes — pruning that tombstone would resurrect it.
+            //
+            // Build the live id set INSIDE the fence so it is coherent with the
+            // swap we just published. The merged output M authored its range as
+            // [merged_min, merged_max] over the inputs (all <= T), so M itself can
+            // have min_sequence <= T — that is expected and fine: M's `<= T` rows
+            // are exactly the SURVIVORS the rewrite kept after applying deletes,
+            // so the pruned tombstones no longer apply to them. M is therefore
+            // EXCLUDED from the assertion (it is the bake target, not an unmerged
+            // holdout).
+            let current_snapshot_id = self.get_current_snapshot_id();
+            let mut live_ids: Vec<String> =
+                self.protected_snapshots.load().keys().cloned().collect();
+            live_ids.push(current_snapshot_id.clone());
+            for id in &live_ids {
+                if id == &new_snapshot_id {
+                    continue; // M is the bake target, not an unmerged holdout.
+                }
+                let files = self
+                    .catalog
+                    .get_snapshot_files(&self.table_metadata.table_id, id)
+                    .await
+                    .unwrap_or_default();
+                if files.is_empty() {
+                    // A live PROTECTED snapshot always carries data, so an empty
+                    // manifest means its Stage-1 population failed or is pending:
+                    // its per-file ranges are UNKNOWN, so we cannot prove its rows
+                    // are all > T and must NOT prune (a later pass retries once the
+                    // manifest is rebuilt). Without this guard a population failure
+                    // on an unmerged `<= T` snapshot would let the prune resurrect
+                    // its deleted rows. The current snapshot in CDC mode is genesis
+                    // (no data) — an empty manifest there is the no-rows case and is
+                    // safe, so it alone is exempt.
+                    if id != &current_snapshot_id {
+                        clean_prefix_holds = false;
+                        violating_min = Some(-1); // sentinel: empty manifest, range unknown
+                        break;
+                    }
+                    continue;
+                }
+                for f in &files {
+                    if f.min_sequence <= prefix_cutoff {
+                        clean_prefix_holds = false;
+                        violating_min = Some(f.min_sequence);
+                        break;
+                    }
+                }
+                if !clean_prefix_holds {
+                    break;
+                }
+            }
+
+            // Prune the deletion index of `delete_seq <= T` ONLY when the
+            // clean-prefix invariant holds — under the SAME write fence as the
+            // swap, so scans never see a torn (swapped-but-not-pruned) state.
+            if clean_prefix_holds {
+                self.prune_deletion_index_at_or_below(prefix_cutoff);
+            }
+        }
+
+        if clean_prefix_holds {
+            tracing::info!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                merged_inputs = selected.len(),
+                rows = total_rows,
+                new_snapshot_id = new_snapshot_id.as_str(),
+                prefix_cutoff,
+                duration_ms = compaction_start.elapsed().as_millis(),
+                "Seq-prefix bake completed; pruned deletion index at or below T"
+            );
+        } else {
+            // Publishing the merge is always safe; only the prune was unsafe.
+            tracing::warn!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                merged_inputs = selected.len(),
+                new_snapshot_id = new_snapshot_id.as_str(),
+                prefix_cutoff,
+                violating_min_sequence = violating_min,
+                "Seq-prefix bake merge committed but deletion-index prune SKIPPED: a live \
+                 snapshot still has min_sequence <= T (clean-prefix invariant violated). \
+                 Pruning would risk resurrecting a deleted row; the index is left intact."
+            );
+        }
+
+        // Retire the merged-away inputs (whole-dir, event-anchored) and sweep
+        // aged-out retirements — identical to the size-tier path.
+        self.retire_snapshot_dirs(old_ids.iter().map(String::as_str));
+        self.sweep_retired_snapshot_dirs();
 
         Ok(true)
     }
@@ -18507,6 +18979,26 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         // file-path scoped and would otherwise be lost if they target a file
         // that is swapped away by the merge.
 
+        // Seq-prefix BAKE (Stage 2) — runs FIRST, gated on the deletion-index
+        // size (the very quantity it shrinks). The bake exists to keep the
+        // merge-on-read deletion index small (≈ half the per-query CPU on the
+        // saturated lab), so it fires only once tombstones have genuinely
+        // accumulated past `BAKE_DELETION_INDEX_TRIGGER`. Cheap lock-free
+        // early-out: a single atomic deletion-snapshot load + count, skipping the
+        // compaction lock / fence on the common path where the index is still
+        // small. Key-mode only (the method itself re-gates and re-checks under
+        // the fence). A committed bake also reduces the protected-snapshot count,
+        // so on a bake we return without also running the size-tier subset pass
+        // this tick; the next tick re-evaluates both.
+        let deletion_index_len = self.pk_deletion_snapshot().delete_len();
+        if deletion_index_len >= BAKE_DELETION_INDEX_TRIGGER && !self.should_capture_positions() {
+            match self.bake_seq_prefix_protected_snapshots().await {
+                Ok(true) => return Ok(true),
+                Ok(false) => { /* nothing baked this pass; fall through to size-tier */ }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+
         // Cheap lock-free early-out first: skip acquiring `compaction_lock` /
         // `listing_fence` and building a session context unless the protected
         // set already has enough runs to be worth merging. `protected_snapshots`
@@ -22562,6 +23054,482 @@ mod tests {
             reference,
             vec!["above.vortex"],
             "only a file entirely above T (min_sequence > T) is referenced in place"
+        );
+    }
+
+    // ========================================================================
+    // STAGE 2 — seq-prefix BAKE (resurrect-rows-critical). These five tests
+    // exercise `bake_seq_prefix_protected_snapshots` end-to-end on a key-mode
+    // upsert table: real protected snapshots backed by real Vortex files, with
+    // each snapshot's per-file manifest sequence range PINNED via
+    // `upsert_snapshot_file` so the seq-prefix cutoff `T` is deterministic
+    // (independent of the write path's auto-assigned reservation sequences).
+    // ========================================================================
+
+    /// Build a key-mode (`deletion_mode: Key`) file-backed upsert table holding
+    /// `n` protected snapshots, one row each (id = 0..n), and PIN each protected
+    /// snapshot's manifest file range to `[seq_i, seq_i]` where `seq_i` is the
+    /// i-th value of `seqs` (creation order = ascending protected-snapshot id).
+    /// Returns the provider, the temp dir (kept alive), and the protected
+    /// snapshot ids in creation (sequence) order.
+    ///
+    /// The pin keeps the seq-prefix cutoff deterministic: selection reads these
+    /// manifest `max_sequence` values, not the write path's reserved sequences.
+    async fn build_seq_prefix_fixture(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        seqs: &[i64],
+    ) -> (CayenneTableProvider, TempDir, Vec<String>) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let (provider, _catalog, tmp) = create_cdc_upsert_table(table_name, runtime_env).await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        // Each distinct-key insert publishes its own file-backed protected
+        // snapshot (inline disabled in the fixture).
+        for (i, _) in seqs.iter().enumerate() {
+            let id = i64::try_from(i).expect("row index fits i64");
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+
+        // Populate manifests for the live set (under the lock the real
+        // post-write lane holds), then OVERWRITE each protected snapshot's
+        // manifest rows with the pinned [seq, seq] range.
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+
+        let mut ids: Vec<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids.len(),
+            seqs.len(),
+            "fixture must produce one protected snapshot per seq ({} expected, got {})",
+            seqs.len(),
+            ids.len()
+        );
+
+        let table_id = provider.table_metadata.table_id.clone();
+        for (id, &seq) in ids.iter().zip(seqs.iter()) {
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            assert!(
+                !files.is_empty(),
+                "protected snapshot {id} must have a data file to pin"
+            );
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("pin manifest sequence");
+            }
+        }
+        (provider, tmp, ids)
+    }
+
+    /// Install a known Int64 deletion index (delete-only entries) onto a provider.
+    fn install_int64_deletes(provider: &CayenneTableProvider, deletes: &[(i64, i64)]) {
+        let index = DeletionIndex::from_map(deletes.iter().copied().collect::<HashMap<i64, i64>>());
+        store_int64_tombstones(provider, index);
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (1). After a bake, a tombstone with
+    /// `delete_seq <= T` is GONE from the index AND the deleted row stays deleted
+    /// on scan. Five snapshots (ids 0..5) pinned at seqs 10,20,30,40,50; K = 3 is
+    /// kept unbaked, so the older prefix is {0,1} with `T = 20`. Key 0 (written at
+    /// 10) is deleted at delete_seq 15 (<= T) — the bake must physically remove it
+    /// and drop the tombstone; key 1 (written at 20) is NOT deleted and survives.
+    #[tokio::test]
+    async fn seq_prefix_bake_drops_baked_tombstone_and_keeps_row_deleted() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_drops_tombstone",
+            ctx.runtime_env(),
+            &[10, 20, 30, 40, 50],
+        )
+        .await;
+
+        // Delete key 0 at delete_seq 15 (<= T=20, in the older prefix's snapshot).
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+
+        // The tombstone for key 0 (delete_seq 15 <= T=20) is gone from the index.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(0).map(|t| t.delete_sequence),
+            None,
+            "the <= T tombstone must be pruned after the bake"
+        );
+        assert_eq!(
+            tombstones.delete_len(),
+            0,
+            "no live tombstones remain (the only delete was <= T)"
+        );
+
+        // Key 0's row stays physically deleted (the merge applied the delete);
+        // every other row is still present.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_drops_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "key 0 stays deleted after the bake (no resurrection), others preserved"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (2). A row written `<= T`, deleted `<= T`, then
+    /// RE-INSERTED at `> T` is PRESENT after the bake — the `> T` version must
+    /// survive (not dropped as part of the bake, not resurrected-as-deleted).
+    ///
+    /// End-to-end through the real upsert path (no synthetic state), so the
+    /// re-insert lands in a genuine newer protected snapshot whose deletion
+    /// threshold the engine itself assigns `>= ` the old row's delete sequence —
+    /// the production mechanism by which the re-inserted copy stays visible while
+    /// the old copy is hidden (protected-snapshot scans IGNORE the re-insert
+    /// marker; visibility comes from the newer snapshot's threshold).
+    ///
+    /// Sequence of events:
+    /// 1. Insert key 100 (value 1) — the OLD copy, in the OLDEST snapshot.
+    /// 2. Insert keys 1,2,3,4 — four more snapshots.
+    /// 3. Re-insert key 100 (value 999) — a real upsert: writes a tombstone for
+    ///    key 100 at some `delete_seq D` and publishes a NEW snapshot (the
+    ///    SURVIVOR) whose threshold the engine assigns `>= D`.
+    ///
+    /// Six protected snapshots; K = 3 kept. The older prefix is the OLDEST three
+    /// (the OLD-100 snapshot + keys 1,2). We pin the older prefix's manifest so
+    /// `T = D` and pin the kept snapshots `> D`, so the SURVIVOR (newest) is
+    /// referenced in place. After the bake: the OLD-100 copy is physically removed
+    /// (the merge applied the `D > old-snapshot-threshold` delete), the `<= T = D`
+    /// tombstone is pruned, and the SURVIVOR (999) still scans — key 100 present
+    /// exactly once at its re-inserted value.
+    #[tokio::test]
+    async fn seq_prefix_bake_keeps_reinserted_row_above_cutoff() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table("bake_keeps_reinsert", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // (1) OLD copy of key 100 (value 1) → oldest snapshot.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[100], &[1])).await;
+        // (2) four more distinct-key snapshots.
+        for id in 1..=4_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+        // (3) Re-insert key 100 (value 999): a real upsert → tombstone for key 100
+        // + a new SURVIVOR snapshot whose threshold the engine assigns >= delete.
+        insert_batch(
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[100], &[999]),
+        )
+        .await;
+
+        // The engine assigned the tombstone a delete sequence; T must be >= it.
+        let delete_seq = provider
+            .deletion_index_max_sequence()
+            .expect("the re-insert recorded a tombstone with a delete sequence");
+
+        // Precondition: exactly the re-inserted copy (999) of key 100 is visible.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_reinsert")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 100)
+                .collect::<Vec<_>>(),
+            vec![(100, 999)],
+            "precondition: re-insert hides the old copy, only value 999 visible"
+        );
+
+        // Populate manifests, then PIN them: older prefix (oldest 3) at `T = D`,
+        // kept snapshots (newest 3, incl. the SURVIVOR) strictly above `D`, so the
+        // SURVIVOR is referenced in place and the OLD-100 snapshot is baked.
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+        let mut ids: Vec<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids.len(),
+            6,
+            "5 distinct inserts + 1 re-insert = 6 snapshots"
+        );
+        // Older prefix = oldest 3 → pin max_sequence = D (so T = D >= delete_seq).
+        // Kept = newest 3 → pin min_sequence = D + 10 (> T).
+        for (i, id) in ids.iter().enumerate() {
+            let seq = if i < 3 { delete_seq } else { delete_seq + 10 };
+            let files = provider
+                .list_snapshot_files_with_sizes(id)
+                .await
+                .expect("list snapshot files");
+            for (file_name, size) in files {
+                provider
+                    .catalog
+                    .upsert_snapshot_file(&SnapshotFile {
+                        table_id: table_id.clone(),
+                        snapshot_id: id.clone(),
+                        file_path: file_name,
+                        row_count: 1,
+                        file_size_bytes: i64::try_from(size).unwrap_or(0),
+                        min_sequence: seq,
+                        max_sequence: seq,
+                    })
+                    .await
+                    .expect("pin manifest sequence");
+            }
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "older prefix must bake");
+
+        // The <= T (= D) delete of key 100 is pruned from the index.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(100).map(|t| t.delete_sequence),
+            None,
+            "the <= T delete of key 100 is pruned after the bake"
+        );
+
+        // Key 100 present exactly once, as its re-inserted (> T) value 999 —
+        // neither dropped (the > T survivor was referenced in place) nor
+        // resurrected-as-deleted (the prune did not change the survivor's
+        // visibility, and the old copy stays physically gone).
+        let key100: Vec<(i64, i64)> =
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_reinsert")
+                .await
+                .into_iter()
+                .filter(|(id, _)| *id == 100)
+                .collect();
+        assert_eq!(
+            key100,
+            vec![(100, 999)],
+            "key 100 present exactly once as its re-inserted > T value 999, got {key100:?}"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (3). A `> T` snapshot's rows remain readable after
+    /// the bake — the scan union still reads the untouched (referenced-in-place)
+    /// snapshots. Five snapshots 0..5 at 10,20,30,40,50; older prefix {0,1}
+    /// (T=20) bakes; snapshots 2,3,4 (seqs 30,40,50 > T) are left untouched and
+    /// their rows (ids 2,3,4) must still scan.
+    #[tokio::test]
+    async fn seq_prefix_bake_leaves_above_cutoff_snapshots_readable() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, ids) =
+            build_seq_prefix_fixture("bake_keeps_above", ctx.runtime_env(), &[10, 20, 30, 40, 50])
+                .await;
+        let before: std::collections::HashSet<String> = provider
+            .protected_snapshots
+            .load_full()
+            .keys()
+            .cloned()
+            .collect();
+
+        // No deletes at all — pure structural check that the bake merges the
+        // older prefix and the > T snapshots survive untouched.
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "older prefix {{0,1}} bakes");
+
+        // The newest K=3 snapshots (ids[2..5]) are still present (untouched).
+        let after = provider.protected_snapshots.load_full();
+        for kept in &ids[2..] {
+            assert!(
+                after.contains_key(kept),
+                "referenced-in-place snapshot {kept} (min_sequence > T) must be untouched"
+            );
+        }
+        // The two baked inputs are gone, replaced by one merged snapshot.
+        assert!(
+            !after.contains_key(&ids[0]) && !after.contains_key(&ids[1]),
+            "the baked inputs must be retired from the protected set"
+        );
+        assert!(
+            after.len() < before.len(),
+            "the bake reduces the protected-snapshot count: {} -> {}",
+            before.len(),
+            after.len()
+        );
+
+        // Every row still scans (the union reads M ∪ the untouched > T snapshots).
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_above").await,
+            vec![(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)],
+            "all rows readable after the bake — untouched > T snapshots included"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (4). The bake is a NO-OP on a position-delete
+    /// table: `should_capture_positions()` is true (default `auto` resolves to
+    /// position for a PK table), so the seq-prefix bake returns `Ok(false)`
+    /// without merging — even with enough protected snapshots to otherwise bake.
+    #[tokio::test]
+    async fn seq_prefix_bake_is_noop_on_position_delete_table() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: "bake_noop_position".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                // Default deletion mode left as auto → resolves to POSITION for a
+                // PK table, which the bake gate must skip.
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .create(options)
+            .await
+            .expect("table created");
+        assert!(
+            provider.should_capture_positions(),
+            "fixture must resolve to position mode or this test pins nothing"
+        );
+
+        // Enough distinct-key inserts to clear the K+2 floor if it were key-mode.
+        for id in 0..6_i64 {
+            insert_batch(
+                &provider,
+                id_value_batch(Arc::clone(&schema), &[id], &[id * 10]),
+            )
+            .await;
+        }
+        {
+            let _guard = provider.compaction_lock.lock().await;
+            provider.rebuild_live_snapshot_manifests().await;
+        }
+        let before = provider.protected_snapshots.load_full().len();
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            !baked,
+            "the seq-prefix bake must be a no-op on a position-delete table"
+        );
+        assert_eq!(
+            provider.protected_snapshots.load_full().len(),
+            before,
+            "a position-mode bake must not touch the protected set"
+        );
+    }
+
+    /// STAGE-2 DELIVERABLE TEST (5). The clean-prefix assertion SKIPS the prune
+    /// (but STILL merges) when a `<= T` snapshot would be left unmerged. We pin
+    /// the OLDER prefix to bake at `T`, but pin one of the KEPT (newest-K)
+    /// snapshots with `min_sequence <= T` — so after the swap a live snapshot
+    /// still reaches at or below `T`. The merge is published (count drops) but the
+    /// `<= T` tombstone is NOT pruned (resurrect-safe).
+    #[tokio::test]
+    async fn seq_prefix_bake_skips_prune_when_clean_prefix_violated() {
+        let ctx = SessionContext::new();
+        // Older prefix {0,1} pinned at 10,20 ⇒ T=20. Kept snapshots {2,3,4}:
+        // pin id-2 at seq 5 (< T=20) to VIOLATE the clean prefix; ids 3,4 are
+        // above T (30,40). The violating kept snapshot id-2 makes the post-swap
+        // live set contain a min_sequence (5) <= T.
+        let (provider, _tmp, _ids) =
+            build_seq_prefix_fixture("bake_skips_prune", ctx.runtime_env(), &[10, 20, 5, 30, 40])
+                .await;
+
+        // A tombstone at delete_seq 12 (<= T=20). Were the prune to run it would
+        // be dropped, but key 2 (written at 5 <= 12) physically survives in the
+        // unmerged kept snapshot id-2 → dropping the tombstone would resurrect it.
+        install_int64_deletes(&provider, &[(2, 12)]);
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(
+            baked,
+            "the merge is still published even when the prune is skipped"
+        );
+
+        // The tombstone MUST survive (prune skipped) — clean-prefix violated.
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(2).map(|t| t.delete_sequence),
+            Some(12),
+            "the <= T tombstone must be RETAINED when a kept snapshot still has min_sequence <= T"
+        );
+        assert_eq!(
+            tombstones.delete_len(),
+            1,
+            "no tombstone was pruned under the violated clean-prefix invariant"
+        );
+        // Key 2 stays hidden (its surviving tombstone still applies) — no
+        // resurrection despite the kept <= T snapshot.
+        let pairs = collect_id_value_pairs(&ctx, &provider, "bake_skips_prune").await;
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 2),
+            "key 2 stays deleted (tombstone retained) — no resurrection, got {pairs:?}"
         );
     }
 

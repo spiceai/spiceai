@@ -607,8 +607,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// place), so a file is only safe to delete when NO live-or-protected
     /// snapshot's manifest references it. The caller filters these rows down to
     /// the live set and reconstructs the referenced physical paths.
-    async fn get_all_snapshot_files(&self, table_id: &str)
-    -> CatalogResult<Vec<SnapshotFile>>;
+    async fn get_all_snapshot_files(&self, table_id: &str) -> CatalogResult<Vec<SnapshotFile>>;
 
     /// Drop manifest rows for snapshots other than the given one (snapshot GC).
     async fn clear_snapshot_files_except(
