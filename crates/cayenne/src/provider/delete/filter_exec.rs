@@ -19,7 +19,8 @@ limitations under the License.
 //! This module provides execution plans that filter out deleted rows during query execution:
 //!
 //! - **`Int64PkDeletionFilterExec`**: Optimized for tables with single-column Int64 primary keys.
-//!   Probes a [`DeletionIndex`] (bloom filter + `HashMap<i64, i64>`) once per row.
+//!   Probes a [`DeletionIndex`] (bloom filter over a layered base+delta map of fused
+//!   per-key delete/insert sequence numbers) once per row.
 //!
 //! - **`KeyBasedDeletionFilterExec`**: For tables with composite or non-integer primary keys.
 //!   Uses Arrow's `RowConverter` to create deterministic byte keys, then probes a
@@ -627,8 +628,9 @@ impl datafusion_execution::RecordBatchStream for KeyBasedDeletionFilterStream {
 /// Execution plan that filters out deleted rows based on Int64 primary key values.
 ///
 /// Optimised for the common case of tables with a single-column Int64 primary key.
-/// Avoids `RowConverter` overhead and probes a [`DeletionIndex`] (bloom filter +
-/// `HashMap<i64, i64>`) directly with native i64 comparisons.
+/// Avoids `RowConverter` overhead and probes a [`DeletionIndex`] (bloom filter over a
+/// layered base+delta map of fused delete/insert sequence numbers) directly with native
+/// i64 comparisons.
 ///
 /// Like [`KeyBasedDeletionFilterExec`], this exec is **filter-pushdown-transparent**
 /// (forwards parent predicates to the child Vortex scan so zone-map pruning runs
