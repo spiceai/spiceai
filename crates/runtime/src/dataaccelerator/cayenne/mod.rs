@@ -187,7 +187,11 @@ fn parse_u64_aliases_with_hint(
 /// `fundu` for consistency with the other Spice duration knobs (e.g.
 /// `retention_period`). `None` when unset; a warning + `None` when present but
 /// unparseable.
-fn parse_goal_duration_secs(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
+fn parse_goal_duration_secs(
+    acceleration: &Acceleration,
+    key: &str,
+    table_name: &str,
+) -> Option<f64> {
     let raw = acceleration.params.get(key)?;
     match fundu::parse_duration(raw) {
         Ok(d) => Some(d.as_secs_f64()),
@@ -1520,8 +1524,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    39,
-    { S3_PARAMS_LEN + 39 },
+    44,
+    { S3_PARAMS_LEN + 44 },
 >(
     S3_PARAMETERS,
     [
@@ -1610,6 +1614,16 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("tuning")
             .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
             .one_of(&["auto", "adaptive"]),
+        ParameterSpec::component("goal_replication_lag")
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps within cayenne_goal_convergence_window."),
+        ParameterSpec::component("goal_freshness")
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s')."),
+        ParameterSpec::component("goal_query_latency")
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms')."),
+        ParameterSpec::component("goal_qph")
+            .description("Goal-driven adaptive tuning: target query throughput in queries per hour (higher is better), e.g. '5000'."),
+        ParameterSpec::component("goal_convergence_window")
+            .description("Goal-driven adaptive tuning: the time budget to converge toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s."),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")

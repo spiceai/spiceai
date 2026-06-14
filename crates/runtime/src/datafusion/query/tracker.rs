@@ -115,7 +115,7 @@ impl QueryTracker {
         // to every participant — conservative, biasing toward more query-health
         // tuning (the safe direction).
         if self.error_message.is_none() {
-            let latency_ms = f64::from(query_duration.as_secs_f32()) * 1000.0;
+            let latency_ms = query_duration.as_secs_f64() * 1000.0;
             for ds in self.datasets.iter() {
                 cayenne::record_query_latency(ds.table(), latency_ms);
             }

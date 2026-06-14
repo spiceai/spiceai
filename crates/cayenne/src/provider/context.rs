@@ -487,7 +487,6 @@ impl CayenneContext {
         &self,
         rows: u64,
         delete_rows: u64,
-        update_rows: u64,
         bytes: u64,
         apply: std::time::Duration,
         source_commit_ts_ms: Option<i64>,
@@ -505,7 +504,6 @@ impl CayenneContext {
             apply,
             arrival_gap,
             delete_rows,
-            update_rows,
         });
         // Fold in the now-relative goal signals. Wall clock (epoch ms), NOT the
         // monotonic `Instant` above: lag/freshness are absolute "now − ts" ages.

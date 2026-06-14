@@ -17572,6 +17572,13 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
                 goal_query_latency_ms: goals.query_latency_p99.map_or(-1.0, |g| g.target),
                 qph: snap.qph.unwrap_or(-1.0),
                 goal_qph: goals.qph.map_or(-1.0, |g| g.target),
+                // Environment/data signals (−1.0 when unavailable; the telemetry
+                // layer suppresses negatives). Storage-tier codes are always present.
+                cpu_pressure: snap.cpu_pressure.unwrap_or(-1.0),
+                io_latency_ms: snap.io_latency_ms.unwrap_or(-1.0),
+                publish_latency_ms: snap.publish_latency_ms.unwrap_or(-1.0),
+                data_storage_class: snap.data_storage.metric_code(),
+                metastore_storage_class: snap.metastore_storage.metric_code(),
             },
             &[telemetry::KeyValue::new("table", table.clone())],
         );

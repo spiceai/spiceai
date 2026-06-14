@@ -818,6 +818,20 @@ pub struct CayenneAutotuneState {
     pub qph: f64,
     /// QPH goal target (queries/hour); `< 0` ⇒ no goal configured.
     pub goal_qph: f64,
+    /// cgroup-aware CPU busy-fraction of available cores; `< 0` ⇒ unavailable
+    /// (non-Linux or not yet sampled).
+    pub cpu_pressure: f64,
+    /// Per-batch object-store/disk write latency (EWMA, ms); `< 0` ⇒ no Vortex spill
+    /// observed (pure-inline table).
+    pub io_latency_ms: f64,
+    /// Per-batch metastore publish-wall latency (EWMA, ms); `< 0` ⇒ no metastore
+    /// publish observed (e.g. the writer-free pipelined path).
+    pub publish_latency_ms: f64,
+    /// Detected data-acceleration storage tier (`StorageClass::metric_code`: 0 local
+    /// SSD, 1 EBS, 2 tmpfs, 3 unknown/object-store).
+    pub data_storage_class: u64,
+    /// Detected metastore storage tier (same code mapping as `data_storage_class`).
+    pub metastore_storage_class: u64,
 }
 
 static CAYENNE_AT_ROWS_PER_SEC: OnceLock<Gauge<f64>> = OnceLock::new();
@@ -842,6 +856,11 @@ static CAYENNE_AT_QUERY_LATENCY_P99_MS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_GOAL_QUERY_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
 static CAYENNE_AT_GOAL_QPH: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_CPU_PRESSURE: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_IO_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_PUBLISH_LATENCY_MS: OnceLock<Gauge<f64>> = OnceLock::new();
+static CAYENNE_AT_DATA_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
+static CAYENNE_AT_METASTORE_STORAGE_CLASS: OnceLock<Gauge<u64>> = OnceLock::new();
 
 /// Emit the auto-tuner state gauges for one table. `dimensions` should carry
 /// `table`. Called on each background tick.
@@ -1073,6 +1092,70 @@ pub fn track_cayenne_autotune_state(state: &CayenneAutotuneState, dimensions: &[
             })
             .record(state.goal_qph, dimensions);
     }
+
+    // Environment/data signals the closed loop reasons over (Part A). The three
+    // pressure/latency gauges are suppressed (sentinel `< 0`) until sampled — CPU
+    // is non-Linux/unsampled; I/O and publish latency stay unset until the table
+    // spills to Vortex / takes the writer-bearing publish path. The storage-tier
+    // codes are detected facts, always emitted (see `StorageClass::metric_code`).
+    if state.cpu_pressure >= 0.0 {
+        CAYENNE_AT_CPU_PRESSURE
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_cpu_pressure")
+                    .with_description(
+                        "cgroup-aware CPU busy-fraction of available cores; gates CPU-stealing tuning moves.",
+                    )
+                    .build()
+            })
+            .record(state.cpu_pressure, dimensions);
+    }
+    if state.io_latency_ms >= 0.0 {
+        CAYENNE_AT_IO_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_io_latency_ms")
+                    .with_description(
+                        "Per-batch object-store/disk write latency (EWMA); drives the I/O-bound tuning gate.",
+                    )
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.io_latency_ms, dimensions);
+    }
+    if state.publish_latency_ms >= 0.0 {
+        CAYENNE_AT_PUBLISH_LATENCY_MS
+            .get_or_init(|| {
+                cayenne_operational_meter()
+                    .f64_gauge("cayenne_ingest_publish_latency_ms")
+                    .with_description(
+                        "Per-batch metastore publish-wall latency (EWMA); drives the publish-bound tuning gate.",
+                    )
+                    .with_unit("ms")
+                    .build()
+            })
+            .record(state.publish_latency_ms, dimensions);
+    }
+    CAYENNE_AT_DATA_STORAGE_CLASS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_data_storage_class")
+                .with_description(
+                    "Detected data-acceleration storage tier (0 local SSD, 1 EBS, 2 tmpfs, 3 unknown/object-store).",
+                )
+                .build()
+        })
+        .record(state.data_storage_class, dimensions);
+    CAYENNE_AT_METASTORE_STORAGE_CLASS
+        .get_or_init(|| {
+            cayenne_operational_meter()
+                .u64_gauge("cayenne_metastore_storage_class")
+                .with_description(
+                    "Detected metastore storage tier (same code mapping as cayenne_data_storage_class).",
+                )
+                .build()
+        })
+        .record(state.metastore_storage_class, dimensions);
 }
 
 static CAYENNE_AT_ADJUSTMENTS: OnceLock<Counter<u64>> = OnceLock::new();

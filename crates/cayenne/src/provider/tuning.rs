@@ -47,9 +47,9 @@ limitations under the License.
 //! [`LiveActuators`] at the use sites, running [`decide`] on the per-table
 //! background task) lives in the provider.
 
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -112,13 +112,13 @@ const MEM_PRESSURE_HIGH: f64 = 0.85;
 /// [`MEM_PRESSURE_HIGH`] avoids grow/shrink flapping near the limit.
 const MEM_PRESSURE_OK: f64 = 0.75;
 
-/// CPU busy-fraction (of available cores, cgroup-aware) above which the controller
-/// withholds CPU-stealing moves — adding write-encode shards and shrinking the
-/// compaction interval both compete with query threads. Mirrors [`MEM_PRESSURE_HIGH`].
-const CPU_PRESSURE_HIGH: f64 = 0.85;
-
-/// CPU busy-fraction below which those CPU-stealing moves re-enable (hysteresis gap
-/// to [`CPU_PRESSURE_HIGH`], like the memory pair).
+/// CPU busy-fraction (of available cores, cgroup-aware) below which the controller
+/// re-enables CPU-stealing moves — adding write-encode shards and shrinking the
+/// compaction interval both compete with query threads, so they are withheld until
+/// CPU is comfortably free. Unlike memory (a hard ceiling, which also needs a
+/// high-water *shrink* trigger, [`MEM_PRESSURE_HIGH`]), CPU saturation needs no
+/// active-shrink threshold: the relax tier already sheds load, so a single growth
+/// gate suffices.
 const CPU_PRESSURE_OK: f64 = 0.75;
 
 /// Fraction of the offered-load interval (`arrival_gap_ms`) that per-batch
@@ -129,6 +129,21 @@ const IO_BOUND_FRACTION: f64 = 0.5;
 /// Same, for per-batch metastore publish latency → "publish-bound" (the
 /// single-writer commit is eating the offered-load window).
 const PUBLISH_BOUND_FRACTION: f64 = 0.5;
+
+/// Multiplier applied to [`IO_BOUND_FRACTION`] / [`PUBLISH_BOUND_FRACTION`] on a slow
+/// storage tier (EBS, object store). Halving the bar makes the controller treat a
+/// table as I/O-/publish-bound at a lower per-batch latency, so on slow/networked
+/// media it amortizes commits (grows the memtable) and withholds write shards
+/// *sooner* — the closed-loop counterpart to the warm-start's per-tier file-size
+/// pre-sizing. Fast media (local SSD, tmpfs) use the base fraction unchanged.
+const SLOW_TIER_BOUND_SCALE: f64 = 0.5;
+
+/// Idle horizon for [`QueryObservations::qph`]: with no query observed within this
+/// window the table is treated as having no QPH signal (the goal is skipped) rather
+/// than reporting a lifetime rate that decays toward 0 while parked. ~5 minutes —
+/// long enough to span normal gaps between analytical queries, short enough that a
+/// parked table stops driving QPH tuning promptly.
+const QPH_IDLE_MS: u64 = 300_000;
 
 const MIB: i64 = 1024 * 1024;
 
@@ -627,14 +642,12 @@ pub(crate) struct WriteSample {
     /// Wall time since the previous batch (the offered-load interval). `None`
     /// for the first batch.
     pub arrival_gap: Option<Duration>,
-    /// Rows in this batch that were true tombstone deletes (the CDC `delete`
-    /// op-group). Feeds the delete fraction of the mutation-heavy signal.
+    /// Rows in this batch that mutated an existing key — the `superseded` count
+    /// (rows removed/replaced by an upsert or a delete). Updates and deletes both
+    /// supersede a live row and churn the keyset / fan out files the same way, so
+    /// this is the "mutation" signal for the mutation-heavy gate; inserts (which
+    /// supersede nothing) are the remainder. Named `delete_rows` for history.
     pub delete_rows: u64,
-    /// Rows in this batch that REPLACED an existing live PK (upsert updates — the
-    /// `superseded` count). Heavy updates churn the keyset and fan out files like
-    /// deletes, so they join `delete_rows` in the mutation-heavy gate. Inserts are
-    /// the remainder (`rows − delete_rows − update_rows`), not stored.
-    pub update_rows: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -647,11 +660,9 @@ struct EwmaInner {
     /// arrival-interval variance (and thus the burstiness CV) without storing a
     /// history: `Var = E[x²] − E[x]²`.
     arrival_gap_ms_sq: f64,
-    /// EWMA of the per-batch delete fraction (`delete_rows / rows`), in `[0, 1]`.
+    /// EWMA of the per-batch mutation fraction (`superseded delete_rows / rows`),
+    /// in `[0, 1]` — the mutation-heavy gate signal (updates + deletes).
     delete_fraction: f64,
-    /// EWMA of the per-batch update fraction (`update_rows / rows`), in `[0, 1]`.
-    /// Joins `delete_fraction` in the mutation-heavy gate.
-    update_fraction: f64,
     samples: u64,
     /// EWMA per-batch object-store/disk write latency (the `vortex_write` phase),
     /// ms; paired with `io_samples` for cold-start priming. `0` / no samples ⇒
@@ -737,11 +748,6 @@ impl IngestStats {
         } else {
             0.0
         };
-        let inst_update_fraction = if s.rows > 0 {
-            (u64_to_f64(s.update_rows) / u64_to_f64(s.rows)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
 
         let mut inner = self.inner.lock();
         let prior = inner.samples;
@@ -755,7 +761,6 @@ impl IngestStats {
             prior,
         );
         ewma(&mut inner.delete_fraction, inst_delete_fraction, prior);
-        ewma(&mut inner.update_fraction, inst_update_fraction, prior);
         inner.samples = prior.saturating_add(1);
     }
 
@@ -887,7 +892,6 @@ impl IngestStats {
             cpu_pressure: cpu_pressure(),
             io_latency_ms: (inner.io_samples > 0).then_some(inner.io_latency_ms),
             publish_latency_ms: (inner.publish_samples > 0).then_some(inner.publish_latency_ms),
-            update_fraction: inner.update_fraction,
             data_storage: StorageClass::default(),
             metastore_storage: StorageClass::default(),
         }
@@ -946,9 +950,6 @@ pub(crate) struct IngestSnapshot {
     /// EWMA per-batch metastore publish latency in ms, or `None` before the first
     /// publish. High vs the arrival interval ⇒ bias to larger inline-flush (amortize commits).
     pub publish_latency_ms: Option<f64>,
-    /// EWMA fraction of ingested rows that REPLACE an existing key (upsert updates),
-    /// in `[0, 1]`. Joins `delete_fraction` in the mutation-heavy gate.
-    pub update_fraction: f64,
     /// Storage medium of the table's data files, surfaced for observability/telemetry.
     /// The slow-tier write bias is realized in the static warm-start (the accelerator
     /// sizes the initial inline-flush by storage class) and dynamically via the
@@ -1192,6 +1193,9 @@ pub struct QueryObservations {
     /// One slot beyond the bounds is the implicit `(60s, +inf)` overflow bucket.
     lat_buckets: [AtomicU64; LAT_BUCKET_BOUNDS_MS.len() + 1],
     total_queries: AtomicU64,
+    /// Millis since `anchor` of the most recent recorded query — gates [`Self::qph`]
+    /// so an idle table reports "no QPH signal" instead of a decaying lifetime rate.
+    last_query_millis: AtomicU64,
     anchor: Instant,
 }
 
@@ -1208,6 +1212,7 @@ impl QueryObservations {
         Self {
             lat_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             total_queries: AtomicU64::new(0),
+            last_query_millis: AtomicU64::new(0),
             anchor: Instant::now(),
         }
     }
@@ -1221,6 +1226,12 @@ impl QueryObservations {
             .unwrap_or(LAT_BUCKET_BOUNDS_MS.len());
         self.lat_buckets[idx].fetch_add(1, Ordering::Relaxed);
         self.total_queries.fetch_add(1, Ordering::Relaxed);
+        // Stamp arrival (millis since anchor) so `qph` can distinguish a
+        // currently-loaded table from one that has gone idle.
+        self.last_query_millis.store(
+            u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// p99 latency estimate (upper bound of the bucket where the running cumulative
@@ -1257,16 +1268,29 @@ impl QueryObservations {
         self.total_queries.load(Ordering::Relaxed)
     }
 
-    /// Queries-per-hour over the lifetime of these observations, or `None` before a
-    /// measurable interval. Lifetime QPH is the simplest correct cut; it
-    /// under-reacts to recent spikes (a windowed rate is a future refinement).
+    /// Queries-per-hour, or `None` when there is no current query signal: no queries
+    /// yet, or the table has gone idle (no query within [`QPH_IDLE_MS`]). Without the
+    /// idle gate a lifetime average decays toward 0 while parked, which would keep a
+    /// QPH goal perpetually "violated" and drive tuning that cannot improve QPH
+    /// without new queries. While active it is the lifetime rate — the simplest
+    /// correct cut; it under-reacts to recent spikes (a true windowed rate is a
+    /// future refinement).
     #[must_use]
     pub fn qph(&self) -> Option<f64> {
+        let total = self.total_queries.load(Ordering::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        let now_millis = u64::try_from(self.anchor.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let idle_millis = now_millis.saturating_sub(self.last_query_millis.load(Ordering::Relaxed));
+        if idle_millis > QPH_IDLE_MS {
+            return None;
+        }
         let hours = self.anchor.elapsed().as_secs_f64() / 3600.0;
         if hours <= f64::EPSILON {
             return None;
         }
-        Some(u64_to_f64(self.total_queries.load(Ordering::Relaxed)) / hours)
+        Some(u64_to_f64(total) / hours)
     }
 }
 
@@ -1324,8 +1348,12 @@ pub fn record_query_latency(name: &str, latency_ms: f64) {
     }
 }
 
-/// Drop a table's query observations (on table teardown) so the registry does not
-/// leak handles or hand a recreated table a stale histogram.
+/// Drop a table's query observations on teardown. [`register_query_observations`] is
+/// idempotent and reuses any existing handle, so observations live for the process
+/// lifetime unless a caller explicitly deregisters here — a table that is dropped and
+/// recreated WITHOUT an intervening deregister intentionally inherits its prior
+/// histogram/QPH baseline. Call this only on genuine teardown, to reset that baseline
+/// and avoid leaking handles.
 pub fn deregister_query_observations(name: &str) {
     QUERY_OBSERVATIONS.write().remove(&table_registry_key(name));
 }
@@ -1465,7 +1493,9 @@ impl Goals {
         let lag = self
             .replication_lag
             .map_or(0.0, |g| g.violation(s.replication_lag_secs));
-        let fresh = self.freshness.map_or(0.0, |g| g.violation(s.freshness_secs));
+        let fresh = self
+            .freshness
+            .map_or(0.0, |g| g.violation(s.freshness_secs));
         lag.max(fresh)
     }
 
@@ -1542,7 +1572,7 @@ pub(crate) fn decide_with_goals(
     let ingest_fresh = s.samples > samples_at_last_move;
     let behind = ingest_fresh && s.apply_vs_arrival > BEHIND_RATIO;
     let read_amp_high = s.read_amp > READ_AMP_HIGH;
-    let mutation_heavy = (s.delete_fraction + s.update_fraction) > MUTATION_HEAVY_FRACTION;
+    let mutation_heavy = s.delete_fraction > MUTATION_HEAVY_FRACTION;
     let bursty = ingest_fresh && s.arrival_cv > BURSTY_ARRIVAL_CV;
     // Environment gates. CPU-bound withholds CPU-stealing moves (add write shards,
     // compact more); I/O-/publish-bound (per-batch latency eating the offered-load
@@ -1550,9 +1580,18 @@ pub(crate) fn decide_with_goals(
     // commits. Each collapses to legacy behavior when its signal is unavailable
     // (`cpu_ok` true, `io_bound`/`publish_bound` false).
     let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
-    let io_bound = ingest_fresh && latency_bound(s.io_latency_ms, s.arrival_gap_ms, IO_BOUND_FRACTION);
-    let publish_bound =
-        ingest_fresh && latency_bound(s.publish_latency_ms, s.arrival_gap_ms, PUBLISH_BOUND_FRACTION);
+    let io_bound = ingest_fresh
+        && latency_bound(
+            s.io_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage),
+        );
+    let publish_bound = ingest_fresh
+        && latency_bound(
+            s.publish_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage),
+        );
 
     // (1) Memory pressure [hard, highest priority]: the cgroup-aware budget is
     // nearly exhausted. Shrink the two live memory buffers — the inline memtable
@@ -1707,12 +1746,14 @@ pub(crate) fn decide_with_goals(
             //    mean more files; ALSO withheld when the stream is delete-heavy,
             //    where extra shards multiply the per-burst small-file fan-out and
             //    worsen delete routing off the in-memory tier.
-            // 3. ... Also withheld when CPU-bound (more shards steal query
-            //    threads) or I/O-bound (more shards = more files = more uploads).
+            // 3. ... Also withheld when CPU-bound (more shards steal query threads)
+            //    or I/O-/publish-bound (more shards = more files, uploads, and
+            //    metastore commits — the slow-storage/EBS bias).
             if s.read_amp <= READ_AMP_LOW
                 && !mutation_heavy
                 && cpu_ok
                 && !io_bound
+                && !publish_bound
                 && let Some(v) = clamp_move_usize(
                     cur.write_concurrency.max(1),
                     grow_usize(cur.write_concurrency.max(1)),
@@ -1811,11 +1852,25 @@ fn decide_goal(
     let ingest_v = goals.ingest_violation(s);
     let ingest_violated = ingest_fresh && ingest_v > 0.0;
     // Environment/data gates (same semantics as the legacy ladder): CPU-bound
-    // withholds CPU-stealing moves, I/O-bound and mutation-heavy withhold the
-    // write-concurrency lever (more shards = more files / key churn).
+    // withholds CPU-stealing moves; I/O-/publish-bound and mutation-heavy withhold the
+    // write-concurrency lever (more shards = more files / uploads / key churn). On a
+    // slow storage tier the I/O-/publish-bound bar is halved (see `tier_bound_fraction`),
+    // so EBS/object-store tables stop adding shards and lean on buffer growth +
+    // compaction sooner — the closed-loop half of the storage-tier awareness.
     let cpu_ok = s.cpu_pressure.is_none_or(|p| p < CPU_PRESSURE_OK);
-    let io_bound = ingest_fresh && latency_bound(s.io_latency_ms, s.arrival_gap_ms, IO_BOUND_FRACTION);
-    let mutation_heavy = (s.delete_fraction + s.update_fraction) > MUTATION_HEAVY_FRACTION;
+    let io_bound = ingest_fresh
+        && latency_bound(
+            s.io_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(IO_BOUND_FRACTION, s.data_storage),
+        );
+    let publish_bound = ingest_fresh
+        && latency_bound(
+            s.publish_latency_ms,
+            s.arrival_gap_ms,
+            tier_bound_fraction(PUBLISH_BOUND_FRACTION, s.metastore_storage),
+        );
+    let mutation_heavy = s.delete_fraction > MUTATION_HEAVY_FRACTION;
 
     // (2) Query-health tier: a violated latency/QPH goal. Larger/fewer files and
     // more compaction help queries; shedding write shards cuts file fan-out.
@@ -1823,7 +1878,11 @@ fn decide_goal(
         if mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.inline_flush_max_bytes,
-                goal_grow_i64(cur.inline_flush_max_bytes, b.inline_flush_max_bytes, query_v),
+                goal_grow_i64(
+                    cur.inline_flush_max_bytes,
+                    b.inline_flush_max_bytes,
+                    query_v,
+                ),
                 b.inline_flush_max_bytes,
             )
         {
@@ -1852,7 +1911,11 @@ fn decide_goal(
         }
         if let Some(v) = clamp_move_usize(
             cur.compaction_trigger_files,
-            goal_shrink_usize(cur.compaction_trigger_files, b.compaction_trigger_files, query_v),
+            goal_shrink_usize(
+                cur.compaction_trigger_files,
+                b.compaction_trigger_files,
+                query_v,
+            ),
             b.compaction_trigger_files,
         ) {
             return Some(Adjustment {
@@ -1886,7 +1949,11 @@ fn decide_goal(
         if mem_ok
             && let Some(v) = clamp_move_i64(
                 cur.inline_flush_max_bytes,
-                goal_grow_i64(cur.inline_flush_max_bytes, b.inline_flush_max_bytes, ingest_v),
+                goal_grow_i64(
+                    cur.inline_flush_max_bytes,
+                    b.inline_flush_max_bytes,
+                    ingest_v,
+                ),
                 b.inline_flush_max_bytes,
             )
         {
@@ -1914,6 +1981,7 @@ fn decide_goal(
             && !mutation_heavy
             && cpu_ok
             && !io_bound
+            && !publish_bound
             && let Some(v) = clamp_move_usize(
                 cur.write_concurrency.max(1),
                 goal_grow_usize(cur.write_concurrency.max(1), b.write_concurrency, ingest_v),
@@ -2109,7 +2177,8 @@ fn u64_to_f64(v: u64) -> f64 {
     reason = "capped at 1000× before the cast; the value is a small non-negative fraction"
 )]
 fn pressure_to_milli(fraction: f64) -> Option<u64> {
-    (fraction.is_finite() && fraction >= 0.0).then(|| (fraction.min(1000.0) * 1000.0).round() as u64)
+    (fraction.is_finite() && fraction >= 0.0)
+        .then(|| (fraction.min(1000.0) * 1000.0).round() as u64)
 }
 
 /// Decode the ×1000 pressure wire value back to a fraction; `u64::MAX` is the
@@ -2123,6 +2192,18 @@ fn milli_to_pressure(milli: u64) -> Option<f64> {
 /// (collapses to legacy behavior). Shared by the I/O- and publish-bound flags.
 fn latency_bound(latency_ms: Option<f64>, arrival_gap_ms: f64, frac: f64) -> bool {
     matches!(latency_ms, Some(l) if arrival_gap_ms > 0.0 && l > frac * arrival_gap_ms)
+}
+
+/// The effective latency-bound fraction for a storage tier: slow/networked media
+/// (EBS, object store) trip the I/O-/publish-bound gate at a lower fraction
+/// ([`SLOW_TIER_BOUND_SCALE`]); fast media keep the base. Reads the detected tier so
+/// the closed loop is storage-aware without a dedicated decide branch.
+fn tier_bound_fraction(base: f64, storage: StorageClass) -> f64 {
+    if storage.is_slow_tier() {
+        base * SLOW_TIER_BOUND_SCALE
+    } else {
+        base
+    }
 }
 
 /// Clamp `target` to `[lo, hi]` and return it only if it differs from `cur`
@@ -2213,7 +2294,6 @@ mod tests {
             cpu_pressure: None,
             io_latency_ms: None,
             publish_latency_ms: None,
-            update_fraction: 0.0,
             data_storage: StorageClass::Unknown,
             metastore_storage: StorageClass::Unknown,
         }
@@ -3059,7 +3139,10 @@ mod tests {
         };
         let adj = goal_decide(&s, &cur, &bounds(), &goals).expect("a move");
         assert_eq!(adj.actuator, Actuator::WriteConcurrency);
-        assert!(adj.new_value < 8, "latency goal sheds a shard, never grows one");
+        assert!(
+            adj.new_value < 8,
+            "latency goal sheds a shard, never grows one"
+        );
     }
 
     #[test]
@@ -3085,8 +3168,7 @@ mod tests {
             read_amp: 2,
             ..snap()
         };
-        let goals =
-            Goals::from_targets(Some(5.0), None, Some(100.0), None, Duration::from_mins(1));
+        let goals = Goals::from_targets(Some(5.0), None, Some(100.0), None, Duration::from_mins(1));
         let adj = goal_decide(&s, &actuators(), &bounds(), &goals).expect("a move");
         assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
     }
@@ -3108,7 +3190,10 @@ mod tests {
         };
         let adj = goal_decide(&s, &cur, &bounds(), &goals).expect("a move");
         assert_eq!(adj.actuator, Actuator::WriteConcurrency);
-        assert!(adj.new_value > 4, "lag goal raises concurrency when buffers maxed");
+        assert!(
+            adj.new_value > 4,
+            "lag goal raises concurrency when buffers maxed"
+        );
     }
 
     #[test]
@@ -3143,8 +3228,15 @@ mod tests {
             samples: 40,
             ..snap()
         };
-        let adj =
-            decide_with_goals(&s, &actuators(), &bounds(), ms(60_000), ms(30_000), 40, &lag_goal(5.0));
+        let adj = decide_with_goals(
+            &s,
+            &actuators(),
+            &bounds(),
+            ms(60_000),
+            ms(30_000),
+            40,
+            &lag_goal(5.0),
+        );
         assert!(adj.is_none(), "stale lag must not trigger a goal move");
     }
 
@@ -3178,7 +3270,10 @@ mod tests {
         let (lo, hi) = b.inline_flush_max_bytes;
         let max_step = (hi - lo) / i64::from(STEPS_PER_WINDOW);
         let delta = adj.new_value as i64 - cur.inline_flush_max_bytes;
-        assert!(delta > 0 && delta <= max_step, "delta {delta} not in (0, {max_step}]");
+        assert!(
+            delta > 0 && delta <= max_step,
+            "delta {delta} not in (0, {max_step}]"
+        );
     }
 
     #[test]
@@ -3235,10 +3330,16 @@ mod tests {
                 break; // memtable maxed; later levers (mem-tier, etc.) take over.
             }
             let delta = adj.new_value as i64 - cur.inline_flush_max_bytes;
-            assert!(delta > 0 && delta <= max_step, "step {delta} exceeds cap {max_step}");
+            assert!(
+                delta > 0 && delta <= max_step,
+                "step {delta} exceeds cap {max_step}"
+            );
             live.apply(&adj);
             steps += 1;
-            assert!(steps <= STEPS_PER_WINDOW + 1, "did not converge within N steps");
+            assert!(
+                steps <= STEPS_PER_WINDOW + 1,
+                "did not converge within N steps"
+            );
         }
         assert_eq!(
             live.inline_flush_max_bytes(),
@@ -3272,6 +3373,187 @@ mod tests {
         if let Some(qph) = obs.qph() {
             assert!(qph > 0.0);
         }
+    }
+
+    #[test]
+    fn qph_is_none_without_queries() {
+        // A table that has served no queries has no QPH signal. Reporting a
+        // lifetime average here (→ 0 as the anchor ages) would falsely violate a
+        // QPH goal forever and drive tuning that no tuning can satisfy.
+        assert!(QueryObservations::new().qph().is_none());
+    }
+
+    // ---- environment gates (Part A) ---------------------------------------
+
+    #[test]
+    fn cpu_bound_withholds_cpu_stealing_moves() {
+        let b = bounds();
+        // Buffers already maxed, so a behind table falls through to the
+        // write-concurrency lever — the first CPU-stealing move.
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            write_concurrency: 4,
+            ..actuators()
+        };
+        let mut s = snap();
+        s.apply_vs_arrival = 1.5; // falling behind
+
+        // Low CPU: the controller is free to raise write concurrency.
+        s.cpu_pressure = Some(0.50);
+        assert!(
+            matches!(
+                decide_fresh(&s, &cur, &b),
+                Some(adj) if adj.actuator == Actuator::WriteConcurrency
+            ),
+            "low CPU + behind + buffers maxed → raise write concurrency"
+        );
+
+        // High CPU: the same snapshot withholds every CPU-stealing move (more
+        // write shards, more compaction), leaving nothing to do.
+        s.cpu_pressure = Some(0.95);
+        assert!(
+            decide_fresh(&s, &cur, &b).is_none(),
+            "CPU-bound: no write-concurrency growth or compaction shrink"
+        );
+    }
+
+    #[test]
+    fn io_bound_not_behind_grows_memtable() {
+        let b = bounds();
+        let cur = actuators();
+        let mut s = snap(); // healthy / not behind (apply_vs_arrival 0.2)
+        // Per-batch write latency eats > IO_BOUND_FRACTION of the 100 ms window.
+        s.io_latency_ms = Some(80.0);
+        let adj = decide_fresh(&s, &cur, &b).expect("io-bound table tunes");
+        assert_eq!(
+            adj.actuator,
+            Actuator::InlineFlushBytes,
+            "io-bound, not behind → enlarge memtable to amortize commits"
+        );
+    }
+
+    #[test]
+    fn publish_bound_not_behind_grows_memtable() {
+        let b = bounds();
+        let cur = actuators();
+        let mut s = snap();
+        // Metastore publish-wall eats > PUBLISH_BOUND_FRACTION of the window.
+        s.publish_latency_ms = Some(80.0);
+        let adj = decide_fresh(&s, &cur, &b).expect("publish-bound table tunes");
+        assert_eq!(adj.actuator, Actuator::InlineFlushBytes);
+    }
+
+    #[test]
+    fn env_signals_absent_preserves_legacy_behavior() {
+        // Regression guard: with every environment signal unavailable (the snap()
+        // default), a behind table with maxed buffers raises write concurrency
+        // exactly as before the env/data work — no new gate fires when its signal
+        // is absent.
+        let b = bounds();
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            ..actuators()
+        };
+        let mut s = snap();
+        s.apply_vs_arrival = 1.5;
+        assert!(
+            s.cpu_pressure.is_none() && s.io_latency_ms.is_none() && s.publish_latency_ms.is_none()
+        );
+        let adj = decide_fresh(&s, &cur, &b).expect("legacy behind path still acts");
+        assert_eq!(adj.actuator, Actuator::WriteConcurrency);
+    }
+
+    // ---- storage-tier awareness (the EBS bias) ----------------------------
+
+    #[test]
+    fn tier_bound_fraction_lowers_bar_for_slow_storage() {
+        // Slow/networked tiers (EBS, object store / unknown) halve the latency bar;
+        // fast tiers (local SSD, tmpfs) keep it.
+        let scaled = IO_BOUND_FRACTION * SLOW_TIER_BOUND_SCALE;
+        assert!(
+            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Ebs) - scaled).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Unknown) - scaled).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::LocalSsd) - IO_BOUND_FRACTION)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (tier_bound_fraction(IO_BOUND_FRACTION, StorageClass::Tmpfs) - IO_BOUND_FRACTION).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn slow_storage_amortizes_where_fast_storage_tolerates() {
+        let b = bounds();
+        let cur = actuators();
+        let mut s = snap();
+        s.io_latency_ms = Some(30.0); // 30% of the 100 ms offered-load window
+
+        // EBS: the bar is halved (25%) → io-bound → amortize via a larger memtable.
+        s.data_storage = StorageClass::Ebs;
+        assert!(
+            matches!(
+                decide_fresh(&s, &cur, &b),
+                Some(adj) if adj.actuator == Actuator::InlineFlushBytes
+            ),
+            "EBS tolerates less per-batch write latency → grow the memtable"
+        );
+
+        // Local SSD: 30% is under the 50% bar → not io-bound, no io-driven growth.
+        s.data_storage = StorageClass::LocalSsd;
+        assert!(
+            !matches!(
+                decide_fresh(&s, &cur, &b),
+                Some(adj) if adj.actuator == Actuator::InlineFlushBytes
+            ),
+            "local SSD tolerates 30% write latency → no I/O-bound amortization"
+        );
+    }
+
+    #[test]
+    fn lag_goal_on_slow_storage_prefers_buffers_over_shards() {
+        // The production path (goals active). With buffers maxed, a violated lag
+        // goal reaches the write-shard lever — but on a slow tier more shards mean
+        // more parallel slow uploads + more small files. Tier is the only variable.
+        let b = bounds();
+        let cur = ActuatorValues {
+            inline_flush_max_bytes: b.inline_flush_max_bytes.1,
+            mem_tier_max_bytes: b.mem_tier_max_bytes.1,
+            write_concurrency: 4,
+            ..actuators()
+        };
+        let mut s = snap();
+        s.replication_lag_secs = Some(60.0); // 12× over the 5 s goal
+        s.io_latency_ms = Some(30.0); // io-bound only once the bar is halved
+
+        // Local SSD: 30% is under the bar → the lag tier raises write concurrency.
+        s.data_storage = StorageClass::LocalSsd;
+        assert!(
+            matches!(
+                goal_decide(&s, &cur, &b, &lag_goal(5.0)),
+                Some(adj) if adj.actuator == Actuator::WriteConcurrency
+            ),
+            "fast tier: lag-violated + buffers maxed → add a shard"
+        );
+
+        // EBS: the halved bar trips io-bound → withhold the shard, compact instead.
+        s.data_storage = StorageClass::Ebs;
+        assert!(
+            matches!(
+                goal_decide(&s, &cur, &b, &lag_goal(5.0)),
+                Some(adj) if adj.actuator != Actuator::WriteConcurrency
+            ),
+            "slow tier: no shard growth — lean on buffers/compaction"
+        );
     }
 
     #[test]

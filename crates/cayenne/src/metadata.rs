@@ -626,6 +626,19 @@ impl StorageClass {
     pub fn is_slow_tier(self) -> bool {
         matches!(self, Self::Ebs | Self::Unknown)
     }
+
+    /// Stable numeric code for the telemetry info gauge: `0` `LocalSsd`, `1` `Ebs`,
+    /// `2` `Tmpfs`, `3` `Unknown`. Lets dashboards see the storage tier the tuner
+    /// detected without emitting a high-cardinality string label.
+    #[must_use]
+    pub fn metric_code(self) -> u64 {
+        match self {
+            Self::LocalSsd => 0,
+            Self::Ebs => 1,
+            Self::Tmpfs => 2,
+            Self::Unknown => 3,
+        }
+    }
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
