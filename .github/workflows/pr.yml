@@ -109,7 +109,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@c1382e60a94a2c4095b7cf07e99fb61dc87eef18 # v0.5.7
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -198,7 +198,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@c1382e60a94a2c4095b7cf07e99fb61dc87eef18 # v0.5.7
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -303,7 +303,7 @@ jobs:
       - name: Set up spiceio
         if: needs.check_changes.outputs.relevant_changes == 'true' && runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@1a8c1bc2d46e0b68df4a786b5f929d758f75b06e # v0.5.6
+        uses: spiceai/spiceio/.github/actions/setup@c1382e60a94a2c4095b7cf07e99fb61dc87eef18 # v0.5.7
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

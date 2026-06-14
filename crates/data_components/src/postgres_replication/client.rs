@@ -458,10 +458,19 @@ fn wal_stream(
                             unreachable!();
                         }
 
+                        // Carry the transaction's commit time (one commit ts per
+                        // transaction) as Unix-epoch ms so the accelerator can
+                        // compute true source-to-queryable replication lag.
+                        let commit_ts_ms = pg_epoch_to_system_time(commit_time_micros)
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|d| i64::try_from(d.as_millis()).ok());
+
                         let batch = build_change_batch(&working_schema, rel, &buffer.changes)
                             .map_err(|e| StreamError::External(format!(
                                 "change batch build failed for {dataset_name}: {e}"
-                            )))?;
+                            )))?
+                            .with_source_commit_ts_ms(commit_ts_ms);
 
                         let is_ready = !first_emitted;
                         first_emitted = true;
