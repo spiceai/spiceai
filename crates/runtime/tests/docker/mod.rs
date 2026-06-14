@@ -210,7 +210,7 @@ impl<'a> ContainerRunner<'a> {
         }
 
         let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(300), // Timeout after 5min
+            std::time::Duration::from_mins(5), // Timeout after 5min
             CONTAINER_SEMAPHORE.clone().acquire_owned(),
         )
         .await
@@ -280,7 +280,7 @@ impl<'a> ContainerRunner<'a> {
             .start_container(self.name, None::<StartContainerOptions<String>>)
             .await?;
 
-        let start_timeout = start_timeout.unwrap_or_else(|| Duration::from_secs(60));
+        let start_timeout = start_timeout.unwrap_or_else(|| Duration::from_mins(1));
         let start_time = std::time::Instant::now();
         loop {
             let inspect_container = self.docker.inspect_container(self.name, None).await?;

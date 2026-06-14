@@ -155,7 +155,7 @@ pub struct PartialAggregationFlightSqlExec {
     /// Cookie store for authentication propagation.
     cookie_store: Arc<CookieStore>,
     /// Cached plan properties.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Optional W3C `traceparent` value inherited from the source
     /// `FlightSqlExec`. Forwarded as a gRPC metadata header on each
     /// outgoing call so executor-side spans chain back to the originating
@@ -176,12 +176,12 @@ impl PartialAggregationFlightSqlExec {
         output_schema: SchemaRef,
         column_substitutions: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         let statistics = Self::derive_statistics(source, &output_schema);
         Self {
             table_reference: source.table_reference().clone(),
@@ -268,16 +268,12 @@ impl ExecutionPlan for PartialAggregationFlightSqlExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.statistics.clone())
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
@@ -609,11 +605,11 @@ fn find_top_level_as(s: &str) -> Option<usize> {
                 }
                 depth -= 1;
             }
-            b' ' if depth == 0 => {
+            b' ' if depth == 0
                 // Check for " AS "
-                if i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") {
-                    return Some(i);
-                }
+                && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b" AS ") =>
+            {
+                return Some(i);
             }
             _ => {}
         }

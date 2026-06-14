@@ -17,7 +17,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - run: rustup toolchain install 1.94.1 --profile minimal
+      - run: rustup toolchain install 1.95.0 --profile minimal
 
       - name: Set up make
         if: runner.os != 'macOS'

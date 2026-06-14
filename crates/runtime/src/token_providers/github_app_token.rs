@@ -171,7 +171,7 @@ impl GitHubAppTokenProvider {
 
         let handle = tokio::spawn(async move {
             let mut backoff = FibonacciBackoffBuilder::new()
-                .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
+                .max_duration(Some(Duration::from_mins(5))) // Cap at 5 minutes
                 .build();
 
             let mut next_wait = init_token.next_wait();
@@ -195,7 +195,7 @@ impl GitHubAppTokenProvider {
                         let _ = cloned_tx.send(new_token.token.clone());
                     }
                     Err(e) => {
-                        next_wait = backoff.next_duration().unwrap_or(Duration::from_secs(300));
+                        next_wait = backoff.next_duration().unwrap_or(Duration::from_mins(5));
                         tracing::error!(
                             "GitHub token refresh failed: {}. Retrying in {:?}",
                             e,

@@ -25,7 +25,7 @@ use datafusion::{
     logical_expr::{
         ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
         interval_arithmetic::Interval,
-        simplify::{ExprSimplifyResult, SimplifyInfo},
+        simplify::{ExprSimplifyResult, SimplifyContext},
         sort_properties::{ExprProperties, SortProperties},
     },
     prelude::Expr,
@@ -86,7 +86,7 @@ impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFImpl for Scala
     fn simplify(
         &self,
         args: Vec<Expr>,
-        info: &dyn SimplifyInfo,
+        info: &SimplifyContext,
     ) -> DataFusionResult<ExprSimplifyResult> {
         self.scalar_udf.simplify(args, info)
     }

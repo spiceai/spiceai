@@ -89,6 +89,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use object_store::PutPayload;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectStorePath;

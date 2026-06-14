@@ -20,8 +20,9 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, ObjectMeta, ObjectStore,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
+    Attributes, CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    UpdateVersion, path::Path,
 };
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -246,18 +247,32 @@ impl ObjectStore for MemoryObjectStore {
         })
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let key = location.to_string();
-        let mut store = self.state.store.lock().await;
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let state = Arc::clone(&self.state);
 
-        if store.remove(&key).is_some() {
-            Ok(())
-        } else {
-            Err(object_store::Error::NotFound {
-                path: key,
-                source: "Object not found".into(),
+        locations
+            .map(move |location| {
+                let state = Arc::clone(&state);
+                async move {
+                    let location = location?;
+                    let key = location.to_string();
+                    let mut store = state.store.lock().await;
+
+                    if store.remove(&key).is_some() {
+                        Ok(location)
+                    } else {
+                        Err(object_store::Error::NotFound {
+                            path: key,
+                            source: "Object not found".into(),
+                        })
+                    }
+                }
             })
-        }
+            .buffered(10)
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -336,35 +351,18 @@ impl ObjectStore for MemoryObjectStore {
         })
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
         let from_key = from.to_string();
         let to_key = to.to_string();
 
         let mut store = self.state.store.lock().await;
 
-        let Some(obj) = store.get(&from_key).cloned() else {
-            return Err(object_store::Error::NotFound {
-                path: from_key,
-                source: "Source object not found".into(),
-            });
-        };
-
-        let new_obj = StoredObject {
-            data: obj.data,
-            e_tag: self.next_etag(),
-            last_modified: Utc::now(),
-        };
-        store.insert(to_key, new_obj);
-        Ok(())
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let from_key = from.to_string();
-        let to_key = to.to_string();
-
-        let mut store = self.state.store.lock().await;
-
-        if store.contains_key(&to_key) {
+        if matches!(options.mode, CopyMode::Create) && store.contains_key(&to_key) {
             return Err(object_store::Error::AlreadyExists {
                 path: to_key,
                 source: "Destination object already exists".into(),
@@ -423,7 +421,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::TryStreamExt;
-    use object_store::{GetRange, ObjectStore, PutMode, PutOptions, UpdateVersion};
+    use object_store::{GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 
     #[tokio::test]
     async fn test_put_and_get_basic() {

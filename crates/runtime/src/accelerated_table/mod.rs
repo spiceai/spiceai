@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::config::ClusterRole;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
@@ -380,6 +381,9 @@ pub struct Builder {
     cluster_role: Option<ClusterRole>,
     user_facing_schema: Option<SchemaRef>,
     accelerator_write_mutex: Arc<Mutex<()>>,
+    /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
+    /// Layered over the process-global CDC config.
+    cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
 }
 
 impl Builder {
@@ -429,6 +433,7 @@ impl Builder {
             cluster_role: None,
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
+            cdc_param_overrides: None,
         }
     }
 
@@ -676,6 +681,17 @@ impl Builder {
         self
     }
 
+    /// Provide per-dataset `cdc_*` parameter overrides drawn from
+    /// `dataset.acceleration.params`. These layer on top of the runtime-global
+    /// CDC config only for this dataset's changes stream;
+    pub fn cdc_param_overrides(
+        &mut self,
+        overrides: Option<Arc<HashMap<String, String>>>,
+    ) -> &mut Self {
+        self.cdc_param_overrides = overrides;
+        self
+    }
+
     /// Build the accelerated table
     pub async fn build(self) -> AcceleratedTableBuilderResult<AcceleratedTable> {
         if self.refresh.mode != RefreshMode::Changes && self.changes_stream.is_some() {
@@ -864,6 +880,7 @@ impl Builder {
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
+        refresher.with_cdc_param_overrides(self.cdc_param_overrides);
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
@@ -1139,7 +1156,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         layout: runtime_acceleration::snapshot::AccelerationLayout,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
 
         loop {
             interval.tick().await;

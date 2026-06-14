@@ -26,6 +26,35 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
+/// Process-wide CDC shutdown signal, as a monotonically increasing *epoch*.
+///
+/// Raised by the runtime at the *start* of graceful shutdown — before the
+/// (potentially long) connection-drain phase — so CDC sources can release
+/// their upstream resources immediately: a Postgres replication connection
+/// holds a single-consumer slot, and releasing it at SIGTERM (instead of at
+/// process exit) lets a replacement instance attach during a rolling deploy
+/// rather than retrying against "replication slot is active".
+///
+/// An epoch (rather than a one-way flag) keeps multi-`Runtime` processes
+/// working: test suites construct and shut down several `Runtime` instances
+/// in one process, and streams started *after* a shutdown capture the new
+/// epoch and are unaffected. A stream stops when the epoch advances past the
+/// value it captured at start.
+static CDC_SHUTDOWN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Signal every currently-running CDC source in the process to stop and
+/// release its upstream resources. Sources started afterwards are unaffected.
+pub fn begin_shutdown() {
+    CDC_SHUTDOWN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The current shutdown epoch. Long-running CDC sources capture this at
+/// stream start and stop once it changes.
+#[must_use]
+pub fn shutdown_epoch() -> u64 {
+    CDC_SHUTDOWN_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A stream of [`ChangeEnvelope`] items produced by a CDC connector.
 ///
 /// # Readiness contract
@@ -256,6 +285,13 @@ pub struct ChangeBatch {
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
+    /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
+    /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
+    /// replication lag as `now_ms - source_commit_ts_ms`. Populated by CDC
+    /// connectors that carry a source timestamp (Debezium, Postgres logical
+    /// replication, `MongoDB` change streams); left `None` by sources that don't.
+    source_commit_ts_ms: Option<i64>,
 }
 
 pub enum ChangeOperation {
@@ -313,7 +349,25 @@ impl ChangeBatch {
             op_idx,
             primary_keys_idx,
             data_idx,
+            source_commit_ts_ms: None,
         })
+    }
+
+    /// Attach the newest upstream commit timestamp (ms since the Unix epoch) for
+    /// this batch. Connectors that carry a source timestamp set it here; the value
+    /// rides the batch into the accelerator write path, where it feeds the
+    /// replication-lag signal. `None` leaves the batch without lag information.
+    #[must_use]
+    pub fn with_source_commit_ts_ms(mut self, source_commit_ts_ms: Option<i64>) -> Self {
+        self.source_commit_ts_ms = source_commit_ts_ms;
+        self
+    }
+
+    /// The newest upstream commit timestamp (ms since the Unix epoch) in this
+    /// batch, or `None` when the source does not provide one.
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
     }
 
     #[must_use]

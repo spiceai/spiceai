@@ -18,9 +18,9 @@ use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
 #[cfg(feature = "duckdb")]
-use spicepod::acceleration::{OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
 #[cfg(feature = "duckdb")]
-use spicepod::component::dataset::SchemaInference;
+use spicepod::component::dataset::{OnSchemaChange, SchemaInference};
 use spicepod::{
     acceleration::Acceleration, component::dataset::Dataset, param::Params as DatasetParams,
 };
@@ -31,8 +31,8 @@ use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
 const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
-const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_secs(180);
-const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
+const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
@@ -67,6 +67,30 @@ pub fn make_mongodb_extended_inference_dataset(path: &str, name: &str, port: u16
         enabled: true,
         engine: Some("duckdb".to_string()),
         refresh_mode: Some(RefreshMode::Full),
+        ..Acceleration::default()
+    });
+    dataset
+}
+
+/// `MongoDB` source accelerated into a **file-backed** `DuckDB` table with
+/// `on_schema_change: sync_all_columns` and extended inference, for the
+/// restart-time widening test. File-backed (`duckdb_file`, `Mode::File`) so the
+/// accelerated table and its checkpoint survive the restart that re-infers the
+/// (now wider) source schema and drives in-place evolution.
+#[cfg(feature = "duckdb")]
+pub fn make_mongodb_widen_dataset(path: &str, name: &str, port: u16, duckdb_file: &str) -> Dataset {
+    let mut dataset = make_mongodb_dataset(path, name, port, false);
+    dataset.schema_inference = SchemaInference::Extended;
+    dataset.on_schema_change = OnSchemaChange::SyncAllColumns;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("duckdb".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(DatasetParams::from_string_map(HashMap::from([(
+            "duckdb_file".to_string(),
+            duckdb_file.to_string(),
+        )]))),
         ..Acceleration::default()
     });
     dataset

@@ -22,8 +22,9 @@ limitations under the License.
 
 use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, TableMetadata, TableStatistics,
+    PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::collections::HashMap;
@@ -237,6 +238,18 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get table metadata by name.
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
 
+    /// Replace the stored Arrow schema for an existing table (widening schema
+    /// evolution).
+    ///
+    /// Overwrites `cayenne_table.schema_json` for `table_id` with the
+    /// IPC-serialized `schema` (the same serialization `create_table` uses).
+    /// Callers are responsible for ensuring the new schema is a lossless
+    /// widening of the stored one (added nullable columns / widened types) —
+    /// existing data files are NOT rewritten; scans adapt old files to the
+    /// evolved schema at read time. Idempotent: re-applying the same schema is
+    /// a plain single-row UPDATE to the same value.
+    async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()>;
+
     /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
 
@@ -323,15 +336,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Atomically commit the catalog side of an on-conflict (upsert)
     /// deletion.
     ///
-    /// Implementations MUST commit every delete-file row and every
-    /// insert-record row in one durable transaction. The caller allocates
+    /// Implementations MUST commit every delete-file row and its corresponding
+    /// reinsert metadata in one durable transaction. The caller allocates
     /// the needed sequence numbers (via `reserve_sequence_numbers` or
     /// `increment_sequence_number`) before this call, so a failed transaction
     /// may leave a sequence-number gap, but it must not leave a partially
-    /// committed delete-file / insert-record pair. A non-atomic implementation
+    /// committed delete-file / reinsert-metadata pair. A non-atomic implementation
     /// reintroduces the crash window this method exists to close.
-    /// When insert records are provided, `insert_sequence` must be greater than
-    /// each delete file's sequence number so replacement rows remain visible.
+    /// When reinsert keys are provided, `delete_files` must include at least one
+    /// key-based delete file so the reinsert sequence has delete-vector keys to
+    /// stamp, and `insert_sequence` must be greater than each delete file's
+    /// sequence number so replacement rows remain visible.
     ///
     /// This replaces the legacy 3-call sequence on the on-conflict path
     /// (`add_delete_file` per file → `add_insert_records_batch`), which
@@ -357,7 +372,7 @@ pub trait MetadataCatalog: Send + Sync {
     ) -> CatalogResult<()>;
 
     /// Stage-A fold for a pipelined CDC upsert: commit the on-conflict deletion
-    /// metadata (delete files + insert records + protected-snapshot sequence)
+    /// metadata (delete files + reinsert metadata + protected-snapshot sequence)
     /// AND INSERT the inline tombstone (Option D, `published = false`) for any
     /// inlined rows the upsert replaces. Backends that override this method fold
     /// both into the SAME backend transaction (one writer acquisition); the
@@ -368,7 +383,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// This is the single-transaction equivalent of calling
     /// [`Self::commit_on_conflict_deletions`] immediately followed by
     /// [`Self::add_inlined_delete`] with `published = false`: it preserves the
-    /// exact statement order (delete files → insert records → snapshot sequence →
+    /// exact statement order (delete files → reinsert metadata → snapshot sequence →
     /// tombstone INSERT) but acquires the process-wide metastore writer **once**
     /// instead of twice. On a serialized backend (the embedded `SQLite` metastore
     /// WAL-serializes every writer across all tables) this halves the writer
@@ -409,7 +424,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// Returns an error if the transaction cannot be opened, any statement fails,
     /// or the commit fails. In the single-transaction override (`CayenneCatalog`)
     /// a failure rolls back the whole transaction, leaving the catalog unchanged
-    /// (no partial delete-file / insert-record / snapshot-sequence / tombstone /
+    /// (no partial delete-file / reinsert-metadata / snapshot-sequence / tombstone /
     /// pending-flip state). The trait DEFAULT implementation below is NOT atomic
     /// across its steps — it runs `commit_on_conflict_deletions`, then the
     /// deferred `published = 1` flips, then the tombstone INSERT as separate
@@ -561,6 +576,30 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear table-level aggregate statistics for a table.
     async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Upsert per-file footer statistics for listing-time pruning.
+    async fn upsert_snapshot_file_statistics(
+        &self,
+        stats: &SnapshotFileStatistics,
+    ) -> CatalogResult<()>;
+
+    /// Get persisted per-file statistics for one object in a snapshot.
+    async fn get_snapshot_file_statistics(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+        file_path: &str,
+    ) -> CatalogResult<Option<SnapshotFileStatistics>>;
+
+    /// Drop per-file statistics rows for snapshots other than the current one.
+    async fn clear_snapshot_file_statistics_except(
+        &self,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> CatalogResult<()>;
+
+    /// Clear all per-file statistics rows for a table.
+    async fn clear_snapshot_file_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Upsert the persisted primary-key existence index (a bloom checkpoint),
     /// tagged with the snapshot id it covers. Stored in the metastore so it is

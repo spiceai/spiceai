@@ -115,7 +115,7 @@ async fn duckdb_from_functions() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -193,7 +193,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -278,7 +278,7 @@ async fn duckdb_regexp() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -426,7 +426,7 @@ async fn duckdb_json_functions() -> Result<(), String> {
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}
@@ -545,7 +545,7 @@ async fn duckdb_connector_does_not_push_down_spice_functions() -> Result<(), Str
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
                 () = cloned_rt.load_components() => {}

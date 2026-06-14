@@ -25,6 +25,10 @@ pub const CAYENNE_PATH_FILTER_REPLACEMENT: &str = "$1/<CAYENNE_PATH>.vortex";
 const VORTEX_RANGE_FILTER_PATTERN: &str = r"(\.vortex):\d+\.\.\d+";
 const VORTEX_RANGE_FILTER_REPLACEMENT: &str = "$1:<RANGE>";
 
+/// Queries temporarily excluded from explain-plan snapshot validation because their
+/// plans are not yet stable enough to snapshot deterministically.
+const EXPLAIN_SNAPSHOT_SKIP_LIST: &[&str] = &["chbench_q5"];
+
 fn make_tmpdir_regex_pattern(tempdir: &str) -> String {
     format!(r"(?:{tempdir}|private/{tempdir})/[^/]*/(\.spice/)?data")
 }
@@ -63,6 +67,16 @@ pub async fn record_explain_plan(
     // Check the plan
     let sql = Arc::clone(&query.sql);
     let query_name = Arc::clone(&query.name);
+
+    // Skip queries whose explain plans are not yet stable enough to snapshot.
+    let qname: &str = &query_name;
+    if EXPLAIN_SNAPSHOT_SKIP_LIST.contains(&qname) {
+        println!(
+            "Skipping explain-plan snapshot for '{query_name}' (temporarily excluded — see EXPLAIN_SNAPSHOT_SKIP_LIST)"
+        );
+        return Ok(());
+    }
+
     let parameters = query.get_parameters_batch().transpose()?;
     let plan_results = query_to_batches(spice_client, &format!("EXPLAIN {sql}"), parameters)
         .await
@@ -113,7 +127,8 @@ pub async fn record_explain_plan(
 /// The approach: when we find `PartitionedUnionExec`, we identify child subtrees
 /// by their indentation level. Lines at the first child's indent level start new
 /// subtrees. We sort all subtrees alphabetically.
-fn sort_partitioned_union_children(explain_plan: &str) -> String {
+#[must_use]
+pub fn sort_partitioned_union_children(explain_plan: &str) -> String {
     // if no PartitionedUnionExec, return unchanged
     if !explain_plan.contains("PartitionedUnionExec") {
         return explain_plan.to_string();

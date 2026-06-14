@@ -2,17 +2,18 @@
 source: crates/runtime/tests/duckdb/mod.rs
 expression: pretty
 ---
-+---------------+------------------------------------------------------------------------+
-| plan_type     | plan                                                                   |
-+---------------+------------------------------------------------------------------------+
-| logical_plan  | Projection: json_test.id                                               |
-|               |   Filter: json_get_str(json_test.data, Utf8("name")) = Utf8("alice")   |
-|               |     TableScan: json_test projection=[id, data]                         |
-| physical_plan | FilterExec: json_get_str(data@1, name) = alice, projection=[id@0]      |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |
-|               |     SchemaCastScanExec                                                 |
-|               |       CooperativeExec                                                  |
-|               |         BytesProcessedExec                                             |
-|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test"        |
-|               |                                                                        |
-+---------------+------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                 |
++---------------+------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: json_test.id                                                                             |
+|               |   Filter: __datafusion_extracted_1 = Utf8("alice")                                                   |
+|               |     Projection: json_get_str(json_test.data, Utf8("name")) AS __datafusion_extracted_1, json_test.id |
+|               |       TableScan: json_test projection=[id, data]                                                     |
+| physical_plan | FilterExec: __datafusion_extracted_1@0 = alice, projection=[id@1]                                    |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                               |
+|               |     ProjectionExec: expr=[json_get_str(data@1, name) as __datafusion_extracted_1, id@0 as id]        |
+|               |       SchemaCastScanExec                                                                             |
+|               |         BytesProcessedExec                                                                           |
+|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test"                                      |
+|               |                                                                                                      |
++---------------+------------------------------------------------------------------------------------------------------+

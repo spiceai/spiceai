@@ -53,7 +53,11 @@ use parking_lot::Mutex;
 /// # Arguments
 ///
 /// * `stream` - The input record batch stream to sort
-/// * `sort_columns` - Column names to sort by (in order of precedence)
+/// * `sort_columns` - Sort specifications, in order of precedence. Each entry is
+///   either a bare column name (ascending, NULLs last) or
+///   `column [ASC|DESC] [NULLS FIRST|LAST]` (case-insensitive). When the NULLS
+///   placement is omitted, `DESC` defaults to NULLs first and `ASC` to NULLs
+///   last (the SQL/Postgres `ORDER BY` convention).
 /// * `context` - Task context for memory management and spill configuration
 ///
 /// # Returns
@@ -77,7 +81,28 @@ pub fn sort_stream(
 
     // Build sort expressions from configured sort_columns
     let mut sort_exprs = Vec::with_capacity(sort_columns.len());
-    for col_name in sort_columns {
+    for entry in sort_columns {
+        // An entry that matches a column name exactly sorts ascending, NULLs
+        // last — the historical behavior, preserved first so a column whose name
+        // happens to contain whitespace or a direction keyword keeps working.
+        let (col_name, options) = if schema.index_of(entry.trim()).is_ok() {
+            (
+                entry.trim(),
+                arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            )
+        } else if let Some(parsed) = parse_sort_entry(entry) {
+            (parsed.0, parsed.1)
+        } else {
+            tracing::warn!(
+                "Invalid sort column specification '{}', expected 'column [ASC|DESC] [NULLS FIRST|LAST]'. Skipping sort.",
+                entry
+            );
+            return Ok(stream);
+        };
+
         // Validate column exists in schema and get its index
         let Ok(column_index) = schema.index_of(col_name) else {
             tracing::warn!(
@@ -89,10 +114,7 @@ pub fn sort_stream(
 
         sort_exprs.push(PhysicalSortExpr {
             expr: Arc::new(Column::new(col_name, column_index)),
-            options: arrow::compute::SortOptions {
-                descending: false,
-                nulls_first: false,
-            },
+            options,
         });
     }
 
@@ -119,13 +141,56 @@ pub fn sort_stream(
     Ok(sorted_stream)
 }
 
+/// Parse one sort specification of the form
+/// `column [ASC|DESC] [NULLS FIRST|LAST]` (case-insensitive) into the column
+/// name and its Arrow [`SortOptions`](arrow::compute::SortOptions). When the
+/// NULLS placement is omitted it follows the SQL/Postgres `ORDER BY` default:
+/// NULLs first for `DESC`, NULLs last for `ASC`. Returns `None` for an entry
+/// that does not match the grammar (the caller decides how to degrade).
+fn parse_sort_entry(entry: &str) -> Option<(&str, arrow::compute::SortOptions)> {
+    let tokens: Vec<&str> = entry.split_whitespace().collect();
+    let (&column, modifiers) = tokens.split_first()?;
+
+    let mut descending = false;
+    let mut nulls_first: Option<bool> = None;
+    let mut rest = modifiers;
+    if let Some((&dir, after_dir)) = rest.split_first() {
+        if dir.eq_ignore_ascii_case("ASC") {
+            rest = after_dir;
+        } else if dir.eq_ignore_ascii_case("DESC") {
+            descending = true;
+            rest = after_dir;
+        }
+    }
+    match rest {
+        [] => {}
+        [nulls, placement]
+            if nulls.eq_ignore_ascii_case("NULLS")
+                && (placement.eq_ignore_ascii_case("FIRST")
+                    || placement.eq_ignore_ascii_case("LAST")) =>
+        {
+            nulls_first = Some(placement.eq_ignore_ascii_case("FIRST"));
+        }
+        _ => return None,
+    }
+
+    Some((
+        column,
+        arrow::compute::SortOptions {
+            descending,
+            // SQL/Postgres ORDER BY default: DESC puts NULLs first, ASC last.
+            nulls_first: nulls_first.unwrap_or(descending),
+        },
+    ))
+}
+
 /// Streaming execution plan that forwards an existing `RecordBatchStream`.
 ///
 /// This is a simple wrapper that allows integrating an existing stream
 /// into `DataFusion`'s `ExecutionPlan` framework for operations like sorting.
 struct StreamingExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingExec {
@@ -138,7 +203,7 @@ impl StreamingExec {
         );
         Self {
             stream: Mutex::new(Some(stream)),
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -157,6 +222,10 @@ impl DisplayAs for StreamingExec {
 
 #[deny(clippy::missing_trait_methods)]
 impl ExecutionPlan for StreamingExec {
+    fn with_preserve_order(&self, _preserve_order: bool) -> Option<Arc<dyn ExecutionPlan>> {
+        None
+    }
+
     fn name(&self) -> &'static str {
         "StreamingExec"
     }
@@ -176,7 +245,7 @@ impl ExecutionPlan for StreamingExec {
         Arc::clone(self.properties().eq_properties.schema())
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -253,10 +322,6 @@ impl ExecutionPlan for StreamingExec {
 
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         None
-    }
-
-    fn statistics(&self) -> Result<datafusion::common::Statistics> {
-        Ok(datafusion::common::Statistics::new_unknown(&self.schema()))
     }
 
     fn partition_statistics(
@@ -605,5 +670,102 @@ mod tests {
         // Should be sorted in ascending order
         let expected: Vec<i32> = (0..size).collect();
         assert_eq!(all_ids, expected);
+    }
+
+    #[test]
+    fn test_parse_sort_entry_forms() {
+        use arrow::compute::SortOptions;
+
+        // Bare column: ascending, NULLs last.
+        assert_eq!(
+            parse_sort_entry("id"),
+            Some((
+                "id",
+                SortOptions {
+                    descending: false,
+                    nulls_first: false
+                }
+            ))
+        );
+        // Direction only: DESC defaults to NULLs first (SQL ORDER BY convention).
+        assert_eq!(
+            parse_sort_entry("ts DESC"),
+            Some((
+                "ts",
+                SortOptions {
+                    descending: true,
+                    nulls_first: true
+                }
+            ))
+        );
+        assert_eq!(
+            parse_sort_entry("ts asc"),
+            Some((
+                "ts",
+                SortOptions {
+                    descending: false,
+                    nulls_first: false
+                }
+            ))
+        );
+        // Explicit NULLS placement, with and without a direction.
+        assert_eq!(
+            parse_sort_entry("ts DESC NULLS LAST"),
+            Some((
+                "ts",
+                SortOptions {
+                    descending: true,
+                    nulls_first: false
+                }
+            ))
+        );
+        assert_eq!(
+            parse_sort_entry("ts nulls first"),
+            Some((
+                "ts",
+                SortOptions {
+                    descending: false,
+                    nulls_first: true
+                }
+            ))
+        );
+        // Invalid trailing tokens are rejected.
+        assert_eq!(parse_sort_entry("ts SIDEWAYS"), None);
+        assert_eq!(parse_sort_entry("ts DESC NULLS"), None);
+        assert_eq!(parse_sort_entry("ts DESC NULLS SOMETIMES"), None);
+        assert_eq!(parse_sort_entry(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_sort_stream_with_direction_entries() {
+        let schema = create_test_schema();
+        let batch = create_test_batch(
+            vec![3, 1, 4, 2],
+            vec!["c", "a", "d", "b"],
+            vec![30, 10, 40, 20],
+        );
+
+        let stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&schema), stream::iter(vec![Ok(batch)]));
+
+        let context = create_task_context();
+        let sorted = sort_stream(
+            Box::pin(stream),
+            &["id DESC NULLS LAST".to_string()],
+            &context,
+        )
+        .expect("sort should succeed");
+
+        let batches: Vec<RecordBatch> = datafusion::physical_plan::common::collect(sorted)
+            .await
+            .expect("collect batches");
+
+        assert_eq!(batches.len(), 1);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("ids column");
+        assert_eq!(ids.values(), &[4, 3, 2, 1]);
     }
 }

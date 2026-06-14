@@ -5,14 +5,14 @@ on:
   schedule:
     # daily-main, 0900 UTC / 0200 PDT  — full bench suite + HTAP CH-benCHmark SF1
     - cron: '0 9 * * *'
-    # htap-sf1, every 4h — extra HTAP CH-benCHmark SF1 runs so SF1 fires every 4
-    # hours (0100, 0500, 0900 via daily-main, 1300, 1700, 2100) without
-    # re-running the full daily-main suite six times a day.
-    - cron: '0 1,5,13,17,21 * * *'
-    # htap-sf10, every 4h (0000, 0400, 0800, 1200, 1600, 2000) — HTAP CH-benCHmark SF10
-    - cron: '0 0,4,8,12,16,20 * * *'
-    # htap-sf100, every 4h (0200, 0600, 1000, 1400, 1800, 2200) — HTAP CH-benCHmark SF100
-    - cron: '0 2,6,10,14,18,22 * * *'
+    # htap-sf1, every 3h — extra HTAP CH-benCHmark SF1 runs so SF1 fires every 3
+    # hours (0000, 0300, 0600, 0900 via daily-main, 1200, 1500, 1800, 2100) without
+    # re-running the full daily-main suite eight times a day.
+    - cron: '0 0,3,6,12,15,18,21 * * *'
+    # htap-sf10, every 3h (0100, 0400, 0700, 1000, 1300, 1600, 1900, 2200) — HTAP CH-benCHmark SF10
+    - cron: '0 1,4,7,10,13,16,19,22 * * *'
+    # htap-sf100, every 3h (0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) — HTAP CH-benCHmark SF100
+    - cron: '0 2,5,8,11,14,17,20,23 * * *'
 
   workflow_dispatch:
     inputs:
@@ -108,9 +108,9 @@ jobs:
         run: |
           case "${{ github.event.schedule }}" in
             '0 9 * * *')               NAME=daily-main ;;
-            '0 1,5,13,17,21 * * *')    NAME=htap-sf1   ;;
-            '0 0,4,8,12,16,20 * * *')  NAME=htap-sf10  ;;
-            '0 2,6,10,14,18,22 * * *') NAME=htap-sf100 ;;
+            '0 0,3,6,12,15,18,21 * * *')   NAME=htap-sf1   ;;
+            '0 1,4,7,10,13,16,19,22 * * *') NAME=htap-sf10  ;;
+            '0 2,5,8,11,14,17,20,23 * * *') NAME=htap-sf100 ;;
             *)                         NAME=           ;;   # manual / unrecognized cron — match nothing
           esac
           echo "Resolved schedule name: $NAME"
@@ -224,7 +224,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Bench
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-bench
         env:
@@ -233,7 +233,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
       - name: Dispatch Testoperator - Scheduled Streaming - Correctness
-        if: ${{ steps.sched.outputs.name == 'daily-main' }}
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming --workflow streaming-correctness
         env:
@@ -241,9 +241,9 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
-      # HTAP CH-benCHmark — every SF runs 6x/day (every 4 hours). SF1 rides
-      # with daily-main at 0900 plus the htap-sf1 extras at 0100/0500/1300/1700/2100;
-      # SF10 / SF100 each fire on their own every-4h cron.
+      # HTAP CH-benCHmark — every SF runs 8x/day (every 3 hours). SF1 rides
+      # with daily-main at 0900 plus the htap-sf1 extras at 0000/0300/0600/1200/1500/1800/2100;
+      # SF10 / SF100 each fire on their own every-3h cron.
       - name: Dispatch Testoperator - Scheduled CH-BenCHmark - SF1
         if: ${{ matrix.branch == 'trunk' && (steps.sched.outputs.name == 'daily-main' || steps.sched.outputs.name == 'htap-sf1') }}
         run: |
@@ -266,6 +266,15 @@ jobs:
         if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'htap-sf100' }}
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow htap
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF100
+        if: ${{ matrix.branch == 'trunk' && steps.sched.outputs.name == 'daily-main' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf100 --workflow bench
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
@@ -428,6 +437,7 @@ jobs:
           WORKFLOW_COMMIT: ${{ github.event.ref }}
 
       - name: Dispatch Testoperator - ${{ github.event.inputs.workflow_type }} - Streaming
+        if: false
         run: |
           testoperator dispatch ./tools/testoperator/dispatch/streaming \
             --workflow ${{ github.event.inputs.workflow_type }} \

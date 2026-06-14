@@ -127,9 +127,9 @@ impl DynamoDBTableSchema {
         match expr {
             Expr::Column(col) => {
                 let field = self.table_schema.field_with_name(&col.name);
-                field
-                    .map(|f| matches!(f.data_type(), &arrow::datatypes::DataType::Timestamp(_, _)))
-                    .unwrap_or(false)
+                field.is_ok_and(|f| {
+                    matches!(f.data_type(), &arrow::datatypes::DataType::Timestamp(_, _))
+                })
             }
             _ => false,
         }

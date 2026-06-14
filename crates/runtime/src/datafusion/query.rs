@@ -89,6 +89,7 @@ use crate::datafusion::{
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
+use runtime_auth::AuthRequestContext;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
 use runtime_datafusion::config::request_context_config::SpiceRequestContextConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -251,8 +252,17 @@ impl Query {
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // Use session-specific context to preserve prepared statements
-            return flight_session.session_context().state();
+            // Only honor the session if it belongs to the current principal. The
+            // session is selected from a client-controlled `x-session-id` header
+            // before authentication runs; binding it to the authenticated
+            // principal here prevents one principal from executing against
+            // another's session (and its prepared statements) if a session id is
+            // leaked.
+            let current = request_context.auth_principal().and_then(|p| p.stable_id());
+            if principal_owns_session(flight_session.owner_stable_id(), current.as_deref()) {
+                // Use session-specific context to preserve prepared statements
+                return flight_session.session_context().state();
+            }
         }
 
         // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
@@ -316,8 +326,8 @@ impl Query {
             runtime_query = false,
             distributed = true,
             job_id = %job_id,
-            // Distributed-job summary labels — recorded at completion by
-            // `crate::datafusion::query::stage_history::record_stage_history`.
+            // Distributed-job summary labels. Ballista 53 no longer exposes the
+            // scheduler execution graph needed to populate these fields.
             ballista_job_id = tracing::field::Empty,
             stage_count = tracing::field::Empty,
             executor_count = tracing::field::Empty,
@@ -419,9 +429,16 @@ impl Query {
                 }
             }
             QueryMethod::Plan(logical_plan) => {
-                // For direct plan submission, compute cache key and check cache
-                let plan_cache_key =
-                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+                // For direct plan submission, compute cache key and check cache.
+                // Namespace the key per principal so a plan-submitted result is
+                // never served across principals (mirrors the text-query path).
+                let cache_namespace = request_context.cache_namespace();
+                let (ns_tag, ns_id) = cache_namespace.hash_inputs();
+                let plan_cache_key = CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                    Self::plan_hasher(&self.df),
+                    ns_tag,
+                    ns_id,
+                );
 
                 // Check for cached results using the standard cache lookup
                 if let Some(cache_provider) = self.df.results_cache_provider()
@@ -724,10 +741,17 @@ impl Query {
                         }
                     }
                     QueryMethod::Plan(logical_plan) => {
+                        // Namespace the results-cache key per principal so a
+                        // plan-submitted result is never reused across principals.
+                        let cache_namespace = request_context.cache_namespace();
+                        let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_manager = RequestCacheManager::new(
                             CacheStatus::CacheMiss,
-                            CacheKey::LogicalPlan(logical_plan)
-                                .as_raw_key(Query::plan_hasher(&ctx.df)),
+                            CacheKey::LogicalPlan(logical_plan).as_raw_key_in_namespace(
+                                Query::plan_hasher(&ctx.df),
+                                ns_tag,
+                                ns_id,
+                            ),
                         );
                         (logical_plan.clone(), None, cache_manager)
                     }
@@ -1737,7 +1761,7 @@ fn scalar_to_json_value(
     value: &ScalarValue,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
-        ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
+        ScalarValue::Boolean(value) => Ok(value.map_or(Value::Null, Value::Bool)),
         ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
         ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
         ScalarValue::Float64(Some(value)) => number_to_json(*value),
@@ -1763,8 +1787,9 @@ fn scalar_to_json_value(
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
-        ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
-        ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::Union(Some((_, value)), _, _)
+        | ScalarValue::Dictionary(_, value)
+        | ScalarValue::RunEndEncoded(_, _, value) => scalar_to_json_value(value),
         ScalarValue::Null
         | ScalarValue::Float16(None)
         | ScalarValue::Float32(None)
@@ -2022,6 +2047,46 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
                 .downcast_ref::<datafusion_dml::DmlExtensionNode>()
                 .is_some()
     )
+}
+
+/// Returns whether a Flight SQL session may be used by the current principal.
+///
+/// An unowned session (`owner` is `None`) is always permitted, preserving
+/// behavior for unauthenticated setups. An owned session is permitted only when
+/// the current principal's stable id matches the owner's — this is the check
+/// that stops a leaked session id from being usable by a different principal.
+fn principal_owns_session(owner: Option<&str>, current_principal: Option<&str>) -> bool {
+    match owner {
+        None => true,
+        Some(owner) => current_principal == Some(owner),
+    }
+}
+
+#[cfg(test)]
+mod session_ownership_tests {
+    use super::principal_owns_session;
+
+    #[test]
+    fn unowned_session_is_always_allowed() {
+        assert!(principal_owns_session(None, None));
+        assert!(principal_owns_session(None, Some("apikey:abc")));
+    }
+
+    #[test]
+    fn owned_session_requires_matching_principal() {
+        // Same principal: allowed.
+        assert!(principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:abc")
+        ));
+        // Different principal: rejected (cross-principal session access).
+        assert!(!principal_owns_session(
+            Some("apikey:abc"),
+            Some("apikey:xyz")
+        ));
+        // Unauthenticated caller cannot use an owned session.
+        assert!(!principal_owns_session(Some("apikey:abc"), None));
+    }
 }
 
 #[cfg(test)]
@@ -2608,7 +2673,7 @@ mod tests {
     struct TestExecutionPlan {
         metrics: Option<MetricsSet>,
         children: Vec<Arc<dyn ExecutionPlan>>,
-        properties: PlanProperties,
+        properties: Arc<PlanProperties>,
     }
 
     impl TestExecutionPlan {
@@ -2616,12 +2681,12 @@ mod tests {
             Self {
                 metrics,
                 children,
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(Arc::new(Schema::empty())),
                     Partitioning::UnknownPartitioning(1),
                     EmissionType::Final,
                     Boundedness::Bounded,
-                ),
+                )),
             }
         }
     }
@@ -2647,7 +2712,7 @@ mod tests {
             self
         }
 
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
 
