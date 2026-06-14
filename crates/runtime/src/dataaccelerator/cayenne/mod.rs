@@ -66,6 +66,7 @@ use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
+use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -120,6 +121,58 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
         Ok(compiled) => compiled,
         Err(e) => unreachable!("Unable to compile regexp: {e}"),
     });
+
+fn maintained_aggregate_specs_for_cayenne(
+    acceleration: Option<&Acceleration>,
+) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
+    let Some(acceleration) = acceleration else {
+        return Ok(Vec::new());
+    };
+
+    let maintained_aggregates = acceleration.maintained_aggregates.enabled_aggregates();
+    if maintained_aggregates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !acceleration.partition_by.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
+    }
+
+    Ok(maintained_aggregates
+        .iter()
+        .map(
+            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                group_by: aggregate.group_by.clone(),
+                aggregates: aggregate
+                    .aggregates
+                    .iter()
+                    .map(|expr| {
+                        let function = match expr.function {
+                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                            }
+                        };
+
+                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                            function,
+                            column: expr.column.clone(),
+                        }
+                    })
+                    .collect(),
+            },
+        )
+        .collect())
+}
 
 /// Transform schema according to `unsupported_type_action` policy.
 /// Delegates to `cayenne::transform_schema_for_vortex`.
@@ -1340,6 +1393,7 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -1406,7 +1460,8 @@ impl CayenneAccelerator {
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
-            .with_retention_filters(retention_filters);
+            .with_retention_filters(retention_filters)
+            .with_maintained_aggregates(maintained_aggregate_specs);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -2855,6 +2910,69 @@ mod tests {
             ),
             true,
         )
+    }
+
+    fn maintained_aggregate_acceleration() -> Acceleration {
+        Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
+        let acceleration = maintained_aggregate_acceleration();
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("unpartitioned maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
+        assert_eq!(specs[0].aggregates.len(), 1);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+        );
+        assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
+            spicepod_acceleration::MaintainAggregates::Disabled,
+            acceleration.maintained_aggregates.as_slice().to_vec(),
+        );
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("disabled maintained aggregate config should parse");
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_error_for_partitioned_cayenne() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.partition_by = vec![spicepod::partitioning::PartitionedBy {
+            name: "region".to_string(),
+            expression: "region".to_string(),
+        }];
+
+        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect_err("partitioned maintained aggregate config should be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("maintained_aggregates"));
+        assert!(detail.contains("partitioned"));
     }
 
     #[test]

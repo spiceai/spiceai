@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::{args::AppendTestArgs, health::HealthMonitor, wait_test_and_memory};
+use crate::{args::AppendTestArgs, health::HealthMonitor};
 use std::time::Duration;
 use test_framework::{
     TestType,
@@ -115,7 +115,15 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         .with_spiced_instance(spiced_instance)
         .start_test()
         .await?;
-    let test = wait_test_and_memory!(append_test, memory_token, memory_readings);
+    let test = match append_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Append)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
