@@ -123,8 +123,19 @@ jobs:
 
       - name: Run CH-benCHmark - ${{ github.event.inputs.spicepod_path }}
         run: |
+          # Cap spiced CPU on spiceai-dev-xlarge-runners runners
+          SPICED_BIN=/usr/local/bin/spiced
+          if [ "${{ github.event.inputs.runner_type }}" = "spiceai-dev-xlarge-runners" ] && command -v taskset >/dev/null 2>&1; then
+            cat > /tmp/spiced-pinned.sh <<'EOF'
+          #!/usr/bin/env bash
+          exec taskset -c 0-63 /usr/local/bin/spiced "$@"
+          EOF
+            chmod +x /tmp/spiced-pinned.sh
+            SPICED_BIN=/tmp/spiced-pinned.sh
+            echo "Pinning spiced to CPUs 0-63 via wrapper: ${SPICED_BIN}"
+          fi
           testoperator run htap \
-            -s /usr/local/bin/spiced \
+            -s "${SPICED_BIN}" \
             -p '${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}' \
             --query-set chbench \
             --scale-factor ${{ github.event.inputs.scale_factor }} \
