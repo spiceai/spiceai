@@ -28,7 +28,7 @@ use super::streaming::StreamingExec;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use crate::metadata::{
     CreateTableOptions, InlinedData, InlinedDataStats, InlinedDelete, PkConflictDetection,
-    SnapshotFileStatistics, TableMetadata, TableStatistics,
+    SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
 use crate::provider::scan::{CayenneAccelerationExec, round_robin_repartition_if_needed};
 use crate::provider::sink::CayenneDataSink;
@@ -10202,6 +10202,47 @@ impl CayenneTableProvider {
             );
         }
 
+        // Manifest snapshot model (phase 1b): rebuild the authoritative data-file
+        // manifest (`cayenne_snapshot_file`) for every LIVE snapshot (the current
+        // snapshot plus each protected snapshot) from a fresh directory listing
+        // whenever this pass observed a write. Append-only inserts accumulate
+        // into the current snapshot dir; CDC upserts publish each batch as a new
+        // protected snapshot whose files live in their own dir, so the complete
+        // live file set spans current ∪ protected. Post-write maintenance is
+        // COALESCED, so listing each snapshot here yields its COMPLETE file set
+        // regardless of how many appends folded into this pass.
+        //
+        // GC: the append path only UPSERTS (no prune). Stale manifest rows are
+        // removed by compaction's single-keep prune (`prune_snapshot_manifest_to`
+        // after `commit_compaction` folds protected snapshots into one current
+        // snapshot) and by overwrite/drop. Between those, the current snapshot id
+        // is stable (it changes only via compaction/overwrite) and protected
+        // snapshots only grow, so every snapshot upserted here is still live — an
+        // upsert-only pass keeps the manifest complete without ever dropping a
+        // live snapshot's rows.
+        //
+        // Serialized against compaction via `compaction_lock`: a concurrent
+        // compaction flips `current_snapshot_id`, repoints the protected set, and
+        // prunes the manifest to its OWN new snapshot under that lock. Rebuilding
+        // here without it could re-add (now-dead) protected-snapshot rows just
+        // after that prune, or race the pointer/protected-set read. Holding the
+        // lock pins the live set for the whole rebuild; if a compaction is
+        // already running (`try_lock` fails) we skip — it populates the manifest
+        // for its new snapshot, and the next maintenance debounce repopulates.
+        // The append path itself never clears tombstones, so deferring the
+        // manifest off the publish fence cannot resurrect or vanish a row.
+        if state.refresh_listing || had_stats || retention_deleted > 0 {
+            if let Ok(_compaction_guard) = self.compaction_lock.try_lock() {
+                self.rebuild_live_snapshot_manifests().await;
+            } else {
+                tracing::trace!(
+                    table = self.table_metadata.table_name.as_str(),
+                    "Skipping post-write manifest rebuild: a compaction holds the lock \
+                     (it will populate the manifest for its new snapshot)"
+                );
+            }
+        }
+
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             self.schedule_post_write_compaction();
         }
@@ -10524,6 +10565,202 @@ impl CayenneTableProvider {
         name.ends_with(".vortex")
     }
 
+    /// Upsert the authoritative per-snapshot data-file manifest
+    /// (`cayenne_snapshot_file`) for `snapshot_id` from the snapshot directory's
+    /// COMPLETE file listing. Does NOT prune other snapshots — callers pair this
+    /// with [`Self::prune_snapshot_manifest_to`] so a commit that may still fail
+    /// can publish the new set without dropping the live snapshot's rows first.
+    ///
+    /// `file_path` is stored as the snapshot-relative file *name* (what
+    /// [`Self::list_snapshot_files_with_sizes`] returns) — the manifest is scoped
+    /// by `(table_id, snapshot_id)`, so the name uniquely identifies the file
+    /// within the snapshot and the full object-store path is reconstructible as
+    /// `snapshot_dir + "/" + file_path`. Listing the directory (rather than
+    /// threading per-file metadata through every write path) makes the manifest
+    /// equal to the directory listing *by construction* — exactly the invariant
+    /// [`Self::debug_assert_manifest_matches_listing`] checks.
+    ///
+    /// `sequence` is recorded as BOTH `min_sequence` and `max_sequence` for every
+    /// file: the snapshot's commit-sequence watermark bounds every row it
+    /// contains, so a future seq-prefix bake (`max_sequence <= T`) is sound. Per-
+    /// file `row_count` is sourced best-effort from the persisted per-file stats
+    /// cache (`cayenne_snapshot_file_statistics`) and left `0` when absent — the
+    /// authoritative live count lives in `cayenne_table_statistics`; reading every
+    /// Vortex footer here would be an unbounded write-path I/O regression.
+    ///
+    /// Returns the file listing it wrote (so a caller can feed it straight to the
+    /// debug-assert). Errors propagate to the caller, which decides whether to
+    /// fail the operation; the manifest is not yet the scan's file source
+    /// (directory listing still is), so a transiently incomplete manifest cannot
+    /// make a scan miss a live file or read one outside its snapshot.
+    async fn upsert_snapshot_manifest_from_listing(
+        &self,
+        snapshot_id: &str,
+        sequence: i64,
+    ) -> CatalogResult<Vec<(String, u64)>> {
+        let files = self
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: format!(
+                    "Failed to list snapshot '{snapshot_id}' files for manifest population"
+                ),
+                source: Box::new(e),
+            })?;
+
+        let table_id = self.table_metadata.table_id.clone();
+        for (file_name, size) in &files {
+            // Reuse the per-file footer row count when the scan path already
+            // persisted it for this exact (snapshot, file); the manifest entry is
+            // a hint until the manifest becomes the scan's file source, so a 0
+            // here is correct-but-imprecise, never wrong.
+            let row_count = self
+                .catalog
+                .get_snapshot_file_statistics(&table_id, snapshot_id, file_name)
+                .await
+                .ok()
+                .flatten()
+                .map_or(0, |stats| stats.num_rows);
+
+            self.catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.to_string(),
+                    file_path: file_name.clone(),
+                    row_count,
+                    file_size_bytes: i64::try_from(*size).unwrap_or(i64::MAX),
+                    min_sequence: sequence,
+                    max_sequence: sequence,
+                })
+                .await?;
+        }
+
+        Ok(files)
+    }
+
+    /// Snapshot GC of stale manifest rows: drop every manifest row whose
+    /// `snapshot_id` is not `keep_snapshot_id`. Only the live snapshot's file set
+    /// is authoritative (append accumulates into the current snapshot dir;
+    /// compaction mints a fresh snapshot), so after a successful commit every
+    /// other snapshot's manifest rows are dead. Kept separate from the upsert so
+    /// it runs AFTER the commit that makes `keep_snapshot_id` current — a commit
+    /// that fails then leaves the previously-current snapshot's rows intact
+    /// (publish-before-clear).
+    async fn prune_snapshot_manifest_to(&self, keep_snapshot_id: &str) -> CatalogResult<()> {
+        self.catalog
+            .clear_snapshot_files_except(&self.table_metadata.table_id, keep_snapshot_id)
+            .await
+    }
+
+    /// Rebuild the manifest for every LIVE snapshot (the current snapshot plus
+    /// each protected snapshot) from fresh directory listings. Used by the
+    /// append path's coalesced post-write maintenance lane.
+    ///
+    /// Each snapshot is tagged with its OWN commit sequence: the current
+    /// snapshot's from `cayenne_snapshot_sequence`, and each protected
+    /// snapshot's from the in-memory protected-set value (which IS its
+    /// reservation/threshold sequence). Upsert-only — GC of stale rows is the
+    /// compaction/overwrite/drop paths' job (see the call-site comment). Caller
+    /// MUST hold `compaction_lock` so the live set cannot shift mid-rebuild.
+    ///
+    /// Best-effort: a per-snapshot failure is logged and the rest still run; the
+    /// manifest is not yet the scan's file source, so an incomplete manifest
+    /// cannot make a scan miss a live file or read one outside its snapshot.
+    async fn rebuild_live_snapshot_manifests(&self) {
+        // Snapshot the live set as one coherent read (current + protected). The
+        // held `compaction_lock` keeps a compaction from repointing it mid-pass.
+        let current_snapshot = self.get_current_snapshot_id();
+        let current_sequence = self
+            .catalog
+            .get_snapshot_sequence(&self.table_metadata.table_id, &current_snapshot)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+        let mut live: Vec<(String, i64)> = vec![(current_snapshot, current_sequence)];
+        for (snapshot_id, sequence) in self.protected_snapshots.load().iter() {
+            live.push((snapshot_id.clone(), *sequence));
+        }
+
+        for (snapshot_id, sequence) in &live {
+            match self
+                .upsert_snapshot_manifest_from_listing(snapshot_id, *sequence)
+                .await
+            {
+                Ok(files) => {
+                    self.debug_assert_manifest_matches_listing(snapshot_id, &files)
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        snapshot_id = snapshot_id.as_str(),
+                        "Post-write snapshot manifest rebuild failed for one snapshot; \
+                         scan falls back to directory listing"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Debug-only invariant check: the manifest file-name set persisted for
+    /// `snapshot_id` must equal the directory listing that produced it. Compiled
+    /// out of release builds. `listed` is the listing the caller just wrote the
+    /// manifest from, so any divergence means the metastore round-trip lost or
+    /// duplicated a row (or a concurrent writer mutated the manifest) — a bug,
+    /// not a data-loss path, since the scan still reads the directory.
+    #[cfg(debug_assertions)]
+    async fn debug_assert_manifest_matches_listing(
+        &self,
+        snapshot_id: &str,
+        listed: &[(String, u64)],
+    ) {
+        let manifest = match self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    table = %self.table_metadata.table_name,
+                    %error,
+                    "Manifest consistency check skipped: failed to read back manifest"
+                );
+                return;
+            }
+        };
+
+        let manifest_names: std::collections::BTreeSet<&str> =
+            manifest.iter().map(|f| f.file_path.as_str()).collect();
+        let listed_names: std::collections::BTreeSet<&str> =
+            listed.iter().map(|(name, _)| name.as_str()).collect();
+
+        debug_assert_eq!(
+            manifest_names, listed_names,
+            "cayenne_snapshot_file manifest for table {} snapshot {snapshot_id} \
+             does not match the directory listing (manifest={manifest_names:?}, \
+             listing={listed_names:?})",
+            self.table_metadata.table_name,
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    #[expect(
+        clippy::unused_async,
+        reason = "release no-op stub mirrors the async debug-build signature so \
+                  call sites `.await` it unconditionally"
+    )]
+    async fn debug_assert_manifest_matches_listing(
+        &self,
+        _snapshot_id: &str,
+        _listed: &[(String, u64)],
+    ) {
+    }
+
     /// Rewrite the current snapshot into a fresh one, consolidating its files.
     ///
     /// When `sort_columns` are configured, compaction sorts the merged stream
@@ -10658,10 +10895,73 @@ impl CayenneTableProvider {
             &self.pk_deletion_strategy,
         )?;
 
+        // Manifest snapshot model (phase 1c): record the new snapshot's COMPLETE
+        // data-file set BEFORE the commit clears this table's tombstones.
+        // `commit_snapshot_rewrite` -> `commit_compaction` drops every delete
+        // file / insert record / snapshot-sequence row in one transaction, so
+        // the manifest must be durable first to honour the publish-before-clear
+        // invariant (a new file set is published before the old deletions are
+        // cleared). Watermark: compaction mints no new sequence and the commit
+        // clears all sequence rows, so tag every consolidated file with the
+        // CURRENT snapshot's recorded sequence (read while its row still exists)
+        // — every live row materialized into the rewrite was committed at or
+        // before it, so `max_sequence <= T` stays sound. The prune
+        // (`prune_snapshot_manifest_to`) is deferred to AFTER the commit
+        // succeeds, so a failed commit leaves the still-current OLD snapshot's
+        // manifest rows intact (only harmless orphan rows for the abandoned new
+        // snapshot remain, which the next successful prune removes). Best-effort:
+        // a manifest failure must not resurrect deleted rows or lose the rewrite,
+        // so log and continue — the scan still reads the directory until the
+        // manifest becomes the file source.
+        let compaction_watermark = self
+            .catalog
+            .get_snapshot_sequence(
+                &self.table_metadata.table_id,
+                &self.get_current_snapshot_id(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let manifest_listed = match self
+            .upsert_snapshot_manifest_from_listing(&new_snapshot_id, compaction_watermark)
+            .await
+        {
+            Ok(files) => Some(files),
+            Err(error) => {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to populate snapshot manifest before compaction commit; \
+                     scan falls back to directory listing"
+                );
+                None
+            }
+        };
+
         if let Err(e) = self.commit_snapshot_rewrite(&new_snapshot_id).await {
             self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                 .await;
             return Err(Error::Catalog { source: e });
+        }
+
+        // Commit succeeded: `new_snapshot_id` is now current, so the old
+        // snapshot's manifest rows are dead. Prune them and assert the live
+        // manifest matches the listing we wrote it from (debug builds only).
+        if let Some(files) = manifest_listed {
+            if let Err(error) = self.prune_snapshot_manifest_to(&new_snapshot_id).await {
+                tracing::warn!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    new_snapshot_id = new_snapshot_id.as_str(),
+                    "Failed to prune stale snapshot manifest rows after compaction commit"
+                );
+            }
+            self.debug_assert_manifest_matches_listing(&new_snapshot_id, &files)
+                .await;
         }
 
         // Hold the listing fence across the listing-table swap and the
@@ -23079,6 +23379,277 @@ mod tests {
             expected_keys,
             "a FilePositioned conflict supersedes ONE row — the position/key dual \
              encoding must not double-count it"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 1b/1c): `cayenne_snapshot_file` must be
+    // the COMPLETE per-snapshot data-file set, equal to the directory listing.
+    // ----------------------------------------------------------------------
+
+    /// Sorted snapshot-relative file names persisted in the manifest for a
+    /// snapshot.
+    async fn manifest_file_names(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_id: &str,
+        snapshot_id: &str,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = catalog
+            .get_snapshot_files(table_id, snapshot_id)
+            .await
+            .expect("read snapshot manifest")
+            .into_iter()
+            .map(|f| f.file_path)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Sorted snapshot-relative file names actually present in the snapshot
+    /// directory (the authoritative file set the scan reads today).
+    async fn listing_file_names(provider: &CayenneTableProvider, snapshot_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = provider
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .expect("list snapshot files")
+            .into_iter()
+            .map(|(name, _size)| name)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Build an append-only (no PK, no on-conflict) `id`/`value` table whose
+    /// inserts accumulate Vortex files into the CURRENT snapshot directory —
+    /// the shape that exercises the append-path manifest rebuild for the
+    /// current snapshot (CDC-upsert tables instead publish protected snapshots).
+    async fn create_append_only_table(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog created"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let options = CreateTableOptions {
+            table_name: table_name.to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            // Disable inlining so each insert materializes a Vortex file in the
+            // current snapshot dir rather than being absorbed into the metastore.
+            vortex_config: VortexConfig {
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                ..VortexConfig::default()
+            },
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
+            .create(options)
+            .await
+            .expect("table created");
+        (provider, catalog, temp_dir)
+    }
+
+    /// Phase 1b: after appends (which materialize Vortex files in the current
+    /// snapshot dir) plus the coalesced post-write maintenance pass, the
+    /// manifest for the current snapshot must equal the directory listing —
+    /// complete, and with no spurious entries. Sizes recorded must match the
+    /// on-disk sizes.
+    #[tokio::test]
+    async fn manifest_matches_listing_after_append() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("manifest_append", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        // Two appends so the current snapshot accumulates more than one file.
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 64),
+        )
+        .await;
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 64, 64),
+        )
+        .await;
+        // Drain the debounced maintenance lane so the manifest rebuild runs
+        // synchronously (the rebuild is scheduled by the append, not inline).
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let snapshot = provider.get_current_snapshot_id();
+        let listing = provider
+            .list_snapshot_files_with_sizes(&snapshot)
+            .await
+            .expect("listing");
+        assert!(
+            !listing.is_empty(),
+            "fixture must materialize at least one Vortex file in the current snapshot \
+             (inlining disabled, append-only)"
+        );
+
+        assert_eq!(
+            manifest_file_names(&catalog, &table_id, &snapshot).await,
+            listing_file_names(&provider, &snapshot).await,
+            "manifest file set must equal the directory listing for the current snapshot"
+        );
+
+        // Recorded sizes must match the on-disk sizes the listing reports.
+        let manifest: std::collections::HashMap<String, i64> = catalog
+            .get_snapshot_files(&table_id, &snapshot)
+            .await
+            .expect("manifest rows")
+            .into_iter()
+            .map(|f| (f.file_path, f.file_size_bytes))
+            .collect();
+        for (name, size) in &listing {
+            assert_eq!(
+                manifest.get(name).copied(),
+                Some(i64::try_from(*size).expect("size fits i64")),
+                "manifest file_size_bytes must match the on-disk size for {name}"
+            );
+        }
+    }
+
+    /// Phase 1c: after a full-rewrite compaction into a fresh snapshot, the
+    /// manifest must (a) equal the new snapshot's directory listing and (b)
+    /// hold rows for NO other snapshot (the prune GC'd the old one).
+    #[tokio::test]
+    async fn manifest_matches_listing_after_compaction() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_cdc_upsert_table("manifest_compaction", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 64),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance after seed insert");
+
+        let pre_compaction_snapshot = provider.get_current_snapshot_id();
+        // The upsert seed insert published a protected snapshot holding the
+        // actual data files; capture its id (and assert it has manifest rows)
+        // so we can prove the post-compaction prune dropped it.
+        let protected_before: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        assert!(
+            !protected_before.is_empty(),
+            "an upsert seed insert must publish at least one protected snapshot"
+        );
+        for protected in &protected_before {
+            assert!(
+                !catalog
+                    .get_snapshot_files(&table_id, protected)
+                    .await
+                    .expect("read protected manifest")
+                    .is_empty(),
+                "the append maintenance pass must populate each protected snapshot's manifest"
+            );
+        }
+
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked()
+            .await
+            .expect("compaction full rewrite into a fresh current snapshot");
+
+        let snapshot = provider.get_current_snapshot_id();
+        assert_ne!(
+            snapshot, pre_compaction_snapshot,
+            "compaction must mint a fresh current snapshot"
+        );
+
+        assert_eq!(
+            manifest_file_names(&catalog, &table_id, &snapshot).await,
+            listing_file_names(&provider, &snapshot).await,
+            "manifest must equal the listing for the post-compaction snapshot"
+        );
+
+        // Every pre-compaction snapshot (the old empty current + the protected
+        // data snapshots) must be GC'd from the manifest by the prune-to-current.
+        for stale in std::iter::once(pre_compaction_snapshot).chain(protected_before) {
+            assert!(
+                catalog
+                    .get_snapshot_files(&table_id, &stale)
+                    .await
+                    .expect("read stale manifest")
+                    .is_empty(),
+                "pre-compaction snapshot {stale} manifest rows must be pruned after commit"
+            );
+        }
+    }
+
+    /// Dropping a table must clear its manifest rows (`clear_snapshot_files`
+    /// path, wired into `drop_table`).
+    #[tokio::test]
+    async fn drop_table_clears_snapshot_manifest() {
+        let ctx = SessionContext::new();
+        let (provider, catalog, _tmp) =
+            create_append_only_table("manifest_drop", ctx.runtime_env()).await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let table_id = provider.table_metadata.table_id.clone();
+        let table_name = provider.table_metadata.table_name.clone();
+
+        insert_batch(
+            &provider,
+            id_value_batch_for_range(Arc::clone(&schema), 0, 32),
+        )
+        .await;
+        provider
+            .flush_pending_maintenance()
+            .await
+            .expect("drain post-write maintenance");
+
+        let snapshot = provider.get_current_snapshot_id();
+        assert!(
+            !catalog
+                .get_snapshot_files(&table_id, &snapshot)
+                .await
+                .expect("manifest populated")
+                .is_empty(),
+            "precondition: manifest must be populated before drop"
+        );
+
+        assert!(
+            catalog.drop_table(&table_name).await.expect("drop table"),
+            "drop_table must report the table existed"
+        );
+
+        assert!(
+            catalog
+                .get_snapshot_files(&table_id, &snapshot)
+                .await
+                .expect("read manifest after drop")
+                .is_empty(),
+            "drop_table must clear the snapshot manifest"
         );
     }
 

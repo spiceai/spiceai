@@ -19,7 +19,8 @@ limitations under the License.
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
     CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
+    PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -3442,6 +3443,22 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to delete snapshot file statistics.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 5c. Delete the per-snapshot data-file manifest (manifest snapshot
+        // model). `cayenne_snapshot_file` has an ON DELETE CASCADE FK to
+        // `cayenne_table`, but it is cleared explicitly here (like every sibling
+        // metadata table) so a crash between this and the final `cayenne_table`
+        // delete cannot leave orphan manifest rows pinning a phantom file set.
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_snapshot_file WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete snapshot file manifest.".to_string(),
                 source: Box::new(e),
             })?;
 
