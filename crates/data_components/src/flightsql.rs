@@ -989,9 +989,18 @@ pub async fn get_client_for_flight_endpoint(
     if ep.location.is_empty() {
         Ok(client.clone())
     } else {
-        let channel = new_tls_flight_channel(&ep.location[0].uri, None).await?;
-        let channel = CookieService::new(channel, Arc::clone(cookie_store));
-        Ok(FlightSqlServiceClient::new(channel))
+        // Some Flight SQL servers (e.g. StarRocks) advertise an internal/cluster-only address
+        // in the endpoint location that's unreachable from external clients. Per the Flight SQL
+        // spec, data served at the same address as the FlightInfo may carry an empty location;
+        // StarRocks instead returns its internal FE address. If we can't reach the advertised
+        // location, fall back to the original connection that served the FlightInfo.
+        match new_tls_flight_channel(&ep.location[0].uri, None).await {
+            Ok(channel) => {
+                let channel = CookieService::new(channel, Arc::clone(cookie_store));
+                Ok(FlightSqlServiceClient::new(channel))
+            }
+            Err(_) => Ok(client.clone()),
+        }
     }
 }
 

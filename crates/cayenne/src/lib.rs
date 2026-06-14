@@ -82,15 +82,16 @@ pub use catalog_provider::{
 pub use cayenne_catalog::{CayenneCatalog, is_retryable_write_conflict};
 pub use metadata::{
     CdcDurability, DataFile, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    ObjectStoreConfig, PartitionMetadata, TableMetadata, TableStatistics,
+    ObjectStoreConfig, PartitionMetadata, StorageClass, TableMetadata, TableStatistics,
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneTableProvider,
     CayenneTableProviderBuilder, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, SlotAdvancer, TimeRetentionFilterBuilder,
-    set_compaction_runtime_env, set_compaction_runtime_handle, set_global_encode_concurrency,
-    set_global_mem_tier_bytes, set_global_memory_budget,
+    PreparedOverwrite, PreparedStagedAppend, QueryObservations, SlotAdvancer,
+    TimeRetentionFilterBuilder, deregister_query_observations, record_query_latency,
+    register_query_observations, set_compaction_runtime_env, set_compaction_runtime_handle,
+    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_memory_budget,
 };
 pub use schema::transform_schema_for_vortex;

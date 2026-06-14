@@ -256,6 +256,11 @@ pub fn build_changes_stream(
                 &unnest_parameters,
             )
             .map_err(StreamError::MongoDB)? {
+                // MongoDB change-stream cluster time is whole seconds (BSON
+                // Timestamp), so the replication-lag signal here has ~1s
+                // granularity — fine for a multi-second tuner.
+                let change_batch = change_batch
+                    .with_source_commit_ts_ms(tail_cluster_time.map(|s| s.saturating_mul(1000)));
                 let committer = build_batch_committer(
                     mongo_sys.as_ref(),
                     tail_token,

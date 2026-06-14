@@ -24,6 +24,7 @@ use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::collections::HashMap;
@@ -236,6 +237,18 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get table metadata by name.
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
+
+    /// Replace the stored Arrow schema for an existing table (widening schema
+    /// evolution).
+    ///
+    /// Overwrites `cayenne_table.schema_json` for `table_id` with the
+    /// IPC-serialized `schema` (the same serialization `create_table` uses).
+    /// Callers are responsible for ensuring the new schema is a lossless
+    /// widening of the stored one (added nullable columns / widened types) —
+    /// existing data files are NOT rewritten; scans adapt old files to the
+    /// evolved schema at read time. Idempotent: re-applying the same schema is
+    /// a plain single-row UPDATE to the same value.
+    async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()>;
 
     /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;

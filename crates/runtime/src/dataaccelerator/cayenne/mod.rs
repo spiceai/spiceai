@@ -183,6 +183,46 @@ fn parse_u64_aliases_with_hint(
         .unwrap_or(default)
 }
 
+/// Parse a goal duration param (e.g. `"5s"`, `"1m"`, `"250ms"`) to seconds, via
+/// `fundu` for consistency with the other Spice duration knobs (e.g.
+/// `retention_period`). `None` when unset; a warning + `None` when present but
+/// unparseable.
+fn parse_goal_duration_secs(
+    acceleration: &Acceleration,
+    key: &str,
+    table_name: &str,
+) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match fundu::parse_duration(raw) {
+        Ok(d) => Some(d.as_secs_f64()),
+        Err(e) => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' duration '{raw}': {e}; ignoring. Expected a duration like '5s' or '1m'."
+            );
+            None
+        }
+    }
+}
+
+/// Parse a positive goal float param (e.g. queries-per-hour). `None` when unset; a
+/// warning + `None` when present but unparseable or non-positive.
+fn parse_goal_f64(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match raw.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' value '{raw}'; expected a positive number, ignoring."
+            );
+            None
+        }
+    }
+}
+
 fn parse_optional_usize<'a>(
     acceleration: &Acceleration,
     keys: &'a [&'a str],
@@ -797,6 +837,36 @@ impl CayenneAccelerator {
                 " (milliseconds)",
             );
 
+            // Widening schema evolution at table open is gated on the dataset's
+            // `on_schema_change` policy. The policy lives on the Dataset
+            // component (not on Acceleration), so downcast the source;
+            // non-Dataset sources (views, DDL) and `block`/`fail` keep the
+            // default Disabled = legacy pin-stored-schema behavior verbatim.
+            // `refresh_mode: caching` is excluded from in-place evolution in
+            // v1: its hidden `__spice_cache_namespace` column is appended LAST
+            // and evolution also appends at the end — the positional
+            // disagreement is unfixable via column adds.
+            let is_caching_mode = acceleration.refresh_mode == Some(RefreshMode::Caching);
+            config.schema_evolution = source
+                .as_any()
+                .downcast_ref::<crate::component::dataset::Dataset>()
+                .filter(|_| !is_caching_mode)
+                .map_or(
+                    cayenne::metadata::SchemaEvolutionMode::Disabled,
+                    |dataset| match dataset.on_schema_change {
+                        crate::component::dataset::OnSchemaChange::AppendNewColumns => {
+                            cayenne::metadata::SchemaEvolutionMode::AddColumnsOnly
+                        }
+                        crate::component::dataset::OnSchemaChange::SyncAllColumns => {
+                            cayenne::metadata::SchemaEvolutionMode::Widen
+                        }
+                        crate::component::dataset::OnSchemaChange::Block
+                        | crate::component::dataset::OnSchemaChange::Fail => {
+                            cayenne::metadata::SchemaEvolutionMode::Disabled
+                        }
+                    },
+                );
+
             // Parse sort columns
             if let Some(sort_cols_str) = acceleration
                 .params
@@ -955,18 +1025,45 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
                 );
             }
-            config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
-            // `adaptive` depends on extended schema inference. Any emitted
-            // metadata counts: row_count/table_bytes refine memory sizing, while
-            // inferred primary key/index/sort metadata is applied upstream and
-            // feeds the same warm-start / query-health surface. Without any
-            // inferred metadata the loop starts blind, so fall back to `auto` and
-            // tell the operator how to enable it.
-            if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
-                tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` requires `schema_inference: extended` (the closed-loop tuner needs inferred source metadata for its warm-start), but no inferred schema metadata was found; falling back to 'auto' (static). Set `schema_inference: extended` on a connector that emits inferred metadata to enable adaptive tuning."
+            // Resolve the tuning mode. An explicit `cayenne_tuning` value always
+            // wins. When it is UNSET, default to `adaptive` IF extended schema
+            // inference produced metadata (`schema_inference: extended` emitted
+            // the inferred PK / cardinality / sort onto the Arrow schema):
+            // opting into extended schema is the signal the operator wants the
+            // engine to self-tune, and that same metadata is the adaptive
+            // controller's warm start. Without extended-schema metadata (or with
+            // an explicit `auto`/invalid value) the static `auto` derivation is
+            // used. Set `cayenne_tuning: auto` to opt out of the closed loop even
+            // with extended schema enabled.
+            config.dynamic_tuning = match tuning_mode.as_deref() {
+                Some("adaptive") => true,
+                // Explicit `auto` (or an invalid value, already warned above):
+                // static derivation, no closed loop.
+                Some(_) => false,
+                // Unset: enable adaptive iff extended schema inference produced
+                // metadata (see the comment above).
+                None => workload.inferred_metadata.is_present(),
+            };
+            if config.dynamic_tuning && tuning_mode.is_none() {
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`schema_inference: extended` detected and `cayenne_tuning` unset: defaulting to adaptive tuning (closed-feedback loop). Set `cayenne_tuning: auto` to opt out.",
                 );
-                config.dynamic_tuning = false;
+            }
+            // Extended schema inference SHARPENS the warm start (row_count/
+            // table_bytes refine the memory sizing; inferred PK/index/sort metadata
+            // feeds the query-health surface), but it is no longer REQUIRED for
+            // `adaptive`: the controller relearns the observed mean row width from
+            // live ingest and converges its actuators from the hardware-derived
+            // warm start regardless. When the metadata is absent, note that the
+            // warm start is coarser but still let the closed loop run.
+            if config.dynamic_tuning && !workload.inferred_metadata.is_present() {
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_tuning: adaptive`: no inferred schema metadata found (set `schema_inference: extended` for a sharper warm-start); starting from the hardware-derived config and adapting from observed ingest."
+                );
             }
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
@@ -977,6 +1074,46 @@ impl CayenneAccelerator {
                 );
                 config.dynamic_tuning = false;
             }
+            // Goal-driven tuning: parse the high-level SLO setpoints. Times are
+            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. A configured
+            // goal IMPLIES the closed loop (a goal with tuning off is inert),
+            // unless the operator explicitly opted out with `cayenne_tuning: auto`,
+            // and provided the background compaction tick the controller rides is
+            // enabled. Query latency is stored in ms.
+            config.goal_replication_lag_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_replication_lag", table_name);
+            config.goal_freshness_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_freshness", table_name);
+            config.goal_query_latency_ms =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_query_latency", table_name)
+                    .map(|secs| secs * 1000.0);
+            config.goal_convergence_window_secs = parse_goal_duration_secs(
+                acceleration,
+                "cayenne_goal_convergence_window",
+                table_name,
+            );
+            config.goal_qph = parse_goal_f64(acceleration, "cayenne_goal_qph", table_name);
+            let any_goal = config.goal_replication_lag_secs.is_some()
+                || config.goal_freshness_secs.is_some()
+                || config.goal_query_latency_ms.is_some()
+                || config.goal_qph.is_some();
+            if any_goal && tuning_mode.as_deref() == Some("auto") {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set but `cayenne_tuning: auto` explicitly disables the closed loop; the goals will be ignored. Remove `cayenne_tuning: auto` (or set `adaptive`) to enable goal-seeking."
+                );
+            } else if any_goal
+                && !config.dynamic_tuning
+                && config.compaction_background_interval_ms != 0
+            {
+                config.dynamic_tuning = true;
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set: enabling adaptive tuning (goal-seeking closed loop)."
+                );
+            }
             if config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
@@ -984,7 +1121,7 @@ impl CayenneAccelerator {
                     "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
                 );
             }
-            config.pinned_tuning_knobs = cayenne::metadata::PinnedTuningKnobs {
+            config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
                 inline_flush: autotune::is_pinned(
                     acceleration,
                     &[
@@ -1014,6 +1151,7 @@ impl CayenneAccelerator {
                     acceleration,
                     &["cayenne_write_concurrency", "write_concurrency"],
                 ),
+                mem_tier: autotune::is_pinned(acceleration, &["cayenne_cdc_mem_tier_max_bytes"]),
             };
 
             // Surface cross-parameter and out-of-range issues that parse cleanly
@@ -1386,8 +1524,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    39,
-    { S3_PARAMS_LEN + 39 },
+    44,
+    { S3_PARAMS_LEN + 44 },
 >(
     S3_PARAMETERS,
     [
@@ -1474,9 +1612,18 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adjusts the inline-memtable flush caps, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'adaptive' requires 'schema_inference: extended' (the loop's data-aware warm-start needs the inferred cardinality/size); without it, 'adaptive' falls back to 'auto'. In BOTH modes an explicit per-knob value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set knob is pinned (the loop will not move it).")
-            .one_of(&["auto", "adaptive"])
-            .default("auto"),
+            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"]),
+        ParameterSpec::component("goal_replication_lag")
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps within cayenne_goal_convergence_window."),
+        ParameterSpec::component("goal_freshness")
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s')."),
+        ParameterSpec::component("goal_query_latency")
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms')."),
+        ParameterSpec::component("goal_qph")
+            .description("Goal-driven adaptive tuning: target query throughput in queries per hour (higher is better), e.g. '5000'."),
+        ParameterSpec::component("goal_convergence_window")
+            .description("Goal-driven adaptive tuning: the time budget to converge toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s."),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -2015,13 +2162,24 @@ impl DataAccelerator for CayenneAccelerator {
                 &primary_keys,
                 on_conflict.as_ref(),
             );
-            let vortex_config = Self::get_vortex_config_with_footer_cache(
+            let mut vortex_config = Self::get_vortex_config_with_footer_cache(
                 &table_name,
                 source,
                 self.footer_cache_mb,
                 &workload,
             )
             .await;
+            // Partitioned tables are excluded from v1 schema evolution
+            // (per-partition catalog tables would evolve lazily as each
+            // partition opens, leaving mixed schemas across partitions);
+            // keep the legacy pin-stored-schema behavior.
+            if !vortex_config.schema_evolution.is_disabled() {
+                tracing::warn!(
+                    dataset = %source.name(),
+                    "on_schema_change schema evolution is not supported for partitioned Cayenne tables; schema changes will not be applied in place"
+                );
+                vortex_config.schema_evolution = cayenne::metadata::SchemaEvolutionMode::Disabled;
+            }
 
             // Log S3 Express configuration for partitioned tables
             if is_s3_express {
@@ -2204,6 +2362,82 @@ impl DataAccelerator for CayenneAccelerator {
 
         // Recreate the data directory so the next create_external_table works
         tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        Ok(())
+    }
+
+    /// Widening schema evolution for an existing Cayenne table: persist the
+    /// evolved schema to the metastore so the table provider (re)opens with
+    /// it. Existing Vortex data files are NOT rewritten — they are
+    /// self-describing and the scan adapts old files to the evolved schema at
+    /// read time (missing-column null-fill + widened-type cast).
+    ///
+    /// Idempotent: re-applying a plan whose evolved schema is already stored
+    /// is a no-op, so a crash between this engine update and the checkpoint
+    /// update self-heals via restart re-classification.
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, classify};
+
+        let acceleration = source.acceleration().ok_or_else(|| {
+            Box::new(Error::AccelerationNotEnabled {
+                dataset: Arc::from(source.name().to_string()),
+            }) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+        let metastore_type = acceleration
+            .params
+            .get("cayenne_metastore")
+            .map_or("sqlite", String::as_str);
+        let catalog = self
+            .get_or_create_catalog(&metadata_dir, metastore_type)
+            .await?;
+        let table = catalog.get_table(table_name).await.boxed()?;
+
+        // The metastore stores the Vortex-transformed schema (unsupported
+        // types may have been converted), so the evolved schema must go
+        // through the same transform before comparison/persistence.
+        let unsupported_type_action = Self::get_unsupported_type_action(source);
+        let evolved: SchemaRef = Arc::new(transform_schema_for_vortex(
+            plan.evolved_schema.as_ref(),
+            unsupported_type_action,
+        )?);
+
+        if table.schema.as_ref() == evolved.as_ref() {
+            return Ok(());
+        }
+
+        // Re-classify against the STORED schema: re-applies the constraint
+        // guard (Cayenne persists typed PK row-encodings that cannot be
+        // widened in place) and rejects stale/foreign plans.
+        let ctx = EvolutionContext {
+            constraint_columns: &table.primary_key,
+        };
+        match classify(&table.schema, &evolved, &ctx) {
+            SchemaEvolution::Widening(_) => {}
+            // Reorder/nullability-tighten-only: the stored schema stays canonical.
+            SchemaEvolution::Identical => return Ok(()),
+            SchemaEvolution::Incompatible { reason } => {
+                return Err(Box::new(Error::InvalidConfiguration {
+                    detail: Arc::from(format!(
+                        "Cannot evolve Cayenne schema for '{table_name}' in place: {reason}"
+                    )),
+                }));
+            }
+        }
+
+        catalog
+            .update_table_schema(&table.table_id, &evolved)
+            .await
+            .boxed()?;
+        tracing::info!(
+            dataset = %source.name(),
+            "Evolved Cayenne table schema: {}",
+            plan.describe()
+        );
         Ok(())
     }
 

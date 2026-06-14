@@ -23,7 +23,6 @@ use arrow_flight::{
     flight_service_server::FlightService,
     sql::{self, CommandPreparedStatementUpdate, DoPutPreparedStatementResult, ProstMessageExt},
 };
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use postcard::{from_bytes, to_stdvec};
 use prost::Message;
@@ -38,7 +37,9 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
+use super::prepared_statement_query::{
+    PreparedStatement, decode_param_values, encode_single_row_parameters, error_to_status,
+};
 
 /// Static schema for `affected_rows` result to avoid allocation on each request.
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -186,30 +187,7 @@ pub(crate) async fn do_put_update(
     let mut decoder = FlightDataDecoder::new(streaming_flight);
     let schema = decode_schema(&mut decoder).await?;
 
-    let mut parameters = Vec::new();
-    let mut encoder = StreamWriter::try_new(&mut parameters, &schema).map_err(error_to_status)?;
-    let mut total_rows = 0;
-    while let Some(msg) = decoder.try_next().await? {
-        match msg.payload {
-            DecodedPayload::None => {}
-            DecodedPayload::Schema(_) => {
-                return Err(Status::invalid_argument(
-                    "parameter flight data must contain a single schema",
-                ));
-            }
-            DecodedPayload::RecordBatch(record_batch) => {
-                total_rows += record_batch.num_rows();
-                encoder.write(&record_batch).map_err(error_to_status)?;
-            }
-        }
-    }
-    encoder.finish().map_err(error_to_status)?;
-
-    if total_rows > 1 {
-        return Err(Status::invalid_argument(
-            "parameters should contain a single row",
-        ));
-    }
+    let parameters = encode_single_row_parameters(&mut decoder, &schema).await?;
 
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;
