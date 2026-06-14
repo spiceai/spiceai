@@ -2214,6 +2214,35 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn get_all_snapshot_files(
+        &self,
+        table_id: &str,
+    ) -> CatalogResult<Vec<SnapshotFile>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT table_id, snapshot_id, file_path, row_count, file_size_bytes, min_sequence, max_sequence
+                    FROM cayenne_snapshot_file
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(SnapshotFile {
+                        table_id: row.get_string(0)?,
+                        snapshot_id: row.get_string(1)?,
+                        file_path: row.get_string(2)?,
+                        row_count: row.get_i64(3)?,
+                        file_size_bytes: row.get_i64(4)?,
+                        min_sequence: row.get_i64(5)?,
+                        max_sequence: row.get_i64(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
     async fn clear_snapshot_files_except(
         &self,
         table_id: &str,

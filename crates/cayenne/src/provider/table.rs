@@ -3896,6 +3896,7 @@ impl CayenneTableProvider {
             let table_id = self.table_metadata.table_id.clone();
             let current_snapshot = current_snapshot.to_string();
             let protected_snapshots = Arc::clone(&self.protected_snapshots);
+            let catalog = Arc::clone(&self.catalog);
             tokio::spawn(async move {
                 tokio::time::sleep(OLD_SNAPSHOT_CLEANUP_GRACE).await;
                 // Read the LIVE protected set after the grace period. During the
@@ -3906,12 +3907,36 @@ impl CayenneTableProvider {
                 // (empty) captured set causes cleanup to delete them.
                 let protected_snapshot_ids: HashSet<String> =
                     protected_snapshots.load().keys().cloned().collect();
+                // Ref-count source: the manifest, read AFTER the grace so it
+                // reflects the same live set the protected read above does. A
+                // live/protected snapshot can reference a data file that lives
+                // in an old snapshot's dir (an in-place compaction reference);
+                // those files must survive even though their dir is "old".
+                let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        // Reading the manifest is the safety gate; on failure do
+                        // NOT delete (a referenced file could be orphaned).
+                        tracing::warn!(
+                            "Old-snapshot cleanup skipped for table {table_id}: failed to read \
+                             snapshot manifest ({error})"
+                        );
+                        return;
+                    }
+                };
+                let manifest_populated = !all_rows.is_empty();
+                let mut live_snapshot_ids = protected_snapshot_ids.clone();
+                live_snapshot_ids.insert(current_snapshot.clone());
+                let live_referenced =
+                    Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(e) = Self::cleanup_old_snapshots_blocking(
                         &table_path,
                         &table_id,
                         &current_snapshot,
                         &protected_snapshot_ids,
+                        manifest_populated,
+                        &live_referenced,
                     ) {
                         tracing::warn!(
                             "Failed to cleanup old snapshots for table {}: {e}",
@@ -3983,6 +4008,122 @@ impl CayenneTableProvider {
             && last_listed.is_none_or(|t| now.duration_since(t) >= grace)
     }
 
+    /// The physical identity of a manifest row's data file, as a path RELATIVE
+    /// to the table root (`table_path/table_id` locally, the table prefix on
+    /// S3): `"{snapshot_id}/{file_path}"`.
+    ///
+    /// This is the same derivation the scan uses to open a file (it resolves
+    /// `file_path` against the snapshot's own directory — see
+    /// `manifest_partitioned_files`) and the same key
+    /// `list_compaction_candidate_files_with_sizes` builds, so a relative path
+    /// computed here protects exactly the bytes a scan would read. Two manifest
+    /// rows that resolve to the same relative path reference the *same physical
+    /// file* even if they carry different `snapshot_id`s — which is precisely
+    /// the cross-snapshot in-place reference that physical-file GC must respect.
+    fn manifest_file_relative_path(snapshot_id: &str, file_path: &str) -> String {
+        format!("{snapshot_id}/{file_path}")
+    }
+
+    /// Build the set of data files (as table-relative paths, see
+    /// [`Self::manifest_file_relative_path`]) referenced by any LIVE snapshot —
+    /// the current snapshot plus every protected snapshot. A physical file is
+    /// safe to delete during GC only when it is NOT in this set.
+    ///
+    /// `all_rows` is every manifest row for the table
+    /// ([`MetadataCatalog::get_all_snapshot_files`]); rows for snapshots outside
+    /// `live_snapshot_ids` (already-retired snapshots) are skipped — their being
+    /// the thing under deletion must not keep their own files alive. Pure;
+    /// extracted for unit tests.
+    fn live_referenced_relative_paths(
+        all_rows: &[SnapshotFile],
+        live_snapshot_ids: &HashSet<String>,
+    ) -> HashSet<String> {
+        all_rows
+            .iter()
+            .filter(|row| live_snapshot_ids.contains(&row.snapshot_id))
+            .map(|row| Self::manifest_file_relative_path(&row.snapshot_id, &row.file_path))
+            .collect()
+    }
+
+    /// Ref-count-aware deletion of a single retired snapshot directory (local
+    /// FS, blocking I/O). Deletes only the data files inside `snapshot_dir`
+    /// whose table-relative path
+    /// (`{retiring_snapshot_id}/{name}` — see
+    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`, then
+    /// removes the directory itself only once it holds no entries. A file kept
+    /// alive by a live/protected snapshot's manifest (an in-place compaction
+    /// reference) is left untouched.
+    ///
+    /// `live_referenced` MUST be the complete live-referenced set (built from
+    /// [`MetadataCatalog::get_all_snapshot_files`] filtered to the live
+    /// snapshots): an incomplete set could orphan a file a scan still needs.
+    /// When the table's manifest is unpopulated the caller takes the legacy
+    /// whole-directory path instead and never reaches here.
+    ///
+    /// Returns `Ok(true)` when the directory was fully removed, `Ok(false)`
+    /// when one or more referenced files (or non-data files) kept it alive, and
+    /// the directory remains. A `NotFound` directory counts as fully removed.
+    fn delete_retired_snapshot_dir_refcounted(
+        snapshot_dir: &std::path::Path,
+        retiring_snapshot_id: &str,
+        live_referenced: &HashSet<String>,
+    ) -> std::io::Result<bool> {
+        let entries = match std::fs::read_dir(snapshot_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(e),
+        };
+
+        let mut kept_any = false;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            // Only data files participate in ref-counting. A nested directory or
+            // a non-data file (e.g. a staging WAL) is never a manifest target,
+            // so leave it in place and let it keep the dir alive — a later
+            // rotation-anchored cleanup or operator reclaims it. This is the
+            // conservative (never-orphan) choice.
+            let is_referenceable = file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(Self::is_compactable_data_file);
+            if !is_referenceable {
+                kept_any = true;
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                kept_any = true;
+                continue;
+            };
+            let relative = Self::manifest_file_relative_path(retiring_snapshot_id, &name);
+            if live_referenced.contains(&relative) {
+                // Referenced in place by a live/protected snapshot — keep.
+                kept_any = true;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        if kept_any {
+            return Ok(false);
+        }
+
+        // No entries remain: drop the now-empty directory. Treat a concurrent
+        // removal (NotFound) or a late writer racing a file in (NotEmpty) as
+        // "not fully removed" rather than an error — the next sweep retries.
+        match std::fs::remove_dir(snapshot_dir) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Physically delete retired snapshot dirs whose grace has fully elapsed,
     /// evicting each deleted dir's (infinite-TTL) `list_files_cache` entry so
     /// a later plan can't resolve files inside it. Spawned detached — never
@@ -4033,28 +4174,70 @@ impl CayenneTableProvider {
         if due.is_empty() {
             return;
         }
+        // The LIVE snapshot set whose manifests pin files alive: the current
+        // snapshot plus every protected snapshot. Built here (under the same
+        // observation of `current`/`protected` the `due` filter used) so the
+        // spawned task ref-counts against a coherent set.
+        let mut live_snapshot_ids: HashSet<String> = protected.keys().cloned().collect();
+        live_snapshot_ids.insert(current.clone());
         let table_path = self.table_metadata.path.clone();
         let table_id = self.table_metadata.table_id.clone();
         let runtime_env = Arc::clone(self.context.runtime_env());
         let ledger = Arc::clone(&self.retired_snapshot_dirs);
         let last_listed = Arc::clone(&self.snapshot_last_listed);
+        let catalog = Arc::clone(&self.catalog);
         tokio::spawn(async move {
+            // Ref-count source: every manifest row for the table, so a file a
+            // retired dir holds but a LIVE snapshot references in place (an
+            // in-place compaction reference) is NOT unlinked. An empty manifest
+            // means no snapshot here is manifest-tracked yet (legacy /
+            // pre-population), so fall back to the original whole-dir delete —
+            // no cross-snapshot reference can exist without manifest rows.
+            let all_rows = match catalog.get_all_snapshot_files(&table_id).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    // Reading the manifest is the safety check; if it fails we
+                    // must NOT delete (a referenced file could be orphaned).
+                    // Leave the dirs in the ledger and retry next sweep.
+                    tracing::warn!(
+                        target: "cayenne::compaction",
+                        table_id = %table_id,
+                        %error,
+                        "Retired-dir sweep skipped: failed to read snapshot manifest \
+                         (will retry)"
+                    );
+                    return;
+                }
+            };
+            let manifest_populated = !all_rows.is_empty();
+            let live_referenced =
+                Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
             for id in due {
                 let dir = Self::snapshot_dir_path(&table_path, &table_id, &id);
+                let id_for_task = id.clone();
+                let referenced = live_referenced.clone();
                 let removed = tokio::task::spawn_blocking(move || {
-                    match std::fs::remove_dir_all(&dir) {
-                        Ok(()) => Ok(()),
-                        // Already gone (e.g. reaped by a rotation-anchored
-                        // cleanup): success for our purposes.
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e),
+                    if manifest_populated {
+                        Self::delete_retired_snapshot_dir_refcounted(
+                            &dir,
+                            &id_for_task,
+                            &referenced,
+                        )
+                    } else {
+                        // Legacy path: no manifest, so no file is referenced
+                        // across snapshots — the whole dir is dead.
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => Ok(true),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                            Err(e) => Err(e),
+                        }
                     }
                 })
                 .await;
                 match removed {
-                    Ok(Ok(())) => {
-                        // Evict the cached listing AFTER the unlink so the
-                        // next plan lists fresh and sees the dir gone.
+                    Ok(Ok(true)) => {
+                        // Dir fully removed. Evict the cached listing AFTER the
+                        // unlink so the next plan lists fresh and sees it gone.
                         let url = Self::snapshot_dir_url(&table_path, &table_id, &id);
                         Self::invalidate_list_files_cache(&runtime_env, &url);
                         ledger.lock().remove(&id);
@@ -4064,6 +4247,23 @@ impl CayenneTableProvider {
                             table_id = %table_id,
                             snapshot_id = %id,
                             "Deleted retired snapshot dir"
+                        );
+                    }
+                    Ok(Ok(false)) => {
+                        // A file referenced in place by a live/protected
+                        // snapshot (or a non-data sidecar) kept the dir alive.
+                        // KEEP it in the ledger — once the referencing snapshots
+                        // are themselves retired the file becomes orphaned and a
+                        // later sweep reaps the dir. Do NOT evict the listing
+                        // cache: the surviving files must stay resolvable. The
+                        // ledger entry is bounded (one per retired snapshot) and
+                        // re-checking it each grace-gated sweep is cheap.
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table_id = %table_id,
+                            snapshot_id = %id,
+                            "Retired snapshot dir kept: data files still referenced \
+                             in place by a live snapshot (will retry once orphaned)"
                         );
                     }
                     Ok(Err(e)) => {
@@ -4268,6 +4468,22 @@ impl CayenneTableProvider {
                 source: e,
             })?;
 
+        // Ref-count source: a live/protected snapshot can reference a file that
+        // physically lives under an old snapshot's prefix (an in-place
+        // compaction reference). Reading the manifest is the safety gate — on
+        // failure, abort cleanup rather than risk orphaning a referenced file.
+        // Empty manifest = legacy / unpopulated, so prefixes are deleted
+        // wholesale (no cross-snapshot reference can exist without rows).
+        let all_rows = self
+            .catalog
+            .get_all_snapshot_files(&self.table_metadata.table_id)
+            .await
+            .map_err(|source| Error::Catalog { source })?;
+        let manifest_populated = !all_rows.is_empty();
+        let mut live_snapshot_ids = protected_snapshot_ids.clone();
+        live_snapshot_ids.insert(current_snapshot.to_string());
+        let live_referenced = Self::live_referenced_relative_paths(&all_rows, &live_snapshot_ids);
+
         for common_prefix in list_result.common_prefixes {
             if let Some(snapshot_id) = common_prefix.parts().next_back() {
                 let snapshot_id_str = snapshot_id.as_ref();
@@ -4281,9 +4497,83 @@ impl CayenneTableProvider {
                     );
                     continue;
                 }
-                self.delete_prefix_with_object_store(&common_prefix).await?;
+                if manifest_populated {
+                    let snapshot_id_owned = snapshot_id_str.to_string();
+                    self.delete_prefix_refcounted(
+                        &common_prefix,
+                        &snapshot_id_owned,
+                        &live_referenced,
+                    )
+                    .await?;
+                } else {
+                    self.delete_prefix_with_object_store(&common_prefix).await?;
+                }
             }
         }
+
+        Ok(())
+    }
+
+    /// Ref-count-aware deletion of an old snapshot prefix on object storage:
+    /// delete only the objects under `prefix` whose table-relative path
+    /// (`{retiring_snapshot_id}/{file_name}` — see
+    /// [`Self::manifest_file_relative_path`]) is NOT in `live_referenced`. An
+    /// object referenced in place by a live/protected snapshot's manifest is
+    /// left untouched. The S3 mirror of
+    /// [`Self::delete_retired_snapshot_dir_refcounted`]; there is no empty-prefix
+    /// "directory" to remove afterwards on object storage.
+    async fn delete_prefix_refcounted(
+        &self,
+        prefix: &ObjectStorePath,
+        retiring_snapshot_id: &str,
+        live_referenced: &HashSet<String>,
+    ) -> Result<()> {
+        let config = self.require_object_store()?;
+        let objects: Vec<_> = config
+            .store
+            .list(Some(prefix))
+            .try_collect()
+            .await
+            .map_err(|e| Error::ObjectStore {
+                operation: "list objects for snapshot cleanup",
+                table: self.table_metadata.table_name.clone(),
+                source: e,
+            })?;
+
+        let store = Arc::clone(&config.store);
+        let table_name = self.table_metadata.table_name.clone();
+        stream::iter(objects.into_iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(OBJECT_STORE_MOVE_CONCURRENCY, |meta| {
+                let store = Arc::clone(&store);
+                let table_name = table_name.clone();
+                // The object's bare file name is the last path segment; combined
+                // with the retiring snapshot id it forms the same relative key
+                // the manifest ref-count is built from.
+                let file_name = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .map(|p| p.as_ref().to_string());
+                let referenced = file_name.as_ref().is_some_and(|name| {
+                    live_referenced
+                        .contains(&Self::manifest_file_relative_path(retiring_snapshot_id, name))
+                });
+                async move {
+                    if referenced {
+                        // Referenced in place by a live/protected snapshot — keep.
+                        return Ok(());
+                    }
+                    store
+                        .delete(&meta.location)
+                        .await
+                        .map_err(|e| Error::ObjectStore {
+                            operation: "delete object from snapshot cleanup",
+                            table: table_name,
+                            source: e,
+                        })
+                }
+            })
+            .await?;
 
         Ok(())
     }
@@ -5008,6 +5298,15 @@ impl CayenneTableProvider {
     /// * `table_path` - Base path for the table
     /// * `table_id` - Table identifier
     /// * `current_snapshot_id` - The current (active) snapshot ID that should be kept
+    /// * `protected_snapshot_ids` - Protected snapshots that must also be kept
+    /// * `manifest_populated` - Whether the table's manifest has any rows. When
+    ///   `false` (legacy / pre-population) the whole old dir is dead and is
+    ///   removed wholesale, preserving the original behavior. When `true` an old
+    ///   dir is reaped FILE-BY-FILE, keeping any file a live/protected
+    ///   snapshot's manifest references in place (a cross-snapshot reference).
+    /// * `live_referenced` - Table-relative paths (see
+    ///   [`Self::manifest_file_relative_path`]) referenced by the live snapshot
+    ///   set; only consulted when `manifest_populated`.
     ///
     /// # Errors
     ///
@@ -5022,6 +5321,8 @@ impl CayenneTableProvider {
         table_id: &str,
         current_snapshot_id: &str,
         protected_snapshot_ids: &HashSet<String>,
+        manifest_populated: bool,
+        live_referenced: &HashSet<String>,
     ) -> CatalogResult<()> {
         let table_dir = std::path::PathBuf::from(table_path).join(table_id);
 
@@ -5105,16 +5406,37 @@ impl CayenneTableProvider {
                 }
             }
 
-            // Delete the old snapshot directory using blocking I/O
+            // Delete the old snapshot directory using blocking I/O. When the
+            // manifest is populated, delete file-by-file so a file referenced
+            // in place by a live/protected snapshot survives; otherwise (legacy
+            // / unpopulated) the whole dir is dead and removed wholesale.
             tracing::info!(
                 "Deleting old snapshot directory for table {}: {}",
                 table_id,
                 snapshot_id
             );
 
-            std::fs::remove_dir_all(&path).map_err(|source| CatalogError::IoError { source })?;
-
-            deleted_count += 1;
+            if manifest_populated {
+                let snapshot_id = snapshot_id.to_string();
+                let fully_removed = Self::delete_retired_snapshot_dir_refcounted(
+                    &path,
+                    &snapshot_id,
+                    live_referenced,
+                )
+                .map_err(|source| CatalogError::IoError { source })?;
+                if fully_removed {
+                    deleted_count += 1;
+                } else {
+                    tracing::info!(
+                        "Kept old snapshot directory for table {table_id}: {snapshot_id} \
+                         (files still referenced in place by a live snapshot)"
+                    );
+                }
+            } else {
+                std::fs::remove_dir_all(&path)
+                    .map_err(|source| CatalogError::IoError { source })?;
+                deleted_count += 1;
+            }
         }
 
         if deleted_count > 0 {
@@ -21658,6 +21980,206 @@ mod tests {
         );
     }
 
+    /// Phase 4 (physical-file GC ref-counting): the relative-path key combines
+    /// the snapshot id and the file name, so the SAME bare file name under two
+    /// different snapshots maps to two distinct physical files.
+    #[test]
+    fn manifest_file_relative_path_is_snapshot_scoped() {
+        assert_eq!(
+            CayenneTableProvider::manifest_file_relative_path("snapA", "0001.vortex"),
+            "snapA/0001.vortex"
+        );
+        assert_ne!(
+            CayenneTableProvider::manifest_file_relative_path("snapA", "0001.vortex"),
+            CayenneTableProvider::manifest_file_relative_path("snapB", "0001.vortex"),
+            "the same bare name under two snapshots is two different physical files"
+        );
+    }
+
+    /// Phase 4: the live-referenced set is built only from rows whose snapshot is
+    /// in the live set (current + protected); rows belonging to already-retired
+    /// snapshots are excluded so a dying snapshot cannot keep its own files
+    /// alive. A live snapshot that references a file physically located in
+    /// another snapshot's dir (an in-place compaction reference) IS included.
+    #[test]
+    fn live_referenced_relative_paths_filters_to_live_set() {
+        let row = |snap: &str, file: &str| SnapshotFile {
+            table_id: "t".to_string(),
+            snapshot_id: snap.to_string(),
+            file_path: file.to_string(),
+            row_count: 1,
+            file_size_bytes: 100,
+            min_sequence: 1,
+            max_sequence: 1,
+        };
+        let all_rows = vec![
+            // current snapshot owns one file...
+            row("current", "c0.vortex"),
+            // ...and references a file that physically lives in old1's dir.
+            row("current", "old1_baked.vortex"),
+            // protected snapshot owns a file.
+            row("protected", "p0.vortex"),
+            // old1 (already retired) still has a stale manifest row of its own.
+            row("old1", "old1_dead.vortex"),
+        ];
+        let live: HashSet<String> =
+            ["current".to_string(), "protected".to_string()].into_iter().collect();
+
+        let referenced = CayenneTableProvider::live_referenced_relative_paths(&all_rows, &live);
+
+        assert!(referenced.contains("current/c0.vortex"));
+        assert!(referenced.contains("protected/p0.vortex"));
+        assert!(
+            referenced.contains("current/old1_baked.vortex"),
+            "an in-place reference is keyed by the REFERENCING snapshot's id"
+        );
+        assert!(
+            !referenced.contains("old1/old1_dead.vortex"),
+            "a retired snapshot's own rows must not keep its files alive"
+        );
+        assert_eq!(referenced.len(), 3);
+    }
+
+    /// Phase 4: `get_all_snapshot_files` returns every manifest row for a table
+    /// across all snapshots (the GC ref-count source), unlike
+    /// `get_snapshot_files` which is scoped to one snapshot.
+    #[tokio::test]
+    async fn get_all_snapshot_files_spans_snapshots() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("gc_all_manifest_rows", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+
+        let mk = |snap: &str, file: &str| SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: snap.to_string(),
+            file_path: file.to_string(),
+            row_count: 1,
+            file_size_bytes: 100,
+            min_sequence: 1,
+            max_sequence: 1,
+        };
+        for row in [
+            mk("snapA", "a0.vortex"),
+            mk("snapA", "a1.vortex"),
+            mk("snapB", "b0.vortex"),
+        ] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&row)
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let all = provider
+            .catalog
+            .get_all_snapshot_files(&table_id)
+            .await
+            .expect("get_all_snapshot_files");
+        assert_eq!(all.len(), 3, "all rows across both snapshots are returned");
+
+        // A different table id must see none of these rows.
+        let other = provider
+            .catalog
+            .get_all_snapshot_files("some-other-table")
+            .await
+            .expect("get_all_snapshot_files (other table)");
+        assert!(other.is_empty(), "rows are scoped to the requested table id");
+    }
+
+    /// Phase 4: ref-counted retired-dir deletion keeps a data file that a live
+    /// snapshot references in place (even when an identically-named file in a
+    /// LIVE dir exists), deletes the genuinely orphaned files, and reports the
+    /// dir as NOT fully removed while a referenced file survives.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_keeps_referenced_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let table_root = tmp.path().join("table-id");
+        let retired_dir = table_root.join("retired-snap");
+        std::fs::create_dir_all(&retired_dir).expect("create retired dir");
+
+        // Two data files in the retired dir, a non-data sidecar, and a hidden file.
+        std::fs::write(retired_dir.join("kept.vortex"), b"x").expect("write kept");
+        std::fs::write(retired_dir.join("orphan.vortex"), b"x").expect("write orphan");
+        std::fs::write(retired_dir.join("notes.txt"), b"x").expect("write sidecar");
+        std::fs::write(retired_dir.join(".hidden"), b"x").expect("write hidden");
+
+        // A LIVE snapshot references `retired-snap/kept.vortex` in place. It does
+        // NOT reference `retired-snap/orphan.vortex`. Note `kept.vortex` as a
+        // bare name is ambiguous; only the snapshot-scoped relative path is.
+        let referenced: HashSet<String> =
+            ["retired-snap/kept.vortex".to_string()].into_iter().collect();
+
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &retired_dir,
+            "retired-snap",
+            &referenced,
+        )
+        .expect("refcounted delete");
+
+        assert!(
+            !fully_removed,
+            "dir is kept while a referenced file (and the non-data sidecar) survive"
+        );
+        assert!(
+            retired_dir.join("kept.vortex").exists(),
+            "a file referenced in place by a live snapshot must survive"
+        );
+        assert!(
+            !retired_dir.join("orphan.vortex").exists(),
+            "an unreferenced data file must be deleted"
+        );
+        assert!(
+            retired_dir.join("notes.txt").exists(),
+            "a non-data sidecar is conservatively kept (never a manifest target)"
+        );
+    }
+
+    /// Phase 4: when NO file in the retired dir is referenced, every data file
+    /// is deleted and the (now-empty) dir is removed, reported as fully removed.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_removes_fully_orphaned_dir() {
+        let tmp = TempDir::new().expect("temp dir");
+        let table_root = tmp.path().join("table-id");
+        let retired_dir = table_root.join("dead-snap");
+        std::fs::create_dir_all(&retired_dir).expect("create retired dir");
+        std::fs::write(retired_dir.join("a.vortex"), b"x").expect("write a");
+        std::fs::write(retired_dir.join("b.vortex"), b"x").expect("write b");
+
+        // The live set references a same-named file but under a DIFFERENT
+        // snapshot id, so nothing in `dead-snap` is protected.
+        let referenced: HashSet<String> =
+            ["other-snap/a.vortex".to_string()].into_iter().collect();
+
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &retired_dir,
+            "dead-snap",
+            &referenced,
+        )
+        .expect("refcounted delete");
+
+        assert!(fully_removed, "a fully-orphaned dir is removed");
+        assert!(
+            !retired_dir.exists(),
+            "the empty dir itself is removed once all data files are gone"
+        );
+    }
+
+    /// Phase 4: a missing (already-reaped) retired dir is reported as fully
+    /// removed rather than erroring — the sweep is idempotent across retries.
+    #[test]
+    fn delete_retired_snapshot_dir_refcounted_missing_dir_is_ok() {
+        let tmp = TempDir::new().expect("temp dir");
+        let missing = tmp.path().join("table-id").join("never-existed");
+        let fully_removed = CayenneTableProvider::delete_retired_snapshot_dir_refcounted(
+            &missing,
+            "never-existed",
+            &HashSet::new(),
+        )
+        .expect("missing dir is not an error");
+        assert!(fully_removed, "a NotFound dir counts as fully removed");
+    }
+
     /// Helper to read all data from a `CayenneTableProvider` as `RecordBatch`es.
     async fn read_all(
         ctx: &SessionContext,
@@ -25120,11 +25642,15 @@ mod tests {
 
         let protected: HashSet<String> = HashSet::new();
 
+        // Legacy / unpopulated-manifest mode: whole-dir delete (the historical
+        // behavior). Ref-counted file-by-file deletion is covered separately.
         CayenneTableProvider::cleanup_old_snapshots_blocking(
             table_path,
             &table_id,
             &current_snapshot,
             &protected,
+            false,
+            &HashSet::new(),
         )
         .expect("cleanup should succeed");
 
