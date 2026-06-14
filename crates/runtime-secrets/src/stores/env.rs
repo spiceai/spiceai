@@ -82,10 +82,10 @@ pub struct EnvSecretStore {
 
 impl EnvSecretStore {
     fn load(&self) {
-        if let Some(path) = &self.path {
-            if load_from_iter(path, dotenvy::from_path_iter(path)) {
-                return;
-            }
+        if let Some(path) = &self.path
+            && load_from_iter(path, dotenvy::from_path_iter(path))
+        {
+            return;
         }
         // `.env.local` is loaded before `.env` so that its values take priority:
         // dotenvy respects existing `std::env` vars and does not overwrite them,
