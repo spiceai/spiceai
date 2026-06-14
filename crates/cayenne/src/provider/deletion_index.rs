@@ -241,7 +241,6 @@ fn merged_entry(current: Option<TombstoneEntry>, delete_seq: i64, insert_seq: i6
     }
 }
 
-
 // =============================================================================
 // Seq-partitioned runs core (rank-1: probe cost independent of accumulated K)
 // =============================================================================
@@ -656,6 +655,140 @@ where
             .sum();
         run_bytes.saturating_add(self.active.len().saturating_mul(delta_entry_bytes))
     }
+
+    /// Drop every recorded **deletion** whose `delete_seq <= cutoff`, returning a
+    /// fresh core with the surviving entries consolidated into a single frozen
+    /// base run, a bloom rebuilt over the surviving deletion keys, and all
+    /// derived counters/ranges recomputed.
+    ///
+    /// This is the deletion-index half of a seq-prefix compaction
+    /// (`max_sequence <= T` files baked into a consolidated file): once the
+    /// rewrite has physically applied every deletion at or below `cutoff`, those
+    /// tombstones are dead and must be removed so they stop costing probe work
+    /// and memory — but deletions with `delete_seq > cutoff` MUST be retained,
+    /// because they still apply to the higher-than-`T` files the new snapshot
+    /// references in place.
+    ///
+    /// ## What survives, per entry (key fused across every tier first)
+    ///
+    /// - **delete side** is kept iff `delete_seq > cutoff`; a delete at or below
+    ///   `cutoff` is cleared (it was baked into the consolidated file).
+    /// - **insert side** is always preserved: an upsert re-insertion above the
+    ///   cutoff still resolves visibility against any surviving `> cutoff` delete,
+    ///   and an insert-only entry is harmless to keep. An entry that loses its
+    ///   delete side and has no insert record is dropped entirely.
+    ///
+    /// ## Why a single consolidated base run (no per-run tag surgery)
+    ///
+    /// Re-tagging the surviving runs after stripping individual sub-`cutoff`
+    /// delete sides would desync each run's `max_delete_seq` (the basis of the
+    /// protected-probe skip), forcing a full per-run rebuild anyway. A seq-prefix
+    /// bake removes the *bulk* of accumulated deletions by construction, so the
+    /// `> cutoff` remainder is small; folding it into one fresh base run (active
+    /// empty) — exactly the shape [`from_iters`](Self::from_iters) builds — is
+    /// both simplest-correct and cheap. The single run's tag is its true max
+    /// surviving delete seq, so subsequent protected probes skip it precisely.
+    fn prune_deletes_at_or_below(&self, cutoff: i64, bloom_hash_of: impl Fn(&K) -> u64) -> Self {
+        // Fuse every key's sides across all tiers (runs + active), taking the
+        // per-side max — identical to a full-index probe — then apply the cutoff
+        // to the fused delete side. Fusing BEFORE the cutoff is essential: a key
+        // could have a sub-cutoff delete in one run and a `> cutoff` delete in
+        // another; the max wins and the entry correctly survives.
+        let mut fused: HashMap<K, TombstoneEntry, S> = HashMap::default();
+        for run in &self.runs {
+            for (key, entry) in run.map.iter() {
+                let m = merged_entry(fused.get(key).copied(), entry.delete_seq, entry.insert_seq);
+                fused.insert(*key, m.entry);
+            }
+        }
+        for (key, entry) in self.active.iter() {
+            let m = merged_entry(fused.get(key).copied(), entry.delete_seq, entry.insert_seq);
+            fused.insert(*key, m.entry);
+        }
+
+        let mut survivors: HashMap<K, TombstoneEntry, S> =
+            HashMap::with_capacity_and_hasher(fused.len(), S::default());
+        let mut max_sequence_number: Option<i64> = None;
+        let mut min_deleted_key: Option<K> = None;
+        let mut max_deleted_key: Option<K> = None;
+        let mut delete_count = 0_usize;
+        let mut insert_count = 0_usize;
+        let mut run_max_delete_seq = SEQUENCE_ABSENT;
+        // Surviving deletion key-hashes, to size + fill a fresh bloom in one pass
+        // (the kept set may have shrunk well below the old capacity).
+        let mut delete_hashes: Vec<u64> = Vec::new();
+
+        for (key, entry) in &fused {
+            let delete_seq = if entry.delete_seq != SEQUENCE_ABSENT && entry.delete_seq > cutoff {
+                entry.delete_seq
+            } else {
+                SEQUENCE_ABSENT
+            };
+            let insert_seq = entry.insert_seq;
+            if delete_seq == SEQUENCE_ABSENT && insert_seq == SEQUENCE_ABSENT {
+                continue; // fully dead: delete baked, no re-insertion to track.
+            }
+            if delete_seq != SEQUENCE_ABSENT {
+                delete_count += 1;
+                delete_hashes.push(bloom_hash_of(key));
+                if delete_seq > run_max_delete_seq {
+                    run_max_delete_seq = delete_seq;
+                }
+                if max_sequence_number.is_none_or(|m| delete_seq > m) {
+                    max_sequence_number = Some(delete_seq);
+                }
+                if min_deleted_key.is_none_or(|m| *key < m) {
+                    min_deleted_key = Some(*key);
+                }
+                if max_deleted_key.is_none_or(|m| *key > m) {
+                    max_deleted_key = Some(*key);
+                }
+            }
+            if insert_seq != SEQUENCE_ABSENT {
+                insert_count += 1;
+            }
+            survivors.insert(
+                *key,
+                TombstoneEntry {
+                    delete_seq,
+                    insert_seq,
+                },
+            );
+        }
+
+        let bloom_capacity = bloom_capacity_for(delete_count);
+        let bloom = SplitBlockBloomFilter::new(bloom_capacity);
+        for hash in &delete_hashes {
+            bloom.insert(*hash);
+        }
+        let bloom = Arc::new(bloom);
+
+        let entry_count = survivors.len();
+        let runs = if entry_count == 0 {
+            Vec::new()
+        } else {
+            vec![Arc::new(RunData {
+                map: Arc::new(survivors),
+                max_delete_seq: run_max_delete_seq,
+                // Single consolidated run holds every surviving deletion, so its
+                // bloom IS the global one (mirrors `from_iters`' base run).
+                bloom: Arc::clone(&bloom),
+            })]
+        };
+
+        Self {
+            runs,
+            active: PersistentHashMap::default(),
+            bloom,
+            max_sequence_number,
+            min_deleted_key,
+            max_deleted_key,
+            entry_count,
+            delete_count,
+            insert_count,
+            bloom_capacity,
+        }
+    }
 }
 
 // =============================================================================
@@ -978,6 +1111,24 @@ impl DeletionIndex {
             ),
         }
     }
+
+    /// Build a new index with every **deletion** at or below `cutoff` removed,
+    /// retaining deletions with `delete_seq > cutoff` and all insert records.
+    ///
+    /// Used by a seq-prefix compaction after the rewrite has physically applied
+    /// every deletion with `delete_seq <= cutoff` (= `T`): those tombstones are
+    /// now dead, while `> cutoff` tombstones still apply to the higher-than-`T`
+    /// files the new snapshot references in place. The bloom and all derived
+    /// counters/ranges are recomputed over the survivors. See
+    /// [`LayeredRuns::prune_deletes_at_or_below`] for the per-entry semantics.
+    #[must_use]
+    pub fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
+        Self {
+            core: self
+                .core
+                .prune_deletes_at_or_below(cutoff, |pk| hash_key_i64(*pk)),
+        }
+    }
 }
 
 // =============================================================================
@@ -1273,6 +1424,17 @@ impl KeyDeletionIndex {
             ),
         }
     }
+
+    /// Build a new index with every **deletion** at or below `cutoff` removed;
+    /// see [`DeletionIndex::prune_deletes_at_or_below`].
+    #[must_use]
+    pub fn prune_deletes_at_or_below(&self, cutoff: i64) -> Self {
+        Self {
+            core: self
+                .core
+                .prune_deletes_at_or_below(cutoff, |key_hash| bloom_half(*key_hash)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1402,6 +1564,31 @@ mod tests {
                             naive_merge(&mut naive, key, seq, SEQUENCE_ABSENT);
                         }
                         idx = idx.extend(adds.into_iter(), |pk| hash_key_i64(*pk));
+                    }
+                    7 => {
+                        // Seq-prefix prune: drop deletions at or below a cutoff
+                        // (the seq-prefix-compaction bake). Mirror the same cut on
+                        // the naive reference: clear a delete side <= cutoff, keep
+                        // the insert side, drop now-empty entries.
+                        let cutoff = match rng() % 5 {
+                            0 => -1,       // no-op floor (no real seq is <= -1)
+                            1 => 0,        // boundary
+                            2 => seq,      // drop everything recorded so far
+                            3 => i64::MAX, // drop all deletions
+                            // A mid-range cutoff in [0, seq]. `rng() % _` keeps the
+                            // operand non-negative, so the i64 conversion is exact.
+                            _ => {
+                                i64::try_from(rng() % (u64::try_from(seq.max(0)).unwrap_or(0) + 1))
+                                    .unwrap_or(0)
+                            }
+                        };
+                        idx = idx.prune_deletes_at_or_below(cutoff, |pk| hash_key_i64(*pk));
+                        for (d, _) in naive.values_mut() {
+                            if *d != SEQUENCE_ABSENT && *d <= cutoff {
+                                *d = SEQUENCE_ABSENT;
+                            }
+                        }
+                        naive.retain(|_, (d, i)| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT);
                     }
                     _ => {
                         // Upsert conflicts; sometimes inject an OLD delete seq
@@ -1534,6 +1721,177 @@ mod tests {
         assert_eq!(delete_seq_of(&idx, 300), Some(3));
         assert_eq!(idx.get(100).and_then(|t| t.insert_sequence), None);
         assert_eq!(idx.get(400), None);
+    }
+
+    // ---- Seq-prefix prune (phase 3: drop deletions at or below T) ----
+
+    #[test]
+    fn prune_drops_at_or_below_cutoff_keeps_above() {
+        // Deletions at seqs 1,2,3,4. Bake everything <= 2 (the seq-prefix cutoff).
+        let idx = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2), (30, 3), (40, 4)]));
+        let pruned = idx.prune_deletes_at_or_below(2);
+
+        // <= cutoff are gone; > cutoff survive with unchanged seqs.
+        assert_eq!(delete_seq_of(&pruned, 10), None, "seq 1 baked");
+        assert_eq!(
+            delete_seq_of(&pruned, 20),
+            None,
+            "seq 2 baked (boundary <=)"
+        );
+        assert_eq!(delete_seq_of(&pruned, 30), Some(3), "seq 3 survives");
+        assert_eq!(delete_seq_of(&pruned, 40), Some(4), "seq 4 survives");
+
+        // Derived counters / range / max all recomputed over survivors only.
+        assert_eq!(pruned.delete_len(), 2);
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(pruned.insert_len(), 0);
+        assert_eq!(pruned.max_sequence_number(), Some(4));
+        assert_eq!(pruned.deleted_key_range(), Some((30, 40)));
+
+        // The bloom is rebuilt: a baked key now misses the membership filter,
+        // and a survivor still probes present (no false negative).
+        assert!(!pruned.might_contain(10), "baked key dropped from bloom");
+        assert!(pruned.might_contain(30), "survivor retained in bloom");
+    }
+
+    #[test]
+    fn prune_keeps_insert_records_when_delete_side_dropped() {
+        // Upsert conflict: key 7 deleted at seq 2, re-inserted at seq 5. A prune
+        // at cutoff 3 bakes the delete (<= 3) but the re-insertion (5) must stay,
+        // so the row is correctly VISIBLE (insert_seq > delete_seq, delete gone).
+        let idx = DeletionIndex::empty().extend_max_conflicts([7_i64], 2, 5);
+        assert_eq!(
+            idx.get(7).map(|t| (t.delete_sequence, t.insert_sequence)),
+            Some((2, Some(5)))
+        );
+
+        let pruned = idx.prune_deletes_at_or_below(3);
+        // Delete side cleared; the entry survives as insert-only (so it is still
+        // consulted, and the membership bloom no longer reports it as deleted).
+        assert_eq!(delete_seq_of(&pruned, 7), None, "baked delete cleared");
+        assert_eq!(pruned.delete_len(), 0);
+        assert_eq!(pruned.insert_len(), 1, "re-insertion retained");
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(
+            pruned.max_sequence_number(),
+            None,
+            "no surviving delete seq"
+        );
+        assert_eq!(pruned.deleted_key_range(), None);
+        assert!(
+            !pruned.might_contain(7),
+            "insert-only key absent from delete bloom"
+        );
+    }
+
+    #[test]
+    fn prune_above_cutoff_conflict_keeps_both_sides() {
+        // Same conflict but delete (8) and insert (9) are BOTH above the cutoff:
+        // the whole entry must be preserved verbatim.
+        let idx = DeletionIndex::empty().extend_max_conflicts([7_i64], 8, 9);
+        let pruned = idx.prune_deletes_at_or_below(5);
+        assert_eq!(
+            pruned
+                .get(7)
+                .map(|t| (t.delete_sequence, t.insert_sequence)),
+            Some((8, Some(9))),
+            "delete and insert both > cutoff survive unchanged"
+        );
+        assert_eq!(pruned.delete_len(), 1);
+        assert_eq!(pruned.insert_len(), 1);
+    }
+
+    #[test]
+    fn prune_fuses_across_tiers_before_cutoff() {
+        // A key's delete can live below the cutoff in an old tier and ABOVE it in
+        // a newer one. The per-key MAX (the fused value, == what a read sees) is
+        // what the cutoff applies to, so the key must survive with its max seq.
+        // Force two tiers: a frozen base (from_map) plus a later extend.
+        let idx = DeletionIndex::from_map(HashMap::from([(5, 2)])) // base: key 5 @ seq 2
+            .extend_max_deletes([(5, 9)]); // newer delete for key 5 @ seq 9
+        assert_eq!(delete_seq_of(&idx, 5), Some(9), "fused max before prune");
+
+        let pruned = idx.prune_deletes_at_or_below(4);
+        assert_eq!(
+            delete_seq_of(&pruned, 5),
+            Some(9),
+            "fused max (9) is > cutoff (4), so the key survives despite an \
+             obsolete sub-cutoff delete in an older tier"
+        );
+        assert_eq!(pruned.delete_len(), 1);
+    }
+
+    #[test]
+    fn prune_to_empty_yields_no_deletions() {
+        let idx = DeletionIndex::from_map(HashMap::from([(1, 1), (2, 2), (3, 3)]));
+        let pruned = idx.prune_deletes_at_or_below(i64::MAX);
+        assert!(!pruned.has_deletions());
+        assert_eq!(pruned.len(), 0);
+        assert_eq!(pruned.delete_len(), 0);
+        assert_eq!(pruned.max_sequence_number(), None);
+        assert_eq!(pruned.deleted_key_range(), None);
+        assert_eq!(pruned.get(1), None);
+        assert!(!pruned.might_contain(1));
+    }
+
+    #[test]
+    fn prune_noop_below_all_sequences_preserves_everything() {
+        let idx = DeletionIndex::from_map(HashMap::from([(1, 5), (2, 6)])).extend_max_conflicts(
+            [3_i64],
+            7,
+            8,
+        );
+        // Cutoff below every recorded delete seq: nothing baked.
+        let pruned = idx.prune_deletes_at_or_below(0);
+        assert_eq!(pruned.delete_len(), idx.delete_len());
+        assert_eq!(pruned.insert_len(), idx.insert_len());
+        assert_eq!(pruned.len(), idx.len());
+        assert_eq!(pruned.max_sequence_number(), idx.max_sequence_number());
+        assert_eq!(delete_seq_of(&pruned, 1), Some(5));
+        assert_eq!(delete_seq_of(&pruned, 2), Some(6));
+        assert_eq!(
+            pruned
+                .get(3)
+                .map(|t| (t.delete_sequence, t.insert_sequence)),
+            Some((7, Some(8)))
+        );
+    }
+
+    #[test]
+    fn prune_composite_key_index() {
+        // KeyDeletionIndex (composite/non-integer PK) parity check.
+        let idx = KeyDeletionIndex::from_map(HashMap::from([(byte_key(10), 1), (byte_key(20), 3)]));
+        let pruned = idx.prune_deletes_at_or_below(2);
+        assert_eq!(
+            key_delete_seq_of(&pruned, &byte_key(10)),
+            None,
+            "seq 1 baked"
+        );
+        assert_eq!(
+            key_delete_seq_of(&pruned, &byte_key(20)),
+            Some(3),
+            "seq 3 survives"
+        );
+        assert_eq!(pruned.delete_len(), 1);
+        assert_eq!(pruned.max_sequence_number(), Some(3));
+        assert!(!pruned.might_contain(&byte_key(10)));
+        assert!(pruned.might_contain(&byte_key(20)));
+    }
+
+    #[test]
+    fn prune_then_extend_round_trips() {
+        // After a prune the consolidated base run must still accept new deletes
+        // and fuse them correctly (the prune output is a valid index to extend).
+        let idx = DeletionIndex::from_map(HashMap::from([(1, 1), (2, 2), (3, 5)]));
+        let pruned = idx.prune_deletes_at_or_below(3); // keeps only key 3 @ 5
+        assert_eq!(pruned.delete_len(), 1);
+
+        let grown = pruned.extend_max_deletes([(2, 7), (9, 8)]);
+        assert_eq!(delete_seq_of(&grown, 3), Some(5), "survivor intact");
+        assert_eq!(delete_seq_of(&grown, 2), Some(7), "re-deleted post-prune");
+        assert_eq!(delete_seq_of(&grown, 9), Some(8), "new delete");
+        assert_eq!(grown.delete_len(), 3);
+        assert_eq!(grown.max_sequence_number(), Some(8));
     }
 
     // [b3 sub-lever 1] The deleted-key min/max range is the plan-time gate that

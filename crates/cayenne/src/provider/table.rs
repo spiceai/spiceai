@@ -1481,6 +1481,26 @@ struct SnapshotFilesForScan {
     grouped_by_partition: bool,
 }
 
+/// Partition of a snapshot's manifest by a seq-prefix cutoff `T`, the planning
+/// core of an incremental seq-prefix compaction.
+///
+/// A file is **bake-eligible** when `max_sequence <= T`: every row it holds was
+/// committed at or before `T`, so it may carry a deletion with `delete_seq <= T`
+/// that the rewrite physically applies — these files are consolidated into one
+/// new file. A file is **reference-in-place** when `max_sequence > T`: it holds
+/// only rows newer than every applicable deletion (a `<= T` tombstone deletes a
+/// row that existed at seq `<= T`; a `> T` row was written after, so under
+/// upsert semantics the newer row wins), so it can be referenced unchanged in
+/// the new snapshot without rewriting its bytes — the shrink the manifest model
+/// exists to enable.
+#[derive(Debug, Default)]
+struct SeqPrefixPlan {
+    /// Manifest rows whose `max_sequence <= T` — rewritten into one new file.
+    bake: Vec<SnapshotFile>,
+    /// Manifest rows whose `max_sequence > T` — referenced in place unchanged.
+    reference: Vec<SnapshotFile>,
+}
+
 /// Serialize one or more `RecordBatch`es to Arrow IPC stream bytes.
 fn serialize_batches_to_ipc(
     batches: &[RecordBatch],
@@ -10652,6 +10672,45 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// Partition `snapshot_id`'s manifest into bake-eligible (`max_sequence <= T`)
+    /// and reference-in-place (`max_sequence > T`) file sets — the planning step
+    /// of an incremental seq-prefix compaction. See [`SeqPrefixPlan`] for the
+    /// soundness argument.
+    ///
+    /// Returns `Ok(None)` when the manifest is empty (not yet populated): without
+    /// an authoritative file set the seq-prefix split is undefined, so the caller
+    /// falls back to the full-snapshot rewrite (which lists the directory).
+    ///
+    /// The split is purely metadata; it reads no data files. `cutoff` is the
+    /// highest delete sequence currently in the deletion index (`T`): every
+    /// applicable tombstone has `delete_seq <= T`, so every file that could be
+    /// affected by one has `min_sequence <= T` and is captured by the
+    /// `max_sequence <= T` bake predicate (a file's `max_sequence >= its
+    /// min_sequence`).
+    async fn partition_manifest_by_sequence(
+        &self,
+        snapshot_id: &str,
+        cutoff: i64,
+    ) -> CatalogResult<Option<SeqPrefixPlan>> {
+        let manifest = self
+            .catalog
+            .get_snapshot_files(&self.table_metadata.table_id, snapshot_id)
+            .await?;
+        if manifest.is_empty() {
+            return Ok(None);
+        }
+
+        let mut plan = SeqPrefixPlan::default();
+        for file in manifest {
+            if file.max_sequence <= cutoff {
+                plan.bake.push(file);
+            } else {
+                plan.reference.push(file);
+            }
+        }
+        Ok(Some(plan))
+    }
+
     /// Rebuild the manifest for every LIVE snapshot (the current snapshot plus
     /// each protected snapshot) from fresh directory listings. Used by the
     /// append path's coalesced post-write maintenance lane.
@@ -10913,6 +10972,41 @@ impl CayenneTableProvider {
         // a manifest failure must not resurrect deleted rows or lose the rewrite,
         // so log and continue — the scan still reads the directory until the
         // manifest becomes the file source.
+        // Seq-prefix lever signal (phase 3, observability only — does NOT alter
+        // this full-rewrite's behaviour): split the OLD snapshot's manifest at
+        // `T` = the highest applicable delete sequence. `reference` is the count
+        // of files an incremental seq-prefix bake could carry forward unchanged
+        // instead of rewriting — the read-amp + deletion-index shrink the
+        // manifest model exists to capture. Best-effort and skipped when the
+        // index has no deletions (nothing to bake) or the manifest is empty.
+        if let Some(cutoff) = self.deletion_index_max_sequence() {
+            let old_snapshot_id = self.get_current_snapshot_id();
+            match self
+                .partition_manifest_by_sequence(&old_snapshot_id, cutoff)
+                .await
+            {
+                Ok(Some(plan)) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        cutoff,
+                        bake_files = plan.bake.len(),
+                        reference_files = plan.reference.len(),
+                        "Seq-prefix plan for current snapshot (incremental bake candidate)"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        %error,
+                        "Seq-prefix plan unavailable (manifest read failed)"
+                    );
+                }
+            }
+        }
+
         let compaction_watermark = self
             .catalog
             .get_snapshot_sequence(
@@ -11844,6 +11938,18 @@ impl CayenneTableProvider {
         &self.pk_deletion_strategy
     }
 
+    /// Highest **delete** sequence currently in the in-memory deletion index
+    /// (`T`), or `None` when the index records no deletion (position-based
+    /// tables always return `None`). This is the seq-prefix-compaction cutoff:
+    /// every applicable tombstone has `delete_seq <= T`.
+    ///
+    /// Reads one coherent atomic snapshot of the deletion state, so the value is
+    /// consistent with a probe taken from the same load.
+    #[must_use]
+    fn deletion_index_max_sequence(&self) -> Option<i64> {
+        pk_deletion_snapshot_for_strategy(&self.pk_deletion_strategy).max_sequence_number()
+    }
+
     /// Clear all cached deletion vectors and insert records.
     ///
     /// This should be called after compaction operations that have applied all deletions
@@ -11887,6 +11993,71 @@ impl CayenneTableProvider {
 
         tracing::debug!(
             "Cleared all deletion and insert records caches for table {}",
+            self.table_metadata.table_name
+        );
+    }
+
+    /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
+    /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
+    /// `delete_seq > cutoff` and all upsert re-insertion records.
+    ///
+    /// This is the deletion-index half of an incremental seq-prefix compaction
+    /// (see [`Self::rewrite_seq_prefix_for_compaction`]). After the rewrite has
+    /// physically applied every deletion at or below `cutoff` into the new
+    /// consolidated file, those tombstones are dead — but tombstones above the
+    /// cutoff still apply to the higher-than-`T` files the new snapshot
+    /// references in place, so unlike [`Self::clear_all_deletion_caches`] this
+    /// does NOT wipe the whole index, the protected-snapshot set, or the PK
+    /// keyset, and it leaves position deletions untouched (they are file-scoped,
+    /// not sequence-tagged, and still apply to whatever files remain).
+    ///
+    /// `DeletionIndex::prune_deletes_at_or_below` rebuilds the membership bloom
+    /// over the survivors, so the dropped tombstones stop costing probe work and
+    /// memory; the memory accounting is refreshed to the shrunken index.
+    ///
+    /// MUST be called only AFTER the new snapshot's file set has been published
+    /// (commit + manifest), to preserve the publish-before-clear invariant.
+    ///
+    /// Exposed as `#[doc(hidden)] pub` so the crate's integration tests can drive
+    /// the seq-prefix prune directly while the subset-scan execution path that
+    /// will call it in production is built out; it is not part of the documented
+    /// public surface.
+    #[doc(hidden)]
+    pub fn prune_deletion_index_at_or_below(&self, cutoff: i64) {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                if !current.tombstones.has_deletions() {
+                    return;
+                }
+                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(pruned)));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let current = deletion_snapshot.load_full();
+                if !current.tombstones.has_deletions() {
+                    return;
+                }
+                let pruned = current.tombstones.prune_deletes_at_or_below(cutoff);
+                deletion_snapshot.store(Arc::new(RowConverterDeletionSnapshot::from_index(pruned)));
+                self.refresh_deletion_memory_accounting();
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => {
+                // Position deletions are file-scoped, not sequence-tagged; a
+                // seq-prefix bake of files leaves them to the file-level cleanup
+                // path, so there is nothing to prune by sequence here.
+            }
+        }
+
+        tracing::debug!(
+            cutoff,
+            "Pruned in-memory deletion index of tombstones at or below the \
+             seq-prefix cutoff for table {}",
             self.table_metadata.table_name
         );
     }
@@ -15925,15 +16096,17 @@ impl CayenneTableProvider {
         let file_list: futures::stream::BoxStream<'_, DataFusionResult<PartitionedFile>> =
             match manifest_files {
                 Some(files) => stream::iter(files.into_iter().map(Ok)).boxed(),
-                None => pruned_partition_list(
-                    request.state,
-                    store.as_ref(),
-                    request.table_url,
-                    request.partition_filters,
-                    &request.options.file_extension,
-                    &request.options.table_partition_cols,
-                )
-                .await?,
+                None => {
+                    pruned_partition_list(
+                        request.state,
+                        store.as_ref(),
+                        request.table_url,
+                        request.partition_filters,
+                        &request.options.file_extension,
+                        &request.options.table_partition_cols,
+                    )
+                    .await?
+                }
             };
 
         let listing_pruning_predicate = if collect_stats && !request.data_filters.is_empty() {
@@ -21296,6 +21469,192 @@ mod tests {
             file_group_paths(&fallback_files.file_groups),
             file_group_paths(&listing_files.file_groups),
             "with an empty manifest the flag-ON scan must fall back to the directory listing"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Manifest snapshot model (phase 3): incremental seq-prefix compaction
+    // planning + the surgical seq-prefix prune of the deletion index.
+    // ----------------------------------------------------------------------
+
+    /// Build a 1-column Int64-PK provider for deletion-index seq-prefix tests.
+    async fn create_int64_pk_provider(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> (CayenneTableProvider, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        create_cayenne_table_with_config(
+            table_name,
+            schema,
+            VortexConfig::default(),
+            vec!["id".to_string()],
+            runtime_env,
+        )
+        .await
+    }
+
+    /// Read the current Int64 deletion index off a provider (test-only access).
+    fn int64_tombstones(provider: &CayenneTableProvider) -> Arc<DeletionIndex> {
+        match provider.pk_deletion_strategy() {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Arc::clone(&deletion_snapshot.load().tombstones),
+            other => panic!("expected an Int64 PK strategy, got {other:?}"),
+        }
+    }
+
+    /// Install a known deletion index into a provider's Int64 cache.
+    fn store_int64_tombstones(provider: &CayenneTableProvider, index: DeletionIndex) {
+        match provider.pk_deletion_strategy() {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => deletion_snapshot.store(Arc::new(Int64PkDeletionSnapshot::from_index(index))),
+            other => panic!("expected an Int64 PK strategy, got {other:?}"),
+        }
+    }
+
+    /// The surgical seq-prefix prune must drop in-memory tombstones at or below
+    /// `T`, retain those above it (they still apply to the referenced-in-place
+    /// files), and retain upsert re-insertion records — without wiping protected
+    /// snapshots or the keyset the way `clear_all_deletion_caches` does.
+    #[tokio::test]
+    async fn prune_deletion_index_at_or_below_drops_baked_keeps_newer() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_prune", ctx.runtime_env()).await;
+
+        // Deletes at seqs 1,2,3,4 and an upsert conflict on key 50 (delete @2,
+        // re-insert @9). Bake everything <= 2 (the seq-prefix cutoff T).
+        let index = DeletionIndex::from_map(HashMap::from([(10, 1), (20, 2), (30, 3), (40, 4)]))
+            .extend_max_conflicts([50_i64], 2, 9);
+        store_int64_tombstones(&provider, index);
+        // T is the max DELETE sequence (4), not the fused insert seq (9): insert
+        // records are not deletions and never raise the seq-prefix cutoff.
+        assert_eq!(
+            provider.deletion_index_max_sequence(),
+            Some(4),
+            "T tracks the max delete sequence, ignoring re-insertion seqs"
+        );
+
+        provider.prune_deletion_index_at_or_below(2);
+
+        let pruned = int64_tombstones(&provider);
+        assert_eq!(
+            pruned.get(10).map(|t| t.delete_sequence),
+            None,
+            "seq 1 baked"
+        );
+        assert_eq!(
+            pruned.get(20).map(|t| t.delete_sequence),
+            None,
+            "seq 2 baked (boundary <=)"
+        );
+        assert_eq!(
+            pruned.get(30).map(|t| t.delete_sequence),
+            Some(3),
+            "seq 3 > T survives"
+        );
+        assert_eq!(
+            pruned.get(40).map(|t| t.delete_sequence),
+            Some(4),
+            "seq 4 > T survives"
+        );
+        // Key 50's delete (2) is baked, but its re-insertion (9 > 2) is retained,
+        // so the row stays visible — the prune must not lose the insert record.
+        assert_eq!(
+            pruned.get(50).map(|t| t.delete_sequence),
+            None,
+            "delete baked"
+        );
+        assert_eq!(pruned.insert_len(), 1, "re-insertion record retained");
+        assert_eq!(pruned.delete_len(), 2, "only the > T deletes remain");
+    }
+
+    /// On a position-based table the seq-prefix prune is a no-op (position
+    /// deletions are file-scoped, not sequence-tagged) and must not panic.
+    #[tokio::test]
+    async fn prune_deletion_index_at_or_below_is_noop_for_position_based() {
+        let ctx = SessionContext::new();
+        // No primary key → position-based strategy.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "seq_prefix_prune_position",
+            schema,
+            VortexConfig::default(),
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        assert!(matches!(
+            provider.pk_deletion_strategy(),
+            PkDeletionStrategyWithCache::PositionBased { .. }
+        ));
+        assert_eq!(provider.deletion_index_max_sequence(), None);
+        provider.prune_deletion_index_at_or_below(5); // must not panic
+    }
+
+    /// `partition_manifest_by_sequence` splits the manifest at `T`: files with
+    /// `max_sequence <= T` are bake-eligible, files above are referenced in
+    /// place. An empty (unpopulated) manifest returns `None` so the caller falls
+    /// back to the full-snapshot rewrite.
+    #[tokio::test]
+    async fn partition_manifest_by_sequence_splits_at_cutoff() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp) =
+            create_int64_pk_provider("seq_prefix_partition", ctx.runtime_env()).await;
+        let table_id = provider.table_metadata.table_id.clone();
+        let snapshot_id = provider.get_current_snapshot_id();
+
+        // Unpopulated manifest → None (full-rewrite fallback).
+        assert!(
+            provider
+                .partition_manifest_by_sequence(&snapshot_id, 5)
+                .await
+                .expect("manifest read")
+                .is_none(),
+            "an empty manifest must yield None (no seq-prefix split is defined)"
+        );
+
+        // Populate three files straddling the cutoff T=5.
+        for (name, max_seq) in [("a.vortex", 3_i64), ("b.vortex", 5), ("c.vortex", 8)] {
+            provider
+                .catalog
+                .upsert_snapshot_file(&SnapshotFile {
+                    table_id: table_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                    file_path: name.to_string(),
+                    row_count: 1,
+                    file_size_bytes: 100,
+                    min_sequence: max_seq,
+                    max_sequence: max_seq,
+                })
+                .await
+                .expect("upsert manifest row");
+        }
+
+        let plan = provider
+            .partition_manifest_by_sequence(&snapshot_id, 5)
+            .await
+            .expect("manifest read")
+            .expect("populated manifest yields a plan");
+
+        let mut bake: Vec<&str> = plan.bake.iter().map(|f| f.file_path.as_str()).collect();
+        let mut reference: Vec<&str> = plan
+            .reference
+            .iter()
+            .map(|f| f.file_path.as_str())
+            .collect();
+        bake.sort_unstable();
+        reference.sort_unstable();
+        assert_eq!(
+            bake,
+            vec!["a.vortex", "b.vortex"],
+            "max_seq <= T bakes (incl. boundary)"
+        );
+        assert_eq!(
+            reference,
+            vec!["c.vortex"],
+            "max_seq > T referenced in place"
         );
     }
 
