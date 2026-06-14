@@ -554,4 +554,18 @@ mod tests {
 
         assert_eq!(instance.http_base_url(), "http://[::1]:8090");
     }
+
+    #[test]
+    fn process_is_unavailable_for_non_owned_instances() {
+        // Non-owned (Existing/External) instances have no local child process, so
+        // `process()` returns None; callers skip memory monitoring rather than
+        // record the runner's own PID (a self-pid would silently skew the memory
+        // metric).
+        assert!(SpicedInstance::empty().process().is_none());
+        assert!(
+            SpicedInstance::external("http://localhost:50051")
+                .process()
+                .is_none()
+        );
+    }
 }
