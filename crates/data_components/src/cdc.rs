@@ -285,6 +285,13 @@ pub struct ChangeBatch {
     op_idx: usize,
     primary_keys_idx: usize,
     data_idx: usize,
+    /// Newest upstream COMMIT timestamp in this batch (milliseconds since the Unix
+    /// epoch — a wall clock, NOT a monotonic `Instant`), when the source provides
+    /// one; `None` otherwise. Lets a downstream consumer compute true end-to-end
+    /// replication lag as `now_ms - source_commit_ts_ms`. Populated by CDC
+    /// connectors that carry a source timestamp (Debezium, Postgres logical
+    /// replication, `MongoDB` change streams); left `None` by sources that don't.
+    source_commit_ts_ms: Option<i64>,
 }
 
 pub enum ChangeOperation {
@@ -342,7 +349,25 @@ impl ChangeBatch {
             op_idx,
             primary_keys_idx,
             data_idx,
+            source_commit_ts_ms: None,
         })
+    }
+
+    /// Attach the newest upstream commit timestamp (ms since the Unix epoch) for
+    /// this batch. Connectors that carry a source timestamp set it here; the value
+    /// rides the batch into the accelerator write path, where it feeds the
+    /// replication-lag signal. `None` leaves the batch without lag information.
+    #[must_use]
+    pub fn with_source_commit_ts_ms(mut self, source_commit_ts_ms: Option<i64>) -> Self {
+        self.source_commit_ts_ms = source_commit_ts_ms;
+        self
+    }
+
+    /// The newest upstream commit timestamp (ms since the Unix epoch) in this
+    /// batch, or `None` when the source does not provide one.
+    #[must_use]
+    pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        self.source_commit_ts_ms
     }
 
     #[must_use]

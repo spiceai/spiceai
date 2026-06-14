@@ -598,6 +598,49 @@ pub struct PinnedTuningActuators {
     pub mem_tier: bool,
 }
 
+/// Storage medium backing a table's data files or metastore, mapped from the
+/// runtime's detected acceleration storage class at registration. Cayenne-local:
+/// the runtime's `ResolvedAccelerationStorage` lives in the `runtime` crate (which
+/// depends on this one), so it cannot be imported here — the accelerator maps onto
+/// this enum. A *detected* fact, not an operator knob: it never (de)serializes with
+/// the spicepod config (`#[serde(skip)]` on the carrying fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageClass {
+    /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
+    LocalSsd,
+    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    Ebs,
+    /// tmpfs / RAM-backed — fastest; no bias.
+    Tmpfs,
+    /// Object store (S3) or an undetectable mount. The safe default — treated as the
+    /// slow tier so the tuner biases toward fewer, larger files / amortized commits.
+    #[default]
+    Unknown,
+}
+
+impl StorageClass {
+    /// Slow/networked tier (EBS, object store, or undetected) — biases the tuner
+    /// toward larger inline-flush (fewer, bigger files; fewer metastore commits).
+    /// `LocalSsd`/`Tmpfs` are fast and get no bias.
+    #[must_use]
+    pub fn is_slow_tier(self) -> bool {
+        matches!(self, Self::Ebs | Self::Unknown)
+    }
+
+    /// Stable numeric code for the telemetry info gauge: `0` `LocalSsd`, `1` `Ebs`,
+    /// `2` `Tmpfs`, `3` `Unknown`. Lets dashboards see the storage tier the tuner
+    /// detected without emitting a high-cardinality string label.
+    #[must_use]
+    pub fn metric_code(self) -> u64 {
+        match self {
+            Self::LocalSsd => 0,
+            Self::Ebs => 1,
+            Self::Tmpfs => 2,
+            Self::Unknown => 3,
+        }
+    }
+}
+
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -815,6 +858,39 @@ pub struct VortexConfig {
     /// Runtime-only — never compared by `configuration_matches`.
     #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
     pub schema_evolution: SchemaEvolutionMode,
+    /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
+    /// signal-driven controller for that metric). When any is set, the closed loop
+    /// drives that high-level SLO toward target with small incremental steps,
+    /// converging within `goal_convergence_window_secs`. Set from the
+    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
+    /// with the loop off is inert). Runtime-only — never compared by
+    /// `configuration_matches` (does not affect data layout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_replication_lag_secs: Option<f64>,
+    /// Freshness goal target in seconds (age of the newest queryable data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_freshness_secs: Option<f64>,
+    /// Query-latency (p99) goal target in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_query_latency_ms: Option<f64>,
+    /// Query-throughput goal target in queries per hour (higher is better).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_qph: Option<f64>,
+    /// Convergence window (seconds) for goal-driven tuning. `None` → the default
+    /// (`provider::tuning::DEFAULT_GOAL_CONVERGENCE_WINDOW`, 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_convergence_window_secs: Option<f64>,
+    /// Storage medium of the table's DATA files (Vortex), detected at registration
+    /// and mapped from the runtime's acceleration storage class. A slow tier
+    /// (EBS / object store / undetected) biases the tuner toward fewer, larger
+    /// files. Detected runtime fact — `#[serde(skip)]` (never a spicepod knob,
+    /// never compared by `configuration_matches`).
+    #[serde(skip)]
+    pub data_storage_class: StorageClass,
+    /// Storage medium of the METASTORE (where publish commits + inline re-reads
+    /// land). A slow tier biases toward larger inline-flush to amortize commits.
+    #[serde(skip)]
+    pub metastore_storage_class: StorageClass,
 }
 
 /// Evolution set permitted when a widening schema difference is detected at
@@ -1086,6 +1162,13 @@ impl Default for VortexConfig {
             dynamic_tuning: false,
             pinned_tuning_actuators: PinnedTuningActuators::default(),
             schema_evolution: SchemaEvolutionMode::default(),
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_qph: None,
+            goal_convergence_window_secs: None,
+            data_storage_class: StorageClass::default(),
+            metastore_storage_class: StorageClass::default(),
         }
     }
 }

@@ -923,6 +923,9 @@ impl<'a> AppendMutationWriter<'a> {
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
         tracing::trace!(
             table = self.table.table_name(),
             new_snapshot_id,
@@ -982,6 +985,9 @@ impl<'a> AppendMutationWriter<'a> {
             .await;
         record_cayenne_write_phase(self.table.table_name(), "publish_cas", cas_start);
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok((rows, stats_acc, validated_keys, superseded))
     }
@@ -1154,6 +1160,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -1164,6 +1173,9 @@ impl<'a> AppendMutationWriter<'a> {
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok(result)
     }
@@ -1213,6 +1225,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),
