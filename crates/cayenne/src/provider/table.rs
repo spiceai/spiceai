@@ -12807,37 +12807,36 @@ impl CayenneTableProvider {
         // (M present, inputs gone) with a pre-prune deletion index (or vice
         // versa). The clean-prefix assertion is evaluated under this same fence
         // over the now-current live set.
+        // CLEAN-PREFIX DECISION (resurrect-rows-critical) — computed OUTSIDE the
+        // write fence so the per-snapshot manifest reads (metastore I/O) never
+        // stall concurrent scans. The would-be-live set is every currently-live
+        // snapshot except the merged-away inputs (the swap below removes them); the
+        // merged output M is excluded (its `<= T` rows are SURVIVORS the rewrite
+        // kept, so pruned tombstones no longer apply to them). Soundness when the
+        // prune later runs under the fence: snapshots are immutable, so any snapshot
+        // clean here stays clean; and a snapshot a concurrent publish adds in the
+        // gap carries a fresh sequence > T (one monotonic counter; T is a past
+        // max_sequence) so it holds no `<= T` row and cannot violate the invariant.
+        //
+        // Every live snapshot (current ∪ unselected protected) MUST have manifest
+        // min_sequence > T, else it still holds a row at or below T that a `<= T`
+        // tombstone deletes and pruning that tombstone would resurrect it. A
+        // PROTECTED snapshot with an empty manifest has UNKNOWN ranges (Stage-1
+        // population failed/pending) and conservatively blocks the prune; only the
+        // genesis current snapshot (no data) is exempt.
         let mut clean_prefix_holds = true;
         let mut violating_min: Option<i64> = None;
         {
-            let _fence = self.listing_fence.write().await;
-            self.protected_snapshots.rcu(|current| {
-                let mut new_map = (**current).clone();
-                for (id, _) in &selected {
-                    new_map.remove(id);
-                }
-                new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
-                Arc::new(new_map)
-            });
-
-            // CLEAN-PREFIX ASSERTION (resurrect-rows-critical). Over the NEW live
-            // set (current snapshot ∪ post-swap protected set, which now contains
-            // M and the unselected newer snapshots, but NOT the merged-away
-            // inputs), every snapshot's manifest min_sequence MUST be > T.
-            // Otherwise a live snapshot still holds a row at or below T that a
-            // `<= T` tombstone deletes — pruning that tombstone would resurrect it.
-            //
-            // Build the live id set INSIDE the fence so it is coherent with the
-            // swap we just published. The merged output M authored its range as
-            // [merged_min, merged_max] over the inputs (all <= T), so M itself can
-            // have min_sequence <= T — that is expected and fine: M's `<= T` rows
-            // are exactly the SURVIVORS the rewrite kept after applying deletes,
-            // so the pruned tombstones no longer apply to them. M is therefore
-            // EXCLUDED from the assertion (it is the bake target, not an unmerged
-            // holdout).
             let current_snapshot_id = self.get_current_snapshot_id();
-            let mut live_ids: Vec<String> =
-                self.protected_snapshots.load().keys().cloned().collect();
+            let selected_set: std::collections::HashSet<String> =
+                selected.iter().map(|(id, _)| id.clone()).collect();
+            let mut live_ids: Vec<String> = self
+                .protected_snapshots
+                .load()
+                .keys()
+                .filter(|id| !selected_set.contains(*id))
+                .cloned()
+                .collect();
             live_ids.push(current_snapshot_id.clone());
             for id in &live_ids {
                 if id == &new_snapshot_id {
@@ -12853,11 +12852,8 @@ impl CayenneTableProvider {
                     // manifest means its Stage-1 population failed or is pending:
                     // its per-file ranges are UNKNOWN, so we cannot prove its rows
                     // are all > T and must NOT prune (a later pass retries once the
-                    // manifest is rebuilt). Without this guard a population failure
-                    // on an unmerged `<= T` snapshot would let the prune resurrect
-                    // its deleted rows. The current snapshot in CDC mode is genesis
-                    // (no data) — an empty manifest there is the no-rows case and is
-                    // safe, so it alone is exempt.
+                    // manifest is rebuilt). The genesis current snapshot (no data)
+                    // is the safe no-rows case and is exempt.
                     if id != &current_snapshot_id {
                         clean_prefix_holds = false;
                         violating_min = Some(-1); // sentinel: empty manifest, range unknown
@@ -12876,10 +12872,22 @@ impl CayenneTableProvider {
                     break;
                 }
             }
+        }
 
-            // Prune the deletion index of `delete_seq <= T` ONLY when the
-            // clean-prefix invariant holds — under the SAME write fence as the
-            // swap, so scans never see a torn (swapped-but-not-pruned) state.
+        // Publish the protected-set swap AND (when the clean-prefix invariant holds)
+        // the deletion-index prune together under ONE write-fence hold, so a scan
+        // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
+        // in-memory work runs here — no I/O — so the fence is held briefly.
+        {
+            let _fence = self.listing_fence.write().await;
+            self.protected_snapshots.rcu(|current| {
+                let mut new_map = (**current).clone();
+                for (id, _) in &selected {
+                    new_map.remove(id);
+                }
+                new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
+                Arc::new(new_map)
+            });
             if clean_prefix_holds {
                 self.prune_deletion_index_at_or_below(prefix_cutoff);
             }
