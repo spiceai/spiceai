@@ -106,7 +106,10 @@ pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
 pub use staging_wal::{CayenneStagedAppend, PreparedStagedAppend};
 pub use table::{CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder};
-pub use tuning::set_global_memory_budget;
+pub use tuning::{
+    QueryObservations, deregister_query_observations, record_query_latency,
+    register_query_observations, set_global_memory_budget,
+};
 pub use write_budget::set_global_encode_concurrency;
 
 // Re-export deletion utilities for advanced use cases
@@ -1220,6 +1223,510 @@ mod tests {
             result[0].schema(),
             table_schema,
             "Output schema should match the table schema, not the input schema"
+        );
+    }
+
+    fn widening_plan(
+        stored: &Schema,
+        incoming: &Schema,
+        constraint_columns: &[String],
+    ) -> arrow_tools::schema_evolution::WideningPlan {
+        let ctx = arrow_tools::schema_evolution::EvolutionContext { constraint_columns };
+        match arrow_tools::schema_evolution::classify(stored, incoming, &ctx) {
+            arrow_tools::schema_evolution::SchemaEvolution::Widening(plan) => plan,
+            other => panic!("Expected widening classification, got: {other:?}"),
+        }
+    }
+
+    async fn query_count(ctx: &SessionContext, sql: &str) -> i64 {
+        let df = ctx.sql(sql).await.expect("to plan query");
+        let batches = df.collect().await.expect("to collect query results");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("COUNT(*) should be Int64")
+            .value(0)
+    }
+
+    /// Restart-time read-side verification: old NARROWER Vortex files must scan
+    /// correctly under the widened logical schema — including statistics-based
+    /// file pruning with a filter on the widened column, and a filter on an
+    /// ADDED column over pre-evolution files (missing-column null-fill in the
+    /// Vortex opener).
+    #[tokio::test]
+    async fn schema_evolution_restart_scans_old_files_under_widened_schema() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_restart.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Disable write-entry inlining so the pre-evolution rows land in real
+        // Vortex files — the adaptation under test (widened-type filter +
+        // added-column null-fill) is the file read path, not the inline corpus.
+        let vortex_config = crate::metadata::VortexConfig {
+            inline_max_rows: 0,
+            inline_max_bytes: 0,
+            inline_max_buffer_bytes: 0,
+            ..crate::metadata::VortexConfig::default()
+        };
+
+        let table_name = "evolution_restart";
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider =
+            CayenneTableProvider::new(table_name, Arc::clone(&catalog_trait), ctx.runtime_env())
+                .await
+                .expect("to open provider");
+
+        let ids: Vec<i64> = (0..1000).collect();
+        let vs: Vec<i32> = (0..1000).collect();
+        let names: Vec<String> = (0..1000).map(|i| format!("name_{i}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int32Array::from(vs)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+        drop(provider);
+
+        // Restart-time engine evolution: widen `v` Int32 -> Int64 and append a
+        // nullable `tag` column, committed via update_table_schema.
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+        catalog
+            .update_table_schema(&table_metadata.table_id, &plan.evolved_schema)
+            .await
+            .expect("to update table schema");
+
+        // "Restart": a fresh provider must open with the evolved schema.
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to reopen provider"),
+        );
+        assert_eq!(
+            provider.schema().as_ref(),
+            plan.evolved_schema.as_ref(),
+            "reopened provider should expose the evolved schema"
+        );
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+
+        // Filter on the WIDENED column over old Int32 files (exercises the
+        // stats-pruning + expression-adaptation path with an Int64 predicate).
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart WHERE v > 500").await,
+            499
+        );
+        // Filter on the ADDED column over pre-evolution files (null-fill).
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag IS NULL"
+            )
+            .await,
+            1000
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag = 'x'"
+            )
+            .await,
+            0
+        );
+
+        // Post-evolution write: a value outside Int32 range plus the new column.
+        let new_batch = RecordBatch::try_new(
+            Arc::clone(&plan.evolved_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1000_i64])),
+                Arc::new(Int64Array::from(vec![5_000_000_000_i64])),
+                Arc::new(StringArray::from(vec!["name_1000"])),
+                Arc::new(StringArray::from(vec!["x"])),
+            ],
+        )
+        .expect("to build widened batch");
+        insert_batch(&provider, new_batch).await;
+
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_restart").await,
+            1001
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE tag = 'x'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_restart WHERE v > 2147483647"
+            )
+            .await,
+            1
+        );
+    }
+
+    /// `create_table` against an existing table whose ONLY configuration
+    /// difference is a widening schema change: evolves in place when the
+    /// runtime-provided `schema_evolution` mode allows it, and keeps the
+    /// legacy pin-stored-schema behavior otherwise.
+    #[tokio::test]
+    async fn schema_evolution_create_table_widening_gate() {
+        use crate::metadata::SchemaEvolutionMode;
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_gate.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+        let widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let added_only_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]));
+        let pk_widened_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let options_for =
+            |table: &str, schema: &Arc<Schema>, mode: SchemaEvolutionMode| -> CreateTableOptions {
+                CreateTableOptions {
+                    table_name: table.to_string(),
+                    schema: Arc::clone(schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        schema_evolution: mode,
+                        ..crate::metadata::VortexConfig::default()
+                    },
+                }
+            };
+
+        // Disabled (legacy): the stored schema is pinned.
+        let table = "t_disabled";
+        let id_before = catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
+            .await
+            .expect("create");
+        let id_after = catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Disabled,
+            ))
+            .await
+            .expect("re-create with changed schema");
+        assert_eq!(id_before, id_after);
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "disabled mode must pin the stored schema"
+        );
+
+        // Widen: the full widening set evolves in place, same table_id.
+        let table = "t_widen";
+        let id_before = catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let id_after = catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("re-create with widened schema");
+        assert_eq!(id_before, id_after);
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            widened_schema.as_ref(),
+            "widen mode must commit the evolved schema"
+        );
+
+        // AddColumnsOnly: a type widening is OUTSIDE the evolution set (pinned)…
+        let table = "t_addonly";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("create");
+        catalog
+            .create_table(options_for(
+                table,
+                &widened_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("re-create with widened schema");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "append_new_columns must not evolve type widening"
+        );
+        // …but a pure nullable column add IS evolved.
+        catalog
+            .create_table(options_for(
+                table,
+                &added_only_schema,
+                SchemaEvolutionMode::AddColumnsOnly,
+            ))
+            .await
+            .expect("re-create with added column");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            added_only_schema.as_ref(),
+            "append_new_columns must evolve added nullable columns"
+        );
+
+        // Constraint guard: widening a PRIMARY KEY column is Incompatible
+        // (typed PK row-encodings) — pinned even under Widen.
+        let table = "t_pkguard";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        catalog
+            .create_table(options_for(
+                table,
+                &pk_widened_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("re-create with widened PK schema");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "PK type widening must classify Incompatible and pin the stored schema"
+        );
+
+        // Non-schema config differences must keep today's behavior even when
+        // the schema also widened (schema must be the ONLY difference).
+        let table = "t_mixed_diff";
+        catalog
+            .create_table(options_for(
+                table,
+                &stored_schema,
+                SchemaEvolutionMode::Widen,
+            ))
+            .await
+            .expect("create");
+        let mut mixed = options_for(table, &widened_schema, SchemaEvolutionMode::Widen);
+        mixed.vortex_config.sort_columns = vec!["id".to_string()];
+        catalog
+            .create_table(mixed)
+            .await
+            .expect("re-create with mixed config + schema diff");
+        assert_eq!(
+            catalog.get_table(table).await.expect("get").schema.as_ref(),
+            stored_schema.as_ref(),
+            "a non-schema config difference must keep the legacy pin path"
+        );
+    }
+
+    /// Live evolution sequencing: rows pending in the inline corpus written
+    /// PRE-evolution are flushed to a Vortex file before the schema swap (the
+    /// inline branch is unioned projection-only, so a swap with pending inline
+    /// rows would be mistyped), the swap is idempotent, and the PK constraint
+    /// guard rejects a key-widening plan.
+    #[tokio::test]
+    async fn schema_evolution_live_swap_flushes_inline_corpus() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let db_path = temp_dir.path().join("cayenne_evolution_live.db");
+        let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
+        let catalog =
+            Arc::new(CayenneCatalog::new(connection_string.as_str()).expect("to create catalog"));
+        catalog.init().await.expect("to init catalog");
+
+        let stored_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, true),
+        ]));
+
+        let table_name = "evolution_live";
+        // Default VortexConfig keeps write-entry inlining ON (inline_max_rows
+        // 1024), so the small batch below lands in the inline corpus.
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&stored_schema),
+                primary_key: vec!["id".to_string()],
+                on_conflict: Some(OnConflict::DoNothingAll),
+                base_path: temp_dir.path().to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: crate::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("to create table");
+        let table_metadata = catalog.get_table(table_name).await.expect("to get table");
+
+        let ctx = SessionContext::new();
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let provider = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("to open provider"),
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&stored_schema),
+            vec![
+                Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())),
+                Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())),
+            ],
+        )
+        .expect("to build batch");
+        insert_batch(&provider, batch).await;
+        assert!(
+            catalog
+                .get_inlined_data_count(&table_metadata.table_id)
+                .await
+                .expect("inlined count")
+                > 0,
+            "small write should land in the inline corpus"
+        );
+
+        let incoming_schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let plan = widening_plan(&stored_schema, &incoming_schema, &[]);
+
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("live schema evolution");
+
+        assert_eq!(
+            provider.schema().as_ref(),
+            plan.evolved_schema.as_ref(),
+            "live provider should expose the evolved schema after the swap"
+        );
+        assert_eq!(
+            catalog
+                .get_inlined_data_count(&table_metadata.table_id)
+                .await
+                .expect("inlined count"),
+            0,
+            "the inline corpus must be flushed before the schema swap"
+        );
+        assert_eq!(
+            catalog
+                .get_table(table_name)
+                .await
+                .expect("get")
+                .schema
+                .as_ref(),
+            plan.evolved_schema.as_ref(),
+            "the metastore must hold the evolved schema"
+        );
+
+        // Idempotent: re-applying the same plan is a no-op.
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("re-applying the same plan should no-op");
+
+        ctx.register_table(table_name, Arc::<CayenneTableProvider>::clone(&provider))
+            .expect("to register table");
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_live").await,
+            10
+        );
+        assert_eq!(
+            query_count(
+                &ctx,
+                "SELECT COUNT(*) FROM evolution_live WHERE tag IS NULL"
+            )
+            .await,
+            10
+        );
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM evolution_live WHERE v >= 5").await,
+            5
+        );
+
+        // Constraint guard, live path: a plan that widens the PK column must
+        // be rejected (typed PK row-encodings cannot be widened in place).
+        let pk_widening = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]);
+        let pk_plan = widening_plan(plan.evolved_schema.as_ref(), &pk_widening, &[]);
+        assert!(
+            provider.evolve_schema_live(&pk_plan).await.is_err(),
+            "widening a PK column must be rejected by the live path"
         );
     }
 }

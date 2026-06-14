@@ -1,0 +1,44 @@
+---
+source: crates/test-framework/src/snapshot/mod.rs
+description: "Query: chbench_q13"
+---
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: custdist DESC NULLS FIRST, c_orders.c_count DESC NULLS FIRST                                                                                                                                |
+|               |   Projection: c_orders.c_count, count(Int64(1)) AS custdist                                                                                                                                       |
+|               |     Aggregate: groupBy=[[c_orders.c_count]], aggr=[[count(Int64(1))]]                                                                                                                             |
+|               |       SubqueryAlias: c_orders                                                                                                                                                                     |
+|               |         Projection: count(oorder.o_id) AS c_count                                                                                                                                                 |
+|               |           Aggregate: groupBy=[[customer.c_id]], aggr=[[count(oorder.o_id)]]                                                                                                                       |
+|               |             Projection: customer.c_id, oorder.o_id                                                                                                                                                |
+|               |               Left Join: customer.c_w_id = oorder.o_w_id, customer.c_d_id = oorder.o_d_id, customer.c_id = oorder.o_c_id                                                                          |
+|               |                 TableScan: customer projection=[c_id, c_d_id, c_w_id]                                                                                                                             |
+|               |                 Projection: oorder.o_id, oorder.o_d_id, oorder.o_w_id, oorder.o_c_id                                                                                                              |
+|               |                   Filter: oorder.o_carrier_id > Int32(8)                                                                                                                                          |
+|               |                     TableScan: oorder projection=[o_id, o_d_id, o_w_id, o_c_id, o_carrier_id], partial_filters=[oorder.o_carrier_id > Int32(8)]                                                   |
+| physical_plan | SortPreservingMergeExec: [custdist@1 DESC, c_count@0 DESC]                                                                                                                                        |
+|               |   SortExec: expr=[custdist@1 DESC, c_count@0 DESC], preserve_partitioning=[true]                                                                                                                  |
+|               |     ProjectionExec: expr=[c_count@0 as c_count, count(Int64(1))@1 as custdist]                                                                                                                    |
+|               |       AggregateExec: mode=FinalPartitioned, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                                                    |
+|               |         RepartitionExec: partitioning=Hash([c_count@0], 64), input_partitions=64                                                                                                                  |
+|               |           AggregateExec: mode=Partial, gby=[c_count@0 as c_count], aggr=[count(Int64(1))]                                                                                                         |
+|               |             ProjectionExec: expr=[count(oorder.o_id)@1 as c_count]                                                                                                                                |
+|               |               AggregateExec: mode=FinalPartitioned, gby=[c_id@0 as c_id], aggr=[count(oorder.o_id)]                                                                                               |
+|               |                 RepartitionExec: partitioning=Hash([c_id@0], 64), input_partitions=64                                                                                                             |
+|               |                   AggregateExec: mode=Partial, gby=[c_id@0 as c_id], aggr=[count(oorder.o_id)]                                                                                                    |
+|               |                     ProjectionExec: expr=[c_id@1 as c_id, o_id@0 as o_id]                                                                                                                         |
+|               |                       HashJoinExec: mode=Partitioned, join_type=Right, on=[(o_w_id@2, c_w_id@2), (o_d_id@1, c_d_id@1), (o_c_id@3, c_id@0)], projection=[o_id@0, c_id@4]                           |
+|               |                         RepartitionExec: partitioning=Hash([o_w_id@2, o_d_id@1, o_c_id@3], 64), input_partitions=64                                                                               |
+|               |                           ProjectionExec: expr=[o_id@0 as o_id, o_d_id@1 as o_d_id, o_w_id@2 as o_w_id, o_c_id@3 as o_c_id]                                                                       |
+|               |                             SchemaCastScanExec                                                                                                                                                    |
+|               |                               CayenneAccelerationExec: snapshots_scanned=1, files_scanned=67                                                                                                      |
+|               |                                 BytesProcessedExec                                                                                                                                                |
+|               |                                   DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[o_id, o_d_id, o_w_id, o_c_id, o_carrier_id], file_type=vortex, predicate: o_carrier_id@5 > 8 |
+|               |                         RepartitionExec: partitioning=Hash([c_w_id@2, c_d_id@1, c_id@0], 64), input_partitions=64                                                                                 |
+|               |                           SchemaCastScanExec                                                                                                                                                      |
+|               |                             CayenneAccelerationExec: snapshots_scanned=1, files_scanned=71                                                                                                        |
+|               |                               BytesProcessedExec                                                                                                                                                  |
+|               |                                 DataSourceExec: file_groups={64 groups: [<redacted>]}, projection=[c_id, c_d_id, c_w_id], file_type=vortex                                                        |
+|               |                                                                                                                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -52,6 +52,13 @@ pub struct MetricsCollector {
     confirmed_flush_lsn: AtomicU64, // last LSN we acknowledged to the server
     server_wal_end_lsn: AtomicU64,  // latest WAL end reported by the server (keepalive)
 
+    // Schema evolution (stream-time, from pgoutput Relation messages).
+    /// Widening schema changes adopted into the working schema.
+    schema_evolutions_total: AtomicU64,
+    /// Schema changes detected but NOT adopted: incompatible/non-widening
+    /// changes (terminal error) or changes ignored under `block`.
+    schema_evolution_rejections_total: AtomicU64,
+
     // Errors.
     wal_decode_errors_total: AtomicU64,
     schema_mismatch_errors_total: AtomicU64,
@@ -169,6 +176,14 @@ impl MetricsCollector {
         }
     }
 
+    pub fn inc_schema_evolution(&self) {
+        self.schema_evolutions_total.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_schema_evolution_rejected(&self) {
+        self.schema_evolution_rejections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_decode_error(&self) {
         self.wal_decode_errors_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -275,6 +290,19 @@ impl Metrics {
             .duration_since(watermark)
             .ok()
             .and_then(|d| u64::try_from(d.as_millis()).ok())
+    }
+
+    #[must_use]
+    pub fn schema_evolutions_total(&self) -> u64 {
+        self.collector
+            .schema_evolutions_total
+            .load(Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn schema_evolution_rejections_total(&self) -> u64 {
+        self.collector
+            .schema_evolution_rejections_total
+            .load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -398,6 +426,17 @@ mod tests {
         let lag = m.replication_lag_ms().expect("lag set");
         // Should be at least ~150ms; allow slack.
         assert!(lag >= 140, "expected ≥140ms lag, got {lag}");
+    }
+
+    #[test]
+    fn schema_evolution_counters_increment() {
+        let c = MetricsCollector::new();
+        c.inc_schema_evolution();
+        c.inc_schema_evolution();
+        c.inc_schema_evolution_rejected();
+        let m = Metrics::new(c);
+        assert_eq!(m.schema_evolutions_total(), 2);
+        assert_eq!(m.schema_evolution_rejections_total(), 1);
     }
 
     #[test]

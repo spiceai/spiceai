@@ -207,6 +207,45 @@ fn sanitize_column_reference(column_ref: &str) -> Result<Vec<String>> {
 
     Ok(sanitized_columns)
 }
+/// Maps an Arrow [`DataType`] to the Turso DDL type used for `CREATE TABLE` and
+/// `ALTER TABLE ADD COLUMN` statements.
+#[expect(clippy::match_same_arms)]
+fn arrow_type_to_turso_ddl(data_type: &DataType) -> &'static str {
+    match data_type {
+        // Integer types map to SQLite INTEGER
+        DataType::Int64
+        | DataType::Int32
+        | DataType::Int16
+        | DataType::Int8
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::UInt16
+        | DataType::UInt8 => "INTEGER",
+        // Floating point types map to REAL
+        DataType::Float64 | DataType::Float32 => "REAL",
+        // String types map to TEXT
+        DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
+        // Binary types map to BLOB
+        DataType::Binary | DataType::LargeBinary => "BLOB",
+        // Boolean maps to INTEGER (0/1)
+        DataType::Boolean => "INTEGER",
+        // Similar to SQLite Date types stored as `date_text` (ISO-8601 strings) for correct comparison semantics, like o_orderdate > '1894-01-01';
+        DataType::Date32 | DataType::Date64 => "date_text",
+        // Other temporal types map to INTEGER
+        DataType::Timestamp(_, _)
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_) => "INTEGER",
+        // Decimal types map to REAL
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "REAL",
+        // Complex types (List, Struct, etc.) map to TEXT (JSON serialized)
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => "TEXT",
+        // Default to TEXT for unsupported types (serialized as JSON or string)
+        _ => "TEXT",
+    }
+}
+
 // Re-export for use within the runtime crate
 pub use data_components::turso::TursoConnectionPool;
 use runtime_acceleration::snapshot::AccelerationEngine;
@@ -611,42 +650,7 @@ impl DataAccelerator for TursoAccelerator {
         // Build CREATE TABLE statement from schema
         let mut columns = Vec::new();
         for field in cmd.schema.fields() {
-            #[expect(clippy::match_same_arms)]
-            let col_type = match field.data_type() {
-                // Integer types map to SQLite INTEGER
-                DataType::Int64
-                | DataType::Int32
-                | DataType::Int16
-                | DataType::Int8
-                | DataType::UInt64
-                | DataType::UInt32
-                | DataType::UInt16
-                | DataType::UInt8 => "INTEGER",
-                // Floating point types map to REAL
-                DataType::Float64 | DataType::Float32 => "REAL",
-                // String types map to TEXT
-                DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
-                // Binary types map to BLOB
-                DataType::Binary | DataType::LargeBinary => "BLOB",
-                // Boolean maps to INTEGER (0/1)
-                DataType::Boolean => "INTEGER",
-                // Similar to SQLite Date types stored as `date_text` (ISO-8601 strings) for correct comparison semantics, like o_orderdate > '1894-01-01';
-                DataType::Date32 | DataType::Date64 => "date_text",
-                // Other temporal types map to INTEGER
-                DataType::Timestamp(_, _)
-                | DataType::Time32(_)
-                | DataType::Time64(_)
-                | DataType::Duration(_)
-                | DataType::Interval(_) => "INTEGER",
-                // Decimal types map to REAL
-                DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "REAL",
-                // Complex types (List, Struct, etc.) map to TEXT (JSON serialized)
-                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-                    "TEXT"
-                }
-                // Default to TEXT for unsupported types (serialized as JSON or string)
-                _ => "TEXT",
-            };
+            let col_type = arrow_type_to_turso_ddl(field.data_type());
             let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
             let column_name = sanitize_identifier(field.name(), "Column")?;
             columns.push(format!("{column_name} {col_type}{nullable}"));
@@ -810,6 +814,66 @@ impl DataAccelerator for TursoAccelerator {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         tracing::info!(
             "Dropped Turso table '{table_name}' for schema recreation (file_update mode)"
+        );
+        Ok(())
+    }
+
+    async fn evolve_table_schema(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+        plan: &arrow_tools::schema_evolution::WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Type widening and nullability relaxing need no DDL on Turso: column type
+        // affinity already stores the widened values. Only added columns require
+        // `ALTER TABLE ADD COLUMN`.
+        if !plan.added_columns.is_empty() {
+            let pool = self.get_shared_pool(source).await?;
+            let _schema_guard = pool.acquire_schema_write_lock().await;
+            let conn = pool.connect().await?;
+            let quoted_table = sanitize_identifier(table_name, "Table")?;
+
+            // PRAGMA table_info returns no rows when the table does not exist yet; in
+            // that case the table is created with the evolved schema on the next write.
+            let mut existing_columns = Vec::new();
+            let mut rows = conn
+                .query(&format!("PRAGMA table_info({quoted_table})"), ())
+                .await
+                .context(TursoDatabaseSnafu)?;
+            while let Some(row) = rows.next().await.context(TursoDatabaseSnafu)? {
+                // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+                if let turso::Value::Text(column_name) =
+                    row.get_value(1).context(TursoDatabaseSnafu)?
+                {
+                    existing_columns.push(column_name);
+                }
+            }
+
+            if !existing_columns.is_empty() {
+                for field in &plan.added_columns {
+                    // Idempotent: skip columns already added by a prior (possibly
+                    // interrupted) evolution.
+                    if existing_columns.iter().any(|column| column == field.name()) {
+                        continue;
+                    }
+                    let quoted_column = sanitize_identifier(field.name(), "Column")?;
+                    let col_type = arrow_type_to_turso_ddl(field.data_type());
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {col_type}"
+                        ),
+                        (),
+                    )
+                    .await
+                    .context(TursoDatabaseSnafu)?;
+                }
+            }
+        }
+
+        tracing::info!(
+            dataset = %source.name(),
+            "Applied in-place schema evolution to Turso table '{table_name}': {summary}",
+            summary = plan.describe()
         );
         Ok(())
     }

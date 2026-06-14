@@ -68,6 +68,15 @@ pub struct CayenneContext {
     /// dynamic controller. Always recorded (cheap); only acted on when
     /// `dynamic_tuning` is enabled.
     ingest_stats: Arc<IngestStats>,
+    /// Per-table query-side observations (p99 latency + QPH), shared with the
+    /// process-global query registry so the runtime can push query metrics *down*
+    /// into this table's tuner; read on the background tick to derive the
+    /// query-latency / QPH goals. Registered (idempotently) at construction.
+    query_observations: Arc<tuning::QueryObservations>,
+    /// Operator-configured tuning goals (SLOs). When any is set, `retune` runs the
+    /// goal-seeking controller; otherwise the legacy signal-driven one. Built once
+    /// from `config` at construction.
+    goals: tuning::Goals,
     /// Static `[floor, ceiling]` the controller may move each live actuator within.
     tuning_bounds: TuningBounds,
     /// Whether the closed-loop controller may mutate `live_actuators` (off by
@@ -180,6 +189,24 @@ impl CayenneContext {
                 mem_tier_bounds
             },
         };
+        // Register (idempotently) this table's query-observations handle in the
+        // process-global registry so the runtime's query tracker can push p99
+        // latency / QPH down into it (the `runtime` crate cannot be imported here).
+        let query_observations = tuning::register_query_observations(dataset);
+        // Resolve the operator-configured goals (SLOs). When none are set, the
+        // controller stays on the legacy signal-driven path.
+        let goals = tuning::Goals::from_targets(
+            config.goal_replication_lag_secs,
+            config.goal_freshness_secs,
+            config.goal_query_latency_ms,
+            config.goal_qph,
+            config
+                .goal_convergence_window_secs
+                .filter(|s| *s > 0.0)
+                .map_or(tuning::DEFAULT_GOAL_CONVERGENCE_WINDOW, |s| {
+                    std::time::Duration::from_secs_f64(s)
+                }),
+        );
         Arc::new(Self {
             vortex_format,
             config: config.clone(),
@@ -189,6 +216,8 @@ impl CayenneContext {
             runtime_env,
             live_actuators,
             ingest_stats: Arc::new(IngestStats::new()),
+            query_observations,
+            goals,
             tuning_bounds,
             dynamic_tuning: config.dynamic_tuning,
             last_adjust: parking_lot::Mutex::new(None),
@@ -469,6 +498,7 @@ impl CayenneContext {
         delete_rows: u64,
         bytes: u64,
         apply: std::time::Duration,
+        source_commit_ts_ms: Option<i64>,
     ) {
         let now = std::time::Instant::now();
         let arrival_gap = {
@@ -484,19 +514,62 @@ impl CayenneContext {
             arrival_gap,
             delete_rows,
         });
+        // Fold in the now-relative goal signals. Wall clock (epoch ms), NOT the
+        // monotonic `Instant` above: lag/freshness are absolute "now − ts" ages.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(ts_ms) = source_commit_ts_ms {
+            self.ingest_stats.observe_source_commit_ts_ms(ts_ms);
+        }
+        // Stamp freshness at apply time. Exact for the synchronous publish path;
+        // for the backgrounded staged-CDC publish this trails true visibility by
+        // the finalize latency, so it is a lower bound on staleness.
+        self.ingest_stats.set_last_visible_ts_ms(now_ms);
     }
 
-    /// A snapshot of the current ingest accounting (rate + response), for
-    /// observability/logging.
+    /// Fold one CDC batch's object-store/disk write latency (the `vortex_write`
+    /// phase) into the tuner's rolling EWMA. Called from the write path with the
+    /// duration it already measured for telemetry.
+    pub(crate) fn record_io_latency(&self, d: std::time::Duration) {
+        self.ingest_stats.record_io_latency(d);
+    }
+
+    /// Fold one CDC batch's metastore publish latency (the `publish` phase — the
+    /// single-writer commit) into the tuner's rolling EWMA.
+    pub(crate) fn record_publish_latency(&self, d: std::time::Duration) {
+        self.ingest_stats.record_publish_latency(d);
+    }
+
+    /// A snapshot of the current ingest accounting (rate + response), enriched with
+    /// the now-relative CDC goal signals (replication lag, freshness) and the
+    /// query-side goal signals (p99 latency, QPH) — the wall clock and the
+    /// query-observations handle live here, keeping `IngestStats::snapshot` and
+    /// `decide` clock-free/pure. For observability/logging and the control step.
     #[must_use]
     pub(crate) fn ingest_snapshot(&self) -> tuning::IngestSnapshot {
-        self.ingest_stats.snapshot()
+        let mut snap = self.ingest_stats.snapshot();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        snap.replication_lag_secs = self.ingest_stats.replication_lag_secs(now_ms);
+        snap.freshness_secs = self.ingest_stats.freshness_secs(now_ms);
+        snap.query_latency_p99_ms = self.query_observations.p99_latency_ms();
+        snap.qph = self.query_observations.qph();
+        // Per-table static storage classes (detected at registration) — the loop
+        // reasons over them via `IngestSnapshot`, keeping `decide` pure.
+        snap.data_storage = self.config.data_storage_class;
+        snap.metastore_storage = self.config.metastore_storage_class;
+        snap
     }
 
     /// Current live actuator values (after any dynamic adjustments), for metrics.
     #[must_use]
     pub(crate) fn live_actuator_values(&self) -> tuning::ActuatorValues {
         self.live_actuators.values()
+    }
+
+    /// The operator-configured tuning goals (for telemetry/observability — the
+    /// control step reads them internally).
+    #[must_use]
+    pub(crate) fn goals(&self) -> tuning::Goals {
+        self.goals
     }
 
     /// Refresh the externally-observed environment/response signals (read amp +
@@ -506,6 +579,9 @@ impl CayenneContext {
     pub(crate) fn observe_environment(&self, read_amp: usize) {
         self.ingest_stats.set_read_amp(read_amp);
         tuning::sample_mem_pressure(&self.ingest_stats);
+        // Process-global CPU busy-fraction (cgroup-aware); read by every table's
+        // snapshot. Sampled here once per tick (before `retune`).
+        tuning::sample_cpu_pressure();
     }
 
     /// Run one dynamic-tuning control step from the current accounting, applying
@@ -525,7 +601,10 @@ impl CayenneContext {
         let since_last = (*self.last_adjust.lock()).map_or(std::time::Duration::MAX, |t| {
             now.saturating_duration_since(t)
         });
-        let snapshot = self.ingest_stats.snapshot();
+        // Enriched snapshot (adds the now-relative lag/freshness + query p99/QPH
+        // signals the goal controller reads); reduces to the legacy snapshot when
+        // no goals are set.
+        let snapshot = self.ingest_snapshot();
         // Relearn the observed mean row width from live ingest (EWMA bytes ÷ rows)
         // so a later inline-flush byte-budget move derives a row cap matching the
         // table's real rows, not a stale static estimate. Only with a confident
@@ -539,13 +618,14 @@ impl CayenneContext {
             self.live_actuators.observe_mean_row_bytes(bytes_per_row);
         }
         let samples_at_last_move = self.last_adjust_samples.load(Ordering::Relaxed);
-        let adj = tuning::decide(
+        let adj = tuning::decide_with_goals(
             &snapshot,
             &self.live_actuators.values(),
             &self.tuning_bounds,
             since_last,
             min_dwell,
             samples_at_last_move,
+            &self.goals,
         )?;
         self.live_actuators.apply(&adj);
         *self.last_adjust.lock() = Some(now);
@@ -599,6 +679,11 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
+            // `dynamic_filter_pushdown` is left at its default (off): Vortex's
+            // IN-list / `list_contains` evaluation has no hashset (O(K×N)), so
+            // absorbing a hash-join build-side dynamic filter into the Vortex
+            // scan is slower than letting DataFusion's hashed join probe apply
+            // it. See #11307 and `mem_tier_join_does_not_push_dynamic_filter_into_vortex_scan`.
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
