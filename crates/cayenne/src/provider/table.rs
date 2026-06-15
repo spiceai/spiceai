@@ -14691,8 +14691,7 @@ impl CayenneTableProvider {
             return vec![batches];
         }
         let mut sizes = vec![0usize; effective_n];
-        let mut partitions: Vec<Vec<RecordBatch>> =
-            (0..effective_n).map(|_| Vec::new()).collect();
+        let mut partitions: Vec<Vec<RecordBatch>> = (0..effective_n).map(|_| Vec::new()).collect();
         for batch in batches {
             // Assign to the currently least-loaded partition (greedy balance).
             let min_idx = sizes
@@ -27062,11 +27061,9 @@ mod tests {
     /// fan-out floor). A wrong split here would drop/duplicate scanned rows.
     #[test]
     fn partition_memory_batches_preserves_rows_and_bounds_partitions() {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "pk",
-            arrow::datatypes::DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("pk", arrow::datatypes::DataType::Int64, false),
+        ]));
         let make = |rows: i64, start: i64| {
             let vals: Vec<i64> = (start..start + rows).collect();
             RecordBatch::try_new(
@@ -27085,10 +27082,14 @@ mod tests {
         let parts = CayenneTableProvider::partition_memory_batches(batches, 4);
         assert_eq!(parts.len(), 4, "32K-row tier fans out to target_partitions");
         assert_eq!(total(&parts), 32768, "rows preserved across partitions");
-        assert!(parts.iter().all(|p| !p.is_empty()), "no empty partition when batches >= partitions");
+        assert!(
+            parts.iter().all(|p| !p.is_empty()),
+            "no empty partition when batches >= partitions"
+        );
 
         // Trivially small tier stays single-partition (MIN_ROWS_PER_PARTITION floor).
-        let tiny = CayenneTableProvider::partition_memory_batches(vec![make(10, 0), make(10, 50)], 16);
+        let tiny =
+            CayenneTableProvider::partition_memory_batches(vec![make(10, 0), make(10, 50)], 16);
         assert_eq!(tiny.len(), 1, "small tier stays single-partition");
         assert_eq!(total(&tiny), 20);
 
@@ -27098,8 +27099,14 @@ mod tests {
         assert_eq!(total(&one), 40000);
 
         // More partitions requested than batches → capped at the batch count.
-        let few = CayenneTableProvider::partition_memory_batches(vec![make(20000, 0), make(20000, 0)], 16);
-        assert!(few.len() <= 2, "partition count never exceeds the batch count");
+        let few = CayenneTableProvider::partition_memory_batches(
+            vec![make(20000, 0), make(20000, 0)],
+            16,
+        );
+        assert!(
+            few.len() <= 2,
+            "partition count never exceeds the batch count"
+        );
         assert_eq!(total(&few), 40000);
 
         // Empty input is handled defensively (callers early-return, but stay safe).
