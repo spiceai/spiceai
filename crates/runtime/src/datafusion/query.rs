@@ -832,6 +832,26 @@ impl Query {
                 // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
                 // They modify session state rather than producing query results, so must be
                 // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
+                // [query admission] Bound concurrently-EXECUTING analytical
+                // queries (`runtime.query.max_concurrent_queries`) so an OLAP
+                // burst can't oversubscribe the shared query runtime + memory
+                // pool and starve queries (the idle-cores-under-load symptom).
+                // Acquired AFTER the results-cache check above (a cache hit
+                // returned early is never gated) and held — via the cancellation
+                // guard attached to the result stream below — until the stream is
+                // fully drained, so the permit spans the real execution lifetime
+                // (the lazy Flight drain and the managed-runtime driver included).
+                // No-op when `query_admission_semaphore` is unset (unbounded).
+                let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+                    if let Some(semaphore) = ctx.df.query_admission_semaphore() {
+                        Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
+                        // A closed semaphore (shutdown only) proceeds ungated
+                        // rather than failing the query.
+                        semaphore.acquire_owned().await.ok()
+                    } else {
+                        None
+                    };
+
                 let (res_stream, physical_plan): (
                     SendableRecordBatchStream,
                     Arc<dyn ExecutionPlan>,
@@ -1032,7 +1052,13 @@ impl Query {
                     final_stream,
                     query_cancel_token.clone(),
                     query_id_str.clone(),
-                    active_query_guard,
+                    // Bundle the admission permit with the active-query guard so
+                    // BOTH release exactly when the result stream is fully drained
+                    // (completion, error, or cancellation) — the permit thus spans
+                    // the query's true lifetime, not merely until `run` returns
+                    // (Flight drains the stream lazily; the managed runtime drives
+                    // it on a separate task).
+                    (active_query_guard, admission_permit),
                 );
 
                 Ok(QueryResult::new(

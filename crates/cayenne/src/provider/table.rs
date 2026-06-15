@@ -13270,20 +13270,40 @@ impl CayenneTableProvider {
             PkDeletionStrategyWithCache::RowConverterBased {
                 deletion_snapshot, ..
             } => {
-                let converter = self.build_pk_converter(&pk_indices)?;
+                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
                 let pk_columns: Vec<_> = pk_indices
                     .iter()
                     .map(|idx| Arc::clone(batch.column(*idx)))
                     .collect();
-                let rows = converter.convert_columns(&pk_columns)?;
-                let deleted_row_keys = Arc::clone(&deletion_snapshot.load_full().tombstones);
+                let pk_has_nulls = pk_columns.iter().any(|column| column.null_count() > 0);
 
-                if pk_columns.iter().any(|column| column.null_count() > 0) {
+                // [no-tombstone short-circuit] The composite-PK analog of the
+                // Int64 arm's disjoint min/max fast path above. When no row-key
+                // tombstone is live (the file-side index AND the in-RAM tier are
+                // both empty) and the PK columns have no nulls, no scanned row can
+                // be hidden and the batch is valid — pass it through and skip the
+                // O(rows x pk_cols) `RowConverter` encode + `filter_record_batch`
+                // copy entirely. The Int64 arm's disjoint *range* check needs the
+                // encoding for composite keys (the very cost being avoided), so the
+                // empty-set check is the sound, cheap equivalent; gating on
+                // no-nulls preserves the null-PK validation error below. Mem-tier
+                // scans of an INSERT-heavy table take this between updates.
+                if !pk_has_nulls
+                    && deleted_row_keys.is_empty()
+                    && inlined_deletions.row_keys.is_empty()
+                {
+                    return Ok(Some(batch));
+                }
+
+                if pk_has_nulls {
                     return Err(Error::DataValidation {
                         table: self.table_metadata.table_name.clone(),
                         message: "Primary key values must be non-null".to_string(),
                     });
                 }
+
+                let converter = self.build_pk_converter(&pk_indices)?;
+                let rows = converter.convert_columns(&pk_columns)?;
                 // Same column-sweep shape as the Int64 arm: one batched bloom
                 // sweep over the encoded row keys, then the inline-map pass
                 // only for rows still kept (drop is monotone, so skipping
@@ -14441,6 +14461,7 @@ impl CayenneTableProvider {
         snapshot: &crate::provider::mem_tier::MemTier,
         effective_projection: Option<&Vec<usize>>,
         pruning_predicate: Option<&Arc<dyn PhysicalExpr>>,
+        target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         if snapshot.is_empty() || snapshot.segments.is_empty() {
             return Ok(None);
@@ -14458,7 +14479,7 @@ impl CayenneTableProvider {
         if visible_batches.is_empty() {
             return Ok(None);
         }
-        self.finish_mem_tier_scan_plan(visible_batches, effective_projection)
+        self.finish_mem_tier_scan_plan(visible_batches, effective_projection, target_partitions)
     }
 
     /// Shared tail of the mem-tier scan plan: apply the effective projection and
@@ -14467,6 +14488,7 @@ impl CayenneTableProvider {
         &self,
         visible_batches: Vec<RecordBatch>,
         effective_projection: Option<&Vec<usize>>,
+        target_partitions: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ExecutionPlan>>> {
         // Project to the effective projection (reusing the inlined-plan logic).
         let table_schema = self.table_schema();
@@ -14501,13 +14523,66 @@ impl CayenneTableProvider {
             return Ok(None);
         }
 
+        // Fan the in-RAM batches across `target_partitions` so DataFusion
+        // morsel-parallelizes the mem-tier scan instead of pinning it to one
+        // core (the single-partition `MemorySourceConfig` left the box idle on
+        // filtered aggregates over hot CDC tables — the round-robin repartition
+        // in `scan()` is gated off when scan filters are present). Correctness is
+        // unaffected: every batch lands in exactly one partition, so the union of
+        // partitions is the identical row set.
+        let partitions = Self::partition_memory_batches(projected_batches, target_partitions);
         Ok(Some(
             datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                &[projected_batches],
+                &partitions,
                 proj_schema,
                 None,
             )?,
         ))
+    }
+
+    /// Distribute record batches across up to `target_partitions` partitions so
+    /// an in-RAM (mem-tier / inline-corpus) `MemorySourceConfig` scan branch runs
+    /// morsel-parallel across cores instead of pinned to a single one.
+    ///
+    /// Greedy least-loaded assignment by row count keeps the partitions balanced
+    /// when batch sizes vary. Tiny inputs stay single-partition (the
+    /// `MIN_ROWS_PER_PARTITION` floor) so the fan-out cost is never paid on a
+    /// trivially small tier. Correctness-preserving: each input batch is placed in
+    /// exactly one output partition, so the multiset of rows is unchanged — an
+    /// aggregate's partial+final and a filter's per-partition pass both compose
+    /// over the partitions identically to the single-partition shape.
+    fn partition_memory_batches(
+        batches: Vec<RecordBatch>,
+        target_partitions: usize,
+    ) -> Vec<Vec<RecordBatch>> {
+        // At least one row-bearing batch is guaranteed by the callers (they
+        // early-return on empty), but stay defensive.
+        let n = target_partitions.max(1).min(batches.len().max(1));
+        if n <= 1 {
+            return vec![batches];
+        }
+        // Don't fan a trivially small tier across cores — the scheduling +
+        // partial-aggregate merge overhead would dominate the saved scan time.
+        const MIN_ROWS_PER_PARTITION: usize = 8192;
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let effective_n = n.min((total_rows / MIN_ROWS_PER_PARTITION).max(1));
+        if effective_n <= 1 {
+            return vec![batches];
+        }
+        let mut sizes = vec![0usize; effective_n];
+        let mut partitions: Vec<Vec<RecordBatch>> =
+            (0..effective_n).map(|_| Vec::new()).collect();
+        for batch in batches {
+            // Assign to the currently least-loaded partition (greedy balance).
+            let min_idx = sizes
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &rows)| rows)
+                .map_or(0, |(idx, _)| idx);
+            sizes[min_idx] = sizes[min_idx].saturating_add(batch.num_rows());
+            partitions[min_idx].push(batch);
+        }
+        partitions
     }
 
     /// Checkpoint: flush all inlined data to a Vortex file and clear from metastore.
@@ -16878,9 +16953,17 @@ impl TableProvider for CayenneTableProvider {
             if projected_batches.is_empty() {
                 None
             } else {
+                // Fan the inline corpus across cores (same rationale as the
+                // mem-tier branch): a single-partition MemorySource pins the scan
+                // to one core, and the round-robin repartition in `scan()` is
+                // gated off whenever scan filters are present.
+                let inline_partitions = Self::partition_memory_batches(
+                    projected_batches,
+                    state.config().target_partitions(),
+                );
                 let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                        &[projected_batches],
+                        &inline_partitions,
                         proj_schema,
                         None,
                     )?;
@@ -16903,6 +16986,7 @@ impl TableProvider for CayenneTableProvider {
                 &mem_tier_snapshot,
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
+                state.config().target_partitions(),
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 
@@ -26750,5 +26834,56 @@ mod tests {
             None,
             "multi-column PK must never be skipped at plan time"
         );
+    }
+
+    /// L4(b): the in-RAM scan branch partitioner must preserve every row exactly
+    /// once (correctness), bound the partition count by `target_partitions` and
+    /// the batch count, and keep a trivially small tier single-partition (the
+    /// fan-out floor). A wrong split here would drop/duplicate scanned rows.
+    #[test]
+    fn partition_memory_batches_preserves_rows_and_bounds_partitions() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "pk",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let make = |rows: i64, start: i64| {
+            let vals: Vec<i64> = (start..start + rows).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int64Array::from(vals))],
+            )
+            .expect("batch")
+        };
+        let total = |parts: &[Vec<RecordBatch>]| -> usize {
+            parts.iter().flatten().map(RecordBatch::num_rows).sum()
+        };
+
+        // 8 equal batches of 4096 rows (32768 total) across 4 partitions: fans
+        // out to exactly 4 balanced partitions, every row preserved once.
+        let batches: Vec<RecordBatch> = (0..8).map(|i| make(4096, i * 4096)).collect();
+        let parts = CayenneTableProvider::partition_memory_batches(batches, 4);
+        assert_eq!(parts.len(), 4, "32K-row tier fans out to target_partitions");
+        assert_eq!(total(&parts), 32768, "rows preserved across partitions");
+        assert!(parts.iter().all(|p| !p.is_empty()), "no empty partition when batches >= partitions");
+
+        // Trivially small tier stays single-partition (MIN_ROWS_PER_PARTITION floor).
+        let tiny = CayenneTableProvider::partition_memory_batches(vec![make(10, 0), make(10, 50)], 16);
+        assert_eq!(tiny.len(), 1, "small tier stays single-partition");
+        assert_eq!(total(&tiny), 20);
+
+        // target_partitions == 1 → single partition regardless of size.
+        let one = CayenneTableProvider::partition_memory_batches(vec![make(40000, 0)], 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(total(&one), 40000);
+
+        // More partitions requested than batches → capped at the batch count.
+        let few = CayenneTableProvider::partition_memory_batches(vec![make(20000, 0), make(20000, 0)], 16);
+        assert!(few.len() <= 2, "partition count never exceeds the batch count");
+        assert_eq!(total(&few), 40000);
+
+        // Empty input is handled defensively (callers early-return, but stay safe).
+        let empty = CayenneTableProvider::partition_memory_batches(Vec::new(), 8);
+        assert_eq!(total(&empty), 0);
     }
 }
