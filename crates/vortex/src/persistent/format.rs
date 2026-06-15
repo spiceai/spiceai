@@ -302,13 +302,6 @@ config_namespace! {
         pub scan_concurrency: ScanConcurrency, default = ScanConcurrency::Auto
         /// Total byte capacity for a path-aware segment cache shared by scans using this format.
         pub segment_cache_size_bytes: Option<usize>, default = None
-        /// Whether to evaluate hash-join *dynamic* filters inside the Vortex scan.
-        ///
-        /// When `false` (default), a dynamic filter pushed down from a hash join
-        /// (e.g. a build-side `IN` list) is not absorbed into the scan's per-row
-        /// predicate or file-pruning predicate; it is left for the join / a
-        /// post-scan `FilterExec` to apply with a hashed probe.
-        pub dynamic_filter_pushdown: bool, default = false
     }
 }
 
@@ -924,8 +917,7 @@ impl FileFormat for VortexFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         let mut source = VortexSource::new(table_schema, self.session.clone())
             .with_projection_pushdown(self.opts.projection_pushdown)
-            .with_scan_concurrency(self.opts.scan_concurrency)
-            .with_dynamic_filter_pushdown(self.opts.dynamic_filter_pushdown);
+            .with_scan_concurrency(self.opts.scan_concurrency);
 
         if let Some(segment_cache) = self.segment_cache.clone() {
             source = source.with_segment_cache(segment_cache);
