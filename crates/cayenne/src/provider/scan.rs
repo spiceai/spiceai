@@ -25,7 +25,7 @@ use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_common::{DataFusionError, Statistics};
+use datafusion_common::{DataFusionError, Statistics, stats::Precision};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
@@ -56,6 +56,12 @@ pub struct CayenneAccelerationExec {
     scan_identity: OnceLock<Option<Arc<ScanIdentity>>>,
     maintained_aggregates: Option<Arc<MaintainedAggregateRegistry>>,
     maintained_aggregate_epoch: u64,
+    /// Column-statistics overlay sourced from the table's maintained optimizer
+    /// aggregate (live min/max + integer NDV), aligned to the inner plan's
+    /// output schema. Consumed in [`Self::partition_statistics`] to refill
+    /// column stats the Cayenne base+delta `UnionExec` drops to
+    /// `Precision::Absent` via DataFusion's generic `col_stats_union`
+    optimizer_column_overlay: Option<Arc<Statistics>>,
 }
 
 impl CayenneAccelerationExec {
@@ -67,6 +73,7 @@ impl CayenneAccelerationExec {
             scan_identity: OnceLock::new(),
             maintained_aggregates: None,
             maintained_aggregate_epoch: 0,
+            optimizer_column_overlay: None,
         }
     }
 
@@ -83,7 +90,23 @@ impl CayenneAccelerationExec {
             scan_identity: OnceLock::new(),
             maintained_aggregates: Some(maintained_aggregates),
             maintained_aggregate_epoch,
+            optimizer_column_overlay: None,
         }
+    }
+
+    /// Attaches a column-statistics overlay sourced from the table's maintained
+    /// optimizer aggregate (live min/max + integer NDV). At
+    /// [`Self::partition_statistics`] this refills only the columns the Cayenne
+    /// base+delta `UnionExec` wiped to `Precision::Absent`, restoring the
+    /// join-key signal `JoinSelection` needs without overriding any surviving
+    /// child statistic. A `None` overlay (cold aggregate) is a no-op.
+    #[must_use]
+    pub(crate) fn with_optimizer_column_overlay(
+        mut self,
+        overlay: Option<Arc<Statistics>>,
+    ) -> Self {
+        self.optimizer_column_overlay = overlay;
+        self
     }
 
     /// Returns the maintained aggregate registry and scan epoch captured for
@@ -96,14 +119,17 @@ impl CayenneAccelerationExec {
     }
 
     fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
-        match &self.maintained_aggregates {
+        let wrapped = match &self.maintained_aggregates {
             Some(registry) => Self::new_with_maintained_aggregates(
                 inner,
                 Arc::clone(registry),
                 self.maintained_aggregate_epoch,
             ),
             None => Self::new(inner),
-        }
+        };
+        // The output schema is stable across child rewrites (projection/limit
+        // pushdown), so the overlay stays aligned and valid.
+        wrapped.with_optimizer_column_overlay(self.optimizer_column_overlay.clone())
     }
 
     /// Returns a stable identity for the underlying scan source, derived from
@@ -172,6 +198,42 @@ impl CayenneAccelerationExec {
 
         Ok(Some(Arc::new(self.wrap_rewritten_child(inner))))
     }
+}
+
+/// Refills only `Precision::Absent` column stats in `child` from `overlay`,
+/// restoring the join-key `min/max` + `distinct_count` (NDV) that the Cayenne
+/// base+delta `UnionExec` drops (a stat-less/empty delta branch makes
+/// `col_stats_union` return `Absent`, collapsing `estimate_inner_join_cardinality`
+/// to `min(L, R)`). Present child stats — filter-aware `num_rows`/`null_count`
+/// and any surviving column stat — are preserved; a column-count mismatch is a
+/// defensive no-op.
+///
+/// `UnionExec` can't fix this itself: an `Absent` branch means *unknown*, not
+/// *empty*, so it must drop min/max, and NDV isn't additive across branches of
+/// unknown overlap. The repair belongs here because only the Cayenne scan owns
+/// the out-of-band metadata the union can't see — the incrementally-maintained
+/// per-table aggregate (live min/max + HLL-derived integer NDV over base+delta)
+/// — which it applies as an additive overlay, not a stats replacement.
+fn restore_absent_column_statistics(mut child: Statistics, overlay: &Statistics) -> Statistics {
+    if child.column_statistics.len() != overlay.column_statistics.len() {
+        return child;
+    }
+    for (col, src) in child
+        .column_statistics
+        .iter_mut()
+        .zip(overlay.column_statistics.iter())
+    {
+        if matches!(col.min_value, Precision::Absent) {
+            col.min_value = src.min_value.clone();
+        }
+        if matches!(col.max_value, Precision::Absent) {
+            col.max_value = src.max_value.clone();
+        }
+        if matches!(col.distinct_count, Precision::Absent) {
+            col.distinct_count = src.distinct_count;
+        }
+    }
+    child
 }
 
 fn compute_scan_identity(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<ScanIdentity>> {
@@ -635,7 +697,11 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        self.inner.partition_statistics(partition)
+        let child_stats = self.inner.partition_statistics(partition)?;
+        let Some(overlay) = self.optimizer_column_overlay.as_ref() else {
+            return Ok(child_stats);
+        };
+        Ok(restore_absent_column_statistics(child_stats, overlay))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -879,5 +945,127 @@ mod tests {
             paths: Arc::from(vec!["part-000.vortex".to_string()]),
         };
         assert_ne!(bucket_a, bucket_b);
+    }
+
+    /// The base+delta `UnionExec` wipes a join key's min/max + distinct_count to
+    /// `Precision::Absent` (an empty delta branch poisons `col_stats_union`).
+    /// With an optimizer overlay attached, the wrapper must refill exactly those
+    /// Absent fields while preserving the child's (filter-aware) `num_rows`;
+    #[test]
+    fn overlay_refills_union_wiped_join_key_statistics() {
+        use datafusion_common::{ColumnStatistics, ScalarValue};
+        use datafusion_physical_plan::empty::EmptyExec;
+
+        let memory = one_partition_plan();
+        let schema = memory.schema();
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
+
+        // Sanity: the union poisons min/max + distinct_count to Absent.
+        let poisoned = union
+            .partition_statistics(None)
+            .expect("union statistics should be available");
+        assert!(matches!(
+            poisoned.column_statistics[0].min_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            poisoned.column_statistics[0].max_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            poisoned.column_statistics[0].distinct_count,
+            Precision::Absent
+        ));
+
+        let overlay = Arc::new(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Inexact(ScalarValue::Int64(Some(9999))),
+                min_value: Precision::Inexact(ScalarValue::Int64(Some(1))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(42),
+                byte_size: Precision::Absent,
+            }],
+        });
+
+        // Without an overlay: poisoned stats pass through unchanged.
+        let plain = CayenneAccelerationExec::new(Arc::clone(&union));
+        let plain_stats = plain
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        assert!(matches!(
+            plain_stats.column_statistics[0].min_value,
+            Precision::Absent
+        ));
+        assert!(matches!(
+            plain_stats.column_statistics[0].distinct_count,
+            Precision::Absent
+        ));
+
+        // With an overlay: the Absent join-key fields are refilled, num_rows kept.
+        let restored_exec =
+            CayenneAccelerationExec::new(union).with_optimizer_column_overlay(Some(overlay));
+        let restored = restored_exec
+            .partition_statistics(None)
+            .expect("statistics should be available");
+        let col = &restored.column_statistics[0];
+        assert_eq!(col.min_value, Precision::Inexact(ScalarValue::Int64(Some(1))));
+        assert_eq!(
+            col.max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(9999)))
+        );
+        assert_eq!(col.distinct_count, Precision::Inexact(42));
+        assert_eq!(
+            restored.num_rows, poisoned.num_rows,
+            "overlay must not override the child's filter-aware num_rows"
+        );
+    }
+
+    /// The restore must never override a statistic the child already provides —
+    /// only `Precision::Absent` fields are filled from the overlay.
+    #[test]
+    fn restore_preserves_present_child_statistics() {
+        use datafusion_common::{ColumnStatistics, ScalarValue};
+
+        let child = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(7))),
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+        let overlay = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Absent,
+                max_value: Precision::Inexact(ScalarValue::Int64(Some(999))),
+                min_value: Precision::Inexact(ScalarValue::Int64(Some(-5))),
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Inexact(50),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let restored = restore_absent_column_statistics(child, &overlay);
+        let col = &restored.column_statistics[0];
+        // Present max_value must be kept (not overwritten by the overlay).
+        assert_eq!(col.max_value, Precision::Exact(ScalarValue::Int64(Some(7))));
+        // Absent min_value / distinct_count are filled from the overlay.
+        assert_eq!(
+            col.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(-5)))
+        );
+        assert_eq!(col.distinct_count, Precision::Inexact(50));
+        assert_eq!(restored.num_rows, Precision::Exact(100));
     }
 }

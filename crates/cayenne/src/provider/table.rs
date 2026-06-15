@@ -6560,6 +6560,55 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Builds a column-statistics overlay aligned to `output_schema` from the
+    /// incrementally-maintained optimizer aggregate (live min/max + integer NDV
+    /// via `distinct_count`). [`CayenneAccelerationExec`] uses this to refill
+    /// the join-key stats that the base+delta `UnionExec` wipes to
+    /// `Precision::Absent`, restoring `JoinSelection`'s ability to size joins.
+    ///
+    /// Only `column_statistics` are populated (downgraded to inexact via
+    /// [`Self::column_statistics_to_inexact`]); `num_rows`/`total_byte_size`
+    /// are left `Absent` so the physical scan's own filter-aware `num_rows`
+    /// always wins. Columns not present in the aggregate map to
+    /// `ColumnStatistics::new_unknown()`.
+    ///
+    /// Returns `None` when the aggregate is cold or its column count does not
+    /// match the table schema, leaving the scan to report child stats unchanged.
+    fn optimizer_stats_overlay_for_schema(
+        &self,
+        output_schema: &SchemaRef,
+    ) -> Option<Arc<Statistics>> {
+        let table_stats = self.optimizer_table_statistics()?;
+        let table_schema = self.table_schema();
+        if table_stats.column_statistics.len() != table_schema.fields().len() {
+            return None;
+        }
+
+        let by_name: HashMap<&str, &ColumnStatistics> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .zip(table_stats.column_statistics.iter())
+            .collect();
+
+        let column_statistics = output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                by_name.get(field.name().as_str()).map_or_else(
+                    ColumnStatistics::new_unknown,
+                    |stats| Self::column_statistics_to_inexact((*stats).clone()),
+                )
+            })
+            .collect();
+
+        Some(Arc::new(Statistics {
+            num_rows: DFPrecision::Absent,
+            total_byte_size: DFPrecision::Absent,
+            column_statistics,
+        }))
+    }
+
     fn clear_cached_table_statistics_unlocked(&self) {
         let mut cache = self.table_statistics.write();
         cache.optimizer = None;
@@ -11577,15 +11626,19 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
+        let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         if self.maintained_aggregates.is_empty() {
-            Arc::new(CayenneAccelerationExec::new(plan))
+            Arc::new(CayenneAccelerationExec::new(plan).with_optimizer_column_overlay(overlay))
         } else {
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-            Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
-                plan,
-                Arc::clone(&self.maintained_aggregates),
-                epoch,
-            ))
+            Arc::new(
+                CayenneAccelerationExec::new_with_maintained_aggregates(
+                    plan,
+                    Arc::clone(&self.maintained_aggregates),
+                    epoch,
+                )
+                .with_optimizer_column_overlay(overlay),
+            )
         }
     }
 
