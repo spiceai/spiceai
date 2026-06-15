@@ -187,7 +187,19 @@ fn build_change_batch(
 
     let data_batch = mongo_docs_to_arrow(&documents, Arc::clone(&change_data_schema))
         .context(ConversionSnafu)?;
-    let data_array = StructArray::from(data_batch);
+    // `mongo_docs_to_arrow` infers field nullability from the documents (e.g. when
+    // every document has `_id`, it produces a non-null `_id` field). The truncate
+    // path and the runtime CDC wrapper use the all-nullable `change_data_schema`,
+    // so coalescing a TRUNCATE batch with an insert/update batch would fail to
+    // concat (Struct with nullable `_id` vs Struct with non-null `_id`). Rebuild
+    // the struct with the all-nullable schema fields so every change batch — across
+    // all op types — carries an identical struct type.
+    let data_array = StructArray::try_new(
+        change_data_schema.fields().clone(),
+        data_batch.columns().to_vec(),
+        None,
+    )
+    .context(ArrowSnafu)?;
     let op_array: ArrayRef = Arc::new(StringArray::from(ops));
     let wrapper_schema = Arc::new(changes_schema(change_data_schema.as_ref()));
 
@@ -201,7 +213,7 @@ fn build_change_batch(
     ChangeBatch::try_new(record).context(ChangeBatchSnafu)
 }
 
-fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
+pub fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
     let fields = schema
         .fields()
         .iter()

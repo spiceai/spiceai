@@ -179,7 +179,7 @@ pub struct AppResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
     #[serde(rename = "ephemeral-storage", skip_serializing_if = "Option::is_none")]
-    pub ephemeral_storage: Option<String>,
+    pub ephemeral_storage: Option<String>,  
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

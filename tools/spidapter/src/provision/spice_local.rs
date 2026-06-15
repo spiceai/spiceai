@@ -62,7 +62,7 @@ pub(crate) fn build_local_extra_envs(_setup_config: &SetupConfig) -> HashMap<Str
     let mut map = HashMap::new();
     map.insert(
         "SPICED_LOG".to_string(),
-        "info,cayenne=off,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
+        "info,cayenne=info,runtime::accelerated_table::refresh_task::changes=trace,data_components=trace".to_string(),
     );
     map
 }
@@ -500,13 +500,20 @@ fn num_executors() -> anyhow::Result<usize> {
 }
 
 fn standalone_spiced_args(bind_host: &str, ports: LocalPorts, spicepod_path: &Path) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--http".to_string(),
         format!("{bind_host}:{}", ports.http),
         "--flight".to_string(),
         format!("{bind_host}:{}", ports.flight),
-        spicepod_path.display().to_string(),
-    ]
+    ];
+
+    if let Ok(metrics_port) = std::env::var("SPIDAPTER_METRICS_PORT") {
+        args.push("--metrics".to_string());
+        args.push(format!("{bind_host}:{metrics_port}"));
+    }
+
+    args.push(spicepod_path.display().to_string());
+    args
 }
 
 fn scheduler_spiced_args(

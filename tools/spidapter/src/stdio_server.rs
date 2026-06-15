@@ -26,8 +26,8 @@ use spicepod::component::runtime::{
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
 use system_adapter_protocol::{
-    AdbcDriver, DatasetConfig, Handler, IngestionMetrics, MetricsResponse, ResourceMetrics, Server,
-    SetupResponse, SinkConfig, TeardownResponse,
+    AdbcDriver, CdcReplicationMetrics, CdcTableMetrics, DatasetConfig, Handler, IngestionMetrics,
+    MetricsResponse, ResourceMetrics, Server, SetupResponse, SinkConfig, TeardownResponse,
 };
 use tokio::process::Child;
 use tokio::time::sleep;
@@ -37,7 +37,8 @@ use crate::args::{DeploymentMode, StdioArgs};
 use crate::commands;
 use crate::scenario::{
     AccelerationEngine, CayenneConfig, ComputeConfig, DirectConfig, DynamoDbConfig, MongoEndpoint,
-    PgEndpoint, ScenarioConfig, ScpConfig, SourceConfig, SpiceCompute, load_scenario,
+    PgEndpoint, ScenarioConfig, ScpConfig, SourceConfig, SpiceCompute,
+    load_scenario,
 };
 
 #[path = "sources/mod.rs"]
@@ -372,6 +373,100 @@ fn sum_opt_f64_as_u64(
     any.then_some(sum.round() as u64)
 }
 
+/// Fetch raw Prometheus metrics text from a spiced instance.
+async fn fetch_prometheus_metrics(url: &str, api_key: Option<&str>) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let mut req = client.get(url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    resp.text().await.map_err(|e| format!("read body: {e}"))
+}
+
+/// Parse a labeled Prometheus metric line `<name>{...dataset="X"...} <value>`,
+/// summing values per `dataset` label. `name` must include any suffix
+/// (`_sum`, `_count`, `_total`, …).
+fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    let prefix = format!("{name}{{");
+    for line in body.lines() {
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let dataset = line
+            .split("dataset=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap_or("unknown")
+            .to_string();
+        let value: f64 = line
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        *out.entry(dataset).or_insert(0.0) += value;
+    }
+    out
+}
+
+/// Build the vendor-neutral `CdcReplicationMetrics` from spiced's Prometheus
+/// text, mapping spiced's MongoDB/cayenne metric names onto the generic
+/// per-table contract. Returns `None` when no CDC metrics are present (e.g. a
+/// non-CDC run), so the field stays absent rather than empty.
+fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
+    let recv = parse_labeled(body, "dataset_acceleration_cdc_source_recv_wait_ms_sum");
+    let apply = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_sum");
+    let apply_count = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_count");
+    let linger = parse_labeled(body, "dataset_acceleration_cdc_linger_wait_ms_sum");
+    let bytes = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_bytes_sum");
+    // Per-burst row counter emitted by spiced. Match the exact name spiced
+    // exposes (`..._cdc_apply_burst_rows_total`); fall back to legacy/suffixed
+    // variants in case the metric name or OTel→Prometheus suffixing differs.
+    let mut rows = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_rows_total");
+    for alt in [
+        "dataset_acceleration_cdc_apply_burst_rows_total_total",
+        "dataset_acceleration_cdc_apply_rows_total",
+        "dataset_acceleration_cdc_apply_rows_total_total",
+    ] {
+        if rows.is_empty() {
+            rows = parse_labeled(body, alt);
+        }
+    }
+
+    let mut tables: Vec<String> = recv
+        .keys()
+        .chain(apply.keys())
+        .chain(rows.keys())
+        .chain(bytes.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    tables.sort();
+    if tables.is_empty() {
+        return None;
+    }
+
+    let per_table = tables
+        .into_iter()
+        .map(|t| CdcTableMetrics {
+            source_wait_ms: recv.get(&t).copied(),
+            apply_ms: apply.get(&t).copied(),
+            apply_count: apply_count.get(&t).map(|v| *v as u64),
+            linger_ms: linger.get(&t).copied(),
+            rows_applied: rows.get(&t).map(|v| *v as u64),
+            bytes_applied: bytes.get(&t).map(|v| *v as u64),
+            table: t,
+        })
+        .collect();
+
+    Some(CdcReplicationMetrics { per_table })
+}
+
 /// System adapter handler that provisions Spice Cloud apps.
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
@@ -385,7 +480,23 @@ struct SpidapterHandler {
 }
 
 impl SpidapterHandler {
-    fn new(args: &StdioArgs, scenario: ScenarioConfig) -> Self {
+    fn new(args: &StdioArgs, mut scenario: ScenarioConfig) -> Self {
+        // Apply env var overrides for SCP image tag and channel so the workflow
+        // can pass SPIDAPTER_IMAGE_TAG / SPIDAPTER_CHANNEL without modifying the
+        // scenario YAML.
+        if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
+            if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG") {
+                if !tag.is_empty() {
+                    scp.image_tag = Some(tag);
+                }
+            }
+            if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL") {
+                if !channel.is_empty() {
+                    use spice_cloud_client::types::UpdateChannel;
+                    scp.channel = channel.parse::<UpdateChannel>().ok();
+                }
+            }
+        }
         Self {
             runs: HashMap::new(),
             run_datasets: HashMap::new(),
@@ -906,6 +1017,29 @@ impl Handler for SpidapterHandler {
             .get(&run_id)
             .ok_or_else(|| format!("No active run found for {run_id}"))?;
 
+        // Derive the Prometheus metrics URL.
+        // - SCP: the gateway serves Prometheus at `/v1/metrics` (same host as
+        //   `/v1/sql`), so swap only the trailing path segment and keep `/v1`.
+        // - Local: spiced serves Prometheus on a dedicated `--metrics` port
+        //   (SPIDAPTER_METRICS_PORT) at `/metrics`, distinct from the HTTP/SQL
+        //   port — the path swap alone would hit the SQL port and return nothing.
+        let prometheus_url = match state {
+            RunState::Local(_) => match std::env::var("SPIDAPTER_METRICS_PORT") {
+                Ok(port) if !port.trim().is_empty() => {
+                    format!("http://127.0.0.1:{}/metrics", port.trim())
+                }
+                _ => state.sql_url().replace("/v1/sql", "/metrics"),
+            },
+            RunState::Scp(_) => state.sql_url().replace("/v1/sql", "/v1/metrics"),
+        };
+        let api_key = state.api_key().map(|k| k.to_string());
+
+        // Scrape Prometheus metrics for the CDC replication payload.
+        let prom_body = fetch_prometheus_metrics(&prometheus_url, api_key.as_deref())
+            .await
+            .ok();
+        let cdc_replication = prom_body.as_deref().and_then(build_cdc_replication_metrics);
+
         match state {
             RunState::Scp(scp) => {
                 let cloud_metrics = scp
@@ -942,11 +1076,13 @@ impl Handler for SpidapterHandler {
                 Ok(MetricsResponse {
                     resource,
                     ingestion,
+                    cdc_replication,
                 })
             }
             RunState::Local(_) => Ok(MetricsResponse {
                 resource: ResourceMetrics::default(),
                 ingestion: IngestionMetrics::default(),
+                cdc_replication,
             }),
         }
     }
@@ -1406,6 +1542,7 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 ///
 /// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
 /// `scp` provides the scheduler state location and query memory limit.
+#[allow(clippy::too_many_arguments)]
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
@@ -1611,6 +1748,8 @@ mod tests {
             &args,
             &scp,
             None,
+            &Default::default(),
+            None,
         )
         .await
         .expect("spicepod should generate");
@@ -1658,9 +1797,19 @@ mod tests {
         let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
 
         let spicepod =
-            generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args, &scp, None)
-                .await
-                .expect("spicepod loads from disk");
+            generate_initial_spicepod(
+                &run_id,
+                &setup_config,
+                &datasets,
+                None,
+                &args,
+                &scp,
+                None,
+                &Default::default(),
+                None,
+            )
+            .await
+            .expect("spicepod loads from disk");
 
         assert_eq!(spicepod.name, "spidapter-01234567");
         let yaml = serialize_spicepod(&spicepod).expect("serialize");
