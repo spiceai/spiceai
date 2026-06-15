@@ -23,7 +23,7 @@ BRANCH="${BRANCH:-spiceai}"
 
 # Extract the commit hash from the datafusion-table-providers line in [patch.crates-io]
 # Use portable regex (BSD sed on macOS doesn't support \s)
-COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'datafusion-contrib/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
+COMMIT=$(grep -E '^datafusion-table-providers[[:space:]]*=' "$CARGO_TOML" | grep 'spiceai/datafusion-table-providers' | sed -n 's/.*rev *= *"\([^"]*\)".*/\1/p' | head -1)
 
 if [[ -z "$COMMIT" ]]; then
     echo "Error: Could not find datafusion-table-providers commit in $CARGO_TOML"
