@@ -458,10 +458,10 @@ fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
         .map(|t| CdcTableMetrics {
             source_wait_ms: recv.get(&t).copied(),
             apply_ms: apply.get(&t).copied(),
-            apply_count: apply_count.get(&t).map(|v| *v as u64),
+            apply_count: apply_count.get(&t).map(|v| v.round() as u64),
             linger_ms: linger.get(&t).copied(),
-            rows_applied: rows.get(&t).map(|v| *v as u64),
-            bytes_applied: bytes.get(&t).map(|v| *v as u64),
+            rows_applied: rows.get(&t).map(|v| v.round() as u64),
+            bytes_applied: bytes.get(&t).map(|v| v.round() as u64),
             table: t,
         })
         .collect();
@@ -1544,7 +1544,7 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 ///
 /// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
 /// `scp` provides the scheduler state location and query memory limit.
-#[expect(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
