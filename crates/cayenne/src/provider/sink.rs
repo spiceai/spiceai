@@ -181,8 +181,7 @@ impl CayenneDataSink {
     /// Append data from a record batch stream into the Cayenne table.
     ///
     /// Writes data to the current snapshot (via [`CayenneTableProvider::chunk_and_write_parallel`])
-    /// or a new snapshot (via [`CayenneTableProvider::insert_to_new_snapshot_with_sequence`])
-    /// when deletion isolation is needed.
+    /// or stages a new snapshot when deletion isolation is needed.
     ///
     /// # Write Pipeline
     ///

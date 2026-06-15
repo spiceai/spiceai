@@ -65,6 +65,7 @@ pub mod hll;
 #[cfg(feature = "partition-table-provider")]
 pub use ddl::CayenneDdlHandler;
 pub mod logical_optimizer;
+pub mod maintained_aggregate;
 pub mod metadata;
 pub mod metastore;
 pub mod optimizer_rules;

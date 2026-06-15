@@ -30,11 +30,13 @@ limitations under the License.
 //!
 //! - **Int64 PK-based**: For tables with a single-column Int64 primary key.
 //!   Optimized path that extracts PK values directly without `RowConverter` overhead.
-//!   Uses `HashMap<i64, i64>` for PK -> `delete_sequence` mapping.
+//!   The deleted PKs (at the write's `delete_sequence`) are folded into the published
+//!   [`super::super::deletion_index::DeletionIndex`] via `extend_max_deletes`.
 //!
 //! - **Key-based**: For tables with composite or non-integer primary keys.
-//!   Uses Arrow's `RowConverter` to create deterministic byte keys for lookup.
-//!   Uses `HashMap<Box<[u8]>, i64>` for key -> `delete_sequence` mapping.
+//!   Uses Arrow's `RowConverter` to create deterministic byte keys, which are folded
+//!   into the published [`super::super::deletion_index::KeyDeletionIndex`] via
+//!   `extend_max_deletes`.
 //!
 //! # Workflow
 //!
