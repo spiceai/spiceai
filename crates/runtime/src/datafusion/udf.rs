@@ -34,14 +34,11 @@ use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
-use data_components::function_support::{FunctionRestriction, FunctionSupport};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions::math::random::RandomFunc;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::SessionContext;
-use datafusion_table_providers::util::supported_functions::{
-    FunctionRestriction as TpFunctionRestriction, FunctionSupport as TpFunctionSupport,
-};
+use datafusion_table_providers::util::supported_functions::{FunctionRestriction, FunctionSupport};
 use parking_lot::RwLock;
 use runtime_datafusion::query_engine::QueryEngine;
 #[cfg(feature = "models")]
@@ -801,39 +798,25 @@ fn denied_function_names_for_duckdb() -> Vec<String> {
     denied
 }
 
-/// Same deny-list as [`deny_spice_functions_for_duckdb`], but expressed in the
-/// `datafusion-table-providers` [`TpFunctionSupport`] type that the fork's
-/// `DuckDBTableFactory::with_function_support` seam expects.
-///
-/// The runtime maintains its deny-list in the local
-/// [`data_components::function_support::FunctionSupport`] type, which is a
-/// distinct (private-field) reimplementation of the table-providers type. The
-/// `DuckDB` factory lives in the fork and takes the fork's type, so we build it
-/// here from the shared [`denied_function_names_for_duckdb`] name list rather
-/// than trying to convert between the two opaque structs. See issue #10703.
+/// DuckDB-specific deny-list: same set as [`deny_spice_functions_for_duckdb`]
+/// expressed as a value rather than `Arc`. Used with
+/// `DuckDBTableFactory::with_function_support`. See issue #10703.
 #[must_use]
-pub fn deny_spice_functions_for_duckdb_table_providers() -> TpFunctionSupport {
-    TpFunctionSupport::new(
-        Some(TpFunctionRestriction::Deny(
-            denied_function_names_for_duckdb(),
-        )),
+pub fn deny_spice_functions_for_duckdb_table_providers() -> FunctionSupport {
+    FunctionSupport::new(
+        Some(FunctionRestriction::Deny(denied_function_names_for_duckdb())),
         None,
         None,
     )
 }
 
-/// Full Spice UDF deny-list expressed as the `datafusion-table-providers`
-/// [`TpFunctionSupport`] type used by `*TableFactory::with_function_support`.
-///
-/// Suitable for any SQL connector whose unparser dialect has no Spice-function
-/// carve-out (unlike DuckDB): every built-in Spice UDF plus any user-registered
-/// function is blocked from being pushed down to the remote source.
-/// See issue #10703.
+/// Full Spice UDF deny-list as a value (not `Arc`). Suitable for any SQL
+/// connector whose unparser dialect has no Spice-function carve-out — every
+/// built-in Spice UDF plus any user-registered function is blocked from being
+/// pushed down to the remote source. See issue #10703.
 #[must_use]
-pub fn deny_spice_functions_for_table_providers() -> TpFunctionSupport {
-    let mut denied = BUILTIN_DENIED_SPICE_FUNCTION_NAMES.as_slice().to_vec();
-    denied.extend(USER_FUNCTION_NAMES.read().iter().cloned());
-    TpFunctionSupport::new(Some(TpFunctionRestriction::Deny(denied)), None, None)
+pub fn deny_spice_functions_for_table_providers() -> FunctionSupport {
+    deny_spice_specific_functions().as_ref().clone()
 }
 
 fn json_functions() -> Vec<String> {
