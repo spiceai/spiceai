@@ -125,6 +125,15 @@ fn bloom_capacity_for(len: usize) -> usize {
     len.saturating_mul(2).max(MIN_BLOOM_CAPACITY)
 }
 
+/// Keys swept per chunk by the batched probes ([`DeletionIndex::get_batch`] /
+/// [`KeyDeletionIndex::get_batch`]). Sized so one chunk's working set (key
+/// slice / hash buffer plus the candidate-position buffer) stays L1/L2
+/// resident: candidate positions produced by the bloom sweep are still in
+/// cache when the tier walk consumes them, while the chunk is large enough
+/// that each pass runs as a long branch-light loop the out-of-order window
+/// can overlap loads across.
+const BATCH_SWEEP_CHUNK: usize = 2048;
+
 /// Sentinel for "no sequence recorded" inside [`TombstoneEntry`]. Catalog
 /// sequence numbers are non-negative, so `i64::MIN` can never collide with a
 /// real sequence; packing both fields as raw `i64` keeps the per-entry payload
@@ -703,9 +712,10 @@ impl DeletionIndex {
     /// the inverse effect on the bloom-reject path, whose tight probe loop no
     /// longer unrolls as densely (~3.7ns → ~6ns per rejected probe; composite
     /// keys are unaffected). Changes-mode scans — the workload this index is
-    /// hot in — are present-key heavy, so the walk stays inlined. Batch-level
-    /// probing (bloom-sweep the batch, then walk the survivors) would win on
-    /// both paths and is the natural next step if profiles call for it.
+    /// hot in — are present-key heavy, so the walk stays inlined. Callers
+    /// probing a whole batch should prefer [`get_batch`](Self::get_batch),
+    /// which sweeps the bloom across the batch first and walks only the
+    /// survivors — winning on both paths.
     #[inline]
     #[must_use]
     pub fn get(&self, pk: i64) -> Option<Tombstone> {
@@ -713,6 +723,55 @@ impl DeletionIndex {
             return None;
         }
         self.core.tombstone_of(&pk)
+    }
+
+    /// Batched bloom-prefiltered lookup: invokes `on_hit(index, tombstone)`
+    /// for every `pks[index]` that has a recorded deletion, in ascending
+    /// `index` order. Exactly equivalent to calling [`get`](Self::get) on each
+    /// element and reporting the `Some` results — keys holding only an insert
+    /// record are reported absent, per the same contract.
+    ///
+    /// # Why a batch entry point
+    ///
+    /// [`get`](Self::get) fuses the bloom probe with the tier walk per key, so
+    /// on a bloom hit the delta/base map walk (an out-of-cache load at scale)
+    /// serializes against the *next* key's bloom probe. This method
+    /// restructures the loop into the column-sweep form the read-side
+    /// `KeyBasedDeletionFilterExec` already uses (b3 sub-lever 2):
+    ///
+    /// 1. a tight bloom sweep over a chunk of keys — branch-light, one
+    ///    independent 32-byte block load per key that the out-of-order window
+    ///    overlaps across iterations — collecting candidate positions;
+    /// 2. the delta→base tier walk only for the surviving candidates (bloom
+    ///    false positives resolve to "absent" here, preserving per-key `get`
+    ///    results).
+    ///
+    /// Keys are processed in [`BATCH_SWEEP_CHUNK`]-sized chunks so the
+    /// candidate buffer is still cache-hot when pass 2 consumes it.
+    pub fn get_batch(&self, pks: &[i64], mut on_hit: impl FnMut(usize, Tombstone)) {
+        // The bloom is keyed on deletion membership only: with no recorded
+        // deletions every probe would miss (insert-only entries probe as
+        // absent), so skip the sweep entirely.
+        if self.core.delete_count == 0 {
+            return;
+        }
+        let mut candidates: Vec<u32> = Vec::with_capacity(BATCH_SWEEP_CHUNK.min(pks.len()));
+        for (chunk_index, chunk) in pks.chunks(BATCH_SWEEP_CHUNK).enumerate() {
+            let chunk_base = chunk_index * BATCH_SWEEP_CHUNK;
+            candidates.clear();
+            // Pass 1: bloom sweep — no tier walk in the loop body.
+            for (i, &pk) in (0_u32..).zip(chunk.iter()) {
+                if self.core.bloom.might_contain(hash_key_i64(pk)) {
+                    candidates.push(i);
+                }
+            }
+            // Pass 2: tier walk for the bloom survivors only.
+            for &i in &candidates {
+                if let Some(tombstone) = self.core.tombstone_of(&chunk[i as usize]) {
+                    on_hit(chunk_base + i as usize, tombstone);
+                }
+            }
+        }
     }
 
     /// Iterate all effective entries (for callers that need a full walk, e.g.
@@ -969,6 +1028,62 @@ impl KeyDeletionIndex {
             return None;
         }
         self.core.tombstone_of(&key_hash)
+    }
+
+    /// Batched bloom-prefiltered lookup over row-encoded keys: invokes
+    /// `on_hit(index, tombstone)` for every key (0-based position in `keys`)
+    /// that has a recorded deletion, in ascending `index` order. Exactly
+    /// equivalent to calling [`get`](Self::get) on each key and reporting the
+    /// `Some` results — insert-only entries are reported absent, per the same
+    /// contract.
+    ///
+    /// Mirrors [`DeletionIndex::get_batch`]: a chunked XXH3-128 hash pass
+    /// feeds a tight bloom sweep (high hash half), and the delta→base tier
+    /// walk runs only for the surviving candidates. The full 128-bit hash is
+    /// retained per chunk, so survivors probe the maps by hash identity
+    /// without re-hashing the key bytes — one hash computation per key, same
+    /// as [`get`](Self::get).
+    pub fn get_batch<K: AsRef<[u8]>>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        mut on_hit: impl FnMut(usize, Tombstone),
+    ) {
+        // Deletion-keyed bloom: with no recorded deletions every probe would
+        // miss (insert-only entries probe as absent), so skip the sweep.
+        if self.core.delete_count == 0 {
+            return;
+        }
+        let mut keys = keys.into_iter();
+        let mut hashes: Vec<u128> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
+        let mut candidates: Vec<u32> = Vec::with_capacity(BATCH_SWEEP_CHUNK);
+        let mut chunk_base = 0_usize;
+        loop {
+            hashes.clear();
+            hashes.extend(
+                keys.by_ref()
+                    .take(BATCH_SWEEP_CHUNK)
+                    .map(|k| hash_key_128(k.as_ref())),
+            );
+            if hashes.is_empty() {
+                break;
+            }
+            candidates.clear();
+            // Pass 1: bloom sweep over the chunk's hashes — no tier walk in
+            // the loop body.
+            for (i, &key_hash) in (0_u32..).zip(hashes.iter()) {
+                if self.core.bloom.might_contain(bloom_half(key_hash)) {
+                    candidates.push(i);
+                }
+            }
+            // Pass 2: tier walk for the bloom survivors only (probed by the
+            // retained hash identity; false positives resolve to "absent").
+            for &i in &candidates {
+                if let Some(tombstone) = self.core.tombstone_of(&hashes[i as usize]) {
+                    on_hit(chunk_base + i as usize, tombstone);
+                }
+            }
+            chunk_base += hashes.len();
+        }
     }
 
     /// Iterate all effective entries, keyed by the XXH3-128 hash of the
@@ -1234,6 +1349,182 @@ mod tests {
             rejects > 80,
             "expected bloom to reject most non-deleted keys, got {rejects}"
         );
+    }
+
+    /// Reference implementation for the `get_batch` equivalence tests: the
+    /// scalar per-row probe the batch sweep replaces.
+    fn per_row_gets_int64(idx: &DeletionIndex, pks: &[i64]) -> Vec<Option<Tombstone>> {
+        pks.iter().map(|&pk| idx.get(pk)).collect()
+    }
+
+    /// Collect `get_batch` results into per-row form, asserting the callback
+    /// contract along the way (strictly ascending indices, each at most once,
+    /// all in bounds).
+    fn batch_gets_int64(idx: &DeletionIndex, pks: &[i64]) -> Vec<Option<Tombstone>> {
+        let mut out: Vec<Option<Tombstone>> = vec![None; pks.len()];
+        let mut last: Option<usize> = None;
+        idx.get_batch(pks, |i, tombstone| {
+            assert!(i < pks.len(), "callback index out of bounds: {i}");
+            assert!(
+                last.is_none_or(|prev| prev < i),
+                "callback indices must be strictly ascending: {last:?} then {i}"
+            );
+            last = Some(i);
+            out[i] = Some(tombstone);
+        });
+        out
+    }
+
+    fn per_row_gets_key(idx: &KeyDeletionIndex, keys: &[Box<[u8]>]) -> Vec<Option<Tombstone>> {
+        keys.iter().map(|key| idx.get(key)).collect()
+    }
+
+    fn batch_gets_key(idx: &KeyDeletionIndex, keys: &[Box<[u8]>]) -> Vec<Option<Tombstone>> {
+        let mut out: Vec<Option<Tombstone>> = vec![None; keys.len()];
+        let mut last: Option<usize> = None;
+        idx.get_batch(keys.iter().map(AsRef::as_ref), |i, tombstone| {
+            assert!(i < keys.len(), "callback index out of bounds: {i}");
+            assert!(
+                last.is_none_or(|prev| prev < i),
+                "callback indices must be strictly ascending: {last:?} then {i}"
+            );
+            last = Some(i);
+            out[i] = Some(tombstone);
+        });
+        out
+    }
+
+    /// `get_batch` must report exactly what per-row [`DeletionIndex::get`]
+    /// reports, across a layered index (frozen base + delta + insert-only +
+    /// fused conflict entries) and every batch shape the apply path produces.
+    #[test]
+    fn get_batch_matches_per_row_get_int64() {
+        // Base tier: even keys 0..200 deleted at seq 1; key 4 also carries an
+        // insert record (re-inserted at seq 50); key 1000 is insert-only.
+        let deleted: HashMap<i64, i64> = (0..100).map(|i| (i * 2, 1)).collect();
+        let inserts: HashMap<i64, i64> = HashMap::from([(4, 50), (1000, 70)]);
+        let base = DeletionIndex::from_maps(deleted, inserts);
+        // Delta tier: a small extend (below the test merge floor) so probes
+        // exercise the delta→base walk, plus fused conflicts and extreme keys.
+        let idx = base
+            .extend_max_deletes([(3, 7), (i64::MIN, 9), (i64::MAX, 11)])
+            .extend_max_conflicts([5_i64, 4], 20, 21);
+
+        let shapes: &[&[i64]] = &[
+            &[],                             // empty batch
+            &[2],                            // single row, hit
+            &[9999],                         // single row, miss
+            &[0, 2, 4, 6, 8],                // all-hit
+            &[1, 7, 9, 8887, 9999],          // all-miss (odd / out of range)
+            &[0, 1, 2, 7, 4, 9, 3, 5],       // alternating hit/miss + delta hits
+            &[2, 2, 9999, 2],                // duplicate keys in one batch
+            &[i64::MIN, -1, 0, 1, i64::MAX], // extreme key values
+            &[1000, 4, 5],                   // insert-only (absent) vs fused entries
+        ];
+        for pks in shapes {
+            assert_eq!(
+                batch_gets_int64(&idx, pks),
+                per_row_gets_int64(&idx, pks),
+                "get_batch diverged from per-row get for {pks:?}"
+            );
+        }
+
+        // Spot-check the fused-entry payloads survive the batch path intact.
+        let fused = batch_gets_int64(&idx, &[5, 4, 1000]);
+        assert_eq!(
+            fused[0],
+            Some(Tombstone {
+                delete_sequence: 20,
+                insert_sequence: Some(21)
+            })
+        );
+        // Key 4: insert record at 50 (base) fused with conflict insert at 21
+        // (delta) — per-side max keeps 50; conflict delete at 20 wins over 1.
+        assert_eq!(
+            fused[1],
+            Some(Tombstone {
+                delete_sequence: 20,
+                insert_sequence: Some(50)
+            })
+        );
+        assert_eq!(fused[2], None, "insert-only key must probe as absent");
+    }
+
+    /// Batches longer than one sweep chunk must keep global (not chunk-local)
+    /// indices and stay equivalent to per-row probes across the boundary.
+    #[test]
+    fn get_batch_spans_chunk_boundaries_int64() {
+        let deleted: HashMap<i64, i64> = (0..3000).map(|i| (i * 3, i + 1)).collect();
+        let idx = DeletionIndex::from_map(deleted);
+
+        // 5000 keys = 2 full chunks + a partial tail at BATCH_SWEEP_CHUNK=2048.
+        let pks: Vec<i64> = (0..5000).collect();
+        assert!(pks.len() > 2 * BATCH_SWEEP_CHUNK);
+        assert_eq!(batch_gets_int64(&idx, &pks), per_row_gets_int64(&idx, &pks));
+    }
+
+    /// Empty and insert-only indexes take the `delete_count == 0` early-out;
+    /// it must agree with per-row probes (all absent).
+    #[test]
+    fn get_batch_empty_and_insert_only_indexes() {
+        let pks: Vec<i64> = (0..100).collect();
+
+        let empty = DeletionIndex::empty();
+        assert_eq!(batch_gets_int64(&empty, &pks), vec![None; pks.len()]);
+
+        let insert_only =
+            DeletionIndex::from_maps(HashMap::new(), (0..50).map(|i| (i, i + 1)).collect());
+        assert_eq!(batch_gets_int64(&insert_only, &pks), vec![None; pks.len()]);
+
+        let empty_key_idx = KeyDeletionIndex::empty();
+        let keys: Vec<Box<[u8]>> = (0..100_u64).map(byte_key).collect();
+        assert_eq!(
+            batch_gets_key(&empty_key_idx, &keys),
+            vec![None; keys.len()]
+        );
+    }
+
+    /// Composite-key equivalence: layered index, varying key widths (including
+    /// the empty key), duplicates, and a chunk-spanning batch.
+    #[test]
+    fn get_batch_matches_per_row_get_composite() {
+        let deleted: HashMap<Box<[u8]>, i64> = (0..100_u64).map(|i| (byte_key(i * 2), 1)).collect();
+        let inserts: HashMap<Box<[u8]>, i64> = HashMap::from([(byte_key(4), 50)]);
+        let base = KeyDeletionIndex::from_maps(deleted, inserts);
+        let wide_key: Box<[u8]> = vec![7_u8; 24].into_boxed_slice(); // composite-width key
+        let empty_key: Box<[u8]> = Vec::new().into_boxed_slice();
+        let idx = base
+            .extend_max_deletes([(wide_key.clone(), 7), (empty_key.clone(), 9)])
+            .extend_max_conflicts([byte_key(6)], 20, 21);
+
+        let shapes: Vec<Vec<Box<[u8]>>> = vec![
+            vec![],                                             // empty batch
+            vec![byte_key(2)],                                  // single hit
+            vec![byte_key(3)],                                  // single miss
+            (0..10_u64).map(|i| byte_key(i * 2)).collect(),     // all-hit
+            (0..10_u64).map(|i| byte_key(i * 2 + 1)).collect(), // all-miss
+            vec![
+                byte_key(0),
+                byte_key(1),
+                wide_key,
+                byte_key(3),
+                empty_key,
+                byte_key(6),
+            ], // alternating + width mix + fused entry
+            vec![byte_key(2), byte_key(2), byte_key(3), byte_key(2)], // duplicates
+        ];
+        for keys in &shapes {
+            assert_eq!(
+                batch_gets_key(&idx, keys),
+                per_row_gets_key(&idx, keys),
+                "composite get_batch diverged from per-row get"
+            );
+        }
+
+        // Chunk-spanning batch (2 full chunks + tail).
+        let many: Vec<Box<[u8]>> = (0..5000_u64).map(byte_key).collect();
+        assert!(many.len() > 2 * BATCH_SWEEP_CHUNK);
+        assert_eq!(batch_gets_key(&idx, &many), per_row_gets_key(&idx, &many));
     }
 
     #[test]

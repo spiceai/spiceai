@@ -45,14 +45,36 @@ pub enum Error {
 
     #[snafu(display("An invalid GitHub token was provided."))]
     InvalidToken,
+
+    // `{value:?}` debug-formats the untrusted input so control characters
+    // (e.g. a newline) are escaped rather than echoed verbatim, keeping the
+    // message single-line and preventing log injection.
+    #[snafu(display(
+        "Invalid GitHub {component} {value:?}: only letters, digits, '.', '_', '-' (and '/' for a revision) are allowed, and '..' is not permitted."
+    ))]
+    InvalidComponent {
+        component: &'static str,
+        value: String,
+    },
 }
 
-#[derive(Debug)]
 struct GitHubClientConfig {
     org: String,
     repo: String,
     rev: String,
     token: Option<String>,
+}
+
+impl std::fmt::Debug for GitHubClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the GitHub token so a `{:?}` of this config cannot leak it.
+        f.debug_struct("GitHubClientConfig")
+            .field("org", &self.org)
+            .field("repo", &self.repo)
+            .field("rev", &self.rev)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl GitHubClientConfig {
@@ -63,6 +85,38 @@ impl GitHubClientConfig {
             rev: rev.to_string(),
             token: token.map(ToString::to_string),
         }
+    }
+}
+
+/// Validates a user-supplied GitHub URL component (organization, repository, or
+/// revision) before it is interpolated into a `raw.githubusercontent.com` or
+/// GitHub API URL. Rejects characters that could change the request target —
+/// path traversal (`..`), query/fragment injection (`?`, `#`), userinfo/host
+/// confusion (`@`), percent-encoding (`%`), whitespace, and control characters.
+///
+/// `allow_slash` permits `/` so revision refs like `feature/foo` are accepted;
+/// organizations and repositories must not contain `/`.
+fn validate_github_component(
+    component: &'static str,
+    value: &str,
+    allow_slash: bool,
+) -> Result<(), Error> {
+    let valid = !value.is_empty()
+        && !value.contains("..")
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || (allow_slash && c == '/')
+        });
+
+    if valid {
+        Ok(())
+    } else {
+        InvalidComponentSnafu {
+            component,
+            value: value.to_string(),
+        }
+        .fail()
     }
 }
 
@@ -83,6 +137,13 @@ impl GitHubRawObjectStore {
         token: Option<&str>,
         io_runtime: Handle,
     ) -> Result<Self, Error> {
+        let org = org.to_string();
+        let repo = repo.to_string();
+        let rev = rev.to_string();
+        validate_github_component("organization", &org, false)?;
+        validate_github_component("repository", &repo, false)?;
+        validate_github_component("revision", &rev, true)?;
+
         let mut headers = HeaderMap::with_capacity(1);
         if let Some(token) = token {
             headers.insert(
@@ -316,6 +377,17 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
+    #[test]
+    fn github_client_config_debug_redacts_token() {
+        let cfg = GitHubClientConfig::new("org", "repo", "main", Some("ghp_supersecret"));
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("ghp_supersecret"),
+            "Debug leaked the GitHub token: {dbg}"
+        );
+        assert!(dbg.contains("org") && dbg.contains("[REDACTED]"));
+    }
+
     #[tokio::test]
     async fn test_get_opts() {
         let store = GitHubRawObjectStore::try_new(
@@ -338,5 +410,54 @@ mod tests {
             .await;
         println!("{files:?}");
         assert!(!files.is_empty());
+    }
+
+    #[test]
+    fn validate_github_component_accepts_valid_values() {
+        validate_github_component("organization", "spiceai", false).expect("org");
+        validate_github_component("repository", "spice.ai_demo-1", false).expect("repo");
+        validate_github_component("revision", "refs/heads/trunk", true).expect("rev with slashes");
+        validate_github_component("revision", "v1.2.3", true).expect("tag");
+        validate_github_component("revision", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", true)
+            .expect("sha");
+    }
+
+    #[test]
+    fn validate_github_component_rejects_injection_and_traversal() {
+        // Path traversal.
+        assert!(validate_github_component("revision", "..", true).is_err());
+        assert!(validate_github_component("revision", "a/../../b", true).is_err());
+        // Empty and slash-edge cases.
+        assert!(validate_github_component("repository", "", false).is_err());
+        assert!(validate_github_component("revision", "/leading", true).is_err());
+        assert!(validate_github_component("revision", "trailing/", true).is_err());
+        // Organizations/repositories may not contain '/'.
+        assert!(validate_github_component("organization", "org/with/slash", false).is_err());
+        // URL-structure-breaking characters are rejected in every component.
+        for bad in ["a?b", "a#b", "a@b", "a%2fb", "a b", "a\\b", "a:b", "a\nb"] {
+            assert!(
+                validate_github_component("repository", bad, false).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn try_new_rejects_malicious_components() {
+        // Component validation runs before any network access, at construction.
+        assert!(
+            GitHubRawObjectStore::try_new("..", "repo", "main", None, Handle::current()).is_err(),
+            "traversal organization should be rejected"
+        );
+        assert!(
+            GitHubRawObjectStore::try_new("org", "repo?x=1", "main", None, Handle::current())
+                .is_err(),
+            "query-injecting repository should be rejected"
+        );
+        assert!(
+            GitHubRawObjectStore::try_new("org", "repo", "a/../../etc", None, Handle::current())
+                .is_err(),
+            "traversal revision should be rejected"
+        );
     }
 }

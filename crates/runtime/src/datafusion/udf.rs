@@ -1059,6 +1059,26 @@ mod tests {
     }
 
     #[test]
+    fn table_providers_default_deny_list_denies_spice_functions() {
+        // The default table-providers-typed deny-list (wired into the SQLite
+        // and Postgres accelerator factories and the MySQL connector factory)
+        // has no dialect carve-out: every built-in Spice UDF must be denied
+        // while ordinary functions still federate.
+        let support = deny_spice_functions_for_table_providers();
+        let json_name = json_get_str_udf().name().to_string();
+        for name in [EMBED_UDF_NAME, COSINE_DISTANCE_UDF_NAME, json_name.as_str()] {
+            assert!(
+                !support.supports(&make_named_expr(name)),
+                "{name} is a Spice-only function and must be denied"
+            );
+        }
+        assert!(
+            support.supports(&make_named_expr("upper")),
+            "non-Spice functions must not be denied"
+        );
+    }
+
+    #[test]
     fn duckdb_deny_list_allows_dialect_native_functions() {
         // The DuckDB unparser dialect rewrites these into native DuckDB SQL
         // (cosine_distance -> array_cosine_distance, inner_product ->

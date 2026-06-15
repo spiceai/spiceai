@@ -23,10 +23,16 @@ use tonic::service::Interceptor;
 pub fn make_interceptor(
     auth_verifier: Option<Arc<dyn GrpcAuth + Send + Sync>>,
 ) -> impl Interceptor + Send + Sync + Clone {
-    move |req: tonic::Request<()>| {
+    move |mut req: tonic::Request<()>| {
         if let Some(auth_verifier) = &auth_verifier {
             match auth_verifier.grpc_verify(&req) {
-                Ok(AuthVerdict::Allow(_)) => Ok(req),
+                Ok(AuthVerdict::Allow(principal)) => {
+                    // Preserve the authenticated principal on the request so that
+                    // downstream read-only/write authorization is not silently
+                    // disabled if this interceptor is ever wired into a service.
+                    req.extensions_mut().insert(principal);
+                    Ok(req)
+                }
                 Ok(AuthVerdict::Deny) => Err(Status::unauthenticated("Invalid credentials")),
                 Err(e) => {
                     tracing::error!("Error verifying credentials: {e}");
@@ -36,5 +42,42 @@ pub fn make_interceptor(
         } else {
             Ok(req)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthVerdict, GrpcAuth, make_interceptor};
+    use crate::AuthPrincipalRef;
+    use app::spicepod::component::runtime::ApiKey;
+    use std::sync::Arc;
+    use tonic::service::Interceptor;
+
+    struct AllowWith(AuthPrincipalRef);
+    impl GrpcAuth for AllowWith {
+        fn grpc_verify(
+            &self,
+            _req: &tonic::Request<()>,
+        ) -> Result<AuthVerdict, crate::error::Error> {
+            Ok(AuthVerdict::Allow(Arc::clone(&self.0)))
+        }
+    }
+
+    #[test]
+    fn interceptor_preserves_principal_on_allow() {
+        let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str("test-key:rw"));
+        let auth: Arc<dyn GrpcAuth + Send + Sync> = Arc::new(AllowWith(Arc::clone(&principal)));
+        let mut interceptor = make_interceptor(Some(auth));
+
+        let out = interceptor
+            .call(tonic::Request::new(()))
+            .expect("allow verdict should pass the request");
+
+        // Regression: the authenticated principal must be carried on the request
+        // (not dropped), so downstream authorization is not silently disabled.
+        assert!(
+            out.extensions().get::<AuthPrincipalRef>().is_some(),
+            "interceptor must preserve the authenticated principal"
+        );
     }
 }

@@ -27,7 +27,6 @@ use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::PhysicalExpr;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
-use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
@@ -338,60 +337,52 @@ impl FileSource for VortexSource {
         let mut source = self.clone();
         source.target_partitions = Some(config.execution.target_partitions.max(1));
 
-        // Combine new filters with existing predicate for file pruning.
-        // This full predicate is used by FilePruner to eliminate files.
+        // Every filter contributes to the file-pruning predicate used by `FilePruner`
+        // to eliminate whole files via statistics / partition values.
         source.full_predicate = match source.full_predicate {
             Some(predicate) => Some(conjunction(
-                std::iter::once(predicate).chain(filters.clone()),
+                std::iter::once(predicate).chain(filters.iter().map(Arc::clone)),
             )),
-            None => Some(conjunction(filters.clone())),
+            None => Some(conjunction(filters.iter().map(Arc::clone))),
         };
 
-        let supported_filters = filters
-            .into_iter()
-            .map(|expr| {
-                if self
-                    .expression_convertor
-                    .can_be_pushed_down(&expr, self.table_schema.file_schema())
-                {
-                    PushedDownPredicate::supported(expr)
-                } else {
-                    PushedDownPredicate::unsupported(expr)
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if supported_filters
+        // A filter is row-evaluated inside the Vortex scan only if the convertor can
+        // translate it. Hash-join *dynamic* filters appear here as a `lit(true)`
+        // placeholder and are accepted; the per-conjunct decision of what actually
+        // enters the scan (cheap min/max bounds vs. the expensive `InList` membership)
+        // is deferred to file-open time in `VortexOpener`, once the dynamic filter has
+        // materialized into its real expression.
+        let row_eval: Vec<bool> = filters
             .iter()
-            .all(|p| matches!(p.discriminant, PushedDown::No))
-        {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; supported_filters.len()],
-            )
-            .with_updated_node(Arc::new(source) as _));
+            .map(|expr| {
+                self.expression_convertor
+                    .can_be_pushed_down(expr, self.table_schema.file_schema())
+            })
+            .collect();
+
+        if row_eval.iter().any(|&ok| ok) {
+            let supported = filters
+                .iter()
+                .zip(&row_eval)
+                .filter(|&(_, &ok)| ok)
+                .map(|(expr, _)| Arc::clone(expr));
+            let predicate = match source.vortex_predicate {
+                Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
+                None => conjunction(supported),
+            };
+            tracing::debug!(%predicate, "Saving predicate");
+            source.vortex_predicate = Some(predicate);
         }
 
-        let supported = supported_filters
+        let pushdown_result = row_eval
             .iter()
-            .filter_map(|p| match p.discriminant {
-                PushedDown::Yes => Some(&p.predicate),
-                PushedDown::No => None,
-            })
-            .cloned();
+            .map(|&ok| if ok { PushedDown::Yes } else { PushedDown::No })
+            .collect();
 
-        let predicate = match source.vortex_predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
-            None => conjunction(supported),
-        };
-
-        tracing::debug!(%predicate, "Saving predicate");
-
-        source.vortex_predicate = Some(predicate);
-
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            supported_filters.iter().map(|f| f.discriminant).collect(),
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushdown_result)
+                .with_updated_node(Arc::new(source) as _),
         )
-        .with_updated_node(Arc::new(source) as _))
     }
 
     fn try_pushdown_projection(

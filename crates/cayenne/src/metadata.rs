@@ -465,6 +465,14 @@ impl DeletionMode {
     /// strategy. So the *mechanism* is chosen by the presence of a PK, but the
     /// resolved *mode* is position either way.
     ///
+    /// NOTE: the Spice accelerator's auto-tune layer pre-resolves `Auto` to
+    /// [`Self::Key`] for `refresh_mode: changes` (CDC) tables that have a
+    /// primary key BEFORE the config reaches this engine-level resolution —
+    /// position-delete compaction must serialize with writers and starves
+    /// under continuous CDC, while key-delete compaction runs concurrently.
+    /// This function therefore only sees `Auto` for non-CDC tables (and PK-less
+    /// CDC tables), where position remains the right resolution.
+    ///
     /// `Key` is the explicit opt-out (apply deletes above the scan). It only has
     /// meaning with a PK; a PK-less table can only do position-based deletion, so
     /// `Key` there resolves to `Position`.
@@ -489,9 +497,10 @@ impl DeletionMode {
 
 /// Durability mode for the inline CDC write path (`refresh_mode: changes`).
 ///
-/// In [`Self::File`] (the default — byte-identical to the pre-feature behavior)
-/// every CDC batch persists a durable metastore entry / staged Vortex write
-/// before the source slot ack advances. In [`Self::Memory`] the inline path
+/// In [`Self::File`] (the explicit conservative opt-out — byte-identical to
+/// the pre-mem-tier behavior) every CDC batch persists a durable metastore
+/// entry / staged Vortex write before the source slot ack advances. In
+/// [`Self::Memory`] (the default) the inline path
 /// appends each batch to an in-RAM tier and DEFERS the source slot ack until a
 /// periodic/cap-triggered checkpoint flushes the tier to a durable Vortex file —
 /// collapsing per-batch durability cost at the price of replaying the
@@ -508,24 +517,32 @@ impl DeletionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CdcDurability {
-    /// Per-batch durable metastore/Vortex persist before the slot ack. The DEFAULT:
-    /// the proven path that holds CDC replication lag at zero across all tables
-    /// under sustained load.
-    #[default]
+    /// Per-batch durable metastore/Vortex persist before the slot ack. The
+    /// conservative explicit opt-out: byte-identical to the pre-mem-tier
+    /// behavior. Also what every NON-eligible table silently uses regardless
+    /// of configuration (see [`Self::Memory`]'s eligibility gates).
     File,
     /// In-RAM tier; slot ack deferred to a periodic/cap-triggered checkpoint.
-    /// OPT-IN (experimental). Engages only for the changes/small-write refresh
-    /// profile AND a replayable source committer (the runtime arms it lazily on the
-    /// first batch whose committer reports `supports_deferral()`); every other
-    /// profile/source falls back to `File`. The RAM tier is bounded on three axes
-    /// so the deferred slot ack keeps advancing and the tier never grows unbounded:
-    /// a per-table byte cap (`cdc_mem_tier_max_bytes`, default 256 MiB) and age cap
-    /// (`cdc_mem_tier_max_age_ms`, default 10 s) that the write path checks per
-    /// burst, plus a periodic background checkpoint task
-    /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s) that flushes idle /
-    /// pure-upsert tables which never trip a write-path cap. Correctness is
-    /// unaffected (a crash discards the un-checkpointed tail; the source re-streams
-    /// on restart and the PK-idempotent apply converges exactly-once).
+    /// The DEFAULT: A/B-validated faster than `file` end-to-end on the CDC
+    /// profile (higher analytical QPH, lower replication lag, and a fraction
+    /// of the disk footprint) with identical convergence. Safe as a default
+    /// because it is eligibility-gated, not forced: it engages only for the
+    /// changes/small-write refresh profile AND a replayable source committer
+    /// (the runtime arms it lazily on the first batch whose committer reports
+    /// `supports_deferral()`) on a non-partitioned table; every other
+    /// profile/source/table silently keeps the durable `File` path. The RAM
+    /// tier is bounded on three axes so the deferred slot ack keeps advancing
+    /// and the tier never grows unbounded: a per-table byte cap
+    /// (`cdc_mem_tier_max_bytes`, memory-scaled 256 MiB–1 GiB when unset)
+    /// checked by the write path per burst (the synchronous OOM backstop), an age cap
+    /// (`cdc_mem_tier_max_age_ms`, default 10 s) enforced by the periodic
+    /// background checkpoint task WITHOUT blocking the writer
+    /// (`cdc_mem_tier_checkpoint_interval_ms`, default 1 s), which also
+    /// flushes idle / pure-upsert tables that never trip the byte cap.
+    /// Correctness is unaffected (a crash discards the un-checkpointed tail;
+    /// the source re-streams on restart and the PK-idempotent apply converges
+    /// exactly-once).
+    #[default]
     Memory,
 }
 
@@ -565,9 +582,9 @@ impl CdcDurability {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "one independent pin flag per adaptive-tunable knob"
+    reason = "one independent pin flag per adaptive-tunable actuator"
 )]
-pub struct PinnedTuningKnobs {
+pub struct PinnedTuningActuators {
     /// The inline-memtable flush caps were operator-set (don't adapt them).
     pub inline_flush: bool,
     /// `cayenne_compaction_background_interval_ms` was operator-set.
@@ -576,6 +593,52 @@ pub struct PinnedTuningKnobs {
     pub compaction_trigger: bool,
     /// `cayenne_write_concurrency` was operator-set.
     pub write_concurrency: bool,
+    /// `cayenne_cdc_mem_tier_max_bytes` was operator-set (don't adapt the
+    /// in-memory CDC durability tier byte cap).
+    pub mem_tier: bool,
+}
+
+/// Storage medium backing a table's data files or metastore, mapped from the
+/// runtime's detected acceleration storage class at registration. Cayenne-local:
+/// the runtime's `ResolvedAccelerationStorage` lives in the `runtime` crate (which
+/// depends on this one), so it cannot be imported here — the accelerator maps onto
+/// this enum. A *detected* fact, not an operator knob: it never (de)serializes with
+/// the spicepod config (`#[serde(skip)]` on the carrying fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageClass {
+    /// Local NVMe/SSD — fast random I/O; the tuner applies no write-amortization bias.
+    LocalSsd,
+    /// Network block store (e.g. EBS) — higher, variable latency: the slow tier.
+    Ebs,
+    /// tmpfs / RAM-backed — fastest; no bias.
+    Tmpfs,
+    /// Object store (S3) or an undetectable mount. The safe default — treated as the
+    /// slow tier so the tuner biases toward fewer, larger files / amortized commits.
+    #[default]
+    Unknown,
+}
+
+impl StorageClass {
+    /// Slow/networked tier (EBS, object store, or undetected) — biases the tuner
+    /// toward larger inline-flush (fewer, bigger files; fewer metastore commits).
+    /// `LocalSsd`/`Tmpfs` are fast and get no bias.
+    #[must_use]
+    pub fn is_slow_tier(self) -> bool {
+        matches!(self, Self::Ebs | Self::Unknown)
+    }
+
+    /// Stable numeric code for the telemetry info gauge: `0` `LocalSsd`, `1` `Ebs`,
+    /// `2` `Tmpfs`, `3` `Unknown`. Lets dashboards see the storage tier the tuner
+    /// detected without emitting a high-cardinality string label.
+    #[must_use]
+    pub fn metric_code(self) -> u64 {
+        match self {
+            Self::LocalSsd => 0,
+            Self::Ebs => 1,
+            Self::Tmpfs => 2,
+            Self::Unknown => 3,
+        }
+    }
 }
 
 /// Configuration for Vortex encodings to optimize compression and performance.
@@ -596,6 +659,12 @@ pub struct VortexConfig {
     pub target_vortex_file_size_mb: usize,
     /// Columns to sort data by on refresh operations (empty = no sorting)
     pub sort_columns: Vec<String>,
+    /// Columns to hash-cluster rows by during intra-write sharding (the parallel
+    /// encode fan-out). Empty = derive from the primary key (PK-hash clustering,
+    /// the historical behavior); PK-less tables shard round-robin. Ignored for
+    /// sorted tables (`sort_columns` forces a single serial writer).
+    #[serde(default)]
+    pub shard_key_columns: Vec<String>,
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
@@ -719,18 +788,23 @@ pub struct VortexConfig {
     /// above-scan key-based filter.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
-    /// Durability mode for the inline CDC write path. [`CdcDurability::File`]
-    /// (default) persists each batch durably before advancing the source slot;
-    /// [`CdcDurability::Memory`] appends to an in-RAM tier and defers the slot
-    /// ack to a periodic/cap-triggered checkpoint. Default is byte-identical to
-    /// the pre-feature behavior (zero regression when not opted in).
+    /// Durability mode for the inline CDC write path. [`CdcDurability::Memory`]
+    /// (default) appends to an in-RAM tier and defers the slot ack to a
+    /// periodic/cap-triggered checkpoint — A/B-validated faster than `file`
+    /// end-to-end and eligibility-gated (non-CDC profiles, non-replayable
+    /// sources, and partitioned tables silently keep the durable path).
+    /// [`CdcDurability::File`] persists each batch durably before advancing
+    /// the source slot: the explicit conservative opt-out, byte-identical to
+    /// the pre-mem-tier behavior.
     #[serde(default)]
     pub cdc_durability: CdcDurability,
     /// Per-table RAM-tier byte cap before a forced spill (checkpoint) + slot
     /// advance, in `cdc_durability: memory` mode only. `0` disables the
     /// per-table cap; the process-global byte budget still bounds aggregate
     /// resident memory. When both are set, whichever is breached first triggers
-    /// the spill. Defaults to 256 MiB so the periodic background checkpoint is
+    /// the spill. The serde default is the 256 MiB floor; when the param is
+    /// unset the accelerator auto-derives a memory-scaled value (~1/64 of host
+    /// RAM, clamped 256 MiB–1 GiB) so the periodic background checkpoint is
     /// the primary flush path and the write-path spill remains a rare backstop.
     #[serde(default = "default_cdc_mem_tier_max_bytes")]
     pub cdc_mem_tier_max_bytes: i64,
@@ -740,6 +814,18 @@ pub struct VortexConfig {
     /// trip). `0` disables the age trigger. Defaults to 10 s.
     #[serde(default = "default_cdc_mem_tier_max_age_ms")]
     pub cdc_mem_tier_max_age_ms: u64,
+    /// Minimum resident tier bytes before the PERIODIC background tick durably
+    /// checkpoints, in `cdc_durability: memory` mode only. Bounds snapshot /
+    /// delete-file churn: below this size a tick is a no-op unless the tier's
+    /// age has reached `cdc_mem_tier_max_age_ms` (which still bounds the
+    /// deferred slot ack and crash-replay window). The write-path cap spill and
+    /// explicit checkpoints are NOT gated. `0` disables the gate. The serde
+    /// default is the 32 MiB floor; when the param is unset the accelerator
+    /// auto-derives 1/8 of the derived byte cap (clamped 32–128 MiB), keeping
+    /// the cap:gate ratio constant so a larger tier flushes proportionally
+    /// larger files.
+    #[serde(default = "default_cdc_mem_tier_min_flush_bytes")]
+    pub cdc_mem_tier_min_flush_bytes: i64,
     /// Periodic background mem-tier checkpoint interval in milliseconds, in
     /// `cdc_durability: memory` mode only. The accelerator spawns a per-table
     /// background task that checkpoints the RAM tier every interval (mirroring
@@ -759,9 +845,89 @@ pub struct VortexConfig {
     #[serde(default)]
     pub dynamic_tuning: bool,
     /// Adaptive-tunable knobs the operator pinned with an explicit value; the
-    /// closed loop leaves these alone (see [`PinnedTuningKnobs`]).
+    /// closed loop leaves these alone (see [`PinnedTuningActuators`]).
     #[serde(default)]
-    pub pinned_tuning_knobs: PinnedTuningKnobs,
+    pub pinned_tuning_actuators: PinnedTuningActuators,
+    /// Which widening schema differences detected at table open (the requested
+    /// schema vs the stored metastore schema) may be committed in place via
+    /// `update_table_schema` instead of pinning the stored schema. Set by the
+    /// runtime accelerator from the dataset's `on_schema_change` policy
+    /// (`append_new_columns` / `sync_all_columns`); the default
+    /// [`SchemaEvolutionMode::Disabled`] keeps the legacy pin-stored-schema
+    /// behavior verbatim (`on_schema_change: block`/`fail`, or omitted).
+    /// Runtime-only — never compared by `configuration_matches`.
+    #[serde(default, skip_serializing_if = "SchemaEvolutionMode::is_disabled")]
+    pub schema_evolution: SchemaEvolutionMode,
+    /// Goal-driven adaptive-tuning setpoints (each `None` = unset → the legacy
+    /// signal-driven controller for that metric). When any is set, the closed loop
+    /// drives that high-level SLO toward target with small incremental steps,
+    /// converging within `goal_convergence_window_secs`. Set from the
+    /// `cayenne_goal_*` params; setting any goal implies `dynamic_tuning` (a goal
+    /// with the loop off is inert). Runtime-only — never compared by
+    /// `configuration_matches` (does not affect data layout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_replication_lag_secs: Option<f64>,
+    /// Freshness goal target in seconds (age of the newest queryable data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_freshness_secs: Option<f64>,
+    /// Query-latency (p99) goal target in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_query_latency_ms: Option<f64>,
+    /// Query-throughput goal target in queries per hour (higher is better).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_qph: Option<f64>,
+    /// Convergence window (seconds) for goal-driven tuning. `None` → the default
+    /// (`provider::tuning::DEFAULT_GOAL_CONVERGENCE_WINDOW`, 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_convergence_window_secs: Option<f64>,
+    /// Storage medium of the table's DATA files (Vortex), detected at registration
+    /// and mapped from the runtime's acceleration storage class. A slow tier
+    /// (EBS / object store / undetected) biases the tuner toward fewer, larger
+    /// files. Detected runtime fact — `#[serde(skip)]` (never a spicepod knob,
+    /// never compared by `configuration_matches`).
+    #[serde(skip)]
+    pub data_storage_class: StorageClass,
+    /// Storage medium of the METASTORE (where publish commits + inline re-reads
+    /// land). A slow tier biases toward larger inline-flush to amortize commits.
+    #[serde(skip)]
+    pub metastore_storage_class: StorageClass,
+}
+
+/// Evolution set permitted when a widening schema difference is detected at
+/// table open. Mirrors the runtime's `on_schema_change` policy semantics:
+/// `append_new_columns` evolves added nullable columns only, `sync_all_columns`
+/// evolves the full widening set (added columns + lossless type widening +
+/// nullability relax).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaEvolutionMode {
+    /// Never evolve the stored schema (legacy behavior: pin the stored schema
+    /// and warn on any difference).
+    #[default]
+    Disabled,
+    /// Evolve added nullable columns only (`on_schema_change: append_new_columns`).
+    AddColumnsOnly,
+    /// Evolve the full widening set (`on_schema_change: sync_all_columns`).
+    Widen,
+}
+
+impl SchemaEvolutionMode {
+    /// `true` when this is [`SchemaEvolutionMode::Disabled`] (the serde
+    /// skip-serializing predicate, so stored `vortex_config_json` stays
+    /// byte-identical for non-evolving tables).
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, SchemaEvolutionMode::Disabled)
+    }
+
+    /// Whether `plan` falls within this mode's evolution set.
+    #[must_use]
+    pub fn allows(&self, plan: &arrow_tools::schema_evolution::WideningPlan) -> bool {
+        match self {
+            SchemaEvolutionMode::Disabled => false,
+            SchemaEvolutionMode::AddColumnsOnly => plan.is_additive_only(),
+            SchemaEvolutionMode::Widen => true,
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -820,7 +986,11 @@ fn default_inline_flush_max_bytes() -> i64 {
     DEFAULT_INLINE_FLUSH_MAX_BYTES
 }
 
-/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB).
+/// Default per-table RAM-tier byte cap for `cdc_durability: memory` (256 MiB —
+/// the serde/engine floor; the accelerator's auto-tune derives a memory-scaled
+/// value of ~1/64 of host RAM clamped to 256 MiB–1 GiB when the param is unset,
+/// so memory-rich hosts get a larger cap and hosts at/under 16 GiB keep this
+/// floor).
 ///
 /// This is the SYNCHRONOUS write-path spill threshold (`mem_tier_per_table_cap_breached`),
 /// which blocks the refresh-task's next batch while it flushes — so it should be
@@ -830,22 +1000,43 @@ fn default_inline_flush_max_bytes() -> i64 {
 /// longer stalls appends — so a larger tier is cheap. 256 MiB gives the 1 s
 /// background tick time to drain the tier before this cap is reached at typical
 /// CDC rates, while staying small enough that ~N memory-mode tables sum well
-/// under the process-global budget (`get_total_memory()/8`), which remains the
-/// RAM-scaling aggregate backstop. (Was 64 MiB, sized for the old fence-blocking
-/// checkpoint where frequent tiny spills minimized each per-stall duration; that
-/// trade-off is obsolete now that checkpoints don't hold the fence.)
+/// under the process-global budget, which remains the RAM-scaling aggregate
+/// backstop.
 fn default_cdc_mem_tier_max_bytes() -> i64 {
     256 * 1024 * 1024
 }
 
+/// Default minimum tier size before the PERIODIC tick durably checkpoints
+/// (32 MiB — the serde/engine floor; the accelerator's auto-tune derives 1/8 of
+/// the derived byte cap, clamped 32–128 MiB, when the param is unset, keeping
+/// the cap:gate ratio constant). Every durable checkpoint costs a new snapshot +
+/// delete-vector files + a listing refresh under the fence; at a 1 s tick a
+/// high-rate table would otherwise produce ~600 tiny snapshots per 10 minutes
+/// (measured at SF-100: 408–676 accumulated snapshot dirs per heavy table), and
+/// the accumulated churn degrades scans and the apply path. Gating the tick on
+/// min-flush-bytes OR the age cap caps churn at ~`max_bytes/min_flush` files per
+/// flush window while leaving freshness untouched (RAM rows are visible to
+/// queries immediately; only the deferred source-slot ack waits, bounded by
+/// `cdc_mem_tier_max_age_ms`). The write-path cap spill and explicit
+/// checkpoints bypass the gate. `0` disables the gate (every tick flushes).
+fn default_cdc_mem_tier_min_flush_bytes() -> i64 {
+    32 * 1024 * 1024
+}
+
 /// Default RAM-tier age cap for `cdc_durability: memory` (10 s).
 ///
-/// Bounds the crash-replay window and forces a synchronous checkpoint on a
-/// slow-trickle table that never reaches the byte cap. Raised from 2 s now that
-/// the background checkpointer (1 s tick) is the primary, non-fence-blocking
-/// flush path: an actively-written table is drained by the background tick long
-/// before 10 s, so this age cap only catches genuinely slow tables and no longer
-/// needs to fire aggressively on the hot write path.
+/// Bounds the crash-replay window for a slow-trickle table that never reaches
+/// the byte cap. Enforced ONLY by the periodic background tick
+/// (`run_mem_tier_checkpoint_tick`) — the write path never blocks on age (the
+/// writer-side spill predicate is byte-only; see
+/// `mem_tier_per_table_cap_breached`), so the slot-ack/replay bound is
+/// `max_age` + one tick interval + the checkpoint duration, with zero apply
+/// stall. Raised from 2 s now that the background checkpointer (1 s tick) is
+/// the primary, non-fence-blocking flush path: an actively-written table is
+/// drained by the background tick long before 10 s, so this age cap only
+/// catches genuinely slow tables. Deliberately NOT hardware-derived by the
+/// accelerator's auto-tune: it is a time-domain durability-policy bound, and
+/// scaling it with host capacity would silently change crash-replay semantics.
 fn default_cdc_mem_tier_max_age_ms() -> u64 {
     10_000
 }
@@ -936,6 +1127,8 @@ impl Default for VortexConfig {
             target_vortex_file_size_mb: 256,
             // No sort columns by default
             sort_columns: Vec::new(),
+            // Shard key derives from the primary key unless overridden
+            shard_key_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
             // `auto`: size-gated light encoding for small deltas (re-encoded
             // by compaction). Local micro A/B (2026-06-06) was neutral on the
@@ -964,9 +1157,18 @@ impl Default for VortexConfig {
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),
             cdc_mem_tier_max_age_ms: default_cdc_mem_tier_max_age_ms(),
+            cdc_mem_tier_min_flush_bytes: default_cdc_mem_tier_min_flush_bytes(),
             cdc_mem_tier_checkpoint_interval_ms: default_cdc_mem_tier_checkpoint_interval_ms(),
             dynamic_tuning: false,
-            pinned_tuning_knobs: PinnedTuningKnobs::default(),
+            pinned_tuning_actuators: PinnedTuningActuators::default(),
+            schema_evolution: SchemaEvolutionMode::default(),
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_qph: None,
+            goal_convergence_window_secs: None,
+            data_storage_class: StorageClass::default(),
+            metastore_storage_class: StorageClass::default(),
         }
     }
 }

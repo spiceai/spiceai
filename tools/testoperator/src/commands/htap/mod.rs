@@ -44,7 +44,7 @@ use test_framework::{
 
 use crate::{
     args::HtapArgs, commands::bench::prepare_chbench_source, health::HealthMonitor,
-    spiced_metrics::MetricsScraper, wait_test_and_memory,
+    spiced_metrics::MetricsScraper,
 };
 
 pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
@@ -78,7 +78,9 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let ready_wait_start = Instant::now();
 
     let memory_token = CancellationToken::new();
-    let memory_readings = spiced_instance.process()?.watch_memory(&memory_token);
+    let memory_readings = spiced_instance
+        .process()
+        .map(|process| process.watch_memory(&memory_token));
 
     spiced_instance
         .wait_for_ready(Duration::from_secs(test_args.common.ready_wait))
@@ -166,7 +168,15 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         .with_validate_row_count(false)
         .start()?;
 
-    let test = wait_test_and_memory!(benchmark_test, memory_token, memory_readings);
+    let test = match benchmark_test.wait().await {
+        Ok(test) => test,
+        Err(e) => {
+            if let Some(handle) = memory_readings {
+                let _ = observe_memory(memory_token, handle).await;
+            }
+            return Err(e);
+        }
+    };
 
     // 5. Capture replication metrics while OLTP is still running.
     //    lag_ms = now() − commit_time(last_processed_txn), so it inflates with idle time
@@ -183,7 +193,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Htap)?;
     let test_succeeded = test.succeeded();
     let mut spiced_instance = test.end()?;
-    let (max_memory, median_memory) = observe_memory(memory_token, memory_readings).await?;
+    let memory_usage = match memory_readings {
+        Some(handle) => Some(observe_memory(memory_token, handle).await?),
+        None => None,
+    };
 
     // 7. Report analytical query metrics.
     let mut failures: Vec<String> = Vec::new();
@@ -216,8 +229,10 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     crate::metrics::READY_DURATION.record(ready_wait_duration.as_millis().try_into()?, &[]);
     crate::metrics::TEST_DURATION
         .record((metrics.finished_at - metrics.started_at).try_into()?, &[]);
-    crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
-    crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    if let Some((max_memory, median_memory)) = memory_usage {
+        crate::metrics::PEAK_MEMORY_USAGE.record(max_memory * 1024.0, &[]);
+        crate::metrics::MEDIAN_MEMORY_USAGE.record(median_memory * 1024.0, &[]);
+    }
 
     // Calculate analytical throughput — QPH (queries per hour).
     let completed_queries: usize = metrics.metrics.iter().map(|q| q.iterations).sum();
@@ -233,7 +248,11 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
     };
     crate::metrics::QPH.record(qph, &[]);
 
-    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    let metrics = match memory_usage {
+        Some((max_memory, _)) => metrics.with_memory_usage(max_memory),
+        None => metrics,
+    };
+    let records = metrics.build_records()?;
     println!("\n=== Analytical Queries ===");
     print_batches(&records)?;
     println!(

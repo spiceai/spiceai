@@ -74,7 +74,6 @@ pub type Result<T, E = S3ObjectStoreBuilderError> = std::result::Result<T, E>;
 ///     .build()
 ///     .await?;
 /// ```
-#[derive(Debug)]
 pub struct S3ObjectStoreBuilder {
     bucket_name: String,
     io_runtime: Handle,
@@ -88,6 +87,27 @@ pub struct S3ObjectStoreBuilder {
     allow_http: Option<bool>,
     pool_max_idle_per_host: Option<usize>,
     pool_idle_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for S3ObjectStoreBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the AWS credential material so a `{:?}` of this builder (or any
+        // struct that derives `Debug` and embeds it) cannot leak secrets.
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("S3ObjectStoreBuilder")
+            .field("bucket_name", &self.bucket_name)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &redact(&self.access_key_id))
+            .field("secret_access_key", &redact(&self.secret_access_key))
+            .field("session_token", &redact(&self.session_token))
+            .field("client_timeout", &self.client_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("allow_http", &self.allow_http)
+            .field("pool_max_idle_per_host", &self.pool_max_idle_per_host)
+            .field("pool_idle_timeout", &self.pool_idle_timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl S3ObjectStoreBuilder {
@@ -435,6 +455,30 @@ mod tests {
             S3ObjectStoreBuilder::from_url(&url, Handle::current()).expect("should create builder");
 
         assert_eq!(builder.bucket_name, "my-bucket");
+    }
+
+    #[tokio::test]
+    async fn debug_redacts_aws_credentials() {
+        let url = Url::parse("s3://my-bucket/path").expect("valid url");
+        let builder = S3ObjectStoreBuilder::from_url(&url, Handle::current())
+            .expect("should create builder")
+            .with_credentials("AKIAEXAMPLEACCESSKEY", "wSuperSecretAccessKeyValue")
+            .with_session_token("FwoSessionTokenSecretValue");
+
+        let dbg = format!("{builder:?}");
+        assert!(
+            !dbg.contains("wSuperSecretAccessKeyValue"),
+            "Debug leaked secret access key: {dbg}"
+        );
+        assert!(
+            !dbg.contains("FwoSessionTokenSecretValue"),
+            "Debug leaked session token: {dbg}"
+        );
+        assert!(
+            !dbg.contains("AKIAEXAMPLEACCESSKEY"),
+            "Debug leaked access key id: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED]") && dbg.contains("my-bucket"));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
     "license": {
       "name": ""
     },
-    "version": "2.0.0-unstable"
+    "version": "2.1.0-unstable"
   },
   "servers": [
     {
@@ -1225,6 +1225,278 @@
                   "type": "string"
                 },
                 "example": "No query produced from NSQL model"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/nsql/context": {
+      "get": {
+        "tags": [
+          "SQL"
+        ],
+        "summary": "Text-to-SQL Context (NSQL)",
+        "description": "Return the same context block that `/v1/nsql` injects into the configured NSQL model.\n\nThe response is a markdown/plain-text block or JSON object containing the in-scope datasets, schemas,\nSpice-specific SQL functions, registered user-defined functions, relevant JSON/Spark compatibility functions,\nand optional sample data.",
+        "operationId": "get_nsql_context",
+        "parameters": [
+          {
+            "name": "Accept",
+            "in": "header",
+            "description": "The format of the response, one of 'text/markdown' (default), 'text/plain', or 'application/json'.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "model",
+            "in": "query",
+            "description": "The name of the model whose dataset allowlist should be used. If omitted, Spice defaults to the only compatible LLM model configured in the Spicepod.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "include_sampling",
+            "in": "query",
+            "description": "Whether distinct-value samples are included in the context block. Also accepts `sample_data_enabled` for compatibility with `/v1/nsql` request bodies. Default: false.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "sampling_limit",
+            "in": "query",
+            "description": "Maximum number of rows per distinct-value sample. Default: 3, maximum: 100.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "include_examples",
+            "in": "query",
+            "description": "Whether example rows are included in the context block. Defaults to `include_sampling` when omitted, matching `/v1/nsql` `sample_data_enabled` behavior.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "examples_limit",
+            "in": "query",
+            "description": "Maximum number of example rows per dataset. Default: 3, maximum: 100.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "datasets",
+            "in": "query",
+            "description": "Names of datasets to include in the context block. If omitted, all datasets visible to the selected model are included.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "NSQL context block",
+            "content": {
+              "text/markdown": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`\n\n## Schemas\n| table | column | type | nullable |\n| --- | --- | --- | --- |\n| sales_data | customer_id | Utf8 | false |\n\n## SQL Functions\nUse Spice.ai/DataFusion SQL."
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "# Spice.ai NSQL Context\n\n## Datasets\n- `sales_data`"
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NsqlContextJsonResponse"
+                },
+                "example": {
+                  "context": "# Spice.ai NSQL Context\n- Write SQL for the Spice runtime...",
+                  "instructions": [
+                    "Write SQL for the Spice runtime, which uses Apache DataFusion with the SQL parser configured for the PostgreSQL dialect."
+                  ],
+                  "sql": {
+                    "engine": "Apache DataFusion",
+                    "version": "52.5.0",
+                    "dialect": "PostgreSQL",
+                    "parser": "DataFusion SQL parser configured with PostgreSQL dialect",
+                    "notes": [
+                      "Spice supports standard DataFusion SQL plus additional Spice-specific and registered user-defined functions listed in this context."
+                    ]
+                  },
+                  "datasets": [
+                    {
+                      "name": "sales.orders",
+                      "schema": "sales",
+                      "table": "orders",
+                      "description": "Customer orders",
+                      "metadata": {
+                        "description": "Customer orders"
+                      },
+                      "columns": [
+                        {
+                          "name": "customer_id",
+                          "data_type": "Utf8",
+                          "nullable": false,
+                          "description": "Customer account identifier",
+                          "metadata": {
+                            "description": "Customer account identifier"
+                          },
+                          "primary_key": false,
+                          "unique": false,
+                          "indexed": true,
+                          "vector_search": true,
+                          "full_text_search": true
+                        }
+                      ],
+                      "primary_key": [
+                        "order_id"
+                      ],
+                      "unique_constraints": [],
+                      "foreign_keys": [
+                        {
+                          "columns": [
+                            "customer_id"
+                          ],
+                          "foreign_table": "spice.sales.customers",
+                          "foreign_columns": [
+                            "id"
+                          ]
+                        }
+                      ],
+                      "indexes": [
+                        {
+                          "name": "customer_id",
+                          "columns": [
+                            "customer_id"
+                          ],
+                          "kind": "enabled",
+                          "source": "spicepod.acceleration.indexes"
+                        }
+                      ],
+                      "search": {
+                        "vector": [
+                          {
+                            "column": "customer_id",
+                            "function": "vector_search",
+                            "syntax": "vector_search(sales.orders, 'query text', customer_id)",
+                            "model": "embed_model",
+                            "engine": "duckdb_vector_index",
+                            "row_id_columns": [
+                              "order_id"
+                            ],
+                            "vector_size": 384,
+                            "chunked": false,
+                            "index": {
+                              "name": "duckdb_vector_index",
+                              "columns": [
+                                "customer_id",
+                                "order_id"
+                              ],
+                              "kind": "duckdb_vector_index",
+                              "source": "runtime_index"
+                            },
+                            "required_columns": [
+                              "customer_id",
+                              "order_id"
+                            ],
+                            "notes": []
+                          }
+                        ],
+                        "full_text": [
+                          {
+                            "column": "customer_id",
+                            "function": "text_search",
+                            "syntax": "text_search(sales.orders, 'query text', customer_id)",
+                            "engine": "tantivy",
+                            "index_store": "memory",
+                            "row_id_columns": [
+                              "order_id"
+                            ],
+                            "index": {
+                              "name": "full_text",
+                              "columns": [
+                                "customer_id",
+                                "order_id"
+                              ],
+                              "kind": "full_text",
+                              "source": "runtime_index"
+                            },
+                            "required_columns": [
+                              "customer_id",
+                              "order_id"
+                            ],
+                            "notes": []
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "functions": {
+                    "summary": "Spice SQL runs on Apache DataFusion with the SQL parser configured for the PostgreSQL dialect.",
+                    "json": [],
+                    "search": [],
+                    "additional": [],
+                    "spark_compatibility": {
+                      "description": "Spark-compatible scalar functions are available.",
+                      "functions": []
+                    },
+                    "user_defined": []
+                  },
+                  "samples": []
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request parameters",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Dataset 'sales.orders' not found"
+              }
+            }
+          },
+          "406": {
+            "description": "Requested response content type is not available",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Supported response content types are text/markdown, text/plain, and application/json"
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Unexpected internal error. App not prepared in runtime."
               }
             }
           }
@@ -9185,6 +9457,539 @@
           }
         }
       },
+      "NsqlColumnContext": {
+        "type": "object",
+        "required": [
+          "name",
+          "data_type",
+          "nullable",
+          "metadata",
+          "primary_key",
+          "unique",
+          "indexed",
+          "vector_search",
+          "full_text_search"
+        ],
+        "properties": {
+          "data_type": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "full_text_search": {
+            "type": "boolean"
+          },
+          "indexed": {
+            "type": "boolean"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "primary_key": {
+            "type": "boolean"
+          },
+          "source_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unique": {
+            "type": "boolean"
+          },
+          "vector_search": {
+            "type": "boolean"
+          }
+        }
+      },
+      "NsqlContextJsonResponse": {
+        "type": "object",
+        "required": [
+          "context",
+          "instructions",
+          "sql",
+          "datasets",
+          "functions",
+          "samples"
+        ],
+        "properties": {
+          "context": {
+            "type": "string",
+            "description": "The rendered NSQL context block injected into `/v1/nsql` model requests."
+          },
+          "datasets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlDatasetContext"
+            },
+            "description": "In-scope datasets with schema, metadata, relationship, key, and index details."
+          },
+          "functions": {
+            "$ref": "#/components/schemas/NsqlFunctionContext",
+            "description": "Available function groups filtered to the current `DataFusion` context."
+          },
+          "instructions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "High-level SQL generation instructions."
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SampleContextBlock"
+            },
+            "description": "Optional sample blocks included when requested."
+          },
+          "sql": {
+            "$ref": "#/components/schemas/NsqlSqlContext",
+            "description": "SQL engine and dialect details for Spice SQL."
+          }
+        }
+      },
+      "NsqlDatasetContext": {
+        "type": "object",
+        "required": [
+          "name",
+          "table",
+          "metadata",
+          "columns",
+          "primary_key",
+          "unique_constraints",
+          "foreign_keys",
+          "indexes",
+          "search"
+        ],
+        "properties": {
+          "catalog": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlColumnContext"
+            }
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "foreign_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlForeignKeyContext"
+            }
+          },
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlIndexContext"
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "primary_key": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "search": {
+            "$ref": "#/components/schemas/NsqlDatasetSearchContext"
+          },
+          "table": {
+            "type": "string"
+          },
+          "unique_constraints": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "NsqlDatasetSearchContext": {
+        "type": "object",
+        "required": [
+          "vector",
+          "full_text"
+        ],
+        "properties": {
+          "full_text": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlFullTextSearchContext"
+            }
+          },
+          "vector": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlVectorSearchContext"
+            }
+          }
+        }
+      },
+      "NsqlForeignKeyContext": {
+        "type": "object",
+        "required": [
+          "columns",
+          "foreign_table",
+          "foreign_columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "foreign_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "foreign_table": {
+            "type": "string"
+          }
+        }
+      },
+      "NsqlFullTextSearchContext": {
+        "type": "object",
+        "required": [
+          "column",
+          "function",
+          "syntax",
+          "engine",
+          "index_store",
+          "row_id_columns",
+          "required_columns",
+          "notes"
+        ],
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "function": {
+            "type": "string"
+          },
+          "index": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NsqlIndexContext"
+              }
+            ]
+          },
+          "index_store": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "row_id_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "syntax": {
+            "type": "string"
+          }
+        }
+      },
+      "NsqlFunctionContext": {
+        "type": "object",
+        "required": [
+          "summary",
+          "json",
+          "search",
+          "additional",
+          "spark_compatibility",
+          "user_defined"
+        ],
+        "properties": {
+          "additional": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlFunctionContextEntry"
+            }
+          },
+          "json": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlFunctionContextEntry"
+            }
+          },
+          "search": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NsqlFunctionContextEntry"
+            }
+          },
+          "spark_compatibility": {
+            "$ref": "#/components/schemas/NsqlSparkFunctionContext"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "user_defined": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserFunctionContextEntry"
+            }
+          }
+        }
+      },
+      "NsqlFunctionContextEntry": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "example": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "function_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "signatures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "syntax": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "NsqlIndexContext": {
+        "type": "object",
+        "required": [
+          "columns",
+          "kind",
+          "source"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          }
+        }
+      },
+      "NsqlSparkFunctionContext": {
+        "type": "object",
+        "required": [
+          "description",
+          "functions"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "functions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "NsqlSqlContext": {
+        "type": "object",
+        "required": [
+          "engine",
+          "version",
+          "dialect",
+          "parser",
+          "notes"
+        ],
+        "properties": {
+          "dialect": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "parser": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "NsqlVectorSearchContext": {
+        "type": "object",
+        "required": [
+          "column",
+          "function",
+          "syntax",
+          "model",
+          "row_id_columns",
+          "chunked",
+          "required_columns",
+          "notes"
+        ],
+        "properties": {
+          "chunked": {
+            "type": "boolean"
+          },
+          "column": {
+            "type": "string"
+          },
+          "engine": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "function": {
+            "type": "string"
+          },
+          "index": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NsqlIndexContext"
+              }
+            ]
+          },
+          "input_mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "row_id_columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "syntax": {
+            "type": "string"
+          },
+          "vector_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      },
       "OutputItem": {
         "oneOf": [
           {
@@ -10619,6 +11424,21 @@
           "developer"
         ]
       },
+      "SampleContextBlock": {
+        "type": "object",
+        "required": [
+          "title",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
       "Scroll": {
         "type": "object",
         "description": "A scroll action.",
@@ -11817,6 +12637,41 @@
           "url": {
             "type": "string",
             "description": "The URL of the web resource."
+          }
+        }
+      },
+      "UserFunctionContextEntry": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "volatility",
+          "from"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "syntax": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "volatility": {
+            "type": "string"
           }
         }
       },

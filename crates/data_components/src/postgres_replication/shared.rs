@@ -1100,12 +1100,17 @@ async fn handle_decoded(
             }
         }
         DecodedMessage::Update {
-            relation_id, new, ..
+            relation_id,
+            old,
+            new,
         } => {
             if let Some(member_key) = routes.get(&relation_id)
                 && let Some(member) = source.member(member_key)
             {
                 member.metrics.inc_update();
+                // Fill unchanged-TOAST markers from the old tuple (REPLICA
+                // IDENTITY FULL) before buffering.
+                let new = super::changes::merge_unchanged_toast(new, old.as_ref());
                 txn.entry(relation_id).or_default().push(DecodedChange {
                     op: ChangeOp::Update,
                     row: new,
@@ -1158,6 +1163,13 @@ async fn deliver_commit(
     commit_time_micros: i64,
 ) {
     let commit_time = client::pg_epoch_to_system_time(commit_time_micros);
+    // Unix-epoch ms for the per-batch replication-lag signal carried into the
+    // accelerator (distinct from the `SystemTime` used for the local metrics
+    // watermark below).
+    let commit_ts_ms = commit_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok());
 
     for (relation_id, changes) in txn {
         if changes.is_empty() {
@@ -1188,7 +1200,7 @@ async fn deliver_commit(
             continue;
         };
         let batch = match super::changes::build_change_batch(&member.schema, rel, &changes) {
-            Ok(b) => b,
+            Ok(b) => b.with_source_commit_ts_ms(commit_ts_ms),
             Err(e) => {
                 member_fatal(
                     source,

@@ -50,8 +50,9 @@ limitations under the License.
 //! | 7–10 | full default `BtrBlocks` cascade (today's behavior; upper levels reserved) |
 //!
 //! `auto` (the default) size-gates: a delta smaller than a quarter of the
-//! target file size encodes at [`AUTO_LIGHT_LEVEL`]; larger or unknown-size
-//! writes use the full default. Level `7` is the explicit opt-out
+//! target file size — or of unknown size (a transient staged stream that
+//! compaction rewrites) — encodes at [`AUTO_LIGHT_LEVEL`]; only a known-large
+//! write uses the full default. Level `7` is the explicit opt-out
 //! (byte-for-byte the pre-feature behavior). Maintenance writes
 //! ([`WriteClass::Maintenance`]) always use the full default regardless of
 //! the configured level.
@@ -120,8 +121,8 @@ pub(crate) enum WriteClass {
     Maintenance,
 }
 
-/// Level used for every [`WriteClass::Maintenance`] write and for large /
-/// unknown-size deltas under `auto`: the full default `BtrBlocks` cascade.
+/// Level used for every [`WriteClass::Maintenance`] write and for large
+/// known-size deltas under `auto`: the full default `BtrBlocks` cascade.
 /// Aliases the metadata constant so the config default and the mapping
 /// boundary can't drift apart.
 pub(crate) const FULL_LEVEL: u8 = DELTA_ENCODING_FULL_LEVEL;
@@ -141,8 +142,10 @@ pub(crate) const AUTO_LIGHT_DENOMINATOR: u64 = 4;
 /// Resolve the effective encoding level for one snapshot write.
 ///
 /// `estimated_bytes` is the caller's pre-encode size estimate (`None` when
-/// the stream size is unknown, e.g. opaque staged streams). Unknown sizes
-/// resolve to [`FULL_LEVEL`] under `auto` — conservatively assuming large.
+/// the stream size is unknown, e.g. opaque staged streams). Under `auto`, an
+/// unknown size resolves to [`AUTO_LIGHT_LEVEL`]: it is a transient staged
+/// stream (e.g. the off-fence mem-tier checkpoint) that compaction rewrites,
+/// so only a known-large delta takes [`FULL_LEVEL`].
 pub(crate) fn effective_level(
     encoding: DeltaEncoding,
     write_class: WriteClass,
@@ -159,7 +162,13 @@ pub(crate) fn effective_level(
                 u64::try_from(target_size_bytes).unwrap_or(u64::MAX) / AUTO_LIGHT_DENOMINATOR;
             match estimated_bytes {
                 Some(bytes) if bytes < threshold.max(1) => AUTO_LIGHT_LEVEL,
-                _ => FULL_LEVEL,
+                // Unknown size means an opaque staged CDC stream (e.g. the
+                // off-fence mem-tier checkpoint) — transient and rewritten by
+                // compaction, so encode it LIGHT rather than paying the full
+                // BtrBlocks cascade (incl. the FSST symbol-table double-train)
+                // on the CDC hot path. Only a known-large delta takes FULL.
+                None => AUTO_LIGHT_LEVEL,
+                Some(_) => FULL_LEVEL,
             }
         }
     }
@@ -258,8 +267,9 @@ mod tests {
     #[test]
     fn default_is_auto_with_light_small_deltas_and_full_opt_out() {
         // Product decision: `auto` ships as the default — small known-size
-        // deltas encode light; large/unknown writes and maintenance stay on
-        // the full cascade. Level 7 is the explicit opt-out.
+        // deltas and unknown-size (transient, compaction-rewritten) writes
+        // encode light; large known-size writes and maintenance stay on the
+        // full cascade. Level 7 is the explicit opt-out.
         assert_eq!(DeltaEncoding::default(), DeltaEncoding::Auto);
         assert!(
             strategy_builder_for_level(effective_level(
@@ -278,8 +288,8 @@ mod tests {
                 None,
                 TARGET
             ))
-            .is_none(),
-            "default auto must keep unknown-size writes on the full strategy"
+            .is_some(),
+            "default auto must light-encode unknown-size (transient) writes"
         );
         assert!(
             strategy_builder_for_level(effective_level(
@@ -315,10 +325,12 @@ mod tests {
             ),
             FULL_LEVEL
         );
-        // Unknown size -> conservatively full.
+        // Unknown size -> light: an unknown-size staged delta is a transient
+        // CDC stream (the off-fence mem-tier checkpoint) that compaction
+        // rewrites, so it skips the full BtrBlocks cascade on the hot path.
         assert_eq!(
             effective_level(DeltaEncoding::Auto, WriteClass::Delta, None, TARGET),
-            FULL_LEVEL
+            AUTO_LIGHT_LEVEL
         );
     }
 

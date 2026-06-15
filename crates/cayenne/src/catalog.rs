@@ -24,6 +24,7 @@ use super::metadata::{
     CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
     PartitionMetadata, SnapshotFileStatistics, TableMetadata, TableStatistics,
 };
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::collections::HashMap;
@@ -236,6 +237,18 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get table metadata by name.
     async fn get_table(&self, table_name: &str) -> CatalogResult<TableMetadata>;
+
+    /// Replace the stored Arrow schema for an existing table (widening schema
+    /// evolution).
+    ///
+    /// Overwrites `cayenne_table.schema_json` for `table_id` with the
+    /// IPC-serialized `schema` (the same serialization `create_table` uses).
+    /// Callers are responsible for ensuring the new schema is a lossless
+    /// widening of the stored one (added nullable columns / widened types) —
+    /// existing data files are NOT rewritten; scans adapt old files to the
+    /// evolved schema at read time. Idempotent: re-applying the same schema is
+    /// a plain single-row UPDATE to the same value.
+    async fn update_table_schema(&self, table_id: &str, schema: &SchemaRef) -> CatalogResult<()>;
 
     /// Set the current snapshot ID for a table (`UUIDv7` string).
     async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
@@ -668,6 +681,31 @@ pub trait MetadataCatalog: Send + Sync {
     async fn clear_inlined_data_and_deletes(&self, table_id: &str) -> CatalogResult<()> {
         self.clear_inlined_data(table_id).await?;
         self.clear_inlined_deletes(table_id).await
+    }
+
+    /// Commit on-conflict deletion metadata and clear inline data/delete rows
+    /// for the same table.
+    ///
+    /// Production implementations should override this as a single backend
+    /// transaction. The default keeps trait implementors source-compatible, but
+    /// is not atomic across the metadata commit and inline clear.
+    async fn commit_on_conflict_deletions_and_clear_inlined(
+        &self,
+        delete_files: Vec<DeleteFile>,
+        table_id: &str,
+        insert_pk_bytes_list: Vec<Vec<u8>>,
+        insert_sequence: i64,
+        snapshot_sequence: Option<SnapshotSequenceCommit>,
+    ) -> CatalogResult<()> {
+        self.commit_on_conflict_deletions(
+            delete_files,
+            table_id,
+            insert_pk_bytes_list,
+            insert_sequence,
+            snapshot_sequence,
+        )
+        .await?;
+        self.clear_inlined_data_and_deletes(table_id).await
     }
 
     /// Add a small batch of delete identifiers inlined in the metastore.

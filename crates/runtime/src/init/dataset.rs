@@ -599,13 +599,23 @@ impl Runtime {
 
         let source_schema = provider.schema();
         let inferred = InferredSchema::from_metadata(source_schema.metadata());
-        // Only acceleration settings (primary key / indexes / sort) are applied here;
-        // inferred sizing rides on the provider schema metadata and is surfaced as
-        // table statistics elsewhere. Skip the refresh_sql parse and dataset rebuild
-        // when nothing acceleration-relevant was inferred (e.g. sizing only).
+        // Only acceleration settings (primary key / indexes / sort / shard key) are
+        // applied here; inferred sizing and column statistics ride on the provider
+        // schema metadata and are surfaced as table statistics / tuning inputs
+        // elsewhere. Skip the refresh_sql parse and dataset rebuild when nothing
+        // acceleration-relevant was inferred (e.g. sizing only).
+        // `shard_key` is consumed only by Cayenne (see `apply_inferred_shard_key`);
+        // for other engines it is not acceleration-relevant and must not, on its
+        // own, force a refresh_sql parse + dataset rebuild below.
+        let shard_key_relevant = !inferred.shard_key.is_empty()
+            && ds.acceleration.as_ref().is_some_and(|a| {
+                a.engine.to_unpartitioned()
+                    == crate::component::dataset::acceleration::Engine::Cayenne
+            });
         if inferred.primary_key.is_empty()
             && inferred.indexes.is_empty()
             && inferred.sort_columns.is_empty()
+            && !shard_key_relevant
         {
             return ds;
         }
@@ -747,6 +757,14 @@ impl Runtime {
         // begin their source-facing work while this one registers.
         drop(load_guard);
 
+        // `on_schema_change: fail` records an actionable message when a schema change
+        // deferred the provider. Capture it now (the table is moved into registration)
+        // and surface it as the dataset status AFTER registration completes —
+        // registration marks checkpointed datasets Ready, which the fail policy
+        // must override. The deferred retry keeps serving the existing acceleration
+        // and self-heals (a later refresh restores Ready) if the source reverts.
+        let schema_change_failure = federated_table.schema_change_failure().map(str::to_string);
+
         let register_start = Instant::now();
         match Arc::clone(&self)
             .register_dataset(
@@ -804,6 +822,13 @@ impl Runtime {
                 );
                 metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
 
+                if let Some(message) = schema_change_failure {
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(message),
+                    );
+                }
+
                 Ok(())
             }
             Err(err) => {
@@ -845,6 +870,10 @@ impl Runtime {
                 return;
             }
         }
+
+        // Drop the dataset's CDC schema-evolution settings; a reload re-installs
+        // them at registration before the changes stream starts.
+        crate::accelerated_table::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
 
         tracing::info!("Unloaded dataset {}", &ds_name);
         let engine = ds_acceleration.map_or_else(
@@ -1165,6 +1194,16 @@ impl Runtime {
         let replicate = ds.replication.as_ref().is_some_and(|r| r.enabled);
         // FEDERATED TABLE
         if !ds.is_accelerated() {
+            // `on_schema_change` only governs accelerated datasets in v1: federated
+            // queries always reflect the live source schema, so the policy is inert.
+            if ds.on_schema_change != crate::component::dataset::OnSchemaChange::Block {
+                tracing::warn!(
+                    dataset = %ds.name,
+                    "`on_schema_change: {policy}` has no effect on non-accelerated datasets; it applies to accelerated datasets only",
+                    policy = ds.on_schema_change,
+                );
+            }
+
             let ds_name: TableReference = ds.name.clone();
             self.df
                 .register_table(

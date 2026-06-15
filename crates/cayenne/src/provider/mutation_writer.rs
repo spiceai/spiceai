@@ -236,11 +236,12 @@ enum MemWriteOutcome {
     /// returned `CayenneCdcWrite` carries the mem-tier epoch for slot deferral.
     /// Boxed because `CayenneCdcWrite` is large and the other variant is small.
     Done(Box<CayenneCdcWrite>),
-    /// Sustained overload — the global byte budget could not admit the batch even
-    /// after spilling the tier durable. The caller must take the durable path for
-    /// this batch (its committer advances the slot per-batch, which is safe
-    /// because the spill drained every prior mem batch to durable first). The
-    /// re-streamed batches + the held write guard are handed back.
+    /// Sustained overload — the global byte budget could not admit the batch
+    /// even after a bounded wait for other tables' releases AND spilling the
+    /// tier durable. The caller must take the durable path for this batch (its
+    /// committer advances the slot per-batch, which is safe because the spill
+    /// drained every prior mem batch to durable first). The re-streamed batches
+    /// + the held write guard are handed back.
     FallBackToDurable {
         stream: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
@@ -388,10 +389,11 @@ impl<'a> AppendMutationWriter<'a> {
             {
                 MemWriteOutcome::Done(cdc_write) => return Ok(*cdc_write),
                 // Sustained overload: the global budget is full even after a
-                // spill drained the tier (and fired the slot advancer, so the
-                // prior mem batches are durable). This batch takes the durable
-                // path below with a NORMAL committer — safe because the slot is
-                // not ahead of durable (spill-then-fallback ordering guard).
+                // bounded wait for other tables to release AND a spill drained
+                // the tier (firing the slot advancer, so the prior mem batches
+                // are durable). This batch takes the durable path below with a
+                // NORMAL committer — safe because the slot is not ahead of
+                // durable (spill-then-fallback ordering guard).
                 MemWriteOutcome::FallBackToDurable {
                     stream,
                     write_guard,
@@ -594,6 +596,7 @@ impl<'a> AppendMutationWriter<'a> {
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut incoming_bytes: u64 = 0;
         let mut incoming_rows: u64 = 0;
+        let drain_start = Instant::now();
         while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
             let batch = batch?;
             incoming_bytes = incoming_bytes.saturating_add(batch.get_array_memory_size() as u64);
@@ -601,6 +604,15 @@ impl<'a> AppendMutationWriter<'a> {
             batches.push(batch);
         }
         drop(prepared_stream);
+        // Decompose `cdc_path_inmemory`: draining the prepared stream RUNS the
+        // deferred PK-conflict validation and decodes the upstream CDC batches,
+        // so this is the "produce + validate the batch" slice — separating
+        // upstream-bound cost from the fence + append cost that follows.
+        record_cayenne_write_phase(
+            self.table.table_name(),
+            "inmemory_stream_drain",
+            drain_start,
+        );
 
         let PostValidationState {
             on_conflict_deletions,
@@ -611,25 +623,43 @@ impl<'a> AppendMutationWriter<'a> {
 
         // CAP CHECK + spill/fallback decision (OOM-safety, correctness item #2).
         //
-        // 1. Per-table cap breached → spill (checkpoint) FIRST, then append into
-        //    the drained tier.
-        // 2. Global budget can't admit the bytes → spill (which releases the
-        //    flushed epoch's budget) then retry once; still refused → fall back
-        //    to the durable path for this batch. The spill fires the slot
-        //    advancer, draining every prior mem batch to durable, so a durable
-        //    fallback batch is never ahead of durable.
+        // 1. Per-table BYTE cap breached → spill (checkpoint) FIRST — double-
+        //    checked under the checkpoint lock, see
+        //    `spill_mem_tier_if_cap_breached` — then append into the bounded
+        //    tier. Byte cap only: the tier's AGE cap is enforced by the 1s
+        //    background tick without blocking this writer (the age-sharing
+        //    variant made the applier ride out checkpoint outages — the
+        //    measured 33-41s apply stalls behind compaction-starved encodes).
+        // 2. Global budget can't admit the bytes → wait (bounded) for ANOTHER
+        //    table's checkpoint to release budget; on timeout spill self (which
+        //    releases the flushed epoch's budget) and retry once; still refused
+        //    → fall back to the durable path for this batch. The spill fires
+        //    the slot advancer, draining every prior mem batch to durable, so a
+        //    durable fallback batch is never ahead of durable.
+        //
+        // Both admission stalls are timed (`inmemory_spill` /
+        // `inmemory_budget_wait`): they were the invisible bulk of the apply
+        // path under overload — a synchronous whole-tier checkpoint inside the
+        // write path that no phase metric covered.
         if self.table.mem_tier_per_table_cap_breached(incoming_bytes) {
-            self.spill_mem_tier().await?;
+            let spill_start = Instant::now();
+            let spill_result = self
+                .table
+                .spill_mem_tier_if_cap_breached(incoming_bytes)
+                .await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_spill", spill_start);
+            spill_result?;
         }
 
         if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
-            // Global budget full. Spill to free this table's bytes (the
-            // checkpoint releases the flushed tier's bytes), then retry once.
-            self.spill_mem_tier().await?;
-            if !mem_tier_budget::try_reserve_bytes(incoming_bytes) {
-                // Still over budget after spilling (other tables hold it): fall
-                // back to the durable path. The spill already drained and acked
-                // this table's prior mem batches (spill-then-fallback ordering).
+            let wait_start = Instant::now();
+            let admitted = self.table.wait_for_budget_or_spill(incoming_bytes).await;
+            record_cayenne_write_phase(self.table.table_name(), "inmemory_budget_wait", wait_start);
+            if !admitted? {
+                // Still over budget after waiting AND spilling (other tables
+                // hold it): fall back to the durable path. The spill already
+                // drained and acked this table's prior mem batches
+                // (spill-then-fallback ordering).
                 record_cayenne_write_phase(
                     self.table.table_name(),
                     "cdc_path_inmemory_fallback",
@@ -683,20 +713,6 @@ impl<'a> AppendMutationWriter<'a> {
                 epoch,
             ),
         )))
-    }
-
-    /// Spill (checkpoint) the in-memory CDC tier durable, serialized by the
-    /// per-table `mem_checkpoint_lock` so only one spill runs at a time. Awaiting
-    /// the lock when a spill is already in flight provides natural backpressure
-    /// (the WAL apply blocks while the spill runs) instead of growing the tier.
-    async fn spill_mem_tier(&self) -> Result<()> {
-        let _guard = self
-            .table
-            .mem_checkpoint_lock_for_writer()
-            .lock_owned()
-            .await;
-        self.table.checkpoint_mem_tier().await?;
-        Ok(())
     }
 
     pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
@@ -907,6 +923,9 @@ impl<'a> AppendMutationWriter<'a> {
             )
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
         tracing::trace!(
             table = self.table.table_name(),
             new_snapshot_id,
@@ -966,6 +985,9 @@ impl<'a> AppendMutationWriter<'a> {
             .await;
         record_cayenne_write_phase(self.table.table_name(), "publish_cas", cas_start);
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok((rows, stats_acc, validated_keys, superseded))
     }
@@ -1138,6 +1160,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_in(
             self.table.clone_for_write_operations(),
@@ -1148,6 +1173,9 @@ impl<'a> AppendMutationWriter<'a> {
         let publish_start = Instant::now();
         staged_append.finalize_staged_write().await?;
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
+        // Fold the metastore publish-wall latency into the adaptive tuner's
+        // publish-bound signal (the single-writer finalization on the CDC-apply path).
+        self.context.record_publish_latency(publish_start.elapsed());
 
         Ok(result)
     }
@@ -1197,6 +1225,9 @@ impl<'a> AppendMutationWriter<'a> {
             }
         };
         record_cayenne_write_phase(self.table.table_name(), "vortex_write", write_start);
+        // Fold the encode + object-store/disk upload latency into the adaptive
+        // tuner's I/O-bound signal (CDC-apply path only; compaction is excluded).
+        self.context.record_io_latency(write_start.elapsed());
 
         let staged_append = CayenneStagedAppend::from_staged_append_to_snapshot(
             self.table.clone_for_write_operations(),

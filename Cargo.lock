@@ -1438,9 +1438,9 @@ dependencies = [
 
 [[package]]
 name = "aws-runtime"
-version = "1.7.4"
+version = "1.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ed8e8c52d2dc2390ad9f15647fe663f71e9780b4262c190fbb823a32721566"
+checksum = "6c9b9de216a988dd54b754a82a7660cfe14cee4f6782ae4524470972fa0ccb39"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -1466,9 +1466,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.133.0"
+version = "1.134.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76314880945928a4ee3956e92af451ef29ef04b734d008bb94b11158a60a1034"
+checksum = "09525553211416fd3c18ead2dd6a29908dcdeb1a032809a23417e7ab848dc23e"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1494,9 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentity"
-version = "1.103.0"
+version = "1.104.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "623c02af2a02c4181e024e28b5067cd83dfb7f6d4ffe0dcf4a438a3b5c919796"
+checksum = "c1485e816a2cbe6bda0d24d28b508ba19d601ab18274881eb59123d23a47f7f3"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1519,9 +1519,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentityprovider"
-version = "1.120.0"
+version = "1.121.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b79d379e70a831f7e3d999252fc09e3ed899b98280989461e26f45a21cf0709"
+checksum = "dd15437cc96e27f0b5371fcc52a047a114e777efd1a9e73579efa198237e2de4"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1573,9 +1573,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.115.0"
+version = "1.116.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "715fd8729709daa491b2d4aeed33e576d76031c164ad34b65062ea585d97ad5e"
+checksum = "8c937c55ae3030bec4431c0d9146e33d2b3e5f54bb47ed32597068200c56affc"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1598,10 +1598,11 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodbstreams"
-version = "1.102.0"
+version = "1.104.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c499d99d4398e6383fa98c61e4d358cca49554ef178f5f89ef7a907a080a25aa"
+checksum = "abf4dac838c4f916ab96ecb2169d16efa0ab06abccaa21947156605db5d7e85c"
 dependencies = [
+ "arc-swap",
  "aws-credential-types",
  "aws-runtime",
  "aws-smithy-async",
@@ -1622,9 +1623,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ec2"
-version = "1.229.0"
+version = "1.232.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bb5dfffc70e73ed387efa49d11fa455ef41dfb19df2ca41abafbbf8bb60c9d1"
+checksum = "3ed1c72b10833ce8a789a21c1b95df11387932d7e9ee9a2931635bdb6770a0ad"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1648,9 +1649,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-glue"
-version = "1.149.0"
+version = "1.150.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "074cd1198f7b138cf75b9b9e13c44bf2777e05a9acd1f895c7021fc8bfb17474"
+checksum = "c718ce2c35c2552e3b39baa30796a6cb295c1f12e9d91a4cddbf6b8f34438379"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1673,9 +1674,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.135.0"
+version = "1.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f97e3e7e7d86fd26fcdc18bc382da5ca9e8b2ff8d54030d187fd0dac8a236d96"
+checksum = "fbd03e531a7d981fba45114c5813a7565dd470a1bd3ef1188ca98c98ebdfc668"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1709,9 +1710,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3vectors"
-version = "1.27.0"
+version = "1.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5fea7870fcbac178c48a14f59e855558f10e68efbd7d7a55e2f28fd5cfdc593"
+checksum = "064a533ab62804953483c0682239cd0a82652ddbde7c941d2ba6939e34a27c11"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1734,9 +1735,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-secretsmanager"
-version = "1.107.0"
+version = "1.108.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63da8ec2dca98a68d8bcba971abae5f06e2c9c0017f43097d1ff92cff96adc54"
+checksum = "cd24cfd47bda71881c399a7cc4850d5a61727246163d5cd1a7c0b48ef19983cb"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1809,9 +1810,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-sts"
-version = "1.106.0"
+version = "1.107.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c80de7bb7d03e9ca8c9fd7b489f20f3948d3f3be91a7953591347d238115408"
+checksum = "3d0d328ba962af23ecfa3c9f23b98d3d35e325fa218d7f13d17a6bf522f8a560"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1894,9 +1895,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-eventstream"
-version = "0.60.20"
+version = "0.60.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faf09d74e5e32f76b8762da505a3cd59303e367a664ca67295387baa8c1d7548"
+checksum = "78d8391e65fcea47c586a22e1a41f173b38615b112b2c6b7a44e80cec3e6b706"
 dependencies = [
  "aws-smithy-types",
  "bytes",
@@ -2053,9 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-types"
-version = "1.4.9"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53f93074121a1be41317b9aa607143ae17900631f7f59a99f2b905d519d6783b"
+checksum = "32b42fcf341259d85ca10fac9a2f6448a8ec691c6955a18e45bc3b71a85fab85"
 dependencies = [
  "base64-simd",
  "bytes",
@@ -3514,6 +3515,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions",
+ "datafusion-functions-aggregate",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-pruning",
@@ -8284,8 +8286,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9439,7 +9441,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -9453,8 +9455,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9510,8 +9512,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-glue"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9525,8 +9527,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9549,8 +9551,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-datafusion"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9565,8 +9567,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-storage-opendal"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9584,8 +9586,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg_test_utils"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=e519b22193e44667dde7d461e3cac1798fa0c9e2#e519b22193e44667dde7d461e3cac1798fa0c9e2"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b8fc79d9717d8576a45e2bd49aee52967b763f1d#b8fc79d9717d8576a45e2bd49aee52967b763f1d"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -10642,6 +10644,7 @@ dependencies = [
  "bindgen 0.71.1",
  "nix 0.30.1",
  "snafu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -14004,8 +14007,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
- "parking_lot 0.11.2",
+ "hashbrown 0.17.1",
+ "parking_lot 0.12.5",
  "rand 0.8.6",
 ]
 
@@ -14205,9 +14208,9 @@ dependencies = [
 
 [[package]]
 name = "postgres-protocol"
-version = "0.6.11"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56201207dac53e2f38e848e31b4b91616a6bb6e0c7205b77718994a7f49e70fc"
+checksum = "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -14223,9 +14226,9 @@ dependencies = [
 
 [[package]]
 name = "postgres-types"
-version = "0.2.13"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc729a129e682e8d24170cd30ae1aa01b336b096cbb56df6d534ffec133d186"
+checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
  "chrono",
@@ -14476,7 +14479,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -14510,7 +14513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -17501,7 +17504,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -19857,6 +19860,7 @@ name = "token_provider"
 version = "2.1.0-unstable"
 dependencies = [
  "secrecy",
+ "sha2 0.10.9",
  "snafu",
  "tokio",
  "tracing",
@@ -19983,9 +19987,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres"
-version = "0.7.17"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dd8df5ef180f6364759a6f00f7aadda4fbbac86cdee37480826a6ff9f3574ce"
+checksum = "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -21483,7 +21487,7 @@ dependencies = [
 [[package]]
 name = "vortex"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "vortex-alp",
  "vortex-array",
@@ -21517,7 +21521,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -21535,7 +21539,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "arc-swap",
  "arcref",
@@ -21587,7 +21591,7 @@ dependencies = [
 [[package]]
 name = "vortex-array-macros"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -21597,7 +21601,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -21627,7 +21631,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "arrow-buffer",
  "bitvec",
@@ -21640,7 +21644,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -21653,7 +21657,7 @@ dependencies = [
 [[package]]
 name = "vortex-compressor"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -21709,7 +21713,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -21723,7 +21727,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -21737,7 +21741,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -21750,7 +21754,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "fastlanes",
  "itertools 0.14.0",
@@ -21767,7 +21771,7 @@ dependencies = [
 [[package]]
 name = "vortex-file"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "async-trait",
  "bytes",
@@ -21811,7 +21815,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -21821,7 +21825,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "fsst-rs",
  "prost 0.14.3",
@@ -21835,7 +21839,7 @@ dependencies = [
 [[package]]
 name = "vortex-io"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "async-fs",
  "async-stream",
@@ -21865,7 +21869,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -21882,7 +21886,7 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "arcref",
  "arrow-array",
@@ -21924,7 +21928,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "vortex-buffer",
@@ -21934,7 +21938,7 @@ dependencies = [
 [[package]]
 name = "vortex-metrics"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "parking_lot 0.12.5",
  "sketches-ddsketch",
@@ -21943,7 +21947,7 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "pco",
  "prost 0.14.3",
@@ -21957,7 +21961,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "prost 0.14.3",
  "prost-types",
@@ -21966,7 +21970,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "arrow-array",
  "itertools 0.14.0",
@@ -21982,7 +21986,7 @@ dependencies = [
 [[package]]
 name = "vortex-scan"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "async-trait",
  "futures",
@@ -21998,7 +22002,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "num-traits",
  "prost 0.14.3",
@@ -22014,7 +22018,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "dashmap",
  "lasso",
@@ -22026,7 +22030,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -22041,7 +22045,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "dashmap",
  "hashbrown 0.17.1",
@@ -22051,7 +22055,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "vortex-array",
  "vortex-buffer",
@@ -22064,7 +22068,7 @@ dependencies = [
 [[package]]
 name = "vortex-zstd"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/vortex.git?rev=a677d1118273afe4ed9af0cdf3a6dbdd045d4fca#a677d1118273afe4ed9af0cdf3a6dbdd045d4fca"
+source = "git+https://github.com/spiceai/vortex.git?rev=31c65376000614431134c9a287d920cf45c9237f#31c65376000614431134c9a287d920cf45c9237f"
 dependencies = [
  "itertools 0.14.0",
  "prost 0.14.3",
@@ -22678,7 +22682,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

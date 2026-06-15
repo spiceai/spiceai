@@ -19,6 +19,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::refresh::{self, RefreshOverrides};
+use crate::accelerated_table::refresh_task::changes::{
+    CdcSchemaEvolution, install_cdc_schema_evolution,
+};
 use crate::accelerated_table::snapshots::SnapshotRefreshState;
 use crate::accelerated_table::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
@@ -27,7 +30,7 @@ use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
-use crate::component::dataset::{Dataset, ReadyState};
+use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -45,6 +48,11 @@ use crate::dataupdate::{
     UpdateType,
 };
 use crate::federated_table::FederatedTable;
+use crate::schema_evolution::{
+    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
+    dataset_constraint_columns, engine_supports_in_place_evolution, evolution_allowed,
+    reorder_to_checkpoint_order, restrict_schema_to, schema_evolution_labels, widening_plan_kind,
+};
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::secrets::Secrets;
 use crate::tracing_util::view_registered_trace;
@@ -64,6 +72,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow_tools::schema::verify_schema;
+use arrow_tools::schema_evolution::{EvolutionContext, SchemaEvolution, WideningPlan};
 use builder::DataFusionBuilder;
 use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
@@ -315,6 +324,14 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display(
+        "A schema change was detected for dataset {dataset_name} ({change}), and `on_schema_change: fail` is set. The existing acceleration data is preserved. Revert the source schema change to recover, or set `on_schema_change` to `append_new_columns` or `sync_all_columns` to evolve the schema."
+    ))]
+    SchemaChangeFailPolicy {
+        dataset_name: String,
+        change: String,
+    },
 
     #[snafu(display("The catalog {catalog} is not registered."))]
     CatalogMissing { catalog: String },
@@ -1397,13 +1414,19 @@ impl DataFusion {
         // tables. Per-table `cayenne_cdc_mem_tier_max_bytes` is sized in
         // isolation; without this global cap a fleet of memory-mode tables would
         // sum their per-table caps and blow the box (the no-global-cap lesson,
-        // applied to memory). Sized to one eighth of total system/container
+        // applied to memory). Sized to one quarter of total system/container
         // memory, independent of DataFusion's query memory pool; an
         // over-budget append spills to durable Vortex (and, under sustained
         // overload, falls back to the durable path) rather than
         // growing the tier, so memory mode can never OOM. File-mode tables never
-        // touch this budget.
-        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 8;
+        // touch this budget. A quarter (was an eighth): under sustained
+        // high-rate CDC the budget gate fires while resident tiers are far
+        // below it (reservations are held until the flushed epoch's checkpoint
+        // releases them, so encode lag inflates the in-flight aggregate), and a
+        // budget-gated append stalls the apply path — pay RAM for freshness.
+        // The per-table caps and the spill/durable fallbacks stay the
+        // OOM backstops.
+        let mem_tier_budget_bytes = crate::resource_monitor::get_total_memory() / 4;
         cayenne::set_global_mem_tier_bytes(mem_tier_budget_bytes);
         tracing::info!(
             mem_tier_budget_bytes,
@@ -2164,14 +2187,6 @@ impl DataFusion {
             );
         }
 
-        self.handle_schema_difference(
-            dataset,
-            &acceleration_settings,
-            &refresh_schema,
-            refresh_mode,
-        )
-        .await?;
-
         // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
@@ -2181,10 +2196,35 @@ impl DataFusion {
             FederatedTable::Deferred(_) => None,
         };
 
-        // When refresh_sql is used, the accelerated table has a different schema than
-        // the source. Remap constraint column indices from the source schema to the
-        // refresh schema so that upsert/on_conflict still works correctly.
-        let constraints = if parsed_refresh_sql.is_some() {
+        // PK/unique/index column names feed the schema-evolution classifier's
+        // constraint guard: constraint columns must never be widened in place.
+        let constraint_columns =
+            dataset_constraint_columns(dataset, source_constraints, &source_schema);
+
+        let evolved_schema = self
+            .handle_schema_difference(
+                dataset,
+                &acceleration_settings,
+                &refresh_schema,
+                refresh_mode,
+                &constraint_columns,
+            )
+            .await?;
+
+        // Rebind the registration schema to the canonical schema (evolved, or
+        // reordered to checkpoint order) BEFORE constraints/storage_schema/Refresh
+        // are computed, so the registered provider schema, the engine table, and
+        // the positional constraint indices stay aligned. Source-order registration
+        // against a canonical-order engine table transposes columns through
+        // `verify_schema` and DuckDB's positional `INSERT … SELECT *`.
+        let schema_rebound = evolved_schema.is_some();
+        let refresh_schema = evolved_schema.unwrap_or(refresh_schema);
+
+        // When refresh_sql is used — or the registration schema was rebound to the
+        // canonical order — the accelerated table has a different schema/field order
+        // than the source. Remap constraint column indices from the source schema to
+        // the refresh schema so that upsert/on_conflict still works correctly.
+        let constraints = if parsed_refresh_sql.is_some() || schema_rebound {
             source_constraints.and_then(|c| {
                 remap_constraints_to_refresh_schema(c, &source_schema, &refresh_schema)
             })
@@ -2396,6 +2436,12 @@ impl DataFusion {
         accelerated_table_builder.cpu_runtime(self.refresh_runtime().cloned());
         accelerated_table_builder.cluster_role(self.cluster_config.effective_role());
         accelerated_table_builder.accelerator_write_mutex(Arc::clone(&accelerator_write_mutex));
+        accelerated_table_builder.cdc_param_overrides(
+            crate::accelerated_table::refresh_task::changes::extract_cdc_param_overrides(
+                &acceleration_settings.params,
+            )
+            .map(Arc::new),
+        );
         if matches!(refresh_mode, RefreshMode::Caching) {
             // Hide the storage-only namespace column from query planning. Users
             // see the same columns they would have seen pre-isolation.
@@ -2579,6 +2625,18 @@ impl DataFusion {
         }
 
         if refresh_mode == RefreshMode::Changes {
+            // Make the dataset's `on_schema_change` policy + constraint columns
+            // available to the CDC apply loop before the changes stream starts.
+            // Connectors (e.g. Debezium) may have pre-installed a default; this
+            // registration-path install carries the richer constraint set and wins.
+            install_cdc_schema_evolution(
+                &dataset.name,
+                CdcSchemaEvolution {
+                    policy: dataset.on_schema_change,
+                    constraint_columns: constraint_columns.clone(),
+                },
+            );
+
             let changes_stream = source.changes_stream(
                 Arc::clone(&source_table_provider),
                 dataset,
@@ -2667,9 +2725,21 @@ impl DataFusion {
             })
     }
 
-    // For file_update mode: compare the checkpoint schema (from the previous run) against
-    // the source/refresh schema. If there is any schema difference, snapshot the current
-    // file and recreate the acceleration.
+    // Compare the checkpoint schema (from the previous run) against the source/refresh
+    // schema and reconcile any difference per the dataset's `on_schema_change` policy:
+    //
+    // - `block` (default): today's behavior verbatim — only `file_update` mode acts,
+    //   by snapshotting the current file and recreating the acceleration.
+    // - Other policies: classify the change. A widening change inside the policy's
+    //   evolution set is applied IN PLACE via `DataAccelerator::evolve_table_schema`
+    //   (+ checkpoint update), returning the canonical evolved schema so the caller
+    //   rebinds registration to it. Anything the policy did not evolve degrades
+    //   loudly: `file_update` keeps its drop-recreate contract, `file` mode keeps the
+    //   existing acceleration (block-equivalent), and `fail` returns an actionable
+    //   error (the load retry loop self-heals if the source schema reverts).
+    // - When the schemas match by name-set but the source field order drifted from
+    //   the checkpoint, returns the refresh schema reordered to checkpoint order so
+    //   registration is canonically ordered on every restart.
     //
     // We read the schema from the checkpoint rather than from accelerated_table_provider
     // because the provider reports the schema it was *created with* (refresh_schema),
@@ -2677,76 +2747,323 @@ impl DataFusion {
     //
     // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
     // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
+    //
+    // Schema-evolution comparisons restrict the (canonical, possibly fuller) checkpoint
+    // schema to the materialized refresh-schema columns via `restrict_schema_to` so that
+    // non-materialized `refresh_sql` columns are not mis-classified as removed.
     async fn handle_schema_difference(
         &self,
         dataset: &Dataset,
         acceleration_settings: &Acceleration,
         refresh_schema: &Arc<Schema>,
         refresh_mode: RefreshMode,
-    ) -> Result<(), Error> {
-        if acceleration_settings.mode == Mode::FileUpdate
-            && refresh_mode != RefreshMode::Disabled
-            && let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
-            && let Some(existing_schema) = cp.get_schema().await.ok().flatten()
+        constraint_columns: &[String],
+    ) -> Result<Option<SchemaRef>, Error> {
+        let policy = dataset.on_schema_change;
+        let is_file_update =
+            acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled;
+
+        // `block` consults no classifier and reads the checkpoint only on the
+        // file_update path — today's code paths verbatim.
+        if policy == OnSchemaChange::Block && !is_file_update {
+            return Ok(None);
+        }
+
+        let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await else {
+            return Ok(None);
+        };
+        let Some(existing_schema) = cp.get_schema().await.ok().flatten() else {
+            return Ok(None);
+        };
+
+        let needs_dict_normalization = matches!(
+            acceleration_settings.engine.to_unpartitioned(),
+            Engine::DuckDB | Engine::Sqlite | Engine::Turso
+        );
+        let normalized_refresh_schema = if needs_dict_normalization
+            && arrow_tools::schema::has_dictionary_types(refresh_schema)
         {
-            let needs_dict_normalization = matches!(
-                acceleration_settings.engine.to_unpartitioned(),
-                Engine::DuckDB | Engine::Sqlite | Engine::Turso
-            );
-            let normalized_refresh_schema = if needs_dict_normalization
-                && arrow_tools::schema::has_dictionary_types(refresh_schema)
-            {
-                Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
-                    refresh_schema,
-                ))
-            } else {
-                Arc::clone(refresh_schema)
-            };
+            Arc::new(arrow_tools::type_rewrite::normalize_dictionary_types(
+                refresh_schema,
+            ))
+        } else {
+            Arc::clone(refresh_schema)
+        };
 
-            if let Some(diff) =
-                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
-            {
-                tracing::warn!(
-                    "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
-                    dataset.name
-                );
+        // For `refresh_sql` datasets the canonical checkpoint schema carries
+        // non-materialized source columns that are intentionally absent from the
+        // projected refresh schema; compare only the materialized (refresh-schema)
+        // columns so those columns are not mis-classified as removed (which would
+        // make `on_schema_change != block` warn/fail on every restart, or
+        // `file_update` recreate spuriously, even when the source is unchanged).
+        //
+        // Restrict ONLY for `refresh_sql` datasets. For a plain dataset the
+        // checkpoint and refresh schemas have the same column set, so restricting
+        // would be a no-op for an unchanged source — but it would also hide a
+        // genuine column DROP (the dropped column is in the checkpoint, absent from
+        // the refresh schema), defeating `file_update`'s drop-recreate. Compare the
+        // full checkpoint there so real removals are still detected.
+        let comparison_schema = if dataset.refresh_sql().is_some() {
+            restrict_schema_to(&existing_schema, &normalized_refresh_schema)
+        } else {
+            Arc::clone(&existing_schema)
+        };
 
-                // Snapshot before recreating (best-effort)
-                if let Ok(layout) = get_acceleration_layout(dataset).await
-                    && let Some(accel_engine) =
-                        engine_to_acceleration_engine(acceleration_settings.engine)
-                {
-                    dataaccelerator::snapshots::snapshot_before_recreate(
-                        acceleration_settings,
-                        &dataset.name.to_string(),
-                        layout,
-                        accel_engine,
-                        Arc::clone(&existing_schema),
-                        None,
-                    )
-                    .await;
+        if policy != OnSchemaChange::Block {
+            let dataset_name = dataset.name.to_string();
+            let ctx = EvolutionContext { constraint_columns };
+            match arrow_tools::schema_evolution::classify(
+                &comparison_schema,
+                &normalized_refresh_schema,
+                &ctx,
+            ) {
+                SchemaEvolution::Identical => {
+                    // Name-sets match: register with the checkpoint field order (not
+                    // source order) so positional engine paths stay aligned with the
+                    // stored table across restarts. Field definitions (including any
+                    // dictionary types) are kept from the refresh schema.
+                    return Ok(reorder_to_checkpoint_order(
+                        &existing_schema,
+                        refresh_schema,
+                    ));
                 }
-
-                // Drop the existing table from the acceleration engine so it can be recreated
-                // with the updated schema
-                let accelerator = self
-                    .accelerator_engine_registry
-                    .get_accelerator_engine(acceleration_settings.engine)
-                    .await
-                    .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                        name: dataset.name.to_string(),
-                    })?;
-                accelerator
-                    .drop_table(&dataset.name.to_string(), dataset)
-                    .await
-                    .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
-                    .context(UnableToCreateDataAcceleratorSnafu)?;
-
-                // Clear the checkpoint so the refresh treats this as a fresh table
-                let _ = cp.delete().await;
+                SchemaEvolution::Widening(plan) => {
+                    let kind = widening_plan_kind(&plan);
+                    let change = plan.describe();
+                    SCHEMA_EVOLUTION_DETECTED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, kind, "registration"),
+                    );
+                    if policy == OnSchemaChange::Fail {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, kind, "fail_policy"),
+                        );
+                        return SchemaChangeFailPolicySnafu {
+                            dataset_name,
+                            change,
+                        }
+                        .fail();
+                    }
+                    if !evolution_allowed(policy, &plan) {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, kind, "blocked_by_policy"),
+                        );
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected ({change}), but `on_schema_change: {policy}` only evolves added columns{fallback}. Set `on_schema_change: sync_all_columns` to evolve type/nullability changes",
+                            fallback = if is_file_update {
+                                "; the acceleration is recreated (file_update mode)"
+                            } else {
+                                "; the new schema is not applied"
+                            },
+                        );
+                    } else if refresh_mode == RefreshMode::Caching {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, kind, "caching_mode"),
+                        );
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected ({change}), but `refresh_mode: caching` does not support in-place schema evolution{fallback}",
+                            fallback = if is_file_update {
+                                "; the acceleration is recreated (file_update mode)"
+                            } else {
+                                "; delete the acceleration data to adopt the new schema"
+                            },
+                        );
+                    } else if !engine_supports_in_place_evolution(acceleration_settings.engine) {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, kind, "engine_unsupported"),
+                        );
+                        tracing::warn!(
+                            dataset = %dataset.name,
+                            "Schema change detected ({change}), but the '{engine}' acceleration engine does not support in-place schema evolution{fallback}",
+                            engine = acceleration_settings.engine,
+                            fallback = if is_file_update {
+                                "; the acceleration is recreated (file_update mode)"
+                            } else {
+                                "; the new schema is not applied"
+                            },
+                        );
+                    } else {
+                        match self
+                            .evolve_accelerated_table_schema(
+                                dataset,
+                                acceleration_settings,
+                                &cp,
+                                &plan,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                SCHEMA_EVOLUTION_APPLIED.add(
+                                    1,
+                                    &schema_evolution_labels(&dataset_name, kind, "restart"),
+                                );
+                                tracing::info!(
+                                    dataset = %dataset.name,
+                                    "Applied widening schema evolution to the '{engine}' acceleration: {change}",
+                                    engine = acceleration_settings.engine,
+                                );
+                                // The table schema changed; cached plans are obsolete.
+                                self.clear_cached_plans().await;
+                                return Ok(Some(Arc::clone(&plan.evolved_schema)));
+                            }
+                            Err(e) => {
+                                SCHEMA_EVOLUTION_FAILED.add(
+                                    1,
+                                    &schema_evolution_labels(&dataset_name, kind, "apply_error"),
+                                );
+                                tracing::warn!(
+                                    dataset = %dataset.name,
+                                    "Failed to apply widening schema evolution ({change}): {e}{fallback}",
+                                    fallback = if is_file_update {
+                                        ". The acceleration is recreated (file_update mode)"
+                                    } else {
+                                        ". The new schema is not applied; a restart retries the evolution"
+                                    },
+                                );
+                                if !is_file_update {
+                                    // Evolution failed and we will not drop-recreate: pin
+                                    // back to the un-evolved engine-table schema so the
+                                    // registered provider matches it. Use `comparison_schema`,
+                                    // not `existing_schema`: for `refresh_sql` the canonical
+                                    // checkpoint schema appends non-materialized source
+                                    // columns the accelerator never wrote, so registering it
+                                    // would over-declare columns the engine table lacks.
+                                    // `comparison_schema` is restricted to the materialized
+                                    // set (and equals `existing_schema` for non-`refresh_sql`).
+                                    // Widened source data is cast down on write
+                                    // (block-equivalent) and a restart retries the idempotent
+                                    // evolve. file_update falls through to the drop-recreate
+                                    // path below.
+                                    return Ok(Some(Arc::clone(&comparison_schema)));
+                                }
+                            }
+                        }
+                    }
+                }
+                SchemaEvolution::Incompatible { reason } => {
+                    SCHEMA_EVOLUTION_DETECTED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, "incompatible", "registration"),
+                    );
+                    if policy == OnSchemaChange::Fail {
+                        SCHEMA_EVOLUTION_FAILED.add(
+                            1,
+                            &schema_evolution_labels(&dataset_name, "incompatible", "fail_policy"),
+                        );
+                        return SchemaChangeFailPolicySnafu {
+                            dataset_name,
+                            change: reason,
+                        }
+                        .fail();
+                    }
+                    SCHEMA_EVOLUTION_FAILED.add(
+                        1,
+                        &schema_evolution_labels(&dataset_name, "incompatible", "incompatible"),
+                    );
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "Schema change detected that cannot be evolved under `on_schema_change: {policy}`: {reason}{fallback}",
+                        fallback = if is_file_update {
+                            ". The acceleration is recreated (file_update mode)"
+                        } else {
+                            ". The new schema is not applied; revert the source schema change to recover"
+                        },
+                    );
+                }
             }
         }
 
+        // file_update mode contract: anything the policy did not evolve falls back to
+        // snapshot + drop-recreate (today's behavior verbatim under `block`).
+        if is_file_update
+            && let Some(diff) = arrow_tools::schema::schema_difference(
+                &comparison_schema,
+                &normalized_refresh_schema,
+            )
+        {
+            tracing::warn!(
+                "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
+                dataset.name
+            );
+
+            // Snapshot before recreating (best-effort)
+            if let Ok(layout) = get_acceleration_layout(dataset).await
+                && let Some(accel_engine) =
+                    engine_to_acceleration_engine(acceleration_settings.engine)
+            {
+                dataaccelerator::snapshots::snapshot_before_recreate(
+                    acceleration_settings,
+                    &dataset.name.to_string(),
+                    layout,
+                    accel_engine,
+                    Arc::clone(&existing_schema),
+                    None,
+                )
+                .await;
+            }
+
+            // Drop the existing table from the acceleration engine so it can be recreated
+            // with the updated schema
+            let accelerator = self
+                .accelerator_engine_registry
+                .get_accelerator_engine(acceleration_settings.engine)
+                .await
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: dataset.name.to_string(),
+                })?;
+            accelerator
+                .drop_table(&dataset.name.to_string(), dataset)
+                .await
+                .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+                .context(UnableToCreateDataAcceleratorSnafu)?;
+
+            // Clear the checkpoint so the refresh treats this as a fresh table
+            let _ = cp.delete().await;
+        }
+
+        Ok(None)
+    }
+
+    /// Applies a widening plan to the dataset's acceleration engine table and persists
+    /// the canonical evolved schema to the dataset checkpoint.
+    ///
+    /// Engine-first ordering: a crash between the engine DDL and the checkpoint update
+    /// self-heals on restart because `evolve_table_schema` implementations are
+    /// idempotent and the classifier re-derives the same plan.
+    async fn evolve_accelerated_table_schema(
+        &self,
+        dataset: &Dataset,
+        acceleration_settings: &Acceleration,
+        checkpoint: &DatasetCheckpoint,
+        plan: &WideningPlan,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(accelerator) = self
+            .accelerator_engine_registry
+            .get_accelerator_engine(acceleration_settings.engine)
+            .await
+        else {
+            return Err(format!(
+                "the '{engine}' accelerator engine is not available",
+                engine = acceleration_settings.engine
+            )
+            .into());
+        };
+        accelerator
+            .evolve_table_schema(&dataset.name.to_string(), dataset, plan)
+            .await?;
+
+        // Engine DDL committed; persist the canonical schema (preserving the stored
+        // refresh_sql) so restarts classify against the evolved schema.
+        let refresh_sql = checkpoint.get_refresh_sql().await.ok().flatten();
+        checkpoint
+            .checkpoint(&plan.evolved_schema, refresh_sql.as_deref())
+            .await?;
         Ok(())
     }
 

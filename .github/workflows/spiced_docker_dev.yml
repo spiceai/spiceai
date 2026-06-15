@@ -1,4 +1,5 @@
 name: spiced_docker_dev
+run-name: 'spiced_docker_dev: ${{ inputs.tag }} (branch ${{ github.ref_name }} @ ${{ github.sha }})'
 
 on:
   workflow_dispatch:
