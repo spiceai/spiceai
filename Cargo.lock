@@ -2636,7 +2636,7 @@ dependencies = [
  "bitflags 2.12.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2656,7 +2656,7 @@ dependencies = [
  "bitflags 2.12.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2676,7 +2676,7 @@ dependencies = [
  "bitflags 2.12.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -8286,8 +8286,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -9441,7 +9441,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -9455,8 +9455,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9512,8 +9512,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-glue"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9527,8 +9527,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-catalog-rest"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9551,8 +9551,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-datafusion"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9567,8 +9567,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg-storage-opendal"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9586,8 +9586,8 @@ dependencies = [
 
 [[package]]
 name = "iceberg_test_utils"
-version = "0.9.0"
-source = "git+https://github.com/spiceai/iceberg-rust.git?rev=b652de2eb9462ad356b05a83a69e7f0e29420e3f#b652de2eb9462ad356b05a83a69e7f0e29420e3f"
+version = "0.9.1"
+source = "git+https://github.com/spiceai/iceberg-rust.git?rev=9e6e1a00127823d921982db0a3cfb457bc4410cc#9e6e1a00127823d921982db0a3cfb457bc4410cc"
 dependencies = [
  "iceberg",
  "tracing-subscriber",
@@ -14007,8 +14007,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
- "parking_lot 0.11.2",
+ "hashbrown 0.17.1",
+ "parking_lot 0.12.5",
  "rand 0.8.6",
 ]
 
@@ -14478,8 +14478,8 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
- "itertools 0.12.1",
+ "heck 0.5.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -14513,7 +14513,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -17504,7 +17504,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -18045,7 +18045,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -19600,7 +19600,7 @@ dependencies = [
  "ahash 0.8.12",
  "auto_enums",
  "either",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "itertools 0.13.0",
  "once_cell",
  "pulldown-cmark 0.12.2",
@@ -22682,7 +22682,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
