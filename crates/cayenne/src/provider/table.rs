@@ -22828,16 +22828,8 @@ mod tests {
         );
     }
 
-    /// Pins that a DF53 hash-join DYNAMIC filter is NOT absorbed into the Vortex
-    /// scan, even when the fact table has a resident in-memory CDC tier (the
-    /// scan is then union(file branch, bare memory branch)). Vortex's IN-list /
-    /// `list_contains` evaluation has no hashset (O(K×N)) and is slower than
-    /// `DataFusion`'s hashed join probe, so `dynamic_filter_pushdown` is left
-    /// default-off (#11307) and the hash join applies the filter. This guards
-    /// against a regression that re-absorbs the dynamic filter into the Vortex
-    /// scan — the slower path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mem_tier_join_does_not_push_dynamic_filter_into_vortex_scan() {
+    async fn mem_tier_join_probe_keeps_dynamic_filter_pushdown() {
         use arrow::array::Int64Array;
         use datafusion::datasource::MemTable;
 
@@ -22911,20 +22903,16 @@ mod tests {
         let display = datafusion_physical_plan::displayable(physical.as_ref())
             .indent(true)
             .to_string();
-        // #11307 keeps `dynamic_filter_pushdown` off: the build-side dynamic
-        // filter must NOT be absorbed into the Vortex scan (its DataSourceExec
-        // predicate). Vortex IN-list eval is slower than DataFusion's hashed
-        // join probe, which applies the filter instead. Guard against
-        // re-enabling the slower path.
-        let pushed_into_vortex_scan = display.lines().any(|line| {
+        let probe_side_installed = display.lines().any(|line| {
             let l = line.to_lowercase();
-            l.contains("datasourceexec") && l.contains("dynamicfilter")
+            (l.contains("datasourceexec") || l.contains("filterexec"))
+                && l.contains("dynamicfilter")
         });
         assert!(
-            !pushed_into_vortex_scan,
-            "dynamic filter must NOT be pushed into the Vortex scan (DataSourceExec); \
-             it is left to the hash join because Vortex IN-list eval is slower than \
-             DataFusion's hashed probe. Plan:\n{display}"
+            probe_side_installed,
+            "dimension->fact dynamic filter must install on the PROBE side (a scan or \
+             absorber FilterExec line), not merely display on the join, even with a \
+             resident mem tier (bare memory branch blocks pushdown). Plan:\n{display}"
         );
     }
 
