@@ -17177,7 +17177,11 @@ impl TableProvider for CayenneTableProvider {
                 // gated off whenever scan filters are present.
                 let inline_partitions = Self::partition_memory_batches(
                     projected_batches,
-                    state.config().target_partitions(),
+                    // Scan-resolved partition count, NOT the session's: a PK point
+                    // lookup forces `scan_listing_config` to target_partitions=1
+                    // (the file branch does the same), so the in-RAM branch must
+                    // not re-introduce fan-out for point lookups.
+                    scan_listing_config.target_partitions(),
                 );
                 let inline_exec: Arc<dyn ExecutionPlan> =
                     datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
@@ -17204,7 +17208,8 @@ impl TableProvider for CayenneTableProvider {
                 &mem_tier_snapshot,
                 effective_projection.as_ref(),
                 mem_tier_pruning_predicate.as_ref(),
-                state.config().target_partitions(),
+                // Scan-resolved (1 for PK point lookups) — see the inline branch.
+                scan_listing_config.target_partitions(),
             )?
             .map(|mem_exec| self.wrap_memory_branch_with_scan_filters(mem_exec, filters));
 

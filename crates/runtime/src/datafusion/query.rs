@@ -845,9 +845,21 @@ impl Query {
                 let admission_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                     if let Some(semaphore) = ctx.df.query_admission_semaphore() {
                         Self::ensure_not_cancelled(&query_cancel_token, &query_id_str)?;
-                        // A closed semaphore (shutdown only) proceeds ungated
-                        // rather than failing the query.
-                        semaphore.acquire_owned().await.ok()
+                        // Race permit acquisition against cancellation so a query
+                        // cancelled WHILE QUEUED for a permit (client disconnect or
+                        // `/cancel` under load) aborts promptly instead of blocking
+                        // until a permit frees and then still executing. `biased`
+                        // polls cancellation first. A closed semaphore (shutdown
+                        // only) proceeds ungated rather than failing the query.
+                        tokio::select! {
+                            biased;
+                            () = query_cancel_token.cancelled() => {
+                                return Err(Error::QueryCancelled {
+                                    query_id: query_id_str.clone(),
+                                });
+                            }
+                            permit = semaphore.acquire_owned() => permit.ok(),
+                        }
                     } else {
                         None
                     };

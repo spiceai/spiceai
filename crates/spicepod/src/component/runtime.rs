@@ -909,7 +909,9 @@ pub struct Query {
     /// (e.g. concurrent analytical queries alongside CDC ingestion and
     /// compaction). The permit is held for the query's full execution +
     /// result-streaming lifetime; a results-cache hit is never gated. Unset =
-    /// unbounded (the prior behavior).
+    /// unbounded (the prior behavior). A configured value is clamped to a
+    /// minimum of `1` in the runtime builder, so `0` means one concurrent query
+    /// (not unbounded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_queries: Option<usize>,
 }
@@ -1440,6 +1442,34 @@ mod tests {
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.query, None);
+    }
+
+    #[test]
+    fn test_max_concurrent_queries_parse() {
+        // Set: nested under runtime.query parses into the new field.
+        let yaml = r"
+            query:
+                max_concurrent_queries: 4
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime.query.and_then(|q| q.max_concurrent_queries),
+            Some(4)
+        );
+
+        // Absent → None (unbounded), guarding against a serde rename/regression.
+        let yaml = r"
+            query:
+                target_partitions: 8
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(
+            runtime
+                .query
+                .as_ref()
+                .and_then(|q| q.max_concurrent_queries),
+            None
+        );
     }
 
     #[test]
