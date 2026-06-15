@@ -670,11 +670,6 @@ impl CayenneContext {
         VortexTableOptions {
             target_file_size_mb: config.target_vortex_file_size_mb,
             projection_pushdown: ProjectionPushdown::On,
-            // `dynamic_filter_pushdown` is left at its default (off): Vortex's
-            // IN-list / `list_contains` evaluation has no hashset (O(K×N)), so
-            // absorbing a hash-join build-side dynamic filter into the Vortex
-            // scan is slower than letting DataFusion's hashed join probe apply
-            // it. See #11307 and `mem_tier_join_does_not_push_dynamic_filter_into_vortex_scan`.
             segment_cache_size_bytes,
             ..VortexTableOptions::default()
         }
