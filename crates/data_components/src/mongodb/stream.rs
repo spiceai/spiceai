@@ -213,7 +213,7 @@ fn build_change_batch(
     ChangeBatch::try_new(record).context(ChangeBatchSnafu)
 }
 
-#[must_use] 
+#[must_use]
 pub fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
     let fields = schema
         .fields()

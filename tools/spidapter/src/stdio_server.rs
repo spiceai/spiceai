@@ -488,14 +488,16 @@ impl SpidapterHandler {
         // scenario YAML.
         if let Some(ComputeConfig::Scp(ref mut scp)) = scenario.compute {
             if let Ok(tag) = std::env::var("SPIDAPTER_IMAGE_TAG")
-                && !tag.is_empty() {
-                    scp.image_tag = Some(tag);
-                }
+                && !tag.is_empty()
+            {
+                scp.image_tag = Some(tag);
+            }
             if let Ok(channel) = std::env::var("SPIDAPTER_CHANNEL")
-                && !channel.is_empty() {
-                    use spice_cloud_client::types::UpdateChannel;
-                    scp.channel = channel.parse::<UpdateChannel>().ok();
-                }
+                && !channel.is_empty()
+            {
+                use spice_cloud_client::types::UpdateChannel;
+                scp.channel = channel.parse::<UpdateChannel>().ok();
+            }
         }
         Self {
             runs: HashMap::new(),
