@@ -443,12 +443,12 @@ rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3d1f5f6f6d6
 # Tracking Issue: https://github.com/allan2/dotenvy/issues/113
 dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b08003198949dfe2da988633eaad78f" }
 
-iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" }              # spiceai-52
-iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" } # spiceai-52
-iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" } # spiceai-52
-iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" }   # spiceai-52
-iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" } # spiceai-52
-iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "65463fe69575860d53f047e8b5ec9b0922dc7c78" }   # spiceai-52
+iceberg = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" }              # spiceai-52
+iceberg-catalog-glue = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" } # spiceai-52
+iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" } # spiceai-52
+iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" }   # spiceai-52
+iceberg-storage-opendal = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" } # spiceai-52
+iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "ff09ec55bd49effe01ed9d4dafc5c8a6e10fd422" }   # spiceai-52
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
 # [patch.crates-io] block higher up in this file. Keeping those here would be
