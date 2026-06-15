@@ -243,7 +243,7 @@ impl Drop for DynamoDbGuard {
 /// Returns `uri` with its database path component replaced by `database`,
 /// preserving the scheme, authority (userinfo/host), and query string.
 ///
-/// MongoDB reads the default database from the URI path, so rewriting it routes
+/// `MongoDB` reads the default database from the URI path, so rewriting it routes
 /// both the spicebench sink and the spiced connector to the same per-run db.
 fn with_mongodb_database(uri: &str, database: &str) -> String {
     let (base, query) = match uri.split_once('?') {
@@ -268,7 +268,7 @@ fn with_mongodb_database(uri: &str, database: &str) -> String {
     }
 }
 
-/// Drops a MongoDB database on an existing (connect-mode) instance.
+/// Drops a `MongoDB` database on an existing (connect-mode) instance.
 async fn drop_mongodb_database(uri: &str, database: &str) -> anyhow::Result<()> {
     let client = mongodb::Client::with_uri_str(uri)
         .await
@@ -281,7 +281,7 @@ async fn drop_mongodb_database(uri: &str, database: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// RAII guard that drops a per-run MongoDB database when dropped.
+/// RAII guard that drops a per-run `MongoDB` database when dropped.
 ///
 /// Used in connect mode (e.g. Atlas), where the instance is shared and outlives
 /// the run, so the throwaway database must be cleaned up explicitly. (In provision
@@ -504,6 +504,7 @@ fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f6
 /// text, mapping spiced's MongoDB/cayenne metric names onto the generic
 /// per-table contract. Returns `None` when no CDC metrics are present (e.g. a
 /// non-CDC run), so the field stays absent rather than empty.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
     let recv = parse_labeled(body, "dataset_acceleration_cdc_source_recv_wait_ms_sum");
     let apply = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_sum");
@@ -1239,7 +1240,9 @@ impl Handler for SpidapterHandler {
             if let Some(mut guard) = mongodb_guard
                 && let Some((_, database)) = guard.disarm()
             {
-                eprintln!("[stdio] teardown(preserve): keeping MongoDB database '{database}' alive");
+                eprintln!(
+                    "[stdio] teardown(preserve): keeping MongoDB database '{database}' alive"
+                );
             }
             // For SCP: skip app deletion so the deployed spiced stays running.
             eprintln!("[stdio] teardown(preserve): skipping resource deletion");
@@ -1939,17 +1942,10 @@ mod tests {
         let scp = test_scp_config();
         let run_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("parse uuid");
 
-        let spicepod = generate_initial_spicepod(
-            &run_id,
-            &setup_config,
-            &datasets,
-            None,
-            &args,
-            &scp,
-            None,
-        )
-        .await
-        .expect("spicepod loads from disk");
+        let spicepod =
+            generate_initial_spicepod(&run_id, &setup_config, &datasets, None, &args, &scp, None)
+                .await
+                .expect("spicepod loads from disk");
 
         assert_eq!(spicepod.name, "spidapter-01234567");
         let yaml = serialize_spicepod(&spicepod).expect("serialize");
