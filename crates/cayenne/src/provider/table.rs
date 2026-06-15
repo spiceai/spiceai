@@ -2123,6 +2123,17 @@ pub struct CayenneTableProvider {
     /// mode, so file-mode reads/writes are byte-identical. Shared across writer
     /// clones so every clone observes the same tier.
     mem_tier: Arc<ArcSwap<crate::provider::mem_tier::MemTier>>,
+    /// Snapshot-id attestation for sound scan `output_ordering`: `Some(id)` iff
+    /// the current snapshot `id` was produced by the sorted compaction rewrite
+    /// (`rewrite_current_snapshot_for_compaction` while `has_sort_columns()`),
+    /// which writes a single globally-sorted, non-overlapping run. SET under the
+    /// listing fence by that rewrite; CLEARED (`None`) by every other listing
+    /// mutation (snapshot-id change, in-place file add / listing refresh), so a
+    /// scan advertises ordering ONLY when the live file set is provably globally
+    /// sorted (and there are no unsorted in-RAM / protected branches — checked
+    /// separately in `scan`). Shared across writer clones so a compaction clone's
+    /// attestation is observed by scanning clones and invalidated for all on a write.
+    current_sorted_snapshot: Arc<ArcSwap<Option<String>>>,
     /// Serializes mem-tier checkpoints (spills) for this table so a single
     /// checkpoint is in flight at a time. The write path uses
     /// `try_lock()` on this to detect "a checkpoint is already running" and take
@@ -4022,6 +4033,10 @@ impl CayenneTableProvider {
         &self,
         new_snapshot_id: &str,
     ) -> Result<()> {
+        // [sound output_ordering] Rebinding the listing to a snapshot changes the
+        // live file set; invalidate the sorted attestation (the sorted compaction
+        // rewrite swaps the listing directly, not via this path).
+        self.current_sorted_snapshot.store(Arc::new(None));
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -5597,6 +5612,10 @@ impl CayenneTableProvider {
             mem_tier: Arc::new(ArcSwap::from_pointee(
                 crate::provider::mem_tier::MemTier::empty(),
             )),
+            // No sorted rewrite has run on this freshly-opened provider, so the
+            // scan does not advertise ordering until the sorted compactor attests
+            // a snapshot.
+            current_sorted_snapshot: Arc::new(ArcSwap::from_pointee(None)),
             mem_checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             mem_tier_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             slot_advancer: Arc::new(ParkingMutex::new(None)),
@@ -6317,6 +6336,9 @@ impl CayenneTableProvider {
             // Shared so every writer clone appends to / checkpoints the SAME
             // in-memory CDC tier and observes the same slot-advancer handle.
             mem_tier: Arc::clone(&self.mem_tier),
+            // Shared so the sorted-rewrite attestation set by any (compaction)
+            // clone is observed by scanning clones, and cleared for all on a write.
+            current_sorted_snapshot: Arc::clone(&self.current_sorted_snapshot),
             mem_checkpoint_lock: Arc::clone(&self.mem_checkpoint_lock),
             // Shared across clones so EVERY writer serializes on the one publish
             // lock (the seq-ordering invariant requires a single lock per table).
@@ -10826,6 +10848,21 @@ impl CayenneTableProvider {
             self.update_current_snapshot_id(&new_snapshot_id);
             self.clear_all_deletion_caches();
 
+            // [sound output_ordering attestation] When sort columns are
+            // configured this rewrite consolidated the entire snapshot into a
+            // single globally-sorted, non-overlapping run (the stream was sorted
+            // via `sort_stream` above and written by a single writer — see
+            // `snapshot_shard_count`). Attest THIS snapshot id as sorted so a
+            // subsequent `scan` may advertise `output_ordering` by the sort
+            // columns. MUST run AFTER `update_current_snapshot_id` (which clears
+            // the attestation) and under the held listing fence, so a concurrent
+            // scan observes the new listing and the attestation atomically. Any
+            // later listing mutation clears it again (see the clear sites).
+            if self.context.has_sort_columns() {
+                self.current_sorted_snapshot
+                    .store(Arc::new(Some(new_snapshot_id.clone())));
+            }
+
             // Persist accumulated stats from the rewrite — keeps DataFusion's
             // synchronous statistics path consistent with the new snapshot. The
             // rewrite materializes exactly the live rows, so its min/max + NDV +
@@ -11913,6 +11950,11 @@ impl CayenneTableProvider {
     /// in sync with the catalog.
     ///
     pub(crate) fn update_current_snapshot_id(&self, new_snapshot_id: &str) {
+        // [sound output_ordering] Any snapshot-id change invalidates the
+        // sorted-snapshot attestation. The sorted compaction rewrite re-sets it
+        // AFTER calling this; every other id change (overwrite, restore, catalog
+        // refresh) leaves it cleared so the scan never advertises stale ordering.
+        self.current_sorted_snapshot.store(Arc::new(None));
         {
             let mut guard = self.current_snapshot_id.write();
             if guard.as_str() != new_snapshot_id {
@@ -12104,6 +12146,12 @@ impl CayenneTableProvider {
     ///
     /// Returns an error if the listing table cannot be reconstructed.
     pub(crate) async fn refresh_listing_table_under_held_fence(&self) -> Result<()> {
+        // [sound output_ordering] A listing refresh re-lists the current snapshot
+        // because its file set changed (a checkpoint/append wrote files), which
+        // may have added UNSORTED files — invalidate the sorted attestation. The
+        // sorted compaction rewrite swaps the listing directly (not via this
+        // path), so its attestation is unaffected.
+        self.current_sorted_snapshot.store(Arc::new(None));
         // Construct URL to current snapshot using the live snapshot ID
         // (which may differ from table_metadata after compaction)
         let current_snapshot = self.get_current_snapshot_id();
@@ -12172,6 +12220,10 @@ impl CayenneTableProvider {
     /// `listing_fence.read()` across its listing call) and cannot cross a fence
     /// boundary.
     pub(crate) fn publish_current_snapshot_files_changed_under_held_fence(&self) {
+        // [sound output_ordering] This delta-applies newly-added (UNSORTED) files
+        // onto the current snapshot's cached listing in place — invalidate the
+        // sorted attestation so the scan won't advertise stale ordering.
+        self.current_sorted_snapshot.store(Arc::new(None));
         let current_snapshot = self.get_current_snapshot_id();
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -15851,6 +15903,44 @@ impl CayenneTableProvider {
         )
     }
 
+    /// Build the `file_sort_order` (`Vec<Vec<SortExpr>>`) advertised on a
+    /// provably-sorted snapshot's scan, from the table's configured
+    /// `sort_columns`.
+    ///
+    /// CORRECTNESS: the `SortOptions` (direction + nulls placement) are derived by
+    /// reusing [`util::stream_utils::parse_sort_entry`] — the EXACT parser the
+    /// sorted-compaction writer (`sort_stream`) uses — so the advertised ordering
+    /// is byte-identical to the physical on-disk order. Re-deriving them separately
+    /// could advertise (say) ASC over a DESC-written file and silently corrupt
+    /// results via sort-elimination / merge-join.
+    ///
+    /// Returns `None` (→ advertise NO ordering) if `sort_columns` is empty, an
+    /// entry doesn't parse, or ANY sort column is absent from `scan_schema` (e.g.
+    /// projected out) — a partial ordering would be unsound.
+    fn sort_columns_to_file_sort_order(
+        sort_columns: &[String],
+        scan_schema: &arrow_schema::Schema,
+    ) -> Option<Vec<Vec<datafusion::logical_expr::SortExpr>>> {
+        if sort_columns.is_empty() {
+            return None;
+        }
+        let mut exprs = Vec::with_capacity(sort_columns.len());
+        for entry in sort_columns {
+            let (column, opts) = util::stream_utils::parse_sort_entry(entry)?;
+            // Every sort column must exist in the scan schema, else the advertised
+            // order would be partial/wrong — bail out of ordering entirely.
+            scan_schema.field_with_name(column).ok()?;
+            exprs.push(datafusion::logical_expr::SortExpr::new(
+                datafusion::logical_expr::col(column),
+                // `create_lex_ordering` maps this back to `SortOptions { descending:
+                // !asc, nulls_first }`, reproducing exactly what the writer wrote.
+                !opts.descending,
+                opts.nulls_first,
+            ));
+        }
+        Some(vec![exprs])
+    }
+
     async fn create_snapshot_scan_plan(
         &self,
         state: &dyn Session,
@@ -15866,6 +15956,9 @@ impl CayenneTableProvider {
             filters,
             limit,
             state.config(),
+            // This wrapper serves protected-snapshot scans and internal reads,
+            // which are never the provably-sorted main branch — never advertise.
+            false,
         )
         .await
     }
@@ -15878,6 +15971,11 @@ impl CayenneTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
         scan_config: &SessionConfig,
+        // When true, advertise the sort-column `output_ordering` on the file
+        // branch — ONLY the main `scan()` path sets this, and only after proving
+        // the file set is globally sorted with no unsorted union branches. All
+        // other callers (protected-snapshot scans, internal reads) pass `false`.
+        allow_sorted_ordering: bool,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let snapshot_dir_url = Self::snapshot_dir_url(
             &self.table_metadata.path,
@@ -15885,12 +15983,28 @@ impl CayenneTableProvider {
             snapshot_id,
         );
         let table_url = ListingTableUrl::parse(&snapshot_dir_url)?;
-        let options = Self::create_listing_options(
+        let mut options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
             scan_config,
         );
         let scan_schema = Self::snapshot_scan_schema(&self.table_schema(), &options);
+
+        // [sound output_ordering] The caller (only the main `scan()` path) has
+        // verified this scan is over a provably globally-sorted file set. Advertise
+        // the sort-column ordering via `file_sort_order` so DataFusion drops
+        // redundant sorts and can open merge joins; the existing
+        // `create_lex_ordering` + `split_groups_by_statistics` below consume it,
+        // and a `SortPreservingMerge` handles the multi-file case. The order is
+        // built from the SAME `parse_sort_entry` the writer used, so the advertised
+        // direction/nulls placement is byte-identical to the physical order. If any
+        // sort column is absent from the scan schema, advertise NOTHING.
+        if allow_sorted_ordering
+            && let Some(file_sort_order) =
+                Self::sort_columns_to_file_sort_order(self.context.sort_columns(), &scan_schema)
+        {
+            options = options.with_file_sort_order(file_sort_order);
+        }
 
         let partition_column_names = options
             .table_partition_cols
@@ -15931,6 +16045,17 @@ impl CayenneTableProvider {
             &options.file_sort_order,
             state.execution_props(),
         )?;
+        // [sound output_ordering] Advertise the per-partition ordering ONLY when the
+        // files were actually grouped into non-overlapping sorted runs by statistics.
+        // On ANY fallback — per-file stats absent (e.g. `collect_stat` off for
+        // position deletes with pending deletions), overlapping ranges, or more
+        // groups than `target_partitions` — the default grouping may interleave
+        // ranges within a partition, so advertising a per-partition order would be
+        // UNSOUND (wrong results from sort-elimination / merge-join). `output_ordering`
+        // is non-empty only when the caller proved the set globally sorted
+        // (`allow_sorted_ordering`); for every other scan it is empty and this is a
+        // no-op identical to the prior behavior.
+        let mut ordering_is_sound = false;
         if state
             .config_options()
             .execution
@@ -15945,6 +16070,7 @@ impl CayenneTableProvider {
             ) {
                 Ok(new_groups) if new_groups.len() <= options.target_partitions => {
                     partitioned_file_lists = new_groups;
+                    ordering_is_sound = true;
                 }
                 Ok(_) => {
                     tracing::debug!(
@@ -15960,6 +16086,12 @@ impl CayenneTableProvider {
                 }
             }
         }
+        // Never advertise an ordering the grouping above did not prove sound.
+        let output_ordering = if ordering_is_sound {
+            output_ordering
+        } else {
+            Vec::new()
+        };
 
         let file_source = options.format.file_source(Self::snapshot_file_table_schema(
             &self.table_schema(),
@@ -17100,6 +17232,21 @@ impl TableProvider for CayenneTableProvider {
         // #10125 §6.4). The plan is built from the live current_snapshot_id so it
         // can apply per-scan DataFusion config (target_partitions, etc.).
         let current_snapshot_id = self.get_current_snapshot_id();
+        // [sound output_ordering] Advertise the sort-column ordering on the main
+        // file branch ONLY when provably sound: the current snapshot was produced
+        // by the sorted compaction rewrite (attestation id matches) AND this scan
+        // has no unsorted branches — no in-RAM mem-tier rows, no inline-corpus
+        // rows, no protected snapshots (each would union an unsorted stream, and a
+        // UnionExec drops ordering anyway). Read under the held `listing_fence`,
+        // consistent with the attestation's fenced writes. The deletion filter and
+        // `CayenneAccelerationExec` preserve ordering; round-robin repartition is
+        // gated off for ordered plans.
+        let allow_sorted_ordering = self.context.has_sort_columns()
+            && self.current_sorted_snapshot.load_full().as_deref()
+                == Some(current_snapshot_id.as_str())
+            && mem_tier_snapshot.is_empty()
+            && protected_map.is_empty()
+            && inlined_batches.is_empty();
         let listing_scan_start = Instant::now();
         let main_plan_result = self
             .create_snapshot_scan_plan_with_config(
@@ -17109,6 +17256,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_filters,
                 limit,
                 scan_listing_config,
+                allow_sorted_ordering,
             )
             .await;
         self.record_listing_scan_duration(listing_scan_start.elapsed());
@@ -21240,6 +21388,145 @@ mod tests {
             .await
             .expect("query created");
         df.collect().await.expect("collect succeeded")
+    }
+
+    /// [sound output_ordering] A snapshot freshly produced by the sorted compaction
+    /// rewrite, with no unsorted union branches, advertises `output_ordering` by the
+    /// sort columns; a subsequent append delta-adds an UNSORTED file in place and
+    /// MUST clear the attestation so ordering is no longer advertised. Also locks the
+    /// bare-column SortOptions (ascending, NULLs-last) the writer sorted by.
+    #[tokio::test]
+    async fn test_sorted_rewrite_advertises_output_ordering_then_append_clears_it() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // Statistics-based file grouping must be on for the sorted file set to be
+        // grouped into a non-overlapping run (the soundness precondition).
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        // `inline_max_rows: 0` forces writes to files (not the inline memtable), so
+        // the rewrite actually sorts them and the inline-branch gate stays clear.
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "ordering_lifecycle",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id".to_string()],
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![5_i64, 1, 4, 2, 3])),
+                Arc::new(Int64Array::from(vec![50_i64, 10, 40, 20, 30])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("sorted rewrite");
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let ordering = plan.properties().output_ordering().expect(
+            "a sorted-rewritten snapshot with no unsorted branches must advertise output_ordering",
+        );
+        let first = ordering.first();
+        // Bare "id" ⇒ ascending, NULLs-last — must match what `sort_stream` wrote.
+        assert!(!first.options.descending, "bare sort column is ascending");
+        assert!(!first.options.nulls_first, "bare sort column is NULLs-last");
+
+        // A subsequent append delta-adds an UNSORTED file into the same snapshot in
+        // place; the attestation must clear so ordering is no longer advertised.
+        let more = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64, 9])),
+                Arc::new(Int64Array::from(vec![0_i64, 90])),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, more).await;
+        let plan_after = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan after append");
+        assert!(
+            plan_after.properties().output_ordering().is_none(),
+            "after an append delta-adds an unsorted file, output_ordering must NOT be advertised"
+        );
+    }
+
+    /// [sound output_ordering] The advertised SortOptions (direction + NULLs
+    /// placement) MUST be byte-identical to what the writer sorted by — both built
+    /// from the same `parse_sort_entry`. A `DESC NULLS FIRST` sort column must
+    /// advertise descending + NULLs-first; a mismatch = silently wrong results.
+    #[tokio::test]
+    async fn test_output_ordering_sort_options_match_desc_nulls_first() {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let ctx = SessionContext::new_with_config(config);
+        let (provider, _tmp) = create_cayenne_table_with_config(
+            "ordering_desc_nf",
+            Arc::clone(&schema),
+            VortexConfig {
+                sort_columns: vec!["id DESC NULLS FIRST".to_string()],
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 5, 3, 2, 4]))],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("sorted rewrite");
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan plan");
+        let ordering = plan
+            .properties()
+            .output_ordering()
+            .expect("descending sorted snapshot must advertise ordering");
+        let first = ordering.first();
+        assert!(
+            first.options.descending,
+            "`id DESC NULLS FIRST` must advertise a descending ordering"
+        );
+        assert!(
+            first.options.nulls_first,
+            "`id DESC NULLS FIRST` must advertise NULLs-first"
+        );
     }
 
     /// Phase 2 (bloom fallback) helper: create an int64-PK upsert table with an

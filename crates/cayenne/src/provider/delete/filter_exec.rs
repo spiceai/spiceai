@@ -356,6 +356,14 @@ impl ExecutionPlan for KeyBasedDeletionFilterExec {
         &self.properties
     }
 
+    /// Deletion filtering removes rows positionally without reordering, so the
+    /// single input's ordering is preserved end-to-end. Advertising this lets
+    /// DataFusion carry a scan's `output_ordering` across the deletion filter
+    /// (required for sound sorted-file `output_ordering`).
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
     fn partition_statistics(
         &self,
         partition: Option<usize>,
@@ -716,6 +724,14 @@ impl ExecutionPlan for Int64PkDeletionFilterExec {
 
     fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
         &self.properties
+    }
+
+    /// Deletion filtering removes rows positionally without reordering, so the
+    /// single input's ordering is preserved end-to-end. Advertising this lets
+    /// DataFusion carry a scan's `output_ordering` across the deletion filter
+    /// (required for sound sorted-file `output_ordering`).
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn partition_statistics(
