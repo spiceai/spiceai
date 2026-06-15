@@ -128,6 +128,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
+    df_config.options_mut().explain.show_statistics = true;
     df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()

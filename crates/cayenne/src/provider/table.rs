@@ -6472,6 +6472,20 @@ impl CayenneTableProvider {
             cache.optimizer.as_ref()
         };
 
+        if tracing::enabled!(target: "cayenne::stats", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "cayenne::stats",
+                table = %self.table_metadata.table_name,
+                variant = if has_pending_visibility_changes { "optimizer_inexact" } else { "optimizer" },
+                has_pending_deletions = self.has_pending_deletions(),
+                inlined_rows = self.inlined_row_count.load(Ordering::Relaxed),
+                mem_tier_tombstones = Self::mem_tier_has_tombstones(&self.mem_tier.load()),
+                num_rows = ?cached_ref.map(|s| s.num_rows),
+                cache_hit = cached_ref.is_some(),
+                "cached_table_statistics_for_optimizer variant selection"
+            );
+        }
+
         if let Some(source) = cached_ref {
             // Wide-table fast path: build the top-level summary directly from a
             // borrowed reference instead of cloning the full column_statistics
@@ -6558,6 +6572,55 @@ impl CayenneTableProvider {
             distinct_count: stats.distinct_count.to_inexact(),
             byte_size: stats.byte_size.to_inexact(),
         }
+    }
+
+    /// Builds a column-statistics overlay aligned to `output_schema` from the
+    /// incrementally-maintained optimizer aggregate (live min/max + integer NDV
+    /// via `distinct_count`). [`CayenneAccelerationExec`] uses this to refill
+    /// the join-key stats that the base+delta `UnionExec` wipes to
+    /// `Precision::Absent`, restoring `JoinSelection`'s ability to size joins.
+    ///
+    /// Only `column_statistics` are populated (downgraded to inexact via
+    /// [`Self::column_statistics_to_inexact`]); `num_rows`/`total_byte_size`
+    /// are left `Absent` so the physical scan's own filter-aware `num_rows`
+    /// always wins. Columns not present in the aggregate map to
+    /// `ColumnStatistics::new_unknown()`.
+    ///
+    /// Returns `None` when the aggregate is cold or its column count does not
+    /// match the table schema, leaving the scan to report child stats unchanged.
+    fn optimizer_stats_overlay_for_schema(
+        &self,
+        output_schema: &SchemaRef,
+    ) -> Option<Arc<Statistics>> {
+        let table_stats = self.optimizer_table_statistics()?;
+        let table_schema = self.table_schema();
+        if table_stats.column_statistics.len() != table_schema.fields().len() {
+            return None;
+        }
+
+        let by_name: HashMap<&str, &ColumnStatistics> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .zip(table_stats.column_statistics.iter())
+            .collect();
+
+        let column_statistics = output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                by_name.get(field.name().as_str()).map_or_else(
+                    ColumnStatistics::new_unknown,
+                    |stats| Self::column_statistics_to_inexact((*stats).clone()),
+                )
+            })
+            .collect();
+
+        Some(Arc::new(Statistics {
+            num_rows: DFPrecision::Absent,
+            total_byte_size: DFPrecision::Absent,
+            column_statistics,
+        }))
     }
 
     fn clear_cached_table_statistics_unlocked(&self) {
@@ -11577,15 +11640,19 @@ impl CayenneTableProvider {
         &self,
         plan: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
+        let overlay = self.optimizer_stats_overlay_for_schema(&plan.schema());
         if self.maintained_aggregates.is_empty() {
-            Arc::new(CayenneAccelerationExec::new(plan))
+            Arc::new(CayenneAccelerationExec::new(plan).with_optimizer_column_overlay(overlay))
         } else {
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-            Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
-                plan,
-                Arc::clone(&self.maintained_aggregates),
-                epoch,
-            ))
+            Arc::new(
+                CayenneAccelerationExec::new_with_maintained_aggregates(
+                    plan,
+                    Arc::clone(&self.maintained_aggregates),
+                    epoch,
+                )
+                .with_optimizer_column_overlay(overlay),
+            )
         }
     }
 
@@ -15918,6 +15985,15 @@ impl CayenneTableProvider {
         self.note_snapshot_listed(request.snapshot_id);
         let collect_stats = request.options.collect_stat
             && !(self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions());
+        tracing::debug!(
+            target: "cayenne::stats",
+            table = %self.table_metadata.table_name,
+            collect_stats,
+            requested = request.options.collect_stat,
+            position_based = self.pk_deletion_strategy.is_position_based(),
+            has_pending_deletions = self.has_pending_deletions(),
+            "list_files_for_snapshot_scan collect_stats decision (false => per-file stats unknown)"
+        );
         let store = request
             .state
             .runtime_env()
@@ -17253,6 +17329,8 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn statistics(&self) -> Option<datafusion_common::Statistics> {
+        let table_name = &self.table_metadata.table_name;
+
         // Prefer the metastore-persisted table statistics (loaded from Vortex
         // file footers) when present — they cover columns the ListingTable
         // does not expose synchronously without rescanning footers.
@@ -17261,6 +17339,14 @@ impl TableProvider for CayenneTableProvider {
         // persisted `num_rows` for both staged and inline write paths, so the
         // cached stats reflect the live row count after maintenance runs.
         if let Some(stats) = self.cached_table_statistics_for_optimizer() {
+            tracing::debug!(
+                target: "cayenne::stats",
+                table = %table_name,
+                source = "cached_optimizer",
+                num_rows = ?stats.num_rows,
+                total_byte_size = ?stats.total_byte_size,
+                "statistics() returning cached optimizer stats"
+            );
             return Some(stats);
         }
 
@@ -17268,7 +17354,16 @@ impl TableProvider for CayenneTableProvider {
         // persisted stats AND `cached_table_statistics_for_optimizer` returned
         // None), the ListingTable alone would under-count the inline rows, so
         // return None rather than mislead the optimizer with a file-only count.
-        if self.inlined_row_count.load(Ordering::Relaxed) > 0 {
+        let inlined_rows = self.inlined_row_count.load(Ordering::Relaxed);
+        if inlined_rows > 0 {
+            tracing::debug!(
+                target: "cayenne::stats",
+                table = %table_name,
+                source = "none",
+                reason = "inlined_rows_present",
+                inlined_rows,
+                "statistics() returning None (inline rows would be under-counted)"
+            );
             return None;
         }
 
@@ -17276,13 +17371,29 @@ impl TableProvider for CayenneTableProvider {
         // cached table stats are available, the synchronous ListingTable stats
         // are raw file-footer stats and do not account for the pending bitmap.
         if self.pk_deletion_strategy.is_position_based() && self.has_pending_deletions() {
+            tracing::debug!(
+                target: "cayenne::stats",
+                table = %table_name,
+                source = "none",
+                reason = "position_based_pending_deletions",
+                "statistics() returning None (raw footer stats ignore pending position deletes)"
+            );
             return None;
         }
 
         // Fall back to the underlying ListingTable stats. Synchronous method:
         // wait-free ArcSwap snapshot is sufficient.
         let listing_table = self.listing_table.load_full();
-        listing_table.statistics()
+        let stats = listing_table.statistics();
+        tracing::debug!(
+            target: "cayenne::stats",
+            table = %table_name,
+            source = "listing_table",
+            num_rows = ?stats.as_ref().map(|s| s.num_rows),
+            total_byte_size = ?stats.as_ref().map(|s| s.total_byte_size),
+            "statistics() returning ListingTable fallback stats"
+        );
+        stats
     }
 
     fn get_table_definition(&self) -> Option<&str> {
