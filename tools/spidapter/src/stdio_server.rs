@@ -504,7 +504,7 @@ fn parse_labeled(body: &str, name: &str) -> std::collections::HashMap<String, f6
 /// text, mapping spiced's MongoDB/cayenne metric names onto the generic
 /// per-table contract. Returns `None` when no CDC metrics are present (e.g. a
 /// non-CDC run), so the field stays absent rather than empty.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn build_cdc_replication_metrics(body: &str) -> Option<CdcReplicationMetrics> {
     let recv = parse_labeled(body, "dataset_acceleration_cdc_source_recv_wait_ms_sum");
     let apply = parse_labeled(body, "dataset_acceleration_cdc_apply_burst_duration_ms_sum");
@@ -1666,7 +1666,6 @@ fn parse_and_rename_spicepod(yaml_str: &str, run_id: &Uuid) -> anyhow::Result<Sp
 ///
 /// `cayenne` is only used when `setup_config.storage` is `DirectIngest`.
 /// `scp` provides the scheduler state location and query memory limit.
-#[expect(clippy::too_many_arguments)]
 async fn generate_initial_spicepod(
     run_id: &Uuid,
     setup_config: &SetupConfig,
