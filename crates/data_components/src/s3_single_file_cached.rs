@@ -506,4 +506,36 @@ mod tests {
                 .expect("second attempt")
         );
     }
+
+    /// Regression test for the lost S3 `ETag`/Version refresh-skip check.
+    ///
+    /// `FederatedTable::new` wraps the connector's provider in a
+    /// [`crate::MetadataEnrichedTableProvider`] whenever the dataset declares table- or
+    /// column-level metadata. That wrapper returns itself from `as_any`, so the previous
+    /// single-level downcast in `should_skip_refresh_for_table_provider` missed the inner
+    /// `S3SingleFileCached`, returned `Ok(None)`, and forced a full S3 fetch on every refresh.
+    /// The skip check must now see through the wrapper.
+    #[tokio::test]
+    async fn test_should_skip_refresh_through_metadata_enriched_wrapper() {
+        let meta = make_meta("file", 128, 10, Some("etag"), Some("v1"));
+        let store = Arc::new(HeadOnlyObjectStore::new(vec![meta.clone()])) as Arc<dyn ObjectStore>;
+        let cached_table = build_cached_table(store, Some(meta));
+
+        let mut extra_metadata = std::collections::HashMap::new();
+        extra_metadata.insert("schema.key".to_string(), "value".to_string());
+        let wrapped: Arc<dyn TableProvider> = Arc::new(crate::MetadataEnrichedTableProvider::new(
+            Arc::new(cached_table) as Arc<dyn TableProvider>,
+            extra_metadata,
+        ));
+
+        let result = crate::refresh_skip::should_skip_refresh_for_table_provider(wrapped.as_ref())
+            .await
+            .expect("skip check should not error");
+
+        assert_eq!(
+            result,
+            Some(true),
+            "refresh-skip must be reached through the metadata-enriched wrapper"
+        );
+    }
 }
