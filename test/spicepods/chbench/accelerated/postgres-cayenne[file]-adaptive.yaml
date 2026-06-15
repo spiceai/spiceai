@@ -17,8 +17,10 @@ name: postgres-cayenne[file]-adaptive
 #   - It supplies the inferred row_count/table_bytes the adaptive loop's data-aware warm-start
 #     gates on; without extended inference adaptive silently falls back to `auto` (static).
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
-# tick. No per-knob value is set anywhere: an explicit knob would *pin* it under adaptive
+# tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
+# The `cayenne_goal_*` SLOs below are NOT actuator knobs — they are the high-level targets the
+# closed loop converges toward (it still moves the un-pinned actuators freely to hit them).
 #
 # sql_results / task_history stay off to match the baseline and the -cdc-tuned configs, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
@@ -57,6 +59,14 @@ datasets:
       refresh_mode: changes
       params: &cayenne_params
         cayenne_tuning: adaptive
+        # Goal-driven SLOs the closed loop converges toward. Replication-lag and
+        # freshness apply to the CDC (changes) tables; they are inert on the
+        # full-refresh reference tables that share this anchor (no CDC ingest).
+        # Query-latency (p99) and QPH apply to all tables.
+        cayenne_goal_replication_lag: '5s'
+        cayenne_goal_freshness: '30s'
+        cayenne_goal_query_latency: '10s'
+        cayenne_goal_qph: '5000'
 
   - from: postgres:district
     name: district

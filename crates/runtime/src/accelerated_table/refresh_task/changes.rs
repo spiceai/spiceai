@@ -1955,7 +1955,11 @@ impl RefreshTask {
         if let Some(cayenne) = self.cayenne_accelerator() {
             let task_ctx = ctx.task_ctx();
             let cayenne_write = cayenne
-                .write_cdc_append_stream(record_batch_stream, &task_ctx)
+                .write_cdc_append_stream_with_source_commit_ts(
+                    record_batch_stream,
+                    change_batch.source_commit_ts_ms(),
+                    &task_ctx,
+                )
                 .await
                 .map_err(DataFusionError::from)
                 .map_err(find_datafusion_root)

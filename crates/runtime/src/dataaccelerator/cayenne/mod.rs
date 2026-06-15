@@ -66,6 +66,7 @@ use crate::spice_data_base_path;
 use runtime_acceleration::snapshot::{AccelerationEngine, AccelerationLayout};
 use runtime_datafusion_index::{Index, IndexedTableProvider};
 use search::index::native_vector::NativeVectorIndex;
+use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
 const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
@@ -120,6 +121,58 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
         Ok(compiled) => compiled,
         Err(e) => unreachable!("Unable to compile regexp: {e}"),
     });
+
+fn maintained_aggregate_specs_for_cayenne(
+    acceleration: Option<&Acceleration>,
+) -> Result<Vec<cayenne::maintained_aggregate::MaintainedAggregateSpec>> {
+    let Some(acceleration) = acceleration else {
+        return Ok(Vec::new());
+    };
+
+    let maintained_aggregates = acceleration.maintained_aggregates.enabled_aggregates();
+    if maintained_aggregates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !acceleration.partition_by.is_empty() {
+        return Err(Error::InvalidConfiguration {
+            detail: Arc::from(
+                "Cayenne maintained_aggregates is not yet supported on partitioned tables. Remove maintained_aggregates or remove partition_by from the acceleration configuration.",
+            ),
+        });
+    }
+
+    Ok(maintained_aggregates
+        .iter()
+        .map(
+            |aggregate| cayenne::maintained_aggregate::MaintainedAggregateSpec {
+                group_by: aggregate.group_by.clone(),
+                aggregates: aggregate
+                    .aggregates
+                    .iter()
+                    .map(|expr| {
+                        let function = match expr.function {
+                            spicepod_acceleration::MaintainedAggregateFunction::Count => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Sum => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Sum
+                            }
+                            spicepod_acceleration::MaintainedAggregateFunction::Avg => {
+                                cayenne::maintained_aggregate::MaintainedAggregateFunction::Avg
+                            }
+                        };
+
+                        cayenne::maintained_aggregate::MaintainedAggregateExpr {
+                            function,
+                            column: expr.column.clone(),
+                        }
+                    })
+                    .collect(),
+            },
+        )
+        .collect())
+}
 
 /// Transform schema according to `unsupported_type_action` policy.
 /// Delegates to `cayenne::transform_schema_for_vortex`.
@@ -181,6 +234,46 @@ fn parse_u64_aliases_with_hint(
             })
         })
         .unwrap_or(default)
+}
+
+/// Parse a goal duration param (e.g. `"5s"`, `"1m"`, `"250ms"`) to seconds, via
+/// `fundu` for consistency with the other Spice duration knobs (e.g.
+/// `retention_period`). `None` when unset; a warning + `None` when present but
+/// unparseable.
+fn parse_goal_duration_secs(
+    acceleration: &Acceleration,
+    key: &str,
+    table_name: &str,
+) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match fundu::parse_duration(raw) {
+        Ok(d) => Some(d.as_secs_f64()),
+        Err(e) => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' duration '{raw}': {e}; ignoring. Expected a duration like '5s' or '1m'."
+            );
+            None
+        }
+    }
+}
+
+/// Parse a positive goal float param (e.g. queries-per-hour). `None` when unset; a
+/// warning + `None` when present but unparseable or non-positive.
+fn parse_goal_f64(acceleration: &Acceleration, key: &str, table_name: &str) -> Option<f64> {
+    let raw = acceleration.params.get(key)?;
+    match raw.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => {
+            tracing::warn!(
+                target: "spiced::acceleration::cayenne",
+                table = %table_name,
+                "Invalid '{key}' value '{raw}'; expected a positive number, ignoring."
+            );
+            None
+        }
+    }
 }
 
 fn parse_optional_usize<'a>(
@@ -985,7 +1078,32 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{mode}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'."
                 );
             }
-            config.dynamic_tuning = tuning_mode.as_deref() == Some("adaptive");
+            // Resolve the tuning mode. An explicit `cayenne_tuning` value always
+            // wins. When it is UNSET, default to `adaptive` IF extended schema
+            // inference produced metadata (`schema_inference: extended` emitted
+            // the inferred PK / cardinality / sort onto the Arrow schema):
+            // opting into extended schema is the signal the operator wants the
+            // engine to self-tune, and that same metadata is the adaptive
+            // controller's warm start. Without extended-schema metadata (or with
+            // an explicit `auto`/invalid value) the static `auto` derivation is
+            // used. Set `cayenne_tuning: auto` to opt out of the closed loop even
+            // with extended schema enabled.
+            config.dynamic_tuning = match tuning_mode.as_deref() {
+                Some("adaptive") => true,
+                // Explicit `auto` (or an invalid value, already warned above):
+                // static derivation, no closed loop.
+                Some(_) => false,
+                // Unset: enable adaptive iff extended schema inference produced
+                // metadata (see the comment above).
+                None => workload.inferred_metadata.is_present(),
+            };
+            if config.dynamic_tuning && tuning_mode.is_none() {
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`schema_inference: extended` detected and `cayenne_tuning` unset: defaulting to adaptive tuning (closed-feedback loop). Set `cayenne_tuning: auto` to opt out.",
+                );
+            }
             // Extended schema inference SHARPENS the warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
             // feeds the query-health surface), but it is no longer REQUIRED for
@@ -1008,6 +1126,46 @@ impl CayenneAccelerator {
                     "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
                 );
                 config.dynamic_tuning = false;
+            }
+            // Goal-driven tuning: parse the high-level SLO setpoints. Times are
+            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. A configured
+            // goal IMPLIES the closed loop (a goal with tuning off is inert),
+            // unless the operator explicitly opted out with `cayenne_tuning: auto`,
+            // and provided the background compaction tick the controller rides is
+            // enabled. Query latency is stored in ms.
+            config.goal_replication_lag_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_replication_lag", table_name);
+            config.goal_freshness_secs =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_freshness", table_name);
+            config.goal_query_latency_ms =
+                parse_goal_duration_secs(acceleration, "cayenne_goal_query_latency", table_name)
+                    .map(|secs| secs * 1000.0);
+            config.goal_convergence_window_secs = parse_goal_duration_secs(
+                acceleration,
+                "cayenne_goal_convergence_window",
+                table_name,
+            );
+            config.goal_qph = parse_goal_f64(acceleration, "cayenne_goal_qph", table_name);
+            let any_goal = config.goal_replication_lag_secs.is_some()
+                || config.goal_freshness_secs.is_some()
+                || config.goal_query_latency_ms.is_some()
+                || config.goal_qph.is_some();
+            if any_goal && tuning_mode.as_deref() == Some("auto") {
+                tracing::warn!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set but `cayenne_tuning: auto` explicitly disables the closed loop; the goals will be ignored. Remove `cayenne_tuning: auto` (or set `adaptive`) to enable goal-seeking."
+                );
+            } else if any_goal
+                && !config.dynamic_tuning
+                && config.compaction_background_interval_ms != 0
+            {
+                config.dynamic_tuning = true;
+                tracing::info!(
+                    target: "spiced::acceleration::cayenne",
+                    table = %table_name,
+                    "`cayenne_goal_*` set: enabling adaptive tuning (goal-seeking closed loop)."
+                );
             }
             if config.dynamic_tuning {
                 tracing::warn!(
@@ -1235,6 +1393,7 @@ impl CayenneAccelerator {
         // Get metastore type and metadata directory
         let acceleration = source.acceleration();
         let metadata_dir = Self::resolve_metadata_dir(acceleration);
+        let maintained_aggregate_specs = maintained_aggregate_specs_for_cayenne(acceleration)?;
         let metastore_type = acceleration
             .and_then(|a| a.params.get("cayenne_metastore"))
             .map_or("sqlite", String::as_str)
@@ -1301,7 +1460,8 @@ impl CayenneAccelerator {
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
             .with_context(context)
-            .with_retention_filters(retention_filters);
+            .with_retention_filters(retention_filters)
+            .with_maintained_aggregates(maintained_aggregate_specs);
         if let Some(retention_builder) = time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(retention_builder);
         }
@@ -1419,8 +1579,8 @@ fn wrap_with_native_vector_indexes(
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    39,
-    { S3_PARAMS_LEN + 39 },
+    44,
+    { S3_PARAMS_LEN + 44 },
 >(
     S3_PARAMETERS,
     [
@@ -1507,9 +1667,18 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("cdc_mem_tier_checkpoint_interval_ms")
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto' (default): derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. 'schema_inference: extended' sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
-            .one_of(&["auto", "adaptive"])
-            .default("auto"),
+            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: when this is unset, the mode is 'adaptive' if extended schema inference produced metadata (the dataset set 'schema_inference: extended' and the source emitted it) — opting into extended schema enables self-tuning, and that metadata is the adaptive warm-start — otherwise 'auto'. Set 'cayenne_tuning: auto' explicitly to opt out of the closed loop even with extended schema. 'schema_inference: extended' also sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for an explicit 'adaptive' — without it the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
+            .one_of(&["auto", "adaptive"]),
+        ParameterSpec::component("goal_replication_lag")
+            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). When set (and cayenne_tuning is not 'auto'), the closed-loop controller converges toward this SLO in small, bounded steps within cayenne_goal_convergence_window."),
+        ParameterSpec::component("goal_freshness")
+            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s')."),
+        ParameterSpec::component("goal_query_latency")
+            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms')."),
+        ParameterSpec::component("goal_qph")
+            .description("Goal-driven adaptive tuning: target query throughput in queries per hour (higher is better), e.g. '5000'."),
+        ParameterSpec::component("goal_convergence_window")
+            .description("Goal-driven adaptive tuning: the time budget to converge toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s."),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -2741,6 +2910,69 @@ mod tests {
             ),
             true,
         )
+    }
+
+    fn maintained_aggregate_acceleration() -> Acceleration {
+        Acceleration {
+            maintained_aggregates: vec![spicepod_acceleration::MaintainedAggregate {
+                group_by: vec!["customer_id".to_string()],
+                aggregates: vec![spicepod_acceleration::MaintainedAggregateExpr {
+                    function: spicepod_acceleration::MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_convert_for_unpartitioned_cayenne() {
+        let acceleration = maintained_aggregate_acceleration();
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("unpartitioned maintained aggregate config should convert");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].group_by, vec!["customer_id".to_string()]);
+        assert_eq!(specs[0].aggregates.len(), 1);
+        assert_eq!(
+            specs[0].aggregates[0].function,
+            cayenne::maintained_aggregate::MaintainedAggregateFunction::Count
+        );
+        assert_eq!(specs[0].aggregates[0].column, None);
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_empty_when_maintenance_disabled() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.maintained_aggregates = spicepod_acceleration::MaintainedAggregates::new(
+            spicepod_acceleration::MaintainAggregates::Disabled,
+            acceleration.maintained_aggregates.as_slice().to_vec(),
+        );
+
+        let specs = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect("disabled maintained aggregate config should parse");
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn maintained_aggregate_specs_error_for_partitioned_cayenne() {
+        let mut acceleration = maintained_aggregate_acceleration();
+        acceleration.partition_by = vec![spicepod::partitioning::PartitionedBy {
+            name: "region".to_string(),
+            expression: "region".to_string(),
+        }];
+
+        let error = maintained_aggregate_specs_for_cayenne(Some(&acceleration))
+            .expect_err("partitioned maintained aggregate config should be rejected");
+
+        let Error::InvalidConfiguration { detail } = error else {
+            panic!("expected InvalidConfiguration, got {error:?}");
+        };
+        assert!(detail.contains("maintained_aggregates"));
+        assert!(detail.contains("partitioned"));
     }
 
     #[test]

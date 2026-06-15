@@ -20,6 +20,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use crate::maintained_aggregate::MaintainedAggregateRegistry;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -111,6 +112,8 @@ pub struct CayenneAccelerationExec {
     /// `with_fetch`, `try_swapping_with_projection`, `reset_state`) or a concurrent
     /// compaction could GC a snapshot mid-execution.
     scan_guard: Option<Arc<SnapshotScanRef>>,
+    maintained_aggregates: Option<Arc<MaintainedAggregateRegistry>>,
+    maintained_aggregate_epoch: u64,
 }
 
 impl CayenneAccelerationExec {
@@ -121,6 +124,8 @@ impl CayenneAccelerationExec {
             inner,
             scan_identity: OnceLock::new(),
             scan_guard: None,
+            maintained_aggregates: None,
+            maintained_aggregate_epoch: 0,
         }
     }
 
@@ -132,16 +137,68 @@ impl CayenneAccelerationExec {
             inner,
             scan_identity: OnceLock::new(),
             scan_guard: Some(guard),
+            maintained_aggregates: None,
+            maintained_aggregate_epoch: 0,
         }
     }
 
-    /// Rewrap `inner`, preserving this node's scan guard (used by plan-rewriting
-    /// trait methods so the GC-protection survives optimizer transforms).
-    fn rewrap(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
+    /// Creates a new `CayenneAccelerationExec` carrying maintained aggregate
+    /// state captured at the table scan visibility epoch.
+    #[must_use]
+    pub fn new_with_maintained_aggregates(
+        inner: Arc<dyn ExecutionPlan>,
+        maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+        maintained_aggregate_epoch: u64,
+    ) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: None,
+            maintained_aggregates: Some(maintained_aggregates),
+            maintained_aggregate_epoch,
+        }
+    }
+
+    /// As [`Self::new_with_maintained_aggregates`], but also carries an in-flight-scan
+    /// ref-count guard. Used for the outermost wrapper `scan()` returns when the table
+    /// has maintained aggregates, so the result carries BOTH the GC-protection guard
+    /// and the captured aggregate state.
+    #[must_use]
+    pub(crate) fn with_guard_and_maintained_aggregates(
+        inner: Arc<dyn ExecutionPlan>,
+        guard: Arc<SnapshotScanRef>,
+        maintained_aggregates: Arc<MaintainedAggregateRegistry>,
+        maintained_aggregate_epoch: u64,
+    ) -> Self {
+        Self {
+            inner,
+            scan_identity: OnceLock::new(),
+            scan_guard: Some(guard),
+            maintained_aggregates: Some(maintained_aggregates),
+            maintained_aggregate_epoch,
+        }
+    }
+
+    /// Returns the maintained aggregate registry and scan epoch captured for
+    /// this table scan, if aggregate maintenance is enabled for the table.
+    #[must_use]
+    pub(crate) fn maintained_aggregates(&self) -> Option<(&Arc<MaintainedAggregateRegistry>, u64)> {
+        self.maintained_aggregates
+            .as_ref()
+            .map(|registry| (registry, self.maintained_aggregate_epoch))
+    }
+
+    /// Rewrap `inner`, preserving this node's carry-through state — the in-flight
+    /// scan guard AND any maintained-aggregate registry — so both survive the
+    /// optimizer transforms applied by the plan-rewriting trait methods
+    /// (`with_new_children`, `with_fetch`, `try_swapping_with_projection`).
+    fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
         Self {
             inner,
             scan_identity: OnceLock::new(),
             scan_guard: self.scan_guard.clone(),
+            maintained_aggregates: self.maintained_aggregates.clone(),
+            maintained_aggregate_epoch: self.maintained_aggregate_epoch,
         }
     }
 
@@ -209,7 +266,7 @@ impl CayenneAccelerationExec {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(Self::new(inner))))
+        Ok(Some(Arc::new(self.wrap_rewritten_child(inner))))
     }
 }
 
@@ -625,7 +682,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         let Some(input) = children.into_iter().next() else {
             unreachable!("should have one input");
         };
-        Ok(Arc::new(self.rewrap(input)))
+        Ok(Arc::new(self.wrap_rewritten_child(input)))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -694,7 +751,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         self.inner
             .with_fetch(limit)
-            .map(|plan| Arc::new(self.rewrap(plan)) as Arc<dyn ExecutionPlan>)
+            .map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -711,7 +768,9 @@ impl ExecutionPlan for CayenneAccelerationExec {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         self.inner
             .try_swapping_with_projection(projection)
-            .map(|plan| plan.map(|plan| Arc::new(self.rewrap(plan)) as Arc<dyn ExecutionPlan>))
+            .map(|plan| {
+                plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
+            })
     }
 
     fn gather_filters_for_pushdown(
@@ -741,8 +800,7 @@ impl ExecutionPlan for CayenneAccelerationExec {
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
-        Ok(result
-            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
+        Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
     }
 }
 

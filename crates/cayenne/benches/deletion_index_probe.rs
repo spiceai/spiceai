@@ -149,6 +149,78 @@ fn bench_row_keys_probe(c: &mut Criterion) {
     group.finish();
 }
 
+/// Old vs new composite deletion-filter probe shape.
+///
+/// `KeyBasedDeletionFilterExec` used to hash every row's PK key TWICE — a
+/// standalone bloom `might_contain` sweep, then a per-row `get` — before
+/// building the keep mask. Switching the exec to [`KeyDeletionIndex::get_batch`]
+/// hashes each key once (bloom sweep over the precomputed hashes, tier walk for
+/// survivors only). These two lanes isolate that change on the composite hot
+/// loop across deletion ratios.
+fn bench_row_keys_filter_modes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("deletion_index_row_keys_filter_modes");
+    group.throughput(Throughput::Elements(ROWS_PER_BATCH as u64));
+
+    let row_keys = build_row_keys(ROWS_PER_BATCH);
+
+    for ratio in DELETION_RATIOS {
+        let index = build_key_index(ROWS_PER_BATCH, ratio);
+
+        // OLD: bloom `might_contain` sweep (one hash/row) + per-row `get`
+        // (a second hash/row).
+        group.bench_with_input(
+            BenchmarkId::new("sweep_plus_get", format!("ratio={ratio}")),
+            &ratio,
+            |b, _| {
+                b.iter(|| {
+                    let mut maybe = 0_usize;
+                    for key in &row_keys {
+                        if index.might_contain(key.as_ref()) {
+                            maybe += 1;
+                        }
+                    }
+                    let mut keep = 0_usize;
+                    if maybe == 0 {
+                        keep = row_keys.len();
+                    } else {
+                        for key in &row_keys {
+                            let visible = match index.get(key.as_ref()) {
+                                None => true,
+                                Some(t) => t
+                                    .insert_sequence
+                                    .is_some_and(|ins_seq| ins_seq > t.delete_sequence),
+                            };
+                            keep += usize::from(visible);
+                        }
+                    }
+                    black_box((maybe, keep));
+                });
+            },
+        );
+
+        // NEW: `get_batch` — one hash/row, bloom-gated tier walk for survivors.
+        group.bench_with_input(
+            BenchmarkId::new("get_batch", format!("ratio={ratio}")),
+            &ratio,
+            |b, _| {
+                b.iter(|| {
+                    let mut deleted = 0_usize;
+                    index.get_batch(row_keys.iter().map(AsRef::as_ref), |_, t| {
+                        let visible = t
+                            .insert_sequence
+                            .is_some_and(|ins_seq| ins_seq > t.delete_sequence);
+                        if !visible {
+                            deleted += 1;
+                        }
+                    });
+                    black_box(deleted);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_concurrent_load_under_publish(c: &mut Criterion) {
     let mut group = c.benchmark_group("deletion_index_concurrent_load_under_publish");
     group.throughput(Throughput::Elements(1));
@@ -279,6 +351,7 @@ criterion_group!(
     benches,
     bench_int64_probe,
     bench_row_keys_probe,
+    bench_row_keys_filter_modes,
     bench_concurrent_load_under_publish,
     bench_extend_max_at_growing_cache_sizes,
     bench_extend_max_cumulative_from_empty,

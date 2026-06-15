@@ -765,6 +765,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_pushdown_through_residual_filter_exec() -> Result<()> {
+        use datafusion::physical_expr::expressions::IsNotNullExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let schema = lineitem_schema();
+        let flight = make_flight_exec(&schema, "foo.foo.lineitem", &[]);
+        // A FilterExec above the scan means DataFusion kept a predicate the
+        // scan's SQL does NOT apply (FlightSQLTable pushdown is
+        // Exact-or-Unsupported, never Inexact). Pushing the aggregate past it
+        // would aggregate unfiltered rows, so the rule must leave the plan
+        // alone.
+        let predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(Arc::new(Column::new("l_returnflag", 3))));
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, flight)?);
+
+        let sum_expr =
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("l_quantity", 0))])
+                .schema(Arc::clone(&schema))
+                .alias("sum(l_quantity)")
+                .build()?;
+
+        let plan = full_aggregate(filtered, &[(3, "l_returnflag")], vec![Arc::new(sum_expr)])?;
+
+        let optimized = optimize(Arc::clone(&plan))?;
+        assert_eq!(
+            plan_display(&optimized),
+            plan_display(&plan),
+            "partial aggregate must NOT be pushed past a residual FilterExec"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_pushdown_preserves_filters_in_where() -> Result<()> {
         use datafusion::logical_expr::{col, lit};
 
